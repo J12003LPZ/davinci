@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.281
+           Opus 5.5 with high effort · <plan>
+           ~\project
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ /model
+  ⎿  Kept model as Opus 5.5 (default)
+
+❯ /resume
+  ⎿  Resume cancelled
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ● high · /effort ▔
+   Help  General   Commands   Custom commands
+
+   Claude understands your codebase, makes edits with your permission, and executes commands — right from your
+   terminal.
+   Shortcuts
+   ! for shell mode          double tap esc to clear input        ctrl + shift + _ to undo
+   / for commands            shift + tab to auto-accept edits     alt + v to paste images
+   @ for file paths          ctrl + o for verbose output          alt + p to switch model
+   /btw for side question    ctrl + t to toggle tasks             ctrl + s to stash prompt
+                             shift + ⏎ for newline                ctrl + g to edit in $EDITOR
+                                                                  /keybindings to customize
+
+   For more help: https://code.claude.com/docs/en/overview
+
+   Esc to cancel

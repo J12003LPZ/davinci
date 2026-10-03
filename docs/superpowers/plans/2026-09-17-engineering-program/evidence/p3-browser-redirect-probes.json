@@ -1,0 +1,26 @@
+{
+  "playwright": "1.62.0",
+  "chromium": "151.0.7922.34",
+  "route_probe": {
+    "command": "rtk proxy node C:/Users/sergi/AppData/Local/Temp/davinci-browser-redirect-probe.cjs",
+    "context_route_filter": true,
+    "service_workers": "block",
+    "authorized_request_routed": 1,
+    "forbidden_request_routed": 0,
+    "forbidden_server_hits": 1,
+    "outcome": "navigated",
+    "closed_browser_and_servers": true
+  },
+  "proxy_probe": {
+    "command": "rtk proxy node C:/Users/sergi/AppData/Local/Temp/davinci-browser-proxy-probe.cjs",
+    "per_context_proxy": true,
+    "bypass": "<-loopback>",
+    "forbidden_server_hits": 0,
+    "blocked_redirects": 1,
+    "external_status": 403,
+    "internal_status": 200,
+    "same_origin_redirect_final_url_preserved": true,
+    "closed_browser_and_servers": true
+  },
+  "scope": "Two temporary loopback HTTP servers and an explicitly selected installed Playwright package. HTTP redirect probes only, not production adapter or HTTPS/WebSocket/general egress acceptance."
+}

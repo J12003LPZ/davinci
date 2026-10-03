@@ -1,0 +1,66 @@
+[
+  {
+    "fixture": "long-debugging-huge-tool-output",
+    "facts": [
+      "the public API must remain compatible",
+      "the first test failure is the parser boundary"
+    ],
+    "folds": 2,
+    "page_out": false
+  },
+  {
+    "fixture": "multi-step-refactor-early-constraint",
+    "facts": [
+      "preserve the public API",
+      "do not change the serialized file format"
+    ],
+    "folds": 1,
+    "page_out": false
+  },
+  {
+    "fixture": "rejected-approach-revisited",
+    "facts": [
+      "the rejected approach used a global mutable cache",
+      "the replacement must keep ownership local"
+    ],
+    "folds": 2,
+    "page_out": false
+  },
+  {
+    "fixture": "resumed-legacy-compaction-branch",
+    "facts": [
+      "legacy compaction metadata is not authoritative evidence",
+      "the active branch remains the source of truth"
+    ],
+    "folds": 2,
+    "page_out": false
+  },
+  {
+    "fixture": "repeated-two-and-five-fold-continuation",
+    "facts": [
+      "the early user constraint survives every fold",
+      "the modified-file fact remains attributable",
+      "the failed-test evidence remains explicit"
+    ],
+    "folds": 5,
+    "page_out": false
+  },
+  {
+    "fixture": "missing-corrupt-page-replay",
+    "facts": [
+      "a missing immutable page must be rebuilt from visible history",
+      "exact evidence remains recoverable after replay"
+    ],
+    "folds": 1,
+    "page_out": true
+  },
+  {
+    "fixture": "no-session-transient-agent",
+    "facts": [
+      "transient messages receive stable source references",
+      "no session file is required for deterministic replay"
+    ],
+    "folds": 1,
+    "page_out": false
+  }
+]

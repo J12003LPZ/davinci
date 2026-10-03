@@ -1,0 +1,170 @@
+{
+  "schema": 1,
+  "commit": "bfc60e3f698ac30f9fb7500fc24490d028da2439",
+  "pr": 10,
+  "ci_run": 35247901869,
+  "conclusion": "success",
+  "workflows": [
+    {
+      "id": 35247901761,
+      "name": "Workflow lint",
+      "conclusion": "success"
+    },
+    {
+      "id": 35247901735,
+      "name": "Security SARIF interoperability",
+      "conclusion": "success"
+    },
+    {
+      "id": 35247901869,
+      "name": "CI",
+      "conclusion": "success"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "job_id": 105292671956,
+      "url": "https://github.com/J12003LPZ/davinci/actions/runs/35247901869/job/105292671956",
+      "conclusion": "success",
+      "evaluation": {
+        "descendants_after_host_loss": 0,
+        "descendants_after_shutdown": 0,
+        "earliest_cursor": 5243145,
+        "equivalent_requests": 2,
+        "first_ready_ms": 145.236944,
+        "fixture_processes": 3,
+        "host_loss_observation_ms": 200.336137,
+        "job_ids": [
+          1,
+          1
+        ],
+        "measurement": "P2 packaged supervisor; real loopback Node server with child and grandchild",
+        "notes": [
+          "The cold start includes descendants becoming ready; the warm request reuses the same live server.",
+          "Output is a bounded page with byte cursors, not an unbounded saved log.",
+          "Timing is machine-specific; no provider usage is measured."
+        ],
+        "output_emitted_bytes": 5242880,
+        "output_truncated": true,
+        "platform": "linux",
+        "retained_page_bytes": 11,
+        "root_startups": 1,
+        "schema": 1,
+        "second_ready_ms": 0.7370519999999999,
+        "shutdown_cleanup_ms": 20.437166,
+        "stdin_roundtrip": true,
+        "survivors_200ms_after_abrupt_host_exit": 0
+      },
+      "test_results": [
+        "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1235 filtered out; finished in 1.26s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s",
+        "test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 867 filtered out; finished in 0.33s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1014 filtered out; finished in 0.16s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out; finished in 3.86s",
+        "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.11s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 1.67s"
+      ]
+    },
+    {
+      "os": "macos",
+      "job_id": 105292672078,
+      "url": "https://github.com/J12003LPZ/davinci/actions/runs/35247901869/job/105292672078",
+      "conclusion": "success",
+      "evaluation": {
+        "descendants_after_host_loss": 0,
+        "descendants_after_shutdown": 0,
+        "earliest_cursor": 5243145,
+        "equivalent_requests": 2,
+        "first_ready_ms": 478.274334,
+        "fixture_processes": 3,
+        "host_loss_observation_ms": 340.306334,
+        "job_ids": [
+          1,
+          1
+        ],
+        "measurement": "P2 packaged supervisor; real loopback Node server with child and grandchild",
+        "notes": [
+          "The cold start includes descendants becoming ready; the warm request reuses the same live server.",
+          "Output is a bounded page with byte cursors, not an unbounded saved log.",
+          "Timing is machine-specific; no provider usage is measured."
+        ],
+        "output_emitted_bytes": 5242880,
+        "output_truncated": true,
+        "platform": "macos",
+        "retained_page_bytes": 11,
+        "root_startups": 1,
+        "schema": 1,
+        "second_ready_ms": 1.61075,
+        "shutdown_cleanup_ms": 110.99241699999999,
+        "stdin_roundtrip": true,
+        "survivors_200ms_after_abrupt_host_exit": 0
+      },
+      "test_results": [
+        "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1235 filtered out; finished in 1.97s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.51s",
+        "test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 867 filtered out; finished in 1.15s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s",
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.76s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1014 filtered out; finished in 0.75s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1234 filtered out; finished in 2.99s",
+        "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.34s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.50s"
+      ]
+    },
+    {
+      "os": "windows",
+      "job_id": 105292671798,
+      "url": "https://github.com/J12003LPZ/davinci/actions/runs/35247901869/job/105292671798",
+      "conclusion": "success",
+      "evaluation": {
+        "descendants_after_host_loss": 0,
+        "descendants_after_shutdown": 0,
+        "earliest_cursor": 5243139,
+        "equivalent_requests": 2,
+        "first_ready_ms": 297.0468,
+        "fixture_processes": 3,
+        "host_loss_observation_ms": 823.5569,
+        "job_ids": [
+          1,
+          1
+        ],
+        "measurement": "P2 packaged supervisor; real loopback Node server with child and grandchild",
+        "notes": [
+          "The cold start includes descendants becoming ready; the warm request reuses the same live server.",
+          "Output is a bounded page with byte cursors, not an unbounded saved log.",
+          "Timing is machine-specific; no provider usage is measured."
+        ],
+        "output_emitted_bytes": 5242880,
+        "output_truncated": true,
+        "platform": "windows",
+        "retained_page_bytes": 11,
+        "root_startups": 1,
+        "schema": 1,
+        "second_ready_ms": 1.9474,
+        "shutdown_cleanup_ms": 357.2885,
+        "stdin_roundtrip": true,
+        "survivors_200ms_after_abrupt_host_exit": 0
+      },
+      "test_results": [
+        "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.78s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1226 filtered out; finished in 11.46s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.13s",
+        "test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 866 filtered out; finished in 0.63s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s",
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.46s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1012 filtered out; finished in 0.23s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1225 filtered out; finished in 3.25s",
+        "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.19s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 3.62s"
+      ]
+    }
+  ]
+}

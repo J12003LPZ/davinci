@@ -1,0 +1,10 @@
+{
+  "name": "pkg-b",
+  "version": "1.0.0",
+  "dependencies": {
+    "pkg-a": "*"
+  },
+  "scripts": {
+    "custom-task": "node ./run.js"
+  }
+}

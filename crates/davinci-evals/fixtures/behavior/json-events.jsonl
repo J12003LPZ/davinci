@@ -1,0 +1,14 @@
+{"type":"turn_start"}
+{"type":"capability_identity","capability":"debugging"}
+{"type":"prompt_manifest","profile":"stable","profile_version":2,"stable_sha256":"stable-hash","full_sha256":"full-hash","stable_estimated_tokens":12,"dynamic_estimated_tokens":3,"modules":[]}
+{"type":"message_start","role":"assistant","text":"I will inspect the failing code."}
+{"type":"tool_call","id":"grep-1","name":"grep","args":{"query":"bug"}}
+{"type":"tool_result","id":"grep-1","name":"grep","result":{"matches":["src/lib.rs:4"]},"isError":false}
+{"type":"tool_call","id":"read-1","name":"read","args":{"path":"src/lib.rs"}}
+{"type":"tool_result","id":"read-1","name":"read","result":{"content":"fn bug() {}"},"isError":false}
+{"type":"permission_request","tool":"bash"}
+{"type":"tool_call","id":"edit-1","name":"edit","args":{"path":"src/lib.rs"}}
+{"type":"tool_result","id":"edit-1","name":"edit","result":{"success":true},"isError":false,"details":{"path":"src/lib.rs","diff":"+fixed bug"}}
+{"type":"plan","status":"complete"}
+{"type":"shell_exit","id":"bash-1","tool":"bash","command":"cargo test --quiet","exitCode":0}
+{"type":"message_end","role":"assistant","text":"I fixed it; all tests pass."}

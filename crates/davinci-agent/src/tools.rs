@@ -1,0 +1,5891 @@
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::jobs::JobBook;
+use crate::todo::TodoList;
+
+mod foreground;
+mod routing;
+pub(crate) use routing::relevant_tool_families;
+
+#[allow(dead_code)]
+pub fn decision_wait(interactive: bool, deferred: bool, cancelled: bool) -> &'static str {
+    if cancelled {
+        "cancelled"
+    } else if deferred {
+        "deferred"
+    } else if interactive {
+        "wait_for_user"
+    } else {
+        "decision_required"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionHostReply {
+    pub action: crate::decisions::HostDecisionAction,
+    pub host_event_id: String,
+    pub answered_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionHostResponse {
+    Reply(DecisionHostReply),
+    Cancelled,
+    Timeout,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecisionHostRequest {
+    pub question: crate::decisions::DecisionQuestion,
+}
+
+#[derive(Clone)]
+pub struct DecisionResponder(
+    Arc<dyn Fn(DecisionHostRequest) -> DecisionHostResponse + Send + Sync + 'static>,
+);
+
+impl std::fmt::Debug for DecisionResponder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecisionResponder(..)")
+    }
+}
+
+impl DecisionResponder {
+    pub fn new(
+        responder: impl Fn(DecisionHostRequest) -> DecisionHostResponse + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(responder))
+    }
+
+    pub fn respond(&self, request: DecisionHostRequest) -> DecisionHostResponse {
+        (self.0)(request)
+    }
+}
+
+pub const BUILTIN_TOOLS: &[&str] = &[
+    "read",
+    "retrieve_context",
+    "write",
+    "edit",
+    "bash",
+    "powershell",
+    "grep",
+    "find",
+    "ls",
+    "web_fetch",
+    "web_search",
+    "todo",
+    "job_output",
+    "job_kill",
+    "process_start",
+    "process_status",
+    "process_output",
+    "process_write",
+    "process_stop",
+    "process_list",
+    "notebook_edit",
+    "mcp_read",
+    "agent",
+    "batch",
+    "apply_patch",
+    "patch_preview",
+    "patch_apply",
+    "patch_status",
+    "patch_rollback",
+    "exec_command",
+    "write_stdin",
+    "update_plan",
+    "propose_plan",
+    "ask_user_question",
+    "tool_search",
+    "code_definition",
+    "code_references",
+    "code_outline",
+    "code_diagnostics",
+    "code_call_hierarchy",
+    "code_rename_preview",
+];
+
+pub const CODEX_HOT_TOOLS: &[&str] = &[
+    "exec_command",
+    "write_stdin",
+    "apply_patch",
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "update_plan",
+    "propose_plan",
+    "agent",
+    "tool_search",
+];
+
+/// Initial schemas for the opt-in lean surface. Other authorized tools remain
+/// discoverable through `tool_search` without changing permission policy.
+pub const LEAN_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "exec_command",
+    "write_stdin",
+    "apply_patch",
+    "batch",
+    "tool_search",
+    "update_plan",
+    "propose_plan",
+    "ask_user_question",
+    "agent",
+    "job_output",
+    "job_kill",
+    #[cfg(windows)]
+    "bash",
+];
+
+/// What the built-in tools share across calls: the background jobs and the
+/// model's ledger. Both are behind `Arc<Mutex>` because the agent loop, the
+/// tool thread and the davinci shell all read them.
+#[derive(Debug, Clone, Default)]
+pub struct ToolContext {
+    /// Trusted host entry point for foreground process ownership. Without this,
+    /// legacy commands remain available but cannot emit verification receipts.
+    pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
+    /// Host-resolved execution policy for untrusted subprocesses. This is never
+    /// deserialized from model tool arguments.
+    pub sandbox: Option<davinci_protocol::SandboxSpec>,
+    /// Per-dispatch host capture; never reconstructed from tool result JSON.
+    pub command_receipt: Option<crate::command_receipt::CommandReceiptCapture>,
+    /// Trusted host setting; ordinary mutation safety cannot be disabled.
+    pub transactions_disabled: bool,
+    /// Stable provenance for trusted library calls without a RuntimeHandle.
+    pub transaction_owner: crate::runtime::transactions::TransactionOwner,
+    /// Live, engine-installed permission and contract checks for file mutations.
+    pub mutation_authority: Option<crate::runtime::transactions::MutationAuthority>,
+    /// Per-dispatch signal used to invalidate verification even after a failed recovery.
+    pub mutation_attempted: Arc<std::sync::atomic::AtomicBool>,
+    /// Session-owned process service installed by a trusted host, lazily starts children.
+    pub processes: Option<crate::process_manager::ProcessManager>,
+    /// Engine-issued consent for this exact dispatch; never model input.
+    pub dispatch_permit: Option<Arc<crate::approval::DispatchPermit>>,
+    /// Operation identity admitted by the runtime journal for managed-process
+    /// controls.  This is host-installed and never read from model JSON.
+    pub process_operation_binding: Option<crate::runtime::operations::ProcessOperationBinding>,
+    /// Trusted provider/host call identity for native adapters.  It is set by
+    /// the turn host and is never accepted from model-supplied arguments.
+    pub tool_call_id: Option<String>,
+    pub cache: crate::runtime::cache::CacheRuntime,
+    pub jobs: Arc<Mutex<JobBook>>,
+    pub todos: Arc<Mutex<TodoList>>,
+    pub living_plan: Arc<Mutex<crate::LivingPlan>>,
+    pub mcp: crate::mcp::McpRegistry,
+    /// The turn's abort flag, when the host gave the agent one. A foreground
+    /// shell command or a `job_output` wait stops at the next poll instead
+    /// of holding the tool thread until the process ends on its own.
+    pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub runtime: Option<crate::runtime::RuntimeHandle>,
+    /// Provider-facing schemas that have been authorized and exposed for this run.
+    pub tool_exposure: Arc<Mutex<crate::runtime::ToolExposureState>>,
+    /// The run's current tool authorization set, shared with `tool_search`.
+    pub authorized_tools: Arc<Mutex<BTreeSet<String>>>,
+    pub task_coordinator: Option<crate::runtime::task_transport::TaskCoordinatorClient>,
+    pub active_contract: Arc<Mutex<Option<crate::runtime::contracts::TaskContract>>>,
+    pub semantic: Option<Arc<dyn crate::semantic::SemanticService>>,
+    /// Trusted host bridge for synchronous user decisions. This is kept
+    /// distinct from permission approval so a recommendation or answer can
+    /// never issue tool authority.
+    pub decision_responder: Option<DecisionResponder>,
+    /// Process-local guard for the one-outstanding-question invariant.
+    pub decision_slot: Arc<Mutex<Option<String>>>,
+    /// Host-question deadline. `None` uses the production default; tests and
+    /// embedders may choose a shorter explicit bound.
+    pub decision_timeout: Option<std::time::Duration>,
+}
+
+pub fn is_managed_process_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "process_start"
+            | "process_status"
+            | "process_output"
+            | "process_write"
+            | "process_stop"
+            | "process_list"
+    )
+}
+
+pub(crate) fn is_coordinated_mutation(name: &str) -> bool {
+    matches!(
+        name,
+        "write" | "edit" | "notebook_edit" | "apply_patch" | "patch_apply" | "patch_rollback"
+    )
+}
+
+/// Settings-file values for the experimental orchestration features
+/// (`agentTeams`, `dynamicWorkflows`): 0 = unset, 1 = off, 2 = on. The host
+/// sets them from settings; an explicit environment variable still wins, as
+/// Claude Code's `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` does.
+static TEAMS_SETTING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static WORKFLOWS_SETTING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn encode_setting(value: Option<bool>) -> u8 {
+    match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+/// Record the `agentTeams` / `dynamicWorkflows` settings for this process.
+pub fn set_orchestration_settings(agent_teams: Option<bool>, dynamic_workflows: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    TEAMS_SETTING.store(encode_setting(agent_teams), Ordering::SeqCst);
+    WORKFLOWS_SETTING.store(encode_setting(dynamic_workflows), Ordering::SeqCst);
+}
+
+fn flag(env: Option<String>, setting: &std::sync::atomic::AtomicU8) -> bool {
+    match env {
+        Some(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+        None => setting.load(std::sync::atomic::Ordering::SeqCst) == 2,
+    }
+}
+
+pub fn team_tools_enabled() -> bool {
+    flag(
+        std::env::var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS").ok(),
+        &TEAMS_SETTING,
+    )
+}
+
+pub fn workflow_tools_enabled() -> bool {
+    flag(
+        std::env::var("DAVINCI_EXPERIMENTAL_WORKFLOWS")
+            .or_else(|_| std::env::var("DAVINCI_RUNTIME_WORKFLOWS"))
+            .ok(),
+        &WORKFLOWS_SETTING,
+    )
+}
+
+impl ToolContext {
+    pub fn is_aborted(&self) -> bool {
+        self.abort
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Runtime-less hosts still know built-in and connected MCP schemas.
+    /// Native/JS extensions require the live registry that owns their schemas.
+    pub(crate) fn discovery_capabilities(&self) -> Vec<crate::runtime::RuntimeCapability> {
+        if let Some(runtime) = &self.runtime {
+            runtime.capability_registry.list()
+        } else {
+            crate::runtime::builtin_capabilities()
+                .into_iter()
+                .chain(self.mcp.capabilities())
+                .collect()
+        }
+    }
+}
+
+const DEFAULT_MAX_LINES: usize = 2000;
+const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+const GREP_MAX_LINE_LENGTH: usize = 500;
+const GREP_DEFAULT_LIMIT: usize = 100;
+const FIND_DEFAULT_LIMIT: usize = 1000;
+const LS_DEFAULT_LIMIT: usize = 500;
+const POWERSHELL_UTF8_PREFIX: &str =
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub content: String,
+    pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl ToolResult {
+    pub fn take_updates(details: &mut Option<serde_json::Value>) -> Vec<serde_json::Value> {
+        let Some(Value::Object(map)) = details.as_mut() else {
+            return Vec::new();
+        };
+        match map.remove("_piUpdates") {
+            Some(Value::Array(items)) => items,
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ToolError {
+    #[error("Unknown tool: {0}")]
+    Unknown(String),
+    #[error("{0}")]
+    Failed(String),
+    #[error("{0}")]
+    Durability(String),
+}
+
+pub fn tool_specs() -> Vec<AgentTool> {
+    let mut specs = vec![
+        AgentTool {
+            name: "read".into(),
+            description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["path"]}),
+        },
+        AgentTool {
+            name: "retrieve_context".into(),
+            description: "Retrieve an exact Context VM page or authoritative source by reference. Use query and offset/limit to page large evidence without exposing hidden reasoning.".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "page":{"type":"string"},
+                    "sourceRef":{"type":"string"},
+                    "query":{"type":"string"},
+                    "offset":{"type":"integer","minimum":0},
+                    "limit":{"type":"integer","minimum":0,"maximum":400}
+                },
+                "oneOf":[{"required":["page"]},{"required":["sourceRef"]}]
+            }),
+        },
+        AgentTool {
+            name: "write".into(),
+            description: "Write files (creates/overwrites)".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
+        },
+        AgentTool {
+            name: "edit".into(),
+            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},
+                    "edits":{
+                        "type":"array",
+                        "minItems":1,
+                        "description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally.",
+                        "items":{
+                            "type":"object",
+                            "properties":{
+                                "oldText":{"type":"string"},
+                                "newText":{"type":"string"}
+                            },
+                            "required":["oldText","newText"]
+                        }
+                    }
+                },
+                "required":["path","edits"]
+            }),
+        },
+        AgentTool {
+            name: "bash".into(),
+            description: "Execute bash commands. With background: true the command keeps running while you continue; the call returns a job id at once, job_output reads what it printed, job_kill stops it, and you are told when it finishes. Use background for builds, test suites and servers that take more than a few seconds.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"},"background":{"type":"boolean","description":"Run in the background and return a job id immediately (optional)"}},"required":["command"]}),
+        },
+        AgentTool {
+            name: "powershell".into(),
+            description: "Execute PowerShell commands. With background: true the command runs as a background job (see bash).".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean","description":"Run in the background and return a job id immediately (optional)"}},"required":["command"]}),
+        },
+        AgentTool {
+            name: "grep".into(),
+            description: "Search repository text and return matching file paths, line numbers, and optional context. Respects .gitignore. Use it to locate symbols, strings, config keys, and call sites before opening broader files.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"number"},"limit":{"type":"number"}},"required":["pattern"]}),
+        },
+        AgentTool {
+            name: "find".into(),
+            description: "Search for files by glob pattern relative to the search directory. Respects .gitignore. Use to find file locations without reading contents.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"number"}},"required":["pattern"]}),
+        },
+        AgentTool {
+            name: "ls".into(),
+            description: "List directory contents sorted alphabetically with '/' suffix for directories. Includes dotfiles. Use to inspect folder layout.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"number"}}}),
+        },
+        AgentTool {
+            name: "web_fetch".into(),
+            description: "Fetch a web page or file over http(s) and read it as text. HTML is reduced to its readable content (headings, paragraphs, lists, links as `text (url)`, code blocks); JSON and plain text pass through. Output is truncated to 2000 lines or 50KB. Fetch a search result before quoting it.".into(),
+            parameters: crate::web::fetch_parameters(),
+        },
+        AgentTool {
+            name: "web_search".into(),
+            description: "Search the web. Returns numbered results with title, url and snippet. Follow up with web_fetch on a result to read it.".into(),
+            parameters: crate::web::search_parameters(),
+        },
+        AgentTool {
+            name: "todo".into(),
+            description: "Keep a task list for long work only: four or more distinct steps across several files or commands. Skip it for a one-file fix, a small feature, or read-edit-test work. Send the whole list every time (it replaces the previous one): each item has text and a status of pending, active or done. Update it only when a step changes status, and send the update in the same response as your next real tool call.".into(),
+            parameters: crate::todo::tool_parameters(),
+        },
+        AgentTool {
+            name: "job_output".into(),
+            description: "Read the output of a background job started with bash/powershell background: true. Returns what it has printed so far and whether it is still running; wait blocks up to N seconds for it to exit; tail returns only the last N lines.".into(),
+            parameters: crate::jobs::output_parameters(),
+        },
+        AgentTool {
+            name: "job_kill".into(),
+            description: "Stop a background job and its child processes.".into(),
+            parameters: crate::jobs::kill_parameters(),
+        },
+        AgentTool {
+            name: "notebook_edit".into(),
+            description: "Replace, insert or delete one cell of a Jupyter notebook (.ipynb). Cells are numbered as `read` shows them. To change text inside a cell, `edit` also works on notebooks and matches inside cell sources.".into(),
+            parameters: crate::notebook::tool_parameters(),
+        },
+        AgentTool {
+            name: "mcp_read".into(),
+            description: "Read a resource from a connected MCP server. Pass { server, uri }.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"server":{"type":"string","description":"MCP server name"},"uri":{"type":"string","description":"Resource URI"}},"required":["server","uri"]}),
+        },
+        AgentTool {
+            name: "agent".into(),
+            description: "Start nested workers or persistent teammates with their own context. Pass a prompt (one worker) for bounded independent research, or tasks: [{prompt, description?, tools?}] for up to 8 workers that run concurrently. Supports custom agent profiles (via `agent`), execution modes (`oneshot`, `background`, `teammate`), model overrides, and isolation.".into(),
+            parameters: crate::subagent::tool_parameters(),
+        },
+        AgentTool {
+            name: "batch".into(),
+            description: crate::batch::batch_description(),
+            parameters: crate::batch::batch_parameters(),
+        },
+        AgentTool {
+            name: "apply_patch".into(),
+            description: "Apply structured multi-file or multi-hunk patches in Codex format (*** Begin Patch ... *** End Patch). Supports Add, Update, and Delete file operations. Prefer edit for small single-file replacements.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "The patch text enclosed in *** Begin Patch and *** End Patch"
+                    }
+                },
+                "required": ["input"]
+            }),
+        },
+        AgentTool {
+            name: "exec_command".into(),
+            description: "Start a bounded shell command using the platform-appropriate shell (PowerShell on Windows, bash/sh on Unix). Supports background execution.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "timeout": { "type": "number", "description": "Timeout in seconds (optional)" },
+                    "background": { "type": "boolean", "description": "Run in background (optional)" }
+                },
+                "required": ["command"]
+            }),
+        },
+        AgentTool {
+            name: "write_stdin".into(),
+            description: "Send input text to an interactive process or background job.".into(),
+            parameters: crate::jobs::stdin_parameters(),
+        },
+        AgentTool {
+            name: "propose_plan".into(),
+            description: "Create or revise the session's structured implementation plan after inspecting repository files. Include source evidence, assumptions, concrete steps, dependencies, and validation. Never edits implementation files or approves itself.".into(),
+            parameters: crate::living_plan::tool_parameters(),
+        },
+        AgentTool {
+            name: "update_plan".into(),
+            description: "Track execution progress using plan:[{step,status}] for long work only: four or more distinct steps. Skip it for small tasks, and send updates in the same response as your next real tool call. This progress ledger never approves a plan or changes permissions; use propose_plan for evidence-backed implementation decisions.".into(),
+            parameters: update_plan_parameters(),
+        },
+        AgentTool {
+            name: "ask_user_question".into(),
+            description: "Ask one material, evidence-backed structured question of the controlling user. The tool carries question content only; answers and host authority are never accepted from model JSON.".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "additionalProperties": false,
+                "properties":{
+                    "id":{"type":"string"},
+                    "kind":{"type":"string","enum":["scope","approach","tradeoff","compatibility","persistence","behavior","verification","other"]},
+                    "title":{"type":"string"},
+                    "question":{"type":"string"},
+                    "materiality":{"type":"string"},
+                    "evidence_refs":{"type":"array","items":{"type":"string"}},
+                    "options":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
+                        "id":{"type":"string"},"label":{"type":"string"},"explanation":{"type":"string"},"recommended":{"type":"boolean"}
+                    },"required":["id","label","explanation"]}},
+                    "allow_custom":{"type":"boolean"},
+                    "custom_only":{"type":"boolean"}
+                },
+                "required":["id","kind","title","question","materiality","evidence_refs","options"]
+            }),
+        },
+        AgentTool {
+            name: "tool_search".into(),
+            description: "Discover deferred tools and namespaces by keyword, exact name, or explicit family. Search results are paginated and only authorized schemas can be activated.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Keyword, exact tool name, or registered family id" },
+                    "mode": { "type": "string", "enum": ["search", "exact", "family"], "description": "Discovery mode; defaults to search" },
+                    "cursor": { "type": "string", "description": "Opaque numeric listing cursor returned by the previous page" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Number of names to display; defaults to 5" }
+                },
+                "required": ["query"]
+            }),
+        },
+        AgentTool {
+            name: "code_definition".into(),
+            description: "Find symbol definition via language server or text search fallback.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "symbol": { "type": "string", "description": "Symbol name for fallback" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_references".into(),
+            description: "Find symbol references across the workspace via language server or text search fallback.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path containing symbol" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "symbol": { "type": "string", "description": "Symbol name to find references for" },
+                    "includeDeclaration": { "type": "boolean", "description": "Include declaration in results" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_outline".into(),
+            description: "Extract symbol outline (functions, classes, types) for a file.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_diagnostics".into(),
+            description: "Retrieve compiler and linter diagnostics for a file from the language server.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_call_hierarchy".into(),
+            description: "Trace incoming or outgoing call hierarchy for a function or method.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "direction": { "type": "string", "enum": ["incoming", "outgoing"], "description": "Call direction (incoming or outgoing)" }
+                },
+                "required": ["path", "line", "character"]
+            }),
+        },
+        AgentTool {
+            name: "code_rename_preview".into(),
+            description: "Generate a preview of a workspace-wide symbol rename operation.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "newName": { "type": "string", "description": "Proposed new symbol name" }
+                },
+                "required": ["path", "line", "character", "newName"]
+            }),
+        },
+    ];
+    if team_tools_enabled() {
+        specs.extend(crate::runtime::agent_tool_specs());
+        specs.extend(crate::runtime::task_tool_specs());
+    }
+    if workflow_tools_enabled() {
+        specs.extend(crate::runtime::workflow_tool_specs());
+    }
+    specs.extend(crate::process_manager::tool_specs());
+    specs.extend(crate::runtime::transactions::tool_specs());
+    specs
+}
+
+pub fn validate_builtin_tool_descriptions(specs: &[AgentTool]) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    for tool in specs {
+        if tool.description.trim().is_empty() {
+            errors.push(format!("Tool '{}' has an empty description", tool.name));
+            continue;
+        }
+        if tool.description.len() > 700 {
+            errors.push(format!(
+                "Tool '{}' description exceeds 700 characters (length: {})",
+                tool.name,
+                tool.description.len()
+            ));
+        }
+        let lower = tool.description.to_lowercase();
+        if lower.contains("unrestricted") || lower.contains("bypass permission") {
+            errors.push(format!(
+                "Tool '{}' claims authority that contradicts permission engine",
+                tool.name
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+pub fn execute_tool(
+    cwd: &Path,
+    name: &str,
+    input: &serde_json::Value,
+) -> Result<ToolResult, ToolError> {
+    execute_tool_with(cwd, name, input, &ToolContext::default())
+}
+
+/// Run a built-in tool with the shared state of the run: background jobs
+/// and the todo ledger. `execute_tool` runs with fresh, throw-away state.
+pub fn execute_tool_with(
+    cwd: &Path,
+    name: &str,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    match name {
+        transaction if crate::runtime::transactions::is_tool(transaction) => {
+            crate::runtime::transactions::execute(cwd, transaction, input, context)
+        }
+        process if is_managed_process_tool(process) => {
+            if let Some(coordinator) = &context.task_coordinator {
+                return coordinator.call_with_timeout(process, input, context.abort.as_deref(), std::time::Duration::from_secs(15));
+            }
+            let manager = context.processes.as_ref().ok_or_else(|| ToolError::Failed("Managed processes are disabled or unavailable in this host".into()))?;
+            let contract = context.active_contract.lock().unwrap_or_else(|e| e.into_inner());
+            let provenance = crate::jobs::managed::Provenance {
+                session_id: context.runtime.as_ref().and_then(|runtime| runtime.session_id.clone()),
+                agent_id: context.runtime.as_ref().map(|runtime| runtime.agent_id),
+                task_id: contract.as_ref().map(|contract| contract.task_id),
+                graph_node: None,
+            };
+            drop(contract);
+            manager.clone().with_provenance(provenance)
+                .execute_with_operation(
+                    cwd,
+                    process,
+                    input,
+                    context.abort.as_deref(),
+                    context.dispatch_permit.as_deref(),
+                    context.process_operation_binding.as_ref(),
+                )
+                .map_err(ToolError::Failed)
+        }
+        "read" => read_tool_cached(cwd, input, context),
+        "retrieve_context" => crate::runtime::context_vm::retrieve_context_tool(input, context),
+        "write" => write_tool(cwd, input, context),
+        "edit" => edit_tool(cwd, input, context),
+        "apply_patch" => apply_patch_tool(cwd, input, context),
+        "exec_command" => exec_command_tool(cwd, input, context),
+        "write_stdin" => write_stdin_tool(input, context),
+        "bash" => shell_tool(cwd, input, context),
+        "powershell" => powershell_tool(cwd, input, context),
+        "ls" => ls_tool(cwd, input),
+        "grep" => grep_tool(cwd, input, context),
+        "find" => find_tool(cwd, input),
+        "web_fetch" => crate::web::fetch_tool(input).map_err(ToolError::Failed),
+        "web_search" => crate::web::search_tool(input).map_err(ToolError::Failed),
+        "todo" => todo_tool(input, context),
+        "update_plan" => update_plan_tool(input, context),
+        "propose_plan" => {
+            let mut plan = context.living_plan.lock().unwrap_or_else(|e| e.into_inner());
+            plan.update(input, cwd).map_err(ToolError::Failed)?;
+            *context.todos.lock().unwrap_or_else(|e| e.into_inner()) = TodoList {
+                items: plan.steps.iter().map(|step| crate::TodoItem {
+                    text: format!("[{}] {}", step.id, step.change),
+                    status: crate::TodoStatus::Pending,
+                }).collect(),
+            };
+            Ok(ToolResult {
+                content: plan.render(),
+                is_error: false,
+                details: Some(serde_json::json!({"revision": plan.revision, "changes": plan.changes})),
+            })
+        },
+        "ask_user_question" => ask_user_question_tool(cwd, input, context),
+        "tool_search" => tool_search_tool(input, context),
+        "job_output" => crate::jobs::output_tool(&context.jobs, input, context.abort.as_deref())
+            .map_err(ToolError::Failed),
+        "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
+        "notebook_edit" => notebook_edit_tool(cwd, input, context),
+        "mcp_read" => mcp_read_tool(input, context),
+        "agent_status" | "agent_message" | "agent_stop"
+            if !team_tools_enabled() =>
+        {
+            Err(ToolError::Failed(
+                "Team coordination tools are disabled; set DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 to enable".into(),
+            ))
+        }
+        "task_create" | "task_update" | "task_list" | "task_get"
+            if !team_tools_enabled() && context.task_coordinator.is_none() =>
+        {
+            Err(ToolError::Failed(
+                "Team coordination tools are disabled; set DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 to enable".into(),
+            ))
+        }
+        "agent_status" => crate::runtime::agent_status_tool(input, context),
+        "agent_message" => crate::runtime::agent_message_tool(input, context),
+        "agent_stop" => crate::runtime::agent_stop_tool(input, context),
+        "task_create" => crate::runtime::task_create_tool(input, context),
+        "task_update" => crate::runtime::task_update_tool(input, context),
+        "task_list" => crate::runtime::task_list_tool(input, context),
+        "task_get" => crate::runtime::task_get_tool(input, context),
+        "workflow_run" | "workflow_status"
+            if !workflow_tools_enabled() =>
+        {
+            Err(ToolError::Failed(
+                "Workflow coordination tools are disabled; set DAVINCI_EXPERIMENTAL_WORKFLOWS=1 to enable".into(),
+            ))
+        }
+        "workflow_run" => crate::runtime::workflow_run_tool(cwd, input, context),
+        "workflow_status" => crate::runtime::workflow_status_tool(input, context),
+        "code_definition" => code_definition_tool(cwd, input, context),
+        "code_references" => code_references_tool(cwd, input, context),
+        "code_outline" => code_outline_tool(cwd, input, context),
+        "code_diagnostics" => code_diagnostics_tool(cwd, input, context),
+        "code_call_hierarchy" => code_call_hierarchy_tool(cwd, input, context),
+        "code_rename_preview" => code_rename_preview_tool(cwd, input, context),
+        other if other.starts_with("mcp__") => mcp_call_tool(other, input, context),
+        other => Err(ToolError::Unknown(other.to_string())),
+    }
+}
+
+fn apply_patch_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let patch = input
+        .get("input")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Failed("Missing `input` argument for apply_patch".into()))?;
+    let transaction = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
+    let result = (|| {
+        let (changes, message) = crate::apply_patch::prepare_patch(cwd, patch, |path| {
+            transaction.snapshot(path).map_err(|e| e.to_string())
+        })?;
+        let summary = transaction.apply(changes).map_err(|e| e.to_string())?;
+        Ok::<_, String>((message, summary))
+    })();
+    match result {
+        Ok((msg, transaction)) => Ok(ToolResult {
+            content: msg,
+            is_error: false,
+            details: Some(serde_json::json!({"transaction":transaction})),
+        }),
+        Err(err) => Ok(ToolResult {
+            content: err,
+            is_error: true,
+            details: None,
+        }),
+    }
+}
+
+fn exec_command_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if cfg!(windows) {
+        powershell_tool(cwd, input, context)
+    } else {
+        shell_tool(cwd, input, context)
+    }
+}
+
+fn write_stdin_tool(
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    match crate::jobs::stdin_tool(&context.jobs, input) {
+        Ok(result) => Ok(result),
+        Err(err) => Ok(ToolResult {
+            content: err,
+            is_error: true,
+            details: None,
+        }),
+    }
+}
+
+fn wait_for_decision_host(
+    responder: DecisionResponder,
+    request: DecisionHostRequest,
+    context: &ToolContext,
+) -> DecisionHostResponse {
+    use std::sync::mpsc::RecvTimeoutError;
+    const DEFAULT_DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+    let deadline = context.decision_timeout.unwrap_or(DEFAULT_DECISION_TIMEOUT);
+    let started = std::time::Instant::now();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(responder.respond(request));
+    });
+    loop {
+        if context.is_aborted() {
+            return DecisionHostResponse::Cancelled;
+        }
+        if started.elapsed() >= deadline {
+            return DecisionHostResponse::Timeout;
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        match receiver.recv_timeout(POLL.min(remaining)) {
+            Ok(response) => return response,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return DecisionHostResponse::Unavailable,
+        }
+    }
+}
+
+fn ask_user_question_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let raw: crate::decisions::DecisionQuestionInput = serde_json::from_value(input.clone())
+        .map_err(|error| ToolError::Failed(format!("Invalid structured question: {error}")))?;
+    let snapshot = context
+        .living_plan
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let question = crate::decisions::validate_question_for_plan(raw, &snapshot, cwd)
+        .map_err(ToolError::Failed)?;
+
+    let Some(responder) = &context.decision_responder else {
+        return Ok(ToolResult {
+            content: decision_wait(false, false, false).into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(false, false, false),
+                "question": question,
+                "interactive": false
+            })),
+        });
+    };
+    if context.is_aborted() {
+        return Ok(ToolResult {
+            content: decision_wait(true, false, true).into(),
+            is_error: true,
+            details: Some(serde_json::json!({"status": decision_wait(true, false, true)})),
+        });
+    }
+
+    {
+        let mut slot = context
+            .decision_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = slot.as_ref() {
+            return Ok(ToolResult {
+                content: format!(
+                    "{}: another question is already pending ({active})",
+                    decision_wait(false, false, false)
+                ),
+                is_error: true,
+                details: Some(serde_json::json!({
+                    "status": decision_wait(false, false, false),
+                    "pending_decision_id":active,
+                    "question":question
+                })),
+            });
+        }
+        *slot = Some(question.id.clone());
+    }
+
+    struct SlotGuard<'a>(&'a Arc<Mutex<Option<String>>>);
+    impl Drop for SlotGuard<'_> {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+    let _slot_guard = SlotGuard(&context.decision_slot);
+    let wait_started = std::time::Instant::now();
+    let response = wait_for_decision_host(
+        responder.clone(),
+        DecisionHostRequest {
+            question: question.clone(),
+        },
+        context,
+    );
+    let elapsed_ms = wait_started.elapsed().as_millis() as u64;
+
+    match response {
+        DecisionHostResponse::Cancelled => Ok(ToolResult {
+            content: decision_wait(true, false, true).into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(true, false, true),
+                "question":question,
+                "elapsed_ms":elapsed_ms
+            })),
+        }),
+        DecisionHostResponse::Unavailable => Ok(ToolResult {
+            content: decision_wait(false, false, false).into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(false, false, false),
+                "question":question,
+                "interactive":false,
+                "elapsed_ms":elapsed_ms
+            })),
+        }),
+        DecisionHostResponse::Timeout => Ok(ToolResult {
+            content: format!(
+                "{}: timed out waiting for user",
+                decision_wait(false, false, false)
+            ),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(false, false, false),
+                "reason":"timeout",
+                "question":question,
+                "elapsed_ms":elapsed_ms
+            })),
+        }),
+        DecisionHostResponse::Reply(reply) => {
+            let mut pending = snapshot.clone();
+            pending
+                .structured_decisions
+                .insert(question.id.clone(), question.clone());
+            let host_reply = crate::decisions::HostDecisionReply {
+                decision_id: question.id.clone(),
+                expected_plan_revision: snapshot.revision,
+                expected_question_revision: question.plan_revision,
+                host_event_id: reply.host_event_id,
+                answered_at_ms: reply.answered_at_ms,
+                action: reply.action,
+            };
+            let (next, _) = crate::decisions::apply_host_decision(&pending, &host_reply, cwd)
+                .map_err(ToolError::Failed)?;
+            let state = next
+                .structured_decisions
+                .get(&question.id)
+                .map(|decision| format!("{:?}", decision.state).to_ascii_lowercase())
+                .unwrap_or_else(|| "unknown".into());
+            *context
+                .living_plan
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = next.clone();
+            Ok(ToolResult {
+                content: state.clone(),
+                is_error: false,
+                details: Some(serde_json::json!({
+                    "status":state,
+                    "decision_id":question.id,
+                    "revision":next.revision,
+                    "elapsed_ms":elapsed_ms
+                })),
+            })
+        }
+    }
+}
+
+const TOOL_SEARCH_DEFAULT_LIMIT: usize = 5;
+const TOOL_SEARCH_MAX_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSearchMode {
+    Search,
+    Exact,
+    Family,
+}
+
+impl ToolSearchMode {
+    fn parse(value: Option<&str>) -> Result<Self, ToolError> {
+        match value.unwrap_or("search") {
+            "search" => Ok(Self::Search),
+            "exact" => Ok(Self::Exact),
+            "family" => Ok(Self::Family),
+            other => Err(ToolError::Failed(format!(
+                "unsupported tool_search mode `{other}`; expected search, exact, or family"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Exact => "exact",
+            Self::Family => "family",
+        }
+    }
+}
+
+fn tool_search_usize(input: &Value, key: &str, default: usize) -> Result<usize, ToolError> {
+    let Some(value) = input.get(key) else {
+        return Ok(default);
+    };
+    if let Some(number) = value.as_u64() {
+        return usize::try_from(number)
+            .map_err(|_| ToolError::Failed(format!("tool_search {key} is too large")));
+    }
+    if value.is_null() {
+        return Ok(default);
+    }
+    let text = value
+        .as_str()
+        .ok_or_else(|| {
+            ToolError::Failed(format!("tool_search {key} must be a non-negative integer"))
+        })?
+        .trim();
+    // The cursor is a string in the schema, so a first page arrives as "".
+    if text.is_empty() {
+        return Ok(default);
+    }
+    text.parse::<usize>()
+        .map_err(|_| ToolError::Failed(format!("tool_search {key} must be a non-negative integer")))
+}
+
+fn tool_search_tool(
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mode = ToolSearchMode::parse(input.get("mode").and_then(Value::as_str))?;
+    if query.is_empty() && !matches!(mode, ToolSearchMode::Search) {
+        return Err(ToolError::Failed(format!(
+            "tool_search {} mode requires a non-empty query",
+            mode.as_str()
+        )));
+    }
+    let requested_limit = tool_search_usize(input, "limit", TOOL_SEARCH_DEFAULT_LIMIT)?;
+    let limit = requested_limit.clamp(1, TOOL_SEARCH_MAX_LIMIT);
+    let cursor = tool_search_usize(input, "cursor", 0)?;
+    let authorized = context
+        .authorized_tools
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut candidates = context
+        .discovery_capabilities()
+        .into_iter()
+        .map(|capability| (capability.name.clone(), capability))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates.dedup_by(|left, right| left.0 == right.0);
+
+    let query_lower = query.to_lowercase();
+    let matching = candidates
+        .iter()
+        .filter(|(name, _capability)| authorized.contains(name))
+        .filter(|(name, capability)| match mode {
+            ToolSearchMode::Search => {
+                query_lower.is_empty()
+                    || format!(
+                        "{} {} {} {}",
+                        capability.name,
+                        capability.description,
+                        capability.source,
+                        capability.family.as_deref().unwrap_or_default(),
+                    )
+                    .to_lowercase()
+                    .contains(&query_lower)
+                    || name.to_lowercase().contains(&query_lower)
+            }
+            ToolSearchMode::Exact => name == &query,
+            ToolSearchMode::Family => capability.family.as_deref() == Some(query.as_str()),
+        })
+        .collect::<Vec<_>>();
+    let total_matches = matching.len();
+    let display_start = cursor.min(total_matches);
+    let display_end = display_start.saturating_add(limit).min(total_matches);
+    let display = &matching[display_start..display_end];
+    let activation_candidates = if matches!(mode, ToolSearchMode::Family) {
+        &matching[..]
+    } else {
+        display
+    };
+    let mut exposure = context
+        .tool_exposure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut activated = Vec::new();
+    for (name, capability) in activation_candidates {
+        if capability.schema.is_some() {
+            // The candidate list was authorized above.  Keep the activation
+            // idempotent while reporting all schema-bearing members selected
+            // by this request, including on a repeated family lookup.
+            exposure.activate_authorized(name, true);
+            activated.push(name.clone());
+        }
+    }
+    let next_cursor = (display_end < total_matches).then(|| display_end.to_string());
+    let matches = display
+        .iter()
+        .map(|(name, _)| (*name).clone())
+        .collect::<Vec<_>>();
+    let families = display
+        .iter()
+        .filter_map(|(name, capability)| {
+            capability
+                .family
+                .as_ref()
+                .map(|family| ((*name).clone(), family.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let content = if matches.is_empty() {
+        format!("No tools found matching query `{query}`")
+    } else {
+        let labels = display
+            .iter()
+            .map(|(name, capability)| {
+                let mut label = (*name).clone();
+                if let Some(family) = &capability.family {
+                    label.push_str(&format!(" (family: {family})"));
+                }
+                if capability.schema.is_none() {
+                    label.push_str(" [schema unavailable]");
+                }
+                label
+            })
+            .collect::<Vec<_>>();
+        let suffix = next_cursor
+            .as_deref()
+            .map(|cursor| format!("; more available at cursor {cursor}"))
+            .unwrap_or_default();
+        format!(
+            "Found {total_matches} tools; activated {} schemas: {}{suffix}",
+            activated.len(),
+            labels.join(", ")
+        )
+    };
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::json!({
+            "mode": mode.as_str(),
+            "query": query,
+            "matches": matches,
+            "families": families,
+            "activated": activated,
+            "matching_count": total_matches,
+            "activated_count": activated.len(),
+            "cursor": cursor.to_string(),
+            "next_cursor": next_cursor,
+            "limit": limit,
+        })),
+    })
+}
+
+fn mcp_read_tool(
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let server = required_str(input, "server")?;
+    let uri = required_str(input, "uri")?;
+    context.mcp.read(server, uri)
+}
+
+fn mcp_call_tool(
+    name: &str,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    context.mcp.call_exposed(name, input)
+}
+
+fn update_plan_parameters() -> Value {
+    let mut schema = crate::todo::tool_parameters();
+    schema
+        .as_object_mut()
+        .expect("todo schema is an object")
+        .remove("required");
+    schema["properties"]["plan"] = serde_json::json!({
+        "type":"array", "items":{"type":"object", "properties":{
+            "step":{"type":"string"}, "status":{"type":"string"}
+        }, "required":["step","status"]}
+    });
+    schema["properties"]["explanation"] = serde_json::json!({"type":"string"});
+    schema["anyOf"] = serde_json::json!([{"required":["items"]},{"required":["plan"]}]);
+    schema
+}
+
+fn update_plan_tool(input: &Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    let Some(steps) = input.get("plan") else {
+        return todo_tool(input, context);
+    };
+    if input.get("items").is_some() {
+        return Err(ToolError::Failed(
+            "Use either plan or items, not both.".into(),
+        ));
+    }
+    let steps = steps
+        .as_array()
+        .ok_or_else(|| ToolError::Failed("plan must be an array.".into()))?;
+    let items: Vec<Value> = steps
+        .iter()
+        .map(|step| {
+            let mut item = step.clone();
+            if let Some(text) = step.get("step") {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("text".into(), text.clone());
+                }
+            }
+            item
+        })
+        .collect();
+    todo_tool(&serde_json::json!({"items":items}), context)
+}
+
+/// `todo { items }`: the list is replaced whole and echoed back rendered.
+fn todo_tool(input: &serde_json::Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    let list = TodoList::from_args(input).map_err(ToolError::Failed)?;
+    let content = list.render();
+    let details = serde_json::json!({
+        "items": list.items,
+        "done": list.done(),
+        "total": list.items.len(),
+        "summary": list.summary(),
+    });
+    *context.todos.lock().unwrap_or_else(|err| err.into_inner()) = list;
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(details),
+    })
+}
+
+fn read_tool_cached(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    use crate::runtime::cache::*;
+    if !context.cache.config().enabled {
+        return read_tool(cwd, input);
+    }
+    let path = resolve(cwd, required_str(input, "path")?)?;
+    let root = match cwd.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return read_tool(cwd, input),
+    };
+    let absolute = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return read_tool(cwd, input),
+    };
+    let Ok(relative) = absolute.strip_prefix(&root) else {
+        return read_tool(cwd, input);
+    };
+    // The agent's permission gate executes before this dispatch on every call.
+    // A fresh confined read additionally proves that cached bytes cannot grant file access.
+    let snapshot = match context
+        .cache
+        .read_current_file(&root, relative, DEFAULT_MAX_BYTES, || Ok(()))
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => return read_tool(cwd, input),
+    };
+    if detect_image_mime(&path, &snapshot.bytes[..snapshot.bytes.len().min(12)]).is_some()
+        || crate::notebook::is_notebook_path(&path)
+    {
+        return read_tool(cwd, input);
+    }
+    let offset = input
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(DEFAULT_MAX_LINES);
+    let key = CacheKey::new(
+        CacheNamespace::File,
+        format!("text-window:{offset}:{limit}"),
+        1,
+        "read-window-v1",
+        vec![CacheDependency::ContentHash(snapshot.content_hash.clone())],
+    );
+    let window = context.cache.get_or_compute(
+        &CacheRequest::new(key, CachePolicy::MemoryOnly),
+        || Ok(()),
+        None,
+        || {
+            read_text_window_from(
+                std::io::Cursor::new(&snapshot.bytes),
+                offset,
+                limit,
+                DEFAULT_MAX_BYTES,
+            )
+            .map_err(|e| CacheError::Compute(e.to_string()))
+        },
+    );
+    let Ok(window) = window else {
+        return read_tool(cwd, input);
+    };
+    // Only line/byte counts are eligible for disk; no source or tool output is serialized.
+    let counts_key = CacheKey::new(
+        CacheNamespace::File,
+        "text-counts",
+        1,
+        "lossy-utf8-lines-v1",
+        vec![CacheDependency::ContentHash(snapshot.content_hash)],
+    );
+    let counts = context.cache.get_or_compute(
+        &CacheRequest::new(counts_key, CachePolicy::PersistentImmutable),
+        || Ok(()),
+        None,
+        || {
+            let text = String::from_utf8_lossy(&snapshot.bytes);
+            let lines = if text.is_empty() {
+                0
+            } else {
+                text.split('\n')
+                    .count()
+                    .saturating_sub(usize::from(text.ends_with('\n')))
+            };
+            Ok((lines, text.len()))
+        },
+    );
+    let Ok(counts) = counts else {
+        return read_tool(cwd, input);
+    };
+    let truncated_by = if window.truncated {
+        Some(if window.lines_returned >= limit {
+            "lines"
+        } else {
+            "bytes"
+        })
+    } else {
+        None
+    };
+    Ok(ToolResult {
+        content: window.content.clone(),
+        is_error: false,
+        details: Some(serde_json::json!({
+            "path":path, "truncation": {
+                "truncated":window.truncated, "truncatedBy":truncated_by, "firstLine":window.first_line,
+                "totalLines":counts.0, "totalBytes":counts.1, "outputLines":window.lines_returned,
+                "outputBytes":window.content.len(), "maxLines":limit, "maxBytes":DEFAULT_MAX_BYTES
+            }
+        })),
+    })
+}
+
+/// Files a missing-path suggestion scans at most, and how many it names.
+const MISSING_FILE_SCAN_LIMIT: usize = 2_000;
+const MISSING_FILE_SUGGESTIONS: usize = 5;
+
+/// The error for a `read` of a path that does not exist: the path as the
+/// model wrote it plus the closest workspace files, so a wrong guess costs
+/// one call instead of a find/ls detour. The bare OS text ("The system
+/// cannot find the file specified. (os error 2)") named neither. Davinci
+/// divergence from TS read.ts, which surfaces the raw ENOENT.
+fn missing_file_message(cwd: &Path, raw_path: &str, path: &Path) -> String {
+    let wanted = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let wanted_lower = wanted.to_lowercase();
+    let wanted_stem = Path::new(&wanted_lower)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut scored: Vec<(u8, String)> = Vec::new();
+    let mut scanned = 0;
+    if !wanted.is_empty() {
+        walk_workspace_files(cwd, MISSING_FILE_SCAN_LIMIT, &mut |file| {
+            scanned += 1;
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let lower = name.to_lowercase();
+            let stem = Path::new(&lower)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let score = if name == wanted {
+                Some(0)
+            } else if lower == wanted_lower {
+                Some(1)
+            } else if !wanted_stem.is_empty() && stem == wanted_stem {
+                Some(2)
+            } else if wanted_stem.len() >= 3
+                && (lower.contains(&wanted_stem)
+                    || (stem.len() >= 3 && wanted_lower.contains(&stem)))
+            {
+                Some(3)
+            } else {
+                None
+            };
+            if let Some(score) = score {
+                scored.push((score, relativize_find_result_path(file, cwd)));
+            }
+            scanned < MISSING_FILE_SCAN_LIMIT
+        });
+    }
+    scored.sort();
+    scored.dedup();
+    let names: Vec<String> = scored
+        .into_iter()
+        .take(MISSING_FILE_SUGGESTIONS)
+        .map(|(_, name)| name)
+        .collect();
+    if names.is_empty() {
+        format!("File not found: {raw_path}. No similar files in the workspace.")
+    } else {
+        format!(
+            "File not found: {raw_path}. Closest matches: {}",
+            names.join(", ")
+        )
+    }
+}
+
+fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+    let mut prefix_file = fs::File::open(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ToolError::Failed(missing_file_message(cwd, raw_path, &path))
+        } else {
+            ToolError::Failed(err.to_string())
+        }
+    })?;
+    let mut prefix = [0_u8; 12];
+    let prefix_len = prefix_file
+        .read(&mut prefix)
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    if let Some(mime) = detect_image_mime(&path, &prefix[..prefix_len]) {
+        let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+        return read_image(&path, &bytes, mime);
+    }
+    let mut content = String::new();
+    let mut notebook = None;
+    let is_notebook = crate::notebook::is_notebook_path(&path);
+    if is_notebook {
+        let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+        content = String::from_utf8_lossy(&bytes).into_owned();
+        if let Some(parsed) = crate::notebook::parse(&content) {
+            content = crate::notebook::render(&parsed);
+            notebook = Some(serde_json::json!({
+                "cells": parsed.get("cells").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                "language": crate::notebook::language(&parsed),
+            }));
+        }
+    }
+    let offset = input
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize);
+    let limit = limit.unwrap_or(DEFAULT_MAX_LINES);
+    if is_notebook {
+        let (content, truncation) = truncate_read(&content, offset, Some(limit));
+        let mut details = serde_json::json!({"path": path, "truncation": truncation});
+        if let Some(notebook) = notebook {
+            details["notebook"] = notebook;
+        }
+        return Ok(ToolResult {
+            content,
+            is_error: false,
+            details: Some(details),
+        });
+    }
+
+    let window = read_text_window(&path, offset, limit, DEFAULT_MAX_BYTES)?;
+    let truncated_by = if window.truncated {
+        if window.lines_returned >= limit {
+            Some("lines")
+        } else {
+            Some("bytes")
+        }
+    } else {
+        None
+    };
+    let (total_lines, total_bytes) = match small_text_totals(&path)? {
+        Some((lines, bytes)) => (Some(lines), Some(bytes)),
+        None => (None, None),
+    };
+    let truncation = serde_json::json!({
+        "truncated": window.truncated,
+        "truncatedBy": truncated_by,
+        "firstLine": window.first_line,
+        "totalLines": total_lines,
+        "totalBytes": total_bytes,
+        "outputLines": window.lines_returned,
+        "outputBytes": window.content.len(),
+        "maxLines": limit,
+        "maxBytes": DEFAULT_MAX_BYTES,
+    });
+    Ok(ToolResult {
+        content: window.content,
+        is_error: false,
+        details: Some(serde_json::json!({"path": path, "truncation": truncation})),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TextWindow {
+    content: String,
+    first_line: usize,
+    lines_returned: usize,
+    truncated: bool,
+}
+
+struct RawLine {
+    bytes: Vec<u8>,
+    too_long: bool,
+}
+
+fn read_raw_line(
+    reader: &mut BufReader<impl Read>,
+    capture: bool,
+    max_bytes: Option<usize>,
+) -> Result<Option<RawLine>, ToolError> {
+    let mut bytes = Vec::new();
+    let mut saw_any = false;
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        if buffer.is_empty() {
+            return Ok(saw_any.then_some(RawLine {
+                bytes,
+                too_long: false,
+            }));
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(buffer.len());
+        if capture {
+            if max_bytes.is_some_and(|max| bytes.len().saturating_add(content_len) > max) {
+                return Ok(Some(RawLine {
+                    bytes: Vec::new(),
+                    too_long: true,
+                }));
+            }
+            bytes.extend_from_slice(&buffer[..content_len]);
+        }
+
+        let consume_len = newline.map_or(buffer.len(), |index| index + 1);
+        reader.consume(consume_len);
+        saw_any = true;
+        if newline.is_some() {
+            return Ok(Some(RawLine {
+                bytes,
+                too_long: false,
+            }));
+        }
+    }
+}
+
+fn read_text_window(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<TextWindow, ToolError> {
+    let file = fs::File::open(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    read_text_window_from(file, offset, limit, max_bytes)
+}
+
+fn read_text_window_from(
+    file: impl Read,
+    offset: usize,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<TextWindow, ToolError> {
+    let mut reader = BufReader::new(file);
+    let first_line = offset.max(1);
+
+    for _ in 1..first_line {
+        if read_raw_line(&mut reader, false, None)?.is_none() {
+            return Ok(TextWindow {
+                content: String::new(),
+                first_line,
+                lines_returned: 0,
+                truncated: false,
+            });
+        }
+    }
+
+    let mut content = String::new();
+    let mut lines_returned = 0;
+    let mut truncated = false;
+    while lines_returned < limit {
+        let separator_bytes = usize::from(lines_returned > 0);
+        let remaining_bytes = max_bytes.saturating_sub(content.len() + separator_bytes);
+        let Some(line) = read_raw_line(&mut reader, true, Some(remaining_bytes))? else {
+            break;
+        };
+        if line.too_long {
+            truncated = true;
+            break;
+        }
+
+        let line = String::from_utf8_lossy(&line.bytes).into_owned();
+        if content.len() + separator_bytes + line.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        if lines_returned > 0 {
+            content.push('\n');
+        }
+        content.push_str(&line);
+        lines_returned += 1;
+    }
+
+    if !truncated && lines_returned >= limit {
+        truncated = read_raw_line(&mut reader, false, None)?.is_some();
+    }
+
+    Ok(TextWindow {
+        content,
+        first_line,
+        lines_returned,
+        truncated,
+    })
+}
+
+fn small_text_totals(path: &Path) -> Result<Option<(usize, usize)>, ToolError> {
+    let metadata = fs::metadata(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    if metadata.len() > DEFAULT_MAX_BYTES as u64 {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let content = String::from_utf8_lossy(&bytes);
+    let total_lines = if content.is_empty() {
+        0
+    } else {
+        let mut lines = content.split('\n').count();
+        if content.ends_with('\n') {
+            lines = lines.saturating_sub(1);
+        }
+        lines
+    };
+    Ok(Some((total_lines, content.len())))
+}
+
+fn read_image(path: &Path, bytes: &[u8], mime: &str) -> Result<ToolResult, ToolError> {
+    match process_image(bytes, mime) {
+        Ok(processed) => {
+            let mut note = format!("Read image file [{}]", processed.mime_type);
+            for hint in &processed.hints {
+                note.push('\n');
+                note.push_str(hint);
+            }
+            Ok(ToolResult {
+                content: note,
+                is_error: false,
+                details: Some(serde_json::json!({
+                    "path": path,
+                    "image": {
+                        "type": "image",
+                        "data": processed.data,
+                        "mimeType": processed.mime_type,
+                    }
+                })),
+            })
+        }
+        Err(message) => Ok(ToolResult {
+            content: format!("Read image file [{mime}]\n{message}"),
+            is_error: true,
+            details: Some(serde_json::json!({"path": path})),
+        }),
+    }
+}
+
+struct ProcessedImage {
+    data: String,
+    mime_type: String,
+    hints: Vec<String>,
+}
+
+fn process_image(bytes: &[u8], mime: &str) -> Result<ProcessedImage, String> {
+    let normalized = match mime {
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => mime.to_string(),
+        _ => {
+            let png = image::load_from_memory(bytes)
+                .map_err(|err| format!("Unsupported image type: {err}"))?;
+            let mut out = Vec::new();
+            png.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .map_err(|err| err.to_string())?;
+            return Ok(ProcessedImage {
+                data: base64::engine::general_purpose::STANDARD.encode(&out),
+                mime_type: "image/png".into(),
+                hints: vec![format!("[Image converted from {mime} to image/png.]")],
+            });
+        }
+    };
+    Ok(ProcessedImage {
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        mime_type: normalized,
+        hints: Vec::new(),
+    })
+}
+
+fn detect_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn write_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let path = resolve_for_mutation(cwd, required_str(input, "path")?)?;
+    crate::file_mutation_queue::with_file_mutation_queue(&path, || {
+        let manager = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
+        let snapshot = manager.snapshot(&path)?;
+        let created = snapshot.bytes().is_none();
+        let content = required_str(input, "content")?;
+        // The change is what the transcript shows, so the previous content
+        // is read before it is gone; a fresh file diffs against nothing.
+        let previous = snapshot.text().unwrap_or_default().to_owned();
+        let transaction =
+            manager.apply(vec![snapshot.change(Some(content.as_bytes().to_vec()))])?;
+        let (diff, first_changed_line) = crate::edit_diff::generate_diff_string(
+            &crate::edit_diff::normalize_to_lf(&previous),
+            &crate::edit_diff::normalize_to_lf(content),
+            4,
+        );
+        Ok(ToolResult {
+            content: format!("Wrote {}", path.display()),
+            is_error: false,
+            details: Some(serde_json::json!({
+                "path": path,
+                "diff": diff,
+                "firstChangedLine": first_changed_line,
+                "created": created,
+                "transaction":transaction,
+            })),
+        })
+    })
+}
+
+fn edit_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let (display_path, edits) =
+        crate::edit_diff::prepare_edit_arguments(input).map_err(ToolError::Failed)?;
+    let path = resolve_for_mutation(cwd, &display_path)?;
+    let manager = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
+    crate::file_mutation_queue::with_file_mutation_queue(&path, || {
+        if crate::notebook::is_notebook_path(&path) {
+            if let Some(result) = notebook_edit_locked(&path, &display_path, &edits, &manager)? {
+                return Ok(result);
+            }
+        }
+        edit_tool_locked(&path, &display_path, &edits, &manager)
+    })
+}
+
+/// `edit` on a notebook: the replacements land inside cell sources. `None`
+/// when the file is not notebook JSON, so it is edited as text.
+fn notebook_edit_locked(
+    path: &Path,
+    display_path: &str,
+    edits: &[crate::edit_diff::Edit],
+    manager: &crate::runtime::transactions::tools::ToolTransaction<'_>,
+) -> Result<Option<ToolResult>, ToolError> {
+    let snapshot = manager.snapshot(path)?;
+    let raw = snapshot.text().map_err(ToolError::Failed)?;
+    let Some(mut notebook) = crate::notebook::parse(raw) else {
+        return Ok(None);
+    };
+    let changes = crate::notebook::edit_in_cells(&mut notebook, edits, display_path)
+        .map_err(ToolError::Failed)?;
+    let text = crate::notebook::serialize(&notebook, crate::notebook::detect_indent(raw));
+    let transaction = manager.apply(vec![snapshot.change(Some(text.into_bytes()))])?;
+    let (diff, first_changed_line) = crate::notebook::changes_diff(&changes);
+    let cells: Vec<usize> = changes.iter().map(|change| change.index + 1).collect();
+    Ok(Some(ToolResult {
+        content: format!(
+            "Edited {display_path} (cell {})",
+            cells
+                .iter()
+                .map(|cell| cell.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        is_error: false,
+        details: Some(serde_json::json!({
+            "path": display_path,
+            "edits": edits.len(),
+            "cells": cells,
+            "diff": diff,
+            "firstChangedLine": first_changed_line,
+            "transaction":transaction,
+        })),
+    }))
+}
+
+/// `notebook_edit { path, cell, mode, source?, cellType? }`.
+fn notebook_edit_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    use crate::notebook::{self, EditMode};
+    let display_path = required_str(input, "path")?.to_string();
+    let path = resolve_for_mutation(cwd, &display_path)?;
+    let cell = input
+        .get("cell")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ToolError::Failed("Missing cell (1-based cell number)".into()))?
+        as usize;
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_str)
+        .and_then(EditMode::parse)
+        .ok_or_else(|| ToolError::Failed("mode must be replace, insert or delete".into()))?;
+    let source = input.get("source").and_then(Value::as_str);
+    let cell_type = notebook::apply_kind(input.get("cellType").and_then(Value::as_str))
+        .map_err(ToolError::Failed)?;
+    crate::file_mutation_queue::with_file_mutation_queue(&path, || {
+        let manager = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
+        let snapshot = manager.snapshot(&path)?;
+        let raw = snapshot.text().map_err(ToolError::Failed)?;
+        let mut parsed = notebook::parse(raw).ok_or_else(|| {
+            ToolError::Failed(format!("{display_path} is not a Jupyter notebook"))
+        })?;
+        let outcome =
+            notebook::structural_edit(&mut parsed, &display_path, cell, mode, source, cell_type)
+                .map_err(ToolError::Failed)?;
+        let text = notebook::serialize(&parsed, notebook::detect_indent(raw));
+        let transaction = manager.apply(vec![snapshot.change(Some(text.into_bytes()))])?;
+        Ok(ToolResult {
+            content: outcome.summary,
+            is_error: false,
+            details: Some(serde_json::json!({
+                "path": display_path,
+                "cell": cell,
+                "mode": input.get("mode").and_then(Value::as_str).unwrap_or("replace").to_ascii_lowercase(),
+                "cells": outcome.cells,
+                "diff": outcome.diff,
+                "transaction":transaction,
+            })),
+        })
+    })
+}
+
+fn edit_tool_locked(
+    path: &Path,
+    display_path: &str,
+    edits: &[crate::edit_diff::Edit],
+    manager: &crate::runtime::transactions::tools::ToolTransaction<'_>,
+) -> Result<ToolResult, ToolError> {
+    let snapshot = manager.snapshot(path)?;
+    let raw = snapshot.text().map_err(ToolError::Failed)?;
+    let (bom, content) = crate::edit_diff::split_bom(raw);
+    let ending = crate::edit_diff::detect_line_ending(content);
+    let normalized = crate::edit_diff::normalize_to_lf(content);
+    let applied =
+        crate::edit_diff::apply_edits_to_normalized_content(&normalized, edits, display_path)
+            .map_err(ToolError::Failed)?;
+    let final_content = format!(
+        "{bom}{}",
+        crate::edit_diff::restore_line_endings(&applied.new_content, ending)
+    );
+    let transaction = manager.apply(vec![snapshot.change(Some(final_content.into_bytes()))])?;
+    let (diff, first_changed_line) =
+        crate::edit_diff::generate_diff_string(&applied.base_content, &applied.new_content, 4);
+    Ok(ToolResult {
+        content: format!("Edited {display_path}"),
+        is_error: false,
+        details: Some(serde_json::json!({
+            "path": display_path,
+            "edits": edits.len(),
+            "tokensBefore": applied.base_content.len(),
+            "diff": diff,
+            "firstChangedLine": first_changed_line,
+            "transaction":transaction,
+        })),
+    })
+}
+
+/// A `timeout` at or above this many "seconds" that is a whole multiple of
+/// 1000 is read as milliseconds. GPT models trained on Codex's millisecond
+/// shell parameters send `120000` or `10000` here; taken as seconds those
+/// are 33 and 2.8 hours. No foreground command is given 10,000+ seconds on
+/// purpose in whole thousands, while 1000-9999 stays seconds because values
+/// such as 1800 or 3600 are plausible. Davinci divergence from TS bash.ts.
+const MILLISECOND_TIMEOUT_THRESHOLD: f64 = 10_000.0;
+
+fn resolve_bash_timeout_ms(input: &serde_json::Value) -> Result<Option<u64>, ToolError> {
+    // Codex spelling, accepted though not advertised so the schema keeps
+    // TS parity.
+    if let Some(value) = input.get("timeout_ms").filter(|value| !value.is_null()) {
+        let millis = value
+            .as_f64()
+            .filter(|millis| millis.is_finite() && *millis > 0.0)
+            .ok_or_else(|| {
+                ToolError::Failed("Invalid timeout_ms: must be a positive number".into())
+            })?;
+        return resolve_bash_timeout_seconds(millis / 1000.0).map(Some);
+    }
+    let Some(value) = input.get("timeout") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let seconds = value.as_f64().ok_or_else(|| {
+        ToolError::Failed("Invalid timeout: must be a finite number of seconds".into())
+    })?;
+    if seconds >= MILLISECOND_TIMEOUT_THRESHOLD && seconds % 1000.0 == 0.0 {
+        return resolve_bash_timeout_seconds(seconds / 1000.0).map(Some);
+    }
+    resolve_bash_timeout_seconds(seconds).map(Some)
+}
+
+/// The seconds shown in "Command timed out after N seconds". The model's own
+/// `timeout` text is kept when it was read as seconds (TS prints it
+/// verbatim, e.g. `0.2`); a value read as milliseconds, or `timeout_ms`,
+/// is shown as the seconds actually applied.
+fn shell_timeout_label(input: &serde_json::Value, timeout_ms: Option<u64>) -> Option<String> {
+    let timeout_ms = timeout_ms?;
+    if let Some(value) = input
+        .get("timeout")
+        .filter(|_| input.get("timeout_ms").is_none())
+    {
+        if value
+            .as_f64()
+            .is_some_and(|seconds| ((seconds * 1000.0) as u64) == timeout_ms)
+        {
+            return Some(match value {
+                serde_json::Value::Number(number) => number.to_string(),
+                other => other.to_string(),
+            });
+        }
+    }
+    let seconds = timeout_ms as f64 / 1000.0;
+    Some(if seconds.fract() == 0.0 {
+        format!("{}", seconds as u64)
+    } else {
+        format!("{seconds}")
+    })
+}
+
+fn resolve_bash_timeout_seconds(seconds: f64) -> Result<u64, ToolError> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(ToolError::Failed(
+            "Invalid timeout: must be a finite number of seconds".into(),
+        ));
+    }
+    let timeout_ms = seconds * 1000.0;
+    const MAX_TIMEOUT_MS: f64 = 2_147_483_647.0;
+    if timeout_ms > MAX_TIMEOUT_MS {
+        return Err(ToolError::Failed(format!(
+            "Invalid timeout: maximum is {} seconds",
+            MAX_TIMEOUT_MS / 1000.0
+        )));
+    }
+    Ok(timeout_ms as u64)
+}
+
+fn wants_background(input: &serde_json::Value) -> bool {
+    input
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn admit_background_operation(
+    context: &ToolContext,
+    shell: &str,
+    command: &str,
+) -> Result<Option<crate::runtime::operations::AgentOperationHandle>, ToolError> {
+    let Some(runtime) = context.runtime.as_ref() else {
+        return Ok(None);
+    };
+    let Some(adapter) = runtime.child_operation_adapter() else {
+        return Ok(None);
+    };
+    let logical_id = context
+        .process_operation_binding
+        .as_ref()
+        .map(|binding| format!("background:{}", binding.operation_id))
+        .or_else(|| {
+            runtime
+                .operations
+                .as_ref()
+                .and_then(|operations| operations.operation_context().wire_tool_call_id.clone())
+                .map(|call_id| format!("background:{call_id}"))
+        })
+        .unwrap_or_else(|| format!("background:{}", uuid::Uuid::now_v7()));
+    let mut child =
+        crate::runtime::operations::ChildExecutionContext::new(logical_id, runtime, None);
+    child.host = "background_job".to_owned();
+    let payload = serde_json::json!({
+        "shell": shell,
+        "command_digest": crate::runtime::operations::PayloadDigest::of_bytes(command.as_bytes()),
+    });
+    adapter
+        .start(
+            crate::runtime::operations::ChildExecutionKind::BackgroundJob,
+            child,
+            payload,
+        )
+        .map(Some)
+        .map_err(|error| {
+            ToolError::Failed(format!("background job was not durably admitted: {error}"))
+        })
+}
+
+fn reject_existing_background_operation(
+    operation: &crate::runtime::operations::AgentOperationHandle,
+) -> Result<Option<ToolResult>, ToolError> {
+    match operation.disposition() {
+        crate::runtime::operations::AgentLaunchDisposition::New => Ok(None),
+        crate::runtime::operations::AgentLaunchDisposition::ExistingResult => operation
+            .replay_result()
+            .map(Some)
+            .map_err(|error| ToolError::Failed(format!("background job replay blocked: {error}"))),
+        crate::runtime::operations::AgentLaunchDisposition::ExistingInFlight => {
+            Err(ToolError::Failed(format!(
+                "background job is already active under operation {}",
+                operation.operation_id()
+            )))
+        }
+    }
+}
+
+/// Spawn the shell with the command, stdout and stderr piped, exactly as a
+/// foreground call would — a background job is the same process, only
+/// nobody waits for it.
+fn spawn_shell(
+    cwd: &Path,
+    command: &str,
+    background: bool,
+) -> Result<std::process::Child, ToolError> {
+    let custom = std::env::var("PI_SHELL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let config = davinci_ai::resolve_shell_config(custom.as_deref()).map_err(ToolError::Failed)?;
+    let mut process = Command::new(&config.shell);
+    process
+        .args(&config.args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    match config.command_transport {
+        davinci_ai::CommandTransport::Argv => {
+            if background {
+                process.arg(command).stdin(std::process::Stdio::piped());
+            } else {
+                process.arg(command).stdin(std::process::Stdio::null());
+            }
+        }
+        davinci_ai::CommandTransport::Stdin => {
+            process.stdin(std::process::Stdio::piped());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own group, so `job_kill` can take the whole tree down.
+        process.process_group(0);
+    }
+    let mut child = process
+        .spawn()
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    if matches!(
+        config.command_transport,
+        davinci_ai::CommandTransport::Stdin
+    ) {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(command.as_bytes())
+                .map_err(|err| ToolError::Failed(err.to_string()))?;
+        }
+    }
+    Ok(child)
+}
+
+/// Resolves the shell for a sandboxed background command; see
+/// [`sandboxed_background`].
+fn sandboxed_background_shell(
+    cwd: &Path,
+    input: &serde_json::Value,
+    command: &str,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let custom = std::env::var("PI_SHELL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let shell = davinci_ai::resolve_shell_config(custom.as_deref()).map_err(ToolError::Failed)?;
+    let mut argv = shell.args;
+    let stdin = match shell.command_transport {
+        davinci_ai::CommandTransport::Argv => {
+            argv.push(command.to_string());
+            None
+        }
+        davinci_ai::CommandTransport::Stdin => Some(command.as_bytes()),
+    };
+    sandboxed_background(
+        cwd,
+        input,
+        ("shell", command),
+        (shell.shell.into(), argv, stdin),
+        context,
+    )
+}
+
+/// A background command under a sandbox policy: launched through the trusted
+/// supervisor with the sandboxed configuration, never as a direct host child,
+/// and registered as a supervised job.
+fn sandboxed_background(
+    cwd: &Path,
+    input: &serde_json::Value,
+    (tool, command): (&str, &str),
+    (executable, argv, stdin): (std::path::PathBuf, Vec<String>, Option<&[u8]>),
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let sandbox = context
+        .sandbox
+        .as_ref()
+        .expect("caller checked the sandbox");
+    let Some(host) = &context.foreground_supervisor else {
+        return Err(ToolError::Failed(
+            "sandbox policy requires the trusted process supervisor; direct host background spawn denied"
+                .into(),
+        ));
+    };
+    if !sandbox.process.allow_background {
+        return Err(ToolError::Failed(
+            "sandbox policy does not permit background processes".into(),
+        ));
+    }
+    let config = foreground::process_config(cwd, executable, argv, context)?.as_background();
+    let operation = admit_background_operation(context, tool, command)?;
+    if let Some(operation) = operation.as_ref() {
+        if let Some(result) = reject_existing_background_operation(operation)? {
+            return Ok(result);
+        }
+    }
+    let launch = || -> Result<crate::jobs::SupervisedLaunch, ToolError> {
+        let launch = crate::jobs::SupervisedLaunch::spawn(host, config.clone())
+            .map_err(ToolError::Failed)?;
+        if let Some(bytes) = stdin {
+            launch.write_stdin(bytes).map_err(ToolError::Failed)?;
+        }
+        Ok(launch)
+    };
+    let launch = match operation.as_ref() {
+        Some(operation) => operation
+            .begin(false, || Ok(()), launch)
+            .map_err(|error| {
+                ToolError::Failed(format!("background job dispatch failed: {error}"))
+            })??,
+        None => launch()?,
+    };
+    let shown = required_str(input, "command")?;
+    let pid = launch.pid();
+    let id = context
+        .jobs
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .register_supervised(
+            shown,
+            launch,
+            context.runtime.as_ref().map(|runtime| runtime.agent_id),
+            operation,
+        );
+    Ok(crate::jobs::started_result(id, pid, shown))
+}
+
+fn shell_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let command = required_str(input, "command")?;
+    let timeout_ms = resolve_bash_timeout_ms(input)?;
+    let command = match std::env::var("PI_SHELL_COMMAND_PREFIX") {
+        Ok(prefix) if !prefix.is_empty() => format!("{prefix}; {command}"),
+        _ => command.to_string(),
+    };
+    let background = wants_background(input);
+    let started_at_ms = crate::command_receipt::now();
+    if background && context.sandbox.is_some() {
+        return sandboxed_background_shell(cwd, input, &command, context);
+    }
+    if background {
+        let operation = admit_background_operation(context, "shell", &command)?;
+        if let Some(operation) = operation.as_ref() {
+            if let Some(result) = reject_existing_background_operation(operation)? {
+                return Ok(result);
+            }
+        }
+        let child = match operation.as_ref() {
+            Some(operation) => operation
+                .begin(false, || Ok(()), || spawn_shell(cwd, &command, true))
+                .map_err(|error| {
+                    ToolError::Failed(format!("background job dispatch failed: {error}"))
+                })??,
+            None => spawn_shell(cwd, &command, true)?,
+        };
+        let shown = required_str(input, "command")?;
+        let pid = child.id();
+        let id = context
+            .jobs
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .register_with_provenance_and_operation(
+                shown,
+                child,
+                None,
+                context.runtime.as_ref().map(|runtime| runtime.agent_id),
+                None,
+                operation,
+            );
+        return Ok(crate::jobs::started_result(id, pid, shown));
+    }
+    let timeout_label = shell_timeout_label(input, timeout_ms);
+    if context.sandbox.is_some() && context.foreground_supervisor.is_none() {
+        return Err(ToolError::Failed(
+            "sandbox policy requires the trusted process supervisor; direct host fallback denied"
+                .into(),
+        ));
+    }
+    let (output, pipe_truncated) = if let Some(host) = &context.foreground_supervisor {
+        let custom = std::env::var("PI_SHELL")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let shell =
+            davinci_ai::resolve_shell_config(custom.as_deref()).map_err(ToolError::Failed)?;
+        let mut argv = shell.args;
+        let stdin = match shell.command_transport {
+            davinci_ai::CommandTransport::Argv => {
+                argv.push(command.clone());
+                &[][..]
+            }
+            davinci_ai::CommandTransport::Stdin => command.as_bytes(),
+        };
+        let output = foreground::run(
+            host,
+            foreground::config(cwd, shell.shell.into(), argv, context)?,
+            stdin,
+            timeout_ms,
+            timeout_label.as_deref(),
+            context,
+        )?;
+        if let Some(capture) = &context.command_receipt {
+            capture.completed(cwd, &command, started_at_ms, &output);
+        }
+        (output, false)
+    } else {
+        wait_shell_output(
+            spawn_shell(cwd, &command, false)?,
+            timeout_ms,
+            timeout_label.as_deref(),
+            context,
+        )?
+    };
+    let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(ToolResult {
+        content,
+        is_error: !output.status.success() || pipe_truncated,
+        details: Some(serde_json::json!({"exitCode": output.status.code()})),
+    })
+}
+
+const MAX_SHELL_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const PIPE_TRUNCATED_NOTE: &str = "(output truncated: a background process kept the pipe open)";
+
+#[derive(Default)]
+struct ShellStreamCapture {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+fn read_shell_stream_into(
+    mut pipe: impl std::io::Read,
+    limit: usize,
+    capture: &Arc<Mutex<ShellStreamCapture>>,
+) -> std::io::Result<()> {
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let mut capture = capture.lock().unwrap_or_else(|err| err.into_inner());
+        let retained = count.min(limit.saturating_sub(capture.bytes.len()));
+        capture.bytes.extend_from_slice(&buffer[..retained]);
+        capture.overflow |= retained != count;
+        // Keep draining after the cap: stopping here could block the child on
+        // a full pipe. Incomplete output must never become verification evidence.
+    }
+    if capture
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .overflow
+    {
+        return Err(std::io::Error::other(
+            "command output exceeded stream byte limit",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_shell_stream(pipe: impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let capture = Arc::new(Mutex::new(ShellStreamCapture::default()));
+    read_shell_stream_into(pipe, limit, &capture)?;
+    let bytes = capture
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .bytes
+        .clone();
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn join_shell_stream(
+    handle: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, ToolError> {
+    match handle {
+        None => Ok(Vec::new()),
+        Some(handle) => handle
+            .join()
+            .map_err(|_| ToolError::Failed("command output reader panicked".into()))?
+            .map_err(|error| ToolError::Failed(format!("command output capture failed: {error}"))),
+    }
+}
+
+fn shell_readers_finished(
+    stdout: &Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stderr: &Option<std::thread::JoinHandle<std::io::Result<()>>>,
+) -> bool {
+    stdout.as_ref().map_or(true, |handle| handle.is_finished())
+        && stderr.as_ref().map_or(true, |handle| handle.is_finished())
+}
+
+fn join_finished_shell_stream(
+    handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+) -> Result<bool, ToolError> {
+    match handle {
+        None => Ok(true),
+        Some(handle) if handle.is_finished() => handle
+            .join()
+            .map_err(|_| ToolError::Failed("command output reader panicked".into()))?
+            .map_err(|error| ToolError::Failed(format!("command output capture failed: {error}")))
+            .map(|()| true),
+        Some(_) => Ok(false),
+    }
+}
+
+fn finish_shell_capture(
+    child_pid: u32,
+    stdout_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stderr_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stdout_capture: &Arc<Mutex<ShellStreamCapture>>,
+    stderr_capture: &Arc<Mutex<ShellStreamCapture>>,
+) -> Result<(Vec<u8>, Vec<u8>, bool), ToolError> {
+    const READER_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    while !shell_readers_finished(&stdout_handle, &stderr_handle)
+        && started.elapsed() < READER_GRACE
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let pending = !shell_readers_finished(&stdout_handle, &stderr_handle);
+    if pending {
+        crate::jobs::kill_tree(child_pid);
+    }
+
+    let stdout_done = join_finished_shell_stream(stdout_handle)?;
+    let stderr_done = join_finished_shell_stream(stderr_handle)?;
+    let stdout = stdout_capture.lock().unwrap_or_else(|err| err.into_inner());
+    let stderr = stderr_capture.lock().unwrap_or_else(|err| err.into_inner());
+    if stdout.overflow || stderr.overflow {
+        return Err(ToolError::Failed(
+            "command output capture failed: command output exceeded stream byte limit".into(),
+        ));
+    }
+    Ok((
+        stdout.bytes.clone(),
+        stderr.bytes.clone(),
+        pending || !stdout_done || !stderr_done,
+    ))
+}
+
+fn append_pipe_truncated_note(stderr: &mut Vec<u8>, truncated: bool) {
+    if !truncated {
+        return;
+    }
+    if !stderr.is_empty() {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(PIPE_TRUNCATED_NOTE.as_bytes());
+}
+
+fn wait_shell_output(
+    mut child: std::process::Child,
+    timeout_ms: Option<u64>,
+    timeout_label: Option<&str>,
+    context: &ToolContext,
+) -> Result<(std::process::Output, bool), ToolError> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_capture = Arc::new(Mutex::new(ShellStreamCapture::default()));
+    let stderr_capture = Arc::new(Mutex::new(ShellStreamCapture::default()));
+    let stdout_handle = stdout.map(|pipe| {
+        let capture = Arc::clone(&stdout_capture);
+        std::thread::spawn(move || read_shell_stream_into(pipe, MAX_SHELL_STREAM_BYTES, &capture))
+    });
+    let stderr_handle = stderr.map(|pipe| {
+        let capture = Arc::clone(&stderr_capture);
+        std::thread::spawn(move || read_shell_stream_into(pipe, MAX_SHELL_STREAM_BYTES, &capture))
+    });
+    // Poll rather than block in `wait`: the turn's abort flag has to be able
+    // to end the command, timeout or not.
+    let start = std::time::Instant::now();
+    let limit = timeout_ms.map(std::time::Duration::from_millis);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let timed_out = limit.is_some_and(|limit| start.elapsed() >= limit);
+                let aborted = context.is_aborted();
+                if !timed_out && !aborted {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                crate::jobs::kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                let (stdout, mut stderr, truncated) = finish_shell_capture(
+                    child.id(),
+                    stdout_handle,
+                    stderr_handle,
+                    &stdout_capture,
+                    &stderr_capture,
+                )?;
+                append_pipe_truncated_note(&mut stderr, truncated);
+                let mut content = String::from_utf8_lossy(&stdout).into_owned();
+                if !stderr.is_empty() {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(&String::from_utf8_lossy(&stderr));
+                }
+                let status = if timed_out {
+                    let seconds = timeout_label.unwrap_or("0");
+                    format!("Command timed out after {seconds} seconds")
+                } else {
+                    "Command aborted".to_string()
+                };
+                return Err(ToolError::Failed(if content.is_empty() {
+                    status
+                } else {
+                    format!("{content}\n\n{status}")
+                }));
+            }
+            Err(err) => {
+                crate::jobs::kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = finish_shell_capture(
+                    child.id(),
+                    stdout_handle,
+                    stderr_handle,
+                    &stdout_capture,
+                    &stderr_capture,
+                );
+                return Err(ToolError::Failed(err.to_string()));
+            }
+        }
+    };
+    let (stdout, mut stderr, truncated) = finish_shell_capture(
+        child.id(),
+        stdout_handle,
+        stderr_handle,
+        &stdout_capture,
+        &stderr_capture,
+    )?;
+    append_pipe_truncated_note(&mut stderr, truncated);
+    Ok((
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        truncated,
+    ))
+}
+
+pub(crate) fn resolve_powershell_executable(cwd: &Path) -> Result<PathBuf, ToolError> {
+    ["pwsh", "powershell"]
+        .into_iter()
+        .find_map(|program| crate::process_manager::resolve_native_executable(program, cwd).ok())
+        .ok_or_else(|| {
+            ToolError::Failed("PowerShell is not available and could not be launched".into())
+        })
+}
+
+fn powershell_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let command = required_str(input, "command")?;
+    let timeout_ms = resolve_bash_timeout_ms(input)?;
+    let timeout_label = shell_timeout_label(input, timeout_ms);
+    if let Ok(reply) = std::env::var("PI_POWERSHELL_REPLY") {
+        return Ok(ToolResult {
+            content: reply,
+            is_error: false,
+            details: Some(serde_json::json!({"exitCode": 0})),
+        });
+    }
+    let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
+    let background = wants_background(input);
+    if background && context.sandbox.is_some() {
+        return sandboxed_background(
+            cwd,
+            input,
+            ("powershell", command),
+            (
+                resolve_powershell_executable(cwd)?,
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    wrapped,
+                ],
+                None,
+            ),
+            context,
+        );
+    }
+    if !background && context.sandbox.is_some() && context.foreground_supervisor.is_none() {
+        return Err(ToolError::Failed(
+            "sandbox policy requires the trusted process supervisor; direct host fallback denied"
+                .into(),
+        ));
+    }
+    if !background {
+        if let Some(host) = &context.foreground_supervisor {
+            let executable = resolve_powershell_executable(cwd)?;
+            let started_at_ms = crate::command_receipt::now();
+            let config = foreground::config(
+                cwd,
+                executable,
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    wrapped,
+                ],
+                context,
+            )?;
+            let output = foreground::run(
+                host,
+                config,
+                &[],
+                timeout_ms,
+                timeout_label.as_deref(),
+                context,
+            )?;
+            if let Some(capture) = &context.command_receipt {
+                capture.completed(cwd, command, started_at_ms, &output);
+            }
+            let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !output.stderr.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            return Ok(ToolResult {
+                content,
+                is_error: !output.status.success(),
+                details: Some(serde_json::json!({"exitCode": output.status.code()})),
+            });
+        }
+    }
+    let operation = if background {
+        admit_background_operation(context, "powershell", command)?
+    } else {
+        None
+    };
+    if let Some(operation) = operation.as_ref() {
+        if let Some(result) = reject_existing_background_operation(operation)? {
+            return Ok(result);
+        }
+    }
+    for program in ["pwsh", "powershell"] {
+        let executable = if operation.is_some() {
+            crate::process_manager::resolve_native_executable(program, cwd).ok()
+        } else {
+            None
+        };
+        if operation.is_some() && executable.is_none() {
+            continue;
+        }
+        let program_path = executable.as_deref().unwrap_or_else(|| Path::new(program));
+        let stdin = if background {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        };
+        let spawn = || {
+            let mut process = Command::new(program_path);
+            process
+                .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
+                .current_dir(cwd)
+                .stdin(stdin)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                process.process_group(0);
+            }
+            process
+                .spawn()
+                .map_err(|error| ToolError::Failed(error.to_string()))
+        };
+        let child = if let Some(operation) = operation.as_ref() {
+            operation.begin(false, || Ok(()), spawn).map_err(|error| {
+                ToolError::Failed(format!("background job dispatch failed: {error}"))
+            })??
+        } else {
+            match spawn() {
+                Ok(child) => child,
+                Err(_) => continue,
+            }
+        };
+        if background {
+            let pid = child.id();
+            let id = context
+                .jobs
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .register_with_provenance_and_operation(
+                    command,
+                    child,
+                    None,
+                    context.runtime.as_ref().map(|runtime| runtime.agent_id),
+                    None,
+                    operation,
+                );
+            return Ok(crate::jobs::started_result(id, pid, command));
+        }
+        let (output, pipe_truncated) =
+            wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
+        let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.stderr.is_empty() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        return Ok(ToolResult {
+            content,
+            is_error: !output.status.success() || pipe_truncated,
+            details: Some(serde_json::json!({"exitCode": output.status.code()})),
+        });
+    }
+    Err(ToolError::Failed(
+        "PowerShell is not available and could not be launched".into(),
+    ))
+}
+
+fn ls_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let path = resolve(
+        cwd,
+        input.get("path").and_then(|v| v.as_str()).unwrap_or("."),
+    )?;
+    if !path.exists() {
+        return Err(ToolError::Failed(format!(
+            "Path not found: {}",
+            path.display()
+        )));
+    }
+    if !path.is_dir() {
+        return Err(ToolError::Failed(format!(
+            "Not a directory: {}",
+            path.display()
+        )));
+    }
+    let limit = input
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(LS_DEFAULT_LIMIT)
+        .max(1);
+    let mut entries: Vec<String> = fs::read_dir(&path)
+        .map_err(|err| ToolError::Failed(format!("Cannot read directory: {err}")))?
+        .flatten()
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A symlink's own type says nothing about its target; only
+            // then is the `stat` worth paying for.
+            let is_dir = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+                _ => entry.path().is_dir(),
+            };
+            if is_dir {
+                format!("{name}/")
+            } else {
+                name
+            }
+        })
+        .collect();
+    entries.sort_by_key(|name| name.to_ascii_lowercase());
+    if entries.is_empty() {
+        return Ok(ToolResult {
+            content: "(empty directory)".into(),
+            is_error: false,
+            details: None,
+        });
+    }
+    let entry_limit_reached = entries.len() > limit;
+    entries.truncate(limit);
+    let mut output = entries.join("\n");
+    let mut details = serde_json::Map::new();
+    if entry_limit_reached {
+        output.push_str(&format!(
+            "\n\n[{limit} entries limit reached. Use limit={} for more]",
+            limit.saturating_mul(2)
+        ));
+        details.insert("entryLimitReached".into(), serde_json::json!(limit));
+    }
+    Ok(ToolResult {
+        content: output,
+        is_error: false,
+        details: if details.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(details))
+        },
+    })
+}
+
+fn path_is_inside_git_repo(search_path: &Path) -> bool {
+    let mut current = if search_path.is_file() {
+        search_path.parent().unwrap_or(search_path).to_path_buf()
+    } else {
+        search_path.to_path_buf()
+    };
+    loop {
+        if current.join(".git").exists() {
+            return true;
+        }
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if parent == current {
+            return false;
+        }
+        current = parent.to_path_buf();
+    }
+}
+
+/// Directories the fd and rg fast paths skip, matching what the native
+/// fallback's `IgnoreRules` already skips. `--hidden` alone made `.git`
+/// internals the bulk of find and grep output, so results depended on
+/// whether fd/rg were installed. Davinci divergence from TS pi, whose fd
+/// path has the same gap (find.ts) while its fallback excludes `.git`.
+const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "node_modules"];
+
+/// True when the caller deliberately aimed at an excluded directory: the
+/// search root lies inside one, or the pattern/glob names one. Those
+/// searches keep today's behaviour.
+fn targets_excluded_dir(pattern: &str, search_path: &Path) -> bool {
+    let names_dir = |text: &str| {
+        text.split(['/', '\\']).any(|part| {
+            // A directory-specific glob is explicit intent; broad `*` and
+            // `**` still retain the default noise exclusions.
+            part.chars().any(|ch| ch.is_alphanumeric() || ch == '.')
+                && SEARCH_EXCLUDED_DIRS
+                    .iter()
+                    .any(|dir| crate::permission::glob_matches(part, dir))
+        })
+    };
+    (!pattern.starts_with('!') && names_dir(pattern))
+        || search_path.components().any(|component| {
+            SEARCH_EXCLUDED_DIRS.contains(&component.as_os_str().to_string_lossy().as_ref())
+        })
+}
+
+fn build_fd_args(pattern: &str, search_path: &Path, limit: usize) -> Vec<String> {
+    let mut args = vec!["--glob".into(), "--color=never".into(), "--hidden".into()];
+    if !path_is_inside_git_repo(search_path) {
+        args.push("--no-require-git".into());
+    }
+    if !targets_excluded_dir(pattern, search_path) {
+        for dir in SEARCH_EXCLUDED_DIRS {
+            args.push("--exclude".into());
+            args.push((*dir).into());
+        }
+    }
+    args.push("--max-results".into());
+    args.push(limit.to_string());
+    let mut effective_pattern = pattern.to_string();
+    if pattern.contains('/') {
+        args.push("--full-path".into());
+        if !pattern.starts_with('/') && !pattern.starts_with("**/") && pattern != "**" {
+            effective_pattern = format!("**/{pattern}");
+        }
+        if cfg!(windows) {
+            effective_pattern = effective_pattern.replace('/', "[/\\\\]");
+        }
+    }
+    args.push("--".into());
+    args.push(effective_pattern);
+    args.push(search_path.to_string_lossy().into_owned());
+    args
+}
+
+fn build_rg_args(
+    pattern: &str,
+    search_path: &Path,
+    glob: Option<&str>,
+    ignore_case: bool,
+    literal: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "--json".into(),
+        "--line-number".into(),
+        "--color=never".into(),
+        "--hidden".into(),
+    ];
+    if ignore_case {
+        args.push("--ignore-case".into());
+    }
+    if literal {
+        args.push("--fixed-strings".into());
+    }
+    if let Some(glob) = glob {
+        args.push("--glob".into());
+        args.push(glob.to_string());
+    }
+    // After the user's glob: rg lets a later glob override an earlier one,
+    // so a broad `**/*` placed last would bring `.git` back.
+    if !targets_excluded_dir(glob.unwrap_or(""), search_path) {
+        for dir in SEARCH_EXCLUDED_DIRS {
+            args.push("--glob".into());
+            args.push(format!("!{dir}"));
+        }
+    }
+    args.push("--".into());
+    args.push(pattern.to_string());
+    args.push(search_path.to_string_lossy().into_owned());
+    args
+}
+
+fn run_managed_tool(
+    env_name: &str,
+    default_name: &str,
+    args: &[String],
+) -> Result<Option<std::process::Output>, ToolError> {
+    let program = std::env::var(env_name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_name.to_string());
+    match Command::new(&program).args(args).output() {
+        Ok(output) => Ok(Some(output)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ToolError::Failed(format!(
+            "Failed to run {default_name}: {err}"
+        ))),
+    }
+}
+
+/// One `match` event out of ripgrep's `--json` stream: file, line number
+/// and the line's text when ripgrep sent it.
+type RgMatch = (PathBuf, usize, Option<String>);
+
+/// Parse a `--json` match event. Anything that is not a complete match
+/// (summaries, `begin`/`end` markers, a malformed line) yields `None`.
+fn parse_rg_match(line: &str) -> Option<RgMatch> {
+    let event = serde_json::from_str::<Value>(line).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("match") {
+        return None;
+    }
+    let data = event.get("data")?;
+    let file = data.get("path")?.get("text")?.as_str()?;
+    let line_number = data.get("line_number")?.as_u64()?;
+    let line_text = data
+        .get("lines")
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((PathBuf::from(file), line_number as usize, line_text))
+}
+
+/// What reading a ripgrep stream ended with.
+struct RgStream {
+    matches: Vec<RgMatch>,
+    /// `limit` matches are in hand; the caller stops the child rather
+    /// than waiting for it to finish walking the tree.
+    limit_reached: bool,
+    /// The turn's abort flag was raised while the stream was still open.
+    aborted: bool,
+}
+
+fn is_secret_search_path(path: &Path) -> bool {
+    crate::permission::is_secret_file_path(&path.to_string_lossy())
+        || path.canonicalize().is_ok_and(|resolved| {
+            crate::permission::is_secret_file_path(&resolved.to_string_lossy())
+        })
+}
+
+/// Recursive permission applies to the search root, not every descendant.
+/// Secret files require an explicit path that the permission gate can approve.
+fn excludes_secret_descendants(search_path: &Path) -> bool {
+    search_path.is_dir() && !is_secret_search_path(search_path)
+}
+
+/// Read ripgrep's `--json` output as it arrives (grep.ts reads it line by
+/// line through `readline` for the same reason): the read stops the moment
+/// `limit` matches have been collected or the turn is aborted, so the
+/// caller can kill ripgrep instead of waiting for it to visit every file
+/// under the search path. Before this the tool sat in `Command::output`
+/// for as long as ripgrep took — a worker that grepped its home directory
+/// held its turn for half an hour with the matches already in the pipe.
+///
+/// The pipe is drained on its own thread and handed over a channel so the
+/// abort flag can be polled while nothing arrives.
+fn stream_rg_matches<R: std::io::Read + Send + 'static>(
+    pipe: R,
+    limit: usize,
+    context: &ToolContext,
+    exclude_secrets: bool,
+) -> RgStream {
+    use std::io::BufRead;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    let (sender, receiver) = mpsc::sync_channel::<String>(64);
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(pipe).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut stream = RgStream {
+        matches: Vec::new(),
+        limit_reached: false,
+        aborted: false,
+    };
+    loop {
+        if context.is_aborted() {
+            stream.aborted = true;
+            break;
+        }
+        match receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(line) => {
+                if let Some(found) = parse_rg_match(&line) {
+                    if exclude_secrets && is_secret_search_path(&found.0) {
+                        continue;
+                    }
+                    stream.matches.push(found);
+                    if stream.matches.len() >= limit {
+                        stream.limit_reached = true;
+                        break;
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    stream
+}
+
+/// Run ripgrep and collect up to `limit` matches from its stream, killing
+/// it as soon as they are in hand. `None` when ripgrep is not installed,
+/// which sends the caller to the native walk.
+fn run_rg_streaming(
+    args: &[String],
+    limit: usize,
+    context: &ToolContext,
+    exclude_secrets: bool,
+) -> Result<Option<(Vec<RgMatch>, bool)>, ToolError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let program = std::env::var("PI_RG_PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "rg".to_string());
+    let mut child = match Command::new(&program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(ToolError::Failed(format!("Failed to run ripgrep: {err}")));
+        }
+    };
+    // stderr is drained on its own thread so a chatty ripgrep (permission
+    // errors under a home directory) can never block on a full pipe.
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stream = match child.stdout.take() {
+        Some(pipe) => stream_rg_matches(pipe, limit, context, exclude_secrets),
+        None => RgStream {
+            matches: Vec::new(),
+            limit_reached: false,
+            aborted: false,
+        },
+    };
+    if stream.limit_reached || stream.aborted {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|err| ToolError::Failed(format!("Failed to run ripgrep: {err}")))?;
+    let stderr = stderr_handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if stream.aborted {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let code = status.code().unwrap_or(-1);
+    if !stream.limit_reached && code != 0 && code != 1 {
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(ToolError::Failed(if stderr.is_empty() {
+            format!("ripgrep exited with code {code}")
+        } else {
+            stderr
+        }));
+    }
+    Ok(Some((stream.matches, stream.limit_reached)))
+}
+
+/// Render grep matches of one file with `context` lines around each, merging
+/// overlapping or adjacent windows so every line prints once and putting a
+/// `--` line between separate groups, as ripgrep does. `match_lines` are
+/// 1-based and ascending. Returns the lines and whether any line was cut.
+/// Davinci divergence from TS grep.ts, which repeated shared context lines.
+fn render_grep_context(
+    display: &str,
+    file_lines: &[&str],
+    match_lines: &[usize],
+    context: usize,
+) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut lines_truncated = false;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &line in match_lines {
+        let start = line.saturating_sub(context).max(1);
+        let end = (line + context).min(file_lines.len().max(line));
+        match ranges.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => ranges.push((start, end)),
+        }
+    }
+    for (group, (start, end)) in ranges.into_iter().enumerate() {
+        if group > 0 {
+            out.push("--".to_string());
+        }
+        for current in start..=end {
+            let (text, truncated) =
+                truncate_line(file_lines.get(current - 1).copied().unwrap_or(""));
+            lines_truncated |= truncated;
+            if match_lines.binary_search(&current).is_ok() {
+                out.push(format!("{display}:{current}: {text}"));
+            } else {
+                out.push(format!("{display}-{current}- {text}"));
+            }
+        }
+    }
+    (out, lines_truncated)
+}
+
+fn grep_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    tool_context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let pattern = required_str(input, "pattern")?;
+    let search_path = resolve(
+        cwd,
+        input.get("path").and_then(Value::as_str).unwrap_or("."),
+    )?;
+    if !search_path.exists() {
+        return Err(ToolError::Failed(format!(
+            "Path not found: {}",
+            search_path.display()
+        )));
+    }
+    if tool_context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let glob = input.get("glob").and_then(Value::as_str);
+    let ignore_case = input
+        .get("ignoreCase")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let literal = input
+        .get("literal")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let context = input.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(GREP_DEFAULT_LIMIT)
+        .max(1);
+    let args = build_rg_args(pattern, &search_path, glob, ignore_case, literal);
+    let Some((raw_matches, match_limit_reached)) = run_rg_streaming(
+        &args,
+        limit,
+        tool_context,
+        excludes_secret_descendants(&search_path),
+    )?
+    else {
+        return grep_tool_native(cwd, input, tool_context);
+    };
+    let is_dir = search_path.is_dir();
+    if raw_matches.is_empty() {
+        return Ok(ToolResult {
+            content: "No matches found".into(),
+            is_error: false,
+            details: None,
+        });
+    }
+    let mut lines_truncated = false;
+    let mut matches = Vec::new();
+    if context > 0 {
+        // ripgrep reports a file's matches together and in line order, so
+        // each run of equal paths is one file: read it once, merge windows.
+        let mut index = 0;
+        while index < raw_matches.len() {
+            let file = raw_matches[index].0.clone();
+            let mut lines = Vec::new();
+            while index < raw_matches.len() && raw_matches[index].0 == file {
+                lines.push(raw_matches[index].1);
+                index += 1;
+            }
+            lines.sort_unstable();
+            lines.dedup();
+            let display = format_grep_path(&file, &search_path, is_dir);
+            let Ok(body) = fs::read_to_string(&file) else {
+                for line_number in lines {
+                    matches.push(format!("{display}:{line_number}: (unable to read file)"));
+                }
+                continue;
+            };
+            let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+            let file_lines: Vec<&str> = normalized.split('\n').collect();
+            let (rendered, truncated) = render_grep_context(&display, &file_lines, &lines, context);
+            lines_truncated |= truncated;
+            matches.extend(rendered);
+        }
+    }
+    if context == 0 {
+        for (file, line_number, line_text) in raw_matches {
+            let display = format_grep_path(&file, &search_path, is_dir);
+            let text = line_text
+                .as_deref()
+                .unwrap_or("")
+                .replace("\r\n", "\n")
+                .replace('\r', "")
+                .trim_end_matches('\n')
+                .to_string();
+            let (text, truncated) = truncate_line(&text);
+            lines_truncated |= truncated;
+            matches.push(format!("{display}:{line_number}: {text}"));
+        }
+    }
+    let mut output_text = matches.join("\n");
+    let mut details = serde_json::Map::new();
+    let mut notices = Vec::new();
+    if match_limit_reached {
+        notices.push(format!(
+            "{limit} matches limit reached. Use limit={} for more, or refine pattern",
+            limit.saturating_mul(2)
+        ));
+        details.insert("matchLimitReached".into(), serde_json::json!(limit));
+    }
+    if lines_truncated {
+        notices.push(format!(
+            "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+        ));
+        details.insert("linesTruncated".into(), Value::Bool(true));
+    }
+    if !notices.is_empty() {
+        output_text.push_str("\n\n[");
+        output_text.push_str(&notices.join(". "));
+        output_text.push(']');
+    }
+    Ok(ToolResult {
+        content: output_text,
+        is_error: false,
+        details: if details.is_empty() {
+            None
+        } else {
+            Some(Value::Object(details))
+        },
+    })
+}
+
+/// How many files the native grep scans at once. Reading is the cost, and
+/// it overlaps well on the SSDs the tool runs against.
+const GREP_SCAN_THREADS: usize = 8;
+/// Below this many files a pool costs more than it saves.
+const GREP_PARALLEL_MIN_FILES: usize = 32;
+/// Bytes inspected for a NUL to decide a file is binary (what ripgrep does).
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// The compiled form of a grep pattern: built once per call, not once per
+/// line as the first version did.
+enum Matcher {
+    Literal(String),
+    LiteralIgnoreCase(String),
+    Regex(regex::Regex),
+}
+
+impl Matcher {
+    fn new(pattern: &str, ignore_case: bool, literal: bool) -> Self {
+        if literal {
+            return if ignore_case {
+                Self::LiteralIgnoreCase(pattern.to_ascii_lowercase())
+            } else {
+                Self::Literal(pattern.to_string())
+            };
+        }
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        {
+            Ok(regex) => Self::Regex(regex),
+            // An invalid regex falls back to a substring match, as before.
+            Err(_) => Self::new(pattern, ignore_case, true),
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Literal(needle) => line.contains(needle.as_str()),
+            Self::LiteralIgnoreCase(needle) => {
+                // Only lower-case a line that could match at all.
+                line.len() >= needle.len() && line.to_ascii_lowercase().contains(needle.as_str())
+            }
+            Self::Regex(regex) => regex.is_match(line),
+        }
+    }
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0)
+}
+
+/// A scanned file's rendered match lines and whether any line was cut.
+type ScannedFile = (Vec<String>, bool);
+
+/// Scan one file for the native grep. Returns the rendered match lines (with
+/// context) and whether any line was cut, or `None` for a file that is not
+/// text.
+fn grep_scan_file(
+    file: &Path,
+    matcher: &Matcher,
+    context: usize,
+    display: &str,
+    remaining: usize,
+) -> Option<(Vec<String>, bool)> {
+    let bytes = fs::read(file).ok()?;
+    if looks_binary(&bytes) {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&bytes);
+    let mut out = Vec::new();
+    let mut lines_truncated = false;
+    if context == 0 {
+        for (index, line) in body.lines().enumerate() {
+            if out.len() >= remaining {
+                break;
+            }
+            if matcher.is_match(line) {
+                let (text, truncated) = truncate_line(line);
+                lines_truncated |= truncated;
+                out.push(format!("{display}:{}: {text}", index + 1));
+            }
+        }
+        return Some((out, lines_truncated));
+    }
+    let file_lines: Vec<&str> = body.lines().collect();
+    let mut match_lines = Vec::new();
+    for (index, line) in file_lines.iter().enumerate() {
+        if match_lines.len() >= remaining {
+            break;
+        }
+        if matcher.is_match(line) {
+            match_lines.push(index + 1);
+        }
+    }
+    let (rendered, truncated) = render_grep_context(display, &file_lines, &match_lines, context);
+    out.extend(rendered);
+    lines_truncated |= truncated;
+    Some((out, lines_truncated))
+}
+
+fn grep_tool_native(
+    cwd: &Path,
+    input: &serde_json::Value,
+    tool_context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let pattern = required_str(input, "pattern")?;
+    let search_path = resolve(
+        cwd,
+        input.get("path").and_then(|v| v.as_str()).unwrap_or("."),
+    )?;
+    if !search_path.exists() {
+        return Err(ToolError::Failed(format!(
+            "Path not found: {}",
+            search_path.display()
+        )));
+    }
+    let glob = input.get("glob").and_then(|v| v.as_str());
+    let ignore_case = input
+        .get("ignoreCase")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let literal = input
+        .get("literal")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let context = input
+        .get("context")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(GREP_DEFAULT_LIMIT)
+        .max(1);
+    let is_dir = search_path.is_dir();
+    let matcher = Matcher::new(pattern, ignore_case, literal);
+
+    // Walk first, scan after: the walk is cheap directory metadata, the
+    // scan is the file reads, and only the scan is worth spreading out.
+    let mut files: Vec<PathBuf> = Vec::new();
+    let exclude_secrets = excludes_secret_descendants(&search_path);
+    walk_files(
+        &search_path,
+        &IgnoreRules::load(&search_path),
+        &mut |file| {
+            if glob.is_none_or(|glob| path_glob_match(glob, file, &search_path))
+                && !(exclude_secrets && is_secret_search_path(file))
+            {
+                files.push(file.to_path_buf());
+            }
+            // A large tree is abandoned at the next file once the turn is
+            // aborted, like the ripgrep path.
+            !tool_context.is_aborted()
+        },
+    );
+    if tool_context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+
+    let scan = |file: &Path, remaining: usize| {
+        let display = format_grep_path(file, &search_path, is_dir);
+        grep_scan_file(file, &matcher, context, &display, remaining)
+    };
+    let mut matches: Vec<String> = Vec::new();
+    let mut lines_truncated = false;
+    if files.len() < GREP_PARALLEL_MIN_FILES {
+        for file in &files {
+            if matches.len() >= limit {
+                break;
+            }
+            if let Some((lines, truncated)) = scan(file, limit - matches.len()) {
+                lines_truncated |= truncated;
+                matches.extend(lines);
+            }
+        }
+    } else {
+        // Every thread pulls the next file index; results land in the
+        // file's slot so the merged order is the walk order, exactly as
+        // the sequential scan would have produced it. `found` lets the
+        // pool stop early once the limit is clearly reached.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let found = AtomicUsize::new(0);
+        let slots: Mutex<Vec<Option<ScannedFile>>> =
+            Mutex::new((0..files.len()).map(|_| None).collect());
+        let threads = GREP_SCAN_THREADS.min(files.len());
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= files.len() || found.load(Ordering::Relaxed) >= limit {
+                        break;
+                    }
+                    if let Some(result) = scan(&files[index], limit) {
+                        found.fetch_add(result.0.len(), Ordering::Relaxed);
+                        slots.lock().unwrap_or_else(|err| err.into_inner())[index] = Some(result);
+                    }
+                });
+            }
+        });
+        for slot in slots.into_inner().unwrap_or_else(|err| err.into_inner()) {
+            if matches.len() >= limit {
+                break;
+            }
+            if let Some((lines, truncated)) = slot {
+                lines_truncated |= truncated;
+                matches.extend(lines);
+            }
+        }
+    }
+    if matches.is_empty() {
+        return Ok(ToolResult {
+            content: "No matches found".into(),
+            is_error: false,
+            details: None,
+        });
+    }
+    let match_limit_reached = matches.len() >= limit;
+    matches.truncate(limit);
+    let mut output = matches.join("\n");
+    let mut details = serde_json::Map::new();
+    let mut notices = Vec::new();
+    if match_limit_reached {
+        notices.push(format!(
+            "{limit} matches limit reached. Use limit={} for more, or refine pattern",
+            limit.saturating_mul(2)
+        ));
+        details.insert("matchLimitReached".into(), serde_json::json!(limit));
+    }
+    if lines_truncated {
+        notices.push("some lines truncated".into());
+        details.insert("linesTruncated".into(), serde_json::json!(true));
+    }
+    if !notices.is_empty() {
+        output.push_str("\n\n[");
+        output.push_str(&notices.join(". "));
+        output.push(']');
+    }
+    Ok(ToolResult {
+        content: output,
+        is_error: false,
+        details: if details.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(details))
+        },
+    })
+}
+
+fn find_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let pattern = required_str(input, "pattern")?;
+    let search_path = resolve(
+        cwd,
+        input.get("path").and_then(Value::as_str).unwrap_or("."),
+    )?;
+    if !search_path.exists() {
+        return Err(ToolError::Failed(format!(
+            "Path not found: {}",
+            search_path.display()
+        )));
+    }
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(FIND_DEFAULT_LIMIT)
+        .max(1);
+    let args = build_fd_args(pattern, &search_path, limit);
+    let Some(output) = run_managed_tool("PI_FD_PATH", "fd", &args)? else {
+        return find_tool_native(cwd, input);
+    };
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ToolError::Failed(if stderr.is_empty() {
+            format!("fd exited with code {}", output.status.code().unwrap_or(-1))
+        } else {
+            stderr
+        }));
+    }
+    let mut hits = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let path = PathBuf::from(line);
+            relativize_find_result_path(&path, &search_path)
+        })
+        .collect::<Vec<_>>();
+    if hits.is_empty() {
+        return Ok(ToolResult {
+            content: "No files found matching pattern".into(),
+            is_error: false,
+            details: None,
+        });
+    }
+    let result_limit_reached = hits.len() >= limit;
+    hits.truncate(limit);
+    let mut output_text = hits.join("\n");
+    let mut details = serde_json::Map::new();
+    if result_limit_reached {
+        output_text.push_str(&format!("\n\n[{limit} results limit reached]"));
+        details.insert("resultLimitReached".into(), serde_json::json!(limit));
+    }
+    Ok(ToolResult {
+        content: output_text,
+        is_error: false,
+        details: if details.is_empty() {
+            None
+        } else {
+            Some(Value::Object(details))
+        },
+    })
+}
+
+fn find_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let pattern = required_str(input, "pattern")?;
+    let search_path = resolve(
+        cwd,
+        input.get("path").and_then(|v| v.as_str()).unwrap_or("."),
+    )?;
+    if !search_path.exists() {
+        return Err(ToolError::Failed(format!(
+            "Path not found: {}",
+            search_path.display()
+        )));
+    }
+    let limit = input
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(FIND_DEFAULT_LIMIT)
+        .max(1);
+    let mut hits = Vec::new();
+    walk_files(
+        &search_path,
+        &IgnoreRules::load(&search_path),
+        &mut |file| {
+            if hits.len() >= limit {
+                return false;
+            }
+            if path_glob_match(pattern, file, &search_path) {
+                hits.push(relativize_find_result_path(file, &search_path));
+            }
+            true
+        },
+    );
+    if hits.is_empty() {
+        return Ok(ToolResult {
+            content: "No files found matching pattern".into(),
+            is_error: false,
+            details: None,
+        });
+    }
+    let result_limit_reached = hits.len() >= limit;
+    hits.truncate(limit);
+    let mut output = hits.join("\n");
+    let mut details = serde_json::Map::new();
+    if result_limit_reached {
+        output.push_str(&format!("\n\n[{limit} results limit reached]"));
+        details.insert("resultLimitReached".into(), serde_json::json!(limit));
+    }
+    Ok(ToolResult {
+        content: output,
+        is_error: false,
+        details: if details.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(details))
+        },
+    })
+}
+
+pub fn relativize_find_result_path(result_path: &Path, search_path: &Path) -> String {
+    let display = result_path.to_string_lossy();
+    let had_trailing = display.ends_with('/') || display.ends_with('\\');
+    let relative = if result_path.is_absolute() || display.starts_with('/') {
+        match result_path.strip_prefix(search_path) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => {
+                // Keep the TypeScript-style root relativization even when a
+                // fixture uses POSIX paths on Windows.
+                let root = search_path.to_string_lossy();
+                display
+                    .strip_prefix(root.as_ref())
+                    .map(|path| path.trim_start_matches(['/', '\\']).to_owned())
+                    .unwrap_or_else(|| display.into_owned())
+            }
+        }
+    } else {
+        display.into_owned()
+    };
+    let mut posix = relative.replace('\\', "/");
+    if posix.is_empty() {
+        posix = ".".into();
+    }
+    if had_trailing && !posix.ends_with('/') {
+        posix.push('/');
+    }
+    posix
+}
+
+fn required_str<'a>(input: &'a serde_json::Value, field: &str) -> Result<&'a str, ToolError> {
+    input
+        .get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::Failed(format!("Missing {field}")))
+}
+
+fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, ToolError> {
+    let path = PathBuf::from(path);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
+}
+
+pub fn resolve_for_mutation(cwd: &Path, raw_path: &str) -> Result<PathBuf, ToolError> {
+    let path = resolve(cwd, raw_path)?;
+    let (_, symlink_escape) = crate::permission::check_path_boundary(cwd, &path);
+    if symlink_escape {
+        return Err(ToolError::Failed(format!(
+            "Untrusted symlink escape rejected for mutation: '{raw_path}'"
+        )));
+    }
+    Ok(path)
+}
+
+struct IgnoreRules {
+    /// Rules without a `/`: matched against an entry's own name.
+    name_patterns: Vec<String>,
+    /// Rules with a `/`: matched against the whole path.
+    path_patterns: Vec<String>,
+}
+
+impl IgnoreRules {
+    /// Automatic discovery cannot read arbitrary-size ignore files or scan
+    /// arbitrarily many ancestors before its entry budget even starts.
+    fn load_for_discovery(root: &Path) -> Option<Self> {
+        let mut patterns = vec![".git".to_string(), "node_modules".to_string()];
+        let mut remaining = 16 * 1024;
+        let mut current = root;
+        for _ in 0..64 {
+            let path = current.join(".gitignore");
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.len() > remaining as u64 {
+                        return None;
+                    }
+                    let mut body = String::new();
+                    fs::File::open(&path)
+                        .ok()?
+                        .take(remaining as u64 + 1)
+                        .read_to_string(&mut body)
+                        .ok()?;
+                    if body.len() > remaining {
+                        return None;
+                    }
+                    remaining -= body.len();
+                    for line in body.lines().map(str::trim) {
+                        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                            continue;
+                        }
+                        if patterns.len() >= 256 {
+                            return None;
+                        }
+                        patterns.push(line.trim_end_matches('/').to_string());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+            let parent = current.parent();
+            if current.join(".git").exists() || parent.is_none() {
+                let (path_patterns, name_patterns) = patterns
+                    .into_iter()
+                    .partition(|pattern| pattern.contains('/'));
+                return Some(Self {
+                    name_patterns,
+                    path_patterns,
+                });
+            }
+            current = parent?;
+        }
+        None
+    }
+
+    fn load(root: &Path) -> Self {
+        let mut patterns = vec![".git".into(), "node_modules".into()];
+        let mut current = if root.is_file() {
+            root.parent().unwrap_or(root).to_path_buf()
+        } else {
+            root.to_path_buf()
+        };
+        loop {
+            let gitignore = current.join(".gitignore");
+            if let Ok(body) = fs::read_to_string(&gitignore) {
+                for line in body.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                        continue;
+                    }
+                    patterns.push(line.trim_end_matches('/').to_string());
+                }
+            }
+            if current.join(".git").exists() {
+                break;
+            }
+            match current.parent() {
+                Some(parent) => current = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        let (path_patterns, name_patterns): (Vec<String>, Vec<String>) = patterns
+            .into_iter()
+            .partition(|pattern| pattern.contains('/'));
+        Self {
+            name_patterns,
+            path_patterns,
+        }
+    }
+
+    /// The walk prunes an ignored directory before descending, so an entry
+    /// only has to be judged by its own name against the name rules
+    /// (`.git`, `target`, `*.log`); the path rules (`docs/build`) see the
+    /// whole path. Neither needs the string of every ancestor rebuilt per
+    /// entry, which the first version did.
+    fn ignored(&self, path: &Path) -> bool {
+        if !self.name_patterns.is_empty() {
+            if let Some(name) = path.file_name() {
+                let name = name.to_string_lossy();
+                if self
+                    .name_patterns
+                    .iter()
+                    .any(|pattern| glob_match(pattern, &name))
+                {
+                    return true;
+                }
+            }
+        }
+        if self.path_patterns.is_empty() {
+            return false;
+        }
+        let posix = path.to_string_lossy().replace('\\', "/");
+        self.path_patterns
+            .iter()
+            .any(|pattern| glob_match(pattern, &posix) || posix.ends_with(pattern))
+    }
+}
+
+/// Depth-first walk in a stable order (entries sorted by name, so results
+/// do not depend on the file system's iteration order). The entry's own
+/// file type is used — `read_dir` already knows it — instead of a `stat`
+/// per path, and symlinked directories are not followed.
+fn walk_files(root: &Path, ignore: &IgnoreRules, visit: &mut dyn FnMut(&Path) -> bool) {
+    if root.is_file() {
+        let _ = visit(root);
+        return;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<fs::DirEntry> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        // Directories are pushed in reverse so the stack pops them in name
+        // order.
+        let mut dirs = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if ignore.ignored(&path) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                dirs.push(path);
+            } else if file_type.is_file() {
+                if !visit(&path) {
+                    return;
+                }
+            } else if file_type.is_symlink() {
+                // A link to a file is searched like the file; a link to a
+                // directory is not followed (cycles).
+                if path.is_file() && !visit(&path) {
+                    return;
+                }
+            }
+        }
+        stack.extend(dirs.into_iter().rev());
+    }
+}
+
+/// Bounded discovery for automatic context and missing-file suggestions.
+/// Counts every directory entry, including ignored paths and empty directories.
+/// Returns false on truncation or I/O failure: a partial scan proves no uniqueness.
+/// A directory larger than the remaining budget is not partially sorted or visited.
+pub(crate) fn walk_workspace_files(
+    root: &Path,
+    max_entries: usize,
+    visit: &mut dyn FnMut(&Path) -> bool,
+) -> bool {
+    let Some(ignore) = IgnoreRules::load_for_discovery(root) else {
+        return false;
+    };
+    let mut remaining = max_entries;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return false;
+        };
+        let entries: Result<Vec<_>, _> = entries.take(remaining.saturating_add(1)).collect();
+        let Ok(mut entries) = entries else {
+            return false;
+        };
+        if entries.len() > remaining {
+            return false;
+        }
+        remaining -= entries.len();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut dirs = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if ignore.ignored(&path) {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                return false;
+            };
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if (kind.is_file() || kind.is_symlink() && path.is_file()) && !visit(&path) {
+                return false;
+            }
+        }
+        stack.extend(dirs.into_iter().rev());
+    }
+    true
+}
+
+fn format_grep_path(file: &Path, search_path: &Path, is_dir: bool) -> String {
+    if is_dir {
+        let relative = file
+            .strip_prefix(search_path)
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| {
+                file.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        if !relative.is_empty() && !relative.starts_with("..") {
+            return relative;
+        }
+    }
+    file.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.display().to_string())
+}
+
+fn truncate_line(line: &str) -> (String, bool) {
+    let sanitized = line.replace('\r', "");
+    if sanitized.chars().count() > GREP_MAX_LINE_LENGTH {
+        (sanitized.chars().take(GREP_MAX_LINE_LENGTH).collect(), true)
+    } else {
+        (sanitized, false)
+    }
+}
+
+pub(crate) fn truncate_read(
+    content: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> (String, serde_json::Value) {
+    let lines: Vec<&str> = if content.is_empty() {
+        Vec::new()
+    } else {
+        let mut lines: Vec<&str> = content.split('\n').collect();
+        if content.ends_with('\n') {
+            lines.pop();
+        }
+        lines
+    };
+    let start = offset.saturating_sub(1).min(lines.len());
+    let max_lines = limit.unwrap_or(DEFAULT_MAX_LINES);
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated_by = None;
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        if out.len() >= max_lines {
+            truncated_by = Some("lines");
+            break;
+        }
+        let add = if index > start || !out.is_empty() {
+            line.len() + 1
+        } else {
+            line.len()
+        };
+        if bytes + add > DEFAULT_MAX_BYTES {
+            truncated_by = Some("bytes");
+            break;
+        }
+        out.push(*line);
+        bytes += add;
+    }
+    let output = out.join("\n");
+    let details = serde_json::json!({
+        "truncated": truncated_by.is_some(),
+        "truncatedBy": truncated_by,
+        "totalLines": lines.len(),
+        "totalBytes": content.len(),
+        "outputLines": out.len(),
+        "outputBytes": output.len(),
+        "maxLines": max_lines,
+        "maxBytes": DEFAULT_MAX_BYTES,
+    });
+    (output, details)
+}
+
+fn path_glob_match(pattern: &str, file: &Path, search_path: &Path) -> bool {
+    let relative = file
+        .strip_prefix(search_path)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| file.to_string_lossy().replace('\\', "/"));
+    let name = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    glob_match(pattern, &relative) || glob_match(pattern, &name)
+}
+
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if pattern == "*" || pattern == "**" || pattern == "**/*" {
+        return true;
+    }
+    let pattern = pattern.replace('\\', "/");
+    let name = name.replace('\\', "/");
+    // match_glob_chars already implements **/ as zero-or-more path
+    // components. Recursing here for every leading **/ reintroduced an
+    // exponential search for patterns such as **/**/**/....
+    match_glob_chars(&pattern, &name)
+}
+
+fn match_glob_chars(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // memo[i * (n.len() + 1) + j]: does p[i..] match n[j..]? Each cell is
+    // computed once, so matching takes O(|p| * |n|) work regardless of stars.
+    let mut memo = vec![None; (p.len() + 1) * (n.len() + 1)];
+    fn rec(p: &[char], n: &[char], i: usize, j: usize, memo: &mut [Option<bool>]) -> bool {
+        let key = i * (n.len() + 1) + j;
+        if let Some(known) = memo[key] {
+            return known;
+        }
+        let result = match (p.get(i), n.get(j)) {
+            (None, None) => true,
+            (Some('*'), _) if p.get(i + 1) == Some(&'*') => {
+                let slash = p.get(i + 2) == Some(&'/');
+                let rest = if slash { i + 3 } else { i + 2 };
+                rec(p, n, rest, j, memo)
+                    || (j < n.len() && rec(p, n, i, j + 1, memo))
+                    || (slash && n.get(j) == Some(&'/') && rec(p, n, i + 3, j + 1, memo))
+            }
+            (Some('*'), _) => {
+                rec(p, n, i + 1, j, memo) || (j < n.len() && rec(p, n, i, j + 1, memo))
+            }
+            (Some('?'), Some(_)) => rec(p, n, i + 1, j + 1, memo),
+            (Some(a), Some(b)) if a == b => rec(p, n, i + 1, j + 1, memo),
+            _ => false,
+        };
+        memo[key] = Some(result);
+        result
+    }
+    rec(&p, &n, 0, 0, &mut memo)
+}
+
+fn code_definition_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let symbol = input.get("symbol").and_then(Value::as_str);
+
+    if let Some(semantic) = &context.semantic {
+        let request_context = crate::semantic::SemanticRequestContext {
+            deadline: None,
+            abort: context.abort.clone(),
+        };
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::Definition {
+                cwd,
+                path: raw_path,
+                position: crate::semantic::Position {
+                    line: line.saturating_sub(1),
+                    character: character.saturating_sub(1),
+                },
+            },
+            &request_context,
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
+            }
+            Err(err) => return Err(ToolError::Failed(err)),
+        }
+    }
+
+    let sym = symbol.ok_or_else(|| {
+        ToolError::Failed(
+            "No language server available and no `symbol` argument provided for text fallback"
+                .into(),
+        )
+    })?;
+    let res =
+        crate::semantic::text_fallback_definition(cwd, sym, Some(&path), context.abort.as_deref())
+            .map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
+}
+
+fn code_references_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let symbol = input.get("symbol").and_then(Value::as_str);
+    let include_decl = input
+        .get("includeDeclaration")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    if let Some(semantic) = &context.semantic {
+        let request_context = crate::semantic::SemanticRequestContext {
+            deadline: None,
+            abort: context.abort.clone(),
+        };
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::References {
+                cwd,
+                path: raw_path,
+                position: crate::semantic::Position {
+                    line: line.saturating_sub(1),
+                    character: character.saturating_sub(1),
+                },
+                include_declaration: include_decl,
+            },
+            &request_context,
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
+            }
+            Err(err) => return Err(ToolError::Failed(err)),
+        }
+    }
+
+    let sym = symbol.ok_or_else(|| {
+        ToolError::Failed(
+            "No language server available and no `symbol` argument provided for text fallback"
+                .into(),
+        )
+    })?;
+    let res =
+        crate::semantic::text_fallback_references(cwd, sym, Some(&path), context.abort.as_deref())
+            .map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
+}
+
+fn code_outline_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let _path = resolve(cwd, raw_path)?;
+
+    if let Some(semantic) = &context.semantic {
+        let request_context = crate::semantic::SemanticRequestContext {
+            deadline: None,
+            abort: context.abort.clone(),
+        };
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::Outline {
+                cwd,
+                path: raw_path,
+            },
+            &request_context,
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
+            }
+            Err(err) => return Err(ToolError::Failed(err)),
+        }
+    }
+
+    let res = crate::semantic::text_fallback_outline(cwd, raw_path).map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
+}
+
+fn code_diagnostics_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let _path = resolve(cwd, raw_path)?;
+
+    if let Some(semantic) = &context.semantic {
+        let request_context = crate::semantic::SemanticRequestContext {
+            deadline: None,
+            abort: context.abort.clone(),
+        };
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::Diagnostics {
+                cwd,
+                path: raw_path,
+            },
+            &request_context,
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
+            }
+            Err(err) => return Err(ToolError::Failed(err)),
+        }
+    }
+
+    let res =
+        crate::semantic::text_fallback_diagnostics(cwd, raw_path).map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
+}
+
+fn code_call_hierarchy_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let _path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let direction = input
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("incoming");
+    let incoming = direction != "outgoing";
+
+    if let Some(semantic) = &context.semantic {
+        match semantic.call_hierarchy(
+            cwd,
+            raw_path,
+            line.saturating_sub(1),
+            character.saturating_sub(1),
+            incoming,
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
+            }
+            Err(err) => return Err(ToolError::Failed(err)),
+        }
+    }
+
+    Err(ToolError::Failed(
+        "Call hierarchy is unsupported without an active language server".into(),
+    ))
+}
+
+fn code_rename_preview_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let _path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let new_name = required_str(input, "newName")?;
+
+    if let Some(semantic) = &context.semantic {
+        match semantic.rename_preview(
+            cwd,
+            raw_path,
+            line.saturating_sub(1),
+            character.saturating_sub(1),
+            new_name,
+        ) {
+            Ok(preview) => {
+                let content = serde_json::to_string_pretty(&preview).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&preview).unwrap_or_default()),
+                });
+            }
+            Err(err) => return Err(ToolError::Failed(err)),
+        }
+    }
+
+    Err(ToolError::Failed("Rename preview is unavailable without an active language server; plain text search cannot safely guarantee semantic rename".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn planning_tools_are_reserved_for_long_tasks() {
+        let specs = tool_specs();
+        for name in ["todo", "update_plan"] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} spec"));
+            assert!(
+                spec.description.contains("four or more"),
+                "{name}: {}",
+                spec.description
+            );
+            assert!(
+                !spec.description.contains("three or more"),
+                "{name}: {}",
+                spec.description
+            );
+            assert!(
+                spec.description.contains("same response"),
+                "{name}: {}",
+                spec.description
+            );
+        }
+    }
+
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn tool_search_treats_an_empty_cursor_as_the_first_page() {
+        for cursor in [
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(null),
+        ] {
+            let input = serde_json::json!({"query": "x", "cursor": cursor});
+            assert_eq!(tool_search_usize(&input, "cursor", 0).unwrap(), 0);
+        }
+        assert_eq!(
+            tool_search_usize(&serde_json::json!({"cursor": "10"}), "cursor", 0).unwrap(),
+            10
+        );
+        assert_eq!(
+            tool_search_usize(&serde_json::json!({"cursor": 5}), "cursor", 0).unwrap(),
+            5
+        );
+        assert!(tool_search_usize(&serde_json::json!({"cursor": "abc"}), "cursor", 0).is_err());
+        assert!(tool_search_usize(&serde_json::json!({"cursor": -1}), "cursor", 0).is_err());
+    }
+
+    #[test]
+    fn pathological_glob_finishes_quickly() {
+        let name = "a".repeat(40);
+        let started = std::time::Instant::now();
+        assert!(!match_glob_chars("*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn repeated_double_star_prefixes_finish_quickly() {
+        let pattern = format!("{}missing.rs", "**/".repeat(48));
+        let name = format!("{}/present.rs", "a/".repeat(48));
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pattern, &name));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn glob_semantics_are_unchanged() {
+        for (pattern, name, expected) in [
+            ("*.rs", "src/lib.rs", true),
+            ("src/**/*.rs", "src/a/b/c.rs", true),
+            ("src/**/*.rs", "src/c.rs", true),
+            ("?.md", "a.md", true),
+            ("?.md", "ab.md", false),
+            ("**", "anything/at/all", true),
+            ("a*b", "a/x/b", true),
+        ] {
+            assert_eq!(
+                match_glob_chars(pattern, name),
+                expected,
+                "{pattern} {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_capture_rejects_partial_reads_and_drains_overflow() {
+        use std::io::{self, Read};
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+        assert!(read_shell_stream(io::Cursor::new(b"prefix").chain(Broken), 16).is_err());
+        let mut oversized = io::Cursor::new(b"123456789");
+        assert!(read_shell_stream(&mut oversized, 8).is_err());
+        assert_eq!(
+            oversized.position(),
+            9,
+            "overflow must still drain the pipe"
+        );
+        assert_eq!(
+            read_shell_stream(io::Cursor::new(b"12345678"), 8).unwrap(),
+            b"12345678"
+        );
+        assert!(read_shell_stream(io::empty(), 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_capture_reader_failures_are_not_empty_success() {
+        let panic =
+            std::thread::spawn(|| -> std::io::Result<Vec<u8>> { panic!("injected reader panic") });
+        assert!(join_shell_stream(Some(panic)).is_err());
+        let error = std::thread::spawn(|| Err(std::io::Error::other("injected pipe error")));
+        assert!(join_shell_stream(Some(error)).is_err());
+        assert!(join_shell_stream(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_capture_output_fixture() {
+        use std::io::Write;
+        let Ok(stream) = std::env::var("DAVINCI_TEST_SHELL_CAPTURE_STREAM") else {
+            return;
+        };
+        let mut pipe: Box<dyn Write> = match stream.as_str() {
+            "stdout" => Box::new(std::io::stdout()),
+            "stderr" => Box::new(std::io::stderr()),
+            _ => panic!("invalid fixture stream"),
+        };
+        let bytes = [b'x'; 8192];
+        for _ in 0..=MAX_SHELL_STREAM_BYTES / bytes.len() {
+            pipe.write_all(&bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn shell_capture_real_child_overflow_is_an_error() {
+        for stream in ["stdout", "stderr"] {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::tests::shell_capture_output_fixture",
+                    "--nocapture",
+                ])
+                .env("DAVINCI_TEST_SHELL_CAPTURE_STREAM", stream)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let error = wait_shell_output(child, Some(10_000), Some("10"), &ToolContext::default())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("stream byte limit"),
+                "{stream}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_shell_returns_when_a_grandchild_keeps_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext::default();
+        let started = std::time::Instant::now();
+        let result = execute_tool_with(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command": "sleep 30 & echo started", "timeout": 5}),
+            &context,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        let result = result.unwrap();
+        assert!(result.content.contains("started"));
+        assert!(result.content.contains("output truncated"));
+        assert!(result.is_error, "partial output cannot verify success");
+    }
+
+    #[test]
+    fn read_large_text_file_returns_requested_window() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let content = (1..=5000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).unwrap();
+
+        let window = read_text_window(&path, 2500, 3, 1024).unwrap();
+
+        assert_eq!(window.first_line, 2500);
+        assert_eq!(window.lines_returned, 3);
+        assert_eq!(window.content, "line 2500\nline 2501\nline 2502");
+        assert!(window.truncated);
+    }
+
+    #[test]
+    fn read_window_preserves_utf8_at_byte_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("utf8.txt");
+        fs::write(&path, "éclair\nnext\n").unwrap();
+
+        let window = read_text_window(&path, 1, 1, "éclair".len()).unwrap();
+
+        assert_eq!(window.content, "éclair");
+        assert!(!window.content.contains('\u{fffd}'));
+        assert!(window.truncated);
+    }
+
+    #[test]
+    fn f02_waiting_mode() {
+        assert_eq!(decision_wait(false, false, false), "decision_required");
+        assert_eq!(decision_wait(true, false, false), "wait_for_user");
+        assert_eq!(decision_wait(true, true, false), "deferred");
+        assert_eq!(decision_wait(true, false, true), "cancelled");
+    }
+
+    fn f02_question_fixture() -> (tempfile::TempDir, ToolContext, serde_json::Value) {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("src.rs"), "fn existing() {}\n").unwrap();
+        let mut plan = crate::LivingPlan::default();
+        plan.update(
+            &serde_json::json!({
+                "expected_revision":0,
+                "goal":"Choose cache persistence",
+                "evidence":[{"path":"src.rs","finding":"Current cache entry point"}]
+            }),
+            dir.path(),
+        )
+        .unwrap();
+        let context = ToolContext {
+            living_plan: Arc::new(Mutex::new(plan)),
+            ..ToolContext::default()
+        };
+        let question = serde_json::json!({
+            "id":"cache-scope",
+            "kind":"persistence",
+            "title":"Cache scope",
+            "question":"Which cache should be used?",
+            "materiality":"Changes persistence semantics",
+            "evidence_refs":["src.rs"],
+            "options":[
+                {"id":"memory","label":"Memory","explanation":"Process local","recommended":true},
+                {"id":"sqlite","label":"SQLite","explanation":"Persistent","recommended":false}
+            ],
+            "allow_custom":true,
+            "custom_only":false
+        });
+        (dir, context, question)
+    }
+
+    #[test]
+    fn f02_question_schema_has_content_but_no_authority_fields() {
+        let spec = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "ask_user_question")
+            .unwrap();
+        let properties = spec.parameters["properties"].as_object().unwrap();
+        for forbidden in [
+            "answer",
+            "state",
+            "actor",
+            "approved_revision",
+            "permission_mode",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "schema exposed {forbidden}"
+            );
+        }
+        assert_eq!(spec.parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn f02_no_ui_and_timeout_return_pending_without_plan_mutation() {
+        let (dir, context, question) = f02_question_fixture();
+        let before = context.living_plan.lock().unwrap().clone();
+        let unavailable =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &context).unwrap();
+        assert!(unavailable.is_error);
+        assert_eq!(
+            unavailable.details.as_ref().unwrap()["status"],
+            "decision_required"
+        );
+        assert_eq!(*context.living_plan.lock().unwrap(), before);
+
+        let timeout_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                DecisionHostResponse::Unavailable
+            })),
+            decision_timeout: Some(std::time::Duration::from_millis(25)),
+            ..ToolContext::default()
+        };
+        let started = std::time::Instant::now();
+        let timed_out =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &timeout_context)
+                .unwrap();
+        assert!(timed_out.is_error);
+        assert_eq!(timed_out.details.as_ref().unwrap()["reason"], "timeout");
+        assert!(
+            timed_out.details.as_ref().unwrap()["elapsed_ms"]
+                .as_u64()
+                .unwrap()
+                >= 20
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+        assert_eq!(*timeout_context.living_plan.lock().unwrap(), before);
+    }
+
+    #[test]
+    fn f02_host_answer_uses_authenticated_reply_and_never_changes_files() {
+        let (dir, context, question) = f02_question_fixture();
+        let source_before = fs::read(dir.path().join("src.rs")).unwrap();
+        let answer_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                DecisionHostResponse::Reply(DecisionHostReply {
+                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    host_event_id: "ui-event-1".into(),
+                    answered_at_ms: 42,
+                })
+            })),
+            ..ToolContext::default()
+        };
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &answer_context).unwrap();
+        assert!(!result.is_error);
+        let plan = answer_context.living_plan.lock().unwrap().clone();
+        let decision = &plan.structured_decisions["cache-scope"];
+        assert_eq!(
+            decision.state,
+            crate::decisions::DecisionState::AnsweredByUser
+        );
+        assert_eq!(
+            decision.answer.as_ref().unwrap().host_event_id,
+            "ui-event-1"
+        );
+        assert_eq!(fs::read(dir.path().join("src.rs")).unwrap(), source_before);
+    }
+
+    #[test]
+    fn f02_one_question_capacity_and_parent_stop_are_fail_closed() {
+        let (dir, context, question) = f02_question_fixture();
+        *context.decision_slot.lock().unwrap() = Some("already-pending".into());
+        let occupied = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_slot: context.decision_slot.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| panic!("must not dispatch"))),
+            ..ToolContext::default()
+        };
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &occupied).unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            result.details.as_ref().unwrap()["pending_decision_id"],
+            "already-pending"
+        );
+
+        let stopped = ToolContext {
+            living_plan: context.living_plan.clone(),
+            abort: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            decision_responder: Some(DecisionResponder::new(|_| panic!("must not dispatch"))),
+            ..ToolContext::default()
+        };
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &stopped).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.details.as_ref().unwrap()["status"], "cancelled");
+
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let during_wait = ToolContext {
+            living_plan: context.living_plan.clone(),
+            abort: Some(abort.clone()),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                DecisionHostResponse::Unavailable
+            })),
+            decision_timeout: Some(std::time::Duration::from_secs(1)),
+            ..ToolContext::default()
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &during_wait).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.details.as_ref().unwrap()["status"], "cancelled");
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+    }
+
+    #[test]
+    fn f02_hanging_responder_times_out_promptly_without_plan_mutation() {
+        let (dir, context, question) = f02_question_fixture();
+        let before = context.living_plan.lock().unwrap().clone();
+        let timeout_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                DecisionHostResponse::Reply(DecisionHostReply {
+                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    host_event_id: "late-event".into(),
+                    answered_at_ms: 100,
+                })
+            })),
+            decision_timeout: Some(std::time::Duration::from_millis(25)),
+            ..ToolContext::default()
+        };
+        let started = std::time::Instant::now();
+        let timed_out =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &timeout_context)
+                .unwrap();
+        assert!(timed_out.is_error);
+        assert_eq!(timed_out.details.as_ref().unwrap()["reason"], "timeout");
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(*timeout_context.living_plan.lock().unwrap(), before);
+        assert!(timeout_context.decision_slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn f02_abort_while_responder_blocked_cancels_promptly() {
+        let (dir, context, question) = f02_question_fixture();
+        let before = context.living_plan.lock().unwrap().clone();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abort_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            abort: Some(abort.clone()),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                DecisionHostResponse::Reply(DecisionHostReply {
+                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    host_event_id: "late-event".into(),
+                    answered_at_ms: 100,
+                })
+            })),
+            decision_timeout: Some(std::time::Duration::from_secs(10)),
+            ..ToolContext::default()
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &abort_context).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.details.as_ref().unwrap()["status"], "cancelled");
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(*abort_context.living_plan.lock().unwrap(), before);
+        assert!(abort_context.decision_slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn parallel_edits_on_the_same_file_are_serialized() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("parallel-edit.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let cwd = dir.path().to_path_buf();
+        let left = std::thread::spawn({
+            let cwd = cwd.clone();
+            move || {
+                execute_tool(
+                    &cwd,
+                    "edit",
+                    &serde_json::json!({
+                        "path":"parallel-edit.txt",
+                        "edits":[{"oldText":"alpha","newText":"ALPHA"}]
+                    }),
+                )
+            }
+        });
+        let right = std::thread::spawn({
+            let cwd = cwd.clone();
+            move || {
+                execute_tool(
+                    &cwd,
+                    "edit",
+                    &serde_json::json!({
+                        "path":"parallel-edit.txt",
+                        "edits":[{"oldText":"beta","newText":"BETA"}]
+                    }),
+                )
+            }
+        });
+        left.join().unwrap().unwrap();
+        right.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "ALPHA\nBETA\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn multi_edit_executes_with_empty_legacy_placeholders() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({
+                "path": "a.txt",
+                "edits": [
+                    {"oldText": "alpha", "newText": "ALPHA"},
+                    {"oldText": "gamma", "newText": "GAMMA"}
+                ],
+                "oldText": "", "newText": ""
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+    }
+
+    #[test]
+    fn read_write_edit_semantics() {
+        let dir = tempdir().unwrap();
+        execute_tool(
+            dir.path(),
+            "write",
+            &serde_json::json!({"path":"a.txt","content":"hello"}),
+        )
+        .unwrap();
+        let read = execute_tool(dir.path(), "read", &serde_json::json!({"path":"a.txt"})).unwrap();
+        assert_eq!(read.content, "hello");
+        execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({"path":"a.txt","oldText":"hello","newText":"world"}),
+        )
+        .unwrap();
+        let read = execute_tool(dir.path(), "read", &serde_json::json!({"path":"a.txt"})).unwrap();
+        assert_eq!(read.content, "world");
+        execute_tool(
+            dir.path(),
+            "write",
+            &serde_json::json!({"path":"b.txt","content":"one\ntwo\nthree\n"}),
+        )
+        .unwrap();
+        let sliced = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path":"b.txt","offset":2,"limit":1}),
+        )
+        .unwrap();
+        assert_eq!(sliced.content, "two");
+        assert_eq!(
+            sliced.details.as_ref().unwrap()["truncation"]["totalLines"],
+            3
+        );
+        execute_tool(
+            dir.path(),
+            "write",
+            &serde_json::json!({"path":"c.txt","content":"alpha\nbeta\ngamma\n"}),
+        )
+        .unwrap();
+        execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({
+                "path":"c.txt",
+                "edits":[
+                    {"oldText":"alpha","newText":"ALPHA"},
+                    {"oldText":"gamma","newText":"GAMMA"}
+                ]
+            }),
+        )
+        .unwrap();
+        let on_disk = fs::read_to_string(dir.path().join("c.txt")).unwrap();
+        assert_eq!(on_disk, "ALPHA\nbeta\nGAMMA\n");
+        let missing = execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({"path":"c.txt","edits":[{"oldText":"nope","newText":"x"}]}),
+        )
+        .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("Could not find the exact text in c.txt"));
+    }
+
+    #[test]
+    fn bash_timeout_matches_ts_errors() {
+        let dir = tempdir().unwrap();
+        let invalid = execute_tool(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command":"true","timeout":0}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "Invalid timeout: must be a finite number of seconds"
+        );
+        let timed_out = execute_tool(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command":"sleep 2","timeout":0.2}),
+        )
+        .unwrap_err();
+        assert!(timed_out
+            .to_string()
+            .contains("Command timed out after 0.2 seconds"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_powershell_honors_and_validates_timeout() {
+        let dir = tempdir().unwrap();
+        let capture =
+            crate::command_receipt::CommandReceiptCapture::new("timeout", "powershell", None);
+        let context = ToolContext {
+            command_receipt: Some(capture.clone()),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let error = execute_tool_with(
+            dir.path(),
+            "powershell",
+            &serde_json::json!({"command":"Start-Sleep -Seconds 2", "timeout":0.2}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Command timed out after 0.2 seconds"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(capture.take().is_none());
+        let invalid = execute_tool_with(dir.path(), "powershell", &serde_json::json!({"command":"Set-Content -Path should-not-exist.txt -Value ran", "timeout":0}), &context).unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "Invalid timeout: must be a finite number of seconds"
+        );
+        assert!(!dir.path().join("should-not-exist.txt").exists());
+    }
+
+    #[test]
+    fn grep_find_ls_match_ts_strings() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/app.ts"), "const needle = 1;\nkeep\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "secret.txt\n").unwrap();
+        fs::write(dir.path().join("secret.txt"), "needle hidden").unwrap();
+        let grep = execute_tool(
+            dir.path(),
+            "grep",
+            &serde_json::json!({"pattern":"needle","glob":"*.ts"}),
+        )
+        .unwrap();
+        assert!(grep.content.contains("src/app.ts:1: const needle = 1;"));
+        assert!(!grep.content.contains("secret.txt"));
+        let missing = execute_tool(
+            dir.path(),
+            "grep",
+            &serde_json::json!({"pattern":"nope","path":"missing"}),
+        )
+        .unwrap_err();
+        assert!(missing.to_string().starts_with("Path not found:"));
+        let none =
+            execute_tool(dir.path(), "grep", &serde_json::json!({"pattern":"zzzz"})).unwrap();
+        assert_eq!(none.content, "No matches found");
+        let found =
+            execute_tool(dir.path(), "find", &serde_json::json!({"pattern":"*.ts"})).unwrap();
+        assert_eq!(found.content, "src/app.ts");
+        let empty =
+            execute_tool(dir.path(), "find", &serde_json::json!({"pattern":"*.rs"})).unwrap();
+        assert_eq!(empty.content, "No files found matching pattern");
+        let listed = execute_tool(dir.path(), "ls", &serde_json::json!({})).unwrap();
+        assert!(listed.content.contains("src/"));
+        let empty_dir = dir.path().join("blank");
+        fs::create_dir_all(&empty_dir).unwrap();
+        let empty_ls =
+            execute_tool(dir.path(), "ls", &serde_json::json!({"path":"blank"})).unwrap();
+        assert_eq!(empty_ls.content, "(empty directory)");
+        let not_dir =
+            execute_tool(dir.path(), "ls", &serde_json::json!({"path":"src/app.ts"})).unwrap_err();
+        assert!(not_dir.to_string().starts_with("Not a directory:"));
+    }
+
+    #[test]
+    fn audit_regression_recursive_grep_omits_credentials() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("nested/secrets")).unwrap();
+        for name in [
+            ".env",
+            ".env.local",
+            "ID_RSA_backup",
+            "key.pem",
+            "nested/secrets/token.txt",
+        ] {
+            fs::write(dir.path().join(name), "needle PRIVATE_FIXTURE\n").unwrap();
+        }
+        fs::write(dir.path().join("public.txt"), "needle PUBLIC_FIXTURE\n").unwrap();
+        for native in [false, true] {
+            for glob in ["**/*", ".env", "**/.env*", "[.]env", "*.pem"] {
+                let input =
+                    serde_json::json!({"pattern":"needle", "path":".", "glob":glob, "context":1});
+                let result = if native {
+                    grep_tool_native(dir.path(), &input, &ToolContext::default())
+                } else {
+                    grep_tool(dir.path(), &input, &ToolContext::default())
+                }
+                .unwrap();
+                assert!(
+                    !result.content.contains("PRIVATE_FIXTURE"),
+                    "credential exposed for glob {glob}, native={native}"
+                );
+                if glob == "**/*" {
+                    assert!(result.content.contains("PUBLIC_FIXTURE"));
+                }
+            }
+            // The caller's permission gate still authorizes an explicit secret path.
+            let input = serde_json::json!({"pattern":"needle", "path":".env"});
+            let explicit = if native {
+                grep_tool_native(dir.path(), &input, &ToolContext::default())
+            } else {
+                grep_tool(dir.path(), &input, &ToolContext::default())
+            }
+            .unwrap();
+            assert!(explicit.content.contains("PRIVATE_FIXTURE"));
+        }
+    }
+
+    /// A ripgrep stdout that never ends: one match event per read, forever.
+    struct EndlessRg(usize);
+
+    impl std::io::Read for EndlessRg {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            let line = format!(
+                "{{\"type\":\"match\",\"data\":{{\"path\":{{\"text\":\"f{}.rs\"}},\"line_number\":{},\"lines\":{{\"text\":\"needle\\n\"}}}}}}\n",
+                self.0, self.0
+            );
+            let bytes = line.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+    }
+
+    /// A ripgrep stdout that produces nothing and never closes, like a
+    /// walk over a huge tree that has found nothing yet.
+    struct SilentRg {
+        receiver: std::sync::mpsc::Receiver<u8>,
+        /// Held so the receiver blocks instead of seeing a closed channel.
+        _sender: std::sync::mpsc::Sender<u8>,
+    }
+
+    impl std::io::Read for SilentRg {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.receiver.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn grep_stops_reading_ripgrep_at_the_match_limit() {
+        let stream = stream_rg_matches(EndlessRg(0), 5, &ToolContext::default(), false);
+        assert_eq!(stream.matches.len(), 5);
+        assert!(stream.limit_reached);
+        assert!(!stream.aborted);
+        assert_eq!(stream.matches[4].0, PathBuf::from("f5.rs"));
+        assert_eq!(stream.matches[4].1, 5);
+    }
+
+    #[test]
+    fn grep_stops_reading_ripgrep_when_the_turn_is_aborted() {
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let context = ToolContext {
+            abort: Some(abort.clone()),
+            ..ToolContext::default()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let abort = abort.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                abort.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let started = std::time::Instant::now();
+        let stream = stream_rg_matches(
+            SilentRg {
+                receiver,
+                _sender: sender,
+            },
+            5,
+            &context,
+            false,
+        );
+        assert!(stream.aborted);
+        assert!(stream.matches.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn grep_honours_the_limit_and_the_abort_flag_end_to_end() {
+        let dir = tempdir().unwrap();
+        for index in 0..6 {
+            fs::write(
+                dir.path().join(format!("file{index}.txt")),
+                "needle one\nneedle two\n",
+            )
+            .unwrap();
+        }
+        let limited = execute_tool(
+            dir.path(),
+            "grep",
+            &serde_json::json!({"pattern":"needle","limit":2}),
+        )
+        .unwrap();
+        let match_lines = limited
+            .content
+            .lines()
+            .filter(|line| line.contains(": needle"))
+            .count();
+        assert_eq!(match_lines, 2, "{}", limited.content);
+        assert!(limited.content.contains("2 matches limit reached"));
+        assert_eq!(
+            limited
+                .details
+                .and_then(|d| d.get("matchLimitReached").cloned()),
+            Some(serde_json::json!(2))
+        );
+        let aborted = execute_tool_with(
+            dir.path(),
+            "grep",
+            &serde_json::json!({"pattern":"needle"}),
+            &ToolContext {
+                abort: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+                ..ToolContext::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(aborted.to_string(), "Operation aborted");
+    }
+
+    #[test]
+    fn powershell_and_image_read() {
+        // Keep the reply override out of other concurrently running command tests.
+        if std::env::var_os("DAVINCI_POWERSHELL_REPLY_FIXTURE").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::tests::powershell_and_image_read",
+                    "--nocapture",
+                ])
+                .env("DAVINCI_POWERSHELL_REPLY_FIXTURE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "fixture must execute its child test"
+            );
+            return;
+        }
+        std::env::set_var("PI_POWERSHELL_REPLY", "ps-ok");
+        let dir = tempdir().unwrap();
+        let capture =
+            crate::command_receipt::CommandReceiptCapture::new("simulated", "powershell", None);
+        let context = ToolContext {
+            command_receipt: Some(capture.clone()),
+            ..Default::default()
+        };
+        let ps = execute_tool_with(
+            dir.path(),
+            "powershell",
+            &serde_json::json!({"command":"Get-Date"}),
+            &context,
+        )
+        .unwrap();
+        std::env::remove_var("PI_POWERSHELL_REPLY");
+        assert_eq!(ps.content, "ps-ok");
+        assert!(
+            capture.take().is_none(),
+            "simulated output must not produce execution evidence"
+        );
+        assert!(tool_specs().iter().any(|tool| tool.name == "powershell"));
+        let png = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        fs::write(dir.path().join("dot.png"), &bytes).unwrap();
+        let read =
+            execute_tool(dir.path(), "read", &serde_json::json!({"path":"dot.png"})).unwrap();
+        assert!(read.content.starts_with("Read image file [image/png]"));
+        assert!(read.details.as_ref().unwrap()["image"]["data"].is_string());
+    }
+
+    #[test]
+    fn fd_and_rg_argv_match_typescript_tools() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let fd = build_fd_args("src/*.rs", dir.path(), 25);
+        let expected_pattern = if cfg!(windows) {
+            "**[/\\\\]src[/\\\\]*.rs"
+        } else {
+            "**/src/*.rs"
+        };
+        assert_eq!(
+            fd,
+            vec![
+                "--glob",
+                "--color=never",
+                "--hidden",
+                "--exclude",
+                ".git",
+                "--exclude",
+                "node_modules",
+                "--max-results",
+                "25",
+                "--full-path",
+                "--",
+                expected_pattern,
+                dir.path().to_string_lossy().as_ref(),
+            ]
+        );
+        let rg = build_rg_args("Needle", dir.path(), Some("*.rs"), true, true);
+        assert_eq!(
+            rg,
+            vec![
+                "--json",
+                "--line-number",
+                "--color=never",
+                "--hidden",
+                "--ignore-case",
+                "--fixed-strings",
+                "--glob",
+                "*.rs",
+                "--glob",
+                "!.git",
+                "--glob",
+                "!node_modules",
+                "--",
+                "Needle",
+                dir.path().to_string_lossy().as_ref(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fd_argv_disables_git_requirement_outside_a_repo() {
+        let dir = tempdir().unwrap();
+        let args = build_fd_args("*.rs", dir.path(), 10);
+        assert!(args.iter().any(|arg| arg == "--no-require-git"));
+    }
+
+    #[test]
+    fn shell_timeout_reads_codex_millisecond_values() {
+        let resolve = |input: serde_json::Value| resolve_bash_timeout_ms(&input).unwrap();
+        assert_eq!(resolve(serde_json::json!({"timeout": 120})), Some(120_000));
+        assert_eq!(
+            resolve(serde_json::json!({"timeout": 3600})),
+            Some(3_600_000)
+        );
+        assert_eq!(resolve(serde_json::json!({"timeout": 1.5})), Some(1_500));
+        // Millisecond-shaped values seen from GPT models in the benchmark.
+        assert_eq!(
+            resolve(serde_json::json!({"timeout": 120000})),
+            Some(120_000)
+        );
+        assert_eq!(resolve(serde_json::json!({"timeout": 10000})), Some(10_000));
+        // Above the threshold but not whole thousands: still seconds.
+        assert_eq!(
+            resolve(serde_json::json!({"timeout": 10001})),
+            Some(10_001_000)
+        );
+        assert_eq!(
+            resolve(serde_json::json!({"timeout_ms": 2500})),
+            Some(2_500)
+        );
+        assert_eq!(resolve(serde_json::json!({})), None);
+        assert!(resolve_bash_timeout_ms(&serde_json::json!({"timeout_ms": -1})).is_err());
+        assert!(resolve_bash_timeout_ms(&serde_json::json!({"timeout": 0})).is_err());
+        let label = |input: serde_json::Value| {
+            shell_timeout_label(&input, resolve_bash_timeout_ms(&input).unwrap())
+        };
+        assert_eq!(
+            label(serde_json::json!({"timeout": 0.2})).as_deref(),
+            Some("0.2")
+        );
+        assert_eq!(
+            label(serde_json::json!({"timeout": 120000})).as_deref(),
+            Some("120")
+        );
+        assert_eq!(
+            label(serde_json::json!({"timeout_ms": 2500})).as_deref(),
+            Some("2.5")
+        );
+        assert_eq!(label(serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn read_of_missing_file_names_closest_matches() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("shop")).unwrap();
+        fs::write(dir.path().join("shop").join("pricing.py"), "x").unwrap();
+        fs::write(dir.path().join("README.md"), "x").unwrap();
+        let err = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path": "pricing.py"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("File not found: pricing.py"), "{err}");
+        assert!(err.contains("shop/pricing.py"), "{err}");
+        assert!(!err.contains("os error"), "{err}");
+        let err = execute_tool(dir.path(), "read", &serde_json::json!({"path": "zzz.rs"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No similar files"), "{err}");
+    }
+
+    #[test]
+    fn search_fast_paths_keep_excluded_dirs_when_targeted() {
+        let dir = tempdir().unwrap();
+        let fd = build_fd_args(".git/hooks/*", dir.path(), 10);
+        assert!(!fd.iter().any(|arg| arg == "--exclude"));
+        let rg = build_rg_args("x", &dir.path().join(".git"), None, false, false);
+        assert!(!rg.iter().any(|arg| arg == "!.git"));
+        let rg = build_rg_args("x", dir.path(), Some("node_modules/**"), false, false);
+        assert!(!rg.iter().any(|arg| arg == "!node_modules"));
+        // A broad user glob must not re-include .git: the negation comes last.
+        let rg = build_rg_args("x", dir.path(), Some("**/*"), false, false);
+        let user = rg.iter().position(|arg| arg == "**/*").unwrap();
+        let negated = rg.iter().position(|arg| arg == "!.git").unwrap();
+        assert!(negated > user, "{rg:?}");
+        // A file that merely starts with ".git" is not a request for .git.
+        let fd = build_fd_args(".gitignore", dir.path(), 10);
+        assert!(fd.iter().any(|arg| arg == ".git"));
+    }
+
+    #[test]
+    fn grep_context_merges_overlapping_windows() {
+        let lines: Vec<&str> = (1..=12).map(|_| "x").collect();
+        let (out, truncated) = render_grep_context("f.py", &lines, &[3, 5, 11], 1);
+        assert!(!truncated);
+        assert_eq!(
+            out,
+            vec![
+                "f.py-2- x",
+                "f.py:3: x",
+                "f.py-4- x",
+                "f.py:5: x",
+                "f.py-6- x",
+                "--",
+                "f.py-10- x",
+                "f.py:11: x",
+                "f.py-12- x",
+            ]
+        );
+        // Adjacent windows join without a separator; edges clamp to the file.
+        let (out, _) = render_grep_context("f.py", &lines, &[1, 4], 1);
+        assert_eq!(out.first().unwrap(), "f.py:1: x");
+        assert!(!out.contains(&"--".to_string()));
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn native_grep_prints_each_context_line_once() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.txt"),
+            "one\nneedle\nthree\nneedle\nfive\n",
+        )
+        .unwrap();
+        let out = grep_tool_native(
+            dir.path(),
+            &serde_json::json!({"pattern": "needle", "context": 1}),
+            &ToolContext::default(),
+        )
+        .unwrap()
+        .content;
+        assert_eq!(out.matches("three").count(), 1, "{out}");
+        assert_eq!(out.matches("needle").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn relativize_find_result_is_posix() {
+        assert_eq!(
+            relativize_find_result_path(Path::new("/tmp/root/src/app.ts"), Path::new("/tmp/root")),
+            "src/app.ts"
+        );
+    }
+
+    #[test]
+    fn execute_tool_apply_patch_works() {
+        let dir = tempdir().unwrap();
+        let patch = r#"*** Begin Patch
+*** Add File: test.txt
++Hello Codex
+*** End Patch"#;
+        let res = execute_tool(
+            dir.path(),
+            "apply_patch",
+            &serde_json::json!({ "input": patch }),
+        )
+        .unwrap();
+        assert!(!res.is_error);
+        assert!(res.content.contains("1 added"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("test.txt")).unwrap(),
+            "Hello Codex\n"
+        );
+    }
+
+    #[test]
+    fn write_stdin_tool_reports_error_on_missing_args_or_invalid_job() {
+        let dir = tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // Missing job_id
+        let res = execute_tool_with(
+            dir.path(),
+            "write_stdin",
+            &serde_json::json!({ "input": "test" }),
+            &context,
+        )
+        .unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("Missing jobId"));
+
+        // Missing input
+        let res = execute_tool_with(
+            dir.path(),
+            "write_stdin",
+            &serde_json::json!({ "job_id": 1 }),
+            &context,
+        )
+        .unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("Missing required parameter: input"));
+
+        // Non-existent job
+        let res = execute_tool_with(
+            dir.path(),
+            "write_stdin",
+            &serde_json::json!({ "job_id": 42, "input": "test" }),
+            &context,
+        )
+        .unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("No background job 42"));
+    }
+
+    #[test]
+    fn test_team_tools_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // When disabled (default)
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS");
+        let specs = tool_specs();
+        assert!(!specs.iter().any(|s| s.name == "agent_status"));
+        assert!(!specs.iter().any(|s| s.name == "task_create"));
+        assert!(!specs.iter().any(|s| s.name == "task_get"));
+
+        let err = execute_tool_with(dir.path(), "agent_status", &serde_json::json!({}), &context)
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed(ref msg) if msg.contains("Team coordination tools are disabled"))
+        );
+
+        // When enabled
+        std::env::set_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1");
+        let specs_enabled = tool_specs();
+        let capabilities = crate::runtime::capabilities::builtin_capabilities();
+        let get_dispatch = execute_tool_with(
+            dir.path(),
+            "task_get",
+            &serde_json::json!({"task_id": uuid::Uuid::new_v4().to_string()}),
+            &context,
+        );
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS");
+        assert!(
+            matches!(get_dispatch, Err(ToolError::Failed(message)) if message == "Runtime subsystem not initialized")
+        );
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap.name == "task_get" && cap.read_only));
+        assert!(specs_enabled.iter().any(|s| s.name == "agent_status"));
+        assert!(specs_enabled.iter().any(|s| s.name == "task_create"));
+        assert!(specs_enabled.iter().any(|s| s.name == "task_update"));
+        assert!(specs_enabled.iter().any(|s| s.name == "task_get"));
+    }
+
+    #[test]
+    fn test_workflow_tools_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // When disabled (default)
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_WORKFLOWS");
+        std::env::remove_var("DAVINCI_RUNTIME_WORKFLOWS");
+        let specs = tool_specs();
+        assert!(!specs.iter().any(|s| s.name == "workflow_run"));
+        assert!(!specs.iter().any(|s| s.name == "workflow_status"));
+
+        let err = execute_tool_with(
+            dir.path(),
+            "workflow_status",
+            &serde_json::json!({}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed(ref msg) if msg.contains("Workflow coordination tools are disabled"))
+        );
+
+        // When enabled
+        std::env::set_var("DAVINCI_EXPERIMENTAL_WORKFLOWS", "1");
+        let specs_enabled = tool_specs();
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_WORKFLOWS");
+        assert!(specs_enabled.iter().any(|s| s.name == "workflow_run"));
+        assert!(specs_enabled.iter().any(|s| s.name == "workflow_status"));
+    }
+
+    #[test]
+    fn semantic_tools_registration_and_fallback_execution() {
+        let dir = tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // 1. Tool specs exist
+        let specs = tool_specs();
+        assert!(specs.iter().any(|s| s.name == "code_definition"));
+        assert!(specs.iter().any(|s| s.name == "code_references"));
+        assert!(specs.iter().any(|s| s.name == "code_outline"));
+        assert!(specs.iter().any(|s| s.name == "code_diagnostics"));
+        assert!(specs.iter().any(|s| s.name == "code_call_hierarchy"));
+        assert!(specs.iter().any(|s| s.name == "code_rename_preview"));
+
+        // 2. Prepare sample source file
+        let src = r#"
+pub struct User {
+    pub name: String,
+}
+
+impl User {
+    pub fn greet(&self) -> String {
+        format!("Hello, {}", self.name)
+    }
+}
+"#;
+        std::fs::write(dir.path().join("user.rs"), src).unwrap();
+
+        // 3. Fallback definition
+        let def_res = execute_tool_with(
+            dir.path(),
+            "code_definition",
+            &serde_json::json!({"path": "user.rs", "symbol": "greet"}),
+            &context,
+        )
+        .unwrap();
+        assert!(!def_res.is_error);
+        assert!(def_res.content.contains("greet"));
+        assert!(def_res.content.contains("fallback"));
+
+        // 4. Fallback references
+        let ref_res = execute_tool_with(
+            dir.path(),
+            "code_references",
+            &serde_json::json!({"path": "user.rs", "symbol": "User"}),
+            &context,
+        )
+        .unwrap();
+        assert!(!ref_res.is_error);
+        assert!(ref_res.content.contains("user.rs"));
+
+        // 5. Fallback outline
+        let outline_res = execute_tool_with(
+            dir.path(),
+            "code_outline",
+            &serde_json::json!({"path": "user.rs"}),
+            &context,
+        )
+        .unwrap();
+        assert!(!outline_res.is_error);
+        assert!(outline_res.content.contains("User"));
+        assert!(outline_res.content.contains("greet"));
+
+        // 6. Diagnostics without a server are explicitly partial, never a
+        // false claim that an empty result proves the file is error-free.
+        let diag_res = execute_tool_with(
+            dir.path(),
+            "code_diagnostics",
+            &serde_json::json!({"path": "user.rs"}),
+            &context,
+        )
+        .unwrap();
+        assert!(!diag_res.is_error);
+        assert_eq!(
+            diag_res
+                .details
+                .as_ref()
+                .and_then(|value| value["partial"].as_bool()),
+            Some(true)
+        );
+        assert!(diag_res.content.contains("no compiler diagnostics"));
+
+        // 7. Call hierarchy without server returns unsupported error
+        let hier_res = execute_tool_with(
+            dir.path(),
+            "code_call_hierarchy",
+            &serde_json::json!({"path": "user.rs", "line": 7, "character": 12}),
+            &context,
+        );
+        assert!(hier_res.is_err());
+        assert!(hier_res
+            .unwrap_err()
+            .to_string()
+            .contains("Call hierarchy is unsupported"));
+
+        // 8. Rename preview without server returns error
+        let rename_res = execute_tool_with(
+            dir.path(),
+            "code_rename_preview",
+            &serde_json::json!({"path": "user.rs", "line": 7, "character": 12, "newName": "say_hello"}),
+            &context,
+        );
+        assert!(rename_res.is_err());
+        assert!(rename_res
+            .unwrap_err()
+            .to_string()
+            .contains("Rename preview is unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod sandbox_process_fail_closed_tests {
+    use super::*;
+    use davinci_protocol::{
+        EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
+        SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode, SandboxSpec,
+    };
+
+    fn sandbox(root: &std::path::Path) -> SandboxSpec {
+        SandboxSpec {
+            id: SandboxId("fail-closed".into()),
+            mode: SandboxMode::FullAccess,
+            backend: SandboxBackendKind::Host,
+            container: None,
+            workspace: root.canonicalize().unwrap().to_string_lossy().into_owned(),
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::Unrestricted,
+            environment: EnvironmentPolicy::default(),
+            resources: ResourcePolicy::default(),
+            process: ProcessPolicy::default(),
+            required_capabilities: SandboxCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn configured_sandbox_never_falls_back_to_direct_foreground_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            sandbox: Some(sandbox(root.path())),
+            foreground_supervisor: None,
+            ..Default::default()
+        };
+        let error = execute_tool_with(
+            root.path(),
+            "exec_command",
+            &serde_json::json!({"command":"echo sandbox-bypass"}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("sandbox") && error.to_string().contains("supervisor"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sandboxed_background_command_runs_as_a_supervised_job() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = sandbox(root.path());
+        spec.process.allow_background = true;
+        let context = ToolContext {
+            sandbox: Some(spec),
+            foreground_supervisor: Some(crate::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: vec![
+                    "--exact".into(),
+                    "tools::foreground::tests::foreground_supervisor_fixture".into(),
+                    "--nocapture".into(),
+                ],
+            }),
+            ..Default::default()
+        };
+        let started = execute_tool_with(
+            root.path(),
+            "exec_command",
+            &serde_json::json!({
+                "command": "printf supervised-background; exit 3",
+                "background": true
+            }),
+            &context,
+        )
+        .unwrap();
+        let id = started.details.as_ref().unwrap()["jobId"].as_u64().unwrap();
+        let output = execute_tool_with(
+            root.path(),
+            "job_output",
+            &serde_json::json!({"jobId": id, "wait": 10}),
+            &context,
+        )
+        .unwrap();
+        assert!(
+            output.content.contains("supervised-background"),
+            "{}",
+            output.content
+        );
+        let job_book = context.jobs.lock().unwrap();
+        let job = job_book.get(id as u32).unwrap();
+        assert_eq!(job.status(), crate::jobs::JobStatus::Exited(3));
+    }
+
+    #[test]
+    fn configured_sandbox_never_falls_back_to_direct_background_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            sandbox: Some(sandbox(root.path())),
+            foreground_supervisor: None,
+            ..Default::default()
+        };
+        let error = execute_tool_with(
+            root.path(),
+            "exec_command",
+            &serde_json::json!({
+                "command":"echo sandbox-background-bypass",
+                "background":true
+            }),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("sandbox") && error.to_string().contains("background"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_discovery_regressions {
+    use super::*;
+
+    #[test]
+    fn wildcard_directory_targets_are_not_overridden() {
+        for pattern in [
+            "**/node_modules*/**",
+            "**/.git*/**",
+            "node_module?/pkg/*.js",
+        ] {
+            assert!(targets_excluded_dir(pattern, Path::new(".")), "{pattern}");
+            let args = build_rg_args("needle", Path::new("."), Some(pattern), false, false);
+            assert!(!args
+                .iter()
+                .any(|arg| arg == "!node_modules" || arg == "!.git"));
+        }
+        assert!(!targets_excluded_dir("**/*", Path::new(".")));
+        assert!(!targets_excluded_dir("!**/.git*/**", Path::new(".")));
+        assert!(targets_excluded_dir(
+            &format!(".git{}", "*".repeat(40000)),
+            Path::new(".")
+        ));
+    }
+
+    #[test]
+    fn discovery_counts_empty_directories_and_reports_truncation() {
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..20 {
+            fs::create_dir(root.path().join(format!("dir{n:02}"))).unwrap();
+        }
+        let mut visited = 0;
+        assert!(!walk_workspace_files(root.path(), 3, &mut |_| {
+            visited += 1;
+            true
+        }));
+        assert_eq!(visited, 0);
+        assert!(walk_workspace_files(root.path(), 20, &mut |_| true));
+    }
+}

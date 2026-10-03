@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "project": "P10",
+  "name": "verification-planner",
+  "status": "implementation_present_focused_validation_passed",
+  "checkpointDate": "2026-09-18",
+  "sourceCopy": ".codex-p9",
+  "implementation": {
+    "tool": "verification_plan",
+    "command": "verification-status",
+    "execution": "planning_only",
+    "sourceBoundSteps": true,
+    "explicitStepDependencies": true,
+    "genericBuildRequiresExternalReceipt": true,
+    "authorizationUsesDispatcherCwd": true,
+    "hostOwnedTransactionResolution": true,
+    "permissionClass": "read",
+    "graphClassifierDenied": true,
+    "changedSurfaces": [
+      "crates/davinci-coding-agent/src/native_extensions/verification_planner/model.rs",
+      "crates/davinci-coding-agent/src/native_extensions/verification_planner/rules.rs",
+      "crates/davinci-coding-agent/src/native_extensions/verification_planner/tools.rs",
+      "crates/davinci-coding-agent/src/native_extensions/verification_planner/mod.rs",
+      "crates/davinci-coding-agent/src/native_extensions/mod.rs",
+      "crates/davinci-coding-agent/src/native_extensions/extension_host.rs",
+      "crates/davinci-coding-agent/src/native_extensions/graph/roles.rs",
+      "crates/davinci-coding-agent/src/settings.rs",
+      "crates/davinci-coding-agent/src/main.rs",
+      "crates/davinci-agent/src/permission.rs",
+      "crates/davinci-coding-agent/tests/verification_planner.rs",
+      "crates/davinci-coding-agent/tests/verification_planner_eval.rs"
+    ]
+  },
+  "validation": {
+    "rustfmt": {
+      "command": "rtk proxy rustfmt --check --edition 2021 <P10 Rust sources and tests>",
+      "exitCode": 0
+    },
+    "cargoMetadata": {
+      "command": "rtk proxy cargo metadata --offline --locked --no-deps --format-version 1 --manifest-path .codex-p9/Cargo.toml",
+      "exitCode": 0
+    },
+    "cargoCheck": {
+      "command": "rtk proxy cargo check --offline --locked --manifest-path .codex-p9/Cargo.toml -p davinci-coding-agent --target-dir .codex-p9-target",
+      "status": "not_used_for_current_gate",
+      "error": "The focused test and packaged smoke commands were used instead of a duplicate check.",
+      "exitCode": 0
+    },
+    "tests": "passed: 5 verification_planner tests and 1 evaluation test",
+    "clippy": "strict affected-library Clippy passed; dedicated davinci-evals all-target Clippy passed; legacy workspace lints remain outside this gate",
+    "normalDispatch": "packaged smoke passed",
+    "graphDispatch": "packaged Graph Writer smoke passed",
+    "ci": "PR #18 exact-head green 35417186830; final assembled tree on main 70542fcb"
+  },
+  "remainingGates": [
+    "full davinci-agent and davinci-coding-agent package suites still have historical Windows ACL/legacy failures; not weakened"
+  ],
+  "merge": {
+    "pushed": true,
+    "merged": true,
+    "pr": 18
+  }
+}

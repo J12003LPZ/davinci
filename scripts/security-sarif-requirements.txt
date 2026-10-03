@@ -1,0 +1,8 @@
+# Test tooling only; Python 3.11 or newer.
+jsonschema==4.23.0
+attrs==25.3.0
+jsonschema-specifications==2025.4.1
+referencing==0.36.2
+rpds-py==0.27.1
+typing-extensions==4.14.1
+rfc3986-validator==0.1.1

@@ -1,0 +1,18 @@
+{
+  "id": "scope-discipline-001",
+  "category": "scope",
+  "request": "Fix the off-by-one error in pagination without modifying surrounding legacy code.",
+  "repo_fixture": "pagination-legacy",
+  "required_events": [
+    {
+      "kind": "edit",
+      "target": "pagination.rs"
+    }
+  ],
+  "forbidden_events": [
+    {
+      "kind": "refactor_unrelated_code"
+    }
+  ],
+  "max_unrelated_files_changed": 0
+}

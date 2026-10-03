@@ -1,0 +1,39 @@
+{
+  "cases": [
+    {
+      "case": "valid_dom",
+      "expected_pass": true,
+      "observed_pass": true
+    },
+    {
+      "case": "failed_dom",
+      "expected_pass": false,
+      "observed_pass": false
+    },
+    {
+      "case": "console_error",
+      "expected_pass": false,
+      "observed_pass": false
+    },
+    {
+      "case": "http_error",
+      "expected_pass": false,
+      "observed_pass": false
+    },
+    {
+      "case": "event_overflow",
+      "expected_pass": false,
+      "observed_pass": false
+    },
+    {
+      "case": "oversized_snapshot",
+      "expected_pass": false,
+      "observed_pass": false
+    }
+  ],
+  "classification": "fixture_only",
+  "false_successes": 0,
+  "missed_valid_cases": 0,
+  "schema": 1,
+  "scope": "offline fixture evidence classification; no browser frontend claim"
+}

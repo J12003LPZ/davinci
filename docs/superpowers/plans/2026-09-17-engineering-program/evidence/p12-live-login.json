@@ -1,0 +1,194 @@
+{
+  "schema_version": 2,
+  "test": "browser_integration_tests::login_button_seventeen_step_normal_dispatch_and_graph_deny",
+  "command": "cargo test --offline --locked -p davinci-coding-agent --bin davinci -- --ignored --nocapture login_button_seventeen_step",
+  "local_runs": [
+    {
+      "pass": true,
+      "duration_s": 6.47,
+      "checkpoint_id": "ws-036fef7745b6687f8da15a39",
+      "workspace_diff_error": false,
+      "metrics": {
+        "process_start_ms": 122.1111,
+        "browser_open_ms": 418.2212,
+        "impact_analyze_cold_ms": 68.7418,
+        "impact_analyze_warm_ms": 38.2895,
+        "repo_map_ms": 72.4989,
+        "workspace_checkpoint_ms": 49.8195
+      }
+    },
+    {
+      "pass": true,
+      "duration_s": 6.57,
+      "checkpoint_id": "ws-8e014735e6883802aefdc8f9",
+      "workspace_diff_error": false,
+      "metrics": {
+        "process_start_ms": 143.748,
+        "browser_open_ms": 405.9771,
+        "impact_analyze_cold_ms": 66.2633,
+        "impact_analyze_warm_ms": 35.1222,
+        "repo_map_ms": 41.8084,
+        "workspace_checkpoint_ms": 42.7217
+      }
+    }
+  ],
+  "hosted_acceptance": {
+    "sha": "9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e",
+    "ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612",
+    "sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353623",
+    "workflow_lint_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353647",
+    "all_jobs_green": true,
+    "jobs": {
+      "macos": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980220",
+      "linux": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980322",
+      "windows": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980285"
+    },
+    "artifacts": [
+      "p12-live-login-macOS",
+      "p12-live-login-Linux",
+      "p12-live-login-Windows"
+    ],
+    "fixture_id": "login-button-seventeen-step",
+    "runs_per_mode": 2,
+    "platforms": {
+      "macos": {
+        "feature_off": {
+          "startup_ms_median": 225.9491875,
+          "memory_bytes_median": 37027840
+        },
+        "feature_on": {
+          "startup_ms_median": 162.4749375,
+          "memory_bytes_median": 50642944,
+          "cache_hits": 3,
+          "graph_cache_hits": 4,
+          "browser_success": true,
+          "runs": [
+            {
+              "startup_ms": 173.054875,
+              "memory_bytes": 50724864,
+              "process_start_ms": 83.315917,
+              "browser_open_ms": 1787.022,
+              "impact_analyze_cold_ms": 35.65975,
+              "impact_analyze_warm_ms": 21.197958,
+              "graph_checkpoint_id": "ws-7db1bcc9bfad331fc412ab8e"
+            },
+            {
+              "startup_ms": 151.895,
+              "memory_bytes": 50561024,
+              "process_start_ms": 75.532667,
+              "browser_open_ms": 526.732958,
+              "impact_analyze_cold_ms": 33.8685,
+              "impact_analyze_warm_ms": 21.668375,
+              "graph_checkpoint_id": "ws-2ecfee1ad7933bbaf335d799"
+            }
+          ]
+        }
+      },
+      "linux": {
+        "feature_off": {
+          "startup_ms_median": 280.666362,
+          "memory_bytes_median": 50587648
+        },
+        "feature_on": {
+          "startup_ms_median": 337.7264305,
+          "memory_bytes_median": 62803968,
+          "cache_hits": 3,
+          "graph_cache_hits": 4,
+          "browser_success": true,
+          "runs": [
+            {
+              "startup_ms": 278.504085,
+              "memory_bytes": 62853120,
+              "process_start_ms": 86.689757,
+              "browser_open_ms": 670.612288,
+              "impact_analyze_cold_ms": 31.345932,
+              "impact_analyze_warm_ms": 14.866446,
+              "graph_checkpoint_id": "ws-01437f35a7fb646d2b580196"
+            },
+            {
+              "startup_ms": 396.948776,
+              "memory_bytes": 62754816,
+              "process_start_ms": 87.253885,
+              "browser_open_ms": 623.135357,
+              "impact_analyze_cold_ms": 22.862319,
+              "impact_analyze_warm_ms": 14.697905,
+              "graph_checkpoint_id": "ws-b538e341af6ef74e0d6bab8c"
+            }
+          ]
+        }
+      },
+      "windows": {
+        "feature_off": {
+          "startup_ms_median": 617.2215,
+          "memory_bytes_median": 25702400
+        },
+        "feature_on": {
+          "startup_ms_median": 364.06425,
+          "memory_bytes_median": 39739392,
+          "cache_hits": 3,
+          "graph_cache_hits": 4,
+          "browser_success": true,
+          "runs": [
+            {
+              "startup_ms": 356.8615,
+              "memory_bytes": 39768064,
+              "process_start_ms": 165.4176,
+              "browser_open_ms": 843.8915,
+              "impact_analyze_cold_ms": 251.0187,
+              "impact_analyze_warm_ms": 66.1674,
+              "graph_checkpoint_id": "ws-7eb3cdbed0a31e1bb0f001cf"
+            },
+            {
+              "startup_ms": 371.267,
+              "memory_bytes": 39710720,
+              "process_start_ms": 198.568,
+              "browser_open_ms": 724.4478,
+              "impact_analyze_cold_ms": 108.8899,
+              "impact_analyze_warm_ms": 51.7975,
+              "graph_checkpoint_id": "ws-cc94ca4715b4ee2d4a2bf760"
+            }
+          ]
+        }
+      }
+    },
+    "graph_writer_ran_seventeen_steps": true,
+    "graph_writer_workspace_diff_error": false,
+    "graph_classifier_denied_verification_plan": true,
+    "graph_classifier_denied_workspace_restore": true,
+    "graph_classifier_deny_via": "agent.call pre_tool NativeExtensionHost::before_tool"
+  },
+  "final_main_verification": {
+    "sha": "70542fcbf93e223aa40889763d37e1a76913f50d",
+    "ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35462619603",
+    "sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35462619625",
+    "workflow_lint_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353647",
+    "all_jobs_green": true,
+    "workflow_lint_note": "validated on the unchanged workflow set"
+  },
+  "dispatched_required_tools": [
+    "repo_map",
+    "lsp_document_symbols",
+    "package_info",
+    "git_blame_symbol",
+    "impact_analyze",
+    "process_start",
+    "workspace_checkpoint",
+    "edit",
+    "lsp_diagnostics",
+    "test_plan",
+    "bash",
+    "build_command",
+    "browser_open",
+    "browser_snapshot",
+    "browser_console",
+    "workspace_diff",
+    "verification_plan"
+  ],
+  "limitations": {
+    "lsp_diagnostics": "dispatched, returned an error because no language server is present in the fixture",
+    "lsp_document_symbols": "dispatched, returned an error because no language server is present in the fixture",
+    "workspace_diff": "succeeded on every hosted run",
+    "local_linux_macos": "not executed locally; the hosted Linux and macOS jobs passed the real Chromium path",
+    "local_windows_cargo": "fresh local Cargo validation remains unavailable in this environment because rustc reports Access is denied and the offline registry lacks cpal; hosted CI is the release gate"
+  }
+}

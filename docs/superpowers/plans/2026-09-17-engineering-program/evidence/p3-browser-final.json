@@ -1,0 +1,120 @@
+{
+  "milestone": "P3 Browser / Playwright Verification Final Evidence",
+  "base_commit": "eec83bda4da82ceb6c8ee244faa9657cdac0ce93",
+  "trusted_dependencies": {
+    "node": "v24.19.0",
+    "playwright": "1.62.0",
+    "browser": "Chromium 151.0.7922.34",
+    "node_path": "C:/Program Files/nodejs/node.exe",
+    "package_path": "C:/Users/sergi/Desktop/codex-chatgpt-web-codex-security/.venv/Lib/site-packages/playwright/driver/package"
+  },
+  "package_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-agent -p davinci-coding-agent",
+    "exit_code": 0,
+    "coding_agent_lib_passed": 1241,
+    "coding_agent_lib_failed": 0,
+    "coding_agent_lib_ignored": 15,
+    "supervisor_and_transaction_suites_passed": true
+  },
+  "real_browser_tests": {
+    "command": "cargo test -p davinci-coding-agent --offline --locked with explicit DAVINCI_TRUSTED_NODE_TEST_PATH and DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH",
+    "exit_code": 0,
+    "cases": [
+      {
+        "test": "browser_integration_tests::normal_browser_native_dispatch_actions_revocation_and_cleanup",
+        "target": "bin/davinci",
+        "status": "passed",
+        "duration_s": 16.07,
+        "verified": [
+          "managed Node HTTP server through process manager",
+          "planted button failure detection",
+          "transactional source edit to index.html",
+          "context re-open on same origin",
+          "all 10 native tools exercised",
+          "observed corrected DOM and ARIA tree",
+          "retained PNG artifact without binary output in conversation",
+          "revocation of snapshot permission denied at request time",
+          "terminal cleanup of context and server"
+        ]
+      },
+      {
+        "test": "browser_integration_tests::rpc_browser_verification_receipt_wire_exchange",
+        "target": "bin/davinci",
+        "status": "passed",
+        "duration_s": 1.42,
+        "verified": [
+          "external child process over stdin/stdout RPC loop",
+          "verify_browser RPC command with dom_contains and accessibility_contains",
+          "RealBrowser receipt returned with backend_kind real_browser",
+          "transaction ID and affected_paths bound to source",
+          "5 action sequences correlated",
+          "model messages not populated with verification evidence or binary data",
+          "clean child shutdown on stdin close"
+        ]
+      },
+      {
+        "test": "native_extensions::graph::coordinator_handler::tests::graph_browser_transport_shares_server_and_isolates_worker_contexts",
+        "target": "lib",
+        "status": "passed",
+        "duration_s": 5.76,
+        "verified": [
+          "two authenticated worker transports reuse same real managed HTTP server",
+          "isolated browser contexts and cookie state across workers",
+          "foreign context IDs denied",
+          "all 10 native actions exercised",
+          "revoked snapshot permission denied",
+          "teardown removes exactly departing worker context"
+        ]
+      },
+      {
+        "test": "native_extensions::graph::controller::tests::graph_scheduler_writer_uses_authenticated_browser_transport",
+        "target": "lib",
+        "status": "passed",
+        "duration_s": 4.19,
+        "verified": [
+          "run_graph creates Writer node with host-assigned runtime agent ID",
+          "scheduler binds authenticated coordinator transport with browser tools",
+          "worker transaction uses exact Graph owner",
+          "worker applies real source edit",
+          "managed Node dev server started through coordinator",
+          "worker opens Chromium through coordinator bound to transaction ID",
+          "browser click executed and snapshot verifies Done button",
+          "worker submits PatchReport artifact",
+          "graph reaches Phase::Done"
+        ]
+      }
+    ]
+  },
+  "deterministic_node_tests": {
+    "command": "rtk proxy node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_host.test.cjs",
+    "exit_code": 0,
+    "passed": 33,
+    "failed": 0,
+    "skipped": 0,
+    "duration_ms": 225.6854
+  },
+  "real_node_tests": {
+    "command": "node --test crates/davinci-coding-agent/src/interaction_testing/browser_network.real.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_backend.real.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.real.test.cjs",
+    "exit_code": 0,
+    "passed": 5,
+    "failed": 0,
+    "skipped": 0,
+    "duration_ms": 1244.2755,
+    "verified": [
+      "actual browser backend planted login failure detection (console error, HTTP 500) and corrected flow verification",
+      "real Chromium proxy enforcement on redirects and subresources (0 forbidden server hits)",
+      "real Chromium authorized HTTPS and WSS with foreign redirect blocking (0 forbidden server hits)",
+      "real Chromium owned WebSocket delivery and foreign upgrade blocking (0 forbidden server hits)",
+      "real Chromium actions and PNG transfer across bounded correlated JSONL without binary output"
+    ]
+  },
+  "invariants_verified": {
+    "source_provenance": "browser_open accepts only opaque transaction_id; host resolves and binds source; rechecked before and after evidence collection",
+    "read_authority": "ProcessManager::check_current_source_read verifies canonical workspace, task contract, and permission policy",
+    "non_mutation_evidence": "Passing browser receipt is evidence only; does NOT transition transaction to Verified state; transaction remains Applied",
+    "network_confinement": "Loopback origin proxy blocks external redirects, foreign subresources, and unauthorized WebSocket upgrades; 0 foreign hits",
+    "model_isolation": "Model receives opaque browser handles only; no model-provided paths, hashes, CDP, or arbitrary JS evaluation; RPC verify_browser is host-only",
+    "graph_scheduler_transport": "Coordinator transport conditionally selects browser tools only when deps.browser.is_some(); worker receives authenticated parent transport with host TransactionOwner",
+    "windows_ci_race_fix": "Supervisor exit queue deadline increased to 2s; saturated output queue regression passes"
+  }
+}

@@ -1,0 +1,1455 @@
+//! Char-grid primitives.
+//!
+//! Everything here returns either a *run* (`Vec<Span>`) or a *row* (`Line`), so
+//! callers can count rows exactly: the transcript tail-truncates like a
+//! scrollback and the composer anchors to the bottom of the window at any
+//! height. Surfaces are composed as rows rather than as ratatui `Block`s for
+//! the same reason — a Studio box has to sit *inside* the transcript's row
+//! list and still report its own height (design.md §6).
+//!
+//! Mirrors `docs/ui/davinci_tui/lib/davinci/ui.ex`.
+
+use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
+
+use super::theme::{glyph, State, Theme};
+
+/// Prose never exceeds 74 columns, however wide the terminal (design.md §6).
+pub const MEASURE: u16 = 74;
+
+/// A run of text in one color.
+pub fn span(content: impl Into<String>, color: Color) -> Span<'static> {
+    Span::styled(content.into(), Style::default().fg(color))
+}
+
+/// Opaque newspaper clipping. Only display headings are uppercased; values,
+/// paths and command text retain their original spelling.
+pub fn paper_label(text: &str, theme: &Theme, accent: bool) -> Span<'static> {
+    Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(if accent { theme.primary } else { theme.text })
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// A static, irregular screen-print edge. Texture stays outside readable text
+/// and never animates, so it cannot compete with the working indicator.
+pub fn print_rule(width: u16, theme: &Theme) -> Line<'static> {
+    Line::from(span("─".repeat(usize::from(width)), theme.border))
+}
+
+/// A run of text in one color, on a tinted row.
+pub fn span_on(
+    content: impl Into<String>,
+    color: Color,
+    background: Option<Color>,
+) -> Span<'static> {
+    let mut style = Style::default().fg(color);
+    if let Some(background) = background {
+        style = style.bg(background);
+    }
+    Span::styled(content.into(), style)
+}
+
+/// A run of text carrying the theme's emphasis (bold under `NO_COLOR`, §9).
+pub fn span_strong(content: impl Into<String>, color: Color, theme: &Theme) -> Span<'static> {
+    Span::styled(
+        content.into(),
+        Style::default().fg(color).add_modifier(theme.emphasis),
+    )
+}
+
+/// `n` cells of nothing, optionally tinted so a selected row reads as one band.
+pub fn pad(n: u16, background: Option<Color>) -> Span<'static> {
+    let mut style = Style::default();
+    if let Some(background) = background {
+        style = style.bg(background);
+    }
+    Span::styled(" ".repeat(n as usize), style)
+}
+
+/// Display width of a run, in terminal cells.
+pub fn run_width(spans: &[Span<'_>]) -> u16 {
+    spans
+        .iter()
+        .fold(0usize, |used, item| {
+            used.saturating_add(UnicodeWidthStr::width(item.content.as_ref()))
+        })
+        .min(usize::from(u16::MAX)) as u16
+}
+
+/// An empty row.
+pub fn blank() -> Line<'static> {
+    Line::from(Vec::<Span<'static>>::new())
+}
+
+/// `n` empty rows.
+pub fn blanks(n: usize) -> Vec<Line<'static>> {
+    (0..n).map(|_| blank()).collect()
+}
+
+/// Left run, right run, flush to `width`.
+pub fn spread(width: u16, left: Vec<Span<'static>>, right: Vec<Span<'static>>) -> Line<'static> {
+    spread_on(width, left, right, None)
+}
+
+/// `spread`, with the gap tinted to match a selected row.
+pub fn spread_on(
+    width: u16,
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    background: Option<Color>,
+) -> Line<'static> {
+    // The header and the status bar are one line each at every width, so the
+    // right run gives way rather than pushing the row past the window (§6).
+    // The left run is the identity and the mode; it is never given away.
+    let left = truncate_run(left, width);
+    let room = width.saturating_sub(run_width(&left));
+    let right = truncate_run(right, room.saturating_sub(1));
+    let gap = room.saturating_sub(run_width(&right));
+    let mut spans = left;
+    spans.push(pad(gap, background));
+    spans.extend(right);
+    Line::from(spans)
+}
+
+/// Cut a run to `width` cells, dropping whole spans from the end and clipping
+/// the one that straddles the edge.
+pub fn truncate_run(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    if run_width(&spans) <= width {
+        return spans;
+    }
+    let width = usize::from(width);
+    let mut out = Vec::with_capacity(spans.len());
+    let mut used = 0usize;
+    for span in spans {
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if used.saturating_add(span_width) <= width {
+            used = used.saturating_add(span_width);
+            out.push(span);
+            continue;
+        }
+        let room = width.saturating_sub(used);
+        if room > 0 {
+            let clipped = clip_ellipsis(
+                span.content.as_ref(),
+                u16::try_from(room).unwrap_or(u16::MAX),
+            );
+            out.push(Span::styled(clipped, span.style));
+        }
+        break;
+    }
+    out
+}
+
+/// Centre a run in `width`.
+pub fn center(width: u16, spans: Vec<Span<'static>>) -> Line<'static> {
+    let lead = width.saturating_sub(run_width(&spans)) / 2;
+    let mut row = vec![pad(lead, None)];
+    row.extend(spans);
+    Line::from(row)
+}
+
+/// Push a run right by `n` cells.
+pub fn indent(n: u16, spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut row = vec![pad(n, None)];
+    row.extend(spans);
+    Line::from(row)
+}
+
+/// Truncate to `max` display cells, never mid-grapheme.
+pub fn clip(text: &str, max: u16) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(cells) > usize::from(max) {
+            break;
+        }
+        out.push_str(grapheme);
+        used = used.saturating_add(cells);
+    }
+    out
+}
+
+/// `clip`, but a cut is marked: the last cell goes to an ellipsis so a
+/// shortened name never reads as the whole thing. Use this wherever a person
+/// is meant to read the text; bare `clip` is for cuts that are their own
+/// evidence (a wrapped word, a row against the window edge is still marked by
+/// the caller).
+pub fn clip_ellipsis(text: &str, max: u16) -> String {
+    if UnicodeWidthStr::width(text) <= max as usize {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = clip(text, max - 1);
+    out.push('…');
+    out
+}
+
+/// The first piece of an over-long word, for `wrap`. Like `clip`, except it
+/// never comes back empty: a double-width character in a one-column measure
+/// fits nowhere, and returning nothing there left `wrap` breaking the same
+/// word forever. One character overflows the measure; no character hangs the
+/// interface.
+fn break_head(word: &str, width: u16) -> String {
+    let head = clip(word, width);
+    if !head.is_empty() {
+        return head;
+    }
+    word.chars().next().map(String::from).unwrap_or_default()
+}
+
+/// Wrap prose to the measure. Words longer than the measure are broken.
+pub fn wrap(text: &str, width: u16) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word.to_string();
+        if current.is_empty() {
+            while UnicodeWidthStr::width(word.as_str()) > width as usize {
+                let head = break_head(&word, width);
+                word = word[head.len()..].to_string();
+                lines.push(head);
+            }
+            current = word;
+            continue;
+        }
+        let candidate_width =
+            UnicodeWidthStr::width(current.as_str()) + 1 + UnicodeWidthStr::width(word.as_str());
+        if candidate_width <= width as usize {
+            current.push(' ');
+            current.push_str(&word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            while UnicodeWidthStr::width(word.as_str()) > width as usize {
+                let head = break_head(&word, width);
+                word = word[head.len()..].to_string();
+                lines.push(head);
+            }
+            current = word;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Keep the last `n` rows — the transcript scrolls like a terminal.
+pub fn tail(lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
+    if lines.len() <= n {
+        return lines;
+    }
+    lines[lines.len() - n..].to_vec()
+}
+
+/// Grow to exactly `n` rows so a column can be bottom-anchored.
+pub fn pad_to(mut lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
+    while lines.len() < n {
+        lines.push(blank());
+    }
+    lines
+}
+
+/// A proportion meter: filled run, tip, empty run. Always exactly `width`
+/// cells, so a number is never shown without its cap (design.md §9).
+pub fn meter(fraction: f64, width: u16, theme: &Theme, color: Option<Color>) -> Vec<Span<'static>> {
+    let color = color.unwrap_or(theme.primary);
+    let filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as u16).min(width);
+    if filled == 0 {
+        return vec![span(
+            glyph::METER_EMPTY.repeat(width as usize),
+            theme.border,
+        )];
+    }
+    vec![
+        span(glyph::METER_FILLED.repeat((filled - 1) as usize), color),
+        span(glyph::METER_TIP, color),
+        span(
+            glyph::METER_EMPTY.repeat((width - filled) as usize),
+            theme.border,
+        ),
+    ]
+}
+
+/// The `constructio III / V` tick meter (design.md §6).
+pub fn ticks(done: usize, total: usize, cell_width: u16, theme: &Theme) -> Vec<Span<'static>> {
+    if total == 0 {
+        return vec![span(glyph::TICK.repeat(cell_width as usize), theme.border)];
+    }
+    let per = (cell_width as usize / total).max(1);
+    vec![
+        span(glyph::METER_FILLED.repeat(per * done), theme.primary),
+        span(
+            glyph::TICK.repeat(per * total.saturating_sub(done)),
+            theme.border,
+        ),
+    ]
+}
+
+/// A bordered surface with its label notched into the top-left of the rule and
+/// optional metadata notched into the top-right (design.md §3).
+pub struct Surface {
+    section: bool,
+    width: u16,
+    inset: u16,
+    border: Color,
+    background: Option<Color>,
+    title: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    body: Vec<Vec<Span<'static>>>,
+}
+
+impl Surface {
+    /// An open terminal section using the same layout and theme as framed surfaces.
+    /// The two structural rows are a heading and breathing room, never a box.
+    pub fn section(width: u16, theme: &Theme) -> Self {
+        Self {
+            section: true,
+            ..Self::new(width, theme)
+        }
+    }
+
+    pub fn new(width: u16, theme: &Theme) -> Self {
+        Self {
+            section: false,
+            width,
+            inset: 0,
+            border: theme.border,
+            background: None,
+            title: Vec::new(),
+            right: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// Draw the rule in something other than `border` — copper for the
+    /// composer, warning for the governor proposal.
+    pub fn border(mut self, color: Color) -> Self {
+        self.border = color;
+        self
+    }
+
+    /// Tint the surface without changing its row count or text geometry.
+    pub fn background(mut self, color: Color) -> Self {
+        self.background = Some(color);
+        self
+    }
+
+    /// Push the whole surface right, and narrow it by the same amount.
+    pub fn inset(mut self, inset: u16) -> Self {
+        self.inset = inset;
+        self
+    }
+
+    pub fn title(mut self, title: Vec<Span<'static>>) -> Self {
+        self.title = title
+            .into_iter()
+            .map(|mut item| {
+                item.style = item.style.add_modifier(Modifier::BOLD);
+                item
+            })
+            .collect();
+        self
+    }
+
+    pub fn right(mut self, right: Vec<Span<'static>>) -> Self {
+        self.right = right;
+        self
+    }
+
+    pub fn row(mut self, row: Vec<Span<'static>>) -> Self {
+        self.body.push(row);
+        self
+    }
+
+    pub fn rows(mut self, rows: Vec<Vec<Span<'static>>>) -> Self {
+        self.body.extend(rows);
+        self
+    }
+
+    /// Row count, known before rendering.
+    pub fn height(&self) -> usize {
+        self.body.len() + 2
+    }
+
+    pub fn lines(self) -> Vec<Line<'static>> {
+        if self.section {
+            let inset = self.inset.min(self.width / 4);
+            let width = self.width.saturating_sub(inset * 2);
+            let inner = width.saturating_sub(4);
+            let mut heading = vec![pad(2.min(width), None)];
+            heading.extend(self.title);
+            let mut rows = vec![spread(width, heading, self.right)];
+            for body in self.body {
+                let mut row = vec![pad(2.min(width), None)];
+                row.extend(truncate_run(body, inner));
+                rows.push(spread(width, row, Vec::new()));
+            }
+            rows.push(spread(width, Vec::new(), Vec::new()));
+            return rows
+                .into_iter()
+                .map(|row| {
+                    let mut spans = vec![pad(inset, None)];
+                    spans.extend(row.spans);
+                    spans.push(pad(inset, None));
+                    Line::from(truncate_run(spans, self.width))
+                })
+                .collect();
+        }
+        // An inset surface floats clear of *both* edges, as the mockups inset
+        // Instrumenta by the same margin left and right (`1d`).
+        let width = self.width.saturating_sub(self.inset * 2).max(4);
+        let inner = width - 4;
+        let mut out = Vec::with_capacity(self.height());
+
+        out.push(self.top_rule(width));
+        for row in self.body {
+            // A row that would push past the rule is cut, never wrapped: a
+            // surface reports one height and keeps it.
+            let row = truncate_run(row, inner);
+            let used = run_width(&row);
+            let mut spans = vec![span("│ ", self.border)];
+            spans.extend(row);
+            spans.push(pad(inner.saturating_sub(used), None));
+            spans.push(span(" │", self.border));
+            out.push(Line::from(spans));
+        }
+        out.push(Line::from(vec![span(
+            format!("╰{}╯", "─".repeat((width - 2) as usize)),
+            self.border,
+        )]));
+
+        if let Some(background) = self.background {
+            for line in &mut out {
+                line.style = line.style.bg(background);
+            }
+        }
+
+        if self.inset == 0 {
+            out
+        } else {
+            out.into_iter()
+                .map(|line| {
+                    let mut spans = vec![pad(self.inset, None)];
+                    spans.extend(line.spans);
+                    spans.push(pad(self.inset, None));
+                    Line::from(spans).style(line.style)
+                })
+                .collect()
+        }
+    }
+
+    fn top_rule(&self, width: u16) -> Line<'static> {
+        let mut left = if self.title.is_empty() {
+            vec![span("╭─", self.border)]
+        } else {
+            let mut left = vec![span("╭─ ", self.border)];
+            left.extend(self.title.iter().cloned());
+            left.push(span(" ", self.border));
+            left
+        };
+        let right = if self.right.is_empty() {
+            vec![span("─╮", self.border)]
+        } else {
+            let mut right = vec![span("─ ", self.border)];
+            right.extend(self.right.iter().cloned());
+            right.push(span(" ─╮", self.border));
+            right
+        };
+        let dashes = width
+            .saturating_sub(run_width(&left))
+            .saturating_sub(run_width(&right))
+            .max(1);
+        left.push(span("─".repeat(dashes as usize), self.border));
+        left.extend(right);
+        Line::from(left)
+    }
+}
+
+/// A rule inside a surface, separating a header row from its list.
+pub fn surface_rule(width: u16, theme: &Theme) -> Vec<Span<'static>> {
+    vec![span(
+        "─".repeat(width.saturating_sub(4) as usize),
+        theme.border,
+    )]
+}
+
+/// A plain horizontal rule with a mark at its centre (startup, `1a`).
+pub fn hair_rule(width: u16, theme: &Theme, mark: &str) -> Line<'static> {
+    let mark_width = UnicodeWidthStr::width(mark) as u16;
+    let arm = width.saturating_sub(4 + mark_width).max(2) / 2;
+    let dash = "─".repeat(arm as usize);
+    Line::from(vec![
+        span(format!("·{dash} "), theme.border),
+        span(mark.to_string(), theme.muted),
+        span(format!(" {dash}·"), theme.border),
+    ])
+}
+
+/// A compact `● Read(path)` call with optional timing and outcome. Keep
+/// explicit state glyphs for errors and monochrome terminals.
+#[allow(clippy::too_many_arguments)]
+pub fn tool_line(
+    width: u16,
+    theme: &Theme,
+    state: State,
+    instrument: &str,
+    target: &str,
+    duration: Option<&str>,
+    tick: u64,
+    live: bool,
+) -> Line<'static> {
+    let (label, argument) = tool_caption(instrument, target);
+    let cc = theme.cc();
+    let failed = matches!(state, State::Failed | State::Attention);
+    let running =
+        live && duration.is_none() && !failed && !matches!(state, State::Skipped | State::Queued);
+    let mark = if theme.no_color {
+        state.glyph()
+    } else if running && tick % 2 == 1 {
+        " "
+    } else {
+        "●"
+    };
+    let color = if failed {
+        cc.error
+    } else if running {
+        cc.inactive
+    } else {
+        cc.success
+    };
+    let run = vec![
+        span(format!("{mark} "), color),
+        span(label, theme.text).add_modifier(Modifier::BOLD),
+        span("(", theme.text),
+        span(
+            clip_ellipsis(
+                argument,
+                width.saturating_sub(
+                    u16::try_from(UnicodeWidthStr::width(label))
+                        .unwrap_or(u16::MAX)
+                        .saturating_add(6),
+                ),
+            ),
+            theme.text,
+        ),
+        span(")", theme.text),
+    ];
+    Line::from(truncate_run(run, width))
+}
+
+/// Presentation names only. The runtime's tool names and arguments stay intact.
+fn tool_caption<'a>(instrument: &'a str, target: &'a str) -> (&'a str, &'a str) {
+    if instrument == "manus" {
+        return ("Shell", target);
+    }
+    if let Some((verb, argument)) = target.split_once(' ') {
+        let name = match verb {
+            "read" => "Read",
+            "list" => "List",
+            "write" => "Write",
+            "edit" => "Update",
+            "search" | "find" => "Search",
+            "fetch" => "Fetch",
+            "mcp" => "MCP",
+            "agent" => "Agent",
+            _ => "",
+        };
+        if !name.is_empty() {
+            return (name, argument);
+        }
+    }
+    let name = match instrument {
+        "instrumenta" => "Tool",
+        "memoria" => "Memory",
+        "grafo" => "Graph",
+        "cogitator" => "Model",
+        "societas" => "Agent",
+        "opus" => "Workflow",
+        other => other,
+    };
+    (name, target)
+}
+
+/// Tool detail — an error body or a diff hunk — indented two further (§3).
+pub fn detail_line(theme: &Theme, text: &str) -> Line<'static> {
+    indent(4, vec![span(text.to_string(), theme.muted)])
+}
+
+/// A failure detail: what went wrong in error ink, the subject in muted ink.
+/// Under `NO_COLOR` an `!` carries the state instead (`1g`, `1h`).
+pub fn failure_line(theme: &Theme, what: &str, subject: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    if theme.no_color {
+        spans.push(span_strong(
+            format!("{} ", glyph::ATTENTION),
+            theme.error,
+            theme,
+        ));
+    }
+    spans.push(span(format!("{what} "), theme.error));
+    spans.push(span(subject.to_string(), theme.muted));
+    indent(4, spans)
+}
+
+/// Whether a run carries the theme's emphasis; used by tests and by the
+/// Keep `height` rows around `anchor`, folding the rest into `… n above` /
+/// `… n below` in border colour. A list that fits is returned whole
+/// (design.md §11).
+pub fn window(
+    rows: Vec<Line<'static>>,
+    height: usize,
+    anchor: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let total = rows.len();
+    if total <= height {
+        return rows;
+    }
+    // In tiny terminals the selected content outranks scroll indicators.
+    let markers = if height >= 3 { 2 } else { 0 };
+    let inner = height.saturating_sub(markers).max(1);
+    let start = anchor
+        .min(total.saturating_sub(1))
+        .saturating_sub(inner / 2)
+        .min(total.saturating_sub(inner));
+    let end = (start + inner).min(total);
+    let mut out = Vec::with_capacity(height);
+    if markers > 0 && start > 0 {
+        out.push(Line::from(span(format!("… {start} above"), theme.muted)));
+    }
+    out.extend(rows.into_iter().skip(start).take(end - start));
+    if markers > 0 && end < total {
+        out.push(Line::from(span(
+            format!("… {} below", total - end),
+            theme.muted,
+        )));
+    }
+    out
+}
+
+/// Uppercase column headers in border colour over a hair rule in the dim
+/// ramp, as the artboards draw `PROVIDER / MODEL … CREDENTIAL`. Two rows,
+/// each exactly `width`. A column of width 0 takes the slack; `true` right-
+/// aligns (design.md §11).
+pub fn column_header(
+    width: u16,
+    columns: &[(&str, u16, bool)],
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let fixed: u16 = columns
+        .iter()
+        .filter(|column| column.1 > 0)
+        .map(|column| column.1)
+        .sum::<u16>()
+        .saturating_add(columns.len().saturating_sub(1) as u16);
+    let slack = width.saturating_sub(fixed);
+    let mut spans = Vec::new();
+    for (index, (label, column_width, right)) in columns.iter().enumerate() {
+        let w = if *column_width == 0 {
+            slack
+        } else {
+            *column_width
+        };
+        let cell = if *right {
+            format!("{label:>w$}", w = w as usize)
+        } else {
+            format!("{label:<w$}", w = w as usize)
+        };
+        spans.push(span(clip(&cell, w), theme.border));
+        if index + 1 < columns.len() {
+            spans.push(span(" ", theme.border));
+        }
+    }
+    let mut header = truncate_run(spans, width);
+    let gap = width.saturating_sub(run_width(&header));
+    if gap > 0 {
+        header.push(pad(gap, None));
+    }
+    let rule = Line::from(vec![span(
+        glyph::METER_EMPTY.repeat(width as usize),
+        theme.dim().border,
+    )]);
+    vec![Line::from(header), rule]
+}
+
+/// A footnote: left in the ink given, right in border. One row where both
+/// fit at 100 columns or more, two rows (the right one indented) otherwise
+/// (design.md §11).
+pub fn footnote(
+    width: u16,
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    _theme: &Theme,
+) -> Vec<Line<'static>> {
+    if right.is_empty() {
+        return vec![Line::from(truncate_run(left, width))];
+    }
+    if width >= 100 && run_width(&left) + run_width(&right) + 3 <= width {
+        return vec![spread(width, left, right)];
+    }
+    vec![
+        Line::from(truncate_run(left, width)),
+        indent(2, truncate_run(right, width.saturating_sub(2))),
+    ]
+}
+
+/// The 3-cell copper bar that marks the selected row (design.md §6,
+/// Instrumenta). The bar is three cells wide on screen, whatever its byte
+/// length.
+pub const SELECTION_BAR: &str = "❯ ";
+const UNSELECTED_BAR: &str = "  ";
+
+/// The selection bar on the tint, or its blank.
+pub fn selection_bar(selected: bool, theme: &Theme) -> Span<'static> {
+    let cc = theme.cc();
+    if selected {
+        span(SELECTION_BAR, cc.permission)
+    } else {
+        span(UNSELECTED_BAR, cc.inactive)
+    }
+}
+
+/// The keybind row a sheet ends with: hints joined by ` │ `, the escape hint
+/// flush right. Hints drop from the end when the row is short of room; the
+/// escape hint never drops (design.md §11).
+pub fn hint_row(
+    width: u16,
+    hints: &[Vec<Span<'static>>],
+    escape: Option<&str>,
+    theme: &Theme,
+) -> Line<'static> {
+    let quiet = theme.cc().inactive;
+    let right: Vec<Span<'static>> = escape.map(|esc| vec![span(esc, quiet)]).unwrap_or_default();
+    let room = width.saturating_sub(run_width(&right)).saturating_sub(3);
+    let mut left: Vec<Span<'static>> = Vec::new();
+    for (index, hint) in hints.iter().enumerate() {
+        let mut candidate = left.clone();
+        if index > 0 {
+            candidate.push(span(" · ", quiet));
+        }
+        candidate.extend(hint.iter().cloned().map(|mut item| {
+            item.style = item.style.fg(quiet);
+            item
+        }));
+        if run_width(&candidate) > room {
+            break;
+        }
+        left = candidate;
+    }
+    spread(width, left, right)
+}
+
+/// `NO_COLOR` audit.
+pub fn is_strong(span: &Span<'_>) -> bool {
+    span.style.add_modifier.contains(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn editorial_labels_use_opaque_ink_and_preserve_monochrome() {
+        use super::*;
+        use crate::davinci::theme::ColorDepth;
+        for depth in [
+            ColorDepth::TrueColor,
+            ColorDepth::Ansi256,
+            ColorDepth::Basic,
+        ] {
+            for no_color in [false, true] {
+                let theme = Theme::da_vinci(depth, no_color);
+                let label = paper_label("Review changes", &theme, true);
+                assert_eq!(label.content, "Review changes");
+                assert!(label.style.add_modifier.contains(Modifier::BOLD));
+                assert_eq!(label.style.fg, Some(theme.primary));
+                assert!(label.style.bg.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn print_rules_fit_even_empty_and_narrow_terminals() {
+        use super::*;
+        let theme = Theme::da_vinci(crate::davinci::theme::ColorDepth::TrueColor, false);
+        for width in [0, 1, 2, 40, 80, 160] {
+            assert_eq!(run_width(&print_rule(width, &theme).spans), width);
+        }
+    }
+    use super::*;
+    use crate::davinci::theme::ColorDepth;
+
+    fn theme() -> Theme {
+        Theme::da_vinci(ColorDepth::TrueColor, false)
+    }
+
+    fn text_of(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn width_of(line: &Line<'_>) -> u16 {
+        UnicodeWidthStr::width(text_of(line).as_str()) as u16
+    }
+
+    #[test]
+    fn the_measure_is_seventy_four() {
+        assert_eq!(MEASURE, 74);
+    }
+
+    #[test]
+    fn window_keeps_the_anchor_and_counts_both_folds() {
+        let th = theme();
+        let rows: Vec<Line<'static>> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let out = window(rows, 6, 10, &th);
+        assert_eq!(out.len(), 6);
+        assert!(text_of(&out[0]).starts_with("… "), "{:?}", text_of(&out[0]));
+        assert!(out.iter().any(|l| text_of(l) == "row 10"));
+        assert!(text_of(out.last().unwrap()).ends_with(" below"));
+    }
+
+    #[test]
+    fn window_of_a_short_list_is_the_list() {
+        let th = theme();
+        let rows: Vec<Line<'static>> = (0..3).map(|i| Line::from(format!("row {i}"))).collect();
+        assert_eq!(window(rows, 10, 0, &th).len(), 3);
+    }
+
+    #[test]
+    fn column_header_is_two_rows_of_the_width() {
+        let th = theme();
+        let rows = column_header(
+            60,
+            &[
+                ("PROVIDER / MODEL", 0, false),
+                ("WINDOW", 6, true),
+                ("CREDENTIAL", 12, false),
+            ],
+            &th,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(width_of(&rows[0]), 60);
+        assert_eq!(width_of(&rows[1]), 60);
+        assert!(text_of(&rows[0]).contains("PROVIDER / MODEL"));
+        assert!(text_of(&rows[1]).chars().all(|c| c == '─'));
+    }
+
+    #[test]
+    fn footnote_is_one_row_wide_and_two_narrow() {
+        let th = theme();
+        let left = vec![span("dimmed rows have no credential", th.text)];
+        let right = vec![span("switching keeps the transcript", th.border)];
+        assert_eq!(footnote(100, left.clone(), right.clone(), &th).len(), 1);
+        assert_eq!(footnote(80, left, right, &th).len(), 2);
+    }
+
+    #[test]
+    fn hint_row_right_aligns_the_escape_and_never_drops_it() {
+        let th = theme();
+        let hints = vec![
+            vec![span("↑↓ move", th.border)],
+            vec![span("enter select", th.border)],
+            vec![span("ctrl+p cycle ring", th.border)],
+        ];
+        let row = hint_row(40, &hints, Some("esc close"), &th);
+        let text = text_of(&row);
+        assert_eq!(width_of(&row), 40);
+        assert!(text.ends_with("esc close"));
+        assert!(text.starts_with("↑↓ move · enter select"), "{text}");
+        assert!(!text.contains("ctrl+p"), "{text}");
+    }
+
+    #[test]
+    fn the_selection_bar_is_two_cells_in_reference_focus_ink() {
+        let th = theme();
+        let bar = selection_bar(true, &th);
+        assert_eq!(UnicodeWidthStr::width(bar.content.as_ref()), 2);
+        assert_eq!(bar.style.fg, Some(th.cc().permission));
+        assert_eq!(bar.style.bg, None);
+        assert_eq!(
+            UnicodeWidthStr::width(selection_bar(false, &th).content.as_ref()),
+            2
+        );
+    }
+
+    #[test]
+    fn prose_wraps_at_the_measure_however_wide_the_terminal() {
+        let prose = "A request enters davinci-agent as a Turn, is planned, then dispatched \
+                     to the provider adapter. Session state is written after every tool \
+                     call, so an interrupt never loses the transcript.";
+        for width in [MEASURE, 100, 160, 400] {
+            let measure = MEASURE.min(width);
+            for row in wrap(prose, measure) {
+                assert!(
+                    UnicodeWidthStr::width(row.as_str()) <= measure as usize,
+                    "row {row:?} exceeds the measure at terminal width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_a_word_longer_than_the_measure() {
+        let long = "crates/davinci-session/src/".to_string() + &"x".repeat(90);
+        let rows = wrap(&long, 20);
+        assert!(rows.len() > 1);
+        for row in &rows {
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 20);
+        }
+        assert_eq!(rows.concat().replace(' ', ""), long.replace(' ', ""));
+    }
+
+    #[test]
+    fn wrap_of_empty_prose_is_one_empty_row() {
+        assert_eq!(wrap("", 74), vec![String::new()]);
+        assert_eq!(wrap("anything", 0), vec![String::new()]);
+    }
+
+    #[test]
+    fn clip_never_exceeds_the_cap() {
+        assert_eq!(clip("store.rs", 40), "store.rs");
+        assert_eq!(clip("crates/davinci-session", 6), "crates");
+        assert_eq!(
+            UnicodeWidthStr::width(clip("Δ".repeat(20).as_str(), 5).as_str()),
+            5
+        );
+    }
+
+    #[test]
+    fn spread_fills_exactly_the_given_width() {
+        let th = theme();
+        let line = spread(
+            80,
+            vec![span("agent · main", th.primary)],
+            vec![span("47k/200k", th.muted)],
+        );
+        assert_eq!(width_of(&line), 80);
+    }
+
+    #[test]
+    fn spread_never_pushes_a_row_past_the_window() {
+        let th = theme();
+        for width in [20u16, 40, 80, 100] {
+            let line = spread(
+                width,
+                vec![span(
+                    "C:\\a\\very\\long\\path\\that\\keeps\\going",
+                    th.muted,
+                )],
+                vec![span("main │ sonnet", th.secondary)],
+            );
+            assert_eq!(width_of(&line), width, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn spread_gives_the_right_run_away_and_keeps_the_identity() {
+        let th = theme();
+        let line = spread(
+            24,
+            vec![span("D davinci · agent", th.text)],
+            vec![span("C:\\dev\\oss\\davinci-rust", th.muted)],
+        );
+        let drawn = text_of(&line);
+        assert!(drawn.starts_with("D davinci · agent"), "{drawn}");
+        assert_eq!(width_of(&line), 24);
+    }
+
+    #[test]
+    fn truncate_run_drops_whole_spans_then_clips_the_straddler() {
+        let th = theme();
+        let run = vec![
+            span("abc", th.text),
+            span("defgh", th.muted),
+            span("ij", th.border),
+        ];
+        assert_eq!(run_width(&truncate_run(run.clone(), 10)), 10);
+        let cut = truncate_run(run.clone(), 5);
+        assert_eq!(run_width(&cut), 5);
+        assert_eq!(cut.len(), 2);
+        // The straddling span is cut, and the cut is marked.
+        assert_eq!(cut[1].content.as_ref(), "d…");
+        assert_eq!(cut[1].style.fg, Some(th.muted));
+        assert!(truncate_run(run, 0).is_empty());
+    }
+
+    #[test]
+    fn center_splits_the_slack_evenly() {
+        let th = theme();
+        let line = center(21, vec![span("DAVINCI", th.text)]);
+        assert_eq!(text_of(&line), "       DAVINCI");
+    }
+
+    #[test]
+    fn meter_is_always_exactly_its_width() {
+        let th = theme();
+        for width in [8u16, 12, 20, 24] {
+            for step in 0..=20 {
+                let fraction = step as f64 / 20.0;
+                let cells = run_width(&meter(fraction, width, &th, None));
+                assert_eq!(cells, width, "fraction {fraction} at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn meter_arithmetic_matches_the_status_bar() {
+        let th = theme();
+        // 47k of 200k, drawn in twelve cells (screen 1b).
+        let spans = meter(47.0 / 200.0, 12, &th, None);
+        let drawn: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(drawn, "━━◸─────────");
+        assert_eq!(run_width(&spans), 12);
+    }
+
+    #[test]
+    fn an_empty_meter_is_all_rule_and_a_full_one_ends_in_its_tip() {
+        let th = theme();
+        let empty: String = meter(0.0, 6, &th, None)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(empty, "──────");
+        let full: String = meter(1.0, 6, &th, None)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(full, "━━━━━◸");
+    }
+
+    #[test]
+    fn ticks_split_the_cell_run_between_done_and_queued() {
+        let th = theme();
+        let spans = ticks(3, 5, 20, &th);
+        let drawn: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(drawn, "━━━━━━━━━━━━········");
+        assert_eq!(run_width(&spans), 20);
+        assert_eq!(spans[0].style.fg, Some(th.primary));
+        assert_eq!(spans[1].style.fg, Some(th.border));
+    }
+
+    #[test]
+    fn a_surface_is_two_rows_taller_than_its_body() {
+        let th = theme();
+        let surface = Surface::new(40, &th)
+            .title(vec![span("STUDIO", th.primary)])
+            .row(vec![span("surveyed workspace", th.text)])
+            .row(vec![span("traced request pipeline", th.text)]);
+        assert_eq!(surface.height(), 4);
+        assert_eq!(surface.lines().len(), 4);
+    }
+
+    #[test]
+    fn every_surface_row_is_exactly_the_surface_width() {
+        let th = theme();
+        for width in [40u16, 62, 80, 100] {
+            let lines = Surface::new(width, &th)
+                .title(vec![span("INSTRUMENTA", th.primary)])
+                .right(vec![span("ctrl+p", th.border)])
+                .row(vec![span("/git status", th.text)])
+                .row(Vec::new())
+                .lines();
+            for line in &lines {
+                assert_eq!(width_of(line), width, "row {:?}", text_of(line));
+            }
+        }
+    }
+
+    #[test]
+    fn a_surface_notches_its_label_into_the_top_left_of_the_rule() {
+        let th = theme();
+        let lines = Surface::new(40, &th)
+            .title(vec![span("STUDIO", th.primary)])
+            .lines();
+        let top = text_of(&lines[0]);
+        assert!(top.starts_with("╭─ STUDIO ─"), "{top}");
+        assert!(top.ends_with("─╮"), "{top}");
+        assert_eq!(text_of(&lines[1]), format!("╰{}╯", "─".repeat(38)));
+    }
+
+    #[test]
+    fn a_surface_notches_metadata_into_the_top_right_of_the_rule() {
+        let th = theme();
+        let lines = Surface::new(60, &th)
+            .title(vec![span("GRAFO", th.primary)])
+            .right(vec![span("0 cycles", th.success)])
+            .lines();
+        let top = text_of(&lines[0]);
+        assert!(top.starts_with("╭─ GRAFO ─"), "{top}");
+        assert!(top.ends_with("─ 0 cycles ─╮"), "{top}");
+    }
+
+    #[test]
+    fn an_untitled_surface_still_rules_edge_to_edge() {
+        let th = theme();
+        let lines = Surface::new(30, &th)
+            .row(vec![span("body", th.text)])
+            .lines();
+        assert_eq!(text_of(&lines[0]), format!("╭{}╮", "─".repeat(28)));
+    }
+
+    #[test]
+    fn an_inset_surface_keeps_its_outer_width() {
+        let th = theme();
+        let lines = Surface::new(100, &th)
+            .inset(6)
+            .title(vec![span("MEMORIA", th.primary)])
+            .row(vec![span("review-agent-runtime", th.text)])
+            .lines();
+        for line in &lines {
+            assert_eq!(width_of(line), 100);
+            assert!(text_of(line).starts_with("      "));
+        }
+    }
+
+    #[test]
+    fn a_surface_can_be_drawn_in_a_colour_other_than_border() {
+        let th = theme();
+        let lines = Surface::new(40, &th)
+            .border(th.warning)
+            .title(vec![span("GOVERNOR", th.warning)])
+            .lines();
+        assert_eq!(lines[0].spans[0].style.fg, Some(th.warning));
+    }
+
+    #[test]
+    fn a_tool_call_names_the_action() {
+        let th = theme();
+        let line = tool_line(
+            100,
+            &th,
+            State::Done,
+            "manus",
+            "cargo check -p davinci-agent",
+            Some("1.84s"),
+            0,
+            false,
+        );
+        let drawn = text_of(&line);
+        assert_eq!(drawn, "● Shell(cargo check -p davinci-agent)");
+        assert_eq!(line.spans.iter().filter(|s| is_strong(s)).count(), 1);
+    }
+
+    #[test]
+    fn a_narrow_row_keeps_the_action_and_clips_its_argument() {
+        let th = theme();
+        let drawn = text_of(&tool_line(
+            34,
+            &th,
+            State::Done,
+            "manus",
+            "cargo check -p davinci-agent",
+            Some("1.84s"),
+            0,
+            false,
+        ));
+        assert!(!drawn.contains("manus"), "got {drawn:?}");
+        assert!(drawn.starts_with("● Shell(cargo check"), "got {drawn:?}");
+        assert!(UnicodeWidthStr::width(drawn.as_str()) <= 34);
+    }
+
+    #[test]
+    fn the_general_purpose_instrument_is_never_named() {
+        let th = theme();
+        let drawn = text_of(&tool_line(
+            100,
+            &th,
+            State::Read,
+            "instrumenta",
+            "read lib.rs",
+            Some("0.01s"),
+            0,
+            false,
+        ));
+        assert_eq!(drawn.trim_end(), "● Read(lib.rs)");
+    }
+
+    #[test]
+    fn arguments_keep_text_ink_and_failures_keep_error_ink() {
+        let th = theme();
+        let read = tool_line(
+            100,
+            &th,
+            State::Read,
+            "instrumenta",
+            "lib.rs",
+            None,
+            0,
+            false,
+        );
+        assert_eq!(read.spans[3].style.fg, Some(th.text));
+        let failed = tool_line(
+            100,
+            &th,
+            State::Failed,
+            "manus",
+            "cargo test",
+            None,
+            0,
+            false,
+        );
+        assert_eq!(failed.spans[3].style.fg, Some(th.text));
+        assert_eq!(failed.spans[0].style.fg, Some(th.cc().error));
+        assert!(text_of(&failed).starts_with("● Shell("));
+    }
+
+    #[test]
+    fn tail_keeps_the_last_rows_and_pad_to_grows_to_height() {
+        let th = theme();
+        let rows: Vec<Line<'static>> = (0..10)
+            .map(|i| Line::from(vec![span(i.to_string(), th.text)]))
+            .collect();
+        let kept = tail(rows.clone(), 3);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(text_of(&kept[0]), "7");
+        assert_eq!(tail(rows.clone(), 20).len(), 10);
+        assert_eq!(pad_to(rows, 14).len(), 14);
+    }
+
+    #[test]
+    fn a_hair_rule_carries_its_mark_at_the_centre() {
+        let th = theme();
+        let line = hair_rule(40, &th, "◦");
+        let drawn = text_of(&line);
+        assert!(drawn.starts_with('·') && drawn.ends_with('·'), "{drawn}");
+        assert!(drawn.contains(" ◦ "), "{drawn}");
+    }
+
+    #[test]
+    fn a_word_wider_than_the_measure_is_broken_rather_than_wrapped_forever() {
+        // A double-width character in a one-column measure fits nowhere.
+        // `clip` gives back nothing there, which used to leave the word
+        // unchanged and the wrap loop spinning: 100% CPU inside the alternate
+        // screen, on nothing worse than a resize and a CJK word.
+        let lines = wrap("日本語", 1);
+        assert_eq!(lines, vec!["日", "本", "語"]);
+
+        let lines = wrap("hello 日本語 there", 2);
+        assert!(lines.iter().all(|line| !line.is_empty()), "{lines:?}");
+        assert!(lines.concat().contains('日'), "{lines:?}");
+    }
+
+    #[test]
+    fn emphasis_is_only_applied_under_no_color() {
+        let plain = theme();
+        let no_color = Theme::da_vinci(ColorDepth::TrueColor, true);
+        assert!(!is_strong(&span_strong("✓", plain.success, &plain)));
+        assert!(is_strong(&span_strong("✓", no_color.success, &no_color)));
+    }
+}
+
+#[cfg(test)]
+mod section_regressions {
+    use super::*;
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    #[test]
+    fn a_tiny_window_never_exceeds_its_budget_or_loses_its_anchor() {
+        let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
+        for height in 0..8 {
+            let rows = (0..20).map(|n| Line::from(format!("row {n}"))).collect();
+            let visible = window(rows, height, 10, &theme);
+            assert!(
+                visible.len() <= height,
+                "height {height}: {} rows",
+                visible.len()
+            );
+            if height > 0 {
+                assert!(visible.iter().any(|r| r.to_string() == "row 10"));
+            }
+        }
+    }
+}
+
+/// A picker/settings row. Focus is independent of the saved/current value.
+pub fn section_row(
+    width: u16,
+    theme: &Theme,
+    selected: bool,
+    label: &str,
+    value: &str,
+) -> Line<'static> {
+    let cc = theme.cc();
+    let width = width.min(96);
+    let available = width.saturating_sub(2);
+    let value_room = if width < 32 {
+        0
+    } else {
+        (available / 3).min(28)
+    };
+    let value = clip_ellipsis(value, value_room);
+    let value_width = run_width(&[span(value.clone(), cc.inactive)]);
+    let name_room = available.saturating_sub(value_width + u16::from(!value.is_empty()));
+    let left = vec![
+        span(
+            if selected {
+                SELECTION_BAR
+            } else {
+                UNSELECTED_BAR
+            },
+            if selected { cc.permission } else { cc.inactive },
+        ),
+        span(
+            clip_ellipsis(label, name_room),
+            if selected { cc.permission } else { theme.text },
+        ),
+    ];
+    spread(width, left, vec![span(value, cc.inactive)])
+}
+
+/// Wrapped secondary information aligns with picker labels, never with the marker.
+pub fn section_detail(width: u16, theme: &Theme, text: &str) -> Vec<Line<'static>> {
+    if text.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let lead = 3.min(width.saturating_sub(1));
+    wrap(text, width.saturating_sub(lead))
+        .into_iter()
+        .map(|text| {
+            let mut row = vec![pad(lead, None)];
+            row.push(span(text, theme.muted));
+            Line::from(truncate_run(row, width))
+        })
+        .collect()
+}
+
+/// Locate visual focus after headings, wrapped details and nonselectable rows.
+pub fn focused_row(rows: &[Line<'_>]) -> Option<usize> {
+    rows.iter().position(|row| {
+        row.spans
+            .iter()
+            .any(|s| s.content.as_ref() == SELECTION_BAR || s.content.trim() == "❯")
+    })
+}
+
+/// A section subheading, using the same indentation and wrapping as details.
+pub fn section_heading(width: u16, theme: &Theme, text: &str) -> Vec<Line<'static>> {
+    // These headings can contain case-sensitive IDs and numeric summaries.
+    // Keep their text and wrapping; only the printed treatment changes.
+    section_detail(width, theme, text)
+        .into_iter()
+        .map(|row| {
+            Line::from(
+                row.spans
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, span)| {
+                        if index == 0 {
+                            span
+                        } else {
+                            Span::styled(span.content, paper_label("", theme, false).style)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+/// A status is not a cursor. Its glyph remains meaningful without color.
+pub fn section_state(width: u16, theme: &Theme, state: State, text: &str) -> Vec<Line<'static>> {
+    let mut rows = section_detail(width, theme, &format!("{} {text}", state.glyph()));
+    let color = match state {
+        State::Failed => theme.error,
+        State::Attention => theme.warning,
+        _ => theme.text,
+    };
+    for row in &mut rows {
+        for span in &mut row.spans {
+            span.style.fg = Some(color);
+        }
+    }
+    rows
+}
+
+/// Window an open section while retaining its title/query and final help row.
+/// `anchor` is a rendered row, not an item index, so expanded details can be
+/// paged without changing the selected answer. The last row is Surface's
+/// breathing room; the row immediately before it is the keyboard footer.
+pub fn window_section(
+    rows: Vec<Line<'static>>,
+    height: usize,
+    pinned: usize,
+    anchor: Option<usize>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if rows.len() <= height {
+        return rows;
+    }
+    let anchor = anchor.or_else(|| focused_row(&rows)).unwrap_or(0);
+    if height < 3 {
+        return window(rows, height, anchor, theme);
+    }
+    let pinned = pinned
+        .max(1)
+        .min(height.saturating_sub(2))
+        .min(rows.len().saturating_sub(2));
+    let footer_at = rows.len().saturating_sub(2);
+    let mut visible = rows[..pinned].to_vec();
+    visible.extend(window(
+        rows[pinned..footer_at].to_vec(),
+        height - pinned - 1,
+        anchor.saturating_sub(pinned),
+        theme,
+    ));
+    visible.push(rows[footer_at].clone());
+    visible
+}
+
+#[cfg(test)]
+mod section_window_tests {
+    use super::*;
+    use crate::davinci::theme::ColorDepth;
+    #[test]
+    fn paging_keeps_the_title_and_help_without_changing_the_focus() {
+        let th = Theme::da_vinci(ColorDepth::TrueColor, false);
+        let mut rows = vec![Line::from("Choose an action"), Line::from("Context")];
+        rows.extend((0..60).map(|i| section_row(40, &th, i == 30, &format!("choice {i}"), "")));
+        rows.push(Line::from("esc cancel"));
+        rows.push(Line::default());
+        let current = window_section(rows.clone(), 8, 1, None, &th);
+        assert!(current.iter().any(|r| r.to_string().contains("choice 30")));
+        let paged = window_section(rows, 8, 1, Some(0), &th);
+        assert!(paged[0].to_string().contains("Choose an action"));
+        assert!(paged.iter().any(|r| r.to_string().contains("Context")));
+        assert!(paged.last().unwrap().to_string().contains("esc cancel"));
+    }
+}
+
+/// Keep the end of an editable query visible without splitting a grapheme.
+pub fn clip_tail(text: &str, max: u16) -> String {
+    if UnicodeWidthStr::width(text) <= max as usize {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut kept = Vec::new();
+    let mut used = 1usize;
+    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(text, true).rev() {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if used + cells > max as usize {
+            break;
+        }
+        kept.push(grapheme);
+        used += cells;
+    }
+    format!("…{}", kept.into_iter().rev().collect::<String>())
+}

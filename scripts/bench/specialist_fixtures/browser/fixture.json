@@ -1,0 +1,19 @@
+{
+  "browsers": {
+    "chrome": {
+      "available": false,
+      "reason": "fixture-only"
+    },
+    "edge": {
+      "available": true,
+      "version": "fixture"
+    }
+  },
+  "expected": {
+    "network": false,
+    "selected": "edge"
+  },
+  "kind": "browser-availability",
+  "offline": true,
+  "preference_required": false
+}

@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.281
+           Opus 5.5 with high effort · <plan>
+           ~\project
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+❯ Think briefly, then: 1) run the shell command echo hello, 2) read README.md, 3) edit README.md to append a final line
+  Edited., 4) write a todo list with 3 short items using your todo tool and mark the first done, 5) end with a short
+  markdown reply that has a heading, a bullet list of 2 items, inline code, and a fenced rust code block of 2 lines.
+
+● Reading 1 file, running 1 shell command…
+  ⎿  $ echo hello
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✢ Levitating… (3s · ↓ 227 tokens · thought for 1s)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← 1 agent

@@ -1,0 +1,87 @@
+{
+  "milestone": "P6 Git Intelligence Final Evidence",
+  "base_branch": "codex/build-intelligence-01a0ad48",
+  "branch": "codex/git-intelligence-01a0ad48",
+  "tools": [
+    "git_symbol_history",
+    "git_related_commits",
+    "git_changed_symbols",
+    "git_branch_diff",
+    "git_blame_symbol",
+    "git_commit_context",
+    "git_conflict_explain"
+  ],
+  "commands": [
+    "git-status"
+  ],
+  "capabilities": [
+    "Tree-Sitter AST symbol tracking across historical git revisions",
+    "Acceptance Guard: shallow and bounded histories report Unknown/Partial introduction rather than claiming oldest returned commit introduced symbol",
+    "Strict separation of objective facts from commit message inferences",
+    "Porcelain blame parser with line-level attribution and author percentages",
+    "3-way unmerged conflict stage inspection with zero index or working tree mutation",
+    "Safe subprocess execution with sanitized environment, pager disabled, option injection and path traversal guards",
+    "CacheRuntime integration with CacheNamespace::Git and CacheDependency::GitObject"
+  ],
+  "security_invariants": {
+    "zero_mutation_guarantee": true,
+    "no_shell_interpolation": true,
+    "sanitized_git_environment": true,
+    "option_injection_guards": true,
+    "path_traversal_guards": true,
+    "read_only_tool_class": true,
+    "acceptance_guard_shallow_incomplete_history": true,
+    "facts_vs_inference_separation": true
+  },
+  "package_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent --test git_intelligence",
+    "exit_code": 0,
+    "passed": 11,
+    "failed": 0,
+    "ignored": 0,
+    "cases": [
+      "test_non_git_directory_handling",
+      "test_permission_classification_and_host_integration",
+      "test_conflict_explain_zero_mutation",
+      "test_security_guards_option_injection_and_traversal",
+      "test_blame_symbol_porcelain",
+      "test_facts_vs_inference_separation",
+      "test_caching_and_telemetry",
+      "test_changed_symbols_ast_comparison",
+      "test_acceptance_guard_shallow_and_bounded_history",
+      "test_branch_diff_with_merge_base",
+      "test_symbol_history_with_modifications_and_renames"
+    ]
+  },
+  "graph_role_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent git_intelligence_tools_follow_role_selection",
+    "exit_code": 0,
+    "passed": 1,
+    "failed": 0
+  },
+  "agent_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-agent",
+    "exit_code": 0,
+    "passed": 73,
+    "failed": 0,
+    "ignored": 3
+  },
+  "lint_checks": {
+    "fmt": "rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check (exit 0)",
+    "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
+  },
+  "pull_request": {
+    "number": 15,
+    "url": "https://github.com/J12003LPZ/davinci/pull/15",
+    "base": "codex/build-intelligence-01a0ad48",
+    "head": "codex/git-intelligence-01a0ad48"
+  },
+  "ci_verification": {
+    "head_sha": "dcaf02b5ad366ef0c48ac0017684bb83f2ec2c9d",
+    "push_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35372343120",
+    "push_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35372343125",
+    "pr_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35372351676",
+    "pr_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35372351664",
+    "status": "all green (22/22 jobs on push CI, 22/22 jobs on PR CI, push & PR SARIF success)"
+  }
+}

@@ -1,0 +1,1093 @@
+//! JSONL session store matching `@earendil-works/pi-agent-core` session harness.
+
+mod codec;
+mod discovery;
+mod errors;
+mod jsonl_repo;
+mod repo;
+pub mod runtime_log;
+mod tree;
+mod types;
+
+pub use codec::{
+    encode_header, encode_mutation, metadata_from_header, migrate_v3_to_v4, parse_header,
+    parse_mutation,
+};
+pub use discovery::{
+    cwd_encoded_dir, default_agent_dir, default_session_dir, discover_session_headers,
+    discover_sessions, encode_cwd_component, expand_tilde, home_dir, latest_session,
+    resolve_session_dir, resolve_session_dir_from, resolve_session_ref, SessionSummary,
+};
+pub use errors::{JsonlDecodeError, SessionError};
+pub use jsonl_repo::{
+    expected_session_path, jsonl_session_directory_name, session_file_name, utc_date_from_unix_ms,
+    validate_session_id, JsonlCreateOptions, JsonlSessionInfo, JsonlSessionRepo,
+    JsonlStoredSession,
+};
+pub use repo::{
+    assistant_message_entry, compaction_entry, custom_entry, operation_started, user_message_entry,
+    BranchBounds, EntryOrder, EntryQuery, ForkOptions, ForkPosition, ForkScope,
+    InMemorySessionRepo, LanePointer, LogItem, LogOptions, RecordQuery, Session,
+    SessionCreateOptions, SessionMetadata, SessionState, SessionStats, SessionView,
+};
+pub use runtime_log::{
+    read_runtime_log, runtime_log_path, RuntimeLogError, RuntimeLogWriter,
+    CURRENT_RUNTIME_SCHEMA_VERSION,
+};
+pub use tree::{
+    branch_entries, build_context_entries, build_session_path, build_session_tree, entries_since,
+    export_session_jsonl, fork_user_messages, resolved_labels, session_usage_stats,
+    SessionUsageStats,
+};
+pub use types::*;
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::types::{operation_entry_matches, prepare_operation_entry};
+use uuid::Uuid;
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WriterState {
+    pub(crate) tail_checked: bool,
+    pub(crate) rewrite_as_v4: bool,
+    pub(crate) lock: Option<std::sync::Arc<davinci_sys::lock::ExclusiveFileLock>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonlSession {
+    pub path: PathBuf,
+    pub header: JsonlV4Header,
+    pub entries: Vec<SessionEntry>,
+    pub records: Vec<LaneRecord>,
+    pub leaf_id: Option<String>,
+    max_seq: u64,
+    persistence_error: Option<String>,
+    pub(crate) writer: WriterState,
+}
+
+impl JsonlSession {
+    pub fn create(
+        sessions_root: &Path,
+        cwd: &str,
+        name: Option<&str>,
+    ) -> Result<Self, SessionError> {
+        fs::create_dir_all(sessions_root).map_err(|err| {
+            SessionError::storage(format!("Unable to create session directory: {err}"))
+        })?;
+        let dir = sessions_root.join(encode_cwd_component(cwd));
+        Self::create_in_directory(&dir, cwd, name)
+    }
+
+    /// Create a conversation in an already selected storage namespace. This
+    /// keeps private task storage independent of workspace filename encoding.
+    pub fn create_in_directory(
+        dir: &Path,
+        cwd: &str,
+        name: Option<&str>,
+    ) -> Result<Self, SessionError> {
+        fs::create_dir_all(dir).map_err(|err| {
+            SessionError::storage(format!("Unable to create cwd session directory: {err}"))
+        })?;
+        let id = Uuid::new_v4().to_string();
+        let path = dir.join(format!("{id}.jsonl"));
+        let header = JsonlV4Header {
+            kind: "header".into(),
+            version: 4,
+            id: id.clone(),
+            created_at: now_ms(),
+            cwd: cwd.to_string(),
+            parent_session_id: None,
+            legacy_parent_session_path: None,
+            metadata: name.map(|n| {
+                let mut map = serde_json::Map::new();
+                map.insert("name".into(), serde_json::Value::String(n.to_string()));
+                serde_json::Value::Object(map)
+            }),
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to create session file: {err}"))
+            })?;
+        file.write_all(encode_header(&header).as_bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_parent(&path))
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to write session header: {err}"))
+            })?;
+        Ok(Self {
+            path,
+            header,
+            entries: Vec::new(),
+            records: Vec::new(),
+            leaf_id: None,
+            max_seq: 0,
+            persistence_error: None,
+            writer: WriterState::default(),
+        })
+    }
+
+    pub fn open(path: &Path) -> Result<Self, SessionError> {
+        let content = fs::read_to_string(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                SessionError::not_found(format!("Session file not found: {}", path.display()))
+            } else {
+                SessionError::storage(format!("Unable to open session file: {err}"))
+            }
+        })?;
+        let terminated = content.ends_with('\n');
+        let physical: Vec<&str> = content.lines().collect();
+        let first = physical.first().copied().ok_or_else(|| {
+            SessionError::invalid_entry(format!(
+                "Invalid JSONL v4 session {}: line 1 is empty",
+                path.display()
+            ))
+        })?;
+        let last_index = physical.len().saturating_sub(1);
+        let header = match parse_header(first) {
+            Ok(header) => header,
+            Err(_err) if first.contains("\"type\"") || first.contains("\"role\"") => {
+                return migrate_v3_to_v4(
+                    path,
+                    first,
+                    physical
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .skip(1)
+                        .map(|(index, line)| (index + 1, line)),
+                    terminated,
+                    physical.len(),
+                );
+            }
+            Err(err) => {
+                return Err(SessionError::invalid_entry(format!(
+                    "Invalid JSONL v4 session {}: line 1 {}",
+                    path.display(),
+                    err
+                )));
+            }
+        };
+        let mut session = Self {
+            path: path.to_path_buf(),
+            header,
+            entries: Vec::new(),
+            records: Vec::new(),
+            leaf_id: None,
+            max_seq: 0,
+            persistence_error: None,
+            writer: WriterState::default(),
+        };
+        for (index, line) in physical.iter().enumerate().skip(1) {
+            let line_no = index + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse_mutation(line) {
+                Ok(SessionMutation::Entry { entry, .. }) => {
+                    session.max_seq = session.max_seq.max(entry.seq);
+                    session.leaf_id = Some(entry.id.clone());
+                    session.entries.push(entry);
+                }
+                Ok(SessionMutation::Record { record, .. }) => {
+                    session.max_seq = session.max_seq.max(record.seq);
+                    session.records.push(record);
+                }
+                Ok(
+                    SessionMutation::Lane { .. }
+                    | SessionMutation::FactName { .. }
+                    | SessionMutation::FactLabel { .. },
+                ) => {}
+                Err(_) if index == last_index && !terminated => break,
+                Err(err) => {
+                    return Err(SessionError::invalid_entry(format!(
+                        "Invalid JSONL v4 session {}: line {line_no} {}",
+                        path.display(),
+                        err
+                    )));
+                }
+            }
+        }
+        Ok(session)
+    }
+
+    pub fn append_entry(&mut self, mut entry: SessionEntry) -> Result<(), SessionError> {
+        self.prepare_first_write()?;
+        entry.seq = self.max_seq.saturating_add(1);
+        if entry.timestamp == 0 {
+            entry.timestamp = now_ms();
+        }
+        if entry.id.is_empty() {
+            entry.id = Uuid::new_v4().to_string();
+        }
+        entry.parent_id = self.leaf_id.clone();
+        self.write_line(&encode_mutation(&SessionMutation::Entry {
+            lane: None,
+            entry: entry.clone(),
+        }))?;
+        self.max_seq = entry.seq;
+        self.leaf_id = Some(entry.id.clone());
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// Append an operation projection once. The stable event ID is also the
+    /// session entry ID, so a retry after a crash can find the durable append.
+    /// Existing IDs must carry the same payload; a different payload is an
+    /// integrity error rather than a successful duplicate.
+    pub fn append_entry_once(
+        &mut self,
+        event_id: &str,
+        expected_parent_id: Option<&str>,
+        mut entry: SessionEntry,
+    ) -> Result<SessionEntry, SessionError> {
+        self.prepare_first_write()?;
+        prepare_operation_entry(event_id, &mut entry)?;
+        if let Some(existing) = self.entries.iter().find(|existing| existing.id == event_id) {
+            if operation_entry_matches(existing, &entry)
+                && self.entry_is_on_current_lineage(event_id)
+            {
+                return Ok(existing.clone());
+            }
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} is outside the current lineage or has a different payload"
+            )));
+        }
+        if self.leaf_id.as_deref() != expected_parent_id {
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} session lineage changed before append"
+            )));
+        }
+        entry.parent_id = expected_parent_id.map(str::to_owned);
+        self.append_entry(entry.clone())?;
+        Ok(self.entries.last().cloned().unwrap_or(entry))
+    }
+
+    fn entry_is_on_current_lineage(&self, event_id: &str) -> bool {
+        let by_id: std::collections::HashMap<_, _> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.parent_id.as_deref()))
+            .collect();
+        let mut current = self.leaf_id.as_deref();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = current {
+            if id == event_id {
+                return true;
+            }
+            if !seen.insert(id) {
+                return false;
+            }
+            current = by_id.get(id).copied().flatten();
+        }
+        false
+    }
+
+    pub fn set_leaf(&mut self, leaf_id: Option<String>) {
+        self.leaf_id = leaf_id;
+    }
+
+    /// TS `branchWithSummary`: move the leaf to `branch_from_id`, then append a
+    /// `branch_summary` whose `fromId` is the abandoned leaf.
+    pub fn branch_with_summary(
+        &mut self,
+        branch_from_id: Option<String>,
+        summary: &str,
+        details: serde_json::Value,
+        usage: Option<serde_json::Value>,
+        from_hook: bool,
+    ) -> Result<String, SessionError> {
+        self.prepare_first_write()?;
+        if let Some(id) = branch_from_id.as_deref() {
+            if !id.is_empty() && !self.entries.iter().any(|entry| entry.id == id) {
+                return Err(SessionError::not_found(format!("Entry {id} not found")));
+            }
+        }
+        let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".into());
+        let original_leaf = self.leaf_id.clone();
+        self.leaf_id = branch_from_id;
+        let mut extra = serde_json::Map::new();
+        extra.insert("fromId".into(), serde_json::Value::String(from_id));
+        extra.insert("summary".into(), serde_json::Value::String(summary.into()));
+        extra.insert("details".into(), details);
+        extra.insert("fromHook".into(), serde_json::Value::Bool(from_hook));
+        if let Some(usage) = usage {
+            extra.insert("usage".into(), usage);
+        }
+        let result = self.append_entry(SessionEntry {
+            id: String::new(),
+            entry_type: "branch_summary".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: None,
+            extra,
+        });
+        if let Err(error) = result {
+            self.leaf_id = original_leaf;
+            return Err(error);
+        }
+        Ok(self.leaf_id.clone().unwrap_or_default())
+    }
+
+    pub fn fork(&self, entry_id: &str, sessions_root: &Path) -> Result<Self, SessionError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == entry_id)
+            .ok_or_else(|| SessionError::not_found(format!("Entry {entry_id} not found")))?;
+        let mut forked = Self::create(sessions_root, &self.header.cwd, None)?;
+        forked.prepare_first_write()?;
+        forked.header.parent_session_id = Some(self.header.id.clone());
+        forked.rewrite_header()?;
+        for entry in self.entries.iter().take(index + 1) {
+            let mut clone = entry.clone();
+            clone.id = Uuid::new_v4().to_string();
+            clone.parent_id = forked.leaf_id.clone();
+            forked.append_entry(clone)?;
+        }
+        Ok(forked)
+    }
+
+    pub fn clone_session(&self, sessions_root: &Path) -> Result<Self, SessionError> {
+        let mut cloned = Self::create(sessions_root, &self.header.cwd, None)?;
+        cloned.prepare_first_write()?;
+        cloned.header.parent_session_id = Some(self.header.id.clone());
+        cloned.rewrite_header()?;
+        for entry in &self.entries {
+            let mut clone = entry.clone();
+            clone.id = Uuid::new_v4().to_string();
+            clone.parent_id = cloned.leaf_id.clone();
+            cloned.append_entry(clone)?;
+        }
+        Ok(cloned)
+    }
+
+    pub fn set_name(&mut self, name: &str) -> Result<(), SessionError> {
+        self.prepare_first_write()?;
+        let original = self.header.metadata.clone();
+        let mut map = match &self.header.metadata {
+            Some(serde_json::Value::Object(map)) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if name.is_empty() {
+            map.remove("name");
+        } else {
+            map.insert("name".into(), serde_json::Value::String(name.to_string()));
+        }
+        self.header.metadata = if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map))
+        };
+        if let Err(error) = self.rewrite_header() {
+            self.header.metadata = original;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn display_name(&self) -> Option<String> {
+        self.header
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    pub fn persistence_error(&self) -> Option<&str> {
+        self.persistence_error.as_deref()
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<(), SessionError> {
+        self.prepare_first_write()?;
+        self.persist(|path| {
+            let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
+                SessionError::storage(format!("Unable to append session file: {err}"))
+            })?;
+            file.write_all(line.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to append session file: {err}"))
+                })
+        })
+    }
+
+    fn prepare_first_write(&mut self) -> Result<(), SessionError> {
+        if let Some(error) = &self.persistence_error {
+            return Err(SessionError::storage(format!(
+                "Session recovery required: {error}"
+            )));
+        }
+        self.prepare_first_write_inner().inspect_err(|error| {
+            self.persistence_error = Some(error.to_string());
+        })
+    }
+
+    fn prepare_first_write_inner(&mut self) -> Result<(), SessionError> {
+        if self.writer.lock.is_none() {
+            let mut lock_path = self.path.as_os_str().to_owned();
+            lock_path.push(".lock");
+            let lock = davinci_sys::lock::ExclusiveFileLock::try_acquire(Path::new(&lock_path))
+                .map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        SessionError::storage(format!(
+                            "Session {} is open in another davinci process; close it there or start a new session",
+                            self.path.display()
+                        ))
+                    } else {
+                        SessionError::storage(format!("Unable to lock session: {err}"))
+                    }
+                })?;
+            self.writer.lock = Some(std::sync::Arc::new(lock));
+
+            // The session may have been opened before another process took
+            // the writer lock, appended, and exited. Re-read after acquiring
+            // ownership and adopt durable state before planning our first
+            // mutation. leaf_id alone is intentionally excluded from the
+            // comparison because callers may select an existing branch with
+            // set_leaf without changing the file.
+            let current = Self::open(&self.path)?;
+            if current.header != self.header
+                || current.entries != self.entries
+                || current.records != self.records
+                || current.max_seq != self.max_seq
+            {
+                self.header = current.header;
+                self.entries = current.entries;
+                self.records = current.records;
+                self.leaf_id = current.leaf_id;
+                self.max_seq = current.max_seq;
+            }
+            self.writer.rewrite_as_v4 |= current.writer.rewrite_as_v4;
+        }
+        if !self.writer.tail_checked {
+            repair_jsonl_tail(&self.path)?;
+            self.writer.tail_checked = true;
+        }
+        if self.writer.rewrite_as_v4 {
+            self.publish_as_v4()?;
+            self.writer.rewrite_as_v4 = false;
+        }
+        Ok(())
+    }
+
+    fn publish_as_v4(&mut self) -> Result<(), SessionError> {
+        let mut backup = self.path.as_os_str().to_owned();
+        backup.push(".v3.bak");
+        let backup = PathBuf::from(backup);
+        if !backup.exists() {
+            fs::copy(&self.path, &backup).map_err(|err| {
+                SessionError::storage(format!("Unable to back up v3 session: {err}"))
+            })?;
+        }
+        let mut body = encode_header(&self.header);
+        for entry in &self.entries {
+            body.push_str(&encode_mutation(&SessionMutation::Entry {
+                lane: None,
+                entry: entry.clone(),
+            }));
+        }
+        let path = self.path.clone();
+        self.persist(|_| {
+            davinci_sys::fs::atomic_write(&path, body.as_bytes()).map_err(|err| {
+                SessionError::storage(format!("Unable to convert session to v4: {err}"))
+            })
+        })
+    }
+
+    fn rewrite_header(&mut self) -> Result<(), SessionError> {
+        self.prepare_first_write()?;
+        let header = encode_header(&self.header);
+        self.persist(|path| {
+            let rest = fs::read_to_string(path).map_err(|err| {
+                SessionError::storage(format!("Unable to read session file: {err}"))
+            })?;
+            let mut lines = rest.lines();
+            let _ = lines.next();
+            let mut body = header;
+            for line in lines {
+                body.push_str(line);
+                body.push('\n');
+            }
+            let permissions = fs::metadata(path)
+                .map_err(|err| SessionError::storage(err.to_string()))?
+                .permissions();
+            jsonl_repo::publish_atomically(path, |temporary| {
+                fs::write(temporary, body)
+                    .and_then(|()| fs::set_permissions(temporary, permissions))
+                    .map_err(|err| {
+                        SessionError::storage(format!("Unable to rewrite session header: {err}"))
+                    })
+            })
+        })
+    }
+
+    fn persist(
+        &mut self,
+        write: impl FnOnce(&Path) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        if let Some(error) = &self.persistence_error {
+            return Err(SessionError::storage(format!(
+                "Session recovery required: {error}"
+            )));
+        }
+        write(&self.path).inspect_err(|error| {
+            self.persistence_error = Some(error.to_string());
+        })
+    }
+}
+
+fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| SessionError::storage(format!("Unable to inspect session tail: {err}")))?;
+    if content.is_empty() || content.ends_with('\n') {
+        return Ok(());
+    }
+
+    let tail = content
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail)
+        .unwrap_or(&content);
+    let complete = if content.contains('\n') {
+        parse_mutation(tail).is_ok()
+    } else {
+        parse_header(tail).is_ok()
+    };
+    if complete {
+        let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
+            SessionError::storage(format!("Unable to terminate complete session tail: {err}"))
+        })?;
+        file.write_all(b"\n")
+            .and_then(|()| file.sync_all())
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to terminate complete session tail: {err}"))
+            })?;
+    } else {
+        davinci_sys::fs::truncate_torn_tail(path).map_err(|err| {
+            SessionError::storage(format!("Unable to repair session tail: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn first_write_failure_requires_reopening_even_after_storage_is_restored() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/fixture", None).unwrap();
+        let backup = session.path.with_extension("backup");
+        fs::rename(&session.path, &backup).unwrap();
+        fs::create_dir(&session.path).unwrap();
+        assert!(session
+            .append_entry(SessionEntry::message("user", serde_json::json!("lost")))
+            .is_err());
+        assert!(session.persistence_error().is_some());
+        fs::remove_dir(&session.path).unwrap();
+        fs::rename(&backup, &session.path).unwrap();
+        assert!(session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!("must reopen")
+            ))
+            .is_err());
+        assert!(session.entries.is_empty());
+    }
+
+    #[test]
+    fn failed_session_writes_preserve_cursor_and_metadata() {
+        for operation in ["append", "branch", "name"] {
+            let dir = tempdir().unwrap();
+            let mut session =
+                JsonlSession::create(dir.path(), "/fixture", Some("original")).unwrap();
+            session
+                .append_entry(SessionEntry::message("user", serde_json::json!("first")))
+                .unwrap();
+            let original = session.clone();
+            let backup = session.path.with_extension("backup");
+            fs::rename(&session.path, &backup).unwrap();
+            fs::create_dir(&session.path).unwrap();
+            let result = match operation {
+                "append" => {
+                    session.append_entry(SessionEntry::message("user", serde_json::json!("lost")))
+                }
+                "branch" => session
+                    .branch_with_summary(None, "lost", serde_json::json!({}), None, false)
+                    .map(|_| ()),
+                _ => session.set_name("lost"),
+            };
+            assert!(result.is_err());
+            assert_eq!(session.leaf_id, original.leaf_id, "{operation}");
+            assert_eq!(session.entries, original.entries, "{operation}");
+            assert_eq!(session.header, original.header, "{operation}");
+            fs::remove_dir(&session.path).unwrap();
+            fs::rename(&backup, &session.path).unwrap();
+            assert!(session
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!("must reopen")
+                ))
+                .is_err());
+            let session_path = session.path.clone();
+            let original_leaf_id = original.leaf_id.clone();
+            drop(session);
+            drop(original);
+            let mut reopened = JsonlSession::open(&session_path).unwrap();
+            reopened
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!("recovered"),
+                ))
+                .unwrap();
+            assert_eq!(reopened.entries.len(), 2);
+            assert_eq!(reopened.entries[1].parent_id, original_leaf_id);
+        }
+    }
+
+    #[test]
+    fn append_sequence_is_cached_across_open() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        for index in 0..100 {
+            session
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!(format!("{index}")),
+                ))
+                .unwrap();
+        }
+        assert_eq!(session.entries.last().unwrap().seq, 100);
+        let path = session.path.clone();
+        drop(session);
+
+        let mut reopened = JsonlSession::open(&path).unwrap();
+        reopened
+            .append_entry(SessionEntry::message("user", serde_json::json!("next")))
+            .unwrap();
+        assert_eq!(reopened.entries.last().unwrap().seq, 101);
+    }
+
+    #[test]
+    fn open_skips_an_unterminated_torn_last_line() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"kind\":\"entry\",\"seq\":9,\"entry\":{\"id\":\"to");
+        fs::write(&path, bytes).unwrap();
+        let reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 1);
+    }
+
+    #[test]
+    fn complete_unterminated_last_entry_is_preserved_before_append() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        session
+            .append_entry(SessionEntry::message("assistant", serde_json::json!("two")))
+            .unwrap();
+        let second = session.leaf_id.clone().unwrap();
+        let path = session.path.clone();
+        drop(session);
+
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, bytes).unwrap();
+
+        let mut reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 2);
+        reopened
+            .append_entry(SessionEntry::message("user", serde_json::json!("three")))
+            .unwrap();
+        assert_eq!(reopened.entries.len(), 3);
+        assert_eq!(
+            reopened.entries[2].parent_id.as_deref(),
+            Some(second.as_str())
+        );
+        drop(reopened);
+        assert_eq!(JsonlSession::open(&path).unwrap().entries.len(), 3);
+    }
+
+    #[test]
+    fn first_writer_reloads_changes_made_after_open_before_appending() {
+        let dir = tempdir().unwrap();
+        let mut initial = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        initial
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = initial.path.clone();
+        drop(initial);
+
+        let mut stale = JsonlSession::open(&path).unwrap();
+        let mut other = JsonlSession::open(&path).unwrap();
+        other
+            .append_entry(SessionEntry::message("assistant", serde_json::json!("two")))
+            .unwrap();
+        let second = other.leaf_id.clone().unwrap();
+        drop(other);
+
+        stale
+            .append_entry(SessionEntry::message("user", serde_json::json!("three")))
+            .unwrap();
+        assert_eq!(stale.entries.len(), 3);
+        assert_eq!(stale.entries[2].seq, 3);
+        assert_eq!(stale.entries[2].parent_id.as_deref(), Some(second.as_str()));
+    }
+
+    #[test]
+    fn append_after_torn_tail_does_not_glue_lines() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"kind\":\"ent");
+        fs::write(&path, bytes).unwrap();
+        let mut reopened = JsonlSession::open(&path).unwrap();
+        reopened
+            .append_entry(SessionEntry::message("user", serde_json::json!("two")))
+            .unwrap();
+        drop(reopened);
+        let again = JsonlSession::open(&path).unwrap();
+        assert_eq!(again.entries.len(), 2);
+    }
+
+    #[test]
+    fn terminated_corrupt_line_is_still_an_error() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"not json\n");
+        fs::write(&path, bytes).unwrap();
+        assert!(JsonlSession::open(&path).is_err());
+    }
+
+    #[test]
+    fn appending_to_a_migrated_v3_session_reopens_cleanly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("2026-01-01_abc.jsonl");
+        let original = concat!(
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":"hello"}}"#,
+            "\n",
+        );
+        fs::write(&path, original).unwrap();
+        let mut session = JsonlSession::open(&path).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("next")))
+            .unwrap();
+        drop(session);
+        let reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 3);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("2026-01-01_abc.jsonl.v3.bak")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn renaming_a_migrated_v3_session_keeps_every_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("2026-01-01_abc.jsonl");
+        let original = concat!(
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":"hello"}}"#,
+            "\n",
+        );
+        fs::write(&path, original).unwrap();
+        let mut session = JsonlSession::open(&path).unwrap();
+        session.set_name("renamed").unwrap();
+        drop(session);
+        let reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 2);
+        assert_eq!(reopened.display_name().as_deref(), Some("renamed"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("2026-01-01_abc.jsonl.v3.bak")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_second_writer_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut first = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        first
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = first.path.clone();
+        let mut second = JsonlSession::open(&path).unwrap();
+        let err = second
+            .append_entry(SessionEntry::message("user", serde_json::json!("two")))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("open in another davinci process"),
+            "{err}"
+        );
+        first
+            .append_entry(SessionEntry::message("user", serde_json::json!("three")))
+            .unwrap();
+        drop(first);
+        let mut third = JsonlSession::open(&path).unwrap();
+        third
+            .append_entry(SessionEntry::message("user", serde_json::json!("four")))
+            .unwrap();
+    }
+
+    #[test]
+    fn create_append_and_reopen_v4() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/project", Some("demo")).unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"hello"}]),
+            ))
+            .unwrap();
+        let reopened = JsonlSession::open(&session.path).unwrap();
+        assert_eq!(reopened.header.version, 4);
+        assert_eq!(reopened.entries.len(), 1);
+        assert_eq!(reopened.display_name().as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn migrate_v3_headerless_message() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":1,"message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+"#,
+        )
+        .unwrap();
+        let session = JsonlSession::open(&path).unwrap();
+        assert_eq!(session.header.version, 4);
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(session.header.source_format_hint(), 3);
+    }
+
+    #[test]
+    fn migrate_v3_uses_ts_header_and_iso_timestamps() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("2026-01-02T03-04-05-678Z_abc-123.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":3,"id":"abc-123","timestamp":"2020-01-01T00:00:00.000Z","cwd":"C:\\work\\proj","parentSession":"C:\\old\\parent.jsonl"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2020-01-01T00:00:01.500Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let session = JsonlSession::open(&path).unwrap();
+        assert_eq!(session.header.version, 4);
+        assert_eq!(session.header.id, "abc-123");
+        assert_eq!(session.header.cwd, "C:\\work\\proj");
+        assert_eq!(session.header.created_at, 1_577_836_800_000);
+        assert_eq!(
+            session.header.legacy_parent_session_path.as_deref(),
+            Some("C:\\old\\parent.jsonl")
+        );
+        assert_eq!(session.header.source_format_hint(), 3);
+        // The v3 header line must not surface as a session entry.
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(session.entries[0].timestamp, 1_577_836_801_500);
+    }
+
+    #[test]
+    fn tree_fork_stats_and_jsonl_export_match_ts_shapes() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/project", Some("demo")).unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"hello"}]),
+            ))
+            .unwrap();
+        let mut assistant = SessionEntry::message(
+            "assistant",
+            serde_json::json!([
+                {"type":"text","text":"hi"},
+                {"type":"toolCall","name":"read"}
+            ]),
+        );
+        assistant.message = Some(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type":"text","text":"hi"},
+                {"type":"toolCall","name":"read"}
+            ],
+            "usage": { "input": 10, "output": 4, "cacheRead": 1, "cacheWrite": 2, "cost": { "total": 0.5 } }
+        }));
+        session.append_entry(assistant).unwrap();
+        session
+            .append_entry(SessionEntry::label_change(
+                &session.entries[0].id,
+                Some("root"),
+            ))
+            .unwrap();
+
+        let tree = build_session_tree(&session.entries);
+        assert_eq!(tree.as_array().unwrap().len(), 1);
+        assert_eq!(tree[0]["label"], "root");
+        assert_eq!(tree[0]["children"].as_array().unwrap().len(), 1);
+
+        let fork = fork_user_messages(&session.entries);
+        assert_eq!(fork[0]["text"], "hello");
+        assert_eq!(fork[0]["entryId"], session.entries[0].id);
+
+        let missing = entries_since(&session.entries, Some("missing")).unwrap_err();
+        assert_eq!(missing, "Entry not found: missing");
+        assert_eq!(
+            entries_since(&session.entries, Some(&session.entries[0].id))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let stats = session_usage_stats(&session.entries);
+        assert_eq!(stats.user_messages, 1);
+        assert_eq!(stats.assistant_messages, 1);
+        assert_eq!(stats.tool_calls, 1);
+        assert_eq!(stats.input, 10);
+        assert_eq!(stats.token_total(), 17);
+        assert!((stats.cost - 0.5).abs() < f64::EPSILON);
+
+        let out = dir.path().join("export.jsonl");
+        export_session_jsonl(&session, &out).unwrap();
+        let raw = std::fs::read_to_string(&out).unwrap();
+        let header: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(header["type"], "session");
+        assert_eq!(header["id"], session.header.id);
+        assert!(raw.contains("\"parentId\":null"));
+    }
+
+    #[test]
+    fn build_context_entries_follows_leaf_and_latest_compaction() {
+        fn msg(id: &str, parent: Option<&str>, role: &str, text: &str) -> SessionEntry {
+            SessionEntry {
+                id: id.into(),
+                entry_type: "message".into(),
+                parent_id: parent.map(str::to_string),
+                seq: 0,
+                timestamp: 0,
+                message: Some(serde_json::json!({
+                    "role": role,
+                    "content": [{"type": "text", "text": text}],
+                })),
+                custom_type: None,
+                extra: serde_json::Map::new(),
+            }
+        }
+        fn compaction(id: &str, parent: &str, summary: &str, first_kept: &str) -> SessionEntry {
+            let mut extra = serde_json::Map::new();
+            extra.insert("summary".into(), serde_json::json!(summary));
+            extra.insert("firstKeptEntryId".into(), serde_json::json!(first_kept));
+            SessionEntry {
+                id: id.into(),
+                entry_type: "compaction".into(),
+                parent_id: Some(parent.into()),
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: None,
+                extra,
+            }
+        }
+        fn branch_summary(id: &str, parent: &str, summary: &str, from: &str) -> SessionEntry {
+            let mut extra = serde_json::Map::new();
+            extra.insert("summary".into(), serde_json::json!(summary));
+            extra.insert("fromId".into(), serde_json::json!(from));
+            SessionEntry {
+                id: id.into(),
+                entry_type: "branch_summary".into(),
+                parent_id: Some(parent.into()),
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: None,
+                extra,
+            }
+        }
+
+        let entries = vec![
+            msg("1", None, "user", "start"),
+            msg("2", Some("1"), "assistant", "r1"),
+            msg("3", Some("2"), "user", "q2"),
+            msg("4", Some("3"), "assistant", "r2"),
+            compaction("5", "4", "Compacted history", "3"),
+            msg("6", Some("5"), "user", "q3"),
+            msg("7", Some("6"), "assistant", "r3"),
+            msg("8", Some("3"), "user", "wrong path"),
+            msg("9", Some("8"), "assistant", "wrong response"),
+            branch_summary("10", "3", "Tried wrong approach", "9"),
+            msg("11", Some("10"), "user", "better approach"),
+        ];
+        assert_eq!(
+            build_context_entries(&entries, Some("7"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5", "3", "4", "6", "7"]
+        );
+        assert_eq!(
+            build_context_entries(&entries, Some("11"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "10", "11"]
+        );
+        assert_eq!(
+            build_context_entries(&entries, Some("missing"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "10", "11"]
+        );
+    }
+}

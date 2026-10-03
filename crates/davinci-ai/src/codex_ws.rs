@@ -1,0 +1,1377 @@
+//! Codex WebSocket client (RFC 6455) matching
+//! `vendor/pi/packages/ai/src/api/openai-codex-responses.ts`.
+//! Tests never open ChatGPT: fixtures and loopback only.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use base64::Engine;
+use serde_json::Value;
+use sha1::{Digest, Sha1};
+use uuid::Uuid;
+
+use crate::catalog::Model;
+use crate::codex::{
+    acquire_cached_continuation, build_cached_websocket_request_body,
+    record_websocket_request_stats, replay_codex_events, store_cached_continuation,
+    websocket_connect_timeout_error, websocket_handshake_headers, websocket_idle_timeout_error,
+    CachedWebSocketContinuation, CodexWebsocketMessage, SESSION_WEBSOCKET_CACHE_TTL_MS,
+    SESSION_WEBSOCKET_MAX_AGE_MS, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
+};
+use crate::responses_ledger::NativeResponsesOutput;
+use crate::stream::{AssistantMessage, AssistantMessageEvent, StopReason};
+use crate::stream_decoder::{ResponsesDecoder, StreamDecoder};
+
+type AbortFlag<'a> = Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>;
+
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const OPCODE_TEXT: u8 = 0x1;
+const OPCODE_CLOSE: u8 = 0x8;
+const OPCODE_PING: u8 = 0x9;
+const OPCODE_PONG: u8 = 0xA;
+const DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_codex_websocket(
+    url: &str,
+    body: &Value,
+    headers: &[(String, String)],
+    model: &Model,
+    connect_timeout_ms: u64,
+    idle_timeout_ms: Option<u64>,
+    cache_session_id: Option<&str>,
+    account_id: &str,
+    use_cached_context: bool,
+    started: &mut bool,
+    abort: AbortFlag<'_>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<CodexWebsocketMessage, String> {
+    if let Ok(reply) = std::env::var("PI_CODEX_WS_REPLY") {
+        return process_fixture(
+            &reply,
+            body,
+            model,
+            connect_timeout_ms,
+            idle_timeout_ms,
+            cache_session_id,
+            account_id,
+            use_cached_context,
+            started,
+            on_event,
+        );
+    }
+    if !allows_live_websocket(url) {
+        return Err("WebSocket transport is not available in this runtime".into());
+    }
+    let (_, continuation) =
+        acquire_cached_continuation(cache_session_id, account_id, Instant::now());
+    let (request_body, _) = build_cached_websocket_request_body(body, continuation.as_ref());
+    let acquired = acquire_live_socket(
+        url,
+        headers,
+        connect_timeout_ms,
+        cache_session_id,
+        account_id,
+    )?;
+    let mut stream = acquired.stream;
+    let socket_reused = acquired.reused;
+    record_websocket_request_stats(
+        cache_session_id,
+        socket_reused,
+        use_cached_context,
+        &request_body,
+    );
+    let idle_timeout_ms = idle_timeout_ms
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(idle_timeout_ms)))
+        .map_err(|err| format!("WebSocket timeout: {err}"))?;
+    let mut outgoing = request_body.clone();
+    if let Value::Object(map) = &mut outgoing {
+        map.insert("type".into(), Value::String("response.create".into()));
+    }
+    crate::wire_dump::write_current("wire", &outgoing);
+    let observation = crate::provider_observation::Attempt::try_start("websocket")?;
+    let send = write_text_frame(&mut stream, &outgoing.to_string());
+    if let Err(err) = send {
+        observation.finish("failed", None, None);
+        release_live_socket(acquired.key, stream, false);
+        return Err(err);
+    }
+    let mut decoder = ResponsesDecoder::new(model);
+    let (events, message, aborted) = match read_codex_events(
+        &mut stream,
+        Some(idle_timeout_ms),
+        started,
+        &mut decoder,
+        abort,
+        on_event,
+    ) {
+        Ok(read) => read,
+        Err(err) => {
+            observation.finish("failed", None, None);
+            release_live_socket(acquired.key, stream, false);
+            return Err(err);
+        }
+    };
+    if aborted {
+        observation.finish("aborted", None, message.usage.clone());
+        // The socket is mid-response; nothing later can reuse it.
+        release_live_socket(acquired.key, stream, false);
+        return Ok(CodexWebsocketMessage {
+            message,
+            native_responses: None,
+        });
+    }
+    let native_responses = NativeResponsesOutput::from_events(&events);
+    let mut keep = acquired.key.is_some();
+    if use_cached_context {
+        if let Some(response_id) = events.iter().rev().find_map(|event| {
+            event
+                .pointer("/response/id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }) {
+            store_cached_continuation(
+                cache_session_id,
+                account_id,
+                CachedWebSocketContinuation {
+                    last_request_body: body.clone(),
+                    last_response_id: response_id,
+                    last_response_items: native_response_items_from_events(&events),
+                },
+                socket_reused,
+                Instant::now(),
+            );
+        } else {
+            keep = false;
+        }
+    }
+    release_live_socket(acquired.key, stream, keep);
+    observation.finish(
+        if message.stop_reason == Some(StopReason::Error) {
+            "failed"
+        } else {
+            "completed"
+        },
+        None,
+        message.usage.clone(),
+    );
+    Ok(CodexWebsocketMessage {
+        message,
+        native_responses,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_fixture(
+    reply: &str,
+    body: &Value,
+    model: &Model,
+    connect_timeout_ms: u64,
+    idle_timeout_ms: Option<u64>,
+    cache_session_id: Option<&str>,
+    account_id: &str,
+    use_cached_context: bool,
+    started: &mut bool,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<CodexWebsocketMessage, String> {
+    match reply {
+        "timeout" => Err(websocket_connect_timeout_error(connect_timeout_ms)),
+        "limit" => Err(crate::codex::WEBSOCKET_CONNECTION_LIMIT_REACHED.into()),
+        "idle" => Err(websocket_idle_timeout_error(
+            idle_timeout_ms.unwrap_or(connect_timeout_ms),
+        )),
+        "unavailable" => Err("WebSocket transport is not available in this runtime".into()),
+        corpus => {
+            let (reused, continuation) =
+                acquire_cached_continuation(cache_session_id, account_id, Instant::now());
+            let (request_body, _) =
+                build_cached_websocket_request_body(body, continuation.as_ref());
+            record_websocket_request_stats(
+                cache_session_id,
+                reused,
+                use_cached_context,
+                &request_body,
+            );
+            *started = true;
+            let events = replay_codex_events(model, corpus);
+            for event in &events {
+                on_event(event);
+            }
+            let message = done_message(&events)?;
+            if use_cached_context {
+                let raw_events = fixture_raw_events(corpus);
+                let mut response_items = native_response_items_from_events(&raw_events);
+                if response_items.as_array().is_some_and(Vec::is_empty) {
+                    // Old minimal fixtures predate native output-item events.
+                    // Keep this fallback fixture-only; the live path never
+                    // reconstructs native provider state from UI messages.
+                    response_items = reconstructed_response_items_for_fixture(&message);
+                }
+                store_cached_continuation(
+                    cache_session_id,
+                    account_id,
+                    CachedWebSocketContinuation {
+                        last_request_body: body.clone(),
+                        last_response_id: "resp_fixture".into(),
+                        last_response_items: response_items,
+                    },
+                    reused,
+                    Instant::now(),
+                );
+            }
+            let native_responses = NativeResponsesOutput::from_events(&fixture_raw_events(corpus));
+            Ok(CodexWebsocketMessage {
+                message,
+                native_responses,
+            })
+        }
+    }
+}
+
+fn allows_live_websocket(url: &str) -> bool {
+    is_loopback(url)
+        || std::env::var("PI_CODEX_WS_URL").is_ok()
+        || (!cfg!(test)
+            && (url.starts_with("ws://") || url.starts_with("wss://") || url.starts_with("http")))
+}
+
+fn is_loopback(url: &str) -> bool {
+    url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
+}
+
+fn native_response_items_from_events(events: &[Value]) -> Value {
+    // Prefer the terminal response envelope when it contains the final native
+    // output array. It is authoritative and can carry opaque/future fields.
+    if let Some(output) = events.iter().rev().find_map(|event| {
+        event
+            .pointer("/response/output")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+    }) {
+        return Value::Array(output.clone());
+    }
+
+    // Streaming transports also emit completed native items individually.
+    // Preserve each raw item verbatim and restore provider output order.
+    let mut completed = events
+        .iter()
+        .filter(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+        })
+        .filter_map(|event| {
+            let item = event.get("item")?.clone();
+            let index = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            Some((index, item))
+        })
+        .collect::<Vec<_>>();
+    completed.sort_by_key(|(index, _)| *index);
+    Value::Array(completed.into_iter().map(|(_, item)| item).collect())
+}
+
+fn fixture_raw_events(corpus: &str) -> Vec<Value> {
+    corpus
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+            if payload.is_empty() || payload == "[DONE]" || payload.starts_with(':') {
+                return None;
+            }
+            serde_json::from_str::<Value>(payload).ok()
+        })
+        .collect()
+}
+
+fn reconstructed_response_items_for_fixture(message: &AssistantMessage) -> Value {
+    let chat = crate::assistant_to_chat(message);
+    let items = crate::stream::openai_responses_input(std::slice::from_ref(&chat))
+        .into_iter()
+        .filter(|item| {
+            !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
+        .collect();
+    Value::Array(items)
+}
+
+fn done_message(events: &[AssistantMessageEvent]) -> Result<AssistantMessage, String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AssistantMessageEvent::Done { message, .. } => Some(message.clone()),
+            AssistantMessageEvent::Error { error, .. } => Some({
+                let mut message = error.clone();
+                message.stop_reason = Some(StopReason::Error);
+                message
+            }),
+            _ => None,
+        })
+        .ok_or_else(|| WEBSOCKET_CLOSED_BEFORE_COMPLETED.to_string())
+}
+
+struct LiveSocketKey {
+    session_id: String,
+    account_id: String,
+}
+
+struct AcquiredSocket {
+    stream: WsStream,
+    reused: bool,
+    key: Option<LiveSocketKey>,
+}
+
+struct LiveSocketEntry {
+    stream: Option<WsStream>,
+    busy: bool,
+    created_at: Instant,
+    last_used: Instant,
+}
+
+struct LiveSocketCache {
+    sessions: HashMap<String, HashMap<String, LiveSocketEntry>>,
+}
+
+fn live_cache() -> &'static Mutex<LiveSocketCache> {
+    static CACHE: OnceLock<Mutex<LiveSocketCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(LiveSocketCache {
+            sessions: HashMap::new(),
+        })
+    })
+}
+
+fn lock_live() -> std::sync::MutexGuard<'static, LiveSocketCache> {
+    live_cache().lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub(crate) fn close_live_sockets(session_id: Option<&str>) {
+    let mut cache = lock_live();
+    if let Some(session_id) = session_id {
+        cache.sessions.remove(session_id);
+        return;
+    }
+    cache.sessions.clear();
+}
+
+fn stream_is_open(stream: &WsStream) -> bool {
+    match &stream.inner {
+        WsInner::Plain(inner) => inner.peer_addr().is_ok(),
+        WsInner::Tls(inner) => inner.sock.peer_addr().is_ok(),
+        #[cfg(test)]
+        WsInner::Memory { .. } => true,
+    }
+}
+
+fn is_live_expired(entry: &LiveSocketEntry, now: Instant) -> bool {
+    now.duration_since(entry.last_used).as_millis() as u64 >= SESSION_WEBSOCKET_CACHE_TTL_MS
+        || now.duration_since(entry.created_at).as_millis() as u64 >= SESSION_WEBSOCKET_MAX_AGE_MS
+}
+
+fn acquire_live_socket(
+    url: &str,
+    headers: &[(String, String)],
+    connect_timeout_ms: u64,
+    session_id: Option<&str>,
+    account_id: &str,
+) -> Result<AcquiredSocket, String> {
+    let now = Instant::now();
+    if let Some(session_id) = session_id {
+        let mut cache = lock_live();
+        if let Some(account_entries) = cache.sessions.get_mut(session_id) {
+            if let Some(entry) = account_entries.get_mut(account_id) {
+                if entry.busy {
+                    drop(cache);
+                    let stream = open_codex_websocket(url, headers, connect_timeout_ms)?;
+                    return Ok(AcquiredSocket {
+                        stream,
+                        reused: false,
+                        key: None,
+                    });
+                }
+                if is_live_expired(entry, now)
+                    || entry.stream.as_ref().is_some_and(|s| !stream_is_open(s))
+                {
+                    account_entries.remove(account_id);
+                    if account_entries.is_empty() {
+                        cache.sessions.remove(session_id);
+                    }
+                } else if let Some(stream) = entry.stream.take() {
+                    entry.busy = true;
+                    entry.last_used = now;
+                    return Ok(AcquiredSocket {
+                        stream,
+                        reused: true,
+                        key: Some(LiveSocketKey {
+                            session_id: session_id.to_string(),
+                            account_id: account_id.to_string(),
+                        }),
+                    });
+                }
+            }
+        }
+    }
+    let stream = open_codex_websocket(url, headers, connect_timeout_ms)?;
+    let key = session_id.map(|session_id| {
+        let mut cache = lock_live();
+        let account_entries = cache.sessions.entry(session_id.to_string()).or_default();
+        account_entries.insert(
+            account_id.to_string(),
+            LiveSocketEntry {
+                stream: None,
+                busy: true,
+                created_at: now,
+                last_used: now,
+            },
+        );
+        LiveSocketKey {
+            session_id: session_id.to_string(),
+            account_id: account_id.to_string(),
+        }
+    });
+    Ok(AcquiredSocket {
+        stream,
+        reused: false,
+        key,
+    })
+}
+
+fn release_live_socket(key: Option<LiveSocketKey>, mut stream: WsStream, keep: bool) {
+    let Some(key) = key else {
+        let _ = write_frame(&mut stream, OPCODE_CLOSE, &[], true);
+        return;
+    };
+    if !keep || !stream_is_open(&stream) {
+        let _ = write_frame(&mut stream, OPCODE_CLOSE, &[], true);
+        let mut cache = lock_live();
+        if let Some(account_entries) = cache.sessions.get_mut(&key.session_id) {
+            account_entries.remove(&key.account_id);
+            if account_entries.is_empty() {
+                cache.sessions.remove(&key.session_id);
+            }
+        }
+        return;
+    }
+    let mut cache = lock_live();
+    if let Some(entry) = cache
+        .sessions
+        .get_mut(&key.session_id)
+        .and_then(|accounts| accounts.get_mut(&key.account_id))
+    {
+        entry.stream = Some(stream);
+        entry.busy = false;
+        entry.last_used = Instant::now();
+    }
+}
+
+struct WsStream {
+    inner: WsInner,
+}
+
+enum WsInner {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    #[cfg(test)]
+    Memory {
+        reader: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    },
+}
+
+impl WsStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match &self.inner {
+            WsInner::Plain(stream) => stream.set_read_timeout(timeout),
+            WsInner::Tls(stream) => stream.sock.set_read_timeout(timeout),
+            #[cfg(test)]
+            WsInner::Memory { .. } => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(bytes: Vec<u8>) -> Self {
+        Self {
+            inner: WsInner::Memory {
+                reader: std::io::Cursor::new(bytes),
+                written: Vec::new(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn written(&self) -> &[u8] {
+        match &self.inner {
+            WsInner::Memory { written, .. } => written,
+            _ => panic!("test stream is not in memory"),
+        }
+    }
+}
+
+impl Read for WsStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.inner {
+            WsInner::Plain(stream) => stream.read(buf),
+            WsInner::Tls(stream) => stream.read(buf),
+            #[cfg(test)]
+            WsInner::Memory { reader, .. } => reader.read(buf),
+        }
+    }
+}
+
+impl Write for WsStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.inner {
+            WsInner::Plain(stream) => stream.write(buf),
+            WsInner::Tls(stream) => stream.write(buf),
+            #[cfg(test)]
+            WsInner::Memory { written, .. } => {
+                written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.inner {
+            WsInner::Plain(stream) => stream.flush(),
+            WsInner::Tls(stream) => stream.flush(),
+            #[cfg(test)]
+            WsInner::Memory { .. } => Ok(()),
+        }
+    }
+}
+
+fn open_codex_websocket(
+    url: &str,
+    headers: &[(String, String)],
+    timeout_ms: u64,
+) -> Result<WsStream, String> {
+    let parsed = url::Url::parse(url).map_err(|err| format!("WebSocket address: {err}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "WebSocket address: missing host".to_string())?;
+    let scheme = parsed.scheme();
+    let default_port = if scheme == "wss" || scheme == "https" {
+        443
+    } else {
+        80
+    };
+    let port = parsed.port().unwrap_or(default_port);
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+    let request_path = match parsed.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let proxy = crate::http_proxy::resolve_http_proxy_url_for_target(url, None)?;
+    let tcp = if let Some(proxy) = proxy {
+        crate::http_proxy::tcp_connect_via_http_proxy(&proxy, host, port, timeout)?
+    } else {
+        let addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|err| format!("WebSocket address: {err}"))?;
+        let mut last_error = "WebSocket connect failed".to_string();
+        let mut tcp = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(stream) => {
+                    tcp = Some(stream);
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(websocket_connect_timeout_error(timeout_ms));
+                }
+                Err(err) => last_error = format!("WebSocket connect failed: {err}"),
+            }
+        }
+        tcp.ok_or(last_error)?
+    };
+    tcp.set_nodelay(true)
+        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+    tcp.set_read_timeout(Some(timeout))
+        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+    tcp.set_write_timeout(Some(timeout))
+        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+    let mut stream = if scheme == "wss" || scheme == "https" {
+        WsStream {
+            inner: WsInner::Tls(Box::new(wrap_tls(tcp, host)?)),
+        }
+    } else {
+        WsStream {
+            inner: WsInner::Plain(tcp),
+        }
+    };
+    handshake(
+        &mut stream,
+        host,
+        port,
+        default_port,
+        &request_path,
+        headers,
+    )?;
+    Ok(stream)
+}
+
+fn wrap_tls(
+    tcp: TcpStream,
+    host: &str,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
+        .map_err(|err| format!("WebSocket address: {err}"))?;
+    let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+    Ok(rustls::StreamOwned::new(conn, tcp))
+}
+
+fn handshake(
+    stream: &mut WsStream,
+    host: &str,
+    port: u16,
+    default_port: u16,
+    path: &str,
+    headers: &[(String, String)],
+) -> Result<(), String> {
+    let key = websocket_key();
+    let host_header = if port == default_port {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+    );
+    for (name, value) in websocket_handshake_headers(headers) {
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("upgrade")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("sec-websocket-key")
+            || name.eq_ignore_ascii_case("sec-websocket-version")
+        {
+            continue;
+        }
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.flush())
+        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+    let response = read_http_head(stream)?;
+    if !response.starts_with("HTTP/1.1 101") && !response.starts_with("HTTP/1.0 101") {
+        return Err(format!(
+            "WebSocket connect failed: {}",
+            response.lines().next().unwrap_or("invalid handshake")
+        ));
+    }
+    let expected = accept_key(&key);
+    let accept = response
+        .lines()
+        .find_map(|line| line.split_once(':'))
+        .and_then(|(name, value)| {
+            name.eq_ignore_ascii_case("sec-websocket-accept")
+                .then_some(value.trim())
+        });
+    if accept != Some(expected.as_str()) {
+        // Some loopback fixtures omit the accept header after a 101.
+        if accept.is_some() {
+            return Err("WebSocket connect failed: invalid accept key".into());
+        }
+    }
+    Ok(())
+}
+
+fn websocket_key() -> String {
+    base64::engine::general_purpose::STANDARD.encode(Uuid::new_v4().as_bytes())
+}
+
+fn accept_key(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WS_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+fn read_http_head(stream: &mut WsStream) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 1];
+    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream
+            .read(&mut buf)
+            .map_err(|err| map_io_error(err, None))?;
+        if read == 0 {
+            return Err("WebSocket connect failed: closed during handshake".into());
+        }
+        bytes.push(buf[0]);
+        if bytes.len() > 64 * 1024 {
+            return Err("WebSocket connect failed: handshake too large".into());
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| "WebSocket connect failed: invalid handshake".to_string())
+}
+
+fn write_text_frame(stream: &mut WsStream, text: &str) -> Result<(), String> {
+    write_frame(stream, OPCODE_TEXT, text.as_bytes(), true)
+}
+
+fn write_frame(
+    stream: &mut WsStream,
+    opcode: u8,
+    payload: &[u8],
+    mask: bool,
+) -> Result<(), String> {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x80 | opcode);
+    let mask_bit = if mask { 0x80 } else { 0 };
+    if payload.len() < 126 {
+        frame.push(mask_bit | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(mask_bit | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(mask_bit | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    let mask_key = if mask {
+        let uuid = Uuid::new_v4();
+        let bytes = uuid.as_bytes();
+        let key = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        frame.extend_from_slice(&key);
+        Some(key)
+    } else {
+        None
+    };
+    if let Some(key) = mask_key {
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ key[index % 4]);
+        }
+    } else {
+        frame.extend_from_slice(payload);
+    }
+    stream
+        .write_all(&frame)
+        .and_then(|_| stream.flush())
+        .map_err(|err| format!("WebSocket send failed: {err}"))
+}
+
+/// Read frames until the response completes, feeding each one through the
+/// decoder and handing every event to `on_event` as it is produced. Returns
+/// the raw events (the continuation cache needs the response id), the
+/// finished message, and whether the read was cut short by `abort`.
+fn read_codex_events(
+    stream: &mut WsStream,
+    idle_timeout_ms: Option<u64>,
+    started: &mut bool,
+    decoder: &mut ResponsesDecoder,
+    abort: AbortFlag<'_>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<(Vec<Value>, AssistantMessage, bool), String> {
+    use std::sync::atomic::Ordering;
+    let mut events = Vec::new();
+    let mut produced = Vec::new();
+    let mut saw_completion = false;
+    loop {
+        if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let mut closing = Vec::new();
+            let mut message = decoder.finish(&mut closing);
+            message.stop_reason = Some(StopReason::Aborted);
+            message.error_message = Some("Request was aborted".into());
+            on_event(&AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                error: message.clone(),
+            });
+            return Ok((events, message, true));
+        }
+        let (opcode, payload) = match read_message(stream, idle_timeout_ms) {
+            Ok(frame) => frame,
+            Err(_) if saw_completion => break,
+            Err(err) => return Err(err),
+        };
+        match opcode {
+            OPCODE_TEXT => {
+                let text = String::from_utf8(payload)
+                    .map_err(|_| "Invalid Codex WebSocket JSON: invalid utf8".to_string())?;
+                let parsed: Value = serde_json::from_str(&text)
+                    .map_err(|err| format!("Invalid Codex WebSocket JSON: {err}"))?;
+                let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or("");
+                if crate::trace::enabled() {
+                    crate::trace::log(&format!(
+                        "ws frame {}",
+                        crate::trace::describe_event(&parsed)
+                    ));
+                }
+                if event_type == "error" {
+                    let detail = parsed
+                        .pointer("/error/message")
+                        .or_else(|| parsed.get("message"))
+                        .or_else(|| parsed.pointer("/error/code"))
+                        .or_else(|| parsed.get("code"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("error");
+                    return Err(format!("Codex error: {detail}"));
+                }
+                if event_type == "response.failed" {
+                    let reason = parsed
+                        .pointer("/response/error/message")
+                        .or_else(|| parsed.pointer("/response/error/code"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex response failed");
+                    return Err(format!("Codex error: {reason}"));
+                }
+                if matches!(
+                    event_type,
+                    "response.created"
+                        | "response.output_text.delta"
+                        | "response.completed"
+                        | "response.done"
+                        | "response.incomplete"
+                ) {
+                    *started = true;
+                }
+                let first = produced.len();
+                decoder.feed(&parsed, &mut produced);
+                for event in &produced[first..] {
+                    on_event(event);
+                }
+                if matches!(
+                    event_type,
+                    "response.completed" | "response.done" | "response.incomplete"
+                ) {
+                    saw_completion = true;
+                    events.push(parsed);
+                    break;
+                }
+                events.push(parsed);
+            }
+            OPCODE_CLOSE => {
+                if !saw_completion {
+                    return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into());
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !saw_completion {
+        return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into());
+    }
+    let first = produced.len();
+    let message = decoder.finish(&mut produced);
+    for event in &produced[first..] {
+        on_event(event);
+    }
+    Ok((events, message, false))
+}
+
+/// Reads a complete WebSocket message and handles interleaved control frames.
+fn read_message(
+    stream: &mut WsStream,
+    idle_timeout_ms: Option<u64>,
+) -> Result<(u8, Vec<u8>), String> {
+    let mut opcode = None;
+    let mut payload = Vec::new();
+    loop {
+        let (fin, frame_opcode, data) = read_frame(stream, idle_timeout_ms)?;
+        match frame_opcode {
+            OPCODE_PING => {
+                if !fin {
+                    return Err("Fragmented WebSocket control frame".into());
+                }
+                write_frame(stream, OPCODE_PONG, &data, true)?;
+                continue;
+            }
+            OPCODE_PONG => {
+                if !fin {
+                    return Err("Fragmented WebSocket control frame".into());
+                }
+                continue;
+            }
+            OPCODE_CLOSE => return Ok((OPCODE_CLOSE, data)),
+            0x0 if opcode.is_none() => {
+                return Err("WebSocket continuation without a start frame".into());
+            }
+            0x0 => {}
+            start => {
+                if opcode.is_some() {
+                    return Err("WebSocket data frame inside a fragmented message".into());
+                }
+                opcode = Some(start);
+            }
+        }
+        if payload.len().saturating_add(data.len()) > 8 * 1024 * 1024 {
+            return Err("WebSocket message too big".into());
+        }
+        payload.extend_from_slice(&data);
+        if fin {
+            let opcode =
+                opcode.ok_or_else(|| "WebSocket message has no start frame".to_string())?;
+            return Ok((opcode, payload));
+        }
+    }
+}
+
+fn read_frame(
+    stream: &mut WsStream,
+    idle_timeout_ms: Option<u64>,
+) -> Result<(bool, u8, Vec<u8>), String> {
+    let mut header = [0u8; 2];
+    read_exact(stream, &mut header, idle_timeout_ms)?;
+    let fin = header[0] & 0x80 != 0;
+    let opcode = header[0] & 0x0f;
+    let masked = header[1] & 0x80 != 0;
+    let mut len = (header[1] & 0x7f) as u64;
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        read_exact(stream, &mut ext, idle_timeout_ms)?;
+        len = u16::from_be_bytes(ext) as u64;
+    } else if len == 127 {
+        let mut ext = [0u8; 8];
+        read_exact(stream, &mut ext, idle_timeout_ms)?;
+        len = u64::from_be_bytes(ext);
+    }
+    if len > 8 * 1024 * 1024 {
+        return Err("WebSocket message too big".into());
+    }
+    let mask = if masked {
+        let mut key = [0u8; 4];
+        read_exact(stream, &mut key, idle_timeout_ms)?;
+        Some(key)
+    } else {
+        None
+    };
+    let mut payload = vec![0u8; len as usize];
+    read_exact(stream, &mut payload, idle_timeout_ms)?;
+    if let Some(key) = mask {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= key[index % 4];
+        }
+    }
+    Ok((fin, opcode, payload))
+}
+
+fn read_exact(
+    stream: &mut WsStream,
+    buf: &mut [u8],
+    idle_timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match stream.read(&mut buf[offset..]) {
+            Ok(0) => return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into()),
+            Ok(read) => offset += read,
+            Err(err) => return Err(map_io_error(err, idle_timeout_ms)),
+        }
+    }
+    Ok(())
+}
+
+fn map_io_error(err: std::io::Error, idle_timeout_ms: Option<u64>) -> String {
+    if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock {
+        return websocket_idle_timeout_error(
+            idle_timeout_ms.unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS),
+        );
+    }
+    format!("WebSocket error: {err}")
+}
+
+#[cfg(test)]
+pub(crate) fn accept_key_for_tests(key: &str) -> String {
+    accept_key(key)
+}
+
+#[cfg(test)]
+pub(crate) fn read_masked_text(stream: &mut impl Read) -> std::io::Result<String> {
+    let mut frame = [0u8; 2];
+    stream.read_exact(&mut frame)?;
+    let mut len = (frame[1] & 0x7f) as usize;
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        stream.read_exact(&mut ext)?;
+        len = u16::from_be_bytes(ext) as usize;
+    }
+    let mut mask = [0u8; 4];
+    stream.read_exact(&mut mask)?;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    String::from_utf8(payload)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+#[cfg(test)]
+pub(crate) fn write_unmasked_text(stream: &mut impl Write, text: &str) -> std::io::Result<()> {
+    let payload = text.as_bytes();
+    let mut frame = vec![0x81];
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::ModelCost;
+
+    fn codex_model() -> Model {
+        Model {
+            id: "gpt-5".into(),
+            name: "gpt-5".into(),
+            api: "openai-codex-responses".into(),
+            provider: "openai-codex".into(),
+            base_url: Some(crate::codex::DEFAULT_CODEX_BASE_URL.into()),
+            reasoning: true,
+            input: vec!["text".into()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 32_000,
+            compat: Value::Null,
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        }
+    }
+
+    fn frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(if fin { 0x80 } else { 0 }) | opcode];
+        if payload.len() < 126 {
+            out.push(payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            out.push(126);
+            out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            out.push(127);
+            out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn decode_wire_events(events: &[Value]) -> AssistantMessage {
+        let mut wire = Vec::new();
+        for event in events {
+            let bytes = serde_json::to_vec(event).unwrap();
+            // Fragment frames across UTF-8 byte boundaries as the wire permits.
+            let split = bytes.len() / 2;
+            wire.extend(frame(false, OPCODE_TEXT, &bytes[..split]));
+            wire.extend(frame(true, 0, &bytes[split..]));
+        }
+        read_codex_events(
+            &mut WsStream::for_test(wire),
+            Some(1000),
+            &mut false,
+            &mut ResponsesDecoder::new(&codex_model()),
+            None,
+            &mut |_| {},
+        )
+        .unwrap()
+        .1
+    }
+
+    fn mixed_output() -> Value {
+        let patch =
+            "*** Begin Patch\n*** Add File: π.txt\n+data: quotes \" and \\ slashes\n*** End Patch";
+        serde_json::json!([
+            {"type":"reasoning", "id":"rs_1", "summary":[{"type":"summary_text", "text":"Check the patch"}], "encrypted_content":"opaque"},
+            {"type":"message", "id":"msg_1", "content":[{"type":"output_text", "text":"Applying both.", "annotations":[{"future":true}]}]},
+            {"type":"function_call", "id":"fc_1", "call_id":"function-1", "name":"apply_patch", "arguments":serde_json::json!({"input":patch}).to_string()},
+            {"type":"custom_tool_call", "id":"ct_1", "call_id":"custom-1", "name":"apply_patch", "input":patch},
+            {"type":"message", "id":"msg_2", "content":[{"type":"output_text", "text":"Done."}]}
+        ])
+    }
+
+    #[test]
+    fn sse_websocket_and_nonstreaming_share_terminal_output_normalization() {
+        let response = serde_json::json!({"id":"resp_parity", "status":"completed", "output":mixed_output(), "usage":{"input_tokens":17, "output_tokens":9}});
+        let terminal = serde_json::json!({"type":"response.completed", "response":response});
+        let nonstreaming =
+            crate::stream::parse_provider_response(&codex_model(), &response.to_string());
+        let expected = crate::assistant_to_chat(&nonstreaming);
+        assert_eq!(nonstreaming.stop_reason, Some(crate::StopReason::ToolUse));
+        assert_eq!(expected.content.len(), 5);
+        assert_eq!(
+            expected.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY]["function-1|fc_1"],
+            "function"
+        );
+        assert_eq!(
+            expected.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY]["custom-1|ct_1"],
+            "custom"
+        );
+        for terminal_only in [true, false] {
+            let mut events = Vec::new();
+            if !terminal_only {
+                for (index, item) in response["output"].as_array().unwrap().iter().enumerate() {
+                    // The final response corrects stale item/delta content.
+                    let mut prior = item.clone();
+                    if prior["type"] == "message" {
+                        prior["content"][0]["text"] = Value::String("partial".into());
+                    }
+                    events.push(serde_json::json!({"type":"response.output_item.added", "output_index":index, "item":prior}));
+                    events.push(serde_json::json!({"type":"response.output_item.done", "output_index":index, "item":prior}));
+                }
+            }
+            events.push(terminal.clone());
+            events.push(terminal.clone());
+            let mut corpus = String::new();
+            for event in &events {
+                corpus.push_str("data: ");
+                corpus.push_str(&event.to_string());
+                corpus.push_str("\n\n");
+            }
+            let sse = crate::fixture_complete(&codex_model(), &[], &corpus);
+            let websocket = decode_wire_events(&events);
+            for actual in [&sse, &websocket] {
+                assert_eq!(crate::assistant_to_chat(actual), expected);
+                assert_eq!(actual.usage, nonstreaming.usage);
+                assert_eq!(actual.stop_reason, nonstreaming.stop_reason);
+            }
+            let native = crate::NativeResponsesOutput::from_events(&events).unwrap();
+            assert_eq!(
+                native.output_items,
+                response["output"].as_array().unwrap().clone()
+            );
+        }
+    }
+
+    #[test]
+    fn aborting_after_a_tool_item_does_not_return_an_executable_call() {
+        let item = serde_json::json!({"type":"custom_tool_call", "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch"});
+        let event =
+            serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":item});
+        let wire = frame(true, OPCODE_TEXT, &serde_json::to_vec(&event).unwrap());
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_, message, aborted) = read_codex_events(
+            &mut WsStream::for_test(wire),
+            Some(1000),
+            &mut false,
+            &mut ResponsesDecoder::new(&codex_model()),
+            Some(&abort),
+            &mut |event| {
+                if matches!(event, AssistantMessageEvent::ToolcallEnd { .. }) {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap();
+        assert!(aborted);
+        assert_eq!(message.stop_reason, Some(StopReason::Aborted));
+        assert!(message.content.is_empty());
+        let truncated = crate::fixture_complete(&codex_model(), &[], &format!("data: {event}\n\n"));
+        assert_eq!(truncated.stop_reason, Some(StopReason::Error));
+        assert!(truncated.content.is_empty());
+    }
+
+    #[test]
+    fn incomplete_responses_never_expose_executable_calls_on_any_transport() {
+        for status in ["incomplete", "failed", "cancelled", "in_progress", "queued"] {
+            let response = serde_json::json!({"id":"resp_partial", "status":status, "incomplete_details":{"reason":"max_output_tokens"}, "output":mixed_output()});
+            let event = serde_json::json!({"type":"response.completed", "response":response});
+            let messages = [
+                crate::stream::parse_provider_response(&codex_model(), &response.to_string()),
+                crate::fixture_complete(&codex_model(), &[], &format!("data: {event}\n\n")),
+                decode_wire_events(&[event.clone()]),
+            ];
+            for message in &messages {
+                assert!(
+                    !message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, crate::ContentBlock::ToolCall { .. })),
+                    "{status}"
+                );
+                assert!(matches!(
+                    message.stop_reason,
+                    Some(crate::StopReason::Length | crate::StopReason::Error)
+                ));
+            }
+            assert!(crate::NativeResponsesOutput::from_response_value(&response).is_none());
+            assert!(crate::NativeResponsesOutput::from_events(&[event]).is_none());
+        }
+    }
+
+    #[test]
+    fn fragmented_text_message_is_reassembled() {
+        let text = br#"{"type":"response.completed","response":{"id":"r"}}"#;
+        let (a, b) = text.split_at(10);
+        let mut wire = Vec::new();
+        wire.extend(frame(false, OPCODE_TEXT, a));
+        wire.extend(frame(true, OPCODE_PING, b""));
+        wire.extend(frame(true, 0x0, b));
+
+        let mut stream = WsStream::for_test(wire);
+        let (opcode, payload) = read_message(&mut stream, Some(1000)).unwrap();
+
+        assert_eq!(opcode, OPCODE_TEXT);
+        assert_eq!(payload, text);
+        assert_eq!(&stream.written()[..2], &[0x80 | OPCODE_PONG, 0x80]);
+    }
+
+    #[test]
+    fn missing_idle_timeout_reports_the_default_idle_timeout() {
+        let error = map_io_error(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+            None,
+        );
+
+        assert_eq!(
+            error,
+            websocket_idle_timeout_error(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn cached_fixture_response_is_subtracted_from_the_next_user_delta() {
+        let _guard = crate::codex::websocket_state_test_lock();
+        const SESSION: &str = "cached-fixture-response-delta";
+        crate::codex::close_openai_codex_websocket_sessions(Some(SESSION));
+        let first = serde_json::json!({
+            "model": "gpt-5",
+            "input": [
+                {"role":"user","content":[{"type":"input_text","text":"one"}]}
+            ]
+        });
+        let corpus = r#"{"type":"response.created"}
+{"type":"response.output_text.delta","delta":"Hi"}
+{"type":"response.completed","response":{"id":"resp_fixture","status":"completed"}}"#;
+        let mut started = false;
+        process_fixture(
+            corpus,
+            &first,
+            &codex_model(),
+            50,
+            None,
+            Some(SESSION),
+            "acc_test",
+            true,
+            &mut started,
+            &mut |_| {},
+        )
+        .expect("fixture completes");
+
+        let (_, continuation) =
+            acquire_cached_continuation(Some(SESSION), "acc_test", Instant::now());
+        let continuation = continuation.expect("cached continuation");
+        let assistant_item = serde_json::json!({
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"Hi"}]
+        });
+        assert_eq!(
+            continuation.last_response_items,
+            Value::Array(vec![assistant_item.clone()]),
+            "the cached baseline must include the response represented in previous_response_id"
+        );
+
+        let second = serde_json::json!({
+            "model": "gpt-5",
+            "input": [
+                {"role":"user","content":[{"type":"input_text","text":"one"}]},
+                assistant_item,
+                {"role":"user","content":[{"type":"input_text","text":"two"}]}
+            ]
+        });
+        let (delta, used) = build_cached_websocket_request_body(&second, Some(&continuation));
+        assert!(used);
+        assert_eq!(
+            delta["input"],
+            serde_json::json!([
+                {"role":"user","content":[{"type":"input_text","text":"two"}]}
+            ])
+        );
+        crate::codex::close_openai_codex_websocket_sessions(Some(SESSION));
+    }
+}
+
+#[cfg(test)]
+mod native_replay_cache_tests {
+    use super::*;
+
+    #[test]
+    fn native_output_items_preserve_unknown_fields_and_provider_order() {
+        let events = vec![
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                    "future_field": {"v": 2}
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-fixture",
+                    "provider_private_field": true
+                }
+            }),
+        ];
+        let items = native_response_items_from_events(&events);
+        let items = items.as_array().unwrap();
+        assert_eq!(items[0]["id"], "rs_1");
+        assert_eq!(items[0]["provider_private_field"], true);
+        assert_eq!(items[1]["id"], "msg_1");
+        assert_eq!(items[1]["future_field"]["v"], 2);
+    }
+
+    #[test]
+    fn terminal_output_array_is_authoritative_for_replay() {
+        let events = vec![
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "id": "streamed"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "output": [{
+                        "type": "reasoning",
+                        "id": "final",
+                        "encrypted_content": "opaque",
+                        "future": 7
+                    }]
+                }
+            }),
+        ];
+        let items = native_response_items_from_events(&events);
+        assert_eq!(items[0]["id"], "final");
+        assert_eq!(items[0]["future"], 7);
+    }
+}

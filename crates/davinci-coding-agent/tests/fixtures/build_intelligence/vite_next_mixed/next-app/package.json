@@ -1,0 +1,10 @@
+{
+  "name": "my-next-app",
+  "scripts": {
+    "build": "next build",
+    "check": "next lint"
+  },
+  "dependencies": {
+    "next": "^14.0.0"
+  }
+}

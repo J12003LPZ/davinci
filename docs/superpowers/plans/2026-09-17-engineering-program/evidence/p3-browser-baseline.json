@@ -1,0 +1,23 @@
+{
+  "source_head": "a2054d30d539f0c54aa30c589fd5fa701f49200e",
+  "fixture": {
+    "command": "cargo test -p davinci-coding-agent --offline --locked --lib interaction_testing::browser",
+    "passed": 11,
+    "filtered_out": 1009,
+    "classification": "FixtureOnly",
+    "production_callers": 0
+  },
+  "installed_backend": {
+    "node": "v24.19.0",
+    "playwright": "1.62.0",
+    "browser": "151.0.7922.34",
+    "package_path": "C:/Users/sergi/Desktop/codex-chatgpt-web-codex-security/.venv/Lib/site-packages/playwright/driver/package",
+    "executable": "C:/Users/sergi/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe",
+    "cold_start_ms": 429.1058,
+    "samples": 1,
+    "route_web_socket": "function",
+    "locator_aria_snapshot": "function",
+    "closed_context_and_browser": true
+  },
+  "scope": "Existing host-installed Python Playwright driver inspected and explicitly launched. Project node_modules were not loaded. No download or install. This cold measurement is not a reuse/performance improvement claim or frontend-flow acceptance."
+}

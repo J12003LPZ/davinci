@@ -1,0 +1,13 @@
+{
+  "name": "app",
+  "targets": {
+    "build": {
+      "executor": "@nx/webpack:webpack",
+      "dependsOn": ["^build"],
+      "outputs": ["packages/app/dist"]
+    },
+    "lint": {
+      "executor": "@nx/eslint:lint"
+    }
+  }
+}

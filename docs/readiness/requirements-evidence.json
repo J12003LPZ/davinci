@@ -1,0 +1,1843 @@
+{
+  "schema_version": 1,
+  "authoritative_plan_sha256": "003f29097f92d2ac99b80ebce0f266f35f685e06252e577327e2847bbf9d5380",
+  "baseline_sha": "2e52d0f68f9cc989fc69a6114409e237e1990158",
+  "branch": "codex/production-readiness-cloud-20260930",
+  "scope": "Implementation and evidence are separate; no production superiority or completed live acceptance claim.",
+  "requirements": [
+    {
+      "id": "0.1.1",
+      "task": "0.1",
+      "plan_line": 82,
+      "requirement": "Reproduce on a Windows runner (or locally on Windows) with the full `davinci-coding-agent` library suite running in parallel, not the test alone.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        ".github/workflows/readiness-windows.yml",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "windows"
+      ],
+      "remaining": "Full Windows parallel attempts passed, but original failure did not reproduce; its cause is unproven. Final full CI pending; main unchanged because merge is not authorized."
+    },
+    {
+      "id": "0.1.2",
+      "task": "0.1",
+      "plan_line": 83,
+      "requirement": "Decide which of these it is, from evidence:",
+      "status": "external-evidence-pending",
+      "implementation": [
+        ".github/workflows/readiness-windows.yml",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "windows"
+      ],
+      "remaining": "Full Windows parallel attempts passed, but original failure did not reproduce; its cause is unproven. Final full CI pending; main unchanged because merge is not authorized."
+    },
+    {
+      "id": "0.1.3",
+      "task": "0.1",
+      "plan_line": 87,
+      "requirement": "Fix the cause. Raising the timeout is acceptable only if starvation is proven, and then paired with limiting that test group's parallelism.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        ".github/workflows/readiness-windows.yml",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "windows"
+      ],
+      "remaining": "Full Windows parallel attempts passed, but original failure did not reproduce; its cause is unproven. Final full CI pending; main unchanged because merge is not authorized."
+    },
+    {
+      "id": "0.1.4",
+      "task": "0.1",
+      "plan_line": 88,
+      "requirement": "Rerun the Windows shard until it is green on the fix commit.",
+      "status": "implemented-verified",
+      "implementation": [
+        ".github/workflows/readiness-windows.yml",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "windows"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "0.2.1",
+      "task": "0.2",
+      "plan_line": 94,
+      "requirement": "Rule: the installed or benchmarked binary must come from a commit whose full CI (all shards, clippy, fmt) is green.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/release_identity.py",
+        "scripts/install.sh",
+        "scripts/install-davinci.ps1",
+        ".github/workflows/tag-green-release.yml",
+        "scripts/bench/runner.py",
+        "scripts/bench/tests/test_release_identity.py"
+      ],
+      "evidence": [
+        "release"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "0.2.2",
+      "task": "0.2",
+      "plan_line": 95,
+      "requirement": "Add version tags for installed releases, starting from the product version in `Cargo.toml` (1.0.71).",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/release_identity.py",
+        "scripts/install.sh",
+        "scripts/install-davinci.ps1",
+        ".github/workflows/tag-green-release.yml",
+        "scripts/bench/runner.py",
+        "scripts/bench/tests/test_release_identity.py"
+      ],
+      "evidence": [
+        "release"
+      ],
+      "remaining": "No release tag or installation created; manual release work requires a green exact source commit."
+    },
+    {
+      "id": "0.2.3",
+      "task": "0.2",
+      "plan_line": 96,
+      "requirement": "Record the tag, commit, CI run and binary hash in the installation identity file that the install script already writes.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/release_identity.py",
+        "scripts/install.sh",
+        "scripts/install-davinci.ps1",
+        ".github/workflows/tag-green-release.yml",
+        "scripts/bench/runner.py",
+        "scripts/bench/tests/test_release_identity.py"
+      ],
+      "evidence": [
+        "release"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "0.3.1",
+      "task": "0.3",
+      "plan_line": 102,
+      "requirement": "Either point `davinci update` for the CLI itself at DaVinci's own release source, or make it state plainly that DaVinci updates by reinstall from source and name the install script.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/packages.rs"
+      ],
+      "evidence": [
+        "release",
+        "integrated"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "0.3.2",
+      "task": "0.3",
+      "plan_line": 103,
+      "requirement": "Remove the upstream pi package name and pi-mono release link from user-facing output.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/packages.rs"
+      ],
+      "evidence": [
+        "release",
+        "integrated"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "0.3.3",
+      "task": "0.3",
+      "plan_line": 104,
+      "requirement": "Keep the TS-parity paths that handle pi packages (not the CLI itself) unchanged.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/packages.rs"
+      ],
+      "evidence": [
+        "release",
+        "integrated"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "0.4.1",
+      "task": "0.4",
+      "plan_line": 108,
+      "requirement": "No new subsystems, tools, or slash commands until Phase 1 evaluation exists and Phase 2 is measured. Bug fixes and wiring of existing parts are allowed.",
+      "status": "implemented-verified",
+      "implementation": [
+        "Cargo.toml",
+        "docs/readiness/evaluation.md"
+      ],
+      "evidence": [
+        "documents"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.1.1",
+      "task": "1.1",
+      "plan_line": 118,
+      "requirement": "Choose 3\u20135 repositories you own and actively work on (private preferred, to avoid training-data contamination). Mix languages you actually ship (for example Rust, TypeScript, Python).",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/private_suite.py",
+        "scripts/bench/tests/test_private_suite.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Need owner-selected repositories, human prompts and actual 40\u201360 dev / at least 150 holdout tasks; validate through an independently trusted grading boundary."
+    },
+    {
+      "id": "1.1.2",
+      "task": "1.1",
+      "plan_line": 119,
+      "requirement": "Select merged commits or PRs that change source code and add or change tests.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/private_suite.py",
+        "scripts/bench/tests/test_private_suite.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Need owner-selected repositories, human prompts and actual 40\u201360 dev / at least 150 holdout tasks; validate through an independently trusted grading boundary."
+    },
+    {
+      "id": "1.1.3",
+      "task": "1.1",
+      "plan_line": 120,
+      "requirement": "For each one:",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/private_suite.py",
+        "scripts/bench/tests/test_private_suite.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Need owner-selected repositories, human prompts and actual 40\u201360 dev / at least 150 holdout tasks; validate through an independently trusted grading boundary."
+    },
+    {
+      "id": "1.1.4",
+      "task": "1.1",
+      "plan_line": 125,
+      "requirement": "Validate each task the way `scripts/bench/bench.py validate` does today: the starter fails the hidden grader, and the reference commit passes it.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/private_suite.py",
+        "scripts/bench/tests/test_private_suite.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Need owner-selected repositories, human prompts and actual 40\u201360 dev / at least 150 holdout tasks; validate through an independently trusted grading boundary."
+    },
+    {
+      "id": "1.1.5",
+      "task": "1.1",
+      "plan_line": 126,
+      "requirement": "Keep the existing 12 public tasks as a smoke set, not the decision set.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/private_suite.py",
+        "scripts/bench/tests/test_private_suite.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.1.6",
+      "task": "1.1",
+      "plan_line": 127,
+      "requirement": "Target sizes:",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/private_suite.py",
+        "scripts/bench/tests/test_private_suite.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Need owner-selected repositories, human prompts and actual 40\u201360 dev / at least 150 holdout tasks; validate through an independently trusted grading boundary."
+    },
+    {
+      "id": "1.1.7",
+      "task": "1.1",
+      "plan_line": 130,
+      "requirement": "Label each task by size class (small/large), by whether it has visible tests, and by whether it requires changing existing tests.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/private_suite.py",
+        "scripts/bench/tests/test_private_suite.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.1",
+      "task": "1.2",
+      "plan_line": 136,
+      "requirement": "Composite success (existing `task_success`: exit 0, grader pass, no unrelated edits, cleanup complete, no transaction/artifact leaks).",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.2",
+      "task": "1.2",
+      "plan_line": 137,
+      "requirement": "Regression-free success, where the repository's pre-existing tests still pass.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.3",
+      "task": "1.2",
+      "plan_line": 138,
+      "requirement": "Unrelated-edit rate.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.4",
+      "task": "1.2",
+      "plan_line": 139,
+      "requirement": "Uncached input, cached input and output tokens per verified success, reported separately.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.5",
+      "task": "1.2",
+      "plan_line": 140,
+      "requirement": "Estimated cost per verified success from a pinned price table, labeled as an estimate.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.6",
+      "task": "1.2",
+      "plan_line": 141,
+      "requirement": "Median and P90 wall time.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.7",
+      "task": "1.2",
+      "plan_line": 142,
+      "requirement": "Model requests and tool calls per task.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.2.8",
+      "task": "1.2",
+      "plan_line": 143,
+      "requirement": "For interactive/RPC measurements only: background model tokens (learning reviewer, security watch), reported separately.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_metrics.py",
+        "scripts/bench/tests/test_readiness_metrics.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "1.3.1",
+      "task": "1.3",
+      "plan_line": 147,
+      "requirement": "DaVinci vs Codex on the same OpenAI model and effort (existing runner).",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/runner.py",
+        ".github/workflows/competitor-differential.yml"
+      ],
+      "evidence": [
+        "evaluation",
+        "release"
+      ],
+      "remaining": "Actual same-model/same-effort baselines and frozen source/binary campaigns require private inputs and authorized model budget."
+    },
+    {
+      "id": "1.3.2",
+      "task": "1.3",
+      "plan_line": 148,
+      "requirement": "DaVinci vs Claude Code on the same Claude model, using the existing `competitor-differential.yml` path. This is the first time the Claude model path gets measured.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/runner.py",
+        ".github/workflows/competitor-differential.yml"
+      ],
+      "evidence": [
+        "evaluation",
+        "release"
+      ],
+      "remaining": "Actual same-model/same-effort baselines and frozen source/binary campaigns require private inputs and authorized model budget."
+    },
+    {
+      "id": "1.3.3",
+      "task": "1.3",
+      "plan_line": 149,
+      "requirement": "Freeze each baseline campaign with its binary hashes before tuning starts.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/runner.py",
+        ".github/workflows/competitor-differential.yml"
+      ],
+      "evidence": [
+        "evaluation",
+        "release"
+      ],
+      "remaining": "Actual same-model/same-effort baselines and frozen source/binary campaigns require private inputs and authorized model budget."
+    },
+    {
+      "id": "1.4.1",
+      "task": "1.4",
+      "plan_line": 153,
+      "requirement": "Every change in Phases 2\u20135 is an A/B on the dev split, with paired tasks, 3 reps and counterbalanced order (existing).",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/readiness_protocol.py",
+        "scripts/bench/tests/test_readiness_protocol.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Paired three-rep counterbalanced live dev and holdout confirmation campaigns not run."
+    },
+    {
+      "id": "1.4.2",
+      "task": "1.4",
+      "plan_line": 154,
+      "requirement": "A change is promoted only if:",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "scripts/bench/readiness_protocol.py",
+        "scripts/bench/tests/test_readiness_protocol.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Paired three-rep counterbalanced live dev and holdout confirmation campaigns not run."
+    },
+    {
+      "id": "1.4.3",
+      "task": "1.4",
+      "plan_line": 158,
+      "requirement": "Report the bootstrap intervals the bench already computes. With small samples, say \"no measurable difference\" rather than claiming a win.",
+      "status": "implemented-verified",
+      "implementation": [
+        "scripts/bench/readiness_protocol.py",
+        "scripts/bench/tests/test_readiness_protocol.py"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.1",
+      "task": "2.1",
+      "plan_line": 172,
+      "requirement": "Trigger it the first time the model tries to finish (an assistant message with no tool calls) when all of these hold:",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.2",
+      "task": "2.1",
+      "plan_line": 176,
+      "requirement": "Send one harness reminder asking the model to:",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.3",
+      "task": "2.1",
+      "plan_line": 182,
+      "requirement": "Attach the harness-computed change set to the reminder: files changed since the run started, with new files marked (see Task 2.2).",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.4",
+      "task": "2.1",
+      "plan_line": 183,
+      "requirement": "Limit it to once per user prompt. The existing verification gate still runs afterwards, because new tests change the mutation generation.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.5",
+      "task": "2.1",
+      "plan_line": 184,
+      "requirement": "Respect abort, steering and follow-up queues exactly as the existing reminders do.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.6",
+      "task": "2.1",
+      "plan_line": 185,
+      "requirement": "Record a reason code (for example `completion.requirements`) in `RunStats` and the event stream so `/status`, `get_session_stats` and the bench can count triggers.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.7",
+      "task": "2.1",
+      "plan_line": 189,
+      "requirement": "triggers once for a multi-file mutation run and never twice in one prompt;",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.8",
+      "task": "2.1",
+      "plan_line": 190,
+      "requirement": "does not trigger for read-only runs, Plan Mode, or single-file trivial edits below the threshold;",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.9",
+      "task": "2.1",
+      "plan_line": 191,
+      "requirement": "does not change the Stable prompt hash or the provider tool schema;",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.10",
+      "task": "2.1",
+      "plan_line": 192,
+      "requirement": "the final saved answer and session file do not contain the reminder text (mirror the existing `verification_notice.rs` test);",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.11",
+      "task": "2.1",
+      "plan_line": 193,
+      "requirement": "works identically in print, RPC and interactive modes.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.1.12",
+      "task": "2.1",
+      "plan_line": 197,
+      "requirement": "On the dev split, large-class composite success improves versus the frozen baseline, legacy/small success does not drop, and median uncached tokens per task rise by no more than an agreed ceiling (proposed 25%).",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "No measured large-task improvement, small-task non-regression, agreed token ceiling or holdout confirmation."
+    },
+    {
+      "id": "2.1.13",
+      "task": "2.1",
+      "plan_line": 198,
+      "requirement": "Holdout confirms.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/tests/completion_requirements.rs",
+        "crates/davinci-coding-agent/src/main_tests.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "No measured large-task improvement, small-task non-regression, agreed token ceiling or holdout confirmation."
+    },
+    {
+      "id": "2.2.1",
+      "task": "2.2",
+      "plan_line": 204,
+      "requirement": "First inspect the one DaVinci run with an unrelated edit (`unrelated` field in the campaign rows) and the three Codex ones. Design from the actual cause: a scratch script, a new test file outside the allowed list, or a formatter touching extra files.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/src/verification/workspace.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "The original campaign rows containing one DaVinci and three Codex unrelated edits were unavailable; actual cause and rate remain unverified."
+    },
+    {
+      "id": "2.2.2",
+      "task": "2.2",
+      "plan_line": 205,
+      "requirement": "Include the change-set list, with new untracked files flagged, in the Task 2.1 reminder so the model removes temporary files it created.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/src/verification/workspace.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.2.3",
+      "task": "2.2",
+      "plan_line": 206,
+      "requirement": "Do not delete anything automatically. The model decides; the harness only shows the facts.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/completion.rs",
+        "crates/davinci-agent/src/verification/workspace.rs"
+      ],
+      "evidence": [
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "2.3.1",
+      "task": "2.3",
+      "plan_line": 212,
+      "requirement": "Run three arms on the dev split: Stable, Stable + Task 2.1, Preview + Task 2.1 (`--prompt-profile preview` / `DAVINCI_PROMPT_PROFILE`).",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "crates/davinci-coding-agent/src/settings.rs"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "No measured arm winner: Stable/Preview selection, removal and promotion remain conditional on actual evaluation."
+    },
+    {
+      "id": "2.3.2",
+      "task": "2.3",
+      "plan_line": 213,
+      "requirement": "Choose the simplest arm that wins.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "crates/davinci-coding-agent/src/settings.rs"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "No measured arm winner: Stable/Preview selection, removal and promotion remain conditional on actual evaluation."
+    },
+    {
+      "id": "2.3.3",
+      "task": "2.3",
+      "plan_line": 214,
+      "requirement": "If Preview's modules add nothing beyond Task 2.1, remove the candidate modules rather than keep a dormant profile.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "crates/davinci-coding-agent/src/settings.rs"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "No measured arm winner: Stable/Preview selection, removal and promotion remain conditional on actual evaluation."
+    },
+    {
+      "id": "2.3.4",
+      "task": "2.3",
+      "plan_line": 215,
+      "requirement": "If they help, promote them through the prompt-promotion workflow with its evidence record.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "crates/davinci-coding-agent/src/settings.rs"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "No measured arm winner: Stable/Preview selection, removal and promotion remain conditional on actual evaluation."
+    },
+    {
+      "id": "2.4.1",
+      "task": "2.4",
+      "plan_line": 221,
+      "requirement": "Have the model answer the reminder in a small structured form (requirement \u2192 command).",
+      "status": "conditional-not-triggered",
+      "implementation": [
+        "docs/readiness/evaluation.md"
+      ],
+      "evidence": [
+        "documents"
+      ],
+      "remaining": "Await qualifying measured traces; no unconditional adapter or structured receipt reminder added."
+    },
+    {
+      "id": "2.4.2",
+      "task": "2.4",
+      "plan_line": 222,
+      "requirement": "The runtime checks each cited command against host-owned command receipts (`command_receipt.rs`) after the last mutation generation.",
+      "status": "conditional-not-triggered",
+      "implementation": [
+        "docs/readiness/evaluation.md"
+      ],
+      "evidence": [
+        "documents"
+      ],
+      "remaining": "Await qualifying measured traces; no unconditional adapter or structured receipt reminder added."
+    },
+    {
+      "id": "2.4.3",
+      "task": "2.4",
+      "plan_line": 223,
+      "requirement": "An unbacked item gets one more reminder, then completion is allowed with an explicit \"unverified\" notice (existing `VerificationNotice` path).",
+      "status": "conditional-not-triggered",
+      "implementation": [
+        "docs/readiness/evaluation.md"
+      ],
+      "evidence": [
+        "documents"
+      ],
+      "remaining": "Await qualifying measured traces; no unconditional adapter or structured receipt reminder added."
+    },
+    {
+      "id": "3.1.1",
+      "task": "3.1",
+      "plan_line": 233,
+      "requirement": "Add a per-prompt completion hook point inside the agent loop, at the moment the model tries to finish and before the loop ends. Today's user `stop` hooks keep their run-end meaning for compatibility. The new point gets a distinct, documented event name for user hooks.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.1.2",
+      "task": "3.1",
+      "plan_line": 234,
+      "requirement": "Run plugin `Stop` hooks at this new in-loop point instead of after the loop, so a Claude Code plugin's block actually takes effect.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.1.3",
+      "task": "3.1",
+      "plan_line": 235,
+      "requirement": "Block semantics match Claude Code: exit 2 (stderr is the reason) or exit 0 with `decision: block` and a `reason`. The reason is delivered to the model through the reminder channel, and the loop continues.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.1.4",
+      "task": "3.1",
+      "plan_line": 236,
+      "requirement": "Loop guard:",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.1.5",
+      "task": "3.1",
+      "plan_line": 240,
+      "requirement": "PostToolUse feedback: exit 2 appends the hook's stderr to that tool result as feedback. Other failures remain non-blocking warnings, as they are today.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.1.6",
+      "task": "3.1",
+      "plan_line": 241,
+      "requirement": "Trust rules stay unchanged: project hooks only in trusted projects, plugin hooks only while `hooksApproved` matches, and never in graph workers.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.1.7",
+      "task": "3.1",
+      "plan_line": 242,
+      "requirement": "Tests: block then continue, the block cap, the `stop_hook_active` flag, untrusted project ignored, plugin hook digest unapproved ignored, print/RPC/interactive parity.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.1.8",
+      "task": "3.1",
+      "plan_line": 243,
+      "requirement": "Document one recipe in `docs/`: \"make the repo's test/lint command the finish line\".",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/mod.rs",
+        "crates/davinci-agent/tests/completion_hooks.rs",
+        "docs/completion-hooks.md",
+        "crates/davinci-coding-agent/src/plugins/hooks.rs",
+        "crates/davinci-coding-agent/src/plugins/store.rs"
+      ],
+      "evidence": [
+        "hooks",
+        "completion"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.2.1",
+      "task": "3.2",
+      "plan_line": 251,
+      "requirement": "Group captured preimages by user prompt, so each prompt is one checkpoint.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/runtime/rewind.rs",
+        "crates/davinci-coding-agent/src/rpc.rs",
+        "crates/davinci-coding-agent/src/slash.rs"
+      ],
+      "evidence": [
+        "rewind"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.2.2",
+      "task": "3.2",
+      "plan_line": 252,
+      "requirement": "Add `/rewind` to `builtin_slash_commands()`. It lists recent prompts and offers to restore code, conversation, or both.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/runtime/rewind.rs",
+        "crates/davinci-coding-agent/src/rpc.rs",
+        "crates/davinci-coding-agent/src/slash.rs"
+      ],
+      "evidence": [
+        "rewind"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.2.3",
+      "task": "3.2",
+      "plan_line": 253,
+      "requirement": "Offer rewind from double-Escape. Today `double_escape_action` defaults to `tree`; keep `tree` as a configurable option.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/runtime/rewind.rs",
+        "crates/davinci-coding-agent/src/rpc.rs",
+        "crates/davinci-coding-agent/src/slash.rs"
+      ],
+      "evidence": [
+        "rewind"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.2.4",
+      "task": "3.2",
+      "plan_line": 254,
+      "requirement": "Use the existing conflict rules: files edited by the user since the checkpoint show as conflicts and are never silently overwritten.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/runtime/rewind.rs",
+        "crates/davinci-coding-agent/src/rpc.rs",
+        "crates/davinci-coding-agent/src/slash.rs"
+      ],
+      "evidence": [
+        "rewind"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.2.5",
+      "task": "3.2",
+      "plan_line": 255,
+      "requirement": "State the limit plainly in the UI and docs, as Claude Code does: changes made through shell commands are not tracked.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/runtime/rewind.rs",
+        "crates/davinci-coding-agent/src/rpc.rs",
+        "crates/davinci-coding-agent/src/slash.rs"
+      ],
+      "evidence": [
+        "rewind"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.2.6",
+      "task": "3.2",
+      "plan_line": 256,
+      "requirement": "RPC: expose rewind preview and apply.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/runtime/rewind.rs",
+        "crates/davinci-coding-agent/src/rpc.rs",
+        "crates/davinci-coding-agent/src/slash.rs"
+      ],
+      "evidence": [
+        "rewind"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "3.2.7",
+      "task": "3.2",
+      "plan_line": 257,
+      "requirement": "Tests: restore after write/edit/apply_patch, conflict on user edit, conversation-only restore, code-only restore, and the shell-change limitation message.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/runtime/rewind.rs",
+        "crates/davinci-coding-agent/src/rpc.rs",
+        "crates/davinci-coding-agent/src/slash.rs"
+      ],
+      "evidence": [
+        "rewind"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "4.1.1",
+      "task": "4.1",
+      "plan_line": 271,
+      "requirement": "Add a backend that generates a Seatbelt profile from the existing sandbox spec: workspace read or read/write, read-only runtime mounts, `.git`/`.davinci`/`.pi` read-only, private temp, network denied unless allowed.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/sandbox/seatbelt.rs",
+        "crates/davinci-agent/tests/sandbox_seatbelt.rs",
+        ".github/workflows/ci.yml",
+        "docs/sandbox-verification-2026-09-30.md"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "4.1.2",
+      "task": "4.1",
+      "plan_line": 272,
+      "requirement": "It advertises only the capabilities it actually enforces. Memory/PID limits remain capability-gated.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/sandbox/seatbelt.rs",
+        "crates/davinci-agent/tests/sandbox_seatbelt.rs",
+        ".github/workflows/ci.yml",
+        "docs/sandbox-verification-2026-09-30.md"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "4.1.3",
+      "task": "4.1",
+      "plan_line": 273,
+      "requirement": "Mirror the Linux bubblewrap enforcement tests: write outside the workspace denied, network denied, secret environment variables absent, `.git/config` not writable, teardown complete.",
+      "status": "capability-limited",
+      "implementation": [
+        "crates/davinci-agent/src/sandbox/seatbelt.rs",
+        "crates/davinci-agent/tests/sandbox_seatbelt.rs",
+        ".github/workflows/ci.yml",
+        "docs/sandbox-verification-2026-09-30.md"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Seatbelt cannot enforce detached-descendant ownership, deterministic whole-tree teardown, tree timeout or lifetime-private temp. Those capabilities and native Auto are withheld. Native filesystem/environment/network tests passed10/10 at46229662."
+    },
+    {
+      "id": "4.1.4",
+      "task": "4.1",
+      "plan_line": 274,
+      "requirement": "Run these on a macOS CI runner.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-agent/src/sandbox/seatbelt.rs",
+        "crates/davinci-agent/tests/sandbox_seatbelt.rs",
+        ".github/workflows/ci.yml",
+        "docs/sandbox-verification-2026-09-30.md"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "4.2.1",
+      "task": "4.2",
+      "plan_line": 278,
+      "requirement": "When a capable backend is available (bubblewrap on Linux, Seatbelt on macOS), Auto mode defaults to `workspace_write` with network denied.",
+      "status": "capability-limited",
+      "implementation": [
+        "crates/davinci-coding-agent/src/sandbox_config.rs",
+        "crates/davinci-agent/tests/sandbox_auto.rs",
+        "docs/sandbox.md",
+        "crates/davinci-coding-agent/src/js_host.rs",
+        "crates/davinci-coding-agent/src/execution_boundary.rs",
+        "crates/davinci-coding-agent/src/mcp.rs"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Seatbelt cannot enforce detached-descendant ownership, deterministic whole-tree teardown, tree timeout or lifetime-private temp. Those capabilities and native Auto are withheld. Native filesystem/environment/network tests passed10/10 at46229662."
+    },
+    {
+      "id": "4.2.2",
+      "task": "4.2",
+      "plan_line": 279,
+      "requirement": "Commands that need network or paths outside the workspace go through the existing approval path.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/sandbox_config.rs",
+        "crates/davinci-agent/tests/sandbox_auto.rs",
+        "docs/sandbox.md",
+        "crates/davinci-coding-agent/src/js_host.rs",
+        "crates/davinci-coding-agent/src/execution_boundary.rs",
+        "crates/davinci-coding-agent/src/mcp.rs"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "4.2.3",
+      "task": "4.2",
+      "plan_line": 280,
+      "requirement": "Where no backend exists, behavior is unchanged and `/status` says so.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/sandbox_config.rs",
+        "crates/davinci-agent/tests/sandbox_auto.rs",
+        "docs/sandbox.md",
+        "crates/davinci-coding-agent/src/js_host.rs",
+        "crates/davinci-coding-agent/src/execution_boundary.rs",
+        "crates/davinci-coding-agent/src/mcp.rs"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "4.2.4",
+      "task": "4.2",
+      "plan_line": 281,
+      "requirement": "Measure the prompt count per task in Auto mode before and after on the dev split, plus success and wall time. Success must not drop.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "crates/davinci-coding-agent/src/sandbox_config.rs",
+        "crates/davinci-agent/tests/sandbox_auto.rs",
+        "docs/sandbox.md",
+        "crates/davinci-coding-agent/src/js_host.rs",
+        "crates/davinci-coding-agent/src/execution_boundary.rs",
+        "crates/davinci-coding-agent/src/mcp.rs"
+      ],
+      "evidence": [
+        "sandbox"
+      ],
+      "remaining": "Linux capable-default plumbing exists, but macOS cannot meet mandatory ownership capabilities; approval-count/success/wall-time A/B not run."
+    },
+    {
+      "id": "5.1.1",
+      "task": "5.1",
+      "plan_line": 296,
+      "requirement": "Make learning background review and the security watch visible in `/cost`, `/status` and `get_session_stats` as separate token lines.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/native_extensions/background_usage.rs",
+        "docs/session-diagnostics.md"
+      ],
+      "evidence": [
+        "cost-status"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "5.1.2",
+      "task": "5.1",
+      "plan_line": 297,
+      "requirement": "Choose a default and record the choice here:",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/native_extensions/background_usage.rs",
+        "docs/session-diagnostics.md"
+      ],
+      "evidence": [
+        "cost-status"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "5.1.3",
+      "task": "5.1",
+      "plan_line": 300,
+      "requirement": "Measure on interactive/RPC dev-split runs whether learning or the security watch changes success, unrelated edits or security findings. Keep a feature on by default only if it measurably helps.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "crates/davinci-coding-agent/src/native_extensions/background_usage.rs",
+        "docs/session-diagnostics.md"
+      ],
+      "evidence": [
+        "cost-status"
+      ],
+      "remaining": "Interactive/RPC effect and background-spend campaign not run."
+    },
+    {
+      "id": "5.2.1",
+      "task": "5.2",
+      "plan_line": 304,
+      "requirement": "Stop auto-applying learned skills globally without approval (`auto_apply_global`). Default global promotion to require approval; keep project-scoped auto-apply only if the evaluation supports it.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/native_extensions/learning/config.rs",
+        "crates/davinci-coding-agent/src/settings.rs"
+      ],
+      "evidence": [
+        "cost-status"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "5.2.2",
+      "task": "5.2",
+      "plan_line": 305,
+      "requirement": "Reason: a wrong lesson learned in one repository should not silently change behavior in every other one.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/native_extensions/learning/config.rs",
+        "crates/davinci-coding-agent/src/settings.rs"
+      ],
+      "evidence": [
+        "cost-status"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "5.3.1",
+      "task": "5.3",
+      "plan_line": 309,
+      "requirement": "Run Full (current default) vs Lean + `tool_search` on the dev split for both the OpenAI and Claude paths.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/tool-discovery.md"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "OpenAI and Claude Full/Lean paired campaigns not run; Full remains default."
+    },
+    {
+      "id": "5.3.2",
+      "task": "5.3",
+      "plan_line": 310,
+      "requirement": "If Lean is non-inferior on success and lower on tokens, make it the default. Keep Full selectable (`toolSurface`, `DAVINCI_TOOL_SURFACE`).",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/tool-discovery.md"
+      ],
+      "evidence": [
+        "evaluation"
+      ],
+      "remaining": "OpenAI and Claude Full/Lean paired campaigns not run; Full remains default."
+    },
+    {
+      "id": "5.4.1",
+      "task": "5.4",
+      "plan_line": 316,
+      "requirement": "Keep it on by default only if it improves success, tokens or latency without hurting the others.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/production-harness-readiness-plan.md",
+        "docs/readiness/README.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation"
+      ],
+      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM/JEV remain off."
+    },
+    {
+      "id": "5.4.2",
+      "task": "5.4",
+      "plan_line": 317,
+      "requirement": "Otherwise move it off the default path and document it as opt-in.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/production-harness-readiness-plan.md",
+        "docs/readiness/README.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation"
+      ],
+      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM/JEV remain off."
+    },
+    {
+      "id": "5.4.3",
+      "task": "5.4",
+      "plan_line": 318,
+      "requirement": "Record each result in a table in this plan.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/production-harness-readiness-plan.md",
+        "docs/readiness/README.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation"
+      ],
+      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM/JEV remain off."
+    },
+    {
+      "id": "5.4.4",
+      "task": "5.4",
+      "plan_line": 319,
+      "requirement": "Context VM and JEV stay off. Evaluate Context VM only on a dedicated long-session set (sessions long enough to compact at least twice) against current compaction; change the default only on a measured win.",
+      "status": "implemented-verified",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/production-harness-readiness-plan.md",
+        "docs/readiness/README.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "5.5.1",
+      "task": "5.5",
+      "plan_line": 323,
+      "requirement": "Fold the 14 native `*-status` commands into sections of `/status`, plus a `/doctor` command that checks configuration, credentials, sandbox backend, MCP/LSP health and install identity.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/native_extensions/mod.rs",
+        "crates/davinci-coding-agent/src/session_diagnostics.rs",
+        "docs/session-diagnostics.md"
+      ],
+      "evidence": [
+        "cost-status"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "5.5.2",
+      "task": "5.5",
+      "plan_line": 324,
+      "requirement": "Keep the internal views for RPC and sheets. Remove them from public slash discovery, following the `/security-scan` precedent in CLAUDE.md.",
+      "status": "implemented-verified",
+      "implementation": [
+        "crates/davinci-coding-agent/src/native_extensions/mod.rs",
+        "crates/davinci-coding-agent/src/session_diagnostics.rs",
+        "docs/session-diagnostics.md"
+      ],
+      "evidence": [
+        "cost-status"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "5.6.1",
+      "task": "5.6",
+      "plan_line": 328,
+      "requirement": "Correct the crate line counts and add the new behaviors (completion step, blocking hooks, `/rewind`, sandbox defaults) once they land.",
+      "status": "implemented-verified",
+      "implementation": [
+        "CLAUDE.md"
+      ],
+      "evidence": [
+        "documents"
+      ],
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
+    },
+    {
+      "id": "6.1",
+      "task": "6",
+      "plan_line": 336,
+      "requirement": "Compare traces for tool choice, edit format errors, over- or under-exploration, and stopping behavior.",
+      "status": "conditional-not-triggered",
+      "implementation": [
+        "docs/readiness/evaluation.md"
+      ],
+      "evidence": [
+        "documents"
+      ],
+      "remaining": "Await qualifying measured traces; no unconditional adapter or structured receipt reminder added."
+    },
+    {
+      "id": "6.2",
+      "task": "6",
+      "plan_line": 337,
+      "requirement": "Add a small Anthropic prompt adapter only for behaviors the traces show, sized like the OpenAI adapter (`PROVIDER_ADAPTER_MAX_TOKENS`), and promote it through the same A/B protocol.",
+      "status": "conditional-not-triggered",
+      "implementation": [
+        "docs/readiness/evaluation.md"
+      ],
+      "evidence": [
+        "documents"
+      ],
+      "remaining": "Await qualifying measured traces; no unconditional adapter or structured receipt reminder added."
+    },
+    {
+      "id": "done.1",
+      "task": "done",
+      "plan_line": 382,
+      "requirement": "CI is green on the released tag.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation",
+        "integrated"
+      ],
+      "remaining": "No green released tag or private superiority holdout; large-class/background measurements absent, macOS mandatory ownership incomplete."
+    },
+    {
+      "id": "done.2",
+      "task": "done",
+      "plan_line": 383,
+      "requirement": "On the \u2265150-task private holdout, same model and effort, 3 reps:",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation",
+        "integrated"
+      ],
+      "remaining": "No green released tag or private superiority holdout; large-class/background measurements absent, macOS mandatory ownership incomplete."
+    },
+    {
+      "id": "done.3",
+      "task": "done",
+      "plan_line": 388,
+      "requirement": "Large-class success is reported on its own, not hidden inside the average.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation",
+        "integrated"
+      ],
+      "remaining": "No green released tag or private superiority holdout; large-class/background measurements absent, macOS mandatory ownership incomplete."
+    },
+    {
+      "id": "done.4",
+      "task": "done",
+      "plan_line": 389,
+      "requirement": "Interactive background model spend is reported next to print-mode numbers.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation",
+        "integrated"
+      ],
+      "remaining": "No green released tag or private superiority holdout; large-class/background measurements absent, macOS mandatory ownership incomplete."
+    },
+    {
+      "id": "done.5",
+      "task": "done",
+      "plan_line": 390,
+      "requirement": "`/rewind`, blocking hooks, and the sandbox default (where a backend exists) are shipped and documented.",
+      "status": "external-evidence-pending",
+      "implementation": [
+        "docs/readiness/evaluation.md",
+        "docs/readiness/release-discipline.md"
+      ],
+      "evidence": [
+        "documents",
+        "evaluation",
+        "integrated"
+      ],
+      "remaining": "No green released tag or private superiority holdout; large-class/background measurements absent, macOS mandatory ownership incomplete."
+    }
+  ],
+  "plan_copy_original_bytes": 27547,
+  "plan_copy_has_execution_appendix": true,
+  "acceptance_complete": false,
+  "paid_provider_calls_performed": 0,
+  "status_semantics": {
+    "external-evidence-pending": "Actual owner data, model campaign, native CI, main integration or release evidence is absent. Plumbing or synthetic fixtures do not meet acceptance.",
+    "capability-limited": "The implementation explicitly refuses to advertise or activate an unproved capability.",
+    "conditional-not-triggered": "The specification requires observed traces before this work begins; no qualifying evidence exists.",
+    "implemented-verified": "Source implementation and its recorded fixture/native checks verified. Exact source CI46229662 green; final docs/parser commit CI is separately tracked. This status does not imply live acceptance or completed production readiness."
+  },
+  "owner_decisions": {
+    "background": "Off by default, opt-in",
+    "learning_auto_apply": "Approval required for global and project activation",
+    "windows": "WSL2 with capable bubblewrap; native isolation not claimed",
+    "token_ceiling": "25% proposed, owner agreement pending",
+    "private_inputs": "Owner repository selection, source revisions and human prompts pending",
+    "live_budget": "No paid campaign authorized"
+  },
+  "evidence_catalog": {
+    "release": {
+      "kind": "offline-fixtures-and-code-review",
+      "tests": "python3 -m unittest discover -s scripts/bench/tests",
+      "log": "/workspace/readiness-evidence/integrated-final-python-149.log",
+      "result": "Final Python suite149total:142passed7existingplatformskips(2.365s); prior19independent accounting/gate/private-inventory closurecases and4syntheticinstaller scenarios passed. Final parser closure independently passed5focusedtests+5additionalprobes.",
+      "review": "/workspace/readiness-evidence/cost-root-cold-review.md",
+      "guide": "docs/readiness/release-discipline.md",
+      "remaining": "No release tag or installation performed; manual release requires its exact final source commit green."
+    },
+    "evaluation": {
+      "kind": "offline-fixtures-and-code-review",
+      "tests": "python3 -m unittest discover -s scripts/bench/tests",
+      "log": "/workspace/readiness-evidence/integrated-final-python-149.log",
+      "result": "Final Python suite149total:142passed7existingplatformskips(2.365s); prior19independent accounting/gate/private-inventory closurecases and4syntheticinstaller scenarios passed. Final parser closure independently passed5focusedtests+5additionalprobes.",
+      "review": "/workspace/readiness-evidence/cost-root-cold-review.md",
+      "guide": "docs/readiness/evaluation.md",
+      "remaining": "Actual private dev/holdout and same-model campaigns,independently isolated grading and owner budget pending."
+    },
+    "completion": {
+      "kind": "offline-regression",
+      "commit": "f5f2baa826b75046d59a5dd2f0ea38d0b931e881",
+      "tests": "cargo test -p davinci-agent --lib completion --locked --offline -- --test-threads=1",
+      "result": "RED 42 passed/3 failed; GREEN 45 passed/0 failed",
+      "log": "/workspace/readiness-evidence/integrated-completion-green.log",
+      "review": "/workspace/readiness-evidence/completion-runtime-fix-cold-review.md",
+      "guide": "docs/completion.md",
+      "remaining": "Recorded fixtures and Ubuntu/Windows agent source shards passed; private efficacy campaigns pending.",
+      "named_files_fix_commit": "7c4091cfbb8bf458787b53e8396f2f458148d9b0",
+      "named_files_result": "Eight attachment integration tests and all ten CLI output-schema fixtures passed after restoring attachment handling for an unsubscribed rewind runtime; subscribed read denial remains enforced.",
+      "runtime_provenance_fix_commit": "c9e167a508dd8ecfbe1825d8045479cbaf0af8bb",
+      "runtime_provenance_result": "18 named-file/boundary fixtures and all 1314 agent library tests passed; shared-bus/original-ID host rebinding and completion snapshot guard regressions verified. Independent cold review closed.",
+      "runtime_provenance_review": "/workspace/readiness-evidence/runtime-provenance-cold-review.md",
+      "benchmark_observation_fix_commit": "d0d88dd23db2a6f3d73873773acbccc1b1d9234c",
+      "benchmark_observation_result": "Two fixtures RED0/2 -> fullPythonGREEN142passed7skipped; independent parser closure5focusedtests+5probes. Reason-only completion.requirements and hook-block events count without retaining remindertext; legacycauses preserved; follow-up requests/mutations computed.",
+      "benchmark_observation_review": "/workspace/readiness-evidence/completion-observations-cold-review.md"
+    },
+    "hooks": {
+      "kind": "offline-fixtures-and-independent-review",
+      "unit_commit": "4fc668cb503cb40a12e46fea79684838e888237b",
+      "result": "Plugins 34, user hooks 47, completion 6, post-tool 2 passed; strict clippy passed",
+      "log": "/workspace/readiness-evidence/hook-host-results.md",
+      "review": "/workspace/readiness-evidence/hooks-independent-review.md",
+      "guide": "docs/completion-hooks.md",
+      "remaining": "Recorded fixtures and Ubuntu/Windows source shards passed; no competitor behavior efficacy claim."
+    },
+    "rewind": {
+      "kind": "offline-fixtures-and-independent-review",
+      "unit_commit": "673340ac368aa6abe432cdbe0a3514fa3026bda0",
+      "tests": "cargo test -p davinci-agent --lib runtime::rewind --locked --offline",
+      "result": "44 rewind and 24 transaction fixtures passed; strict clippy passed",
+      "log": "/workspace/readiness-evidence/rewind-hard-link-checks.json",
+      "review": "/workspace/readiness-evidence/rewind-cold-review.md",
+      "guide": "docs/rewind.md",
+      "remaining": "Recorded fixtures and native source checks passed; shell mutations remain explicitly untracked."
+    },
+    "sandbox": {
+      "kind": "offline-fixtures-and-independent-review",
+      "unit_commit": "e043a4de76051c1d1442d55fde9bd9a5b3673704",
+      "result": "100 focused fixtures passed; strict clippy passed. Native macOS tests not run locally.",
+      "log": "docs/sandbox-verification-2026-09-30.md",
+      "review": "/workspace/readiness-evidence/sandbox-cold-review.md",
+      "tests": "cargo test -p davinci-agent --locked --test sandbox_seatbelt (required macOS CI only)",
+      "remaining": "Native macOS checks passed. macOS detached descendants,whole-tree teardown and nativeAuto remain unsupported.",
+      "native_diagnostic_commit": "b01e21ab9da04c50d22924095d318ca823225ebd",
+      "native_diagnostic_url": "https://github.com/J12003LPZ/davinci/actions/runs/36699692289/job/109835969775",
+      "native_diagnostic_result": "4 passed / 6 failed, including startup controls. Kernel denied file-read-data /; crash stacks abort in dyld CacheFinder before main. Literal-root-directory read candidate independently reviewed; no descendant/write/network grant added.",
+      "native_fix_commit": "34a2ff65",
+      "native_verification_source": "4622966215f62b7bd1f8072863dce1030f0c2826",
+      "native_verification_url": "https://github.com/J12003LPZ/davinci/actions/runs/36701485168/job/109841707224",
+      "native_verification_result": "Completed macOS job success:10passed0failed0ignored(0.97s), including eight startup controls, unchanged positive/negative filesystem/environment/network assertions, detached descendant gap and mandatory ownership refusal. macOS26.6.2/25G83 arm64 runner; no other macOS version/architecture claim.",
+      "native_local_result": "Root profile fixtures8/8; strict Agent library lint passed44.66s; full-tree format/diff checks passed.",
+      "native_verification_log_sha256": "9efac372d397a329cc37fc38e672d966bff30ac42ab25e02898dd0e88d4844f8",
+      "native_fix_review": "/workspace/readiness-evidence/sandbox-dyld-cold-review.md"
+    },
+    "cost-status": {
+      "kind": "offline-fixtures-and-independent-review",
+      "unit_commit": "6bb5c63eacb96b5bea95d0bc77040c1642bdb72d",
+      "result": "433 scoped test executions passed; 2 existing live tests ignored; strict clippy passed. Independent actual retry fixtures preserve unknown spend.",
+      "log": "/workspace/readiness-evidence/cost-scoped-results.json",
+      "review": "/workspace/readiness-evidence/cost-cold-review.md",
+      "guide": "docs/session-diagnostics.md",
+      "remaining": "Recorded fixtures and sourceCI passed; interactive/RPC dev campaigns pending."
+    },
+    "windows": {
+      "kind": "native-ci",
+      "source_head": "d6c2ab6c82f4a4a0a1446da37dedebee40e52b15",
+      "tested_checkout": "GitHub synthetic PR merge, not certified exact source tree",
+      "url": "https://github.com/J12003LPZ/davinci/actions/runs/36687936657",
+      "result": "Two full parallel coding library runs: each 1385 passed, 0 failed, 17 existing ignored; graph relative script passed. Overall CI at that head failed completion and CLI graph ownership tests.",
+      "log": "/workspace/readiness-evidence/windows-diagnostic-d6c2ab6c.txt",
+      "remaining": "Original graph failure cause unproven. Windows source package shard at46229662 passed; main is unchanged because merge is not authorized."
+    },
+    "documents": {
+      "kind": "source-and-coverage-validation",
+      "guide": "docs/readiness/README.md",
+      "result": "99 original checkboxes retained; audit table records not-run arms, not estimates; original bytes and source lines retained",
+      "remaining": "Independent final audit and exact-head CI records are linked from the final PR; all99 source-line requirements and8constraints mechanically verified."
+    },
+    "integrated": {
+      "kind": "combined-tree-checks",
+      "result": "Full local workspace run d3ac5e68 completed exit101:134targets5218passed6failed40ignored. Six preserved environment failures:unchanged evaluator bare-python lookup fixtures(5),existing LSP zombie descendant fixture(1). All task regressions passed. Full workspace/all-target lint passed3m10s;fixtureCLIbuild1m05s;rebuiltCLIoutputschema10/0. Exact-source pushCI46229662 completed success all41jobs;requirednativeMacSeatbelt10/0/0,Windowsinstallerparse,UbuntuWindowsAgent/coding/evalsandproductionreleasefixtureguardpassed. Final parserfixd0d88dd2 Python149total142passed7skipped with independent closure; final docs/parser commit CI is recorded separately in PR/Actions.",
+      "logs": [
+        "/workspace/readiness-evidence/integrated-final-clippy.log",
+        "/workspace/readiness-evidence/integrated-final-cli-build-after-named.log",
+        "/workspace/readiness-evidence/integrated-named-files-green.log",
+        "/workspace/readiness-evidence/integrated-output-schema-green.log",
+        "/workspace/readiness-evidence/integrated-final-python-147.log",
+        "/workspace/readiness-evidence/integrated-rust-tests.log",
+        "/workspace/readiness-evidence/integrated-rust-tests-7c409.log",
+        "/workspace/readiness-evidence/integrated-d3ac-clippy.log",
+        "/workspace/readiness-evidence/integrated-d3ac-cli-build.log",
+        "/workspace/readiness-evidence/integrated-d3ac-output-schema.log",
+        "/workspace/readiness-evidence/integrated-rust-tests-d3ac.log",
+        "/workspace/readiness-evidence/integrated-dyld-root-tests.log",
+        "/workspace/readiness-evidence/integrated-dyld-root-clippy.log",
+        "/workspace/readiness-evidence/mac-seatbelt-b01-startup.log",
+        "/workspace/readiness-evidence/integrated-final-python-149.log"
+      ],
+      "remaining": "Consult final PR/Actions for exact final-head sourceCI. Local environment failures remain preserved.",
+      "source_commit": "d3ac5e68e2125f3db2c2fd0824bb24b50e13926d",
+      "source_ci": {
+        "source_sha": "4622966215f62b7bd1f8072863dce1030f0c2826",
+        "event": "push",
+        "url": "https://github.com/J12003LPZ/davinci/actions/runs/36701485168",
+        "result": "completed success;41/41jobsincluding27workspacepackageshards,quality,contracts,Python,browser,voice,nativeandaggregate;pushworkflowlint36701485101passed"
+      }
+    },
+    "supervisor-race": {
+      "kind": "regression-and-independent-review",
+      "unit_commit": "9466baa52d234eef72fcb26ad2aec71ff3eb4969",
+      "result": "Deterministic late-close regression failed before fix;18supervisor fixtures plus existing foreground test passed afterward. No timeout raised; owned stop/host-loss cleanup and missing-terminal-error contracts preserved.",
+      "log": "/workspace/readiness-evidence/foreground-race-review.md",
+      "review": "/workspace/readiness-evidence/foreground-race-cold-review.md",
+      "remaining": "Native supervisor and Ubuntu/Windows Agent source checks passed; final exact-head CI is recorded separately in PR/Actions."
+    }
+  },
+  "global_constraints": [
+    {
+      "requirement": "Tests stay fixture-only and offline (`DAVINCI_OFFLINE` / `PI_OFFLINE`, existing fixture hooks). Add a fixture hook rather than a live call.",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    },
+    {
+      "requirement": "Never skip, disable, or quarantine a test to get green.",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    },
+    {
+      "requirement": "Keep TypeScript parity contracts: compaction and branch-summary prompt strings are not reworded; cite the TS source when touching mirrored modules.",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    },
+    {
+      "requirement": "Keep Rust 1.83 and exact `=` dependency pins. This plan needs no new dependencies.",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    },
+    {
+      "requirement": "Stable prompt text changes go through the existing prompt-promotion process (`.github/workflows/prompt-promotion.yml`).",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    },
+    {
+      "requirement": "Harness reminders are appended after the cached prefix. They must not change the Stable prompt hash or the frozen tool schema.",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    },
+    {
+      "requirement": "Benchmark numbers are measured, never estimated. Every claim names its campaign directory, binary hash and commit.",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    },
+    {
+      "requirement": "Preserve worker isolation, fail-closed security, and \"project settings may narrow, never widen\" everywhere.",
+      "evidence": [
+        "documents",
+        "integrated"
+      ],
+      "status": "preserved-pending-final-validation"
+    }
+  ],
+  "reviews": [
+    "completion-runtime-fix-cold-review.md",
+    "hooks-independent-review.md",
+    "rewind-cold-review.md",
+    "sandbox-cold-review.md",
+    "cost-cold-review.md",
+    "evaluation-cold-review.md",
+    "cost-root-cold-review.md"
+  ],
+  "status_counts": {
+    "external-evidence-pending": 33,
+    "implemented-verified": 59,
+    "conditional-not-triggered": 5,
+    "capability-limited": 2
+  }
+}

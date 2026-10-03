@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.281
+           Opus 5.5 with high effort · <plan>
+           ~\project
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  /superpowers:brainstorming                      (superpowers) You MUST use this before any creative work - creating
+                                                  features, building components, adding functionality, or modifying b…
+  /superpowers:verification-before-completion     (superpowers) Use when about to claim work is complete, fixed, or
+                                                  passing, before committing or creating PRs - requires running verif…
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

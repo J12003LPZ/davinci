@@ -1,0 +1,493 @@
+//! Workflow coordination tools for Davinci agent runtime.
+//!
+//! Exposes `workflow_run` and `workflow_status` tools allowing agents to
+//! construct, validate, persist, and execute deterministic multi-phase workflows.
+
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+use super::executor::WorkflowStatus;
+use super::spec::{WorkflowLaunch, WorkflowSpec};
+use super::validate::validate_workflow_with_capabilities;
+use crate::runtime::ids::WorkflowId;
+use crate::runtime::workflow::WorkflowExecutor;
+use crate::runtime::workflow::WorkflowStateStore;
+use crate::tools::{AgentTool, ToolContext, ToolError, ToolResult};
+
+pub fn workflow_tool_specs() -> Vec<AgentTool> {
+    vec![
+        AgentTool {
+            name: "workflow_run".into(),
+            description: "Execute a multi-phase repeatable agent workflow from a validated JSON spec, or run a saved workflow by name. Best for structured multi-step pipelines with intermediate artifacts (use single-agent for direct turns, subagents for bounded research, teams for collaborative task boards, and /graph for verified code mutation pipelines).".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "description": "Workflow specification schema (name, description, max_parallel_agents, max_total_agents, phases)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name of a saved workflow to run from .davinci/workflows/<name>.json"
+                    },
+                    "save_as": {
+                        "type": "string",
+                        "description": "Optional name to save this workflow under .davinci/workflows/<save_as>.json for future reuse"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Whether to execute asynchronously in the background (default: true)"
+                    }
+                }
+            }),
+        },
+        AgentTool {
+            name: "workflow_status".into(),
+            description: "Check status, phases, and artifacts of a workflow by workflow_id, or list all tracked workflows.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "Workflow ID to inspect (optional; if omitted, lists all workflows)"
+                    }
+                }
+            }),
+        },
+    ]
+}
+
+fn is_valid_workflow_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn find_saved_workflow(
+    cwd: &Path,
+    name: &str,
+    project_trusted: bool,
+) -> Result<WorkflowSpec, String> {
+    if !is_valid_workflow_name(name) {
+        return Err(format!("Invalid workflow name: '{name}'"));
+    }
+
+    // Check project locations first
+    let project_candidates = [
+        cwd.join(".davinci")
+            .join("workflows")
+            .join(format!("{name}.json")),
+        cwd.join(".pi")
+            .join("workflows")
+            .join(format!("{name}.json")),
+    ];
+
+    for path in &project_candidates {
+        if path.is_file() {
+            if !project_trusted {
+                return Err(format!(
+                    "Project workflow '{name}' requires project trust. Run /trust to approve this checkout."
+                ));
+            }
+            let data = std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed reading workflow file {}: {e}", path.display()))?;
+            let spec: WorkflowSpec = serde_json::from_str(&data)
+                .map_err(|e| format!("Invalid workflow spec in {}: {e}", path.display()))?;
+            return Ok(spec);
+        }
+    }
+
+    // Check user global locations
+    let home_dir = davinci_session::default_agent_dir();
+    let global_candidates = [home_dir.join("workflows").join(format!("{name}.json"))];
+
+    for path in &global_candidates {
+        if path.is_file() {
+            let data = std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed reading workflow file {}: {e}", path.display()))?;
+            let spec: WorkflowSpec = serde_json::from_str(&data)
+                .map_err(|e| format!("Invalid workflow spec in {}: {e}", path.display()))?;
+            return Ok(spec);
+        }
+    }
+
+    Err(format!(
+        "Saved workflow '{name}' not found in project (.davinci/workflows/) or global (~/.davinci/workflows/)"
+    ))
+}
+
+pub fn save_workflow_to_project(
+    cwd: &Path,
+    name: &str,
+    spec: &WorkflowSpec,
+    project_trusted: bool,
+) -> Result<PathBuf, String> {
+    if !is_valid_workflow_name(name) {
+        return Err(format!("Invalid workflow name: '{name}'"));
+    }
+    if !project_trusted {
+        return Err(format!(
+            "Cannot save project workflow '{name}' in untrusted checkout. Run /trust first."
+        ));
+    }
+
+    let dir = cwd.join(".davinci").join("workflows");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed creating directory {}: {e}", dir.display()))?;
+
+    let file_path = dir.join(format!("{name}.json"));
+    let serialized = serde_json::to_string_pretty(spec)
+        .map_err(|e| format!("Failed serializing workflow spec: {e}"))?;
+
+    std::fs::write(&file_path, serialized)
+        .map_err(|e| format!("Failed writing workflow file {}: {e}", file_path.display()))?;
+
+    Ok(file_path)
+}
+
+pub fn workflow_run_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    workflow_run_tool_with_parent(cwd, input, context, WorkflowLaunch::default())
+}
+
+pub fn workflow_run_tool_with_parent(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+    launch: WorkflowLaunch,
+) -> Result<ToolResult, ToolError> {
+    let runtime = context
+        .runtime
+        .as_ref()
+        .ok_or_else(|| ToolError::Failed("Runtime subsystem not initialized".into()))?;
+
+    let name_val = input.get("name").and_then(Value::as_str);
+    let spec_val = input.get("spec");
+    let save_as = input.get("save_as").and_then(Value::as_str);
+    let background = input
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let spec: WorkflowSpec = if let Some(name) = name_val {
+        find_saved_workflow(cwd, name, runtime.project_trusted).map_err(ToolError::Failed)?
+    } else if let Some(spec_obj) = spec_val {
+        serde_json::from_value(spec_obj.clone())
+            .map_err(|e| ToolError::Failed(format!("Invalid workflow spec: {e}")))?
+    } else {
+        return Err(ToolError::Failed(
+            "Either 'spec' (JSON definition) or 'name' (saved workflow name) must be provided"
+                .into(),
+        ));
+    };
+
+    validate_workflow_with_capabilities(
+        &spec,
+        launch.parent_permission_mode,
+        &[],
+        &runtime.capability_registry,
+    )
+    .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if spec.max_cost_usd.is_some() {
+        return Err(ToolError::Failed(
+            "max_cost_usd is not enforced yet; remove it from the spec".into(),
+        ));
+    }
+
+    // Advisory, like Claude Code's `Large workflow` warning: it never blocks
+    // or limits the run, it tells the model and the user where to stop it.
+    let scheduled: usize = spec.phases.iter().map(|phase| phase.workers.len()).sum();
+    let threshold = launch
+        .large_workflow_threshold
+        .unwrap_or(super::limits::LARGE_WORKFLOW_AGENTS);
+    let large_warning = (scheduled > threshold).then(|| {
+        format!(
+            "Large workflow: {scheduled} agents scheduled (threshold {threshold}). Stop it with /workflow cancel <id> if it is more than the task needs."
+        )
+    });
+
+    let mut saved_path_info = None;
+    if let Some(save_name) = save_as {
+        let path = save_workflow_to_project(cwd, save_name, &spec, runtime.project_trusted)
+            .map_err(ToolError::Failed)?;
+        saved_path_info = Some(path.display().to_string());
+    }
+
+    let executor = match &runtime.workflow_executor {
+        Some(exec) => exec.clone(),
+        None => {
+            let store = WorkflowStateStore::new();
+            std::sync::Arc::new(WorkflowExecutor::new(runtime.clone(), store, None))
+        }
+    };
+
+    if background && launch.report_to_lead {
+        let wf_id = executor
+            .execute_background_with(spec.clone(), launch)
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+
+        let resp = serde_json::json!({
+            "workflow_id": wf_id.to_string(),
+            "name": spec.name,
+            "status": "running",
+            "saved_to": saved_path_info,
+            "message": "Workflow started in background. Its report arrives as an <agent-message>; use workflow_status to inspect progress.",
+            "warning": large_warning,
+        });
+
+        Ok(ToolResult {
+            content: serde_json::to_string_pretty(&resp).unwrap(),
+            is_error: false,
+            details: None,
+        })
+    } else {
+        let state = executor
+            .execute_with(spec.clone(), launch)
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+
+        let mut val = serde_json::to_value(&state).unwrap();
+        let mut remaining = 32 * 1024;
+        let mut outputs = Vec::new();
+        for phase in &spec.phases {
+            if spec.phases.iter().any(|p| p.depends_on.contains(&phase.id)) {
+                continue;
+            }
+            for artifact in executor.store.list_phase_artifacts(state.id, &phase.id) {
+                let output = artifact
+                    .value
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| artifact.to_reference_summary().to_string());
+                let mut end = output.len().min(8192).min(remaining);
+                while !output.is_char_boundary(end) {
+                    end -= 1;
+                }
+                remaining -= end;
+                if end > 0 {
+                    outputs.push(output[..end].to_string());
+                }
+            }
+        }
+        val["final_outputs"] = serde_json::json!(outputs);
+        if let Some(warning) = &large_warning {
+            val["warning"] = serde_json::json!(warning);
+        }
+        if background {
+            val["note"] = serde_json::json!(
+                "ran synchronously: background workflows need an interactive or RPC session"
+            );
+        }
+        if let Some(saved) = saved_path_info {
+            val["saved_to"] = serde_json::Value::String(saved);
+        }
+
+        Ok(ToolResult {
+            content: serde_json::to_string_pretty(&val).unwrap(),
+            is_error: state.status == WorkflowStatus::Failed,
+            details: None,
+        })
+    }
+}
+
+pub fn workflow_status_tool(input: &Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    let runtime = context
+        .runtime
+        .as_ref()
+        .ok_or_else(|| ToolError::Failed("Runtime subsystem not initialized".into()))?;
+
+    let executor = match &runtime.workflow_executor {
+        Some(exec) => exec.clone(),
+        None => {
+            return Ok(ToolResult {
+                content: serde_json::to_string_pretty(&serde_json::json!([])).unwrap(),
+                is_error: false,
+                details: None,
+            });
+        }
+    };
+
+    if let Some(id_str) = input.get("workflow_id").and_then(Value::as_str) {
+        let wf_id = id_str
+            .parse::<WorkflowId>()
+            .map_err(|_| ToolError::Failed(format!("Invalid workflow ID format: '{id_str}'")))?;
+
+        let state = executor
+            .get_state(&wf_id)
+            .ok_or_else(|| ToolError::Failed(format!("Workflow '{id_str}' not found")))?;
+
+        let mut phase_artifacts = serde_json::Map::new();
+        for phase_id in state.phases.keys() {
+            let arts = executor.store.list_phase_artifacts(wf_id, phase_id);
+            let summaries: Vec<_> = arts.into_iter().map(|a| a.to_reference_summary()).collect();
+            phase_artifacts.insert(phase_id.clone(), serde_json::Value::Array(summaries));
+        }
+
+        let resp = serde_json::json!({
+            "workflow": state,
+            "artifacts": phase_artifacts,
+        });
+
+        Ok(ToolResult {
+            content: serde_json::to_string_pretty(&resp).unwrap(),
+            is_error: false,
+            details: None,
+        })
+    } else {
+        let workflows = executor.list_workflows();
+        let summaries: Vec<_> = workflows
+            .into_iter()
+            .map(|w| {
+                serde_json::json!({
+                    "workflow_id": w.id.to_string(),
+                    "name": w.name,
+                    "status": w.status,
+                    "phases_count": w.phases.len(),
+                    "started_ms": w.started_ms,
+                    "finished_ms": w.finished_ms,
+                    "error": w.error,
+                })
+            })
+            .collect();
+
+        Ok(ToolResult {
+            content: serde_json::to_string_pretty(&summaries).unwrap(),
+            is_error: false,
+            details: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::workflow::spec::VALID_3_PHASE_WORKFLOW_JSON;
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+
+    fn setup_context(trusted: bool) -> (ToolContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = RuntimeBus::new();
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), bus)
+            .with_project_trusted(trusted)
+            .with_worktree_manager(super::super::test_worktree_manager(dir.path()));
+        let store = WorkflowStateStore::new();
+        let executor = std::sync::Arc::new(WorkflowExecutor::new(
+            runtime.clone(),
+            store,
+            Some(crate::SubagentRunner::new(|_| Ok("fixture result".into()))),
+        ));
+        let runtime = runtime.with_workflow_executor(executor);
+
+        let context = ToolContext {
+            runtime: Some(runtime),
+            ..Default::default()
+        };
+        (context, dir)
+    }
+
+    #[test]
+    fn a_workflow_over_the_threshold_carries_a_large_warning() {
+        let (context, dir) = setup_context(true);
+        let spec: Value = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        let workers: usize = spec["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|phase| phase["workers"].as_array().unwrap().len())
+            .sum();
+        let run = |threshold: usize| {
+            workflow_run_tool_with_parent(
+                dir.path(),
+                &serde_json::json!({"spec": spec, "background": false}),
+                &context,
+                WorkflowLaunch {
+                    large_workflow_threshold: Some(threshold),
+                    ..WorkflowLaunch::default()
+                },
+            )
+            .unwrap()
+            .content
+        };
+        assert!(run(workers - 1).contains("Large workflow"));
+        assert!(!run(workers).contains("Large workflow"));
+    }
+
+    #[test]
+    fn test_workflow_tool_specs() {
+        let specs = workflow_tool_specs();
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().any(|s| s.name == "workflow_run"));
+        assert!(specs.iter().any(|s| s.name == "workflow_status"));
+    }
+
+    #[test]
+    fn test_workflow_run_sync_and_status() {
+        let (context, dir) = setup_context(true);
+        let spec_val: Value = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+
+        let run_input = serde_json::json!({
+            "spec": spec_val,
+            "background": false,
+            "save_as": "test-flow"
+        });
+
+        let res = workflow_run_tool(dir.path(), &run_input, &context).unwrap();
+        assert!(!res.is_error);
+        assert!(res.content.contains("completed"));
+        assert!(res.content.contains("test-flow.json"));
+
+        // Status check for specific workflow
+        let parsed_res: Value = serde_json::from_str(&res.content).unwrap();
+        let wf_id = parsed_res["id"].as_str().unwrap();
+
+        let status_input = serde_json::json!({ "workflow_id": wf_id });
+        let status_res = workflow_status_tool(&status_input, &context).unwrap();
+        assert!(!status_res.is_error);
+        assert!(status_res.content.contains("investigate"));
+
+        // Status list
+        let list_res = workflow_status_tool(&serde_json::json!({}), &context).unwrap();
+        assert!(!list_res.is_error);
+        assert!(list_res.content.contains(wf_id));
+    }
+
+    #[test]
+    fn test_workflow_save_and_run_untrusted_project_rejected() {
+        let (context, dir) = setup_context(false); // untrusted!
+        let spec_val: Value = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+
+        let run_input = serde_json::json!({
+            "spec": spec_val,
+            "save_as": "untrusted-flow"
+        });
+
+        let err = workflow_run_tool(dir.path(), &run_input, &context).unwrap_err();
+        assert!(err.to_string().contains("untrusted checkout"));
+
+        // Attempting to run by name from untrusted checkout
+        let wf_dir = dir.path().join(".davinci").join("workflows");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(wf_dir.join("saved.json"), VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+
+        let load_input = serde_json::json!({ "name": "saved" });
+        let err2 = workflow_run_tool(dir.path(), &load_input, &context).unwrap_err();
+        assert!(err2.to_string().contains("requires project trust"));
+    }
+    #[test]
+    fn max_cost_usd_is_rejected_until_supported() {
+        let (context, dir) = setup_context(true);
+        let mut spec: Value = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        spec["max_cost_usd"] = serde_json::json!(1.5);
+        let err = workflow_run_tool(
+            dir.path(),
+            &serde_json::json!({"spec": spec, "background": false}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("max_cost_usd"));
+    }
+}

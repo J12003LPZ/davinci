@@ -1,0 +1,438 @@
+use serde::{Deserialize, Serialize};
+
+include!("catalog_include.rs");
+
+pub fn builtin_catalog_json(provider: &str) -> Option<&'static str> {
+    catalog_json(provider)
+}
+
+pub const KNOWN_PROVIDERS: &[&str] = &[
+    "amazon-bedrock",
+    "ant-ling",
+    "anthropic",
+    "google",
+    "google-vertex",
+    "openai",
+    "azure-openai-responses",
+    "openai-codex",
+    "radius",
+    "nvidia",
+    "deepseek",
+    "github-copilot",
+    "xai",
+    "groq",
+    "cerebras",
+    "openrouter",
+    "vercel-ai-gateway",
+    "zai",
+    "zai-coding-cn",
+    "mistral",
+    "minimax",
+    "minimax-cn",
+    "moonshotai",
+    "moonshotai-cn",
+    "huggingface",
+    "fireworks",
+    "together",
+    "baseten",
+    "opencode",
+    "opencode-go",
+    "kimi-coding",
+    "cloudflare-workers-ai",
+    "cloudflare-ai-gateway",
+    "qwen-token-plan",
+    "qwen-token-plan-cn",
+    "qwen-token-plan-individual",
+    "xiaomi",
+    "xiaomi-token-plan-cn",
+    "xiaomi-token-plan-ams",
+    "xiaomi-token-plan-sgp",
+];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+    #[serde(rename = "cacheRead", default)]
+    pub cache_read: f64,
+    #[serde(rename = "cacheWrite", default)]
+    pub cache_write: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelCostRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub tier_input_tokens_above: Option<u64>,
+}
+
+/// Resolve model rates using the raw provider input total. Built-in catalog
+/// tiers are read from the authoritative catalog JSON so the public `Model`
+/// shape stays source-compatible with existing providers and plugins.
+pub fn effective_model_cost_rates(model: &Model, raw_input_tokens: u64) -> ModelCostRates {
+    let mut rates = ModelCostRates {
+        input: model.cost.input,
+        output: model.cost.output,
+        cache_read: model.cost.cache_read,
+        cache_write: model.cost.cache_write,
+        tier_input_tokens_above: None,
+    };
+
+    let Some(json) = builtin_catalog_json(&model.provider) else {
+        return rates;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
+        return rates;
+    };
+    let Some(groups) = root.as_object() else {
+        return rates;
+    };
+
+    let mut selected: Option<(u64, &serde_json::Value)> = None;
+    for group in groups.values().filter_map(serde_json::Value::as_object) {
+        for entry in group.values() {
+            if entry.get("id").and_then(serde_json::Value::as_str) != Some(model.id.as_str()) {
+                continue;
+            }
+
+            // A user/provider override can intentionally reuse a built-in
+            // provider/model id with different pricing. In that case the
+            // built-in long-context tiers are no longer authoritative and
+            // must not be mixed with the override's base rates.
+            let catalog_cost = |name: &str| {
+                entry
+                    .pointer(&format!("/cost/{name}"))
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+            let base_rates_match = catalog_cost("input") == model.cost.input
+                && catalog_cost("output") == model.cost.output
+                && catalog_cost("cacheRead") == model.cost.cache_read
+                && catalog_cost("cacheWrite") == model.cost.cache_write;
+            if !base_rates_match {
+                return rates;
+            }
+
+            let Some(tiers) = entry
+                .pointer("/cost/tiers")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return rates;
+            };
+            for tier in tiers {
+                let Some(threshold) = tier
+                    .get("inputTokensAbove")
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    continue;
+                };
+                if raw_input_tokens > threshold
+                    && selected
+                        .as_ref()
+                        .map(|(current, _)| threshold > *current)
+                        .unwrap_or(true)
+                {
+                    selected = Some((threshold, tier));
+                }
+            }
+        }
+    }
+
+    let Some((threshold, tier)) = selected else {
+        return rates;
+    };
+    rates.input = tier
+        .get("input")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.input);
+    rates.output = tier
+        .get("output")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.output);
+    rates.cache_read = tier
+        .get("cacheRead")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.cache_read);
+    rates.cache_write = tier
+        .get("cacheWrite")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.cache_write);
+    rates.tier_input_tokens_above = Some(threshold);
+    rates
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Model {
+    pub id: String,
+    pub name: String,
+    pub api: String,
+    pub provider: String,
+    #[serde(rename = "baseUrl", default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub reasoning: bool,
+    #[serde(default)]
+    pub input: Vec<String>,
+    pub cost: ModelCost,
+    #[serde(rename = "contextWindow")]
+    pub context_window: u64,
+    #[serde(rename = "maxTokens")]
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub compat: serde_json::Value,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "thinkingLevelMap", default)]
+    pub thinking_level_map: std::collections::BTreeMap<String, Option<String>>,
+}
+
+pub fn flatten_catalog(provider: &str, groups: &serde_json::Value) -> Vec<Model> {
+    let mut models = Vec::new();
+    let Some(map) = groups.as_object() else {
+        return models;
+    };
+    for (_api, group) in map {
+        if let Some(entries) = group.as_object() {
+            for (_id, value) in entries {
+                if let Ok(mut model) = serde_json::from_value::<Model>(value.clone()) {
+                    if model.provider.is_empty() {
+                        model.provider = provider.to_string();
+                    }
+                    models.push(model);
+                }
+            }
+        }
+    }
+    models
+}
+
+pub fn load_builtin_models() -> Vec<Model> {
+    let mut models = Vec::new();
+    for provider in builtin_provider_ids() {
+        if let Some(json) = catalog_json(provider) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                models.extend(flatten_catalog(provider, &value));
+            }
+        }
+    }
+    models.extend(openrouter_image_models());
+    models.extend(load_radius_models());
+    models
+}
+
+pub fn models_from_provider_config(name: &str, config: &serde_json::Value) -> Vec<Model> {
+    let Some(entries) = config.get("models").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let api = config
+        .get("api")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("openai-completions");
+    let base_url = config.get("baseUrl").and_then(serde_json::Value::as_str);
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let mut model = entry.clone();
+            if model.get("provider").is_none() {
+                model["provider"] = serde_json::json!(name);
+            }
+            if model.get("api").is_none() {
+                model["api"] = serde_json::json!(api);
+            }
+            if model.get("baseUrl").is_none() {
+                if let Some(url) = base_url {
+                    model["baseUrl"] = serde_json::json!(url);
+                }
+            }
+            if model.get("cost").is_none() {
+                model["cost"] = serde_json::json!({
+                    "input": 0.0,
+                    "output": 0.0,
+                    "cacheRead": 0.0,
+                    "cacheWrite": 0.0
+                });
+            }
+            if model.get("contextWindow").is_none() {
+                model["contextWindow"] = serde_json::json!(128000);
+            }
+            if model.get("maxTokens").is_none() {
+                model["maxTokens"] = serde_json::json!(4096);
+            }
+            if model.get("input").is_none() {
+                model["input"] = serde_json::json!(["text"]);
+            }
+            if model.get("name").is_none() {
+                if let Some(id) = model.get("id").cloned() {
+                    model["name"] = id;
+                }
+            }
+            if model.get("headers").is_none() {
+                if let Some(headers) = config.get("headers") {
+                    model["headers"] = headers.clone();
+                }
+            }
+            serde_json::from_value(model).ok()
+        })
+        .collect()
+}
+
+pub fn openrouter_image_models() -> Vec<Model> {
+    vec![Model {
+        id: "google/gemini-2.5-flash-image".into(),
+        name: "Gemini 2.5 Flash Image".into(),
+        api: "openrouter-images".into(),
+        provider: "openrouter".into(),
+        base_url: Some("https://openrouter.ai/api/v1".into()),
+        reasoning: false,
+        input: vec!["text".into(), "image".into()],
+        cost: ModelCost {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        },
+        context_window: 32_768,
+        max_tokens: 8192,
+        compat: serde_json::Value::Null,
+        headers: Default::default(),
+        thinking_level_map: Default::default(),
+    }]
+}
+
+pub fn load_radius_models() -> Vec<Model> {
+    let config = if let Ok(path) = std::env::var("PI_RADIUS_CONFIG_REPLY") {
+        std::fs::read_to_string(path).ok()
+    } else if let Ok(body) = std::env::var("PI_RADIUS_CONFIG_JSON") {
+        Some(body)
+    } else if std::env::var("PI_RADIUS_DRY_RUN").is_ok() || cfg!(test) {
+        None
+    } else {
+        fetch_radius_config()
+    };
+    let Some(raw) = config else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    radius_models_from_config(&value)
+}
+
+fn fetch_radius_config() -> Option<String> {
+    let gateway =
+        std::env::var("PI_RADIUS_GATEWAY").unwrap_or_else(|_| "https://radius.pi.dev".into());
+    let gateway = gateway.trim_end_matches('/');
+    let url = format!("{gateway}/v1/config");
+    let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+        .get(&url)
+        .set("accept", "application/json");
+    if let Ok(key) = std::env::var("RADIUS_API_KEY") {
+        request = request.set("Authorization", &format!("Bearer {key}"));
+    } else if let Ok(key) = std::env::var("PI_RADIUS_TOKEN") {
+        request = request.set("Authorization", &format!("Bearer {key}"));
+    }
+    request.call().ok()?.into_string().ok()
+}
+
+pub fn radius_models_from_config(config: &serde_json::Value) -> Vec<Model> {
+    let base_url = config
+        .get("baseUrl")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("https://radius.pi.dev");
+    let mut wrapper = config.clone();
+    if wrapper.get("api").is_none() {
+        wrapper["api"] = serde_json::json!("pi-messages");
+    }
+    if wrapper.get("baseUrl").is_none() {
+        wrapper["baseUrl"] = serde_json::json!(base_url);
+    }
+    models_from_provider_config("radius", &wrapper)
+}
+
+pub fn builtin_provider_ids() -> Vec<&'static str> {
+    KNOWN_PROVIDERS
+        .iter()
+        .copied()
+        .filter(|id| catalog_json(id).is_some())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_long_input_pricing_tier_from_builtin_catalog() {
+        let sol = load_builtin_models()
+            .into_iter()
+            .find(|model| model.provider == "openai" && model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol");
+
+        let base = effective_model_cost_rates(&sol, 272_000);
+        assert_eq!(base.input, 4.0);
+        assert_eq!(base.tier_input_tokens_above, None);
+
+        let high = effective_model_cost_rates(&sol, 272_001);
+        assert_eq!(high.input, 8.0);
+        assert_eq!(high.output, 30.0);
+        assert_eq!(high.cache_read, 0.8);
+        assert_eq!(high.cache_write, 10.0);
+        assert_eq!(high.tier_input_tokens_above, Some(272_000));
+    }
+
+    #[test]
+    fn custom_price_override_does_not_inherit_builtin_long_input_tier() {
+        let mut custom = load_builtin_models()
+            .into_iter()
+            .find(|model| model.provider == "openai" && model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol");
+        custom.cost = ModelCost {
+            input: 123.0,
+            output: 456.0,
+            cache_read: 7.0,
+            cache_write: 8.0,
+        };
+
+        let rates = effective_model_cost_rates(&custom, 300_000);
+        assert_eq!(rates.input, 123.0);
+        assert_eq!(rates.output, 456.0);
+        assert_eq!(rates.cache_read, 7.0);
+        assert_eq!(rates.cache_write, 8.0);
+        assert_eq!(rates.tier_input_tokens_above, None);
+    }
+
+    #[test]
+    fn radius_and_registered_providers_flatten_models() {
+        let config = serde_json::json!({
+            "baseUrl": "https://radius.pi.dev/v1",
+            "models": [{
+                "id": "radius-demo",
+                "name": "Radius Demo",
+                "reasoning": false,
+                "input": ["text"],
+                "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0 },
+                "contextWindow": 128000,
+                "maxTokens": 4096
+            }]
+        });
+        let models = radius_models_from_config(&config);
+        assert_eq!(models[0].provider, "radius");
+        assert_eq!(models[0].api, "pi-messages");
+        assert_eq!(models[0].id, "radius-demo");
+        let registered = models_from_provider_config(
+            "my-proxy",
+            &serde_json::json!({
+                "baseUrl": "https://proxy.example.com",
+                "api": "anthropic-messages",
+                "models": [{ "id": "demo", "name": "Demo" }]
+            }),
+        );
+        assert_eq!(registered[0].provider, "my-proxy");
+        assert_eq!(registered[0].api, "anthropic-messages");
+        assert!(openrouter_image_models()
+            .iter()
+            .all(|model| model.api == "openrouter-images"));
+    }
+}

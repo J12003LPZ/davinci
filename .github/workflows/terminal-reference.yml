@@ -1,0 +1,58 @@
+name: Terminal reference capture
+
+on:
+  push:
+    branches: [J12003LPZ/terminal-ui-rebuild-20260920]
+    paths:
+      - '.github/workflows/terminal-reference.yml'
+      - '.github/scripts/terminal_reference_capture.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminal-reference-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download pinned official reference
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/claude-reference"
+          curl --fail --location --retry 2 https://github.com/anthropics/claude-code/releases/download/v2.1.278/claude-linux-x64.tar.gz -o "$RUNNER_TEMP/claude-reference.tar.gz"
+          echo "1d1f9950b96acb5a50bf342a3d3bd51cdf40b1714b2ca3ce2319ba8e8e7f3633  $RUNNER_TEMP/claude-reference.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/claude-reference.tar.gz" -C "$RUNNER_TEMP/claude-reference"
+          binary=$(find "$RUNNER_TEMP/claude-reference" -type f -name claude -print -quit)
+          test -n "$binary"
+          chmod u+x "$binary"
+          echo "REFERENCE_CLI=$binary" >> "$GITHUB_ENV"
+          "$binary" --version
+      - name: Install capture-only dependencies
+        run: python3 -m pip install --user pexpect==4.9.0 pyte==0.8.2
+      - name: Capture isolated reference terminal
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/scripts/terminal_reference_capture.py')
+          source = path.read_text()
+          before = "            send(b'\\x1b','dismiss prior panel')"
+          after = "            for _ in range(3):\n                send(b'\\x1b','dismiss nested panel focus')"
+          assert source.count(before) == 1
+          path.write_text(source.replace(before, after))
+          PY
+          python3 .github/scripts/terminal_reference_capture.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: claude-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/reference-captures
+          retention-days: 7
+          if-no-files-found: warn

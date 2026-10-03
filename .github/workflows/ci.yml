@@ -1,0 +1,406 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PI_OFFLINE: "1"
+
+jobs:
+  test-impact-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Bounded browser backend and network policy
+        run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_host.test.cjs
+      - name: Exported session tree traversal
+        run: node --test crates/davinci-coding-agent/export-html/template.test.cjs
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Native Seatbelt enforcement and honest capability boundaries
+        id: seatbelt
+        if: runner.os == 'macOS'
+        run: cargo test -p davinci-agent --locked --test sandbox_seatbelt
+      - name: Bounded native sandbox failure diagnostics
+        if: failure() && runner.os == 'macOS' && steps.seatbelt.outcome == 'failure'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, time
+          limit = 128 * 1024
+          predicate = 'process != "log" AND (eventMessage CONTAINS[c] "sandbox_seatbe" OR eventMessage CONTAINS[c] "sandbox-exec")'
+          try:
+              result = subprocess.run(["sudo", "-n", "/usr/bin/log", "show", "--last", "2m", "--style", "compact", "--info", "--debug", "--predicate", predicate], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+              print("Native sandbox system log:", result.returncode)
+              print(result.stdout[:limit].decode("utf-8", errors="replace"))
+          except (OSError, subprocess.TimeoutExpired) as error:
+              print("Native sandbox system log unavailable:", error)
+          reports = []
+          for directory in [pathlib.Path.home() / "Library/Logs/DiagnosticReports", pathlib.Path("/Library/Logs/DiagnosticReports")]:
+              for pattern in ["sandbox_seatbe*.ips", "sandbox-exec*.ips"]:
+                  try:
+                      reports.extend(path for path in directory.glob(pattern) if path.is_file() and time.time() - path.stat().st_mtime < 600)
+                  except OSError as error:
+                      print("Crash report directory unavailable:", error)
+          for path in sorted(reports, key=lambda path: path.stat().st_mtime, reverse=True)[:3]:
+              try:
+                  with path.open("rb") as report:
+                      print("Native sandbox crash report:", path.name)
+                      print(report.read(limit).decode("utf-8", errors="replace"))
+              except OSError as error:
+                  print("Crash report unavailable:", error)
+          PY
+      - name: Native listener ownership proof
+        run: |
+          cargo test -p davinci-agent --locked --lib process_manager::socket_owner
+          cargo clippy -p davinci-agent --locked --lib --tests -- -D warnings
+      - name: Test planning and filesystem observation
+        run: cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation
+      - name: Normal agent edit and verification path
+        run: cargo test -p davinci-coding-agent --locked --bin davinci test_impact_integration_tests
+      - name: Offline test selection evaluation
+        run: cargo test -p davinci-coding-agent --locked --test test_impact_eval -- --ignored --nocapture
+      - name: Managed process authorization and lifecycle
+        run: cargo test -p davinci-agent --locked --lib process_manager::tests
+      - name: Native supervisor ownership and public process contracts
+        run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
+      - name: Evidence artifact retrieval boundaries
+        run: cargo test -p davinci-agent --locked --lib runtime::evidence_store
+      - name: Graph process leases
+        run: cargo test -p davinci-coding-agent --locked --lib graph_managed_process
+      - name: Normal agent process path
+        run: cargo test -p davinci-coding-agent --locked --bin davinci process_manager_integration_tests
+      - name: Packaged supervisor entry point
+        run: cargo test -p davinci-coding-agent --locked --test process_manager
+      - name: Offline process reuse and cleanup evaluation
+        env:
+          DAVINCI_PROCESS_EVAL_ARTIFACT: ${{ runner.temp }}/process-evaluation.json
+        run: cargo test -p davinci-coding-agent --locked --test process_manager -- --ignored --nocapture
+      - name: Preserve native process measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-evaluation-${{ runner.os }}
+          path: ${{ runner.temp }}/process-evaluation.json
+          if-no-files-found: error
+      - name: Native transaction metadata and authorization
+        run: cargo test -p davinci-agent --locked --lib transaction
+      - name: Native directory lease lifetime
+        run: cargo test -p davinci-agent --locked --lib directory_lease
+      - name: Supervisor output capture integrity
+        run: cargo test -p davinci-agent --locked --lib supervisor_capture
+      - name: Foreground supervised command lifecycle
+        run: cargo test -p davinci-agent --locked --lib foreground_supervisor_capture_and_cancellation
+      - name: Transaction recovery, commit evidence and verification
+        run: cargo test -p davinci-agent --locked --test transactions --test transaction_commit --test transaction_verification
+      - name: Transaction CLI and intelligence integration
+        run: cargo test -p davinci-coding-agent --locked --test transaction_cli --test transaction_intelligence
+      - name: Build transaction worker fixture
+        run: cargo build -p davinci-coding-agent --locked --bin davinci
+      - name: Transaction worker submit and recovery
+        env:
+          PI_GRAPH_WORKER_EXECUTABLE: ${{ github.workspace }}/target/debug/davinci${{ runner.os == 'Windows' && '.exe' || '' }}
+          PI_OFFLINE_TOOL_CALL: '[{"name":"write","arguments":{"path":"a.txt","content":"worker edit"}},{"name":"graph_submit","arguments":{"artifact":{"changedFiles":["a.txt"],"summary":"Updated a.txt transactionally","deviations":[],"planInvalidated":false}}}]'
+        run: cargo test -p davinci-coding-agent --locked --lib transaction_parent_launch_accepts_submitted_edit_and_preserves_recovery -- --ignored
+      - name: Offline transaction recovery evaluation
+        env:
+          DAVINCI_TRANSACTION_EVAL_ARTIFACT: ${{ runner.temp }}/transaction-evaluation.json
+        run: cargo test -p davinci-agent --locked --test transaction_eval
+      - name: Preserve native transaction measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: transaction-evaluation-${{ runner.os }}
+          path: ${{ runner.temp }}/transaction-evaluation.json
+          if-no-files-found: error
+
+  p12-live-browser-native:
+    name: p12-live-browser (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install pinned Playwright Chromium fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_dir="$RUNNER_TEMP/davinci-playwright"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            fixture_dir="${RUNNER_TEMP//\\//}/davinci-playwright"
+          fi
+          npm install --prefix "$fixture_dir" --no-save --no-package-lock playwright@1.62.0
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            "$fixture_dir/node_modules/.bin/playwright" install --with-deps chromium
+          else
+            "$fixture_dir/node_modules/.bin/playwright" install chromium
+          fi
+          {
+            echo "DAVINCI_TRUSTED_NODE_TEST_PATH=$(node -p 'process.execPath')"
+            echo "DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH=$fixture_dir/node_modules/playwright"
+            echo "DAVINCI_BROWSER_DIAGNOSTICS=1"
+          } >> "$GITHUB_ENV"
+      - name: Run the P12 feature-off baseline on the shared fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run in 1 2; do
+            DAVINCI_P12_FEATURES=off \
+            DAVINCI_P12_EVAL_ARTIFACT="$RUNNER_TEMP/p12-feature-off-${run}.json" \
+              cargo test -p davinci-coding-agent --locked --bin davinci -- --ignored --nocapture login_button_seventeen_step_normal_dispatch_and_graph_deny
+          done
+      - name: Run the real P12 feature-on normal and Graph 17-step browser path
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run in 1 2; do
+            DAVINCI_P12_FEATURES=on \
+            DAVINCI_P12_EVAL_ARTIFACT="$RUNNER_TEMP/p12-live-login-${run}.json" \
+              cargo test -p davinci-coding-agent --locked --bin davinci -- --ignored --nocapture login_button_seventeen_step_normal_dispatch_and_graph_deny
+          done
+      - name: Compare paired P12 feature receipts
+        env:
+          COMPARISON: ${{ runner.temp }}/p12-feature-comparison.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$RUNNER_TEMP/p12-feature-off-1.json" "$RUNNER_TEMP/p12-feature-off-2.json" "$RUNNER_TEMP/p12-live-login-1.json" "$RUNNER_TEMP/p12-live-login-2.json" "$COMPARISON" <<'PY'
+          import json
+          import pathlib
+          import statistics
+          import sys
+
+          off_paths = list(map(pathlib.Path, sys.argv[1:3]))
+          on_paths = list(map(pathlib.Path, sys.argv[3:5]))
+          comparison_path = pathlib.Path(sys.argv[5])
+          off_runs = [json.loads(path.read_text()) for path in off_paths]
+          on_runs = [json.loads(path.read_text()) for path in on_paths]
+          assert len(off_runs) == len(on_runs) == 2
+          for off in off_runs:
+              assert off["feature_enabled"] is False
+              assert off["fixture_id"] == "login-button-seventeen-step"
+              assert off["memory_bytes"] > 0
+          for on in on_runs:
+              assert on["feature_enabled"] is True
+              assert on["fixture_id"] == "login-button-seventeen-step"
+              assert on["normal"]["metrics"]["memory_bytes"] > 0
+              assert on["normal"]["metrics"]["cache_hits"] > 0
+              assert on["graph_writer"]["metrics"]["cache_hits"] > 0
+              assert on["normal"]["metrics"]["browser_success"] is True
+              assert on["graph_writer"]["metrics"]["browser_success"] is True
+          assert {run["fixture_id"] for run in off_runs + on_runs} == {"login-button-seventeen-step"}
+
+          def distribution(values):
+              return {
+                  "samples": values,
+                  "median": statistics.median(values),
+                  "min": min(values),
+                  "max": max(values),
+              }
+
+          comparison = {
+              "schema_version": 1,
+              "runs_per_mode": 2,
+              "fixture_id": on_runs[0]["fixture_id"],
+              "same_fixture": True,
+              "feature_off": {
+                  "startup_ms": distribution([run["startup_ms"] for run in off_runs]),
+                  "memory_bytes": distribution([run["memory_bytes"] for run in off_runs]),
+                  "disabled_tools": sorted({run["disabled_tool"] for run in off_runs}),
+              },
+              "feature_on": {
+                  "startup_ms": distribution([run["normal"]["metrics"]["startup_ms"] for run in on_runs]),
+                  "memory_bytes": distribution([run["normal"]["metrics"]["memory_bytes"] for run in on_runs]),
+                  "cache_hits": distribution([run["normal"]["metrics"]["cache_hits"] for run in on_runs]),
+                  "graph_cache_hits": distribution([run["graph_writer"]["metrics"]["cache_hits"] for run in on_runs]),
+                  "browser_success": all(run["normal"]["metrics"]["browser_success"] for run in on_runs),
+              },
+          }
+          comparison_path.write_text(json.dumps(comparison, indent=2) + "\n")
+          print(json.dumps(comparison, sort_keys=True))
+          PY
+      - name: Preserve P12 live evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: p12-live-login-${{ runner.os }}
+          path: |
+            ${{ runner.temp }}/p12-feature-off-1.json
+            ${{ runner.temp }}/p12-feature-off-2.json
+            ${{ runner.temp }}/p12-live-login-1.json
+            ${{ runner.temp }}/p12-live-login-2.json
+            ${{ runner.temp }}/p12-feature-comparison.json
+          if-no-files-found: error
+
+  voice-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux capture headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Native deterministic tests (no microphone or model)
+        run: cargo test -p davinci-voice --features native --locked
+      - name: Build matching helper
+        run: cargo build -p davinci-voice --features native --bin davinci-voice-worker --locked
+
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Separate from `quality` so each gets a fresh runner. Stacking the clippy
+  # build, a release build and these debug test builds on one runner starved
+  # it until GitHub reported "The hosted runner lost communication with the
+  # server" during Behavioral contracts. The release credential check lives
+  # in the ubuntu davinci-coding-agent workspace shard.
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Prompt contracts
+        run: |
+          cargo test -p davinci-agent prompt::
+      - name: Behavioral contracts
+        run: |
+          cargo test -p davinci-evals behavior::
+      - name: Ecosystem integration
+        run: cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
+      - name: Ecosystem invariants
+        run: cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
+      - name: Runtime migration baseline
+        run: cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
+
+  python-tests:
+    name: python-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Benchmark harness
+        run: python -m unittest discover -s scripts/bench/tests -p "test_*.py"
+      - name: Inline verification Python checker
+        run: python -m unittest discover -s crates/davinci-agent/src/verification -p "test_python_ast.py"
+      - name: Parse Windows source installer without executing it
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'scripts/install-davinci.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -gt 0) {
+              $parseErrors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+          }
+
+  workspace-test-shards:
+    name: workspace-test (${{ matrix.os }}, ${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        package:
+          - davinci-agent
+          - davinci-ai
+          - davinci-client
+          - davinci-coding-agent
+          - davinci-evals
+          - davinci-mcp
+
+          - davinci-protocol
+          - davinci-server
+          - davinci-session
+          - davinci-session-sqlite
+          - davinci-sys
+          - davinci-telemetry
+          - davinci-tui
+          - davinci-voice
+        exclude:
+          - os: windows-latest
+            package: davinci-voice
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Workspace package tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          # Process-heavy Windows suites otherwise compete for child startup
+          # and can exhaust fixture deadlines on hosted runners.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            export RUST_TEST_THREADS=4
+          fi
+          if [[ "${{ matrix.package }}" == "davinci-coding-agent" ]]; then
+            cargo build -p davinci-coding-agent --bin davinci --locked
+          fi
+          cargo test -p "${{ matrix.package }}" --locked
+      - name: Release build contains no credential fixtures
+        if: matrix.os == 'ubuntu-latest' && matrix.package == 'davinci-coding-agent'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p davinci-coding-agent --bin davinci --locked
+          if strings target/release/davinci | grep -Eq 'PI_OAUTH_FIXTURE|PI_OAUTH_REFRESH_URL|PI_OAUTH_TOKEN_URL|PI_MCP_FIXTURE|PI_SECURITY_SCAN_FIXTURE|PI_SECURITY_SCAN_HOLD'; then
+            echo "credential-affecting test fixture hook leaked into release binary" >&2
+            exit 1
+          fi
+
+  workspace-tests:
+    needs: workspace-test-shards
+    # Do not convert a concurrency-cancelled superseded push into a red
+    # aggregate check. Real shard failures still reach this job and fail below.
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all workspace test shards
+        shell: bash
+        run: test "${{ needs['workspace-test-shards'].result }}" = "success"

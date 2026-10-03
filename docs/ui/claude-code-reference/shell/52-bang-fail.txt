@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.281
+           Opus 5.5 with high effort · <plan>
+           ~\project
+
+▎ ※ You've been granted a $100 bonus credit for cloud sessions, on top of your plan limits · /claim-credit
+
+! echo hi
+  ⎿  hi
+
+● The command ran and printed hi, so the shell is working. What would you like to do next?
+
+✻ Churned for 2s · done 2:27 AM
+
+! git log --oneline -3
+  ⎿  5c14352 init
+
+● The repo has one commit so far: 5c14352 init. You also have uncommitted work: README.md is modified, and Cargo.lock,
+  notes.txt, .serena/ and target/ are untracked. Want help committing it or setting up a .gitignore? target/ and
+  .serena/ usually shouldn't be committed.
+
+✻ Baked for 2s · done 2:27 AM
+
+! exit 3
+  ⎿  (No output)
+
+● That command exited with status 3 and printed nothing, which is what exit 3 does. The session shell is still running,
+  so you can keep going.
+
+✻ Crunched for 2s · done 2:27 AM
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent

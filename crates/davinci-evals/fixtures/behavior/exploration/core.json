@@ -1,0 +1,18 @@
+{
+  "id": "explore-before-edit-001",
+  "category": "exploration",
+  "request": "Change the retry delay to use the existing project convention.",
+  "repo_fixture": "retry-convention",
+  "required_events": [
+    {
+      "kind": "read_or_search",
+      "target": "retry"
+    }
+  ],
+  "forbidden_events": [
+    {
+      "kind": "edit_before_relevant_read"
+    }
+  ],
+  "max_unrelated_files_changed": 0
+}

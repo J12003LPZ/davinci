@@ -1,0 +1,169 @@
+# Davinci Closed Ecosystem Integration Architecture
+
+This document describes the closed ecosystem integration contracts connecting **Graph**, **Token Governor**, **Vector Memory**, **Learning**, and **Security** in Davinci (`pi-rust`).
+
+---
+
+## 1. Producer / Consumer Matrix
+
+Every subsystem boundary in the Davinci ecosystem operates under explicit, bounded contracts with zero model orchestration overhead:
+
+| Producer Subsystem | Consumer Subsystem | Flow & Payload Contract | Bounded Budget / Invariant |
+| :--- | :--- | :--- | :--- |
+| **Vector Memory** | **Normal Interactive Turn** | Ephemeral similarity search on user/turn prompt | Top-k relevant memories, ephemeral injection |
+| **Vector Memory + Learning** | **Graph Worker Context** | `build_context_packet` produces `<context source="davinci" untrusted="true">` | Strict cap: <= 2,500 aggregate tokens (<= 1,200 memory tok / 4 hits; <= 1,000 skill tok / 2 skills) |
+| **Graph Role + Vector Memory + Learning** | **Capability Toolbox** | Assemble already-authorized tools plus bounded memory/skill context for one worker | 0 model calls; existing role policy remains authority; existing graph context cap remains enforced |
+| **Capability Toolbox** | **Graph Worker** | `CapabilitySelection { tools, context }` | No duplicate skills; no partial skill body; exact skill version/hash refs preserved |
+| **Token Governor** | **Graph Worker Execution** | Large compressible tool results are stored exactly, classified locally as log / JSON-array / search / plain text, and the smallest safe specialized-or-generic referenced view is delivered | `retrieve_output` preserved in worker allowlist; exact original recovery on demand; no model or network call for routing |
+| **Graph Execution** | **Security Scanner** | File mutations evaluated via `assess_change_risk` | High risk (`ChangeRisk::High`) or `always` mode triggers `verify_changed_surface` before review |
+| **Graph Verification** | **Learning System** | `VerificationBundle` derived deterministically from unit tests and security | Approval eligibility computed pure/deterministic; `record_skill_version_outcome` updates ledger |
+| **Graph Verification** | **Vector Memory + Learning Reviewer** | A verified run (commands ran, none failed) indexes a `TaskResult` memory of goal, changed files and passing commands, and submits the run as review evidence | Memory confidence 0.9; review runs on the session's shared controller, in the background, spaced by `minReviewIntervalMs` |
+| **Learning System** | **Future Graph Runs** | Verified procedural skills (`SKILL.md`) & high-confidence facts | Selected exact version `(name, version, content_hash)` injected into worker context |
+| **Graph Worker Governor** | **Graph Telemetry** | `graph_submit` writes the worker's governor stats beside its artifact; the parent folds them into `WorkerUsage` | Run totals are per-task sums; the parent session's governor is not reported |
+
+### Responsibility boundaries
+
+- **Graph** owns orchestration and worker lifecycle.
+- **Role policy** owns tool authority and allowlists.
+- **Capability Toolbox** assembles the already-authorized tools with bounded context for one worker.
+- **Vector Memory** supplies declarative context.
+- **Skills / Learning** supply procedural context and verified history.
+- **Token Governor** owns tool-output compression and recovery.
+- **Verification** remains the deterministic authority for outcomes and promotion.
+
+### Context VM / state folding
+
+Context VM is a derived provider-working-set layer shared by normal interactive
+turns and graph consumers. Its ownership boundaries are:
+
+```text
+session JSONL/events = authoritative WAL
+typed Context VM pages = derived, immutable application state
+stored artifacts = exact evidence and recovery source
+ContextImage = bounded provider working set
+provider/KV cache = optional backend optimization
+```
+
+`DAVINCI_CONTEXT_VM` controls rollout and defaults to `off`:
+
+- `off` keeps the existing pruning and legacy compaction behavior.
+- `shadow` compiles and compares a ContextImage but sends the unchanged legacy
+  provider projection.
+- `active` sends the ContextImage and folds derived state without replacing
+  `Agent::messages` or the authoritative session branch.
+
+Context VM pages use the existing `CacheRuntime` under the `context` namespace
+with persistent immutable, content-addressed IDs. Missing or corrupt pages in
+active mode are replayed from the session branch; missing mandatory policy is a
+request-blocking error. `retrieve_context` returns bounded, exact page/source
+content and never exposes hidden reasoning. Token Governor `retrieve_output`
+remains backward compatible; Context VM artifact references use the existing
+output store rather than a second retention database.
+
+The read-only status projection reports mode, epoch, checkpoint/delta/episode
+counts, hot events, last fold reason, page-fault hits/misses, a short prefix
+digest, shadow missing-ref counts and recorded failures. It appears as a
+`context vm:` line in `/status` (text and davinci shell) and as `contextVm` in
+RPC `get_session_stats` whenever the mode is not `off`. The first VM failure or
+fallback in a session, a new shadow mismatch, and each automatic fold raise one
+notice (davinci transcript, RPC `notify`, stderr in print mode); matching
+shadow views stay quiet. `retrieve_context` is offered only in `active` after
+the VM has folded or paged events out, and each folded-episode placeholder
+names the tool and the page id to pass. To debug a discrepancy, switch to `shadow`, inspect the prepared
+manifest and missing user/tool references, inspect the ContextRoot/page refs,
+retrieve the exact source with `retrieve_context`, replay the session branch,
+and compare the legacy and VM provider views. Normal turns add no model call
+for context maintenance; a fold may use the fold path only when its explicit
+manual, phase-boundary, delta, or window-pressure trigger fires.
+
+---
+
+## 2. Invariants
+
+1. **Zero Coordinator Model Calls**:
+   - Preparing context packets, deriving cache keys, taking resource snapshots, evaluating security gates, and recording learning outcomes are strictly local, deterministic computations.
+   - Normal turns and graph runs execute **0 additional coordinator or preparation model calls**.
+2. **Ephemeral Worker Isolation**:
+   - Graph workers execute with `--no-session --no-extensions --no-skills`.
+   - Automatic background memory injection in child processes is suppressed via `PI_GRAPH_SUPPRESS_MEMORY_INJECT=1`.
+3. **Prompt Cache Affinity**:
+   - Provider cache keys are decoupled from session IDs (`StreamOptions::cache_key`).
+   - Derived cache keys (`derive_worker_cache_key`) preserve prompt prefix caching across worker retries and iterations while maintaining ephemeral worker isolation.
+4. **Strict Context Budget Bounds**:
+   - Combined context packets never exceed 2,500 estimated tokens.
+   - At most 4 memory hits and at most 2 skills are injected per worker.
+5. **Exact Provenance and Attribution**:
+   - Tasks record the exact `(name, version, content_hash)` of every injected skill.
+   - Outcome ledgers increment only when the executing version's hash matches the store record.
+6. **Reversible Content-Aware Routing**:
+   - Content-aware routing changes only the live tool result; it never rewrites the stable provider prefix, skills, memory packets, or historical messages.
+   - `content_aware=false` falls back to the prior generic Governor path.
+   - Byte-reduction metrics are operational estimates, not measured token savings.
+
+---
+
+## 3. Fallbacks and Kill Switches
+
+If any ecosystem subsystem needs to be bypassed or isolated during troubleshooting or minimal deployments:
+
+| Capability | Kill Switch / Configuration | Default | Fallback Behavior |
+| :--- | :--- | :--- | :--- |
+| **Graph Context Packet** | `PI_GRAPH_DISABLE_CONTEXT=1` or `maxTokens = 0` | Enabled (2,500 tok) | Graph workers start with empty context packet |
+| **Security Gate** | `GraphConfig::security_verification: "off"` | `"risk"` | Changed files bypass security scan; deterministic test commands still run |
+| **Learning Background Review** | `PI_LEARNING_DISABLE_BACKGROUND=1` | Enabled | Background reviewer thread skips turn analysis; foreground remains unaffected |
+| **Cache Key Decoupling** | Fallback when `cache_key == None` | `Some(key)` | Reverts to `session_id` provider prompt cache grouping |
+| **Token Governor** | `TokenGovernorConfig::enabled: false` | Enabled | Tools stream full, uncompacted output directly |
+| **Content-Aware Governor Routing** | `TokenGovernorConfig::content_aware: false` or one of the `*_GOVERNOR_CONTENT_AWARE` environment overrides | Enabled | Large outputs use the prior generic referenced Governor view; exact storage and retrieval remain unchanged |
+
+---
+
+## 4. Named Ecosystem Test Commands
+
+The ecosystem integration is covered by offline, deterministic integration tests that require zero external network access or provider credentials:
+
+```bash
+# Run all closed-loop ecosystem integration tests:
+cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
+
+# Run invariant enforcement tests (token limits, hit caps, zero model calls):
+cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
+
+# Run runtime migration baseline gate (all 6 core invariants in one gate):
+cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
+
+# Run integration telemetry tests:
+cargo test -p davinci-coding-agent ecosystem_telemetry -- --nocapture
+```
+
+### Interpretation of Cache Evidence
+
+- **Structural Cache Evidence (Offline & Tests)**:
+  `derive_worker_cache_key` generates identical cache keys for compatible worker retries and changes deterministically when model, tools, prompt, or contract changes. This is verified offline in `ecosystem_loop_cache_affinity`.
+- **Live Provider Cache Evidence (Online / Production)**:
+  Real provider usage reports cache hits/writes via provider response headers (e.g. Anthropic `cache_read_input_tokens`, `cache_creation_input_tokens`). These metrics populate `EcosystemStats::cache_read_tokens` and `cache_write_tokens`, displayed compactly in `/status` and `/graph-status`.
+
+---
+
+## 5. Verified Program-Level Acceptance Evidence
+
+The closed ecosystem integration has been fully verified offline against canned deterministic fixtures across all four release gates (A, B, C, D).
+
+| Metric | Target | Verified Value | Evidence / Test Citation |
+| :--- | :--- | :--- | :--- |
+| **Extra orchestration model calls, normal turn** | `0` | **`0`** | `ecosystem_invariants_token_and_calls` |
+| **Extra orchestration model calls, graph run** | `0` | **`0`** | `ecosystem_invariants_token_and_calls` |
+| **Default graph ecosystem context** | `<= 2,500 tok` | **`1,020 tok`** (bounded <= 2,500) | `ecosystem_invariants_token_and_calls`, `ecosystem_loop_memory_to_graph` |
+| **Default full skills injected** | `<= 2 / worker` | **`1`** (bounded <= 2) | `ecosystem_invariants_token_and_calls`, `ecosystem_loop_learning_to_graph` |
+| **Default graph memory hits** | `<= 4 / worker` | **`3`** (bounded <= 4) | `ecosystem_invariants_token_and_calls`, `ecosystem_loop_memory_to_graph` |
+| **Governor compressed output recoverability** | `100%` | **`100%`** (lossless byte-for-byte) | `ecosystem_loop_governor_recovery` |
+| **Required security failure bypasses** | `0` | **`0`** (security failure blocks approval) | `ecosystem_loop_security_gate` |
+| **Graph-owned changed chunks omitted from review** | `0` | **`0`** (100% chunk coverage) | `graph_review_chunk_coverage_and_provenance` |
+| **Cache affinity key stable across compatible retry** | `100%` | **`100%`** (identical key) | `ecosystem_loop_cache_affinity` |
+| **Cache affinity key changes on contract/toolset/model change** | `100%` | **`100%`** (distinct keys) | `ecosystem_loop_cache_affinity` |
+| **Median learning-review input token reduction** | `>= 40%` | **`55.0%`** (20 -> 9 dispatched reviews) | `benchmark_review_gating_efficiency_and_artifact_preservation` |
+| **Relative loss of accepted high-confidence learning artifacts** | `<= 5%` | **`0.0%`** (100% preservation) | `benchmark_review_gating_efficiency_and_artifact_preservation` |
+| **Full-circle multi-run learning feedback** | Run 1 -> Run 2 | **Verified** | `ecosystem_loop_full_circle` |
+| **CI required checks** | fmt + clippy + workspace + ecosystem | **Enforced** | `.github/workflows/ci.yml` |
+| **Network-dependent tests** | `0` | **`0`** (`PI_OFFLINE=1` fixture only) | CI quality job + closed-loop suite |
+
+*Note on Cache Measurement*: Per project guardrails, real-provider cache-hit rate improvements are not claimed from offline fixture runs. Structural cache affinity is proven via deterministic hash equivalence across compatible retries (`ecosystem_loop_cache_affinity`), while real-provider cache read/write token counters are captured via live telemetry in `EcosystemStats`.

@@ -1,0 +1,18 @@
+{
+  "affected_files": 2,
+  "edit_has_transaction_id": false,
+  "journal_after_success": false,
+  "later_user_bytes_preserved": false,
+  "legacy_recovery_succeeded": true,
+  "measurement": "P4 before: public write/edit/apply_patch and preimage-only journal recovery in temporary files",
+  "mutation_ms": 19.9454,
+  "notes": [
+    "A constructed incomplete legacy journal reproduces the public recovery contract; no crash is simulated in this baseline.",
+    "Source byte equality is measured directly. Timing is a single debug-profile sample."
+  ],
+  "operation_count": 3,
+  "patch_has_transaction_id": false,
+  "platform": "windows",
+  "schema": 1,
+  "write_has_transaction_id": false
+}

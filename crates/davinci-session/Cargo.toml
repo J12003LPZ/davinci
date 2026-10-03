@@ -1,0 +1,18 @@
+[package]
+name = "davinci-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "JSONL session store matching pi-agent-core session harness"
+
+[dependencies]
+davinci-protocol = { path = "../davinci-protocol" }
+davinci-sys = { path = "../davinci-sys" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,56 @@
+[
+  {
+    "id": "tool-select-symbol-lookup",
+    "category": "tool_choice",
+    "request": "Where is calculate_context_tokens defined?",
+    "repo_fixture": "symbol-lookup",
+    "expected_tool": "grep",
+    "discouraged_tools": ["read"],
+    "description": "Symbol lookup should use grep or definition search rather than broad file reads."
+  },
+  {
+    "id": "tool-select-independent-reads",
+    "category": "tool_choice",
+    "request": "Read these 4 configuration files: config/a.json, config/b.json, config/c.json, config/d.json.",
+    "repo_fixture": "multi-config",
+    "expected_tool": "batch",
+    "discouraged_tools": [],
+    "description": "Multiple independent known file reads should be batched."
+  },
+  {
+    "id": "tool-select-long-running-build",
+    "category": "tool_choice",
+    "request": "Run cargo test --workspace and monitor it.",
+    "repo_fixture": "workspace-build",
+    "expected_tool": "bash",
+    "expected_parameters": { "background": true },
+    "description": "Long test suites should be run in the background."
+  },
+  {
+    "id": "tool-select-small-replacement",
+    "category": "tool_choice",
+    "request": "Change retry_attempts from 3 to 5 in src/config.rs.",
+    "repo_fixture": "small-config-edit",
+    "expected_tool": "edit",
+    "discouraged_tools": ["apply_patch", "write"],
+    "description": "Single-file small targeted edits should use edit."
+  },
+  {
+    "id": "tool-select-multi-file-patch",
+    "category": "tool_choice",
+    "request": "Rename the internal identifier OldEngine to NewEngine across 5 modules and update callers.",
+    "repo_fixture": "multi-file-rename",
+    "expected_tool": "apply_patch",
+    "discouraged_tools": [],
+    "description": "Structured multi-file modifications should use apply_patch."
+  },
+  {
+    "id": "tool-select-web-lookup",
+    "category": "tool_choice",
+    "request": "Check the latest release notes for serde on crates.io.",
+    "repo_fixture": "external-docs",
+    "expected_tool": "web_search",
+    "followup_tool": "web_fetch",
+    "description": "External factual lookups should search first, then fetch."
+  }
+]

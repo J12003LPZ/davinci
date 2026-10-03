@@ -1,0 +1,10 @@
+{
+  "name": "core",
+  "targets": {
+    "build": {
+      "executor": "@nx/js:tsc",
+      "outputs": ["packages/core/dist"],
+      "dependsOn": []
+    }
+  }
+}

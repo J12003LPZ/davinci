@@ -1,0 +1,665 @@
+use crate::fuzzy::fuzzy_filter;
+use crate::render::Component;
+
+#[derive(Debug, Clone)]
+pub struct SettingItem {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub current_value: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsList {
+    pub items: Vec<SettingItem>,
+    pub selected: usize,
+    pub query: String,
+    pub max_visible: usize,
+}
+
+impl SettingsList {
+    pub fn new(items: Vec<SettingItem>, max_visible: usize) -> Self {
+        Self {
+            items,
+            selected: 0,
+            query: String::new(),
+            max_visible,
+        }
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        let filtered = self.filtered();
+        if filtered.is_empty() {
+            return;
+        }
+        let len = filtered.len() as isize;
+        self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
+    }
+
+    pub fn selected_item(&self) -> Option<SettingItem> {
+        self.filtered().get(self.selected).cloned()
+    }
+
+    pub fn cycle(&mut self) {
+        if let Some(item) = self.filtered().get(self.selected).cloned() {
+            if let Some(item) = self.items.iter_mut().find(|i| i.id == item.id) {
+                if item.values.is_empty() {
+                    return;
+                }
+                let current = item
+                    .values
+                    .iter()
+                    .position(|v| v == &item.current_value)
+                    .unwrap_or(0);
+                item.current_value = item.values[(current + 1) % item.values.len()].clone();
+            }
+        }
+    }
+
+    fn filtered(&self) -> Vec<SettingItem> {
+        if self.query.is_empty() {
+            return self.items.clone();
+        }
+        let labels: Vec<String> = self.items.iter().map(|i| i.label.clone()).collect();
+        let kept = fuzzy_filter(&self.query, &labels);
+        self.items
+            .iter()
+            .filter(|item| kept.contains(&item.label))
+            .cloned()
+            .collect()
+    }
+}
+
+impl Component for SettingsList {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut section = crate::render::CommandSection::new(width, "Settings", None);
+        if !self.query.is_empty() {
+            section.search(&self.query);
+        }
+        let filtered = self.filtered();
+        if filtered.is_empty() {
+            section.detail("No matching settings.");
+        }
+        for index in
+            crate::render::selection_window(self.selected, filtered.len(), self.max_visible)
+        {
+            let item = &filtered[index];
+            let focused = index == self.selected;
+            section.item(focused, &item.label, &item.current_value);
+            if focused {
+                if let Some(description) = &item.description {
+                    section.detail(description);
+                }
+                if !item.values.is_empty() {
+                    section.detail(&format!("Choices: {}", item.values.join(" · ")));
+                }
+            }
+        }
+        section.position(self.selected, filtered.len(), self.max_visible);
+        section.hint("↑↓ move · enter/space change · type to filter · esc close");
+        section.finish()
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        let bindings = crate::keybindings::Keybindings::defaults();
+        if bindings.matches(data, "tui.select.up") {
+            self.move_by(-1);
+        } else if bindings.matches(data, "tui.select.down") {
+            self.move_by(1);
+        } else if data == " " || data == "\n" || data == "\r" {
+            self.cycle();
+        } else if data == "\x7f" || data == "\x08" {
+            self.query.pop();
+            self.selected = 0;
+        } else if data.chars().all(|ch| !ch.is_control()) {
+            self.query.push_str(data);
+            self.selected = 0;
+        }
+    }
+
+    fn invalidate(&mut self) {}
+}
+
+#[derive(Debug, Clone)]
+pub struct InteractiveSettingsConfig {
+    pub theme: String,
+    pub double_escape: String,
+    pub quiet_startup: bool,
+    pub autocomplete_max_visible: u32,
+    pub tree_filter_mode: String,
+    pub mermaid_mode: String,
+    pub enable_analytics: bool,
+    pub auto_compact: bool,
+    pub auto_compact_threshold: String,
+    pub steering_mode: String,
+    pub follow_up_mode: String,
+    pub decision_intelligence: bool,
+    pub transport: String,
+    pub http_idle_timeout: String,
+    pub hide_thinking: bool,
+    /// `showToolOutput`: tool lines carry their result rows (davinci).
+    pub show_tool_output: bool,
+    pub cache_miss_notices: bool,
+    pub collapse_changelog: bool,
+    pub install_telemetry: bool,
+    pub default_project_trust: String,
+    pub tui_mode: String,
+    pub fullscreen_exit_output: String,
+    pub fullscreen_scrollbar: String,
+    pub fullscreen_copy_on_select: bool,
+    pub show_images: bool,
+    pub image_width_cells: u32,
+    pub auto_resize_images: bool,
+    pub block_images: bool,
+    pub skill_commands: bool,
+    pub show_hardware_cursor: bool,
+    pub editor_padding: u32,
+    pub output_padding: u32,
+    pub clear_on_shrink: bool,
+    pub terminal_progress: bool,
+    pub warnings_anthropic_extra_usage: bool,
+    pub model_thinking_summary: String,
+    /// `dynamicWorkflows`: the model may orchestrate subagents with `workflow_run`.
+    pub dynamic_workflows: bool,
+    /// `workflowSizeGuideline`: unrestricted | small | medium | large.
+    pub workflow_size: String,
+    /// `workflowMaxConcurrentAgents`, as text.
+    pub workflow_max_concurrent: String,
+    /// `agentTeams`: persistent teammates with messaging and a task board.
+    pub agent_teams: bool,
+}
+
+impl Default for InteractiveSettingsConfig {
+    fn default() -> Self {
+        Self {
+            theme: "dark".into(),
+            double_escape: "rewind".into(),
+            quiet_startup: false,
+            autocomplete_max_visible: 5,
+            tree_filter_mode: "default".into(),
+            mermaid_mode: "streaming".into(),
+            enable_analytics: false,
+            auto_compact: true,
+            auto_compact_threshold: "default".into(),
+            steering_mode: "one-at-a-time".into(),
+            follow_up_mode: "one-at-a-time".into(),
+            decision_intelligence: false,
+            transport: "auto".into(),
+            http_idle_timeout: "5 min".into(),
+            hide_thinking: false,
+            show_tool_output: false,
+            cache_miss_notices: false,
+            collapse_changelog: false,
+            install_telemetry: false,
+            default_project_trust: "Ask".into(),
+            tui_mode: "regular".into(),
+            fullscreen_exit_output: "transcript".into(),
+            fullscreen_scrollbar: "auto".into(),
+            fullscreen_copy_on_select: true,
+            show_images: true,
+            image_width_cells: 80,
+            auto_resize_images: true,
+            block_images: false,
+            skill_commands: true,
+            show_hardware_cursor: false,
+            editor_padding: 0,
+            output_padding: 1,
+            clear_on_shrink: false,
+            terminal_progress: true,
+            warnings_anthropic_extra_usage: true,
+            model_thinking_summary: "none".into(),
+            dynamic_workflows: false,
+            workflow_size: "medium".into(),
+            workflow_max_concurrent: "16".into(),
+            agent_teams: false,
+        }
+    }
+}
+
+pub fn format_http_idle_timeout(timeout_ms: u64) -> String {
+    match timeout_ms {
+        30_000 => "30 sec".into(),
+        60_000 => "1 min".into(),
+        120_000 => "2 min".into(),
+        300_000 => "5 min".into(),
+        0 => "disabled".into(),
+        other => format!("{} sec", other / 1000),
+    }
+}
+
+pub fn parse_http_idle_timeout(label: &str) -> Option<u64> {
+    match label {
+        "30 sec" => Some(30_000),
+        "1 min" => Some(60_000),
+        "2 min" => Some(120_000),
+        "5 min" => Some(300_000),
+        "disabled" => Some(0),
+        _ => None,
+    }
+}
+
+fn bool_item(id: &str, label: &str, description: &str, value: bool) -> SettingItem {
+    SettingItem {
+        id: id.into(),
+        label: label.into(),
+        description: Some(description.into()),
+        current_value: if value { "true" } else { "false" }.into(),
+        values: vec!["true".into(), "false".into()],
+    }
+}
+
+pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> SettingsList {
+    SettingsList::new(
+        vec![
+            bool_item(
+                "autocompact",
+                "Auto-compact",
+                "Automatically compact context when it gets too large",
+                config.auto_compact,
+            ),
+            SettingItem {
+                id: "autocompact-threshold".into(),
+                label: "Auto-compact threshold".into(),
+                description: Some(
+                    "When auto-compaction triggers: a context percentage or absolute token count"
+                        .into(),
+                ),
+                current_value: config.auto_compact_threshold.clone(),
+                values: vec![
+                    "default".into(),
+                    "90%".into(),
+                    "75%".into(),
+                    "50%".into(),
+                    "25%".into(),
+                ],
+            },
+            bool_item(
+                "show-images",
+                "Show images",
+                "Render images inline in terminal",
+                config.show_images,
+            ),
+            SettingItem {
+                id: "image-width-cells".into(),
+                label: "Image width".into(),
+                description: Some("Preferred inline image width in terminal cells".into()),
+                current_value: config.image_width_cells.to_string(),
+                values: vec!["60".into(), "80".into(), "120".into()],
+            },
+            bool_item(
+                "auto-resize-images",
+                "Auto-resize images",
+                "Resize large images to 2000x2000 max for better model compatibility",
+                config.auto_resize_images,
+            ),
+            bool_item(
+                "block-images",
+                "Block images",
+                "Prevent images from being sent to LLM providers",
+                config.block_images,
+            ),
+            bool_item(
+                "skill-commands",
+                "Skill commands",
+                "Register skills as /skill:name commands",
+                config.skill_commands,
+            ),
+            bool_item(
+                "show-hardware-cursor",
+                "Show hardware cursor",
+                "Show the terminal cursor while still positioning it for IME support",
+                config.show_hardware_cursor,
+            ),
+            SettingItem {
+                id: "editor-padding".into(),
+                label: "Editor padding".into(),
+                description: Some("Horizontal padding for input editor (0-3)".into()),
+                current_value: config.editor_padding.to_string(),
+                values: vec!["0".into(), "1".into(), "2".into(), "3".into()],
+            },
+            SettingItem {
+                id: "output-padding".into(),
+                label: "Output padding".into(),
+                description: Some(
+                    "Horizontal padding for user messages, assistant messages, and thinking".into(),
+                ),
+                current_value: config.output_padding.to_string(),
+                values: vec!["0".into(), "1".into()],
+            },
+            SettingItem {
+                id: "autocomplete-max-visible".into(),
+                label: "Autocomplete max items".into(),
+                description: Some("Max visible items in autocomplete dropdown (3-20)".into()),
+                current_value: config.autocomplete_max_visible.to_string(),
+                values: vec![
+                    "3".into(),
+                    "5".into(),
+                    "7".into(),
+                    "10".into(),
+                    "15".into(),
+                    "20".into(),
+                ],
+            },
+            bool_item(
+                "clear-on-shrink",
+                "Clear on shrink",
+                "Clear empty rows when content shrinks (may cause flicker)",
+                config.clear_on_shrink,
+            ),
+            bool_item(
+                "terminal-progress",
+                "Terminal progress",
+                "Show OSC 9;4 progress indicators in the terminal tab bar",
+                config.terminal_progress,
+            ),
+            SettingItem {
+                id: "steering-mode".into(),
+                label: "Steering mode".into(),
+                description: Some(
+                    "Enter while streaming queues steering messages. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once."
+                        .into(),
+                ),
+                current_value: config.steering_mode.clone(),
+                values: vec!["one-at-a-time".into(), "all".into()],
+            },
+            SettingItem {
+                id: "follow-up-mode".into(),
+                label: "Follow-up mode".into(),
+                description: Some(
+                    "Queue follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once."
+                        .into(),
+                ),
+                current_value: config.follow_up_mode.clone(),
+                values: vec!["one-at-a-time".into(), "all".into()],
+            },
+            SettingItem {
+                id: "decision-intelligence".into(),
+                label: "TypeSafe / Jev decision intelligence".into(),
+                description: Some(
+                    "Use TypeSafe Jev for fast structured routing judgments. Sends the current task after secret/path redaction and removal of fenced code, patches, and stack dumps, plus bounded metadata. Does not automatically read or send repository source files. Unfenced source pasted into task prose may remain.".into(),
+                ),
+                current_value: if config.decision_intelligence {
+                    "on".into()
+                } else {
+                    "off".into()
+                },
+                values: vec!["off".into(), "on".into()],
+            },
+            SettingItem {
+                id: "typesafe-api-key".into(),
+                label: "TypeSafe / Jev API key".into(),
+                description: Some(
+                    "Replace the stored key through a masked prompt. DaVinci validates the new key before saving it and keeps the previous key if validation fails. A successful replacement enables decision intelligence."
+                        .into(),
+                ),
+                current_value: "replace".into(),
+                values: vec!["replace".into()],
+            },
+            SettingItem {
+                id: "transport".into(),
+                label: "Transport".into(),
+                description: Some(
+                    "Preferred transport for providers that support multiple transports".into(),
+                ),
+                current_value: config.transport.clone(),
+                values: vec![
+                    "sse".into(),
+                    "websocket".into(),
+                    "websocket-cached".into(),
+                    "auto".into(),
+                ],
+            },
+            SettingItem {
+                id: "http-idle-timeout".into(),
+                label: "HTTP idle timeout".into(),
+                description: Some(
+                    "Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local models that pause longer than five minutes."
+                        .into(),
+                ),
+                current_value: config.http_idle_timeout.clone(),
+                values: vec![
+                    "30 sec".into(),
+                    "1 min".into(),
+                    "2 min".into(),
+                    "5 min".into(),
+                    "disabled".into(),
+                ],
+            },
+            bool_item(
+                "hide-thinking",
+                "Hide thinking",
+                "Hide thinking blocks in assistant responses",
+                config.hide_thinking,
+            ),
+            bool_item(
+                "show-tool-output",
+                "Tool output",
+                "Show what each tool call came back with under its line (ctrl+t toggles for the session)",
+                config.show_tool_output,
+            ),
+            SettingItem {
+                id: "mermaid-rendering".into(),
+                label: "Mermaid diagrams".into(),
+                description: Some("Render Mermaid code blocks as Unicode diagrams".into()),
+                current_value: config.mermaid_mode.clone(),
+                values: vec!["off".into(), "final".into(), "streaming".into()],
+            },
+            bool_item(
+                "cache-miss-notices",
+                "Cache miss notices",
+                "Show transcript notices for significant prompt-cache misses and compaction costs",
+                config.cache_miss_notices,
+            ),
+            bool_item(
+                "collapse-changelog",
+                "Collapse changelog",
+                "Show condensed changelog after updates",
+                config.collapse_changelog,
+            ),
+            bool_item(
+                "quiet-startup",
+                "Quiet startup",
+                "Disable verbose printing at startup",
+                config.quiet_startup,
+            ),
+            bool_item(
+                "install-telemetry",
+                "Install telemetry",
+                "Send an anonymous version/update ping after changelog-detected updates",
+                config.install_telemetry,
+            ),
+            SettingItem {
+                id: "default-project-trust".into(),
+                label: "Default project trust".into(),
+                description: Some(
+                    "Fallback behavior when no extension or saved trust decision decides project trust"
+                        .into(),
+                ),
+                current_value: config.default_project_trust.clone(),
+                values: vec!["Ask".into(), "Always trust".into(), "Never trust".into()],
+            },
+            SettingItem {
+                id: "double-escape-action".into(),
+                label: "Double-escape action".into(),
+                description: Some("Action when pressing Escape twice with empty editor".into()),
+                current_value: config.double_escape.clone(),
+                values: vec!["rewind".into(), "tree".into(), "fork".into(), "none".into()],
+            },
+            SettingItem {
+                id: "tree-filter-mode".into(),
+                label: "Tree filter mode".into(),
+                description: Some("Default filter when opening /tree".into()),
+                current_value: config.tree_filter_mode.clone(),
+                values: vec![
+                    "default".into(),
+                    "no-tools".into(),
+                    "user-only".into(),
+                    "labeled-only".into(),
+                    "all".into(),
+                ],
+            },
+            SettingItem {
+                id: "tui-mode".into(),
+                label: "TUI mode".into(),
+                description: Some("Interface layout; fullscreen mode is experimental".into()),
+                current_value: config.tui_mode.clone(),
+                values: vec!["regular".into(), "fullscreen".into()],
+            },
+            SettingItem {
+                id: "fullscreen-exit-output".into(),
+                label: "Fullscreen exit output".into(),
+                description: Some(
+                    "Print the transcript or only a session resume hint when exiting fullscreen mode"
+                        .into(),
+                ),
+                current_value: config.fullscreen_exit_output.clone(),
+                values: vec!["transcript".into(), "resume-hint".into()],
+            },
+            SettingItem {
+                id: "fullscreen-scrollbar".into(),
+                label: "Fullscreen scrollbar".into(),
+                description: Some(
+                    "Scrollbar behavior in fullscreen mode; has no effect in regular mode".into(),
+                ),
+                current_value: config.fullscreen_scrollbar.clone(),
+                values: vec!["auto".into(), "always".into(), "hidden".into()],
+            },
+            bool_item(
+                "fullscreen-copy-on-select",
+                "Fullscreen copy on select",
+                "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X",
+                config.fullscreen_copy_on_select,
+            ),
+            SettingItem {
+                id: "theme".into(),
+                label: "Theme".into(),
+                description: Some("Color theme for the interface".into()),
+                current_value: config.theme.clone(),
+                values: vec!["dark".into(), "light".into(), "vox".into(), "pi".into()],
+            },
+            SettingItem {
+                id: "warnings".into(),
+                label: "Warnings".into(),
+                description: Some("Configure warning prompts".into()),
+                current_value: if config.warnings_anthropic_extra_usage {
+                    "configure".into()
+                } else {
+                    "off".into()
+                },
+                values: Vec::new(),
+            },
+            SettingItem {
+                id: "model-thinking".into(),
+                label: "Per-model thinking".into(),
+                description: Some("Override thinking level per model".into()),
+                current_value: config.model_thinking_summary.clone(),
+                values: Vec::new(),
+            },
+            bool_item(
+                "enable-analytics",
+                "Share anonymous usage data",
+                "Opt-in analytics data sharing",
+                config.enable_analytics,
+            ),
+            bool_item(
+                "dynamic-workflows",
+                "Dynamic workflows",
+                "Let the model orchestrate many subagents in phases with workflow_run (DAVINCI_EXPERIMENTAL_WORKFLOWS overrides)",
+                config.dynamic_workflows,
+            ),
+            SettingItem {
+                id: "workflow-size".into(),
+                label: "Dynamic workflow size".into(),
+                description: Some(
+                    "How many agents the model aims for in a workflow: small < 5, medium < 10 (default), large < 50, unrestricted sizes to the task"
+                        .into(),
+                ),
+                current_value: config.workflow_size.clone(),
+                values: vec![
+                    "unrestricted".into(),
+                    "small".into(),
+                    "medium".into(),
+                    "large".into(),
+                ],
+            },
+            SettingItem {
+                id: "workflow-max-concurrent-agents".into(),
+                label: "Workflow concurrent agents".into(),
+                description: Some(
+                    "Most workflow agents running at once (default 16; DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS overrides, 1-256)"
+                        .into(),
+                ),
+                current_value: config.workflow_max_concurrent.clone(),
+                values: vec![
+                    "4".into(),
+                    "8".into(),
+                    "16".into(),
+                    "32".into(),
+                    "64".into(),
+                ],
+            },
+            bool_item(
+                "agent-teams",
+                "Agent teams",
+                "Let the model start persistent teammates that message each other and share a task board (DAVINCI_EXPERIMENTAL_AGENT_TEAMS overrides)",
+                config.agent_teams,
+            ),
+        ],
+        12,
+    )
+}
+
+pub fn default_interactive_settings(
+    theme: &str,
+    double_escape: &str,
+    quiet_startup: bool,
+    autocomplete_max_visible: u32,
+    tree_filter_mode: &str,
+    mermaid_mode: &str,
+    enable_analytics: bool,
+) -> SettingsList {
+    interactive_settings_list(&InteractiveSettingsConfig {
+        theme: theme.into(),
+        double_escape: double_escape.into(),
+        quiet_startup,
+        autocomplete_max_visible,
+        tree_filter_mode: tree_filter_mode.into(),
+        mermaid_mode: mermaid_mode.into(),
+        enable_analytics,
+        ..InteractiveSettingsConfig::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tool_output_row_is_on_the_list_and_defaults_off() {
+        let list = interactive_settings_list(&InteractiveSettingsConfig::default());
+        let item = list
+            .items
+            .iter()
+            .find(|item| item.id == "show-tool-output")
+            .expect("show-tool-output");
+        assert_eq!(item.label, "Tool output");
+        assert_eq!(item.current_value, "false");
+        assert_eq!(item.values, vec!["true", "false"]);
+    }
+
+    #[test]
+    fn typesafe_key_replacement_is_an_explicit_secret_free_action() {
+        let list = interactive_settings_list(&InteractiveSettingsConfig::default());
+        let item = list
+            .items
+            .iter()
+            .find(|item| item.id == "typesafe-api-key")
+            .expect("TypeSafe API key action");
+
+        assert_eq!(item.label, "TypeSafe / Jev API key");
+        assert_eq!(item.current_value, "replace");
+        assert_eq!(item.values, vec!["replace"]);
+        assert!(!format!("{item:?}").contains("apikey_"));
+    }
+}

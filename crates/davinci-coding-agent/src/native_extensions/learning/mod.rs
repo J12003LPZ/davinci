@@ -1,0 +1,2498 @@
+pub mod benchmark;
+pub mod config;
+pub mod evidence;
+pub mod policy;
+pub mod prompts;
+pub mod retrieval;
+pub mod reviewer;
+pub mod skill_manager;
+pub mod store;
+pub mod types;
+
+#[allow(unused_imports)]
+pub use benchmark::LearningBenchmarkResult;
+pub use config::*;
+pub use evidence::*;
+pub use policy::*;
+pub use prompts::*;
+pub use retrieval::*;
+pub use reviewer::*;
+pub use skill_manager::*;
+pub use store::*;
+pub use types::*;
+
+use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
+use davinci_agent::runtime::events::AgentKind;
+use davinci_agent::{ToolError, ToolResult};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use crate::native_extensions::vector_memory::content_hash;
+
+/// Learned skills injected into one turn, and the token budget they share.
+const LEARNED_SKILLS_PER_TURN: usize = 2;
+const LEARNED_SKILL_TOKENS: usize = 1_200;
+/// Reviewer diagnostics kept for `/learning-status`.
+const MAX_DIAGNOSTICS: usize = 50;
+
+#[derive(Debug, Clone)]
+pub struct LearningController {
+    pub config: LearningConfig,
+    pub background_usage: super::background_usage::Counter,
+    pub project_store: LearningStore,
+    pub global_store: LearningStore,
+    pub stats: LearningStats,
+    pub diagnostics: Vec<String>,
+    pub notifications: Vec<String>,
+    pub project_skills_dir: PathBuf,
+    pub global_skills_dir: PathBuf,
+    pub read_set: Arc<Mutex<ReviewReadSet>>,
+    pub project_trusted: bool,
+    pub active_review: Option<ReviewRun>,
+    /// The project store and skills live under the agent directory, keyed by
+    /// repository, where the repository cannot write. Learned project skills
+    /// then need no project trust, and writing them never turns a project
+    /// with no config into one that asks for trust.
+    pub project_store_owned: bool,
+    /// Set when this session can run a model review in the background.
+    pub live: Option<LiveReviewSpec>,
+    /// The live review in flight. A new turn does not cancel it.
+    pub live_review: Option<ReviewRun>,
+    /// Reviews finished on the background thread, applied on the next call.
+    pub completed_reviews: Arc<Mutex<Vec<ReviewResult>>>,
+    pub last_live_review_ms: u64,
+    /// Test hook replacing the reviewer child.
+    pub review_runner: Option<ReviewRunner>,
+}
+
+type ReviewRunnerFn = dyn Fn(&LearningEvidence, &LearningConfig, &ReviewRun, &LiveReviewSpec) -> ReviewResult
+    + Send
+    + Sync;
+
+/// Runs one live review; `execute_live_review` unless a test replaces it.
+#[derive(Clone)]
+pub struct ReviewRunner(pub Arc<ReviewRunnerFn>);
+
+impl std::fmt::Debug for ReviewRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReviewRunner")
+    }
+}
+
+/// `<agent_dir>/learning/projects/<key>`: the davinci-owned home of one
+/// repository's learned ledger and skills.
+fn owned_project_root(agent_dir: &Path, cwd: &Path) -> PathBuf {
+    let repo_id = crate::native_extensions::vector_memory::resolve_repo_id(cwd);
+    let key: String = content_hash(&repo_id).chars().take(16).collect();
+    agent_dir.join("learning").join("projects").join(key)
+}
+
+/// An in-repository learning store that already recorded skills keeps being
+/// used, so skills learned before the store moved stay active.
+fn legacy_store_in_use(root: &Path) -> bool {
+    std::fs::metadata(root.join("skills.jsonl")).is_ok_and(|meta| meta.len() > 0)
+}
+
+impl LearningController {
+    pub fn new(cwd: &Path, agent_dir: Option<&Path>, config: Option<LearningConfig>) -> Self {
+        let config = config.unwrap_or_default();
+        let mut diagnostics = Vec::new();
+
+        let legacy_project_root = {
+            let davinci = cwd.join(".davinci").join("learning");
+            if davinci.exists() {
+                davinci
+            } else {
+                let pi = cwd.join(".pi").join("learning");
+                if pi.exists() {
+                    pi
+                } else {
+                    davinci
+                }
+            }
+        };
+        let owned_root = agent_dir
+            .filter(|_| !legacy_store_in_use(&legacy_project_root))
+            .map(|dir| owned_project_root(dir, cwd));
+        let project_store_owned = owned_root.is_some();
+        let project_root = owned_root.clone().unwrap_or(legacy_project_root);
+        let project_store = match LearningStore::open(project_root) {
+            Ok(store) => store,
+            Err(err) => {
+                diagnostics.push(format!("failed to open project learning store: {}", err));
+                let temp = std::env::temp_dir().join("davinci_learning_fallback_project");
+                LearningStore::open(temp)
+                    .unwrap_or_else(|_| LearningStore::open(PathBuf::from(".")).unwrap())
+            }
+        };
+
+        let global_root = agent_dir
+            .map(|dir| dir.join("learning"))
+            .unwrap_or_else(|| {
+                if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+                    let h = PathBuf::from(home);
+                    let davinci = h.join(".davinci").join("agent").join("learning");
+                    if davinci.exists() {
+                        davinci
+                    } else {
+                        let pi = h.join(".pi").join("agent").join("learning");
+                        if pi.exists() {
+                            pi
+                        } else {
+                            davinci
+                        }
+                    }
+                } else {
+                    PathBuf::from(".davinci").join("learning")
+                }
+            });
+        let global_store = match LearningStore::open(global_root) {
+            Ok(store) => store,
+            Err(err) => {
+                diagnostics.push(format!("failed to open global learning store: {}", err));
+                let temp = std::env::temp_dir().join("davinci_learning_fallback_global");
+                LearningStore::open(temp)
+                    .unwrap_or_else(|_| LearningStore::open(PathBuf::from(".")).unwrap())
+            }
+        };
+
+        let project_skills_dir = if let Some(root) = &owned_root {
+            root.join("skills")
+        } else {
+            let davinci = cwd.join(".davinci").join("skills");
+            if davinci.exists() {
+                davinci
+            } else {
+                let pi = cwd.join(".pi").join("skills");
+                if pi.exists() {
+                    pi
+                } else {
+                    davinci
+                }
+            }
+        };
+        let global_skills_dir = agent_dir.map(|dir| dir.join("skills")).unwrap_or_else(|| {
+            if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+                let h = PathBuf::from(home);
+                let davinci = h.join(".davinci").join("agent").join("skills");
+                if davinci.exists() {
+                    davinci
+                } else {
+                    let pi = h.join(".pi").join("agent").join("skills");
+                    if pi.exists() {
+                        pi
+                    } else {
+                        davinci
+                    }
+                }
+            } else {
+                PathBuf::from(".davinci").join("skills")
+            }
+        });
+
+        Self {
+            config,
+            project_store,
+            global_store,
+            stats: LearningStats::default(),
+            diagnostics,
+            notifications: Vec::new(),
+            project_skills_dir,
+            global_skills_dir,
+            read_set: Arc::new(Mutex::new(ReviewReadSet::new())),
+            project_trusted: false,
+            active_review: None,
+            project_store_owned,
+            live: None,
+            live_review: None,
+            completed_reviews: Arc::new(Mutex::new(Vec::new())),
+            last_live_review_ms: 0,
+            review_runner: None,
+            background_usage: Default::default(),
+        }
+    }
+
+    pub fn set_project_trusted(&mut self, trusted: bool) {
+        self.project_trusted = trusted;
+    }
+
+    /// Project skills may be written and used when the project is trusted, or
+    /// when they live in the davinci-owned store the repository cannot touch.
+    fn project_writable(&self) -> bool {
+        self.project_trusted || self.project_store_owned
+    }
+
+    /// Let this session review turns with a model in the background, on the
+    /// model it is using. Print-mode children never call this, so a graph
+    /// worker or a reviewer child does not review itself.
+    pub fn set_live_reviewer(&mut self, cwd: &Path, model: Option<String>) {
+        self.live = Some(LiveReviewSpec {
+            cwd: cwd.to_path_buf(),
+            model,
+            existing_skills: Vec::new(),
+        });
+    }
+
+    /// Learned skills the reviewer should patch rather than duplicate.
+    fn learned_skill_summaries(&self) -> Vec<(String, String)> {
+        let mut ledger = self.project_store.skills();
+        ledger.extend(self.global_store.skills());
+        let discovered = davinci_agent::discover_skills(&[
+            self.project_skills_dir.clone(),
+            self.global_skills_dir.clone(),
+        ]);
+        ledger
+            .iter()
+            .filter(|record| record.status == ArtifactStatus::Active)
+            .filter_map(|record| {
+                discovered
+                    .iter()
+                    .find(|skill| skill.name == record.name)
+                    .map(|skill| (skill.name.clone(), skill.description.clone()))
+            })
+            .collect()
+    }
+
+    /// Apply the reviews the background thread finished since the last call.
+    pub fn apply_completed_reviews(&mut self) {
+        let finished = std::mem::take(
+            &mut *self
+                .completed_reviews
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for result in finished {
+            self.apply_review_result(result);
+            self.stats.reviews_completed += 1;
+        }
+    }
+
+    /// Whether a background review is still running.
+    pub fn live_review_running(&self) -> bool {
+        self.live_review
+            .as_ref()
+            .is_some_and(|run| !run.is_finished())
+    }
+
+    /// Learned skills relevant to `query`, as a block for the turn context.
+    /// Only skills the learning system activated are injected; hand-written
+    /// skills already reach the model through the skill list.
+    pub fn learned_skill_block(&self, query: &str) -> Option<String> {
+        if !self.config.enabled || query.trim().is_empty() {
+            return None;
+        }
+        let mut ledger = self.project_store.skills();
+        ledger.extend(self.global_store.skills());
+        let learned = |name: &str| {
+            ledger.iter().any(|record| {
+                record.name == name
+                    && record.status == ArtifactStatus::Active
+                    && matches!(
+                        record.origin,
+                        SkillOrigin::LearnedReview | SkillOrigin::LearnedForeground
+                    )
+            })
+        };
+        let candidates = self.graph_skill_candidates(
+            query,
+            crate::native_extensions::graph::Role::Writer,
+            LEARNED_SKILLS_PER_TURN,
+            LEARNED_SKILL_TOKENS,
+        );
+        let blocks = candidates
+            .into_iter()
+            .filter(|candidate| learned(&candidate.name))
+            .map(|candidate| {
+                format!(
+                    "<learned-skill name=\"{}\" version=\"{}\">\n{}\n</learned-skill>",
+                    candidate.name,
+                    candidate.version,
+                    candidate.body.trim()
+                )
+            })
+            .collect::<Vec<_>>();
+        (!blocks.is_empty()).then(|| {
+            format!(
+                "Skills learned from earlier work in this project. Follow them when they apply; ignore them when they do not.\n{}",
+                blocks.join("\n")
+            )
+        })
+    }
+
+    pub fn cancel_active_review(&mut self) {
+        if let Some(run) = self.active_review.take() {
+            if !run.is_finished() {
+                run.cancel();
+                self.stats.reviews_cancelled += 1;
+                self.notifications
+                    .push("learning · review cancelled by new turn".to_string());
+            }
+        }
+    }
+
+    pub fn drain_notifications(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notifications)
+    }
+
+    pub fn review_settled_turn(&mut self, evidence: LearningEvidence) -> Option<String> {
+        self.apply_completed_reviews();
+        if !self.config.enabled || !self.config.background_review {
+            return None;
+        }
+
+        if std::env::var("PI_LEARNING_DISABLE_BACKGROUND")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        if !should_review_evidence(&evidence) {
+            self.stats.reviews_skipped += 1;
+            return None;
+        }
+
+        // A fixture answers at once and keeps tests deterministic; otherwise a
+        // session that can run a model reviews in the background.
+        if std::env::var_os("PI_LEARNING_REVIEW_FIXTURE").is_none() {
+            if let Some(spec) = self.live.clone() {
+                return self.dispatch_live_review(evidence, spec);
+            }
+        }
+
+        self.stats.reviews_dispatched += 1;
+
+        self.cancel_active_review();
+
+        let run = ReviewRun::new(format!("rev-{}", evidence.turn));
+        let run_id = run.id.clone();
+        self.active_review = Some(run.clone());
+        self.stats.reviews_started += 1;
+
+        let result = execute_review(&evidence, &self.config, &run);
+        self.apply_review_result(result);
+        self.stats.reviews_completed += 1;
+        Some(run_id)
+    }
+
+    /// Start a model review of the turn on a background thread. One runs at a
+    /// time and they are spaced `min_review_interval_ms` apart; the evidence
+    /// carries the last ten messages, so a skipped turn is mostly seen by the
+    /// next review.
+    fn dispatch_live_review(
+        &mut self,
+        evidence: LearningEvidence,
+        mut spec: LiveReviewSpec,
+    ) -> Option<String> {
+        let now = now_ms();
+        if self.live_review_running()
+            || now.saturating_sub(self.last_live_review_ms) < self.config.min_review_interval_ms
+        {
+            self.stats.reviews_skipped += 1;
+            return None;
+        }
+        spec.existing_skills = self.learned_skill_summaries();
+        let mut run = ReviewRun::new(format!("rev-{}-{}", evidence.turn, now));
+        run.usage = self.background_usage.clone();
+        let run_id = run.id.clone();
+        self.live_review = Some(run.clone());
+        self.last_live_review_ms = now;
+        self.stats.reviews_dispatched += 1;
+        self.stats.reviews_started += 1;
+        let config = self.config.clone();
+        let completed = Arc::clone(&self.completed_reviews);
+        let runner = self.review_runner.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("learning-review-{run_id}"))
+            .spawn(move || {
+                let result = match runner {
+                    Some(ReviewRunner(runner)) => runner(&evidence, &config, &run, &spec),
+                    None => execute_live_review(&evidence, &config, &run, &spec),
+                };
+                run.mark_finished();
+                completed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(result);
+            });
+        if let Err(error) = spawned {
+            self.live_review = None;
+            self.diagnostics
+                .push(format!("learning review thread: {error}"));
+            return None;
+        }
+        Some(run_id)
+    }
+
+    fn apply_review_result(&mut self, result: ReviewResult) {
+        self.diagnostics.extend(result.diagnostics);
+        if self.diagnostics.len() > MAX_DIAGNOSTICS {
+            let excess = self.diagnostics.len() - MAX_DIAGNOSTICS;
+            self.diagnostics.drain(..excess);
+        }
+        let project_writable = self.project_writable();
+
+        for mut candidate in result.candidates {
+            self.stats.candidates_created += 1;
+            let art_name = match &candidate.artifact {
+                LearningArtifact::SkillCreate { name, .. } => name.clone(),
+                LearningArtifact::SkillPatch { name, .. } => name.clone(),
+                LearningArtifact::SkillSupportFile { name, .. } => name.clone(),
+                LearningArtifact::Memory { .. } => "memory".to_string(),
+                LearningArtifact::FailureLesson { .. } => "failure-lesson".to_string(),
+            };
+            self.notifications
+                .push(format!("learning · candidate saved: {}", art_name));
+
+            // Task 16 Step 3: Prefer patch over duplicate skill. A second
+            // create of an active skill is kept as a candidate, never applied
+            // over the first and never left waiting on the user.
+            let duplicate_create =
+                if let LearningArtifact::SkillCreate { name, .. } = &candidate.artifact {
+                    self.project_store
+                        .skill(name)
+                        .or_else(|| self.global_store.skill(name))
+                        .is_some_and(|existing| existing.status == ArtifactStatus::Active)
+                } else {
+                    false
+                };
+
+            let target_skill = match &candidate.artifact {
+                LearningArtifact::SkillPatch { name, .. }
+                | LearningArtifact::SkillSupportFile { name, .. } => self
+                    .project_store
+                    .skill(name)
+                    .or_else(|| self.global_store.skill(name)),
+                _ => None,
+            };
+
+            let decision = if duplicate_create {
+                CandidateDecision::KeepCandidate
+            } else {
+                evaluate_candidate(&candidate, &self.config, project_writable, target_skill)
+            };
+
+            match decision {
+                CandidateDecision::AutoApply => {
+                    candidate.status = ArtifactStatus::Active;
+                    let store = match candidate.scope {
+                        LearningScope::Project => &mut self.project_store,
+                        LearningScope::Global => &mut self.global_store,
+                    };
+                    let _ = store.upsert_candidate(candidate.clone());
+
+                    match &candidate.artifact {
+                        LearningArtifact::SkillCreate {
+                            name,
+                            description,
+                            body,
+                        } => {
+                            let args = json!({
+                                "action": "create",
+                                "name": name,
+                                "scope": match candidate.scope {
+                                    LearningScope::Project => "project",
+                                    LearningScope::Global => "global",
+                                },
+                                "description": description,
+                                "body": body,
+                                "candidateId": candidate.id,
+                            });
+                            let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                            let ctx = SkillManagerContext {
+                                project_skills_dir: &self.project_skills_dir,
+                                global_skills_dir: &self.global_skills_dir,
+                                project_store: &mut self.project_store,
+                                global_store: &mut self.global_store,
+                                project_trusted: self.project_trusted || self.project_store_owned,
+                                auto_apply_global: self.config.auto_apply_global,
+                                origin: SkillWriteOrigin::BackgroundReview,
+                                read_set: &read_set_snapshot,
+                            };
+                            if SkillManager::execute(ctx, &args).is_ok() {
+                                self.stats.skills_created += 1;
+                                self.stats.candidates_approved += 1;
+                                self.notifications
+                                    .push(format!("learning · skill activated: {}", name));
+                            }
+                        }
+                        LearningArtifact::SkillPatch {
+                            name,
+                            old_text,
+                            new_text,
+                            expected_hash,
+                        } => {
+                            let args = json!({
+                                "action": "patch",
+                                "name": name,
+                                "oldText": old_text,
+                                "newText": new_text,
+                                "expectedHash": expected_hash,
+                                "candidateId": candidate.id,
+                            });
+                            let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                            let ctx = SkillManagerContext {
+                                project_skills_dir: &self.project_skills_dir,
+                                global_skills_dir: &self.global_skills_dir,
+                                project_store: &mut self.project_store,
+                                global_store: &mut self.global_store,
+                                project_trusted: self.project_trusted || self.project_store_owned,
+                                auto_apply_global: self.config.auto_apply_global,
+                                origin: SkillWriteOrigin::BackgroundReview,
+                                read_set: &read_set_snapshot,
+                            };
+                            if SkillManager::execute(ctx, &args).is_ok() {
+                                self.stats.skills_patched += 1;
+                                self.stats.candidates_approved += 1;
+                                self.notifications
+                                    .push(format!("learning · skill activated: {}", name));
+                            }
+                        }
+                        LearningArtifact::SkillSupportFile {
+                            name,
+                            relative_path,
+                            content,
+                            expected_hash,
+                        } => {
+                            let args = json!({
+                                "action": "write_file",
+                                "name": name,
+                                "filePath": relative_path,
+                                "content": content,
+                                "expectedHash": expected_hash,
+                                "candidateId": candidate.id,
+                            });
+                            let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                            let ctx = SkillManagerContext {
+                                project_skills_dir: &self.project_skills_dir,
+                                global_skills_dir: &self.global_skills_dir,
+                                project_store: &mut self.project_store,
+                                global_store: &mut self.global_store,
+                                project_trusted: self.project_trusted || self.project_store_owned,
+                                auto_apply_global: self.config.auto_apply_global,
+                                origin: SkillWriteOrigin::BackgroundReview,
+                                read_set: &read_set_snapshot,
+                            };
+                            if SkillManager::execute(ctx, &args).is_ok() {
+                                self.stats.candidates_approved += 1;
+                                self.notifications.push(format!(
+                                    "learning · support file written: {}/{}",
+                                    name, relative_path
+                                ));
+                            }
+                        }
+                        LearningArtifact::Memory { .. }
+                        | LearningArtifact::FailureLesson { .. } => {
+                            self.stats.candidates_approved += 1;
+                        }
+                    }
+                }
+                CandidateDecision::StageForApproval => {
+                    candidate.status = ArtifactStatus::PendingApproval;
+                    let store = match candidate.scope {
+                        LearningScope::Project => &mut self.project_store,
+                        LearningScope::Global => &mut self.global_store,
+                    };
+                    let _ = store.upsert_candidate(candidate);
+                }
+                CandidateDecision::KeepCandidate => {
+                    candidate.status = ArtifactStatus::Candidate;
+                    let store = match candidate.scope {
+                        LearningScope::Project => &mut self.project_store,
+                        LearningScope::Global => &mut self.global_store,
+                    };
+                    let _ = store.upsert_candidate(candidate);
+                }
+                CandidateDecision::Reject => {
+                    candidate.status = ArtifactStatus::Rejected;
+                    let store = match candidate.scope {
+                        LearningScope::Project => &mut self.project_store,
+                        LearningScope::Global => &mut self.global_store,
+                    };
+                    let _ = store.upsert_candidate(candidate);
+                    self.stats.candidates_rejected += 1;
+                }
+            }
+        }
+    }
+
+    pub fn skill_list_tool(&self, cwd: &Path, args: &Value) -> Result<ToolResult, ToolError> {
+        self.skill_list_tool_with_query_embedding(cwd, args, None)
+    }
+
+    pub fn skill_list_tool_with_query_embedding(
+        &self,
+        _cwd: &Path,
+        args: &Value,
+        query_embedding: Option<&[f32]>,
+    ) -> Result<ToolResult, ToolError> {
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let scope_filter = args.get("scope").and_then(Value::as_str).unwrap_or("all");
+        let status_filter = args.get("status").and_then(Value::as_str).unwrap_or("all");
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 20) as usize;
+
+        let discovered = davinci_agent::discover_skills(&[
+            self.project_skills_dir.clone(),
+            self.global_skills_dir.clone(),
+        ]);
+
+        let mut ledger = self.project_store.skills();
+        ledger.extend(self.global_store.skills());
+
+        let mut matches = rank_skills_with_embeddings(
+            query,
+            query_embedding,
+            &discovered,
+            None,
+            &ledger,
+            limit * 2,
+        );
+
+        if scope_filter == "project" {
+            matches.retain(|m| m.scope == LearningScope::Project);
+        } else if scope_filter == "global" {
+            matches.retain(|m| m.scope == LearningScope::Global);
+        }
+
+        if status_filter != "all" {
+            matches.retain(|m| {
+                let status_str = match m.status {
+                    ArtifactStatus::Candidate => "candidate",
+                    ArtifactStatus::PendingApproval => "pending_approval",
+                    ArtifactStatus::Active => "active",
+                    ArtifactStatus::Archived => "archived",
+                    ArtifactStatus::Rejected => "rejected",
+                };
+                status_str == status_filter
+            });
+        }
+
+        if matches.len() > limit {
+            matches.truncate(limit);
+        }
+
+        let skills_json = matches
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "name": m.descriptor.name,
+                    "description": m.descriptor.description,
+                    "scope": match m.scope {
+                        LearningScope::Project => "project",
+                        LearningScope::Global => "global",
+                    },
+                    "status": match m.status {
+                        ArtifactStatus::Candidate => "candidate",
+                        ArtifactStatus::PendingApproval => "pending_approval",
+                        ArtifactStatus::Active => "active",
+                        ArtifactStatus::Archived => "archived",
+                        ArtifactStatus::Rejected => "rejected",
+                    },
+                    "verifiedSuccesses": m.verified_successes,
+                    "verifiedFailures": m.verified_failures,
+                    "score": (m.score * 100.0).round() / 100.0,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let body = json!({
+            "skills": skills_json,
+        });
+
+        Ok(ToolResult {
+            content: serde_json::to_string_pretty(&body).unwrap_or_default(),
+            is_error: false,
+            details: Some(body),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn graph_skill_candidates(
+        &self,
+        query: &str,
+        role: crate::native_extensions::graph::Role,
+        max_skills: usize,
+        token_cap: usize,
+    ) -> Vec<SkillContextCandidate> {
+        self.graph_skill_candidates_with_embeddings(query, None, None, role, max_skills, token_cap)
+    }
+
+    pub fn graph_skill_candidates_with_embeddings(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        skill_embeddings: Option<&[Option<Vec<f32>>]>,
+        role: crate::native_extensions::graph::Role,
+        max_skills: usize,
+        token_cap: usize,
+    ) -> Vec<SkillContextCandidate> {
+        let discovered = davinci_agent::discover_skills(&[
+            self.project_skills_dir.clone(),
+            self.global_skills_dir.clone(),
+        ]);
+        let mut ledger = self.project_store.skills();
+        ledger.extend(self.global_store.skills());
+        select_graph_skill_candidates_with_embeddings(
+            query,
+            query_embedding,
+            &discovered,
+            skill_embeddings,
+            &ledger,
+            role,
+            max_skills,
+            token_cap,
+        )
+    }
+
+    pub fn record_skill_usage_outcome(
+        &mut self,
+        skill: &SkillVersionRef,
+        signal: SkillUsageSignal,
+    ) -> Result<bool, String> {
+        let outcome = match signal {
+            SkillUsageSignal::VerifiedHelpful => SkillOutcome::VerifiedSuccess,
+            SkillUsageSignal::VerifiedFailureRelevant => SkillOutcome::VerifiedFailure,
+            SkillUsageSignal::Injected
+            | SkillUsageSignal::ScopeRelevant
+            | SkillUsageSignal::Neutral => SkillOutcome::Neutral,
+        };
+        self.record_skill_version_outcome(skill, outcome)
+    }
+
+    pub fn skill_view_tool(&self, _cwd: &Path, args: &Value) -> Result<ToolResult, ToolError> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Failed("missing required argument 'name'".into()))?;
+        let file_req = args
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("SKILL.md");
+
+        let validated_rel = validate_relative_support_path(file_req).map_err(ToolError::Failed)?;
+
+        let (skill_dir, scope, origin) = if let Some(rec) = self.project_store.skill(name) {
+            let dir = rec.path.parent().unwrap_or(&rec.path).to_path_buf();
+            (dir, LearningScope::Project, rec.origin)
+        } else if let Some(rec) = self.global_store.skill(name) {
+            let dir = rec.path.parent().unwrap_or(&rec.path).to_path_buf();
+            (dir, LearningScope::Global, rec.origin)
+        } else if self.project_skills_dir.join(name).exists() {
+            (
+                self.project_skills_dir.join(name),
+                LearningScope::Project,
+                SkillOrigin::User,
+            )
+        } else if self.global_skills_dir.join(name).exists() {
+            (
+                self.global_skills_dir.join(name),
+                LearningScope::Global,
+                SkillOrigin::User,
+            )
+        } else {
+            return Err(ToolError::Failed(format!("skill '{}' not found", name)));
+        };
+
+        let target_path = skill_dir.join(&validated_rel);
+        if !target_path.exists() {
+            return Err(ToolError::Failed(format!(
+                "file {:?} not found for skill {}",
+                file_req, name
+            )));
+        }
+
+        if let Ok(canon_dir) = skill_dir.canonicalize() {
+            if let Ok(canon_target) = target_path.canonicalize() {
+                if !canon_target.starts_with(&canon_dir) {
+                    return Err(ToolError::Failed("path escapes skill directory".into()));
+                }
+            }
+        }
+
+        let content = std::fs::read_to_string(&target_path)
+            .map_err(|e| ToolError::Failed(format!("failed to read {:?}: {}", target_path, e)))?;
+        let hash = content_hash(&content);
+
+        if let Ok(mut set) = self.read_set.lock() {
+            set.record(target_path.clone(), hash.clone());
+        }
+
+        let body = json!({
+            "name": name,
+            "file": file_req,
+            "content": content,
+            "contentHash": hash,
+            "origin": match origin {
+                SkillOrigin::User => "user",
+                SkillOrigin::Imported => "imported",
+                SkillOrigin::LearnedForeground => "learned_foreground",
+                SkillOrigin::LearnedReview => "learned_review",
+            },
+            "scope": match scope {
+                LearningScope::Project => "project",
+                LearningScope::Global => "global",
+            },
+        });
+
+        Ok(ToolResult {
+            content: serde_json::to_string_pretty(&body).unwrap_or_default(),
+            is_error: false,
+            details: Some(body),
+        })
+    }
+
+    pub fn skill_manage_tool(
+        &mut self,
+        _cwd: &Path,
+        args: &Value,
+    ) -> Result<ToolResult, ToolError> {
+        let read_set_snapshot = self.read_set.lock().unwrap().clone();
+        let ctx = SkillManagerContext {
+            project_skills_dir: &self.project_skills_dir,
+            global_skills_dir: &self.global_skills_dir,
+            project_store: &mut self.project_store,
+            global_store: &mut self.global_store,
+            project_trusted: self.project_trusted || self.project_store_owned,
+            auto_apply_global: self.config.auto_apply_global,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set_snapshot,
+        };
+        SkillManager::execute(ctx, args)
+    }
+
+    pub fn record_skill_outcome_for_content_hash(
+        &mut self,
+        name: &str,
+        content_hash: &str,
+        outcome: SkillOutcome,
+    ) -> Result<bool, String> {
+        let candidates = [
+            self.project_store
+                .skill_version_ref_for_content_hash(name, content_hash),
+            self.global_store
+                .skill_version_ref_for_content_hash(name, content_hash),
+        ];
+        let mut refs = Vec::new();
+        for skill in candidates.into_iter().flatten() {
+            if !refs.contains(&skill) {
+                refs.push(skill);
+            }
+        }
+        let mut modified = false;
+        for skill in refs {
+            modified |= self.record_skill_version_outcome(&skill, outcome)?;
+        }
+        Ok(modified)
+    }
+
+    pub fn record_skill_version_outcome(
+        &mut self,
+        skill: &SkillVersionRef,
+        outcome: SkillOutcome,
+    ) -> Result<bool, String> {
+        let project_modified = self
+            .project_store
+            .record_skill_version_outcome(skill, outcome)?;
+        let global_modified = self
+            .global_store
+            .record_skill_version_outcome(skill, outcome)?;
+        let modified = project_modified || global_modified;
+        if modified {
+            match outcome {
+                SkillOutcome::VerifiedSuccess => {
+                    self.stats.verified_skill_successes += 1;
+                    self.auto_promote_version_if_threshold_met(skill);
+                }
+                SkillOutcome::VerifiedFailure => {
+                    self.stats.verified_skill_failures += 1;
+                }
+                SkillOutcome::Neutral => {}
+            }
+        }
+        Ok(modified)
+    }
+
+    fn auto_promote_version_if_threshold_met(&mut self, skill: &SkillVersionRef) -> bool {
+        if !self.config.enabled || self.config.shadow_mode {
+            return false;
+        }
+        let mut promoted = false;
+        if let Some(mut record) = self
+            .project_store
+            .skill_version(&skill.name, skill.version)
+            .cloned()
+        {
+            if self.config.auto_apply_project
+                && record.content_hash == skill.content_hash
+                && record.status != ArtifactStatus::Active
+                && verified_use_threshold_met(&record, &self.config)
+            {
+                record.status = ArtifactStatus::Active;
+                let _ = self.project_store.upsert_skill(record);
+                promoted = true;
+            }
+        }
+        if let Some(mut record) = self
+            .global_store
+            .skill_version(&skill.name, skill.version)
+            .cloned()
+        {
+            if self.config.auto_apply_global
+                && record.content_hash == skill.content_hash
+                && record.status != ArtifactStatus::Active
+                && verified_use_threshold_met(&record, &self.config)
+            {
+                record.status = ArtifactStatus::Active;
+                let _ = self.global_store.upsert_skill(record);
+                promoted = true;
+            }
+        }
+        if promoted {
+            self.stats.candidates_approved += 1;
+            self.notifications.push(format!(
+                "learning · skill auto-promoted after verified uses: {}",
+                skill.name
+            ));
+        }
+        promoted
+    }
+
+    pub fn status_command(&self) -> Value {
+        let project_candidates = self.project_store.candidates().len();
+        let project_active = self
+            .project_store
+            .skills()
+            .iter()
+            .filter(|s| s.status == ArtifactStatus::Active)
+            .count();
+        let global_candidates = self.global_store.candidates().len();
+        let global_active = self
+            .global_store
+            .skills()
+            .iter()
+            .filter(|s| s.status == ArtifactStatus::Active)
+            .count();
+        json!({
+            "enabled": self.config.enabled,
+            "backgroundReview": self.config.background_review,
+            "autoApplyProject": self.config.auto_apply_project,
+            "autoApplyGlobal": self.config.auto_apply_global,
+            "shadowMode": self.config.shadow_mode,
+            "activeReview": self.active_review.as_ref().map(|r| !r.is_finished()).unwrap_or(false)
+                || self.live_review_running(),
+            "reviewer": match &self.live {
+                Some(spec) => json!({
+                    "mode": "background model review",
+                    "model": spec.model,
+                    "minIntervalMs": self.config.min_review_interval_ms,
+                }),
+                None => json!({"mode": "off in this process (print mode or no session)"}),
+            },
+            "projectSkillsDir": self.project_skills_dir,
+            "lastDiagnostic": self.diagnostics.last(),
+            "project": {
+                "candidates": project_candidates,
+                "activeSkills": project_active,
+            },
+            "global": {
+                "candidates": global_candidates,
+                "activeSkills": global_active,
+            },
+            "stats": {
+                "reviewsStarted": self.stats.reviews_started,
+                "reviewsCompleted": self.stats.reviews_completed,
+                "reviewsCancelled": self.stats.reviews_cancelled,
+                "candidatesCreated": self.stats.candidates_created,
+                "candidatesApproved": self.stats.candidates_approved,
+                "candidatesRejected": self.stats.candidates_rejected,
+                "skillsCreated": self.stats.skills_created,
+                "skillsPatched": self.stats.skills_patched,
+            }
+        })
+    }
+
+    pub fn pending_command(&self) -> Value {
+        let mut pending = Vec::new();
+        for c in self.project_store.candidates() {
+            if c.status == ArtifactStatus::PendingApproval {
+                pending.push(json!({
+                    "id": c.id,
+                    "scope": "project",
+                    "confidence": c.confidence,
+                    "rationale": c.rationale,
+                    "artifact": c.artifact,
+                }));
+            }
+        }
+        for c in self.global_store.candidates() {
+            if c.status == ArtifactStatus::PendingApproval {
+                pending.push(json!({
+                    "id": c.id,
+                    "scope": "global",
+                    "confidence": c.confidence,
+                    "rationale": c.rationale,
+                    "artifact": c.artifact,
+                }));
+            }
+        }
+        json!({
+            "pending": pending
+        })
+    }
+
+    pub fn approve_command(&mut self, args: &str) -> Result<Value, String> {
+        let target = args.trim();
+        if target.is_empty() {
+            return Err("usage: /learning-approve <candidateId|all>".into());
+        }
+        let is_all = target == "all";
+        let mut approved_ids = Vec::new();
+        let mut errors = Vec::new();
+
+        let to_process: Vec<LearningCandidate> = if is_all {
+            self.project_store
+                .candidates()
+                .into_iter()
+                .chain(self.global_store.candidates())
+                .filter(|c| c.status == ArtifactStatus::PendingApproval)
+                .collect()
+        } else {
+            self.project_store
+                .candidate(target)
+                .or_else(|| self.global_store.candidate(target))
+                .cloned()
+                .into_iter()
+                .collect()
+        };
+
+        if to_process.is_empty() {
+            return Err(format!(
+                "no matching pending candidate found for '{}'",
+                target
+            ));
+        }
+
+        for mut candidate in to_process {
+            let cid = candidate.id.clone();
+            candidate.status = ArtifactStatus::Active;
+
+            let write_res = match &candidate.artifact {
+                LearningArtifact::SkillCreate {
+                    name,
+                    description,
+                    body,
+                } => {
+                    let args = json!({
+                        "action": "create",
+                        "name": name,
+                        "scope": match candidate.scope {
+                            LearningScope::Project => "project",
+                            LearningScope::Global => "global",
+                        },
+                        "description": description,
+                        "body": body,
+                        "candidateId": candidate.id,
+                    });
+                    let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                    let ctx = SkillManagerContext {
+                        project_skills_dir: &self.project_skills_dir,
+                        global_skills_dir: &self.global_skills_dir,
+                        project_store: &mut self.project_store,
+                        global_store: &mut self.global_store,
+                        project_trusted: self.project_trusted || self.project_store_owned,
+                        auto_apply_global: true,
+                        origin: SkillWriteOrigin::ForegroundUserDirected,
+                        read_set: &read_set_snapshot,
+                    };
+                    SkillManager::execute(ctx, &args).map(|_| name.clone())
+                }
+                LearningArtifact::SkillPatch {
+                    name,
+                    old_text,
+                    new_text,
+                    expected_hash,
+                } => {
+                    let args = json!({
+                        "action": "patch",
+                        "name": name,
+                        "oldText": old_text,
+                        "newText": new_text,
+                        "expectedHash": expected_hash,
+                        "candidateId": candidate.id,
+                    });
+                    let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                    let ctx = SkillManagerContext {
+                        project_skills_dir: &self.project_skills_dir,
+                        global_skills_dir: &self.global_skills_dir,
+                        project_store: &mut self.project_store,
+                        global_store: &mut self.global_store,
+                        project_trusted: self.project_trusted || self.project_store_owned,
+                        auto_apply_global: true,
+                        origin: SkillWriteOrigin::ForegroundUserDirected,
+                        read_set: &read_set_snapshot,
+                    };
+                    SkillManager::execute(ctx, &args).map(|_| name.clone())
+                }
+                LearningArtifact::SkillSupportFile {
+                    name,
+                    relative_path,
+                    content,
+                    expected_hash,
+                } => {
+                    let mut args = json!({
+                        "action": "write_file",
+                        "name": name,
+                        "filePath": relative_path,
+                        "content": content,
+                        "candidateId": candidate.id,
+                    });
+                    if let Some(hash) = expected_hash {
+                        args["expectedHash"] = json!(hash);
+                    }
+                    let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                    let ctx = SkillManagerContext {
+                        project_skills_dir: &self.project_skills_dir,
+                        global_skills_dir: &self.global_skills_dir,
+                        project_store: &mut self.project_store,
+                        global_store: &mut self.global_store,
+                        project_trusted: self.project_trusted || self.project_store_owned,
+                        auto_apply_global: true,
+                        origin: SkillWriteOrigin::ForegroundUserDirected,
+                        read_set: &read_set_snapshot,
+                    };
+                    SkillManager::execute(ctx, &args).map(|_| format!("{}/{}", name, relative_path))
+                }
+                _ => Ok("approved".into()),
+            };
+
+            match write_res {
+                Ok(name) => {
+                    let store = match candidate.scope {
+                        LearningScope::Project => &mut self.project_store,
+                        LearningScope::Global => &mut self.global_store,
+                    };
+                    let _ = store.upsert_candidate(candidate);
+                    self.stats.candidates_approved += 1;
+                    self.notifications
+                        .push(format!("learning · skill activated: {}", name));
+                    approved_ids.push(cid);
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {}", cid, e));
+                }
+            }
+        }
+
+        Ok(json!({
+            "approved": approved_ids,
+            "errors": errors,
+        }))
+    }
+
+    pub fn reject_command(&mut self, args: &str) -> Result<Value, String> {
+        let target = args.trim();
+        if target.is_empty() {
+            return Err("usage: /learning-reject <candidateId|all>".into());
+        }
+        let is_all = target == "all";
+        let mut rejected_ids = Vec::new();
+
+        let to_reject: Vec<LearningCandidate> = if is_all {
+            self.project_store
+                .candidates()
+                .into_iter()
+                .chain(self.global_store.candidates())
+                .filter(|c| {
+                    c.status == ArtifactStatus::PendingApproval
+                        || c.status == ArtifactStatus::Candidate
+                })
+                .collect()
+        } else {
+            self.project_store
+                .candidate(target)
+                .or_else(|| self.global_store.candidate(target))
+                .cloned()
+                .into_iter()
+                .collect()
+        };
+
+        if to_reject.is_empty() {
+            return Err(format!("no matching candidate found for '{}'", target));
+        }
+
+        for mut candidate in to_reject {
+            candidate.status = ArtifactStatus::Rejected;
+            let cid = candidate.id.clone();
+            let store = match candidate.scope {
+                LearningScope::Project => &mut self.project_store,
+                LearningScope::Global => &mut self.global_store,
+            };
+            let _ = store.upsert_candidate(candidate);
+            self.stats.candidates_rejected += 1;
+            rejected_ids.push(cid);
+        }
+
+        Ok(json!({
+            "rejected": rejected_ids
+        }))
+    }
+
+    pub fn skill_list_command(&self, args: &str) -> Result<Value, String> {
+        let query = args.trim();
+        let tool_args = json!({
+            "query": query,
+            "limit": 20
+        });
+        let result = self
+            .skill_list_tool(Path::new("."), &tool_args)
+            .map_err(|e| e.to_string())?;
+        serde_json::from_str(&result.content).map_err(|e| e.to_string())
+    }
+
+    pub fn skill_view_command(&self, args: &str) -> Result<Value, String> {
+        let mut parts = args.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or_else(|| "usage: /skill-view <name> [file]".to_string())?;
+        let file = parts.next().unwrap_or("SKILL.md");
+        let tool_args = json!({
+            "name": name,
+            "file": file
+        });
+        let result = self
+            .skill_view_tool(Path::new("."), &tool_args)
+            .map_err(|e| e.to_string())?;
+        serde_json::from_str(&result.content).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnRequest {
+    pub scope: LearningScope,
+    pub instruction: String,
+}
+
+pub fn parse_learn_args(args: &str) -> Result<LearnRequest, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err("usage: /learn [--global] <instruction>".to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("--global") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err("usage: /learn [--global] <instruction>".to_string());
+        }
+        Ok(LearnRequest {
+            scope: LearningScope::Global,
+            instruction: rest.to_string(),
+        })
+    } else {
+        Ok(LearnRequest {
+            scope: LearningScope::Project,
+            instruction: trimmed.to_string(),
+        })
+    }
+}
+
+pub fn build_learn_prompt(req: &LearnRequest) -> String {
+    format!(
+        "{}\nTarget Scope: {}\nUser Instruction:\n{}",
+        FOREGROUND_LEARN_PROMPT,
+        match req.scope {
+            LearningScope::Project => "project (save in project .pi/skills/)",
+            LearningScope::Global => "global (save in agent ~/.pi/skills/)",
+        },
+        req.instruction
+    )
+}
+
+impl Default for LearningController {
+    fn default() -> Self {
+        Self::new(Path::new("."), None, None)
+    }
+}
+
+/// ContextSource adapter for LearningController.
+#[derive(Clone)]
+pub struct SkillContextSource {
+    learning: Arc<Mutex<LearningController>>,
+}
+
+impl SkillContextSource {
+    #[allow(dead_code)]
+    pub fn new(learning: Arc<Mutex<LearningController>>) -> Self {
+        Self { learning }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_controller(learning: LearningController) -> Self {
+        Self {
+            learning: Arc::new(Mutex::new(learning)),
+        }
+    }
+}
+
+impl ContextSource for SkillContextSource {
+    fn collect(&self, request: &ContextRequest) -> Vec<ContextItem> {
+        let learning = match self.learning.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        if !learning.config.enabled || request.max_tokens == 0 || request.goal.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let (max_skills, token_cap, role) = match request.kind {
+            AgentKind::GraphWorker => {
+                let tokens = 1000.min(request.max_tokens as usize);
+                (2, tokens, crate::native_extensions::graph::Role::Writer)
+            }
+            _ => {
+                let tokens = 1500.min(request.max_tokens as usize);
+                (3, tokens, crate::native_extensions::graph::Role::Writer)
+            }
+        };
+
+        let candidates =
+            learning.graph_skill_candidates(&request.goal, role, max_skills, token_cap);
+        candidates
+            .into_iter()
+            .map(|candidate| ContextItem {
+                source: "learning_skills".to_string(),
+                content: format!("Skill: {}\n{}", candidate.name, candidate.body),
+                estimated_tokens: candidate.estimated_tokens as u64,
+                priority: (candidate.score * 1000.0) as i32,
+                stable_for_cache: true,
+                provenance: json!({
+                    "name": candidate.name,
+                    "version": candidate.version,
+                    "content_hash": candidate.content_hash,
+                    "score": candidate.score,
+                }),
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_extensions::MemoryMessage;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn skill_list_and_view_progressive_disclosure() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), None, None);
+        controller.set_project_trusted(true);
+
+        // Create a skill via skill_manage
+        let create_args = json!({
+            "action": "create",
+            "name": "test-debug",
+            "scope": "project",
+            "description": "A debugging skill",
+            "body": "## Instructions\nDo debugging steps."
+        });
+        controller
+            .skill_manage_tool(dir.path(), &create_args)
+            .unwrap();
+
+        // skill_list should return descriptor, not body
+        let list_args = json!({"query": "debug", "limit": 5});
+        let list_res = controller.skill_list_tool(dir.path(), &list_args).unwrap();
+        assert!(!list_res.is_error);
+        let list_json: Value = serde_json::from_str(&list_res.content).unwrap();
+        let skills = list_json["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["name"], "test-debug");
+        assert_eq!(skills[0]["description"], "A debugging skill");
+        assert!(skills[0].get("body").is_none());
+
+        // skill_view returns full body and records hash
+        let view_args = json!({"name": "test-debug", "file": "SKILL.md"});
+        let view_res = controller.skill_view_tool(dir.path(), &view_args).unwrap();
+        assert!(!view_res.is_error);
+        let view_json: Value = serde_json::from_str(&view_res.content).unwrap();
+        assert!(view_json["content"]
+            .as_str()
+            .unwrap()
+            .contains("Do debugging steps."));
+        let hash = view_json["contentHash"].as_str().unwrap();
+
+        let target_file = controller
+            .project_skills_dir
+            .join("test-debug")
+            .join("SKILL.md");
+        assert!(controller
+            .read_set
+            .lock()
+            .unwrap()
+            .matches(&target_file, hash));
+    }
+
+    #[test]
+    fn parse_learn_args_works() {
+        assert_eq!(
+            parse_learn_args("--global release Rust crates").unwrap(),
+            LearnRequest {
+                scope: LearningScope::Global,
+                instruction: "release Rust crates".into(),
+            }
+        );
+        assert_eq!(
+            parse_learn_args("how we fixed SQLx offline mode").unwrap(),
+            LearnRequest {
+                scope: LearningScope::Project,
+                instruction: "how we fixed SQLx offline mode".into(),
+            }
+        );
+        assert!(parse_learn_args("").is_err());
+        assert!(parse_learn_args("   ").is_err());
+        assert!(parse_learn_args("--global").is_err());
+    }
+
+    #[test]
+    fn learning_status_and_pending_approval() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), None, None);
+        controller.set_project_trusted(true);
+
+        let status = controller.status_command();
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["shadowMode"], false);
+
+        // Stage a candidate for approval
+        let cand = LearningCandidate {
+            id: "cand-123".into(),
+            scope: LearningScope::Project,
+            status: ArtifactStatus::PendingApproval,
+            artifact: LearningArtifact::SkillCreate {
+                name: "pending-skill".into(),
+                description: "desc".into(),
+                body: "body".into(),
+            },
+            confidence: 0.9,
+            source_session_id: "sess-1".into(),
+            source_repo_id: "repo-1".into(),
+            source_turn: 1,
+            created_at_ms: 1000,
+            evidence: VerificationEvidence::default(),
+            rationale: "reusable".into(),
+        };
+        controller.project_store.upsert_candidate(cand).unwrap();
+
+        let pending = controller.pending_command();
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
+
+        // Approve
+        let app_res = controller.approve_command("cand-123").unwrap();
+        assert_eq!(app_res["approved"].as_array().unwrap().len(), 1);
+        assert!(controller
+            .project_skills_dir
+            .join("pending-skill")
+            .join("SKILL.md")
+            .exists());
+
+        // Notifications drained
+        let notifs = controller.drain_notifications();
+        assert!(notifs
+            .iter()
+            .any(|n| n.contains("skill activated: pending-skill")));
+    }
+
+    #[test]
+    fn learning_reject_command() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), None, None);
+        let cand = LearningCandidate {
+            id: "cand-reject".into(),
+            scope: LearningScope::Project,
+            status: ArtifactStatus::PendingApproval,
+            artifact: LearningArtifact::SkillCreate {
+                name: "bad-skill".into(),
+                description: "desc".into(),
+                body: "body".into(),
+            },
+            confidence: 0.5,
+            source_session_id: "sess-1".into(),
+            source_repo_id: "repo-1".into(),
+            source_turn: 1,
+            created_at_ms: 1000,
+            evidence: VerificationEvidence::default(),
+            rationale: "bad".into(),
+        };
+        controller.project_store.upsert_candidate(cand).unwrap();
+
+        let rej_res = controller.reject_command("cand-reject").unwrap();
+        assert_eq!(rej_res["rejected"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            controller
+                .project_store
+                .candidate("cand-reject")
+                .unwrap()
+                .status,
+            ArtifactStatus::Rejected
+        );
+    }
+
+    static E2E_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn learning_e2e_shadow_mode() {
+        let _lock = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            background_review: true,
+            shadow_mode: true,
+            auto_apply_project: false,
+            ..Default::default()
+        };
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
+        controller.set_project_trusted(true);
+
+        let fixture_json = json!({
+            "candidates": [
+                {
+                    "scope": "project",
+                    "confidence": 0.95,
+                    "rationale": "Learned flyio deployment",
+                    "artifact": {
+                        "kind": "skill_create",
+                        "name": "deploy-flyio",
+                        "description": "Deploy to Fly.io",
+                        "body": "fly deploy"
+                    }
+                }
+            ]
+        })
+        .to_string();
+
+        std::env::set_var("PI_LEARNING_REVIEW_FIXTURE", &fixture_json);
+        let evidence = LearningEvidence {
+            session_id: "sess-e2e".into(),
+            repo_id: "repo-e2e".into(),
+            turn: 1,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 1,
+                passed: true,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        };
+
+        let res = controller.review_settled_turn(evidence);
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+
+        assert!(res.is_some());
+        let candidates = controller.project_store.candidates();
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].status == ArtifactStatus::Candidate
+                || candidates[0].status == ArtifactStatus::PendingApproval
+        );
+        assert!(!controller
+            .project_skills_dir
+            .join("deploy-flyio")
+            .join("SKILL.md")
+            .exists());
+    }
+
+    #[test]
+    fn learning_e2e_trusted_project_auto_apply() {
+        let _lock = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            background_review: true,
+            enabled: true,
+            shadow_mode: false,
+            auto_apply_project: true,
+            auto_apply_global: false,
+            ..LearningConfig::default()
+        };
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
+        controller.set_project_trusted(true);
+
+        let fixture_json = json!({
+            "candidates": [
+                {
+                    "scope": "project",
+                    "confidence": 0.95,
+                    "rationale": "Learned flyio deployment",
+                    "artifact": {
+                        "kind": "skill_create",
+                        "name": "deploy-flyio-auto",
+                        "description": "Deploy to Fly.io",
+                        "body": "fly deploy"
+                    }
+                }
+            ]
+        })
+        .to_string();
+
+        std::env::set_var("PI_LEARNING_REVIEW_FIXTURE", &fixture_json);
+        let evidence = LearningEvidence {
+            session_id: "sess-e2e".into(),
+            repo_id: "repo-e2e".into(),
+            turn: 1,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 1,
+                passed: true,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        };
+
+        let res = controller.review_settled_turn(evidence);
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+
+        assert!(res.is_some());
+        let skill_file = controller
+            .project_skills_dir
+            .join("deploy-flyio-auto")
+            .join("SKILL.md");
+        assert!(skill_file.exists());
+        let record = controller.project_store.skill("deploy-flyio-auto").unwrap();
+        assert_eq!(record.origin, SkillOrigin::LearnedReview);
+        assert_eq!(record.status, ArtifactStatus::Active);
+    }
+
+    #[test]
+    fn learning_e2e_negative_tests() {
+        let _lock = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            background_review: true,
+            enabled: true,
+            shadow_mode: false,
+            auto_apply_project: true,
+            auto_apply_global: false,
+            ..LearningConfig::default()
+        };
+
+        // 1. Untrusted project blocks write
+        let mut controller = LearningController::new(dir.path(), None, Some(config.clone()));
+        controller.set_project_trusted(false);
+
+        let fixture_json = json!({
+            "candidates": [
+                {
+                    "scope": "project",
+                    "confidence": 0.95,
+                    "rationale": "Learned flyio deployment",
+                    "artifact": {
+                        "kind": "skill_create",
+                        "name": "untrusted-skill",
+                        "description": "Deploy to Fly.io",
+                        "body": "fly deploy"
+                    }
+                }
+            ]
+        })
+        .to_string();
+
+        std::env::set_var("PI_LEARNING_REVIEW_FIXTURE", &fixture_json);
+        let evidence = LearningEvidence {
+            session_id: "sess-e2e".into(),
+            repo_id: "repo-e2e".into(),
+            turn: 1,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 1,
+                passed: true,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        };
+
+        controller.review_settled_turn(evidence);
+        assert!(!controller
+            .project_skills_dir
+            .join("untrusted-skill")
+            .join("SKILL.md")
+            .exists());
+        assert_eq!(
+            controller
+                .project_store
+                .candidates()
+                .into_iter()
+                .next()
+                .unwrap()
+                .status,
+            // Kept, not staged: nothing waits on the user.
+            ArtifactStatus::Candidate
+        );
+
+        // 2. Failed verification blocks write
+        let dir2 = tempdir().unwrap();
+        let mut controller2 = LearningController::new(dir2.path(), None, Some(config.clone()));
+        controller2.set_project_trusted(true);
+        let fail_evidence = LearningEvidence {
+            session_id: "sess-e2e".into(),
+            repo_id: "repo-e2e".into(),
+            turn: 1,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 1,
+                passed: false,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        };
+        controller2.review_settled_turn(fail_evidence);
+        assert!(!controller2
+            .project_skills_dir
+            .join("untrusted-skill")
+            .join("SKILL.md")
+            .exists());
+
+        // 3. Nothing ran blocks write
+        let dir3 = tempdir().unwrap();
+        let mut controller3 = LearningController::new(dir3.path(), None, Some(config.clone()));
+        controller3.set_project_trusted(true);
+        let nothing_ran = LearningEvidence {
+            session_id: "sess-e2e".into(),
+            repo_id: "repo-e2e".into(),
+            turn: 1,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 0,
+                passed: false,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        };
+        controller3.review_settled_turn(nothing_ran);
+        assert!(!controller3
+            .project_skills_dir
+            .join("untrusted-skill")
+            .join("SKILL.md")
+            .exists());
+
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+    }
+
+    #[test]
+    fn learning_restart_persistence() {
+        let dir = tempdir().unwrap();
+        let agent_dir = tempdir().unwrap();
+        {
+            let mut controller = LearningController::new(dir.path(), Some(agent_dir.path()), None);
+            controller.set_project_trusted(true);
+            let cand = LearningCandidate {
+                id: "cand-persist".into(),
+                scope: LearningScope::Project,
+                status: ArtifactStatus::PendingApproval,
+                artifact: LearningArtifact::SkillCreate {
+                    name: "persisted-skill".into(),
+                    description: "desc".into(),
+                    body: "body".into(),
+                },
+                confidence: 0.9,
+                source_session_id: "sess-1".into(),
+                source_repo_id: "repo-1".into(),
+                source_turn: 1,
+                created_at_ms: 1000,
+                evidence: VerificationEvidence::default(),
+                rationale: "reusable".into(),
+            };
+            controller.project_store.upsert_candidate(cand).unwrap();
+            controller.approve_command("cand-persist").unwrap();
+            assert!(controller
+                .project_skills_dir
+                .join("persisted-skill")
+                .join("SKILL.md")
+                .exists());
+        }
+
+        let controller2 = LearningController::new(dir.path(), Some(agent_dir.path()), None);
+        assert!(controller2.project_store.skill("persisted-skill").is_some());
+        let list = controller2.skill_list_command("persisted").unwrap();
+        assert!(list["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "persisted-skill"));
+    }
+
+    #[test]
+    fn test_clock_override_via_env() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        std::env::set_var("PI_LEARNING_CLOCK_MS", "1700000000123");
+        assert_eq!(
+            crate::native_extensions::learning::types::now_ms(),
+            1700000000123
+        );
+        std::env::remove_var("PI_LEARNING_CLOCK_MS");
+    }
+
+    #[test]
+    fn test_one_off_task_does_not_become_a_skill() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let fixture = json!({
+            "rationale": "one-off local variable rename; no repeatable workflow",
+            "candidates": []
+        });
+        std::env::set_var("PI_LEARNING_REVIEW_FIXTURE", fixture.to_string());
+
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            background_review: true,
+            shadow_mode: false,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
+        controller.set_project_trusted(true);
+
+        let evidence = LearningEvidence {
+            session_id: "sess-one-off".into(),
+            repo_id: "repo-one-off".into(),
+            turn: 1,
+            messages: vec![
+                MemoryMessage {
+                    role: "user".into(),
+                    content: "rename foo to bar".into(),
+                },
+                MemoryMessage {
+                    role: "assistant".into(),
+                    content: "renamed foo to bar".into(),
+                },
+            ],
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 1,
+                passed: true,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        };
+
+        controller.review_settled_turn(evidence);
+        assert_eq!(controller.stats.skills_created, 0);
+        assert_eq!(controller.stats.candidates_created, 0);
+        assert_eq!(controller.project_store.candidates().len(), 0);
+
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+    }
+
+    #[test]
+    fn test_user_correction_overrides_promotion() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let fixture = json!({
+            "candidates": [{
+                "scope": "project",
+                "confidence": 0.95,
+                "rationale": "corrected debugging workflow",
+                "artifact": {
+                    "kind": "skill_create",
+                    "name": "corrected-debug",
+                    "description": "debug procedure with correction",
+                    "body": "# Corrected Debug Procedure\nRun tests with flags"
+                }
+            }]
+        });
+        std::env::set_var("PI_LEARNING_REVIEW_FIXTURE", fixture.to_string());
+
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            background_review: true,
+            shadow_mode: false,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
+        controller.set_project_trusted(true);
+
+        let evidence = LearningEvidence {
+            session_id: "sess-correction".into(),
+            repo_id: "repo-correction".into(),
+            turn: 1,
+            messages: vec![MemoryMessage {
+                role: "user".into(),
+                content: "don't do that, run cargo check first".into(),
+            }],
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 1,
+                passed: true,
+                user_accepted: false,
+                user_corrected: true, // User correction signal!
+                permission_denied: false,
+            },
+        };
+
+        controller.review_settled_turn(evidence);
+        // Because of user_corrected: true, the procedure is not applied. It is
+        // kept as a candidate rather than waiting on the user.
+        assert_eq!(controller.stats.skills_created, 0);
+        assert!(!controller
+            .project_skills_dir
+            .join("corrected-debug")
+            .join("SKILL.md")
+            .exists());
+
+        let pending = controller.pending_command();
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 0);
+        let kept = controller.project_store.candidates();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].status, ArtifactStatus::Candidate);
+
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+    }
+
+    #[test]
+    fn test_approve_skill_support_file() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), None, None);
+        controller.set_project_trusted(true);
+
+        // First create base active skill
+        let create_cand = LearningCandidate {
+            id: "cand-skill-base".into(),
+            scope: LearningScope::Project,
+            status: ArtifactStatus::PendingApproval,
+            artifact: LearningArtifact::SkillCreate {
+                name: "api-helper".into(),
+                description: "helper skill".into(),
+                body: "base content".into(),
+            },
+            confidence: 0.9,
+            source_session_id: "s1".into(),
+            source_repo_id: "r1".into(),
+            source_turn: 1,
+            created_at_ms: 1000,
+            evidence: VerificationEvidence::default(),
+            rationale: "reusable".into(),
+        };
+        controller
+            .project_store
+            .upsert_candidate(create_cand)
+            .unwrap();
+        controller.approve_command("cand-skill-base").unwrap();
+
+        // Now stage a SkillSupportFile candidate
+        let file_cand = LearningCandidate {
+            id: "cand-support-file".into(),
+            scope: LearningScope::Project,
+            status: ArtifactStatus::PendingApproval,
+            artifact: LearningArtifact::SkillSupportFile {
+                name: "api-helper".into(),
+                relative_path: "references/schema.json".into(),
+                content: "{\"version\": 1}".into(),
+                expected_hash: None,
+            },
+            confidence: 0.9,
+            source_session_id: "s1".into(),
+            source_repo_id: "r1".into(),
+            source_turn: 2,
+            created_at_ms: 2000,
+            evidence: VerificationEvidence::default(),
+            rationale: "schema reference".into(),
+        };
+        controller
+            .project_store
+            .upsert_candidate(file_cand)
+            .unwrap();
+
+        let approve_res = controller.approve_command("cand-support-file").unwrap();
+        assert_eq!(approve_res["approved"][0], "cand-support-file");
+
+        let written_file = controller
+            .project_skills_dir
+            .join("api-helper")
+            .join("references")
+            .join("schema.json");
+        assert!(written_file.exists());
+        assert_eq!(
+            std::fs::read_to_string(written_file).unwrap(),
+            "{\"version\": 1}"
+        );
+    }
+
+    #[test]
+    fn test_auto_promote_skill_on_verified_use() {
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            auto_apply_project: true,
+            ..Default::default()
+        };
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
+        let skill_record = SkillLedgerRecord {
+            skill_id: "candidate-skill".into(),
+            name: "auto-test".into(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Candidate,
+            path: dir.path().join("SKILL.md"),
+            content_hash: "hash".into(),
+            version: 1,
+            success_count: 1,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            applicability: Default::default(),
+            pinned: false,
+        };
+        controller.project_store.upsert_skill(skill_record).unwrap();
+
+        // 2nd verified success reaches auto_promote_verified_uses (default 2)
+        controller
+            .record_skill_version_outcome(
+                &SkillVersionRef {
+                    name: "auto-test".into(),
+                    version: 1,
+                    content_hash: "hash".into(),
+                },
+                SkillOutcome::VerifiedSuccess,
+            )
+            .unwrap();
+
+        let updated = controller.project_store.skill("auto-test").unwrap();
+        assert_eq!(updated.status, ArtifactStatus::Active);
+        let notifs = controller.drain_notifications();
+        assert!(notifs
+            .iter()
+            .any(|n| n.contains("auto-promoted after verified uses")));
+    }
+
+    #[test]
+    fn verified_use_threshold_cannot_bypass_default_project_or_global_approval() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), Some(dir.path()), None);
+        let record = SkillLedgerRecord {
+            skill_id: "needs-approval".into(),
+            name: "needs-approval".into(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Candidate,
+            path: dir.path().join("SKILL.md"),
+            content_hash: "hash".into(),
+            version: 1,
+            success_count: 2,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            applicability: Default::default(),
+            pinned: false,
+        };
+        controller
+            .project_store
+            .upsert_skill(record.clone())
+            .unwrap();
+        let mut global = record;
+        global.scope = LearningScope::Global;
+        controller.global_store.upsert_skill(global).unwrap();
+        let version = SkillVersionRef {
+            name: "needs-approval".into(),
+            version: 1,
+            content_hash: "hash".into(),
+        };
+        assert!(!controller.auto_promote_version_if_threshold_met(&version));
+        assert_eq!(
+            controller
+                .project_store
+                .skill("needs-approval")
+                .unwrap()
+                .status,
+            ArtifactStatus::Candidate
+        );
+        assert_eq!(
+            controller
+                .global_store
+                .skill("needs-approval")
+                .unwrap()
+                .status,
+            ArtifactStatus::Candidate
+        );
+        controller.config.auto_apply_project = true;
+        assert!(controller.auto_promote_version_if_threshold_met(&version));
+        assert_eq!(
+            controller
+                .global_store
+                .skill("needs-approval")
+                .unwrap()
+                .status,
+            ArtifactStatus::Candidate
+        );
+    }
+
+    #[test]
+    fn unverified_skill_version_cannot_be_promoted() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), None, None);
+        controller
+            .project_store
+            .upsert_skill(SkillLedgerRecord {
+                skill_id: "unverified-skill".into(),
+                name: "unverified-skill".into(),
+                scope: LearningScope::Project,
+                origin: SkillOrigin::LearnedReview,
+                status: ArtifactStatus::Candidate,
+                path: dir.path().join("SKILL.md"),
+                content_hash: "known-hash".into(),
+                version: 1,
+                success_count: 1,
+                failure_count: 0,
+                neutral_count: 0,
+                last_used_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+                applicability: Default::default(),
+                pinned: false,
+            })
+            .unwrap();
+
+        assert!(!controller
+            .record_skill_outcome_for_content_hash(
+                "unverified-skill",
+                "unknown-hash",
+                SkillOutcome::VerifiedSuccess,
+            )
+            .unwrap());
+
+        controller
+            .record_skill_version_outcome(
+                &SkillVersionRef {
+                    name: "unverified-skill".into(),
+                    version: 1,
+                    content_hash: "wrong-hash".into(),
+                },
+                SkillOutcome::VerifiedSuccess,
+            )
+            .unwrap();
+
+        let unchanged = controller.project_store.skill("unverified-skill").unwrap();
+        assert_eq!(unchanged.status, ArtifactStatus::Candidate);
+        assert_eq!(unchanged.success_count, 1);
+        assert_eq!(controller.stats.verified_skill_successes, 0);
+    }
+
+    #[test]
+    fn identical_cross_scope_skill_version_records_one_outcome_per_use() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let mut controller = LearningController::new(dir.path(), Some(&agent_dir), None);
+        let project_record = SkillLedgerRecord {
+            skill_id: "project-shared-skill".into(),
+            name: "shared-skill".into(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Candidate,
+            path: dir.path().join("project-skill.md"),
+            content_hash: "shared-hash".into(),
+            version: 1,
+            success_count: 0,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            applicability: Default::default(),
+            pinned: false,
+        };
+        let global_record = SkillLedgerRecord {
+            skill_id: "global-shared-skill".into(),
+            scope: LearningScope::Global,
+            path: agent_dir.join("global-skill.md"),
+            ..project_record.clone()
+        };
+        controller
+            .project_store
+            .upsert_skill(project_record)
+            .unwrap();
+        controller.global_store.upsert_skill(global_record).unwrap();
+
+        assert!(controller
+            .record_skill_outcome_for_content_hash(
+                "shared-skill",
+                "shared-hash",
+                SkillOutcome::VerifiedSuccess,
+            )
+            .unwrap());
+
+        assert_eq!(
+            controller
+                .project_store
+                .skill_version("shared-skill", 1)
+                .unwrap()
+                .success_count,
+            1
+        );
+        assert_eq!(
+            controller
+                .global_store
+                .skill_version("shared-skill", 1)
+                .unwrap()
+                .success_count,
+            1
+        );
+        assert_eq!(controller.stats.verified_skill_successes, 1);
+    }
+
+    #[test]
+    fn test_read_only_turn_skips_learning_review_zero_completer_calls() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            background_review: true,
+            enabled: true,
+            shadow_mode: false,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+
+        // If review were invoked, fixture would create a candidate, but it must be skipped
+        std::env::set_var(
+            "PI_LEARNING_REVIEW_FIXTURE",
+            json!({
+                "candidates": [{
+                    "scope": "project",
+                    "confidence": 0.9,
+                    "rationale": "should never be created",
+                    "artifact": {
+                        "kind": "skill_create",
+                        "name": "ghost-skill",
+                        "description": "should not exist",
+                        "body": "ghost"
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
+        let read_only_evidence = LearningEvidence {
+            session_id: "sess-readonly".into(),
+            repo_id: "repo-readonly".into(),
+            turn: 1,
+            messages: vec![
+                MemoryMessage {
+                    role: "user".into(),
+                    content: "how does the architecture work?".into(),
+                },
+                MemoryMessage {
+                    role: "assistant".into(),
+                    content: "it is composed of nodes and edges".into(),
+                },
+            ],
+            tools: vec![ToolEvidence {
+                name: "view_file".into(),
+                is_error: false,
+                args_summary: "src/lib.rs".into(),
+                result_summary: "code".into(),
+                permission_denied: false,
+            }],
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence::default(),
+        };
+
+        let run_id = controller.review_settled_turn(read_only_evidence);
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+
+        assert!(run_id.is_none());
+        assert_eq!(controller.stats.reviews_skipped, 1);
+        assert_eq!(controller.stats.reviews_dispatched, 0);
+        assert_eq!(controller.stats.reviews_started, 0);
+        assert_eq!(controller.project_store.candidates().len(), 0);
+        assert!(!controller
+            .project_skills_dir
+            .join("ghost-skill")
+            .join("SKILL.md")
+            .exists());
+    }
+
+    fn verified_evidence(turn: u64) -> LearningEvidence {
+        LearningEvidence {
+            session_id: "sess-live".into(),
+            repo_id: "repo-live".into(),
+            turn,
+            messages: vec![MemoryMessage {
+                role: "user".into(),
+                content: "Fix the flaky sqlx offline build".into(),
+            }],
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                commands_ran: 2,
+                passed: true,
+                ..VerificationEvidence::default()
+            },
+        }
+    }
+
+    /// A reviewer standing in for the model child: waits for `gate`, then
+    /// proposes one verified skill.
+    fn skill_runner(gate: Arc<std::sync::Barrier>) -> ReviewRunner {
+        ReviewRunner(Arc::new(move |evidence, _, _, spec| {
+            gate.wait();
+            assert!(spec.model.as_deref() == Some("anthropic/test-model"));
+            parse_reviewer_output(
+                &format!(
+                    "Here is the review:\n```json\n{}\n```",
+                    json!({"candidates": [{
+                        "scope": "project",
+                        "confidence": 0.92,
+                        "rationale": "the offline build needs a prepared query cache",
+                        "artifact": {
+                            "kind": "skill_create",
+                            "name": "sqlx-offline-build",
+                            "description": "Build with SQLx offline mode",
+                            "body": "## When to Use\nSQLx offline builds fail.\n## Procedure\nRun cargo sqlx prepare.\n## Pitfalls\nStale cache.\n## Verification\ncargo build."
+                        }
+                    }]})
+                ),
+                evidence,
+                3,
+            )
+            .unwrap()
+        }))
+    }
+
+    #[test]
+    fn live_review_applies_a_skill_without_the_user_or_project_trust() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+        let project = tempdir().unwrap();
+        let agent = tempdir().unwrap();
+        let config = LearningConfig {
+            background_review: true,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+        let mut controller =
+            LearningController::new(project.path(), Some(agent.path()), Some(config));
+        // An untrusted project: learned skills still apply, because they live
+        // in the agent directory, not in the repository.
+        controller.set_project_trusted(false);
+        assert!(controller.project_store_owned);
+        assert!(controller.project_skills_dir.starts_with(agent.path()));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        controller.review_runner = Some(skill_runner(Arc::clone(&gate)));
+        controller.set_live_reviewer(project.path(), Some("anthropic/test-model".into()));
+
+        let run = controller.review_settled_turn(verified_evidence(4));
+        assert!(run.is_some(), "a verified turn is reviewed");
+        // The review is still running: the turn returned without waiting,
+        // and a second turn neither cancels it nor starts another.
+        assert!(controller.live_review_running());
+        controller.cancel_active_review();
+        assert!(controller
+            .review_settled_turn(verified_evidence(6))
+            .is_none());
+        gate.wait();
+
+        let started = std::time::Instant::now();
+        while controller.completed_reviews.lock().unwrap().is_empty() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        controller.apply_completed_reviews();
+
+        let record = controller
+            .project_store
+            .skill("sqlx-offline-build")
+            .unwrap();
+        assert_eq!(record.status, ArtifactStatus::Active);
+        assert!(controller
+            .project_skills_dir
+            .join("sqlx-offline-build")
+            .join("SKILL.md")
+            .is_file());
+        assert!(!project.path().join(".davinci").join("skills").exists());
+        assert_eq!(controller.pending_command()["pending"], json!([]));
+
+        let block = controller
+            .learned_skill_block("sqlx offline build fails")
+            .expect("the learned skill is injected for a matching prompt");
+        assert!(block.contains("cargo sqlx prepare"), "{block}");
+        assert!(controller
+            .learned_skill_block("paint the logo blue")
+            .is_none());
+    }
+
+    #[test]
+    fn without_a_live_reviewer_nothing_is_spawned() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+        let project = tempdir().unwrap();
+        let mut controller = LearningController::new(project.path(), None, None);
+        controller.review_settled_turn(verified_evidence(2));
+        assert!(!controller.live_review_running());
+        assert!(controller.project_store.candidates().is_empty());
+    }
+
+    #[test]
+    fn default_learning_never_dispatches_a_configured_live_reviewer() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), Some(dir.path()), None);
+        controller.set_live_reviewer(dir.path(), Some("fixture/no-paid-call".into()));
+        controller.review_runner = Some(ReviewRunner(Arc::new(|_, _, _, _| {
+            panic!("default must not dispatch")
+        })));
+        assert!(controller
+            .review_settled_turn(verified_evidence(2))
+            .is_none());
+        assert_eq!(controller.stats.reviews_started, 0);
+        assert!(!controller.live_review_running());
+    }
+
+    #[test]
+    fn an_in_repo_store_with_skills_keeps_being_used() {
+        let project = tempdir().unwrap();
+        let agent = tempdir().unwrap();
+        let legacy = project.path().join(".davinci").join("learning");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("skills.jsonl"), "{}\n").unwrap();
+        let controller = LearningController::new(project.path(), Some(agent.path()), None);
+        assert!(!controller.project_store_owned);
+
+        let empty = tempdir().unwrap();
+        std::fs::create_dir_all(empty.path().join(".davinci").join("learning")).unwrap();
+        let controller = LearningController::new(empty.path(), Some(agent.path()), None);
+        assert!(controller.project_store_owned);
+    }
+}

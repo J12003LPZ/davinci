@@ -1,0 +1,404 @@
+[
+  {
+    "id": "dbg-pos-01",
+    "request": "Debug the race condition in the worker pool scheduler.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-02",
+    "request": "Diagnose the memory leak observed during long-running tasks.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-03",
+    "request": "Investigate the failure in test_batch_execution on Windows.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-04",
+    "request": "Find the root cause of the JSON-RPC parse error.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-05",
+    "request": "Why does it crash when an empty buffer is submitted?",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-06",
+    "request": "Troubleshoot the intermittent connection drops in the MQTT client.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-07",
+    "request": "Fix the failing test in tests/auth_integration_test.rs.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-08",
+    "request": "Trace the bug causing corrupted output in compression stream.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-09",
+    "request": "Help me debug why the background worker is hanging indefinitely.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-10",
+    "request": "Diagnose why the HTTP client returns 500 Internal Server Error under load.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-11",
+    "request": "Isolate the root cause of the panic: index out of bounds in parser.rs.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-12",
+    "request": "Investigate why the integration test suite is failing on Linux CI.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-13",
+    "request": "Why did it panic with segmentation fault in the native library wrapper?",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-14",
+    "request": "Reproduce the bug where session IDs are duplicated across threads.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-15",
+    "request": "Trace the error stack trace from the database query timeout.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-16",
+    "request": "Debug the deadlock between mutex A and mutex B in the transaction manager.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-17",
+    "request": "Diagnose the unexpected nil pointer dereference in process_event.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-18",
+    "request": "Investigate the crash report submitted by users on macOS.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-19",
+    "request": "Why is it crashing when processing malformed UTF-8 input?",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-20",
+    "request": "Fix the failing unit test test_token_expiration in token_service.rs.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-21",
+    "request": "Troubleshoot why the WebSocket server abruptly terminates connections.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-22",
+    "request": "Find the root cause of the silent data corruption in the cache layer.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-23",
+    "request": "Debug the infinite loop occurring during cyclic graph resolution.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-24",
+    "request": "Investigate why the queue consumer stops processing messages after 10 minutes.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-25",
+    "request": "Diagnose why memory usage grows unboundedly during batch export.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-26",
+    "request": "Trace the bug where negative timestamps cause unhandled exceptions.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-27",
+    "request": "Why does it crash with SIGSEGV in the audio decode thread?",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-28",
+    "request": "Fix the failing test cases in the parity test suite.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-29",
+    "request": "Troubleshoot the SSL handshake failure when connecting to peer nodes.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-30",
+    "request": "Isolate the root cause of unexpected null response in user lookup.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-31",
+    "request": "Debug the thread contention issue causing high CPU spikes.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-32",
+    "request": "Investigate the failure: assertion failed: left == right in test_merge.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-33",
+    "request": "Why did this fail with error code 137 in Kubernetes container?",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-34",
+    "request": "Reproduce the crash that occurs when closing the application while syncing.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-35",
+    "request": "Diagnose the buffer overflow detected in the packet parser.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-36",
+    "request": "Help me debug the flaky test that fails 1 out of 10 times.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-37",
+    "request": "Trace the bug where events are processed out of order in the pipeline.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-38",
+    "request": "Investigate why the server socket fails with EADDRINUSE on restart.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-39",
+    "request": "Find the root cause of the uncaught TypeError in the event listener.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-40",
+    "request": "Troubleshoot the latency regression introduced in the last release.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-41",
+    "request": "Debug the serialization mismatch between client and server.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-42",
+    "request": "Why does it crash when reading corrupted parquet files?",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-43",
+    "request": "Diagnose why the connection pool runs out of idle connections.",
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-pos-44",
+    "request": "Where did it break and what caused the assertion failure?",
+    "previous_request": "Run cargo test on the scheduler crate",
+    "recent_tools": ["cargo_test"],
+    "expect_debugging": true
+  },
+  {
+    "id": "dbg-neg-01",
+    "request": "Add a new CLI flag --verbose to print debug logs.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-02",
+    "request": "Implement a debug logging module for developers.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-03",
+    "request": "Redesign this dashboard so it feels premium and intentional.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-04",
+    "request": "Perform a code review of this PR focusing on security risks.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-05",
+    "request": "Bump the version in Cargo.toml to 1.0.1.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-06",
+    "request": "Add a new REST endpoint for retrieving user settings.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-07",
+    "request": "Update the README.md with instructions on how to run tests.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-08",
+    "request": "Refactor the authentication service to use dependency injection.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-09",
+    "request": "Write unit tests for the StringCalculator class using pytest.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-10",
+    "request": "Create a Dockerfile for multi-stage production builds.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-11",
+    "request": "Optimize the image compression algorithm for higher throughput.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-12",
+    "request": "Review the diff between HEAD and origin/main.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-13",
+    "request": "Polish the UI for the billing modal with modern spacing.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-14",
+    "request": "Extract common utility functions into a shared helper crate.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-15",
+    "request": "Add unit test coverage for the payment processing module.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-16",
+    "request": "Audit this change before we merge it into main.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-17",
+    "request": "Format all Rust files using cargo fmt.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-18",
+    "request": "Add support for OAuth2 Google login provider.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-19",
+    "request": "Configure GitHub Actions CI workflow to run clippy.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-20",
+    "request": "Create a new React component for the user avatar.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-21",
+    "request": "Clean up unused dependencies from package.json.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-22",
+    "request": "Implement rate limiting middleware for express app.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-23",
+    "request": "Generate documentation using rustdoc and publish to github pages.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-24",
+    "request": "Rename the function process_data to handle_payload across the project.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-25",
+    "request": "Add a health check endpoint at /healthz.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-26",
+    "request": "Migrate the database schema to add the created_at column.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-27",
+    "request": "Review my PR and suggest improvements for error handling.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-28",
+    "request": "Scaffold a new CLI project with clap.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-29",
+    "request": "Set up ESLint and Prettier for the frontend repository.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-30",
+    "request": "Export the telemetry metrics via Prometheus endpoint.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-31",
+    "request": "Add docstrings to all public functions in math_utils.py.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-32",
+    "request": "Implement a cache with LRU eviction policy.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-33",
+    "request": "Update the license header across all source files to Apache 2.0.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-34",
+    "request": "Make the landing page visually appealing with high-contrast accents.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-35",
+    "request": "Implement full-text search using SQLite FTS5.",
+    "expect_debugging": false
+  },
+  {
+    "id": "dbg-neg-36",
+    "request": "Configure git pre-commit hook for linting.",
+    "expect_debugging": false
+  }
+]

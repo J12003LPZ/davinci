@@ -1,0 +1,37 @@
+[package]
+name = "davinci-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Unified multi-provider LLM API matching @earendil-works/pi-ai"
+
+[dependencies]
+davinci-protocol = { path = "../davinci-protocol" }
+davinci-sys = { path = "../davinci-sys" }
+davinci-telemetry = { path = "../davinci-telemetry" }
+base64.workspace = true
+regex.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+# Pinned because the transport hooks are unversioned. 3.2 retains our MSRV.
+ureq-stream = { package = "ureq", version = "=3.2.0", default-features = false, features = ["rustls"] }
+url.workspace = true
+uuid.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+sha1 = { workspace = true }
+sha2.workspace = true
+zstd.workspace = true
+
+[features]
+default = []
+test-fixtures = []
+
+[dev-dependencies]
+davinci-ai = { path = ".", features = ["test-fixtures"] }
+tempfile.workspace = true

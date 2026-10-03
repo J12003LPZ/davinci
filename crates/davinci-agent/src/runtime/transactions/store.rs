@@ -1,0 +1,932 @@
+use super::{files, model::*};
+use crate::runtime::cache::directory::Directory;
+use crate::runtime::checkpoints::compute_sha256;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+fn canonical(root: &Path) -> Result<PathBuf, String> {
+    // Resolve host-selected aliases (notably macOS /var -> /private/var)
+    // before the no-follow component walk. Descendants remain protected
+    // by Directory's handle-bound O_NOFOLLOW traversal.
+    root.canonicalize()
+        .map_err(|e| format!("transaction workspace: {e}"))
+}
+
+/// Directory name for records kept inside a Git directory.
+pub const GIT_STORE_NAME: &str = "davinci-transactions";
+
+/// Where a workspace's transaction records live. `root` must be canonical.
+///
+/// In a Git work tree the records go under the Git directory, like Git's own
+/// rebase and merge state: they never appear in the working tree, stay on the
+/// workspace's filesystem, and are per worktree. A workspace below the top
+/// level gets its own subdirectory. Elsewhere the store stays in
+/// `<root>/.davinci-transactions`. A legacy in-tree store holding an
+/// unfinished transaction stays authoritative so recovery finds it.
+pub fn store_dir(root: &Path) -> PathBuf {
+    let legacy = root.join(STORE_NAME);
+    if legacy.join("active.json").is_file() {
+        return legacy;
+    }
+    git_store_dir(root).unwrap_or(legacy)
+}
+
+fn git_store_dir(root: &Path) -> Option<PathBuf> {
+    for top in root.ancestors() {
+        let dot_git = top.join(".git");
+        let Ok(metadata) = std::fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        let git_dir = if metadata.is_dir() {
+            dot_git
+        } else if metadata.is_file() {
+            // Linked worktrees and submodules: `gitdir: <path>`.
+            let text = std::fs::read_to_string(&dot_git).ok()?;
+            let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+            if target.is_empty() {
+                return None;
+            }
+            top.join(target)
+        } else {
+            return None;
+        };
+        let git_dir = git_dir.canonicalize().ok()?;
+        let mut dir = git_dir.join(GIT_STORE_NAME);
+        if top != root {
+            let relative = root.strip_prefix(top).ok()?;
+            let key = crate::runtime::checkpoints::compute_sha256(
+                relative.to_string_lossy().replace('\\', "/").as_bytes(),
+            );
+            dir = dir.join(format!("sub-{}", &key[..16]));
+        }
+        return Some(dir);
+    }
+    None
+}
+
+pub(super) struct Store {
+    pub directory: Directory,
+    /// A pre-existing in-tree store, read for records written before the
+    /// store moved into the Git directory (rollback of older transactions).
+    legacy: Option<Directory>,
+}
+impl Store {
+    pub fn open(root: &Path) -> Result<Self, String> {
+        let root = canonical(root)?;
+        let location = store_dir(&root);
+        let directory = match Directory::open(&location, true) {
+            Ok(directory) => directory,
+            // A Git directory reached through a link, or one we cannot write:
+            // keep the in-tree store rather than failing the edit.
+            Err(_) if location != root.join(STORE_NAME) => {
+                return Self::open_at(&root, root.join(STORE_NAME));
+            }
+            Err(e) => return Err(format!("transaction store: {e}")),
+        };
+        Ok(Self::with_legacy(&root, location, directory))
+    }
+
+    fn open_at(root: &Path, location: PathBuf) -> Result<Self, String> {
+        let directory =
+            Directory::open(&location, true).map_err(|e| format!("transaction store: {e}"))?;
+        Ok(Self::with_legacy(root, location, directory))
+    }
+
+    fn with_legacy(root: &Path, location: PathBuf, directory: Directory) -> Self {
+        let legacy_path = root.join(STORE_NAME);
+        if location == legacy_path {
+            // Recovery records are local state. Exclusive creation preserves any
+            // existing entry, and Directory keeps the store's link protections.
+            if let Ok(mut file) = directory.file(".gitignore", true) {
+                let _ = file.write_all(b"*\n");
+            }
+            return Self {
+                directory,
+                legacy: None,
+            };
+        }
+        let legacy = Directory::open(&legacy_path, false).ok();
+        Self { directory, legacy }
+    }
+
+    /// Open without creating anything; `None` when no store exists yet.
+    pub fn open_existing(root: &Path) -> Result<Option<Self>, String> {
+        let root = canonical(root)?;
+        let location = store_dir(&root);
+        let legacy_path = root.join(STORE_NAME);
+        let directory = match Directory::open(&location, false) {
+            Ok(directory) => Some(directory),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) if location != legacy_path => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        let legacy = if location == legacy_path {
+            None
+        } else {
+            match Directory::open(&legacy_path, false) {
+                Ok(directory) => Some(directory),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        Ok(match (directory, legacy) {
+            (Some(directory), legacy) => Some(Self { directory, legacy }),
+            (None, Some(legacy)) => Some(Self {
+                directory: legacy,
+                legacy: None,
+            }),
+            (None, None) => None,
+        })
+    }
+
+    /// Record file names from the store and any legacy in-tree store.
+    pub fn record_names(&self) -> std::io::Result<Vec<String>> {
+        let mut names = self.directory.names()?;
+        if let Some(legacy) = &self.legacy {
+            for name in legacy.names()? {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    fn record_file(&self, name: &str) -> std::io::Result<std::fs::File> {
+        match self.directory.file(name, false) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match &self.legacy {
+                Some(legacy) => legacy.file(name, false),
+                None => Err(e),
+            },
+            other => other,
+        }
+    }
+    pub fn load(
+        &self,
+        id: &str,
+        root: &Path,
+        owner: &TransactionOwner,
+        allow_session_recovery: bool,
+    ) -> Result<Record, String> {
+        let mut remaining = MAX_RECORD_BYTES;
+        self.load_bounded(id, root, owner, allow_session_recovery, &mut remaining)
+    }
+    pub fn load_bounded(
+        &self,
+        id: &str,
+        root: &Path,
+        owner: &TransactionOwner,
+        allow_session_recovery: bool,
+        remaining: &mut u64,
+    ) -> Result<Record, String> {
+        let id = valid_id(id)?;
+        let mut file = self
+            .record_file(&format!("{id}.json"))
+            .map_err(|e| format!("transaction record: {e}"))?;
+        let limit = MAX_RECORD_BYTES.min(*remaining);
+        if file.metadata().map_err(|e| e.to_string())?.len() > limit {
+            return Err("transaction record exceeds limit".into());
+        }
+        let mut bytes = Vec::new();
+        let read = (&mut file).take(limit + 1).read_to_end(&mut bytes);
+        *remaining = remaining.saturating_sub(bytes.len() as u64);
+        read.map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > limit {
+            return Err("transaction record exceeds limit".into());
+        }
+        let record: Record = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("invalid transaction record: {e}"))?;
+        let original = &record.summary.owner;
+        let resumed_owner = allow_session_recovery
+            && owner.session_id.as_ref().is_some_and(|id| !id.is_empty())
+            && original.session_id == owner.session_id
+            && original.task_id == owner.task_id
+            && original.parent_agent_id.is_none()
+            && owner.parent_agent_id.is_none()
+            && original.graph_node.is_none()
+            && owner.graph_node.is_none();
+        if record.schema != RECORD_SCHEMA {
+            return Err("unsupported transaction journal schema; preserve the record for recovery with its original version".into());
+        }
+        if record.summary.id != id
+            || (original != owner && !resumed_owner)
+            || Path::new(&record.summary.workspace) != root
+        {
+            return Err("transaction workspace or owner mismatch".into());
+        }
+        if Directory::open(root, false)
+            .and_then(|d| d.identity())
+            .map_err(|e| e.to_string())?
+            != record.summary.workspace_identity
+        {
+            return Err("transaction workspace identity changed".into());
+        }
+        validate(&record, root)?;
+        Ok(record)
+    }
+    pub fn save(&self, record: &Record) -> Result<(), String> {
+        let id = valid_id(&record.summary.id)?;
+        let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err("transaction record exceeds limit".into());
+        }
+        let name = format!("{id}.json");
+        let names = self.directory.names().map_err(|e| e.to_string())?;
+        let records: Vec<_> = names
+            .iter()
+            .filter(|s| s.ends_with(".json") && s.as_str() != "active.json")
+            .collect();
+        if records.len() >= MAX_RECORDS && !records.contains(&&name) {
+            return Err("transaction record capacity reached; preserve or archive completed records before continuing".into());
+        }
+        let mut total = bytes.len() as u64;
+        for other in records {
+            if other == &name {
+                continue;
+            }
+            total = total.saturating_add(
+                self.directory
+                    .file(other, false)
+                    .and_then(|f| f.metadata())
+                    .map_err(|e| e.to_string())?
+                    .len(),
+            );
+        }
+        if total > super::super::checkpoints::MAX_TASK_BLOBS_BYTES {
+            return Err("durable transaction storage capacity reached".into());
+        }
+        self.atomic(&name, &bytes)
+    }
+    fn atomic(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.atomic_with(name, bytes, false, |file, bytes| file.write_all(bytes))
+    }
+    fn atomic_with(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        create_only: bool,
+        write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        let temp = format!("{}.tmp", uuid::Uuid::new_v4());
+        let result = (|| {
+            let mut file = self
+                .directory
+                .file(&temp, true)
+                .map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            failure_tests::inject_write_failure(&mut file, bytes).map_err(|e| e.to_string())?;
+            write(&mut file, bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| e.to_string())?;
+            drop(file);
+            let existing = if create_only {
+                false
+            } else {
+                match self.directory.file(name, false) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(e.to_string()),
+                }
+            };
+            self.directory
+                .replace_source(&temp, name, existing, false)
+                .map_err(|e| e.to_string())
+        })();
+        if result.is_err() {
+            let _ = self.directory.remove(&temp);
+        }
+        result
+    }
+    pub fn active(&self) -> Result<Option<String>, String> {
+        let file = match self.directory.file("active.json", false) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        let mut id = String::new();
+        file.take(64)
+            .read_to_string(&mut id)
+            .map_err(|e| e.to_string())?;
+        valid_id(&id)?;
+        Ok(Some(id))
+    }
+    pub fn begin(&self, id: &str) -> Result<(), String> {
+        valid_id(id)?;
+        self.atomic_with("active.json", id.as_bytes(), true, |file, bytes| {
+            file.write_all(bytes)
+        })
+        .map_err(|e| format!("active transaction marker could not be published: {e}"))
+    }
+    pub fn finish(&self, id: &str) -> Result<(), String> {
+        if self.active()?.as_deref() == Some(id) {
+            self.directory
+                .remove_source("active.json")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod git_ignore_tests {
+    use super::*;
+
+    #[test]
+    fn store_keeps_its_records_out_of_git() {
+        let root = tempfile::tempdir().unwrap();
+        Store::open(root.path()).unwrap();
+        let ignore = root.path().join(STORE_NAME).join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
+        std::fs::write(root.path().join(STORE_NAME).join("record.json"), "{}").unwrap();
+        assert!(
+            std::process::Command::new(davinci_sys::process::resolve_program("git"))
+                .args(["init", "--quiet"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = std::process::Command::new(davinci_sys::process::resolve_program("git"))
+            .args(["status", "--porcelain"])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty(), "{:?}", status.stdout);
+        std::fs::write(&ignore, "custom\n").unwrap();
+        Store::open(root.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "custom\n");
+    }
+}
+
+fn valid_id(id: &str) -> Result<String, String> {
+    let parsed = uuid::Uuid::parse_str(id).map_err(|_| "invalid transaction id")?;
+    if parsed.to_string() != id {
+        return Err("invalid transaction id".into());
+    }
+    Ok(id.into())
+}
+
+fn validate(record: &Record, root: &Path) -> Result<(), String> {
+    super::verification::validate(record)?;
+    super::commit::validate(record)?;
+    if record.changes.is_empty() || record.changes.len() > MAX_FILES {
+        return Err("invalid transaction file count".into());
+    }
+    if record.summary.sequence == 0
+        || record
+            .summary
+            .owner
+            .session_id
+            .as_ref()
+            .is_some_and(|s| s.len() > 1024)
+        || record
+            .summary
+            .owner
+            .graph_node
+            .as_ref()
+            .is_some_and(|s| s.len() > 1024)
+        || record
+            .summary
+            .base_revision
+            .as_ref()
+            .is_some_and(|s| s.len() > 128)
+        || record.summary.verification_state.len() > 1024
+        || record
+            .summary
+            .conflict
+            .as_ref()
+            .is_some_and(|s| s.len() > 8192)
+        || record.summary.warnings.len() > 8
+        || record.summary.warnings.iter().any(|s| s.len() > 8192)
+    {
+        return Err("invalid transaction provenance".into());
+    }
+    let operation_fields = [
+        record.summary.operation_id.is_some(),
+        record.summary.attempt_id.is_some(),
+        record.summary.operation_owner_id.is_some(),
+        record.summary.operation_owner_generation.is_some(),
+        record.summary.operation_workspace_identity.is_some(),
+    ];
+    if operation_fields.iter().any(|present| *present)
+        && operation_fields.iter().any(|present| !present)
+    {
+        return Err("incomplete transaction operation link".into());
+    }
+    if record.summary.operation_workspace_identity.as_deref()
+        != record
+            .summary
+            .operation_id
+            .as_ref()
+            .map(|_| record.summary.workspace_identity.as_str())
+    {
+        return Err("transaction operation workspace binding mismatch".into());
+    }
+    if record
+        .summary
+        .operation_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty())
+        || record
+            .summary
+            .attempt_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty())
+        || record
+            .summary
+            .operation_owner_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty())
+        || record
+            .summary
+            .operation_workspace_identity
+            .as_ref()
+            .is_some_and(|id| id.is_empty())
+    {
+        return Err("empty transaction operation binding".into());
+    }
+    if !crate::runtime::operations::phase_receipts_match_summary(&record.summary) {
+        return Err("invalid transaction phase receipts".into());
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let mut bytes = 0usize;
+    for change in &record.changes {
+        if (change.alias_pending && change.proposed.hash.is_none())
+            || (change.restore_alias_pending
+                && change
+                    .restored
+                    .as_ref()
+                    .is_none_or(|image| image.hash.is_none()))
+            || ((change.alias_pending || change.restore_alias_pending)
+                && !matches!(
+                    record.summary.state,
+                    super::TransactionState::Applying
+                        | super::TransactionState::RollingBack
+                        | super::TransactionState::Conflicted
+                ))
+        {
+            return Err("invalid pending transaction alias publication".into());
+        }
+        let path = files::normalize(root, &change.path)?;
+        let key = if cfg!(windows) {
+            path.to_ascii_lowercase()
+        } else {
+            path.clone()
+        };
+        if path != change.path || !paths.insert(key) {
+            return Err("invalid duplicate transaction path".into());
+        }
+        for (image, content) in [
+            (&change.before, &change.before_bytes),
+            (&change.proposed, &change.proposed_bytes),
+        ] {
+            validate_image(image)?;
+            bytes = bytes.saturating_add(image.macos_acl.as_ref().map_or(0, Vec::len));
+            bytes = bytes.saturating_add(image.streams.values().map(Vec::len).sum::<usize>());
+            bytes = bytes.saturating_add(
+                image
+                    .xattrs
+                    .iter()
+                    .map(|(name, value)| name.len() + value.len())
+                    .sum::<usize>(),
+            );
+            if content.as_ref().map(|v| compute_sha256(v)) != image.hash {
+                return Err("transaction preimage/proposal hash mismatch".into());
+            }
+            if let Some(content) = content {
+                if content.len() > MAX_FILE_BYTES {
+                    return Err("transaction blob exceeds limit".into());
+                }
+                bytes = bytes.saturating_add(content.len());
+            }
+        }
+        if let Some(restored) = &change.restored {
+            validate_image(restored)?;
+            for (field, matches) in [
+                ("content", restored.hash == change.before.hash),
+                ("mode", restored.mode == change.before.mode),
+                ("access", restored.access == change.before.access),
+                (
+                    "windows_metadata",
+                    restored.windows_metadata == change.before.windows_metadata,
+                ),
+                ("owner", restored.unix_owner == change.before.unix_owner),
+                (
+                    "short_name",
+                    restored.windows_short_name == change.before.windows_short_name,
+                ),
+                ("macos_acl", restored.macos_acl == change.before.macos_acl),
+                ("xattrs", restored.xattrs == change.before.xattrs),
+                ("streams", restored.streams == change.before.streams),
+            ] {
+                if !matches {
+                    return Err(format!("transaction restore image mismatch: {field}"));
+                }
+            }
+        }
+        if change.before.hash.is_some() && change.before.identity.is_none() {
+            return Err("transaction preimage identity is missing".into());
+        }
+        for temp in [
+            change.staged_name.as_deref(),
+            change.restore_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let id = temp
+                .strip_prefix(".davinci-txn-")
+                .and_then(|s| s.strip_suffix(".tmp"))
+                .ok_or("invalid transaction staging name")?;
+            valid_id(id)?;
+        }
+    }
+    if !record.summary.path_receipts.is_empty() {
+        if record.summary.path_receipts.len() != record.changes.len()
+            || record
+                .summary
+                .path_receipts
+                .keys()
+                .any(|path| !record.summary.affected_files.contains(path))
+        {
+            return Err("transaction path receipt summary mismatch".into());
+        }
+        for change in &record.changes {
+            let Some(receipt) = record.summary.path_receipts.get(&change.path) else {
+                return Err("transaction path receipt is missing".into());
+            };
+            if receipt.before_hash != change.before.hash
+                || receipt.proposed_hash != change.proposed.hash
+                || (receipt.applied_hash.is_some() && receipt.applied_hash != change.proposed.hash)
+                || receipt.state.is_empty()
+                || receipt.state.len() > 64
+                || receipt.sequence == 0
+                || receipt.sequence > record.summary.sequence
+            {
+                return Err("invalid transaction path receipt".into());
+            }
+        }
+    }
+    if bytes > MAX_TRANSACTION_BYTES {
+        return Err("transaction exceeds byte limit".into());
+    }
+    if record.summary.affected_files
+        != record
+            .changes
+            .iter()
+            .map(|c| c.path.clone())
+            .collect::<Vec<_>>()
+    {
+        return Err("transaction file summary mismatch".into());
+    }
+    if record.summary.before_hashes.len() != record.changes.len()
+        || record.summary.proposed_hashes.len() != record.changes.len()
+        || record
+            .summary
+            .applied_hashes
+            .iter()
+            .any(|(path, hash)| record.summary.proposed_hashes.get(path) != Some(hash))
+    {
+        return Err("transaction hash summary mismatch".into());
+    }
+    for change in &record.changes {
+        if record.summary.before_hashes.get(&change.path) != Some(&change.before.hash)
+            || record.summary.proposed_hashes.get(&change.path) != Some(&change.proposed.hash)
+        {
+            return Err("transaction hash summary mismatch".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_image(image: &Image) -> Result<(), String> {
+    super::windows_metadata::validate_short_name(&image.windows_short_name)?;
+    if !image.windows_short_name.is_empty() && (!cfg!(windows) || image.hash.is_none()) {
+        return Err("invalid transaction short name".into());
+    }
+    #[cfg(windows)]
+    if let Some(metadata) = &image.windows_metadata {
+        super::windows_metadata::ensure_snapshot_attributes(metadata.attributes)?;
+    }
+    if cfg!(windows) && image.identity.is_some() && image.windows_metadata.is_none() {
+        return Err("missing Windows transaction metadata".into());
+    }
+    if image.windows_metadata.is_some() && !cfg!(windows) {
+        return Err("Windows transaction metadata on unsupported platform".into());
+    }
+    if let Some(acl) = &image.macos_acl {
+        super::macos_acl::validate(acl)?;
+        if !cfg!(target_os = "macos") {
+            return Err("macOS transaction ACL on unsupported platform".into());
+        }
+    }
+    super::unix_xattrs::validate(&image.xattrs)?;
+    #[cfg(not(unix))]
+    if !image.xattrs.is_empty() {
+        return Err("Unix transaction attributes on unsupported platform".into());
+    }
+    if image.unix_owner.is_some_and(|ids| ids.contains(&u32::MAX)) {
+        return Err("invalid transaction Unix ownership".into());
+    }
+    #[cfg(not(unix))]
+    if image.unix_owner.is_some() {
+        return Err("Unix transaction ownership on unsupported platform".into());
+    }
+    #[cfg(windows)]
+    super::windows_streams::validate(&image.streams)?;
+    #[cfg(not(windows))]
+    if !image.streams.is_empty() {
+        return Err("Windows transaction streams on unsupported platform".into());
+    }
+    if image.hash.is_none()
+        && (image.identity.is_some()
+            || image.mode.is_some()
+            || image.access.is_some()
+            || image.windows_metadata.is_some()
+            || image.unix_owner.is_some()
+            || image.macos_acl.is_some()
+            || !image.xattrs.is_empty()
+            || !image.streams.is_empty())
+    {
+        return Err("invalid missing transaction image".into());
+    }
+    if image.access.as_ref().is_some_and(|s| {
+        s.len() > 64 * 1024 || !(s.starts_with("D:") || s.starts_with("O:")) || s.contains('\0')
+    }) {
+        return Err("invalid transaction access permissions".into());
+    }
+    let max_mode = if cfg!(unix) { 0o7777 } else { 0o777 };
+    if image.hash.is_some() && image.mode.is_none_or(|mode| mode > max_mode) {
+        return Err("invalid transaction file mode".into());
+    }
+    if image.identity.as_ref().is_some_and(|id| {
+        id.len() > 128 || id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit() || b == b':')
+    }) {
+        return Err("invalid transaction file identity".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::super::{ProposedChange, TransactionCoordinator, TransactionState};
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn transaction_rejects_legacy_or_incomplete_windows_images_without_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), b"before").unwrap();
+        let owner = TransactionOwner::default();
+        let manager = TransactionCoordinator::new(&root, owner.clone()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("file.txt", b"after".to_vec())])
+            .unwrap();
+        let store = Store::open(&root).unwrap();
+        let original = store.load(&preview.id, &root, &owner, false).unwrap();
+        for case in ["legacy", "legacy_v2", "missing", "encrypted"] {
+            let mut record = original.clone();
+            let expected = if case.starts_with("legacy") {
+                record.schema = if case == "legacy_v2" { 2 } else { 1 };
+                "unsupported transaction journal schema; preserve the record for recovery with its original version"
+            } else if case == "missing" {
+                record.changes[0].before.windows_metadata = None;
+                "missing Windows transaction metadata"
+            } else {
+                record.changes[0]
+                    .before
+                    .windows_metadata
+                    .as_mut()
+                    .unwrap()
+                    .attributes |= 0x4000;
+                "transaction cannot journal an encrypted Windows file"
+            };
+            store.save(&record).unwrap();
+            assert_eq!(
+                manager.apply(&preview.id, &|_| Ok(()), None).unwrap_err(),
+                expected
+            );
+            assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"before");
+            let bytes =
+                std::fs::read(root.join(STORE_NAME).join(format!("{}.json", preview.id))).unwrap();
+            assert_eq!(bytes, serde_json::to_vec(&record).unwrap());
+        }
+    }
+
+    #[test]
+    fn transaction_restore_mismatch_identifies_field_without_metadata_values() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), b"private contents").unwrap();
+        let owner = TransactionOwner::default();
+        let manager = TransactionCoordinator::new(&root, owner.clone()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("file.txt", b"after".to_vec())])
+            .unwrap();
+        let store = Store::open(&root).unwrap();
+        let mut record = store.load(&preview.id, &root, &owner, false).unwrap();
+        let mut restored = record.changes[0].before.clone();
+        restored.mode = Some(restored.mode.unwrap() ^ 0o200);
+        record.changes[0].restored = Some(restored);
+        assert_eq!(
+            validate(&record, &root).unwrap_err(),
+            "transaction restore image mismatch: mode"
+        );
+    }
+
+    #[test]
+    fn transaction_unix_ownership_validation_rejects_invalid_images() {
+        let mut image = Image::missing();
+        image.unix_owner = Some([1000, 100]);
+        assert!(validate_image(&image).is_err());
+        image.hash = Some("hash".into());
+        image.identity = Some("1:2".into());
+        image.mode = Some(0o644);
+        image.unix_owner = Some([u32::MAX, 100]);
+        assert!(validate_image(&image).is_err());
+        image.unix_owner = Some([1000, u32::MAX]);
+        assert!(validate_image(&image).is_err());
+        image.unix_owner = Some([1000, 100]);
+        assert_eq!(validate_image(&image).is_ok(), cfg!(unix));
+    }
+
+    thread_local! {
+        static FAIL_WRITE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn inject_write_failure(
+        file: &mut std::fs::File,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let fail = FAIL_WRITE.with(|remaining| {
+            let value = remaining.get();
+            remaining.set(value.saturating_sub(1));
+            value == 1
+        });
+        if fail {
+            file.write_all(&bytes[..bytes.len().min(3)])?;
+            return Err(std::io::Error::other("injected partial journal write"));
+        }
+        Ok(())
+    }
+
+    fn fail_write<T>(index: usize, operation: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_WRITE.with(|remaining| remaining.set(0));
+            }
+        }
+        FAIL_WRITE.with(|remaining| remaining.set(index));
+        let _reset = Reset;
+        operation()
+    }
+
+    #[test]
+    fn transaction_journal_failure_windows_remain_recoverable() {
+        for failed_write in 1..=3 {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), b"before").unwrap();
+            let owner = TransactionOwner::default();
+            let manager = TransactionCoordinator::new(root.path(), owner.clone()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
+                .unwrap();
+            let result = fail_write(failed_write, || {
+                manager.apply(&preview.id, &|_| Ok(()), None)
+            });
+            assert!(result.is_err(), "failure point {failed_write}");
+            assert_eq!(
+                std::fs::read(root.path().join("a.txt")).unwrap(),
+                if failed_write == 3 {
+                    b"after".as_slice()
+                } else {
+                    b"before".as_slice()
+                }
+            );
+            let store = Store::open(&root.path().canonicalize().unwrap()).unwrap();
+            assert_eq!(store.active().unwrap().is_some(), failed_write != 1);
+            assert_eq!(
+                manager.status(&preview.id).unwrap().state,
+                if failed_write == 3 {
+                    TransactionState::Applying
+                } else {
+                    TransactionState::Previewed
+                }
+            );
+            let recovered = TransactionCoordinator::new(root.path(), owner).unwrap();
+            recovered.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+            assert_eq!(std::fs::read(root.path().join("a.txt")).unwrap(), b"before");
+            assert_eq!(
+                recovered.status(&preview.id).unwrap().state,
+                TransactionState::RolledBack
+            );
+            assert!(store.active().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn transaction_marker_partial_write_is_not_published() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().canonicalize().unwrap()).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let result = store.atomic_with("active.json", id.as_bytes(), true, |file, bytes| {
+            file.write_all(&bytes[..5])?;
+            Err(std::io::Error::other("injected storage write failure"))
+        });
+        assert!(result.is_err());
+        assert!(store.active().unwrap().is_none());
+        assert!(store
+            .directory
+            .names()
+            .unwrap()
+            .iter()
+            .all(|name| !name.ends_with(".tmp")));
+        store.begin(&id).unwrap();
+        assert_eq!(store.active().unwrap().as_deref(), Some(id.as_str()));
+        let other = uuid::Uuid::new_v4().to_string();
+        assert!(store.begin(&other).is_err());
+        assert_eq!(store.active().unwrap().as_deref(), Some(id.as_str()));
+        store.finish(&id).unwrap();
+        assert!(store.active().unwrap().is_none());
+    }
+
+    #[test]
+    fn transaction_rollback_journal_failures_recover_without_orphan_stages() {
+        for failed_write in 1..=3 {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), b"before").unwrap();
+            let owner = TransactionOwner::default();
+            let manager = TransactionCoordinator::new(root.path(), owner.clone()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
+                .unwrap();
+            manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+            let error = fail_write(failed_write, || {
+                manager.rollback(&preview.id, &|_| Ok(()), None)
+            })
+            .unwrap_err();
+            assert!(error.contains("injected"), "{error}");
+            assert_eq!(
+                std::fs::read(root.path().join("a.txt")).unwrap(),
+                if failed_write == 3 {
+                    b"before".as_slice()
+                } else {
+                    b"after".as_slice()
+                }
+            );
+            let recovered = TransactionCoordinator::new(root.path(), owner).unwrap();
+            recovered.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+            assert_eq!(std::fs::read(root.path().join("a.txt")).unwrap(), b"before");
+            assert_eq!(
+                recovered.status(&preview.id).unwrap().state,
+                TransactionState::RolledBack
+            );
+            assert!(Store::open(&root.path().canonicalize().unwrap())
+                .unwrap()
+                .active()
+                .unwrap()
+                .is_none());
+            assert!(
+                std::fs::read_dir(root.path())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".davinci-txn-")),
+                "orphan source stage after failure point {failed_write}"
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_record_partial_write_preserves_previous_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().canonicalize().unwrap()).unwrap();
+        let name = "fixture.json";
+        store.atomic(name, b"previous durable journal").unwrap();
+        assert!(store
+            .atomic_with(name, b"replacement journal", false, |file, bytes| {
+                file.write_all(&bytes[..3])?;
+                Err(std::io::Error::other("injected storage write failure"))
+            })
+            .is_err());
+        let mut bytes = Vec::new();
+        store
+            .directory
+            .file(name, false)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"previous durable journal");
+        assert!(store
+            .directory
+            .names()
+            .unwrap()
+            .iter()
+            .all(|name| !name.ends_with(".tmp")));
+    }
+}

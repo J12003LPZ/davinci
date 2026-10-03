@@ -1,0 +1,67 @@
+name: Runtime recovery
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-recovery-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  runtime-recovery:
+    name: Runtime recovery (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: runtime-recovery-${{ matrix.os }}
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Deterministic operation properties and crash recovery
+        run: cargo test -p davinci-agent --locked --test operation_properties --test operation_crash
+      - name: Journal migration and capacity boundaries
+        run: cargo test -p davinci-agent --locked --test operation_journal --test operation_migration --test operation_capacity
+      - name: CLI inspector and recovery end to end
+        run: cargo test -p davinci-coding-agent --locked --test runtime_recovery_e2e --test runtime_inspect
+      - name: Graph retention and recovery boundary
+        run: cargo test -p davinci-coding-agent --locked --lib native_extensions::graph::store::tests::operation_referenced_terminal_run_is_retained_until_archived
+      - name: Platform process and filesystem boundary
+        run: cargo test -p davinci-agent --locked --lib process_manager::socket_owner
+
+  bounded-mutation-schedule:
+    name: Optional bounded mutation fuzz gate
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: runtime-recovery-fuzz
+      - name: Run the stable bounded mutation harness
+        run: cargo test -p davinci-agent --locked --test operation_properties bounded_mutation_fuzz_never_panics_parser_or_reducer -- --nocapture

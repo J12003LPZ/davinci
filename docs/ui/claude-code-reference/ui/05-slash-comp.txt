@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.281
+           Opus 5.5 with high effort · <plan>
+           ~\project
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  /compact                                        Free up context by summarizing the conversation so far
+  /competitive-report-structure                   Use after benchmark-methodology has produced scored competitor
+                                                  profile cards. Assembles findings into a decision-grade report: lan…
+  /competitive-platform-analysis                  Use when scoping a competitive landscape — identifying,
+                                                  categorising, and score-filtering a competitor set before any bench…
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /comp
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
