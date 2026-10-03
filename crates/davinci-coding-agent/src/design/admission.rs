@@ -94,7 +94,7 @@ impl AuthorizedDesignContext {
             .as_ref()
         {
             contract
-                .check_call(&self.workspace, "read", &args)
+                .check_source_read(&self.workspace, path)
                 .map_err(|e| DesignError::Denied(e.to_string()))?;
         }
         let policy = self

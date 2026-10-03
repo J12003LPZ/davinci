@@ -31,7 +31,6 @@ try {
       else throw new Error('Nonregular runtime file');
     }
   }
-  visit(root);
   const playwright = require('playwright-core');
   const executable = fs.realpathSync(playwright.chromium.executablePath());
   let directory = path.dirname(executable);
@@ -53,7 +52,8 @@ try {
   visitBrowser(directory);
   const browser={cache:path.dirname(directory),directory,executable,files:browserFiles};
   const fontDirectories=process.platform==='win32'?[path.join(process.env.WINDIR||'C:\\Windows','Fonts')]:process.platform==='darwin'?['/System/Library/Fonts','/Library/Fonts']:['/usr/share/fonts','/usr/local/share/fonts'];
-  const fonts=fontDirectories.filter(directory=>fs.existsSync(directory)).map(directory=>{
+  const installedFonts=fontDirectories.filter(directory=>fs.existsSync(directory));
+  const fonts=process.platform==='linux' ? [require('./font-snapshot.cjs').snapshotFonts(installedFonts,path.join(root,'fonts'))] : installedFonts.map(directory=>{
     const files={};
     function visitFont(current){
       for(const entry of fs.readdirSync(current,{withFileTypes:true})){
@@ -67,6 +67,11 @@ try {
     visitFont(directory);return {directory:fs.realpathSync(directory),files};
   });
   if(!fonts.some(font=>Object.keys(font.files).length))throw new Error('No installed fonts to pin');
+  if(process.platform==='linux') {
+    // No system/user config includes: only the regular, pinned copies are used.
+    fs.writeFileSync(path.join(root,'fonts.conf'),'<?xml version="1.0"?>\n<fontconfig><reset-dirs/><dir prefix="relative">fonts</dir><cachedir prefix="xdg">fontconfig</cachedir></fontconfig>\n');
+  }
+  visit(root);
   fs.writeFileSync(path.join(root,'runtime-manifest.json'),JSON.stringify({schema_version:1,node_version:process.versions.node,node_sha256:hash(process.execPath),files,browser,fonts},null,2)+'\n');
   process.stdout.write(JSON.stringify({directory:root,node:process.execPath,files:Object.keys(files).length})+'\n');
 } catch(error) {

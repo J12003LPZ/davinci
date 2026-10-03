@@ -207,7 +207,7 @@ pub(crate) fn capture_inner(
     let package = runtime.root.join("node_modules/playwright-core");
     let browser = BrowserProcess::start_design(supervisor, BrowserProcessConfig {
         node:&runtime.node, package:&package, version:"1.62.1", workspace:ctx.workspace(),
-        environment:BTreeMap::from([("PLAYWRIGHT_BROWSERS_PATH".into(),runtime.browser().cache.to_string_lossy().into_owned())]),
+        environment:runtime.browser_environment(),
     }, &json!({"files":compiled.files,"assets":assets,"theme":request.theme,"reducedMotion":request.reduced_motion,"executable":runtime.browser().executable}))
         .map_err(DesignError::MissingCapability)?;
     let send = |command: Value| {

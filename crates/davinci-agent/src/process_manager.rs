@@ -218,7 +218,7 @@ impl ProcessManager {
             .as_ref()
         {
             contract
-                .check_call(&cwd, "read", &args)
+                .check_source_read(&cwd, path)
                 .map_err(|error| error.to_string())?;
         }
         match self

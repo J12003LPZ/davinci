@@ -101,6 +101,19 @@ impl TrustedDesignRuntime {
     pub(crate) fn browser(&self) -> &BrowserPin {
         &self.manifest.browser
     }
+    pub(crate) fn browser_environment(&self) -> BTreeMap<String, String> {
+        let mut environment = BTreeMap::from([(
+            "PLAYWRIGHT_BROWSERS_PATH".into(),
+            self.browser().cache.to_string_lossy().into_owned(),
+        )]);
+        if cfg!(target_os = "linux") {
+            environment.insert(
+                "FONTCONFIG_FILE".into(),
+                self.root.join("fonts.conf").to_string_lossy().into_owned(),
+            );
+        }
+        environment
+    }
     /// Host configuration only. Browser/model arguments cannot select these paths.
     pub fn load(node: &Path, root: &Path, workspace: &Path) -> DesignResult<Self> {
         no_links(node)?;
@@ -196,6 +209,15 @@ impl TrustedDesignRuntime {
                     "installed design runtime changed; reinstall explicitly".into(),
                 ));
             }
+        }
+        if cfg!(target_os = "linux")
+            && (!self.manifest.files.contains_key("fonts.conf")
+                || self.manifest.fonts.len() != 1
+                || self.manifest.fonts[0].directory != self.root.join("fonts"))
+        {
+            return Err(DesignError::MissingCapability(
+                "reinstall the runtime with its pinned Linux font snapshot".into(),
+            ));
         }
         let mut pending = vec![self.root.clone()];
         let mut count = 0usize;

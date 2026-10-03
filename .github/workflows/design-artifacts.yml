@@ -52,6 +52,8 @@ jobs:
         run: python scripts/test-design.py
       - name: Durable design publication interruption boundaries
         run: cargo test -p davinci-coding-agent --lib design::publication_tests --locked
+      - name: Recovery after physical process termination
+        run: cargo test -p davinci-coding-agent --lib design::termination_tests::physical_termination --locked
       - name: Install locked companion development tools
         run: npm --prefix crates/davinci-coding-agent/design-ui ci
       - run: npm --prefix crates/davinci-coding-agent/design-ui run typecheck
@@ -117,4 +119,15 @@ jobs:
         with:
           name: design-native-linux
           path: ${{ env.DAVINCI_DESIGN_EVIDENCE }}
+          if-no-files-found: warn
+      - name: Actual managed target handoff and retained screenshot
+        run: cargo test -p davinci-coding-agent --locked --test design_handoff native_target_flow -- --ignored --nocapture
+      - name: Preserve target handoff receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-target-linux
+          path: |
+            ${{ env.DAVINCI_DESIGN_EVIDENCE }}/target-handoff.json
+            ${{ env.DAVINCI_DESIGN_EVIDENCE }}/target-handoff.png
           if-no-files-found: warn

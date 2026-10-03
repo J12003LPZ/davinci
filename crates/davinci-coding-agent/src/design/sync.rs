@@ -128,7 +128,11 @@ pub fn extract_system_at(
             .unwrap_or_default()
             .to_string_lossy()
             .to_ascii_lowercase();
-        if !["css", "ts", "tsx", "jsx", "json"].contains(&extension.as_str()) {
+        if ![
+            "css", "ts", "tsx", "js", "jsx", "mjs", "cjs", "html", "json",
+        ]
+        .contains(&extension.as_str())
+        {
             continue;
         }
         // JSON is allowed only for the package manifest; other project data may be private.

@@ -1,9 +1,9 @@
 'use strict';
 const http = require('node:http');
 const crypto = require('node:crypto');
-const OPERATIONS = new Set(['list','status','read','read_binding','capture','geometry','create','generate','verify','render','edit','comment','fork','restore','accept','export','apply','draft_implementation','prepare_implementation','sync','cancel','close','job_poll','job_cancel']);
+const OPERATIONS = new Set(['list','status','read','read_binding','capture','geometry','create','generate','verify','render','edit','comment','fork','restore','accept','export','apply','draft_implementation','prepare_implementation','verify_implementation','sync','cancel','close','job_poll','job_cancel']);
 OPERATIONS.add('interact');
-const LONG_OPERATIONS = new Set(['generate','verify','render','interact','draft_implementation']);
+const LONG_OPERATIONS = new Set(['generate','verify','render','interact','draft_implementation','verify_implementation']);
 const MAX_BODY = 1024 * 1024;
 const MAX_RESPONSE = 256 * 1024;
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'";

@@ -24,7 +24,7 @@ export async function call<T>(operation: string, payload: object, signal?: Abort
   signal?.throwIfAborted();
   // Receive the job identity even if cancelled during dispatch so cancellation
   // reaches the native operation instead of orphaning it until its deadline.
-  const longOperation=["generate","verify","render","interact","draft_implementation"].includes(operation);
+  const longOperation=["generate","verify","render","interact","draft_implementation","verify_implementation"].includes(operation);
   const value=await request(operation,payload,longOperation?undefined:signal);
   if(!value.job)return value.result as T;
   const job=value.job;

@@ -97,9 +97,9 @@ fn artifact(
         DesignChange::Created { manifest } | DesignChange::Forked { manifest, .. } => {
             Some(manifest.id)
         }
-        DesignChange::Revision { artifact_id, .. } | DesignChange::Cancelled { artifact_id } => {
-            Some(*artifact_id)
-        }
+        DesignChange::Revision { artifact_id, .. }
+        | DesignChange::Cancelled { artifact_id }
+        | DesignChange::HandoffChecked { artifact_id, .. } => Some(*artifact_id),
         DesignChange::Comment { comment } => Some(comment.artifact_id),
         DesignChange::Rendered { receipt } => Some(receipt.request.artifact_id),
         DesignChange::Accepted { revision, .. } => Some(revision.artifact_id),

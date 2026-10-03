@@ -554,6 +554,7 @@ pub struct Agent {
     /// Cross-thread interrupt: set from the UI thread while `run_loop` runs
     /// on a worker. Checked at every loop step alongside `aborted`.
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) host_command_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Counters for the run (`stats.rs`): turns, batch widths, wall time,
     /// peak context, prunings. Read them through `run_stats`, which also
     /// folds in the counters bumped from inside tool calls.
@@ -742,6 +743,7 @@ impl Agent {
             reload_count: 0,
             event_sink: None,
             abort_signal: None,
+            host_command_abort: None,
             stats: RunStats::default(),
             observation_root_id: uuid::Uuid::new_v4().to_string(),
             root_budget: None,

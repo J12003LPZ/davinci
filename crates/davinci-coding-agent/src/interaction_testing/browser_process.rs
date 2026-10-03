@@ -180,6 +180,9 @@ impl BrowserProcess {
                 return Err("browser host directory must be outside the workspace".into());
             }
             if config.environment.keys().any(|name| {
+                if design.is_some() && cfg!(target_os = "linux") && name == "FONTCONFIG_FILE" {
+                    return false;
+                }
                 !matches!(
                     name.as_str(),
                     "PATH"
@@ -206,6 +209,12 @@ impl BrowserProcess {
                 }
             }
             let mut environment = config.environment;
+            if design.is_some() && cfg!(target_os = "linux") {
+                environment.insert(
+                    "XDG_CACHE_HOME".into(),
+                    directory.join("font-cache").to_string_lossy().into_owned(),
+                );
+            }
             if diagnostics {
                 environment.insert("DAVINCI_BROWSER_DIAGNOSTICS".into(), "1".into());
             }

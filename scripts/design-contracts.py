@@ -51,7 +51,7 @@ def generate():
     types_source = (SOURCE / "types.rs").read_text()
     ids = [name.strip() for name in re.search(r"opaque_id!\(([^)]+)\)", types_source)[1].split(",") if name.strip()]
     names.update(ids)
-    for filename in ["types.rs", "blob.rs", "records.rs", "controller.rs", "commands.rs", "export.rs", "acceptance.rs", "sync.rs", "generation.rs", "handoff.rs", "handoff_draft.rs", "interaction.rs"]:
+    for filename in ["types.rs", "blob.rs", "records.rs", "controller.rs", "commands.rs", "export.rs", "acceptance.rs", "sync.rs", "generation.rs", "handoff.rs", "handoff_draft.rs", "handoff_verification.rs", "interaction.rs"]:
         source = (SOURCE / filename).read_text()
         for match in re.finditer(r"pub (struct|enum) (\w+)\s*\{", source):
             kind, name = match.groups()
@@ -64,7 +64,7 @@ def generate():
 
     def wire_type(value, attributes=""):
         value = value.strip()
-        value = re.sub(r"super::(?:export|acceptance|sync|generation|handoff|handoff_draft|interaction)::", "", value)
+        value = re.sub(r"super::(?:export|acceptance|sync|generation|handoff|handoff_draft|handoff_verification|interaction)::", "", value)
         primitives = {"String": "string", "bool": "boolean", "u32": "number", "i64": "number", "serde_json::Value": "unknown"}
         if value == "u64":
             if not re.search(r'with\s*=\s*"decimal_u64"', attributes):

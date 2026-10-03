@@ -28,6 +28,17 @@ pub(crate) fn design_sandbox(
     }))
     .map_err(|_| "invalid design sandbox")?;
     let mut paths = vec![node.to_path_buf(), package.to_path_buf(), cache];
+    if cfg!(target_os = "linux") {
+        let config = Path::new(
+            environment
+                .get("FONTCONFIG_FILE")
+                .ok_or("pinned font configuration required")?,
+        );
+        super::runtime::no_links(config).map_err(|e| e.to_string())?;
+        let root = config.parent().ok_or("font runtime root unavailable")?;
+        paths.push(config.to_path_buf());
+        paths.push(root.join("fonts"));
+    }
     #[cfg(unix)]
     for system in [
         "/usr",

@@ -29,6 +29,9 @@ pub enum DesignRequest {
     Apply {
         request: super::handoff::ApproveHandoff,
     },
+    VerifyImplementation {
+        request: super::handoff_verification::VerifyHandoff,
+    },
     Status {
         artifact_id: ArtifactId,
     },
@@ -109,6 +112,7 @@ impl DesignRequest {
             Self::DraftImplementation { .. } | Self::PrepareImplementation { .. } => {
                 "design_handoff"
             }
+            Self::VerifyImplementation { .. } => "design_check",
             Self::Apply { .. } => "design_apply",
             Self::Edit { .. } | Self::Comment { .. } | Self::Restore { .. } => "design_patch",
             Self::Verify { .. } | Self::Render { .. } | Self::Interact { .. } => "design_render",
@@ -199,6 +203,28 @@ impl DesignController {
         if let DesignRequest::Apply { request } = request {
             return super::handoff::approve_handoff(&self.store, agent, workspace, request);
         }
+        if let DesignRequest::VerifyImplementation { request } = request {
+            let directory = davinci_session::default_agent_dir();
+            let mut config = crate::settings::load_settings(&directory)
+                .browser_verification
+                .unwrap_or_default();
+            // Project settings may disable this owner, never select its executable.
+            if crate::settings::load_merged_settings(&directory, workspace)
+                .browser_verification
+                .as_ref()
+                .is_some_and(|settings| !settings.enabled)
+            {
+                config.enabled = false;
+            }
+            return super::handoff_verification::verify_handoff(
+                &self.store,
+                agent,
+                workspace,
+                request,
+                config,
+                cancel,
+            );
+        }
         let args = serde_json::to_value(&request)?;
         let ctx =
             AuthorizedDesignContext::for_operation(agent, workspace, request.authority(), &args)?;
@@ -216,6 +242,7 @@ impl DesignController {
             DesignRequest::Generate { .. }
             | DesignRequest::DraftImplementation { .. }
             | DesignRequest::PrepareImplementation { .. }
+            | DesignRequest::VerifyImplementation { .. }
             | DesignRequest::Apply { .. } => {
                 unreachable!("agent operations handled before borrowing the session writer")
             }

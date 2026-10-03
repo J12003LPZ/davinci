@@ -6,8 +6,361 @@ use davinci_coding_agent::design::handoff::validate_candidate;
 use davinci_coding_agent::design::{
     admission::*, events::*, handoff::*, records::*, store::*, types::*,
 };
+use davinci_coding_agent::{
+    design::handoff_verification::*, native_extensions::browser::BrowserConfig,
+};
 use davinci_session::{custom_entry, JsonlSession};
 use std::{collections::BTreeMap, path::Path, process::Command};
+
+fn target_check_fixture() -> (
+    tempfile::TempDir,
+    Agent,
+    DesignStore,
+    PreparedHandoff,
+    VerifyHandoff,
+) {
+    let (dir, mut agent, store, mut request) = fixture(true);
+    let root = agent.cwd.clone();
+    std::fs::write(root.join("verify.test.cjs"), "const {test}=require('node:test'); const assert=require('node:assert/strict'); test('target fixture',()=>assert.equal(1+1,2));\n").unwrap();
+    git(&root, &["add", "verify.test.cjs"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "target check fixture",
+        ],
+    );
+    request.verification = vec![
+        "node --check verify.test.cjs".into(),
+        "node --test --test-reporter=tap verify.test.cjs".into(),
+    ];
+    agent.tool_context.foreground_supervisor =
+        Some(davinci_agent::jobs::supervisor::SupervisorCommand {
+            executable: env!("CARGO_BIN_EXE_davinci").into(),
+            argv: vec!["--internal-process-supervisor".into()],
+        });
+    let prepared = prepare_handoff(&store, &mut agent, &root, request).unwrap();
+    let check = VerifyHandoff {
+        proposal_id: prepared.proposal.request.operation_id,
+        proposal_hash: prepared.proposal_hash.clone(),
+        build_command: prepared.proposal.request.verification[0].clone(),
+        test_command: prepared.proposal.request.verification[1].clone(),
+        timeout_ms: 15_000,
+        browser: None,
+        operation_id: OperationId::new(),
+    };
+    (dir, agent, store, prepared, check)
+}
+
+#[test]
+fn target_checks_collect_actual_discovery_without_certifying_mock_or_rsc_coverage() {
+    let (_dir, mut agent, store, prepared, check) = target_check_fixture();
+    let root = agent.cwd.clone();
+    assert!(verify_handoff(
+        &store,
+        &mut agent,
+        &root,
+        check.clone(),
+        BrowserConfig::default(),
+        None
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("apply this exact proposal"));
+    approve_handoff(
+        &store,
+        &mut agent,
+        &root,
+        ApproveHandoff {
+            proposal_id: check.proposal_id,
+            proposal_hash: prepared.proposal_hash,
+            operation_id: OperationId::new(),
+        },
+    )
+    .unwrap();
+    let mut unreviewed = check.clone();
+    unreviewed.build_command = "npm install".into();
+    assert!(verify_handoff(
+        &store,
+        &mut agent,
+        &root,
+        unreviewed,
+        BrowserConfig::default(),
+        None
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("verbatim"));
+    let report = verify_handoff(
+        &store,
+        &mut agent,
+        &root,
+        check.clone(),
+        BrowserConfig::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(report["state"], "complete", "{report}");
+    assert_eq!(report["commands"].as_array().unwrap().len(), 2, "{report}");
+    assert_eq!(
+        report["commands"][1]["receipt"]["assertion_counts"]["passed"], 1,
+        "{report}"
+    );
+    assert_eq!(report["checks_passed"], false);
+    assert_eq!(report["implementation"], "pending_verification");
+    assert!(report["incomplete_coverage"][0]
+        .as_str()
+        .unwrap()
+        .contains("RSC/client"));
+    assert!(report["incomplete_coverage"][0]
+        .as_str()
+        .unwrap()
+        .contains("mock removal"));
+    assert_eq!(
+        verify_handoff(
+            &store,
+            &mut agent,
+            &root,
+            check.clone(),
+            BrowserConfig::default(),
+            None
+        )
+        .unwrap(),
+        report
+    );
+    let test_source = std::fs::read(root.join("verify.test.cjs")).unwrap();
+    std::fs::write(root.join("verify.test.cjs"), "changed test").unwrap();
+    assert!(verify_handoff(
+        &store,
+        &mut agent,
+        &root,
+        check.clone(),
+        BrowserConfig::default(),
+        None
+    )
+    .is_err());
+    std::fs::write(root.join("verify.test.cjs"), test_source).unwrap();
+    std::fs::write(root.join("app.tsx"), "concurrent edit").unwrap();
+    assert!(verify_handoff(
+        &store,
+        &mut agent,
+        &root,
+        check,
+        BrowserConfig::default(),
+        None
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join("app.tsx")).unwrap(),
+        "concurrent edit"
+    );
+}
+
+#[test]
+fn host_commands_obey_hook_veto_and_cancellation() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let (_dir, mut agent, _store, _prepared, _) = target_check_fixture();
+    let root = agent.cwd.clone();
+    let command = "node --check verify.test.cjs";
+    agent.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(|_, _| {
+        Some("fixture veto".into())
+    })));
+    assert!(agent
+        .execute_host_verification_command(&root, command, 15_000, Arc::new(AtomicBool::new(false)))
+        .is_err());
+    agent.pre_tool = None;
+    let cancelled = Arc::new(AtomicBool::new(true));
+    assert!(agent
+        .execute_host_verification_command(&root, command, 15_000, cancelled.clone())
+        .is_err());
+    cancelled.store(false, Ordering::Release);
+    let ready = root.join("cancel-ready");
+    let began = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            cancelled.store(true, Ordering::Release);
+        });
+        let result = agent.execute_host_verification_command(
+            &root,
+            "node -e 'require(\"node:fs\").writeFileSync(\"cancel-ready\",\"ready\");setTimeout(()=>{},30000)'",
+            15_000,
+            cancelled.clone(),
+        );
+        assert!(ready.exists(), "child must start before cancellation");
+        assert!(result.unwrap_err().contains("verification cancelled"));
+    });
+    assert!(began.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+#[ignore = "requires an explicitly installed trusted browser package and Node executable"]
+fn native_target_flow_retains_screenshot_after_browser_owner_closes() {
+    use davinci_agent::process_manager::ProcessManager;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+    let (_dir, mut agent, store, prepared, mut check) = target_check_fixture();
+    let root = agent.cwd.clone();
+    let config = BrowserConfig {
+        enabled: true,
+        node: std::env::var_os("DAVINCI_DESIGN_NODE")
+            .expect("explicit Node")
+            .into(),
+        package: Path::new(&std::env::var_os("DAVINCI_DESIGN_RUNTIME").expect("explicit runtime"))
+            .join("node_modules/playwright-core"),
+        version: "1.62.1".into(),
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let manager = ProcessManager::new(
+        &root,
+        agent.tool_context.jobs.clone(),
+        agent.permissions.clone(),
+        agent.tool_context.foreground_supervisor.clone().unwrap(),
+    )
+    .unwrap();
+    agent.tool_context.processes = Some(manager.clone());
+    let script = format!(
+        r#"const http=require('node:http'),fs=require('node:fs');http.createServer((q,r)=>{{r.setHeader('Content-Type','text/html');r.end('<!doctype html><title>Target fixture</title>'+fs.readFileSync('app.tsx','utf8').match(/<h1>.*<\/h1>/)[0]+'<button onclick="this.textContent=\'Saved locally\'">Continue</button>')}}).listen({port},'127.0.0.1')"#
+    );
+    let started = manager
+        .execute(
+            &root,
+            "process_start",
+            &json!({"executable":config.node,
+        "argv":["-e",script],"ports":[port]}),
+            None,
+            None,
+        )
+        .unwrap();
+    let id = started.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_err() {
+        assert!(Instant::now() < deadline, "managed target never listened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    approve_handoff(
+        &store,
+        &mut agent,
+        &root,
+        ApproveHandoff {
+            proposal_id: check.proposal_id,
+            proposal_hash: prepared.proposal_hash,
+            operation_id: OperationId::new(),
+        },
+    )
+    .unwrap();
+    check.browser = Some(TargetBrowserCheck {
+        process_id: id,
+        port: port.into(),
+        path: "/".into(),
+        actions: vec![TargetBrowserAction {
+            tool: "browser_click".into(),
+            args: json!({"selector":{"kind":"role","role":"button","name":"Continue"}}),
+        }],
+        dom_contains: "Saved locally".into(),
+        accessibility_contains: "Saved locally".into(),
+    });
+    let report = verify_handoff(&store, &mut agent, &root, check, config, None).unwrap();
+    manager.shutdown();
+    assert_eq!(report["checks_passed"], true, "{report}");
+    assert_eq!(report["implementation"], "pending_verification");
+    let ctx = AuthorizedDesignContext::from_agent(&agent, &root).unwrap();
+    let screenshot: ArtifactRef =
+        serde_json::from_value(report["browser"]["screenshot"].clone()).unwrap();
+    let bytes = davinci_agent::runtime::evidence_store::VerificationEvidenceStore::new(
+        store.blob_directory(&ctx),
+    )
+    .get_artifact(&(&screenshot).into())
+    .unwrap();
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    if let Some(directory) = std::env::var_os("DAVINCI_DESIGN_EVIDENCE") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("target-handoff.png"), bytes).unwrap();
+        std::fs::write(
+            directory.join("target-handoff.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "target process tree survived shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn interrupted_target_checks_require_an_explicit_new_operation() {
+    let (_dir, mut agent, store, prepared, check) = target_check_fixture();
+    let root = agent.cwd.clone();
+    approve_handoff(
+        &store,
+        &mut agent,
+        &root,
+        ApproveHandoff {
+            proposal_id: check.proposal_id,
+            proposal_hash: prepared.proposal_hash,
+            operation_id: OperationId::new(),
+        },
+    )
+    .unwrap();
+    let ctx = AuthorizedDesignContext::from_agent(&agent, &root).unwrap();
+    let reference = davinci_agent::runtime::evidence_store::VerificationEvidenceStore::new(
+        store.blob_directory(&ctx),
+    )
+    .store_artifact("application/json", br#"{"state":"running"}"#)
+    .unwrap();
+    // Reproduce the durable checkpoint left by a process that never finalized.
+    let event = DesignEvent {
+        schema_version: SchemaVersion,
+        owner_session: ctx.session_id().into(),
+        workspace: ctx.workspace_id().into(),
+        operation_id: check.operation_id,
+        payload_digest: digest(&check).unwrap(),
+        change: DesignChange::HandoffChecked {
+            artifact_id: prepared.proposal.request.artifact_id,
+            run_id: check.operation_id,
+            report: reference.into(),
+        },
+    };
+    agent
+        .session
+        .as_mut()
+        .unwrap()
+        .append_entry(custom_entry(
+            &check.operation_id.to_string(),
+            CUSTOM_TYPE,
+            serde_json::to_value(event).unwrap(),
+        ))
+        .unwrap();
+    let before = agent.session.as_ref().unwrap().entries.len();
+    let error = verify_handoff(
+        &store,
+        &mut agent,
+        &root,
+        check,
+        BrowserConfig::default(),
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("outcome is unknown"), "{error}");
+    assert_eq!(agent.session.as_ref().unwrap().entries.len(), before);
+}
 
 #[test]
 fn handoff_requires_concrete_validation_and_rejects_unbounded_or_misleading_patches() {

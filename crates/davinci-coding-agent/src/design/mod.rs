@@ -15,6 +15,7 @@ pub mod export;
 pub mod generation;
 pub mod handoff;
 pub mod handoff_draft;
+pub mod handoff_verification;
 pub mod host;
 pub mod interaction;
 mod inventory;
@@ -47,3 +48,5 @@ pub fn is_command(text: &str) -> bool {
 }
 #[cfg(test)]
 mod publication_tests;
+#[cfg(test)]
+mod termination_tests;

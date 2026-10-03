@@ -60,6 +60,11 @@ pub enum DesignChange {
         proposal_hash: String,
         transaction_id: String,
     },
+    HandoffChecked {
+        artifact_id: ArtifactId,
+        run_id: OperationId,
+        report: ArtifactRef,
+    },
     Cancelled {
         artifact_id: ArtifactId,
     },

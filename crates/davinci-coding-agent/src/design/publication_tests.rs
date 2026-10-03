@@ -9,6 +9,7 @@ thread_local! {
 }
 
 pub(super) fn checkpoint(boundary: &'static str) -> DesignResult<()> {
+    super::termination_tests::checkpoint(boundary)?;
     INTERRUPT.with(|pending| {
         if pending.get() == Some(boundary) {
             pending.set(None);
