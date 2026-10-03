@@ -40,15 +40,86 @@ export function summarizeUsage(records) {
   };
 }
 
+// Normalize only receipts with independent evidence that no counter was filled
+// in by the decoder. A real, explicitly measured zero is still a measurement.
+function measuredAttemptUsage(observation) {
+  const raw = observation.raw_usage;
+  const normalized = davinciUsage(observation.usage);
+  const fields = [normalized.input, normalized.cached, normalized.cacheWrite, normalized.output];
+  const rawFields = [raw?.input_total, raw?.cache_read, raw?.cache_write, raw?.output];
+  if (observation.usage_complete !== true
+      || !["completed", "failed", "cancelled"].includes(observation.status)
+      || raw?.anomalous !== false
+      || [...fields, ...rawFields].some((value) => count(value) === null)
+      || count(normalized.input + normalized.cached + normalized.cacheWrite) !== raw.input_total
+      || normalized.cached !== raw.cache_read
+      || normalized.cacheWrite !== raw.cache_write
+      || normalized.output !== raw.output) {
+    return davinciUsage(null);
+  }
+  return normalized;
+}
+
 export function usageFromEvents(harness, lines) {
   const records = [];
+  const attempts = new Map();
+  let assistantRecords = 0;
+  let incompleteObservations = 0;
   for (const line of lines) {
     let event;
     try { event = JSON.parse(line); } catch { continue; }
     if (harness === "codex" && event?.type === "turn.completed") {
       records.push(codexUsage(event.usage));
-    } else if (harness === "davinci" && event?.type === "message_end" && event.message?.role === "assistant") {
-      records.push(davinciUsage(event.message.usage));
+      continue;
+    }
+    if (harness !== "davinci") continue;
+    if (event?.type === "message_end" && event.message?.role === "assistant") {
+      assistantRecords += 1;
+    }
+    if (event?.type !== "provider_observation") continue;
+    const observation = event.observation;
+    if (observation?.kind === "telemetry_overflow") {
+      incompleteObservations += 1;
+      continue;
+    }
+    if (!["attempt_start", "attempt_end"].includes(observation?.kind)) continue;
+    const request = observation.logical_request_id;
+    const attempt = count(observation.attempt_id);
+    if (typeof request !== "string" || !request || attempt === null) {
+      incompleteObservations += 1;
+      continue;
+    }
+    // JSON tuple encoding avoids delimiter collisions between request IDs.
+    const key = JSON.stringify([request, attempt]);
+    const previous = attempts.get(key);
+    if (observation.kind === "attempt_start") {
+      if (!previous) attempts.set(key, { terminal: false, usage: davinciUsage(null) });
+      continue;
+    }
+    const usage = measuredAttemptUsage(observation);
+    // Compare only accounting evidence; elapsed time and object-key order must
+    // not turn a repeated serialization into another billable attempt.
+    const fingerprint = JSON.stringify([
+      observation.status, observation.usage_complete,
+      usage.input, usage.cached, usage.cacheWrite, usage.output,
+    ]);
+    const conflicted = previous?.conflicted
+      || (previous?.terminal && previous.fingerprint !== fingerprint);
+    attempts.set(key, {
+      terminal: true,
+      fingerprint,
+      conflicted,
+      usage: conflicted ? davinciUsage(null) : usage,
+    });
+  }
+  if (harness === "davinci") {
+    if (attempts.size || incompleteObservations) {
+      records.push(...[...attempts.values()].map((attempt) => attempt.usage));
+      for (let i = 0; i < incompleteObservations; i += 1) records.push(davinciUsage(null));
+    } else {
+      // Old message_end counters have no field-presence evidence. Do not
+      // present decoder defaults as measured usage, even when they are zero.
+      for (let i = 0; i < assistantRecords; i += 1) records.push(davinciUsage(null));
     }
   }
   return summarizeUsage(records);

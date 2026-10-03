@@ -36,6 +36,12 @@ test("only terminal usage observations are counted and API cost is ignored", () 
   const summary = usageFromEvents("davinci", [
     "invalid JSON", "null",
     JSON.stringify({ type: "message_update", message: { role: "assistant", usage: { input: 999 } } }),
+    JSON.stringify({ type: "provider_observation", observation: {
+      kind: "attempt_end", logical_request_id: "test-request", attempt_id: 1,
+      status: "completed", usage_complete: true,
+      usage: { input: 20, cacheRead: 30, cacheWrite: 5, output: 7, cost: { total: 999 } },
+      raw_usage: { input_total: 55, cache_read: 30, cache_write: 5, output: 7, anomalous: false },
+    } }),
     JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 20, cacheRead: 30, cacheWrite: 5, output: 7, cost: { total: 999 } } } }),
     JSON.stringify({ type: "message_end", message: { role: "user" } }),
   ]);
