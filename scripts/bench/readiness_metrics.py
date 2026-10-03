@@ -81,6 +81,17 @@ def background_summary(rows):
     return result, "separate measured interactive/RPC background calls"
 
 
+def attempt_outcome(row):
+    status = row.get("exit")
+    if type(status) is int:
+        return "completed" if status == 0 else "failed"
+    if status in ("timeout", "supervisor_timeout"):
+        return "timed_out"
+    if status == "aborted":
+        return "aborted"
+    return "unknown"
+
+
 def summarize(rows, prices=None):
     if not rows:
         raise ValueError("readiness summary needs at least one run")
@@ -113,6 +124,8 @@ def summarize(rows, prices=None):
         for field in ("diagnosticComparableOperations", "diagnosticUnknownOperations",
                       "repeatedReads", "repeatedSearches", "workerDuplicateOperations")}
     return {"runs": len(rows), "composite_successes": successes, "composite_success_rate": successes / len(rows),
+            "attempt_outcomes": {outcome: sum(attempt_outcome(row) == outcome for row in rows)
+                                 for outcome in ("completed", "failed", "timed_out", "aborted", "unknown")},
             "regression_free_successes": sum(task_success(row) and row.get("regression_pass") is True for row in rows)
                 if all(type(value) is bool for value in regression) else None,
             "regression_observed_runs": sum(type(value) is bool for value in regression),
@@ -142,6 +155,15 @@ def report(rows, prices=None):
     for harness in sorted({row["harness"] for row in rows}):
         selected = [row for row in rows if row["harness"] == harness]
         arms[harness] = {"all": summarize(selected, prices)}
+        # Startup state must be recorded by the workload owner. Token-cache
+        # hits, repetition number and missing metadata do not establish warmth.
+        startup = {}
+        for state in ("cold", "warm", "unknown"):
+            started = [row for row in selected if
+                       (row.get("startup_state") if row.get("startup_state") in ("cold", "warm") else "unknown") == state]
+            if started:
+                startup[state] = summarize(started, prices)
+        arms[harness]["startup"] = startup
         for size in ("small", "large"):
             sized = [row for row in selected if row.get("size_class", "small" if row.get("task_set") == "legacy" else "large") == size]
             if sized:
