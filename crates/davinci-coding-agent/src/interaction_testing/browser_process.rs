@@ -225,6 +225,14 @@ impl BrowserProcess {
                     environment.entry(name.into()).or_insert(value);
                 }
             }
+            if design.is_some() && cfg!(target_os = "linux") {
+                // Bubblewrap supplies a private /tmp but no host home or
+                // account database. Playwright resolves homedir during import
+                // and creates browser profiles through the temporary path.
+                for name in ["HOME", "TMPDIR", "TEMP", "TMP"] {
+                    environment.insert(name.into(), "/tmp".into());
+                }
+            }
             for (name, bytes) in FILES {
                 fs::write(directory.join(name), bytes)
                     .map_err(|_| "cannot materialize browser host")?;

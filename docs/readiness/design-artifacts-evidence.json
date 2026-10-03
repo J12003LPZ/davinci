@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "recorded_at_utc": "2026-10-03T20:03:29.159758+00:00",
+  "recorded_at_utc": "2026-10-03T20:24:08.741311+00:00",
   "status": "incomplete_draft_not_release_certified",
   "baseline_commit": "a669549c5356af8110feff589bc15864fce7209b",
   "original_local_snapshot_commit": "d9725d0cb89db8ca07a7d3920ce1a3aaf55a825f",
@@ -21,6 +21,8 @@
     "native-ci-f2ea.log": "Compiler/host and actual target handoff passed. Both confined tests failed before Chromium because bwrap could not configure its network namespace (RTM_NEWADDR: Operation not permitted). Ubuntu 22.04 fixture pending; policy unchanged.",
     "native-ci-ebf9.log": "Ubuntu 22.04 namespace probe passed. Both native confined tests reproduced an application-workspace realpath failure inside the intentionally private sandbox. Host configuration now selects the private render directory; focused Clippy and formatting passed, native execution pending.",
     "contracts-ebf9": "Windows and Linux design jobs passed: 49 integration tests over 20 targets, two evals each, recovery and real companion browser checks. Complete logs retained.",
+    "native-ci-e751.log": "Namespace probe, compiler/host and managed target handoff passed. Both confined tests failed during Playwright import because the isolated child had no home path or account database. Linux design HOME and temporary paths now select private /tmp; native execution pending.",
+    "contracts-e751": "Both platform design jobs passed on e751806e; complete logs retained.",
     "workflow-warning-focused.log": "One exact local test passed after the Linux agent-wide CI job failed in workflow phase execution. Does not establish the cause or resolve that remote suite failure."
   },
   "platform": "windows-x86_64",
@@ -392,7 +394,7 @@
     "native_confined_capture": "failed_before_chromium_network_namespace_denied"
   },
   "workflow_validation": "actionlint 1.7.7 passed; optional ShellCheck not installed",
-  "source_files_sha256": "944da3d0c7e8a67af912a71fb5a089f79982195fe12f782e76aa0b0db06c55eb",
+  "source_files_sha256": "773e52266159c76176e57f0d0168ee20e7ad4d9a205ec76da404faafb926027d",
   "source_files": {
     ".gitattributes": "c692c1168246fea7980c8562efae5889afa7eac2df20a6408cc0a92c5271b8e7",
     ".github/workflows/design-artifacts.yml": "a36bc7084f26f8962c9e1b7877edb72c0b5b059b01c8883bd9dd8acd5ac725c9",
@@ -478,7 +480,7 @@
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.js": "5032dd8b3aff64eb61bbffc672955185921db57fb523345c693bf0f33f65c12c",
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "7b7e86a3bfc632272152cdba3db3dda2060ab81bb46869d1c45bc11af415e450",
     "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5d22d9aac56ca403aab8634348ad3b2484190b128a391a6d7c1b1f71d060e02c",
-    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "5ea908ff63b863cfdd4b87beddccbd695864db764ec117bd657dca7e9031486c",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "d1ee8a5f53f8056a50ce16ebcb76d1c57d952a6491f417616c5c7ab419068f0a",
     "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "0b00ff710cf4e4d12834f7f4f8c822f516dc001e9e2e03142bed8f5059e9ca6a",
     "crates/davinci-coding-agent/src/lib.rs": "5a04308dddfc7e079be41712adf49497241a6163e93467a54526ff23085d6e8c",
     "crates/davinci-coding-agent/src/main.rs": "724165913b5c5f969a3d25f4e28ab84a9de064810dddb189a27911b41cb026b7",
@@ -604,7 +606,7 @@
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.js": "9e6e4cc2faf3edd4ff94a71f589abf176ad592b5",
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "5d9b7c72adc08d20218853f10e50ec49658f85e7",
     "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5dde53660692bbae94c14db823c6cd62c83fad0e",
-    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "8f850e2a22008553c52f09ddc85e6134cdc208a9",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "5f19b4402f2a580124ddcfb3c2f83114e48307e3",
     "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "9eaa0f08ac3f2fb8063a74af830ec1721c01d41a",
     "crates/davinci-coding-agent/src/lib.rs": "ef46afbca2590acec87e68b6ac1210630f20e2db",
     "crates/davinci-coding-agent/src/main.rs": "7b74685a2851e2c6756ae9fddbd31a76b13bb8c9",
@@ -645,7 +647,7 @@
     "scripts/design-contracts.py": "6a6e196e4905fb9d76a437dc9ec3803846ddd4ce",
     "scripts/test-design.py": "d9ee602b9b17ec86fabea73ecf9dcc0251669b3f"
   },
-  "git_source_blobs_sha256": "5b7068963d1105d7acb5d32b2cb3e03fe1320809ae289bc3e8d6be7ce7b0314d",
+  "git_source_blobs_sha256": "8c2b5711cf9ca990e1624a914958136b718f8dec83ea310bbbb44b0b1e1bf7e3",
   "local_test_binary": {
     "path": "target/debug/davinci.exe",
     "sha256": "809b0c181bf50bb2e7e8303caa2b8c41379bdda01516913c58f75b002023f01a",
@@ -1050,8 +1052,25 @@
     "workflow-lint.log": {
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "bytes": 0
+    },
+    "linux-design-ci-e751.log": {
+      "sha256": "8f1c8318b20bdce35b74818aadb5740c8b28bf015b46f5dfdc0da0a863922213",
+      "bytes": 110523
+    },
+    "windows-design-ci-e751.log": {
+      "sha256": "a8cb04d1cb442b6f0d4e2c1cd0bb91d301670a09d9893ed18679ae6d01818680",
+      "bytes": 97439
+    },
+    "native-ci-e751.log": {
+      "sha256": "6250132fdec94573fd4534860e615b387490055968650602ec60acf667271cad",
+      "bytes": 80401
+    },
+    "private-home-clippy.log": {
+      "sha256": "3bf982fee4460ee03ecbd4fc5ae2ca2a14895b6431b90553b093d14e4d3d3bf2",
+      "bytes": 209
     }
   },
+  "counts_scope": "Historical initial local validation; current platform runs are separately bound under remote_validation and validation_phases.",
   "counts": {
     "design_integration_passed": 46,
     "eval_passed": 2,
