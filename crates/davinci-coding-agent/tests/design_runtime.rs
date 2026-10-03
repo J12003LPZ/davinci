@@ -139,6 +139,7 @@ fn native_confined_capture_and_prototype_actions() {
             reduced_motion: true,
         },
         actions: vec![
+            PrototypeAction::Key { key: "Tab".into() },
             PrototypeAction::Click {
                 selector: PrototypeSelector::Role {
                     role: "button".into(),
@@ -151,35 +152,94 @@ fn native_confined_capture_and_prototype_actions() {
         ],
         operation_id: OperationId::new(),
     };
-    let result = interact(&store, &ctx, session, &runtime, request).unwrap();
-    assert_eq!(
-        result.capture.checks["interaction"].state,
-        CheckState::Current
-    );
-    assert!(result.capture.screenshot.size > 100);
+    let mut captures = Vec::new();
+    for viewport in Viewport::defaults() {
+        let mut current = request.clone();
+        current.render.viewport = viewport;
+        current.operation_id = OperationId::new();
+        let result = interact(&store, &ctx, session, &runtime, current).unwrap();
+        assert_eq!(
+            result.capture.checks["interaction"].state,
+            CheckState::Current
+        );
+        assert_eq!(result.capture.checks["render"].state, CheckState::Current);
+        assert_eq!(result.capture.source_hash, revision.source_hash);
+        assert!(result.capture.screenshot.size > 100);
+        captures.push(result);
+    }
+    // interact closes its browser before returning. Drop the session writer and
+    // retrieve each adopted screenshot through its persisted, owner-bound receipt.
+    let session_path = session.path.clone();
+    drop(agent.session.take());
+    agent.session = Some(JsonlSession::open(&session_path).unwrap());
+    let reopened_ctx = AuthorizedDesignContext::from_agent(&agent, &root).unwrap();
+    let reopened = agent.session.as_ref().unwrap();
     if let Some(directory) = std::env::var_os("DAVINCI_DESIGN_EVIDENCE") {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
         let directory = std::path::PathBuf::from(directory);
         std::fs::create_dir_all(&directory).unwrap();
+        let mut binary = std::fs::File::open(env!("CARGO_BIN_EXE_davinci")).unwrap();
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 65536];
+        loop {
+            let count = binary.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
         std::fs::write(
-            directory.join("native-capture.png"),
-            davinci_agent::runtime::evidence_store::VerificationEvidenceStore::new(
-                store.blob_directory(&ctx),
-            )
-            .get_artifact(&(&result.capture.screenshot).into())
+            directory.join("native-environment.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "platform":std::env::consts::OS, "arch":std::env::consts::ARCH,
+                "binary_sha256":format!("{:x}", hash.finalize()),
+                "runtime_hash":runtime.fingerprint(),
+                "ci_source_commit":std::env::var("GITHUB_SHA").ok(),
+                "ci_run_id":std::env::var("GITHUB_RUN_ID").ok(),
+                "installed_launch_path_verified":false
+            }))
             .unwrap(),
         )
         .unwrap();
-        std::fs::write(
-            directory.join("native-capture.json"),
-            serde_json::to_vec_pretty(&result).unwrap(),
-        )
-        .unwrap();
     }
-    println!(
-        "Native runtime {}; PNG {}",
-        runtime.fingerprint(),
-        result.capture.screenshot.sha256
-    );
+    for result in captures {
+        let retained = load(&store, &reopened_ctx, reopened, result.request.operation_id).unwrap();
+        assert_eq!(retained.capture, result.capture);
+        let png = davinci_agent::runtime::evidence_store::VerificationEvidenceStore::new(
+            store.blob_directory(&reopened_ctx),
+        )
+        .get_artifact(&(&retained.capture.screenshot).into())
+        .unwrap();
+        let viewport = &retained.request.render.viewport;
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(
+            u32::from_be_bytes(png[16..20].try_into().unwrap()),
+            viewport.width
+        );
+        assert_eq!(
+            u32::from_be_bytes(png[20..24].try_into().unwrap()),
+            viewport.height
+        );
+        if let Some(directory) = std::env::var_os("DAVINCI_DESIGN_EVIDENCE") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let name = format!("native-capture-{}x{}", viewport.width, viewport.height);
+            std::fs::write(directory.join(format!("{name}.png")), png).unwrap();
+            std::fs::write(
+                directory.join(format!("{name}.json")),
+                serde_json::to_vec_pretty(&retained).unwrap(),
+            )
+            .unwrap();
+        }
+        println!(
+            "Native runtime {}; {}x{} retained PNG {}",
+            runtime.fingerprint(),
+            viewport.width,
+            viewport.height,
+            retained.capture.screenshot.sha256
+        );
+    }
 }
 
 #[test]

@@ -6,7 +6,7 @@ const MAX_FRAME = 16 * 1024;
 const MAX_RESPONSE = 64 * 1024;
 const MAX_PENDING = 16;
 const ACTIONS = new Set(['navigate', 'click', 'type', 'select', 'snapshot',
-  'accessibility', 'console', 'network', 'screenshot', 'design_geometry']);
+  'accessibility', 'console', 'network', 'screenshot', 'design_geometry', 'key', 'expect_text']);
 
 function fields(value, keys) {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -22,7 +22,7 @@ function validate(request) {
     case 'open': fields(request, ['id', 'op', 'options']); fields(request.options, ['origins', 'viewport']); break;
     case 'execute':
       fields(request, ['id', 'op', 'resource', 'command']); id(request.resource);
-      fields(request.command, ['action', 'url', 'selector', 'text', 'value']);
+      fields(request.command, ['action', 'url', 'selector', 'text', 'value', 'key']);
       if (!ACTIONS.has(request.command.action)) throw new Error('Invalid action');
       break;
     case 'close': fields(request, ['id', 'op', 'resource']); id(request.resource); break;

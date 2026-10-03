@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "recorded_at_utc": "2026-10-03T20:24:08.741311+00:00",
+  "recorded_at_utc": "2026-10-03T20:40:27.217262+00:00",
   "status": "incomplete_draft_not_release_certified",
   "baseline_commit": "a669549c5356af8110feff589bc15864fce7209b",
   "original_local_snapshot_commit": "d9725d0cb89db8ca07a7d3920ce1a3aaf55a825f",
@@ -23,6 +23,7 @@
     "contracts-ebf9": "Windows and Linux design jobs passed: 49 integration tests over 20 targets, two evals each, recovery and real companion browser checks. Complete logs retained.",
     "native-ci-e751.log": "Namespace probe, compiler/host and managed target handoff passed. Both confined tests failed during Playwright import because the isolated child had no home path or account database. Linux design HOME and temporary paths now select private /tmp; native execution pending.",
     "contracts-e751": "Both platform design jobs passed on e751806e; complete logs retained.",
+    "native-ci-8681.log": "Compiler/host and managed target handoff passed; both confined tests reached a transport allowlist mismatch for prototype assertions. Focused key/text regression failed before the fix, all 12 transport tests passed afterward. Native fixture expanded to three viewports, session reopen and test-binary hash retention; compile/Clippy passed, native execution pending.",
     "workflow-warning-focused.log": "One exact local test passed after the Linux agent-wide CI job failed in workflow phase execution. Does not establish the cause or resolve that remote suite failure."
   },
   "platform": "windows-x86_64",
@@ -394,7 +395,7 @@
     "native_confined_capture": "failed_before_chromium_network_namespace_denied"
   },
   "workflow_validation": "actionlint 1.7.7 passed; optional ShellCheck not installed",
-  "source_files_sha256": "773e52266159c76176e57f0d0168ee20e7ad4d9a205ec76da404faafb926027d",
+  "source_files_sha256": "5e902ce7378727b8f3f6a2460b41f6d9a417c46477fa6d117221d1d2258d6f9a",
   "source_files": {
     ".gitattributes": "c692c1168246fea7980c8562efae5889afa7eac2df20a6408cc0a92c5271b8e7",
     ".github/workflows/design-artifacts.yml": "a36bc7084f26f8962c9e1b7877edb72c0b5b059b01c8883bd9dd8acd5ac725c9",
@@ -481,7 +482,8 @@
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "7b7e86a3bfc632272152cdba3db3dda2060ab81bb46869d1c45bc11af415e450",
     "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5d22d9aac56ca403aab8634348ad3b2484190b128a391a6d7c1b1f71d060e02c",
     "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "d1ee8a5f53f8056a50ce16ebcb76d1c57d952a6491f417616c5c7ab419068f0a",
-    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "0b00ff710cf4e4d12834f7f4f8c822f516dc001e9e2e03142bed8f5059e9ca6a",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "d3d09a95cb339c31d457271ff47c32b8dc29001f4ec886ae722d102a3813558e",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs": "da00485e74821344353142d24d493546d5919e639560c8bd073730b5afb160f0",
     "crates/davinci-coding-agent/src/lib.rs": "5a04308dddfc7e079be41712adf49497241a6163e93467a54526ff23085d6e8c",
     "crates/davinci-coding-agent/src/main.rs": "724165913b5c5f969a3d25f4e28ab84a9de064810dddb189a27911b41cb026b7",
     "crates/davinci-coding-agent/src/rpc.rs": "963bcb31a7bafc8e626526a90222ec4f82bd543bb252dede09f62f7641b57809",
@@ -501,7 +503,7 @@
     "crates/davinci-coding-agent/tests/design_profiles.rs": "87bfbbb82cdf537b551cead4ea3eac591ac13b4ec1f793fcfa55d8db95bf4e78",
     "crates/davinci-coding-agent/tests/design_quality.rs": "f155c685c1e20344d8e77207fe2053ed3cf4ae04b0b8473b04d220bbc239c84b",
     "crates/davinci-coding-agent/tests/design_recovery.rs": "94cf59aeb5c8f18f8fb6053e019f5bc2d4494bf9a30fa23b7f6ffe2d0ccd77ae",
-    "crates/davinci-coding-agent/tests/design_runtime.rs": "b415fa517b3149d50e2cc8de75c11296005e3d80e01d0965027982d5c6e4d444",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "50712afba9d46bdb73d3528c0ef42cad3e5cd926b79db8edd0adee67bcccf2a9",
     "crates/davinci-coding-agent/tests/design_security.rs": "eebe6ac654bb8ce9c2333cf29893f222985531b1377abdebd817c684291f100d",
     "crates/davinci-coding-agent/tests/design_store.rs": "318695a83bb7b964499d268284642e47b1895a6aed168a5d200ba4b6a67a8b52",
     "crates/davinci-coding-agent/tests/design_sync.rs": "2ccf22963689755acb1fd5d01bb7b23e7e50e5e1dc466d224e30abea2982093d",
@@ -607,7 +609,8 @@
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "5d9b7c72adc08d20218853f10e50ec49658f85e7",
     "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5dde53660692bbae94c14db823c6cd62c83fad0e",
     "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "5f19b4402f2a580124ddcfb3c2f83114e48307e3",
-    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "9eaa0f08ac3f2fb8063a74af830ec1721c01d41a",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "3e9ec0a65f6e805e287226c74e3382eb64037974",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs": "0734c11e505992d1656861130ddbe76c498ee56b",
     "crates/davinci-coding-agent/src/lib.rs": "ef46afbca2590acec87e68b6ac1210630f20e2db",
     "crates/davinci-coding-agent/src/main.rs": "7b74685a2851e2c6756ae9fddbd31a76b13bb8c9",
     "crates/davinci-coding-agent/src/rpc.rs": "29f1602ac5417ab1419182aebf800586dc868802",
@@ -627,7 +630,7 @@
     "crates/davinci-coding-agent/tests/design_profiles.rs": "840f318850036d81da8012797ab8a8575af87df7",
     "crates/davinci-coding-agent/tests/design_quality.rs": "37ac7250520eadd009bbd61498208a2f376f625b",
     "crates/davinci-coding-agent/tests/design_recovery.rs": "cfaf28c221c0ba0995eadaa8a561acf71c1a9178",
-    "crates/davinci-coding-agent/tests/design_runtime.rs": "957e982463b3af8fff001e2044292dd70c60cb8e",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "26a498291afa4483c01ba8bd9654d98c6898e029",
     "crates/davinci-coding-agent/tests/design_security.rs": "597173705743307435ba93b35930a0bc70cd24bb",
     "crates/davinci-coding-agent/tests/design_store.rs": "326910106b90ed10d0d6721c4d6610dd2105f1a3",
     "crates/davinci-coding-agent/tests/design_sync.rs": "af5a1b10cd3a84fc516be2ca9327cf15fbdc94ea",
@@ -647,7 +650,7 @@
     "scripts/design-contracts.py": "6a6e196e4905fb9d76a437dc9ec3803846ddd4ce",
     "scripts/test-design.py": "d9ee602b9b17ec86fabea73ecf9dcc0251669b3f"
   },
-  "git_source_blobs_sha256": "8c2b5711cf9ca990e1624a914958136b718f8dec83ea310bbbb44b0b1e1bf7e3",
+  "git_source_blobs_sha256": "299d5df57051c958991b320b92d82b687e564fe6e00fde23388d863d3dab763d",
   "local_test_binary": {
     "path": "target/debug/davinci.exe",
     "sha256": "809b0c181bf50bb2e7e8303caa2b8c41379bdda01516913c58f75b002023f01a",
@@ -1068,6 +1071,34 @@
     "private-home-clippy.log": {
       "sha256": "3bf982fee4460ee03ecbd4fc5ae2ca2a14895b6431b90553b093d14e4d3d3bf2",
       "bytes": 209
+    },
+    "native-viewports-compile.log": {
+      "sha256": "369cba804a89d092d2ab704927e1ba8b196b970297e526c92488a854e90c1bfd",
+      "bytes": 1307
+    },
+    "native-viewports-clippy.log": {
+      "sha256": "d41510c0c512edb51166c21af58bcc963a696f50fb7d0b30358e35654d62c433",
+      "bytes": 208
+    },
+    "linux-design-ci-8681.log": {
+      "sha256": "ba195dfdd52ca12d6fefe5d7072279c963be48c0988f124695f424d522594c80",
+      "bytes": 110518
+    },
+    "windows-design-ci-8681.log": {
+      "sha256": "b49efb06f6644c560a45a66320e94eac262c473241366031349bbaa79d8cfe27",
+      "bytes": 97923
+    },
+    "native-ci-8681.log": {
+      "sha256": "bcf56eb9a8f6be08766eb7f52caae59f9c1e54708df48ab8d5b72807f497575e",
+      "bytes": 80042
+    },
+    "prototype-transport-red.log": {
+      "sha256": "0ceeb7a2975da560bee0582f2fa020bf501fa42e74f29716aa0268afc6baa8fe",
+      "bytes": 1233
+    },
+    "prototype-transport-green.log": {
+      "sha256": "0807910ba1e0d0f08c7bf23079e411a97b8f167d48bc3c11873265217e945113",
+      "bytes": 1085
     }
   },
   "counts_scope": "Historical initial local validation; current platform runs are separately bound under remote_validation and validation_phases.",
