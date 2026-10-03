@@ -65,6 +65,7 @@ fn fixture() -> Fixture {
     store::create_run_dir(workspace.path(), &graph_run_id).unwrap();
     let child = AgentId::new();
     let spec = WorkerSpec {
+        service_tier: davinci_ai::CodexServiceTier::Standard,
         task_id: task_id.clone(),
         role: Role::Researcher,
         expect: ArtifactKind::Evidence,

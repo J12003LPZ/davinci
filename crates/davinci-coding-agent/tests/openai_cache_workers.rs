@@ -11,6 +11,7 @@ use std::path::Path;
 
 fn spec(cwd: &Path, model: Option<&str>) -> WorkerSpec {
     WorkerSpec {
+        service_tier: davinci_ai::CodexServiceTier::Standard,
         task_id: "cache-worker".into(),
         role: Role::Researcher,
         expect: ArtifactKind::Evidence,
