@@ -748,6 +748,10 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    options
+        .service_tier
+        .unwrap_or_default()
+        .validate_for_model(model)?;
     let options = options_with_auth_context(options, auth);
     let dump = crate::wire_dump::begin();
     if let Some(dump) = &dump {
