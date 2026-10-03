@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/pr-review-repair.yml
       - .github/scripts/pr_review_repair.py
+      - .github/scripts/pr-review-patches.json.gz
 
 permissions:
   contents: write
@@ -15,37 +16,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
+  repair:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
+    env:
+      PI_OFFLINE: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TEST_THREADS: '4'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Integrate reviewed PR heads on the isolated branch
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REF_NAME" = 'fix/pr-integration-review-20261003'
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git fetch --no-tags origin e07702a02892d4d8b30ec2a76b16820897bfa3f5 a7a59af4cc2781296c1f69f7dc214da784790bce
-          git merge-base --is-ancestor 06bc2f8aa93fee58568cd37fe68ef5a6d24810e3 HEAD
-          git merge --no-edit --no-ff e07702a02892d4d8b30ec2a76b16820897bfa3f5
-          git merge --no-edit --no-ff a7a59af4cc2781296c1f69f7dc214da784790bce
-          git diff --check a669549c5356af8110feff589bc15864fce7209b HEAD
-          git push origin "HEAD:refs/heads/$GITHUB_REF_NAME"
-      - name: Export tracked source without credentials
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/review-source"
-          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/review-source/source.tar.gz"
-          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/review-source/revision.txt"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/setup-node@v4
         with:
-          name: pr-review-integrated-source
-          path: ${{ runner.temp }}/review-source
-          retention-days: 3
+          node-version: '24'
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Add regression tests to the integrated source
+        run: python3 .github/scripts/pr_review_repair.py red
+      - name: Demonstrate the regressions before fixes
+        run: python3 .github/scripts/pr_review_repair.py test-red
+      - name: Apply and format the fixes
+        run: python3 .github/scripts/pr_review_repair.py green
+      - name: Verify fixed regression cases
+        run: python3 .github/scripts/pr_review_repair.py test-green
+      - name: Verify adjacent offline execution contracts
+        run: python3 .github/scripts/pr_review_repair.py test-contracts
+      - name: Check affected production code
+        run: python3 .github/scripts/pr_review_repair.py clippy
+      - name: Publish verified fixes only to the isolated branch
+        run: python3 .github/scripts/pr_review_repair.py publish
+      - name: Collect source and verification evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f .github/scripts/pr_review_repair.py; then
+            python3 .github/scripts/pr_review_repair.py collect
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-review-repair-verification
+          path: ${{ runner.temp }}/pr-review-verification
+          retention-days: 7
           if-no-files-found: error
