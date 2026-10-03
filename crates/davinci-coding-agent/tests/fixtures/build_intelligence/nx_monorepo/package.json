@@ -1,7 +1,0 @@
-{
-  "name": "nx-monorepo",
-  "private": true,
-  "workspaces": [
-    "packages/*"
-  ]
-}

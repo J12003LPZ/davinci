@@ -1,7 +1,0 @@
-{
-  "name": "conditional-app",
-  "version": "1.0.0",
-  "dependencies": {
-    "isomorphic-pkg": "^2.0.0"
-  }
-}

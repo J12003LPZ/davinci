@@ -1,5 +1,0 @@
-{
-  "name": "cyclic-unknown-root",
-  "private": true,
-  "workspaces": ["packages/*"]
-}
