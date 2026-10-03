@@ -5,6 +5,23 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Environment is a startup input, never read by the provider request builder.
+pub fn resolve_service_tier(
+    env: Option<&str>,
+    user: Option<&str>,
+) -> (davinci_ai::CodexServiceTier, Option<&'static str>) {
+    let Some(value) = env.or(user) else {
+        return (davinci_ai::CodexServiceTier::Standard, None);
+    };
+    match davinci_ai::CodexServiceTier::parse(value) {
+        Some(tier) => (tier, None),
+        None => (
+            davinci_ai::CodexServiceTier::Standard,
+            Some("Invalid serviceTier configuration; using Standard"),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessManagerSettings {
@@ -1071,13 +1088,20 @@ pub fn load_merged_settings_with_override(
     let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
     let project_path = if current.exists() { current } else { legacy };
     let project = load_settings_value(&project_path);
-    let merged = enforce_learning_user_boundary(
+    let mut merged = enforce_learning_user_boundary(
         &global,
         enforce_decision_intelligence_user_boundary(
             &global_value,
             deep_merge_json(global_value.clone(), project),
         ),
     );
+    // Project trust does not authorize increased subscription consumption.
+    if let Some(object) = merged.as_object_mut() {
+        object.remove("serviceTier");
+        if let Some(value) = global_value.get("serviceTier") {
+            object.insert("serviceTier".into(), value.clone());
+        }
+    }
     serde_json::from_value(migrate_settings(merged)).unwrap_or_default()
 }
 
@@ -1299,6 +1323,15 @@ pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
 }
 
 impl Settings {
+    pub fn resolved_service_tier(&self) -> davinci_ai::CodexServiceTier {
+        let env = std::env::var("DAVINCI_OPENAI_SERVICE_TIER").ok();
+        let (tier, diagnostic) = resolve_service_tier(env.as_deref(), self.service_tier.as_deref());
+        if let Some(diagnostic) = diagnostic {
+            eprintln!("{diagnostic}");
+        }
+        tier
+    }
+
     pub fn requirement_review_enabled(&self, environment: Option<&str>) -> bool {
         match environment
             .map(str::trim)
@@ -2010,6 +2043,46 @@ mod tests {
         let settings: super::Settings = serde_json::from_str(r#"{"serviceTier":"fast"}"#).unwrap();
         assert_eq!(settings.service_tier.as_deref(), Some("fast"));
         assert!(super::Settings::default().service_tier.is_none());
+    }
+
+    #[test]
+    fn service_tier_configuration_precedence_and_invalid_input() {
+        use davinci_ai::CodexServiceTier::*;
+        assert_eq!(resolve_service_tier(None, None), (Standard, None));
+        assert_eq!(resolve_service_tier(None, Some("priority")), (Fast, None));
+        assert_eq!(
+            resolve_service_tier(Some("fast"), Some("flex")),
+            (Fast, None)
+        );
+        let (tier, diagnostic) = resolve_service_tier(Some("turbo"), Some("fast"));
+        assert_eq!(tier, Standard);
+        assert!(diagnostic.is_some());
+    }
+
+    #[test]
+    fn service_tier_project_cannot_escalate_even_when_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("agent");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            project.join(".pi/settings.json"),
+            r#"{"serviceTier":"fast"}"#,
+        )
+        .unwrap();
+        assert!(
+            load_merged_settings_with_override(&user, &project, Some(true))
+                .service_tier
+                .is_none()
+        );
+        std::fs::write(user.join("settings.json"), r#"{"serviceTier":"flex"}"#).unwrap();
+        assert_eq!(
+            load_merged_settings_with_override(&user, &project, Some(true))
+                .service_tier
+                .as_deref(),
+            Some("flex")
+        );
     }
 
     #[test]

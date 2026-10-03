@@ -892,10 +892,16 @@ mod background_note_tests {
 }
 
 fn model_run(model: &Model) -> String {
+    let speed = if model.speed_mode.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", model.speed_mode)
+    };
     format!(
-        "{} · {} · {}",
+        "{} · {}{} · {}",
         model.model_name,
         model.thinking_level,
+        speed,
         model.permission_label()
     )
 }
@@ -1364,6 +1370,11 @@ mod tests {
         assert!(text(&header(&m)).contains("· Manual"));
         m.permission_mode = "auto".into();
         assert!(text(&header(&m)).contains("sonnet · high · Auto Mode"));
+        assert!(!text(&header(&m)).contains("Standard"));
+        m.speed_mode = "Standard".into();
+        assert!(text(&header(&m)).contains("sonnet · high · Standard · Auto Mode"));
+        m.speed_mode = "Fast".into();
+        assert!(text(&header(&m)).contains("sonnet · high · Fast · Auto Mode"));
         assert!(!text(&status(&m)).contains("no prompts"));
         m.permission_mode = "always-approve".into();
         assert!(text(&header(&m)).contains("· Always Approve"));

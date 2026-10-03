@@ -123,6 +123,80 @@ impl SubscriptionModel {
         Self::from_host(agent, model, auth)
     }
 }
+fn design_stream_options(
+    agent: &Agent,
+    effort: davinci_protocol::ThinkingLevel,
+    request: &DesignModelRequest,
+    remaining: u64,
+    output: u64,
+) -> davinci_ai::StreamOptions {
+    davinci_ai::StreamOptions {
+        service_tier: Some(agent.service_tier),
+        thinking_level: Some(effort),
+        thinking_budgets: agent.thinking_budgets.clone(),
+        timeout_ms: Some(
+            agent
+                .provider_timeout_ms
+                .unwrap_or(remaining)
+                .min(remaining),
+        ),
+        max_retries: Some(0),
+        max_tokens: Some(output),
+        transport: agent.transport.clone(),
+        abort_signal: Some(request.abort.clone()),
+        session_id: agent
+            .session
+            .as_ref()
+            .map(|session| session.header.id.clone()),
+        install_telemetry: Some(agent.install_telemetry),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod service_tier_regression_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn design_inherits_tier_without_changing_effort_or_cancellation() {
+        let mut agent = Agent::new("system");
+        agent.provider_timeout_ms = Some(500);
+        let request = DesignModelRequest {
+            messages: Vec::new(),
+            tools: Vec::new(),
+            deadline_ms: 1000,
+            abort: Arc::new(AtomicBool::new(false)),
+        };
+        for tier in [
+            davinci_ai::CodexServiceTier::Standard,
+            davinci_ai::CodexServiceTier::Fast,
+            davinci_ai::CodexServiceTier::Flex,
+        ] {
+            agent.service_tier = tier;
+            let options = design_stream_options(
+                &agent,
+                davinci_protocol::ThinkingLevel::High,
+                &request,
+                100,
+                64,
+            );
+            assert_eq!(options.service_tier, Some(tier));
+            assert_eq!(
+                options.thinking_level,
+                Some(davinci_protocol::ThinkingLevel::High)
+            );
+            assert_eq!(options.timeout_ms, Some(100));
+            assert_eq!(options.max_retries, Some(0));
+            assert_eq!(options.max_tokens, Some(64));
+            assert!(Arc::ptr_eq(
+                options.abort_signal.as_ref().unwrap(),
+                &request.abort
+            ));
+        }
+    }
+}
+
 impl DesignModel for SubscriptionModel {
     fn validate(&self, agent: &Agent) -> DesignResult<()> {
         if agent.provider != "openai-codex"
@@ -190,26 +264,7 @@ impl DesignModel for SubscriptionModel {
             &self.auth,
             Some(DESIGN_POLICY),
             &request.tools,
-            &davinci_ai::StreamOptions {
-                thinking_level: Some(self.effort),
-                thinking_budgets: agent.thinking_budgets.clone(),
-                timeout_ms: Some(
-                    agent
-                        .provider_timeout_ms
-                        .unwrap_or(remaining)
-                        .min(remaining),
-                ),
-                max_retries: Some(0),
-                max_tokens: Some(output),
-                transport: agent.transport.clone(),
-                abort_signal: Some(request.abort.clone()),
-                session_id: agent
-                    .session
-                    .as_ref()
-                    .map(|session| session.header.id.clone()),
-                install_telemetry: Some(agent.install_telemetry),
-                ..Default::default()
-            },
+            &design_stream_options(agent, self.effort, request, remaining, output),
             &mut |_| {},
         )
         .map(|envelope| CompleteOutput {

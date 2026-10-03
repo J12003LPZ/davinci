@@ -84,6 +84,15 @@ pub struct ProviderAttemptObservation {
     pub usage_complete: Option<bool>,
 }
 
+impl ProviderAttemptObservation {
+    /// Missing response metadata is unknown, including older recorded observations.
+    pub fn service_tier_honored(&self) -> Option<bool> {
+        let requested = self.requested_service_tier.as_deref()?;
+        let returned = self.returned_service_tier.as_deref()?;
+        Some(requested == returned)
+    }
+}
+
 struct State {
     started: Instant,
     template: ProviderAttemptObservation,
@@ -534,6 +543,27 @@ impl Drop for Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_tier_observation_missing_is_unknown_and_mismatch_is_explicit() {
+        for (returned, expected) in [
+            (Some("priority"), Some(true)),
+            (Some("default"), Some(false)),
+            (None, None),
+        ] {
+            let scope = ObservationScope::capture();
+            begin_request("coding", "model", None, "schema");
+            dispatch_options(&serde_json::json!({"service_tier":"priority"}));
+            if let Some(tier) = returned {
+                record_returned_identity(&serde_json::json!({"service_tier":tier}));
+            }
+            let observations = scope.finish("completed");
+            assert_eq!(
+                observations.last().unwrap().service_tier_honored(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn rejected_terminal_receipt_cannot_return_success() {

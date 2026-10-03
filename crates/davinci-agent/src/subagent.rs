@@ -220,6 +220,8 @@ Available agent profiles (pass one as `agent`):",
 
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRequest {
+    /// Host-owned policy; never parsed from model tool arguments.
+    pub service_tier: davinci_ai::CodexServiceTier,
     /// Live progress for the lead's transcript; the host feeds it the
     /// worker's own events.
     pub progress: Option<crate::subagent_progress::ProgressReporter>,
@@ -391,6 +393,7 @@ pub fn scoped_tools(requested: Option<&[String]>, parent: &[String]) -> Vec<Stri
 /// What the worker inherits from the parent turn.
 #[derive(Debug, Clone, Default)]
 pub struct SubagentParent {
+    pub service_tier: davinci_ai::CodexServiceTier,
     /// The lead's event sink and the `agent` call being run, so worker
     /// progress can be drawn under that call.
     pub event_sink: Option<crate::EventSink>,
@@ -904,6 +907,7 @@ pub fn run_tool(
             _ => None,
         };
         requests.push(SubagentRequest {
+            service_tier: parent.service_tier,
             progress,
             max_turns: None,
             prompt: spec.prompt.clone(),
@@ -1779,6 +1783,36 @@ mod tests {
 
         parent_token.cancel();
         assert!(child_token.is_cancelled());
+    }
+
+    #[test]
+    fn service_tier_inherits_host_policy_and_ignores_tool_escalation() {
+        for tier in [
+            davinci_ai::CodexServiceTier::Standard,
+            davinci_ai::CodexServiceTier::Fast,
+        ] {
+            let runner = SubagentRunner::new(move |req| {
+                assert_eq!(req.service_tier, tier);
+                Ok("done".into())
+            });
+            let parent = SubagentParent {
+                service_tier: tier,
+                ..Default::default()
+            };
+            assert!(run_tool(
+                &json!({"prompt":"fixture", "service_tier":"fast"}),
+                &["read".into()],
+                Some(&runner),
+                &parent
+            )
+            .is_ok());
+        }
+        let mut agent = crate::Agent::new("fixture");
+        agent.service_tier = davinci_ai::CodexServiceTier::Fast;
+        assert_eq!(
+            agent.workflow_launch(false).service_tier,
+            davinci_ai::CodexServiceTier::Fast
+        );
     }
 
     #[test]

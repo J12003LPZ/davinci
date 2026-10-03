@@ -147,6 +147,15 @@ impl DesignController {
         request: DesignRequest,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> DesignResult<Value> {
+        // RPC and CLI operations inherit the active host abort flag. A browser
+        // operation may supply its own narrower cancellation scope explicitly.
+        let cancel = cancel.or_else(|| agent.abort_signal.clone());
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(DesignError::Cancelled);
+        }
         if !self.enabled
             && !matches!(
                 &request,
