@@ -702,6 +702,7 @@ impl WorkflowExecutor {
 
             let child_token = agent_token.clone();
             let req = SubagentRequest {
+                service_tier: launch.service_tier,
                 progress: Some(reporter.clone()),
                 max_turns: worker.max_turns,
                 parent_tools: Some(

@@ -73,8 +73,10 @@ pub fn compose_turn_prompt(
 
     let bundle = profile.bundle();
     let policy = crate::prompt::model_policy::prompt_model_policy(ctx.provider, ctx.model_id);
-    let mut modules =
+    let modules =
         crate::prompt::model_policy::apply_model_policy(policy, profile, bundle.modules.clone());
+    let mut modules =
+        crate::prompt::tool_strategy::apply_subscription_strategy(ctx.provider, modules);
 
     // 1. Dynamic provider adapter
     let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);

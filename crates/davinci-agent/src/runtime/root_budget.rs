@@ -63,6 +63,8 @@ enum Disposition {
 #[serde(deny_unknown_fields)]
 struct Reservation {
     actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
     output_ceiling: Option<u64>,
     cost_ceiling: Option<u64>,
     output: Option<u64>,
@@ -78,6 +80,18 @@ struct Ledger {
     limits: BudgetLimits,
     reservations: BTreeMap<String, Reservation>,
     halted: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    operations: BTreeMap<String, OperationLimit>,
+}
+
+/// A narrower host operation on the same ledger. All children and retries
+/// inherit it at admission, including processes holding older root handles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationLimit {
+    max_requests: u64,
+    deadline_unix_ms: u64,
+    closed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -173,6 +187,7 @@ impl RootBudget {
                     limits: budget.limits.clone(),
                     reservations: BTreeMap::new(),
                     halted: false,
+                    operations: BTreeMap::new(),
                 })?
             }
             Err(error) => return Err(error.to_string()),
@@ -228,6 +243,22 @@ impl RootBudget {
         if ledger.schema_version != 1 || ledger.root != self.root || ledger.limits != self.limits {
             return Err("root budget identity or approved limits changed".into());
         }
+        if ledger.operations.len() > 4096
+            || ledger
+                .operations
+                .values()
+                .filter(|limit| !limit.closed)
+                .count()
+                > 1
+            || ledger.operations.iter().any(|(id, limit)| {
+                id.is_empty()
+                    || id.len() > 256
+                    || limit.max_requests == 0
+                    || limit.deadline_unix_ms == 0
+            })
+        {
+            return Err("root budget contains invalid operation limits".into());
+        }
         for (attempt, reservation) in &ledger.reservations {
             if attempt.is_empty()
                 || attempt.len() > 512
@@ -235,6 +266,10 @@ impl RootBudget {
                 || reservation.actor.len() > 256
                 || reservation.output_ceiling == Some(0)
                 || (self.limits.max_output_tokens.is_some() && reservation.output_ceiling.is_none())
+                || reservation
+                    .operation
+                    .as_ref()
+                    .is_some_and(|id| !ledger.operations.contains_key(id))
                 || reservation
                     .output
                     .zip(reservation.output_ceiling)
@@ -272,6 +307,53 @@ impl RootBudget {
     pub fn snapshot(&self) -> Result<BudgetSnapshot, String> {
         let _lock = self.lock()?;
         self.read()?.snapshot()
+    }
+
+    /// Install a persisted narrower limit without replacing the root identity
+    /// or refunding any prior request. Reopening the same active operation is
+    /// idempotent; its approved deadline and allowance cannot be changed.
+    pub fn begin_operation(
+        &self,
+        id: &str,
+        max_requests: u64,
+        deadline_unix_ms: u64,
+    ) -> Result<(), String> {
+        if id.is_empty() || id.len() > 256 || max_requests == 0 || deadline_unix_ms == 0 {
+            return Err("operation needs a bounded identity and positive finite limits".into());
+        }
+        let _lock = self.lock()?;
+        let mut ledger = self.read()?;
+        let requested = OperationLimit {
+            max_requests,
+            deadline_unix_ms,
+            closed: false,
+        };
+        if let Some(existing) = ledger.operations.get(id) {
+            return if existing == &requested {
+                Ok(())
+            } else {
+                Err("operation limits changed or operation already closed".into())
+            };
+        }
+        if ledger.operations.len() >= 4096 || ledger.operations.values().any(|limit| !limit.closed)
+        {
+            return Err("another operation owns this root or operation capacity reached".into());
+        }
+        ledger.operations.insert(id.into(), requested);
+        self.write(&ledger)
+    }
+
+    /// Host-owned completion releases only the narrower scope. Unsettled
+    /// reservations remain charged to the root and still block future sends.
+    pub fn finish_operation(&self, id: &str) -> Result<(), String> {
+        let _lock = self.lock()?;
+        let mut ledger = self.read()?;
+        ledger
+            .operations
+            .get_mut(id)
+            .ok_or("unknown root operation")?
+            .closed = true;
+        self.write(&ledger)
     }
 
     /// A unique actual-send identity must be reserved before dispatch. A
@@ -323,6 +405,21 @@ impl RootBudget {
         if ledger.reservations.contains_key(attempt) || ledger.reservations.len() >= 65_536 {
             return Err("root budget denied: duplicate attempt or ledger capacity reached".into());
         }
+        let operation = ledger.operations.iter().find(|(_, limit)| !limit.closed);
+        if let Some((id, limit)) = operation {
+            let count = ledger
+                .reservations
+                .values()
+                .filter(|reservation| {
+                    reservation.operation.as_ref() == Some(id)
+                        && reservation.disposition != Disposition::Released
+                })
+                .count();
+            if count as u64 >= limit.max_requests || now >= u128::from(limit.deadline_unix_ms) {
+                return Err("root operation request allowance or deadline exhausted".into());
+            }
+        }
+        let operation = operation.map(|(id, _)| id.clone());
         let used = snapshot
             .committed_output_tokens
             .checked_add(snapshot.reserved_output_tokens);
@@ -350,6 +447,7 @@ impl RootBudget {
             attempt.into(),
             Reservation {
                 actor: actor.into(),
+                operation,
                 output_ceiling: output,
                 cost_ceiling,
                 output: None,
@@ -561,6 +659,7 @@ mod tests {
                 format!("{index:08}{}", "x".repeat(500)),
                 Reservation {
                     actor: "a".repeat(256),
+                    operation: None,
                     output_ceiling: Some(1),
                     cost_ceiling: None,
                     output: None,
