@@ -1,0 +1,115 @@
+{
+  "repository": "https://github.com/Leonxlnx/taste-skill",
+  "commit": "ce26fc25c0e5e8cab638f883de62d9a86ee5e45b",
+  "path": "skills/taste-skill/SKILL.md",
+  "git_blob": "b72132fcd466da605623ffe96e370b3991fc5285",
+  "sha256": "aa194351b246b8b4799099d4ed7b033d29eab6e6e3d58d8d2172978be7b3ec89",
+  "license_sha256": "4575a543ab88dad12ccea7d97e563d0bce5b448b06072e65d3264497dad326df",
+  "sections": [
+    {
+      "number": 0,
+      "name": "## 0. BRIEF INFERENCE (Read the Room Before Anything Else)",
+      "start": 588,
+      "end": 3259,
+      "sha256": "4a03d1d2728673ca5077986e4dae59fca2ad3cd45cf9abdb7587893f87cdff82"
+    },
+    {
+      "number": 1,
+      "name": "## 1. THE THREE DIALS (Core Configuration)",
+      "start": 3259,
+      "end": 5112,
+      "sha256": "801b82144caf95ce9bb8085372e64992b3e23cdb85469c54fcd9d5b1ce29f084"
+    },
+    {
+      "number": 2,
+      "name": "## 2. BRIEF \u2192 DESIGN SYSTEM MAP",
+      "start": 5112,
+      "end": 8387,
+      "sha256": "ac1a5a970a84f6bc40f02e4f89ef6da50f8ed6eedc6fb1ae9981662ccdf9a859"
+    },
+    {
+      "number": 3,
+      "name": "## 3. DEFAULT ARCHITECTURE & CONVENTIONS",
+      "start": 8387,
+      "end": 11554,
+      "sha256": "c66ce92fa2efa7d5ec235b0113da08389a7c86f7efb7170b5582b1d232b4fd39"
+    },
+    {
+      "number": 4,
+      "name": "## 4. DESIGN ENGINEERING DIRECTIVES (Bias Correction)",
+      "start": 11554,
+      "end": 36455,
+      "sha256": "1729f1ce25dbf36d406eee5da4fec6844116e7ff51fe576d1b1e848157102310"
+    },
+    {
+      "number": 5,
+      "name": "## 5. CONTEXT-AWARE PROACTIVITY",
+      "start": 36455,
+      "end": 45169,
+      "sha256": "4fa88e9e604a994721ef9e442e6efc8beec8c85b6294aef45213663dd0495d13"
+    },
+    {
+      "number": 6,
+      "name": "## 6. PERFORMANCE & ACCESSIBILITY GUARDRAILS",
+      "start": 45169,
+      "end": 47297,
+      "sha256": "f9d14be480a9da19e7ba4a1092e52a1dc584ecaa5e621e9b5f507f27b21b1690"
+    },
+    {
+      "number": 7,
+      "name": "## 7. DIAL DEFINITIONS (Technical Reference)",
+      "start": 47297,
+      "end": 48911,
+      "sha256": "92eda98f687850eae45417d7ce2a77257b3e95f496ba657f8dca71c6e28ce118"
+    },
+    {
+      "number": 8,
+      "name": "## 8. DARK MODE PROTOCOL",
+      "start": 48911,
+      "end": 50360,
+      "sha256": "f4ec062c9848207c52d45545631ae13ca9d17983edf8fabd9639360f883b772d"
+    },
+    {
+      "number": 9,
+      "name": "## 9. AI TELLS (Forbidden Patterns)",
+      "start": 50360,
+      "end": 62300,
+      "sha256": "cae326bf75fb69185592813daac259f6234be2f8636d4a01fb91ba96d5c93cbb"
+    },
+    {
+      "number": 10,
+      "name": "## 10. REFERENCE VOCABULARY (Pattern Names the Agent Should Know)",
+      "start": 62300,
+      "end": 66596,
+      "sha256": "243baf44f7dba3e5e668e1d5b0db0f98f6bcd84f7d84aa2020d3dc94b41a8f36"
+    },
+    {
+      "number": 11,
+      "name": "## 11. REDESIGN PROTOCOL",
+      "start": 66596,
+      "end": 69887,
+      "sha256": "491f0d8aee669b3f3a0b06cf3911e560df9dbc652c8fccb3d1904d93e8483ec2"
+    },
+    {
+      "number": 12,
+      "name": "## 12. THE BLOCK LIBRARY (Contract - Implementations Land Here Iteratively)",
+      "start": 69887,
+      "end": 71940,
+      "sha256": "1cc553c632eab1409174b511c21a747ce59b35b628dcaaef54fa79e0703430ce"
+    },
+    {
+      "number": 13,
+      "name": "## 13. OUT OF SCOPE",
+      "start": 71940,
+      "end": 72637,
+      "sha256": "7b69a35b7ea1b3a20491bb5c1cebea0590ea7a6f4d62e70273ea12ac229b1f1b"
+    },
+    {
+      "number": 14,
+      "name": "## 14. FINAL PRE-FLIGHT CHECK",
+      "start": 72637,
+      "end": 87253,
+      "sha256": "e6b18cafdd370b2ef1005dc951dac93b4b4c1eb42fc8e4bd47072462aaf279e7"
+    }
+  ]
+}

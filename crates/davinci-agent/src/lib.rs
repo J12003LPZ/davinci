@@ -6,6 +6,7 @@ pub mod cache_stability;
 pub mod decision;
 pub mod decisions;
 pub mod delegation;
+pub mod host_operation;
 mod permission_state;
 pub mod process_manager;
 pub mod subagent_progress;
@@ -451,6 +452,7 @@ pub struct Agent {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
+    pub service_tier: davinci_ai::CodexServiceTier,
     pub effort_policy: effort::EffortPolicy,
     decision_effort_advice_enabled: bool,
     decision_completion_advice_enabled: bool,
@@ -553,6 +555,7 @@ pub struct Agent {
     /// Cross-thread interrupt: set from the UI thread while `run_loop` runs
     /// on a worker. Checked at every loop step alongside `aborted`.
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) host_command_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Counters for the run (`stats.rs`): turns, batch widths, wall time,
     /// peak context, prunings. Read them through `run_stats`, which also
     /// folds in the counters bumped from inside tool calls.
@@ -668,6 +671,7 @@ impl Agent {
             last_real_user_request: None,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
+            service_tier: davinci_ai::CodexServiceTier::Standard,
             effort_policy: effort::EffortPolicy::default(),
             decision_effort_advice_enabled: false,
             decision_completion_advice_enabled: false,
@@ -741,6 +745,7 @@ impl Agent {
             reload_count: 0,
             event_sink: None,
             abort_signal: None,
+            host_command_abort: None,
             stats: RunStats::default(),
             observation_root_id: uuid::Uuid::new_v4().to_string(),
             root_budget: None,
@@ -948,6 +953,16 @@ impl Agent {
         Ok(())
     }
 
+    /// Read the existing host-approved ledger; feature adapters must never
+    /// create a replacement budget or use unaccounted provider transports.
+    pub fn root_budget(&self) -> Option<&runtime::capacity::RootBudget> {
+        self.root_budget.as_ref().or_else(|| {
+            self.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.root_budget.as_ref())
+        })
+    }
+
     pub(crate) fn provider_observation_scope(
         &self,
         purpose: &str,
@@ -1090,6 +1105,7 @@ impl Agent {
     /// for background runs whose host can deliver the report.
     pub fn workflow_launch(&self, report_to_lead: bool) -> crate::runtime::WorkflowLaunch {
         crate::runtime::WorkflowLaunch {
+            service_tier: self.service_tier,
             parent_permission_mode: Some(self.permission_mode()),
             provider: Some(self.provider.clone()),
             model_id: Some(self.model_id.clone()),

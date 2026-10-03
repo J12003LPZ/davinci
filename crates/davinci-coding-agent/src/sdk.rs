@@ -90,6 +90,18 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
+    /// Typed design entry point; uses this session's existing approval policy.
+    pub fn design(
+        &mut self,
+        request: crate::design::controller::DesignRequest,
+    ) -> crate::design::error::DesignResult<serde_json::Value> {
+        let controller = crate::design::controller::DesignController::new(
+            crate::design::store::DesignStore::new(self.agent_dir.join("design")),
+            crate::design::enabled(),
+        );
+        controller.execute(&mut self.agent, &self.cwd, request)
+    }
+
     pub fn subscribe(&mut self, listener: impl Fn(&davinci_agent::AgentEvent) + 'static) {
         self.listeners.push(Box::new(listener));
     }
@@ -506,6 +518,7 @@ pub fn create_agent_session(
     )?
     .profile;
     let mut agent = Agent::new_builtin(resolved_profile);
+    agent.service_tier = settings.resolved_service_tier();
     agent.cwd = cwd.clone();
     agent.context_files = load_context_files(&cwd, true);
     let mut skill_roots = project_resource_roots(&cwd, trusted, "skills");

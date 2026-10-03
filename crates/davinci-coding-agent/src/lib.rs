@@ -5,6 +5,7 @@ pub mod args;
 pub mod completion_delivery;
 pub mod decision_providers;
 pub mod decision_state;
+pub mod design;
 pub mod execution_boundary;
 pub mod hooks;
 pub mod interaction_testing;

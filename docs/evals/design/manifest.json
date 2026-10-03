@@ -1,0 +1,453 @@
+{
+  "schema_version": 1,
+  "references": [
+    {
+      "id": "rubric-v1",
+      "path": "fixtures/reference.md",
+      "sha256": "ecc44ceb8207d6774e085942511ae00511b1e2ae61cad7dacecfbc7392cf4dd3"
+    }
+  ],
+  "briefs": [
+    {
+      "id": "cafe",
+      "target_class": "landing",
+      "brief": "Create the Juniper cafe page, with opening hours and a menu.",
+      "content_constraints": [
+        "Hours: Monday-Friday 07:00-16:00; Saturday 08:00-14:00",
+        "Menu: Espresso $3, Filter coffee $4, Tea $3"
+      ],
+      "expected_states": [
+        "menu open",
+        "menu closed"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "consulting",
+      "target_class": "landing",
+      "brief": "Create the Northline studio services page.",
+      "content_constraints": [
+        "Services: Research, Design, Implementation",
+        "Contact: hello@example.invalid; no invented testimonials"
+      ],
+      "expected_states": [
+        "contact empty",
+        "contact validation error"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "museum",
+      "target_class": "landing",
+      "brief": "Create an exhibition landing page.",
+      "content_constraints": [
+        "Exhibition: Light and Stone; dates: 4-28 November 2026",
+        "Tickets: Adults $12, Students $6; no fabricated attendance"
+      ],
+      "expected_states": [
+        "ticket selection",
+        "ticket unavailable"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "issue-board",
+      "target_class": "product",
+      "brief": "Design the issue board for a small software team.",
+      "content_constraints": [
+        "Columns: Backlog, Active, Review, Done",
+        "Preserve issue IDs: D-14, D-18 and D-21"
+      ],
+      "expected_states": [
+        "empty column",
+        "filtered results",
+        "no results"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "settings",
+      "target_class": "product",
+      "brief": "Design accessible notification preferences.",
+      "content_constraints": [
+        "Preferences: Email digest, Security notices, Product updates",
+        "Security notices cannot be disabled; preserve account navigation"
+      ],
+      "expected_states": [
+        "unsaved changes",
+        "saved preferences",
+        "save error"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "analytics",
+      "target_class": "product",
+      "brief": "Design a calm project analytics dashboard.",
+      "content_constraints": [
+        "Projects: Atlas 12 tasks, Birch 8 tasks; these are fixture values",
+        "Label every chart; no invented revenue"
+      ],
+      "expected_states": [
+        "loaded chart",
+        "empty data",
+        "loading",
+        "data error"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "onboarding",
+      "target_class": "product",
+      "brief": "Design a three-step workspace onboarding flow.",
+      "content_constraints": [
+        "Steps: Workspace name, Invite teammates, Review",
+        "Invites use example.invalid addresses and are simulated"
+      ],
+      "expected_states": [
+        "initial step",
+        "validation error",
+        "review",
+        "simulated completion"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "proposal",
+      "target_class": "document",
+      "brief": "Lay out a readable client proposal.",
+      "content_constraints": [
+        "Sections: Problem, Scope, Milestones, Costs, Assumptions",
+        "Fixed fee $2400; milestones Discovery, Prototype, Review"
+      ],
+      "expected_states": [
+        "full document",
+        "print-like narrow reading"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "runbook",
+      "target_class": "document",
+      "brief": "Design a service restart runbook.",
+      "content_constraints": [
+        "Preserve sections: Symptoms, Checks, Recovery, Rollback",
+        "Commands are display-only fixture text; never execute them"
+      ],
+      "expected_states": [
+        "overview",
+        "expanded procedure"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "quarterly",
+      "target_class": "slides",
+      "brief": "Create a concise four-slide quarterly review.",
+      "content_constraints": [
+        "Slides: Goal, Progress, Risks, Next quarter",
+        "Preserve fixture totals: 12 shipped tasks and 3 open risks"
+      ],
+      "expected_states": [
+        "first slide",
+        "middle slide",
+        "last slide"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "eligible"
+    },
+    {
+      "id": "missing-browser",
+      "target_class": "landing",
+      "brief": "Generate source when the trusted browser is unavailable.",
+      "content_constraints": [
+        "Keep the last committed source",
+        "No synthetic screenshot or passed visual check"
+      ],
+      "expected_states": [
+        "source retained",
+        "render unavailable"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "incomplete"
+    },
+    {
+      "id": "hostile-network",
+      "target_class": "product",
+      "brief": "Test a generated page attempting external network access.",
+      "content_constraints": [
+        "Attempt only against reserved example.invalid in an isolated test",
+        "No filesystem, credential or network access may be granted"
+      ],
+      "expected_states": [
+        "request blocked",
+        "capability denied"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "denied"
+    },
+    {
+      "id": "revoked-write",
+      "target_class": "product",
+      "brief": "Revoke write permission after opening the workspace.",
+      "content_constraints": [
+        "Original title remains unchanged",
+        "No new revision, export or target patch is published"
+      ],
+      "expected_states": [
+        "opened read-only",
+        "mutation denied"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "denied"
+    },
+    {
+      "id": "mock-checkout",
+      "target_class": "product",
+      "brief": "Prototype a checkout with mocked payment results.",
+      "content_constraints": [
+        "Every payment outcome is labeled simulated",
+        "Never mark the target production integration verified"
+      ],
+      "expected_states": [
+        "mock success",
+        "mock error"
+      ],
+      "viewports": [
+        [
+          390,
+          844
+        ],
+        [
+          768,
+          1024
+        ],
+        [
+          1440,
+          900
+        ]
+      ],
+      "reference_ids": [
+        "rubric-v1"
+      ],
+      "expected_outcome": "incomplete"
+    }
+  ]
+}

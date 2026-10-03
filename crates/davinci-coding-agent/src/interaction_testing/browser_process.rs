@@ -17,6 +17,7 @@ use std::{
 };
 
 use super::artifacts::{compute_sha256, ArtifactBudgetTracker};
+use crate::design::confinement::design_sandbox;
 
 const MAX_RESPONSE: usize = 64 * 1024;
 const MAX_REQUEST: usize = 16 * 1024;
@@ -112,6 +113,32 @@ impl BrowserProcess {
         host: &SupervisorCommand,
         config: BrowserProcessConfig<'_>,
     ) -> Result<Self, String> {
+        Self::start_inner(host, config, None)
+    }
+
+    /// Design pages require OS-enforced network denial, including non-HTTP egress.
+    /// The bundle is host-owned, immutable input; the workspace is never mounted.
+    pub fn start_design(
+        host: &SupervisorCommand,
+        config: BrowserProcessConfig<'_>,
+        bundle: &Value,
+    ) -> Result<Self, String> {
+        // 100 MiB of retained raster data after base64 plus the bounded compiled source.
+        if serde_json::to_vec(bundle)
+            .map_err(|_| "invalid design bundle")?
+            .len()
+            > 150 * 1024 * 1024
+        {
+            return Err("design bundle transfer limit".into());
+        }
+        Self::start_inner(host, config, Some(bundle))
+    }
+
+    fn start_inner(
+        host: &SupervisorCommand,
+        config: BrowserProcessConfig<'_>,
+        design: Option<&Value>,
+    ) -> Result<Self, String> {
         crate::execution_boundary::require_executor("browser process")?;
         let workspace = config
             .workspace
@@ -153,6 +180,9 @@ impl BrowserProcess {
                 return Err("browser host directory must be outside the workspace".into());
             }
             if config.environment.keys().any(|name| {
+                if design.is_some() && cfg!(target_os = "linux") && name == "FONTCONFIG_FILE" {
+                    return false;
+                }
                 !matches!(
                     name.as_str(),
                     "PATH"
@@ -179,6 +209,12 @@ impl BrowserProcess {
                 }
             }
             let mut environment = config.environment;
+            if design.is_some() && cfg!(target_os = "linux") {
+                environment.insert(
+                    "XDG_CACHE_HOME".into(),
+                    directory.join("font-cache").to_string_lossy().into_owned(),
+                );
+            }
             if diagnostics {
                 environment.insert("DAVINCI_BROWSER_DIAGNOSTICS".into(), "1".into());
             }
@@ -189,14 +225,39 @@ impl BrowserProcess {
                     environment.entry(name.into()).or_insert(value);
                 }
             }
+            if design.is_some() && cfg!(target_os = "linux") {
+                // Bubblewrap supplies a private /tmp but no host home or
+                // account database. Playwright resolves homedir during import
+                // and creates browser profiles through the temporary path.
+                for name in ["HOME", "TMPDIR", "TEMP", "TMP"] {
+                    environment.insert(name.into(), "/tmp".into());
+                }
+            }
             for (name, bytes) in FILES {
                 fs::write(directory.join(name), bytes)
                     .map_err(|_| "cannot materialize browser host")?;
             }
+            if let Some(bundle) = design {
+                fs::write(
+                    directory.join("design.json"),
+                    serde_json::to_vec(bundle).map_err(|_| "invalid design bundle")?,
+                )
+                .map_err(|_| "cannot materialize design bundle")?;
+            }
+            // The application workspace is intentionally absent inside the
+            // design sandbox. Its host resolves paths against the private
+            // directory; dependency ownership was checked outside the sandbox.
+            let browser_workspace = if design.is_some() {
+                &directory
+            } else {
+                &workspace
+            };
             fs::write(
                 directory.join("config.json"),
                 serde_json::to_vec(&json!({
-                    "packagePath": package, "version": config.version, "workspace": workspace
+                    "packagePath": crate::design::runtime::node_path(&package), "version": config.version,
+                    "workspace": crate::design::runtime::node_path(browser_workspace),
+                    "design": design.is_some()
                 }))
                 .map_err(|_| "invalid browser host configuration")?,
             )
@@ -205,6 +266,11 @@ impl BrowserProcess {
             let event_state = state.clone();
             let owner: Arc<Mutex<Option<Weak<Supervisor>>>> = Arc::new(Mutex::new(None));
             let event_owner = owner.clone();
+            let sandbox = if design.is_some() {
+                Some(design_sandbox(&directory, &node, &package, &environment)?)
+            } else {
+                None
+            };
             let supervisor = Arc::new(
                 Supervisor::spawn_with_stderr(
                     host,
@@ -219,7 +285,7 @@ impl BrowserProcess {
                         ],
                         cwd: directory.clone(),
                         environment,
-                        sandbox: None,
+                        sandbox,
                         background: true,
                         service: true,
                         operation: None,
@@ -527,6 +593,19 @@ fn clean_directory(directory: &Path) {
         let _ = fs::remove_file(directory.join(name));
     }
     let _ = fs::remove_file(directory.join("config.json"));
+    let _ = fs::remove_file(directory.join("design.json"));
+    // Fontconfig writes only inside this private cache. Resolve its final target
+    // before recursive removal; a replaced link must never delete another tree.
+    if let (Ok(root), Ok(cache)) = (
+        directory.canonicalize(),
+        directory.join("font-cache").canonicalize(),
+    ) {
+        if cache.parent() == Some(root.as_path())
+            && cache.file_name().is_some_and(|name| name == "font-cache")
+        {
+            let _ = fs::remove_dir_all(cache);
+        }
+    }
     if let Ok(entries) = fs::read_dir(directory) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -545,6 +624,24 @@ fn clean_directory(directory: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_font_cache_is_removed_without_touching_neighbor_data() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("browser");
+        fs::create_dir_all(private.join("font-cache/fontconfig")).unwrap();
+        fs::write(private.join("font-cache/fontconfig/cache"), "cache").unwrap();
+        let neighbor = root.path().join("preserved");
+        fs::write(&neighbor, "user data").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&neighbor, private.join("font-cache/alias")).unwrap();
+        clean_directory(&private);
+        assert!(
+            !private.exists(),
+            "private font cache leaked after browser close"
+        );
+        assert_eq!(fs::read_to_string(neighbor).unwrap(), "user data");
+    }
 
     #[test]
     fn helper_entry() {

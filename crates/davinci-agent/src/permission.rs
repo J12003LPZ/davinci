@@ -129,8 +129,10 @@ pub(crate) fn is_secret_file_path(path: &str) -> bool {
 
 pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
-        "patch_preview" | "patch_status" => ToolClass::Read,
-        "patch_apply" | "patch_rollback" => ToolClass::Edit,
+        "patch_preview" | "patch_status" | "design_read" => ToolClass::Read,
+        // Host-only design application still dispatches patch_apply separately;
+        // this classification cannot grant paths or bypass the transaction gate.
+        "patch_apply" | "patch_rollback" | "design_apply" => ToolClass::Edit,
         "process_status" | "process_output" | "process_list" => ToolClass::Read,
         "process_start" | "process_write" => ToolClass::Shell,
         "process_stop" => ToolClass::Other,

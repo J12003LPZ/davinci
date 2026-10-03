@@ -2396,6 +2396,10 @@ fn graph_command_opens_view(name: &str, args: &str) -> bool {
 }
 
 fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -> Option<Next> {
+    if davinci_coding_agent::design::is_command(line) {
+        // The ordinary worker path keeps the UI alive while approval is pending.
+        return Some(submit_prompt(shell, line, &[]));
+    }
     let (name, args) = crate::parse_extension_command(line);
     if name.is_empty() {
         return None;
@@ -4020,6 +4024,11 @@ pub fn perform(
         }
         // Bare `/thinking` or `/effort`: the model picker opens on the
         // current model, whose effort row adjusts with ←/→.
+        SlashAction::ToggleFast => {
+            let text = crate::toggle_fast(parsed, agent);
+            model.speed_mode = crate::speed_label(agent);
+            Ok(Done::Said(text))
+        }
         SlashAction::SetThinking(level) if level.trim().is_empty() => {
             open_models_sheet(parsed, agent, model);
             Ok(Done::Opened)
@@ -4454,6 +4463,7 @@ fn model_has_credential(parsed: &crate::args::Args, provider: &str, model_id: &s
 /// and the row Cogitator marks as the one in hand all move together.
 fn sync_thinking_state(agent: &Agent, model: &mut Model) {
     model.thinking_level = agent.thinking_level.as_str().to_string();
+    model.speed_mode = crate::speed_label(agent);
     model.thinking_levels = crate::current_runtime_model(agent)
         .map(|runtime| {
             crate::get_supported_thinking_levels(&runtime)

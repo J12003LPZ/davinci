@@ -847,6 +847,36 @@ impl TaskContract {
     }
 
     /// Checks whether a tool call conforms to this contract's scope and effects.
+    /// Check a host evidence read without expanding the contract's write scope.
+    /// The caller must separately enforce current read permissions and hooks.
+    pub fn check_source_read(&self, cwd: &Path, path: &Path) -> Result<(), String> {
+        let root = cwd.canonicalize().map_err(|e| e.to_string())?;
+        let target = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let target = target.canonicalize().map_err(|e| e.to_string())?;
+        let relative = target
+            .strip_prefix(&root)
+            .map_err(|_| "source read escapes the contracted workspace")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let normalized = normalize_relative_path(&relative).map_err(|e| e.to_string())?;
+        let protected: Vec<&str> = self.protected_paths.iter().map(String::as_str).collect();
+        // Match against the exact resolved path as the read scope, while keeping
+        // protected paths authoritative. This grants no write permission.
+        if !path_scope_allows_case(
+            &normalized,
+            &[&normalized],
+            &protected,
+            cfg!(any(windows, target_os = "macos")),
+        ) {
+            return Err("source read is protected by the current contract".into());
+        }
+        Ok(())
+    }
+
     pub fn check_call(
         &self,
         cwd: &Path,
@@ -1097,6 +1127,49 @@ mod tests {
             tampered.validate(),
             Err(ContractError::DigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn source_reads_preserve_protected_scope_without_granting_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for name in ["app.tsx", "package.json", ".env"] {
+            std::fs::write(root.path().join(name), "fixture").unwrap();
+        }
+        std::fs::write(outside.path().join("outside"), "private").unwrap();
+        let contract = TaskContract::new(
+            "read-evidence",
+            1,
+            TaskId::new(),
+            1,
+            vec!["app.tsx".into()],
+            vec![".env".into()],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        contract
+            .check_source_read(
+                root.path(),
+                &root.path().join("app.tsx").canonicalize().unwrap(),
+            )
+            .unwrap();
+        contract
+            .check_source_read(root.path(), Path::new("package.json"))
+            .unwrap();
+        assert!(!contract.allows_path("package.json").unwrap());
+        assert!(contract
+            .check_source_read(root.path(), Path::new(".env"))
+            .is_err());
+        assert!(contract
+            .check_source_read(root.path(), &outside.path().join("outside"))
+            .is_err());
+        #[cfg(windows)]
+        assert!(contract
+            .check_source_read(root.path(), Path::new(".ENV"))
+            .is_err());
     }
 
     #[test]

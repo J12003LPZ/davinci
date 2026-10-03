@@ -94,6 +94,44 @@ pub fn has_uncommitted_changes(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Inspect an already isolated worktree for a host-approved coding handoff.
+/// This owner never switches branches or hides unrelated working changes.
+pub fn handoff_snapshot(cwd: &Path, paths: &[String]) -> Result<String, WorktreeError> {
+    let git_dir = run_git(cwd, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+    let common = run_git(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    if git_dir == common {
+        return Err(WorktreeError::GitError(
+            "Open the coding session in an isolated worktree before applying a design".into(),
+        ));
+    }
+    if paths.is_empty()
+        || paths.len() > 32
+        || paths
+            .iter()
+            .any(|p| p.is_empty() || p.starts_with('-') || p.contains('\0'))
+    {
+        return Err(WorktreeError::GitError(
+            "handoff needs bounded target paths".into(),
+        ));
+    }
+    let mut args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    if !run_git(cwd, &args)?.is_empty() {
+        return Err(WorktreeError::DirtyWorktreePreserved {
+            path: cwd.to_path_buf(),
+        });
+    }
+    Ok(format!(
+        "{}\n{}\n{}",
+        git_dir,
+        run_git(cwd, &["rev-parse", "HEAD"])?,
+        run_git(cwd, &["symbolic-ref", "--short", "HEAD"])?
+    ))
+}
+
 /// Thread-safe manager for ephemeral git worktrees.
 #[derive(Clone)]
 pub struct WorktreeManager {

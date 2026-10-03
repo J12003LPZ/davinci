@@ -39,7 +39,19 @@ async function main() {
     throw new Error('Invalid browser host configuration');
   }
   const config = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const backend = createBrowserBackend(loadTrustedPlaywright(config));
+  if (Object.keys(config).some(key => !['packagePath','version','workspace','design'].includes(key)) ||
+      (config.design !== undefined && typeof config.design !== 'boolean')) throw new Error('Invalid browser host fields');
+  let design;
+  if (config.design) {
+    const designPath = path.join(hostDirectory, 'design.json');
+    if (fs.lstatSync(designPath).isSymbolicLink() || fs.statSync(designPath).size > 150 * 1024 * 1024) {
+      throw new Error('Invalid design bundle');
+    }
+    design = JSON.parse(fs.readFileSync(designPath, 'utf8'));
+  }
+  const backend = createBrowserBackend(loadTrustedPlaywright({
+    packagePath:config.packagePath, version:config.version, workspace:config.workspace
+  }), design);
   const transport = createBrowserTransport({input: process.stdin, output: process.stdout,
     backend, artifact: createArtifactSink(__dirname)});
   const close = () => {void transport.close();};
