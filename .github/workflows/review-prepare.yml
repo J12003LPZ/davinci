@@ -12,6 +12,11 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   prepare:
+    # Cancel only the redundant CI run caused by creating this temporary branch.
+    # Actual pull-request and main CI concurrency groups are unaffected.
+    concurrency:
+      group: ci-push-refs/heads/chore/review-fix-preparation-20261003
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

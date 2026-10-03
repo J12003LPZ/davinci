@@ -11,7 +11,7 @@ TEMP = Path(os.environ['RUNNER_TEMP'])
 HEAD85 = '06bc2f8aa93fee58568cd37fe68ef5a6d24810e3'
 HEAD86 = 'a7a59af4cc2781296c1f69f7dc214da784790bce'
 HEAD84 = 'b30783f610597f8448a35097ef5e1ad4c55e509d'
-PREFIX = 'fix/review-prepared-20261003'
+PREFIX = 'fix/review-prepared-20261003-v2'
 CHANGES = json.loads((ROOT / 'changes.json').read_text(encoding='utf-8'))
 
 
@@ -41,6 +41,18 @@ def apply(directory: Path, groups: set[str]) -> list[str]:
         if text.count(change['before']) != 1:
             raise RuntimeError(f'Expected exactly one reviewed anchor: {relative}')
         buffers[relative] = text.replace(change['before'], change['after'], 1)
+    if 'integration' in groups:
+        # Keep the regression module at file end, following the repository's
+        # Rust layout rather than placing production items after a test module.
+        relative = 'crates/davinci-coding-agent/src/design/model.rs'
+        text = buffers[relative]
+        marker = '#[cfg(test)]\nmod service_tier_regression_tests {'
+        if text.count(marker) != 1:
+            raise RuntimeError('Expected one Design tier regression module')
+        start = text.index(marker)
+        end = text.index('impl DesignModel for SubscriptionModel {', start)
+        tests = text[start:end].strip()
+        buffers[relative] = (text[:start] + text[end:]).rstrip() + '\n\n' + tests + '\n'
     # All anchors must be valid before the disposable worktree is changed.
     for relative, content in buffers.items():
         (directory / relative).write_text(content, encoding='utf-8', newline='\n')
