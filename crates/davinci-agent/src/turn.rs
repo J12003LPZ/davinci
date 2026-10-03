@@ -362,6 +362,7 @@ impl Agent {
         let mut truncated_call_retries = 0_u32;
         let mut verification_reminded_generation = None;
         let mut turns_this_run = 0_u32;
+        let mut fast_downgrade_notified = false;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
         self.push_event(
@@ -598,6 +599,27 @@ impl Agent {
             };
             for observation in observations.finish(status) {
                 self.stats.note_provider_observation(&observation);
+                if status == "completed"
+                    && !fast_downgrade_notified
+                    && observation.kind == "logical_end"
+                    && observation.requested_service_tier.as_deref() == Some("priority")
+                    && observation.service_tier_honored() == Some(false)
+                {
+                    fast_downgrade_notified = true;
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::CompletionNotice {
+                            reason_code: "service_tier_downgrade".into(),
+                            text: format!(
+                                "Fast was requested, but the backend served this turn at {} tier.",
+                                observation
+                                    .returned_service_tier
+                                    .as_deref()
+                                    .unwrap_or_default()
+                            ),
+                        },
+                    );
+                }
                 self.push_event(
                     &mut events,
                     AgentEvent::ProviderObservation {
@@ -2386,6 +2408,7 @@ impl Agent {
                 let active_contract = self.active_contract();
                 let contract_digest = active_contract.as_ref().map(|c| c.digest.clone());
                 let parent = crate::subagent::SubagentParent {
+                    service_tier: self.service_tier,
                     event_sink: self.event_sink.clone(),
                     tool_call_id: Some(id.to_string()),
                     allow_async: self.async_agents_allowed,

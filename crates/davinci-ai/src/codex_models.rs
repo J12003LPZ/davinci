@@ -38,6 +38,11 @@ const DEFAULT_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CodexModelInfo {
     pub slug: String,
+    /// None means older/unknown metadata; an explicit empty catalog means unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tiers: Option<Vec<CodexServiceTierInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,7 +62,45 @@ pub struct CodexReasoningLevel {
     pub effort: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CodexServiceTierInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastCapability {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+/// Sidecar lookup keeps capabilities even when a built-in catalog record wins.
+pub fn fast_capability_for_model(agent_dir: &Path, model_id: &str) -> FastCapability {
+    load_codex_models(agent_dir)
+        .iter()
+        .find(|model| model.slug == model_id)
+        .map(CodexModelInfo::fast_capability)
+        .unwrap_or(FastCapability::Unknown)
+}
+
 impl CodexModelInfo {
+    pub fn fast_capability(&self) -> FastCapability {
+        match &self.service_tiers {
+            None => FastCapability::Unknown,
+            Some(tiers)
+                if tiers.iter().any(|tier| {
+                    crate::CodexServiceTier::parse(&tier.id) == Some(crate::CodexServiceTier::Fast)
+                }) =>
+            {
+                FastCapability::Supported
+            }
+            Some(_) => FastCapability::Unsupported,
+        }
+    }
+
     /// Codex shows a model in its picker when `visibility` is `list`. Hidden
     /// models stay usable by exact id through the resolver's custom-id path.
     fn is_listed(&self) -> bool {

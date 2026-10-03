@@ -85,6 +85,7 @@ fn revision_fixture(
             },
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: false,
             on_update: Arc::new(move |run, _| {
                 if let Some(verification) = &run.verification {

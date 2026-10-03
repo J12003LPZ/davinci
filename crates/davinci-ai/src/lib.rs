@@ -57,7 +57,9 @@ pub mod responses_ledger;
 pub mod responses_request;
 pub mod responses_tools;
 mod retry;
+pub mod service_tier;
 mod shell;
+pub use service_tier::CodexServiceTier;
 mod stream;
 pub mod subscription_policy;
 #[doc(hidden)]
@@ -105,9 +107,10 @@ pub use codex::{
 };
 pub use codex_flags::CodexFeatureFlags;
 pub use codex_models::{
-    codex_cli_cache_path, codex_model_source_paths, codex_models_path, load_codex_models,
-    merge_codex_models, overlay_codex_models, parse_codex_models, refresh_codex_models,
-    CodexModelInfo, CodexModelsFile, CodexModelsRefresh, CODEX_MODELS_REFRESH_INTERVAL_MS,
+    codex_cli_cache_path, codex_model_source_paths, codex_models_path, fast_capability_for_model,
+    load_codex_models, merge_codex_models, overlay_codex_models, parse_codex_models,
+    refresh_codex_models, CodexModelInfo, CodexModelsFile, CodexModelsRefresh,
+    CodexServiceTierInfo, FastCapability, CODEX_MODELS_REFRESH_INTERVAL_MS,
 };
 pub use deferred::{
     cancel_deferred, fetch_deferred, DeferredFetchOptions, DeferredFetchResult, DeferredHandle,
