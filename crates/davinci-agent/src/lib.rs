@@ -451,6 +451,7 @@ pub struct Agent {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
+    pub service_tier: davinci_ai::CodexServiceTier,
     pub effort_policy: effort::EffortPolicy,
     decision_effort_advice_enabled: bool,
     decision_completion_advice_enabled: bool,
@@ -668,6 +669,7 @@ impl Agent {
             last_real_user_request: None,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
+            service_tier: davinci_ai::CodexServiceTier::Standard,
             effort_policy: effort::EffortPolicy::default(),
             decision_effort_advice_enabled: false,
             decision_completion_advice_enabled: false,
@@ -1090,6 +1092,7 @@ impl Agent {
     /// for background runs whose host can deliver the report.
     pub fn workflow_launch(&self, report_to_lead: bool) -> crate::runtime::WorkflowLaunch {
         crate::runtime::WorkflowLaunch {
+            service_tier: self.service_tier,
             parent_permission_mode: Some(self.permission_mode()),
             provider: Some(self.provider.clone()),
             model_id: Some(self.model_id.clone()),

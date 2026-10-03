@@ -933,6 +933,7 @@ mod tests {
             config: super::super::config::GraphConfig::default(),
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: None,

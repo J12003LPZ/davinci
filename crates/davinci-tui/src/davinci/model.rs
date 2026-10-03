@@ -2361,6 +2361,7 @@ pub struct Model {
     pub active_provider: String,
     /// Active thinking/reasoning level for the model in hand (`off`, `high`, ...).
     pub thinking_level: String,
+    pub speed_mode: String,
     /// The runtime-confirmed permission mode (`ask`, `edits`, `read-only`,
     /// `auto`, `always-approve`). This is the sole source for Plan indicators;
     /// a keyboard request never advances it ahead of the runtime policy.
@@ -2556,6 +2557,7 @@ impl Model {
             model_name: String::new(),
             active_provider: String::new(),
             thinking_level: "off".into(),
+            speed_mode: String::new(),
             permission_mode: "ask".into(),
             show_tool_output: false,
             jobs_running: 0,

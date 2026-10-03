@@ -529,6 +529,10 @@ pub fn run_worker(
     };
     let cache_profile = worker_cache_profile(spec);
     let mut command = Command::new(executable);
+    command.env(
+        "DAVINCI_OPENAI_SERVICE_TIER",
+        spec.service_tier.settings_value(),
+    );
     command.env_remove(super::worker_sessions::SESSION_ENV);
     if let Some(binding) = &spec.worker_session {
         match serde_json::to_string(binding) {
@@ -1033,6 +1037,7 @@ mod tests {
 
     fn spec() -> WorkerSpec {
         WorkerSpec {
+            service_tier: davinci_ai::CodexServiceTier::Standard,
             task_id: "review-1".into(),
             role: Role::Reviewer,
             expect: ArtifactKind::Review,
