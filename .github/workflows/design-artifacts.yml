@@ -50,6 +50,8 @@ jobs:
       - run: python scripts/design-contracts.py --check
       - name: Every design integration target and the offline evaluation manifest
         run: python scripts/test-design.py
+      - name: Durable design publication interruption boundaries
+        run: cargo test -p davinci-coding-agent --lib design::publication_tests --locked
       - name: Install locked companion development tools
         run: npm --prefix crates/davinci-coding-agent/design-ui ci
       - run: npm --prefix crates/davinci-coding-agent/design-ui run typecheck
@@ -73,13 +75,14 @@ jobs:
           if-no-files-found: warn
 
   native-render:
-    if: github.event_name == 'workflow_dispatch' && inputs.native_render
+    if: github.event_name == 'pull_request' || inputs.native_render
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       PI_OFFLINE: '1'
       CARGO_INCREMENTAL: '0'
       DAVINCI_DESIGN_RUNTIME: ${{ runner.temp }}/design-runtime
+      DAVINCI_DESIGN_EVIDENCE: ${{ runner.temp }}/design-native-evidence
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -100,4 +103,15 @@ jobs:
           node crates/davinci-coding-agent/design-ui/scripts/install-runtime.cjs "$DAVINCI_DESIGN_RUNTIME"
           echo "DAVINCI_DESIGN_NODE=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
       - name: Strict real compiler, host, confined capture and prototype actions
-        run: cargo test -p davinci-coding-agent --locked --test design_runtime -- --ignored --nocapture
+        shell: bash
+        run: |
+          mkdir -p "$DAVINCI_DESIGN_EVIDENCE"
+          set -o pipefail
+          cargo test -p davinci-coding-agent --locked --test design_runtime -- --ignored --nocapture 2>&1 | tee "$DAVINCI_DESIGN_EVIDENCE/native-tests.log"
+      - name: Preserve native gate diagnostics and successful capture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-native-linux
+          path: ${{ env.DAVINCI_DESIGN_EVIDENCE }}
+          if-no-files-found: warn

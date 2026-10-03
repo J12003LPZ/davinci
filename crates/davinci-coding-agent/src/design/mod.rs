@@ -45,3 +45,5 @@ pub fn is_command(text: &str) -> bool {
         Some("/design" | "/design-sync")
     )
 }
+#[cfg(test)]
+mod publication_tests;

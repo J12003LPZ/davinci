@@ -57,7 +57,12 @@ impl Blobs {
         Ok(VerificationEvidenceStore::new(self.0.clone()))
     }
     pub fn store_artifact(&self, media: &str, bytes: &[u8]) -> Result<ArtifactRef, String> {
-        self.owner()?.store_artifact(media, bytes).map(Into::into)
+        #[cfg(test)]
+        super::publication_tests::checkpoint("before_blob").map_err(|e| e.to_string())?;
+        let reference = self.owner()?.store_artifact(media, bytes)?;
+        #[cfg(test)]
+        super::publication_tests::checkpoint("after_blob").map_err(|e| e.to_string())?;
+        Ok(reference.into())
     }
     pub fn get_artifact(&self, reference: &ArtifactRef) -> Result<Vec<u8>, String> {
         super::types::validate_hash(&reference.sha256).map_err(|e| e.to_string())?;

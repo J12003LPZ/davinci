@@ -157,6 +157,24 @@ fn native_confined_capture_and_prototype_actions() {
         CheckState::Current
     );
     assert!(result.capture.screenshot.size > 100);
+    if let Some(directory) = std::env::var_os("DAVINCI_DESIGN_EVIDENCE") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("native-capture.png"),
+            davinci_agent::runtime::evidence_store::VerificationEvidenceStore::new(
+                store.blob_directory(&ctx),
+            )
+            .get_artifact(&(&result.capture.screenshot).into())
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("native-capture.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+    }
     println!(
         "Native runtime {}; PNG {}",
         runtime.fingerprint(),

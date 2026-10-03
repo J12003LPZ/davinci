@@ -118,6 +118,8 @@ impl DesignStore {
         };
         let id = op.to_string();
         let parent = session.leaf_id.clone();
+        #[cfg(test)]
+        super::publication_tests::checkpoint("before_event")?;
         session
             .append_entry_once(
                 &id,
@@ -125,6 +127,8 @@ impl DesignStore {
                 custom_entry(&id, CUSTOM_TYPE, serde_json::to_value(event)?),
             )
             .map_err(|e| DesignError::IoFailure(e.to_string()))?;
+        #[cfg(test)]
+        super::publication_tests::checkpoint("after_event")?;
         Ok(())
     }
     fn quota(&self, ctx: &AuthorizedDesignContext, additional: u64) -> DesignResult<()> {
