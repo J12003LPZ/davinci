@@ -3,10 +3,13 @@
 //! exclusive files under a bound directory so two `davinci` processes share the
 //! same two-scan cap.
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
+
+pub use super::root_budget::{BudgetLimits, BudgetSnapshot, RootBudget};
 
 const MAX_TOTAL: usize = 4;
 const MAX_SCANS: usize = 2;
@@ -21,6 +24,7 @@ pub enum RequestClass {
 struct Counts {
     total: usize,
     scans: usize,
+    waiters: VecDeque<(Weak<()>, bool)>,
 }
 
 pub struct RequestCapacity {
@@ -51,7 +55,11 @@ impl Default for RequestCapacity {
 impl RequestCapacity {
     pub const fn new() -> Self {
         Self {
-            counts: Mutex::new(Counts { total: 0, scans: 0 }),
+            counts: Mutex::new(Counts {
+                total: 0,
+                scans: 0,
+                waiters: VecDeque::new(),
+            }),
             changed: Condvar::new(),
         }
     }
@@ -77,14 +85,32 @@ impl RequestCapacity {
         shared: Option<&Path>,
     ) -> Option<RequestPermit<'_>> {
         let scan = matches!(class, RequestClass::SecurityScan);
+        // A weak ticket disappears even when a cancellation callback panics.
+        let ticket = Arc::new(());
+        let weak = Arc::downgrade(&ticket);
         let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.waiters.push_back((weak.clone(), scan));
         loop {
+            counts
+                .waiters
+                .retain(|(ticket, _)| ticket.strong_count() > 0);
             if cancelled() {
+                counts.waiters.retain(|(ticket, _)| !ticket.ptr_eq(&weak));
+                self.changed.notify_all();
                 return None;
             }
-            if counts.total < MAX_TOTAL && (!scan || counts.scans < MAX_SCANS) {
+            // FIFO among eligible requests. A scan waiting for its class cap
+            // cannot obstruct the foreground slots reserved by MAX_SCANS.
+            let first = counts
+                .waiters
+                .iter()
+                .position(|(_, scan)| !scan || counts.scans < MAX_SCANS);
+            if counts.total < MAX_TOTAL && first.is_some_and(|i| counts.waiters[i].0.ptr_eq(&weak))
+            {
+                counts.waiters.remove(first.expect("eligible ticket"));
                 counts.total += 1;
                 counts.scans += usize::from(scan);
+                self.changed.notify_all();
                 drop(counts);
                 let mut permit = RequestPermit {
                     pool: self,
@@ -166,8 +192,13 @@ impl Drop for RequestPermit<'_> {
 
 /// Dedicated worker slot capacity allocator supporting dynamic concurrency limits and atomic acquisition.
 pub struct WorkerSlotCapacity {
-    active: Mutex<usize>,
+    active: Mutex<WorkerCounts>,
     changed: Condvar,
+}
+
+struct WorkerCounts {
+    active: usize,
+    waiters: VecDeque<Weak<()>>,
 }
 
 impl Default for WorkerSlotCapacity {
@@ -179,7 +210,10 @@ impl Default for WorkerSlotCapacity {
 impl WorkerSlotCapacity {
     pub const fn new() -> Self {
         Self {
-            active: Mutex::new(0),
+            active: Mutex::new(WorkerCounts {
+                active: 0,
+                waiters: VecDeque::new(),
+            }),
             changed: Condvar::new(),
         }
     }
@@ -189,13 +223,29 @@ impl WorkerSlotCapacity {
         max_concurrency: usize,
         cancelled: impl Fn() -> bool,
     ) -> Option<WorkerSlotPermit<'_>> {
+        if max_concurrency == 0 {
+            return None;
+        }
+        let ticket = Arc::new(());
+        let weak = Arc::downgrade(&ticket);
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.waiters.push_back(weak.clone());
         loop {
+            active.waiters.retain(|ticket| ticket.strong_count() > 0);
             if cancelled() {
+                active.waiters.retain(|ticket| !ticket.ptr_eq(&weak));
+                self.changed.notify_all();
                 return None;
             }
-            if *active < max_concurrency {
-                *active += 1;
+            if active.active < max_concurrency
+                && active
+                    .waiters
+                    .front()
+                    .is_some_and(|ticket| ticket.ptr_eq(&weak))
+            {
+                active.waiters.pop_front();
+                active.active += 1;
+                self.changed.notify_all();
                 return Some(WorkerSlotPermit { pool: self });
             }
             let (next_active, _timeout) = self
@@ -207,7 +257,7 @@ impl WorkerSlotCapacity {
     }
 
     pub fn active_count(&self) -> usize {
-        *self.active.lock().unwrap_or_else(|e| e.into_inner())
+        self.active.lock().unwrap_or_else(|e| e.into_inner()).active
     }
 }
 
@@ -218,7 +268,7 @@ pub struct WorkerSlotPermit<'a> {
 impl Drop for WorkerSlotPermit<'_> {
     fn drop(&mut self) {
         let mut active = self.pool.active.lock().unwrap_or_else(|e| e.into_inner());
-        *active = active.saturating_sub(1);
+        active.active = active.active.saturating_sub(1);
         self.pool.changed.notify_all();
     }
 }
@@ -226,6 +276,78 @@ impl Drop for WorkerSlotPermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_worker_waiters_are_fifo_and_zero_capacity_refuses() {
+        let pool = WorkerSlotCapacity::new();
+        assert!(pool.acquire(0, || false).is_none());
+        let occupied = pool.acquire(1, || false).unwrap();
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (order_tx, order_rx) = std::sync::mpsc::channel();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            for index in 0..3 {
+                let ready = ready_tx.clone();
+                let order = order_tx.clone();
+                let pool = &pool;
+                scope.spawn(move || {
+                    let announced = std::cell::Cell::new(false);
+                    let permit = pool
+                        .acquire(1, || {
+                            if !announced.replace(true) {
+                                ready.send(index).unwrap();
+                            }
+                            std::time::Instant::now() >= deadline
+                        })
+                        .expect("queued worker admitted before test deadline");
+                    order.send(index).unwrap();
+                    drop(permit);
+                });
+                assert_eq!(
+                    ready_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    index
+                );
+            }
+            drop(occupied);
+            for index in 0..3 {
+                assert_eq!(
+                    order_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    index
+                );
+            }
+        });
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    #[test]
+    fn harness_class_blocked_scan_does_not_block_foreground() {
+        let pool = RequestCapacity::new();
+        let a = pool.acquire(RequestClass::SecurityScan, || false).unwrap();
+        let b = pool.acquire(RequestClass::SecurityScan, || false).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let pool = &pool;
+            let cancelled = &cancelled;
+            scope.spawn(move || {
+                assert!(pool
+                    .acquire(RequestClass::SecurityScan, || {
+                        let _ = tx.send(());
+                        cancelled.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .is_none());
+            });
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let foreground = pool.acquire(RequestClass::Foreground, || {
+                std::time::Instant::now() >= deadline
+            });
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(foreground.is_some());
+        });
+        drop((a, b));
+        assert_eq!(pool.counts.lock().unwrap().total, 0);
+    }
 
     #[test]
     fn cancelled_request_never_receives_capacity() {

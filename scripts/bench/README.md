@@ -213,12 +213,71 @@ Inherited product/provider/OTEL overrides are stripped. Codex uses
 binary bytes, fixture hashes, and the pinned model catalog are rechecked during
 the campaign.
 
+Both harnesses receive the same execution-environment preamble followed by the
+unchanged task text. The runner has already prepared an isolated repository;
+the preamble directs edits and verification to that directory and excludes
+repository worktree/session bootstrap and remote shipping rituals. Repository
+coding/testing guidance and task scope still apply. Instruction files are not
+rewritten. This preamble is part of the runner revision and must remain fixed
+within a matched comparison.
+
+Grading saves complete local `.regression.json` and `.grader.json` receipts
+beside each task workspace, outside the graded tree. They include command,
+working directory, timeout, exit, cleanup status and both output streams.
+Result rows contain receipt paths and SHA-256 hashes; their compact summaries
+are not the full failure evidence. The visible regression receipt is saved
+before hidden tests are overlaid. Fixture validation uses separate
+`.starter-grader.json`, `.reference-grader.json` and
+`.reference-regression.json` files. These receipts can contain private source
+paths and test output; keep them with the local campaign evidence and review
+them before sharing. A receipt does not establish independent grader isolation.
+
 ## Metric definitions and acceptance
+
+### Codex subscription acceptance
+
+Use `--subscription-policy` with an external JSON policy containing exactly
+`schema_version: 1`, `billing: "subscription-only"`, `model: "gpt-6-luna"`,
+`effort: "high"`, and positive integer `max_requests`, `max_tasks`, and
+`max_wall_seconds`. Select only the DaVinci arm, set `BENCH_EFFORT=high`, and
+provide settings with `transport: "sse"`, `effortPolicy: "fixed"`,
+`retry.enabled: false`, and `retry.provider.maxRetries: 0`. Policy admission
+rejects other models, efforts, billing routes, extra fields, or excessive task
+schedules before launching a model process.
+
+`--grading-timeout` freezes a per-grader and regression-process bound between
+1 and 3600 seconds (default 120); select a sufficient bound for cold Rust builds
+during `validate` and `run`. Subscription campaigns also clamp each grading
+process to the remaining campaign wall-clock allowance.
+
+No API spend authorized. Subscription-only campaign. Budget by subscription usage allowance, request count, task count, and wall-clock time; API-equivalent dollars are reporting-only.
+
+This path uses existing Codex OAuth credentials and the ChatGPT-backed
+`openai-codex-responses` route. It creates a shared durable request ledger and
+absolute deadline, requires fresh committed receipts for every task, and stops
+on quota exhaustion, failed transport, unknown response identity or accounting,
+or exhausted caps. It cannot silently switch billing routes. Token usage remains
+unknown where the provider omits it. Authorized API spending is zero; actual
+billing is unmeasured, not a manufactured zero. Public Responses cache/output
+limits are not assumed for the OAuth route.
+
+The current adapter cannot enforce a reliable subscription allowance percentage.
+Freeze conservative request/task/time caps instead and retain any available
+before/after subscription-window snapshots. Those snapshots cover the account,
+including other sessions. The current native supervisor owns and reaps the
+process tree; it does not provide OS filesystem/network isolation or certify
+hidden-grader secrecy. Independent acceptance remains a separate gate.
 
 - **Wall time:** monotonic launch through process reaping and container cleanup.
   Grading/parsing are excluded. All failures/timeouts stay in distributions;
   paired both-successful rows are reported separately so an early failure is
   visible rather than silently rewarded as a speedup.
+- **Startup state:** readiness reports retain all rows and separately summarize
+  an optional workload-recorded `startup_state` of `cold` or `warm`. Missing or
+  unrecognized values are `unknown`; provider cache hits and repetition order
+  never establish process warmth. `attempt_outcomes` counts process completion,
+  failure, timeout, abort, and unknown exit status separately from composite
+  task success. Missing token usage stays unavailable in each group.
 - **Task success:** integer exit zero, grader success, confirmed cleanup, no
   unrelated changes, no transaction leak, and no detected forbidden artifact.
   Missing evidence cannot pass. Cleanup and inspection failures are written as

@@ -712,6 +712,9 @@ impl ResponsesDecoder {
         if let Some(usage) = response.and_then(|response| response.get("usage")) {
             self.message.usage = Some(responses_usage(&self.model, usage));
         }
+        if let Some(response) = response {
+            crate::provider_observation::record_returned_identity(response);
+        }
         let status = response
             .and_then(|response| response.get("status"))
             .and_then(Value::as_str);
@@ -797,6 +800,7 @@ impl ResponsesDecoder {
 /// tokens inside `input_tokens`, so both are subtracted, and the cost is
 /// applied from the model's table.
 pub(crate) fn responses_usage(model: &Model, usage: &Value) -> davinci_protocol::Usage {
+    crate::provider_observation::record_openai_usage(usage);
     let get = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let cached = usage
         .pointer("/input_tokens_details/cached_tokens")

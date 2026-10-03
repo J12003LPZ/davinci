@@ -48,7 +48,19 @@ fn args(words: &[&str]) -> Vec<String> {
 // --- plugins ---------------------------------------------------------------
 
 pub fn plugin_rows(agent_dir: &Path) -> Vec<ManagedRow> {
-    let file = store::load(agent_dir);
+    let file = match store::load(agent_dir) {
+        Ok(file) => file,
+        Err(err) => {
+            return vec![ManagedRow {
+                key: "installed.json".into(),
+                title: "Plugin registry".into(),
+                status: "unavailable".into(),
+                health: Health::Failed,
+                detail: err,
+                ..ManagedRow::default()
+            }]
+        }
+    };
     let off_by_env = super::disabled_by_env();
     file.plugins
         .iter()

@@ -719,6 +719,7 @@ mod tests {
                 exit_code: 1,
                 duration_ms: 10,
                 output_tail: "boom".into(),
+                test_discovery: None,
                 skipped: false,
             }],
             passed: false,

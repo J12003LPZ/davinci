@@ -59,11 +59,8 @@ fn registry_path(agent_dir: &Path) -> PathBuf {
     plugins_dir(agent_dir).join("marketplaces.json")
 }
 
-pub fn load_registry(agent_dir: &Path) -> Registry {
-    std::fs::read_to_string(registry_path(agent_dir))
-        .ok()
-        .and_then(|body| serde_json::from_str(&body).ok())
-        .unwrap_or_default()
+pub fn load_registry(agent_dir: &Path) -> Result<Registry, String> {
+    store::read_json(&registry_path(agent_dir))
 }
 
 fn save_registry(agent_dir: &Path, registry: &Registry) -> Result<(), String> {
@@ -217,6 +214,8 @@ fn clone(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String> {
 
 /// Add a marketplace and return its catalog name.
 pub fn add(agent_dir: &Path, spec: &str, cwd: &Path) -> Result<String, String> {
+    let _lock = store::lock_registry(&registry_path(agent_dir))?;
+    let mut registry = load_registry(agent_dir)?;
     let source = parse_source(spec, cwd)?;
     let base = plugins_dir(agent_dir).join("marketplaces");
     std::fs::create_dir_all(&base).map_err(|err| err.to_string())?;
@@ -236,10 +235,7 @@ pub fn add(agent_dir: &Path, spec: &str, cwd: &Path) -> Result<String, String> {
                 let catalog = read_catalog(&staging)
                     .ok_or_else(|| format!("no marketplace.json in {url}"))?;
                 let name = catalog_name(&catalog, &staging)?;
-                let dest = base.join(&name);
-                if dest.exists() {
-                    std::fs::remove_dir_all(&dest).map_err(|err| err.to_string())?;
-                }
+                let dest = base.join(format!("{name}-{}", uuid::Uuid::new_v4()));
                 std::fs::rename(&staging, &dest).map_err(|err| err.to_string())?;
                 Ok::<_, String>((name, dest))
             })();
@@ -249,7 +245,6 @@ pub fn add(agent_dir: &Path, spec: &str, cwd: &Path) -> Result<String, String> {
             result?
         }
     };
-    let mut registry = load_registry(agent_dir);
     registry.insert(
         name.clone(),
         KnownMarketplace {
@@ -279,13 +274,15 @@ fn catalog_name(catalog: &Value, root: &Path) -> Result<String, String> {
 
 /// Pull git marketplaces. Returns one line per marketplace.
 pub fn update(agent_dir: &Path, only: Option<&str>) -> Result<Vec<String>, String> {
-    let mut registry = load_registry(agent_dir);
+    let _lock = store::lock_registry(&registry_path(agent_dir))?;
+    let mut registry = load_registry(agent_dir)?;
     if let Some(name) = only {
         if !registry.contains_key(name) {
             return Err(format!("no marketplace named {name}"));
         }
     }
     let mut lines = Vec::new();
+    let mut failures = Vec::new();
     for (name, entry) in registry.iter_mut() {
         if only.is_some_and(|wanted| wanted != name) {
             continue;
@@ -302,23 +299,32 @@ pub fn update(agent_dir: &Path, only: Option<&str>) -> Result<Vec<String>, Strin
                 entry.last_updated = store::now_ms();
                 lines.push(format!("{name}: updated"));
             }
-            Err(err) => lines.push(format!("{name}: {err}")),
+            Err(err) => failures.push(format!("{name}: {err}")),
         }
     }
     save_registry(agent_dir, &registry)?;
-    Ok(lines)
+    if failures.is_empty() {
+        Ok(lines)
+    } else {
+        Err(format!(
+            "marketplace refresh failed:\n{}",
+            failures.join("\n")
+        ))
+    }
 }
 
 pub fn remove(agent_dir: &Path, name: &str) -> Result<(), String> {
-    let mut registry = load_registry(agent_dir);
+    let _lock = store::lock_registry(&registry_path(agent_dir))?;
+    let mut registry = load_registry(agent_dir)?;
     let entry = registry
         .remove(name)
         .ok_or_else(|| format!("no marketplace named {name}"))?;
+    save_registry(agent_dir, &registry)?;
     let owned = plugins_dir(agent_dir).join("marketplaces");
     if clone_url(&entry.source).is_some() && entry.install_location.starts_with(&owned) {
         let _ = std::fs::remove_dir_all(&entry.install_location);
     }
-    save_registry(agent_dir, &registry)
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -347,10 +353,10 @@ impl Catalog {
 
 /// Every readable catalog: DaVinci's registry first, then Claude Code's and
 /// Codex's. The first catalog with a name wins.
-pub fn catalogs(agent_dir: &Path) -> Vec<Catalog> {
+pub fn catalogs(agent_dir: &Path) -> Result<Vec<Catalog>, String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    let mut candidates: Vec<(String, PathBuf, &'static str)> = load_registry(agent_dir)
+    let mut candidates: Vec<(String, PathBuf, &'static str)> = load_registry(agent_dir)?
         .into_iter()
         .map(|(name, entry)| (name, entry.install_location, "davinci"))
         .collect();
@@ -368,7 +374,7 @@ pub fn catalogs(agent_dir: &Path) -> Vec<Catalog> {
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// The catalog entry for `name` (optionally `name@marketplace`).
@@ -378,7 +384,7 @@ pub fn find_entry(agent_dir: &Path, wanted: &str) -> Result<(Catalog, Value), St
         None => (wanted, None),
     };
     let mut found = Vec::new();
-    for catalog in catalogs(agent_dir) {
+    for catalog in catalogs(agent_dir)? {
         if market.is_some_and(|m| m != catalog.name) {
             continue;
         }
@@ -404,7 +410,8 @@ pub fn find_entry(agent_dir: &Path, wanted: &str) -> Result<(Catalog, Value), St
     }
 }
 
-/// Install one catalog entry into `cache/<marketplace>/<plugin>/<version>/`.
+/// Validate and publish into a unique directory. The caller commits the
+/// registry pointer separately; an interrupted install cannot damage its predecessor.
 pub fn install(
     agent_dir: &Path,
     catalog: &Catalog,
@@ -442,10 +449,14 @@ pub fn install(
             .and_then(Value::as_str)
             .filter(|version| validate_name(version).is_ok())
             .unwrap_or("latest");
-        let dest = plugin_base.join(version);
-        if dest.exists() {
-            std::fs::remove_dir_all(&dest).map_err(|err| err.to_string())?;
+        let staged = manifest::load_plugin(&staging)?;
+        if staged.name != name {
+            return Err(format!(
+                "plugin name {} does not match catalog entry {name}",
+                staged.name
+            ));
         }
+        let dest = plugin_base.join(format!("{version}-{}", uuid::Uuid::new_v4()));
         std::fs::rename(&staging, &dest).map_err(|err| err.to_string())?;
         let plugin = manifest::load_plugin(&dest)?;
         Ok::<_, String>((dest, plugin))
@@ -644,6 +655,57 @@ mod tests {
     }
 
     #[test]
+    fn audit_marketplace_corruption_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let market = dir.path().join("market");
+        write(
+            &market.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"demo","plugins":[]}"#,
+        );
+        let path = registry_path(dir.path());
+        for body in ["{broken", "[]", r#"{"demo":false}"#] {
+            write(&path, body);
+            assert!(load_registry(dir.path()).is_err());
+            assert!(update(dir.path(), None).is_err());
+            assert!(remove(dir.path(), "demo").is_err());
+            assert!(add(dir.path(), market.to_str().unwrap(), dir.path()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn audit_same_version_install_never_replaces_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("market");
+        let catalog = Catalog {
+            name: "market".into(),
+            root: source.clone(),
+            from: "davinci",
+            document: Value::Null,
+        };
+        let entry = serde_json::json!({"name":"demo","source":"./demo","version":"1.0"});
+        let manifest_path = source.join("demo/.claude-plugin/plugin.json");
+        write(&manifest_path, r#"{"name":"demo","version":"1.0"}"#);
+        write(&source.join("demo/data.txt"), "working");
+        let (old, _) = install(dir.path(), &catalog, &entry).unwrap();
+        write(&source.join("demo/data.txt"), "replacement");
+        let (new, _) = install(dir.path(), &catalog, &entry).unwrap();
+        assert_ne!(old, new);
+        assert_eq!(
+            std::fs::read_to_string(old.join("data.txt")).unwrap(),
+            "working"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("data.txt")).unwrap(),
+            "replacement"
+        );
+        write(&manifest_path, r#"{"name":"wrong-plugin"}"#);
+        assert!(install(dir.path(), &catalog, &entry).is_err());
+        assert!(manifest::load_plugin(&old).is_ok());
+        assert!(manifest::load_plugin(&new).is_ok());
+    }
+
+    #[test]
     fn adds_a_local_marketplace_and_installs_from_it() {
         let dir = tempfile::tempdir().unwrap();
         let _homes = FakeHomes::new(dir.path());
@@ -671,11 +733,20 @@ mod tests {
 
         let name = add(&agent_dir, market.to_str().unwrap(), dir.path()).unwrap();
         assert_eq!(name, "demo-market");
-        assert_eq!(catalogs(&agent_dir).len(), 1);
+        assert_eq!(catalogs(&agent_dir).unwrap().len(), 1);
 
         let (catalog, entry) = find_entry(&agent_dir, "hello").unwrap();
         let (path, plugin) = install(&agent_dir, &catalog, &entry).unwrap();
-        assert!(path.ends_with(Path::new("demo-market").join("hello").join("0.1.0")));
+        assert!(path
+            .parent()
+            .unwrap()
+            .ends_with(Path::new("demo-market").join("hello")));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("0.1.0-"));
         assert_eq!(plugin.skill_files.len(), 1);
 
         let (catalog, entry) = find_entry(&agent_dir, "loose@demo-market").unwrap();
@@ -688,6 +759,6 @@ mod tests {
 
         remove(&agent_dir, "demo-market").unwrap();
         assert!(market.exists(), "a local marketplace is never deleted");
-        assert!(catalogs(&agent_dir).is_empty());
+        assert!(catalogs(&agent_dir).unwrap().is_empty());
     }
 }

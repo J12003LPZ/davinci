@@ -59,12 +59,14 @@ pub mod responses_tools;
 mod retry;
 mod shell;
 mod stream;
+pub mod subscription_policy;
 #[doc(hidden)]
 pub use stream::{openai_responses_input, openai_responses_input_with};
 pub mod provider_observation;
 mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
+mod stream_http;
 mod stream_reader;
 mod thinking;
 pub mod trace;

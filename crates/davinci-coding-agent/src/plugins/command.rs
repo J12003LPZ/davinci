@@ -16,7 +16,7 @@ use super::store::{self, InstalledPlugin, Origin};
 pub const USAGE: &str = "\
 plugin [list]                          installed plugins
 plugin browse [query]                  plugins in every known marketplace
-plugin install <name>[@marketplace]    install and enable
+plugin install <name>[@marketplace]    install or replace (preserves enabled state)
 plugin import [claude|codex] [<key>|--all]
                                        list or adopt Claude Code / Codex plugins
 plugin info <plugin>                   components, hooks and warnings
@@ -37,12 +37,12 @@ const RELOAD_HINT: &str = "Start a new session or run /reload to load it.";
 pub fn run(args: &[String], agent_dir: &Path, cwd: &Path) -> Result<String, String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
-        [] | ["list"] | ["ls"] => Ok(list(agent_dir)),
+        [] | ["list"] | ["ls"] => list(agent_dir),
         ["help"] | ["--help"] | ["-h"] => Ok(USAGE.to_string()),
-        ["browse", rest @ ..] | ["search", rest @ ..] => Ok(browse(agent_dir, &rest.join(" "))),
+        ["browse", rest @ ..] | ["search", rest @ ..] => browse(agent_dir, &rest.join(" ")),
         ["install", target] | ["add", target] => install(agent_dir, target),
-        ["import"] => Ok(importable(None, agent_dir)),
-        ["import", tool @ ("claude" | "codex")] => Ok(importable(Some(tool), agent_dir)),
+        ["import"] => importable(None, agent_dir),
+        ["import", tool @ ("claude" | "codex")] => importable(Some(tool), agent_dir),
         ["import", "--all"] => import_all(None, agent_dir),
         ["import", tool @ ("claude" | "codex"), "--all"] => import_all(Some(tool), agent_dir),
         ["import", tool @ ("claude" | "codex"), key] => import_one(Some(tool), key, agent_dir),
@@ -55,7 +55,7 @@ pub fn run(args: &[String], agent_dir: &Path, cwd: &Path) -> Result<String, Stri
         ["disable", target] => set_enabled(agent_dir, target, false),
         ["update", target] => update(agent_dir, target),
         ["uninstall", target] | ["remove", target] => uninstall(agent_dir, target),
-        ["marketplace"] | ["marketplace", "list"] => Ok(marketplaces(agent_dir)),
+        ["marketplace"] | ["marketplace", "list"] => marketplaces(agent_dir),
         ["marketplace", "add", source] => {
             let name = marketplace::add(agent_dir, source, cwd)?;
             Ok(format!(
@@ -83,8 +83,8 @@ fn hook_state(record: &InstalledPlugin, plugin: &Plugin) -> &'static str {
     }
 }
 
-fn list(agent_dir: &Path) -> String {
-    let file = store::load(agent_dir);
+fn list(agent_dir: &Path) -> Result<String, String> {
+    let file = store::load(agent_dir)?;
     let mut out = String::new();
     if super::disabled_by_env() {
         out.push_str("DAVINCI_PLUGINS=off: no plugin is loaded in this environment.\n\n");
@@ -135,17 +135,19 @@ fn list(agent_dir: &Path) -> String {
         );
     }
     let _ = write!(out, "\nRun `plugin help` for all commands.");
-    out
+    Ok(out)
 }
 
-fn browse(agent_dir: &Path, query: &str) -> String {
-    let catalogs = marketplace::catalogs(agent_dir);
+fn browse(agent_dir: &Path, query: &str) -> Result<String, String> {
+    let catalogs = marketplace::catalogs(agent_dir)?;
     if catalogs.is_empty() {
-        return "No marketplaces known. Add one with `plugin marketplace add <owner/repo>`, \
+        return Ok(
+            "No marketplaces known. Add one with `plugin marketplace add <owner/repo>`, \
                 for example `plugin marketplace add anthropics/claude-plugins-official`."
-            .into();
+                .into(),
+        );
     }
-    let installed = store::load(agent_dir);
+    let installed = store::load(agent_dir)?;
     let query = query.trim().to_ascii_lowercase();
     let mut out = String::new();
     for catalog in catalogs {
@@ -179,10 +181,10 @@ fn browse(agent_dir: &Path, query: &str) -> String {
         }
     }
     if out.is_empty() {
-        return format!("No plugin matches {query:?}.");
+        return Ok(format!("No plugin matches {query:?}."));
     }
     out.push_str("\n* installed. Install with `plugin install <name>@<marketplace>`.");
-    out
+    Ok(out)
 }
 
 fn first_line(text: &str, max: usize) -> String {
@@ -195,32 +197,27 @@ fn first_line(text: &str, max: usize) -> String {
 }
 
 fn install(agent_dir: &Path, target: &str) -> Result<String, String> {
+    // Refuse corrupt state before fetching or staging an installation.
+    store::load(agent_dir)?;
     let (catalog, entry) = marketplace::find_entry(agent_dir, target)?;
     let (path, plugin) = marketplace::install(agent_dir, &catalog, &entry)?;
     let key = format!("{}@{}", plugin.name, catalog.name);
-    let previous = store::update(agent_dir, |file| {
+    let record = store::update(agent_dir, |file| {
         let previous = file.plugins.get(&key).cloned();
-        file.plugins.insert(
-            key.clone(),
-            InstalledPlugin {
-                origin: Origin::Davinci,
-                install_path: Some(path.clone()),
-                version: plugin.version.clone(),
-                enabled: true,
-                hooks_approved: previous.as_ref().and_then(|p| p.hooks_approved.clone()),
-                installed_at: store::now_ms(),
-            },
-        );
-        Ok(previous)
+        let record = InstalledPlugin {
+            origin: Origin::Davinci,
+            install_path: Some(path.clone()),
+            version: plugin.version.clone(),
+            enabled: previous.as_ref().is_none_or(|p| p.enabled),
+            hooks_approved: previous.as_ref().and_then(|p| p.hooks_approved.clone()),
+            installed_at: store::now_ms(),
+        };
+        file.plugins.insert(key.clone(), record.clone());
+        Ok(record)
     })?;
     let mut out = format!("Installed {key} ({}).", plugin.component_summary());
-    if let Some(previous) = previous.and_then(|p| p.install_path) {
-        if previous != path && previous.starts_with(store::plugins_dir(agent_dir).join("cache")) {
-            let _ = std::fs::remove_dir_all(previous);
-        }
-    }
-    let record = &store::load(agent_dir).plugins[&key];
-    append_hook_notice(&mut out, &key, record, &plugin);
+    // Retain previous directories: active sessions may still hold their paths.
+    append_hook_notice(&mut out, &key, &record, &plugin);
     let _ = write!(out, "\n{RELOAD_HINT}");
     Ok(out)
 }
@@ -257,14 +254,14 @@ fn describe_hooks(plugin: &Plugin) -> String {
     out
 }
 
-fn importable(tool: Option<&str>, agent_dir: &Path) -> String {
-    let installed = store::load(agent_dir);
+fn importable(tool: Option<&str>, agent_dir: &Path) -> Result<String, String> {
+    let installed = store::load(agent_dir)?;
     let found: Vec<_> = external::all_plugins()
         .into_iter()
         .filter(|p| tool.map_or(true, |t| p.origin.label() == t))
         .collect();
     if found.is_empty() {
-        return "No Claude Code or Codex plugins found on this machine.".into();
+        return Ok("No Claude Code or Codex plugins found on this machine.".into());
     }
     let mut out = String::from("Plugins installed by other tools:\n");
     for plugin in &found {
@@ -290,12 +287,12 @@ fn importable(tool: Option<&str>, agent_dir: &Path) -> String {
         "\n* already adopted. Adopt with `plugin import <key>`, or every plugin enabled there \
          with `plugin import --all`. Adopted plugins load in place and follow that tool's updates.",
     );
-    out
+    Ok(out)
 }
 
 fn adopt(found: &external::ExternalPlugin, agent_dir: &Path) -> Result<String, String> {
     let plugin = manifest::load_plugin(&found.path)?;
-    store::update(agent_dir, |file| {
+    let record = store::update(agent_dir, |file| {
         if let Some(existing) = file.plugins.get(&found.key) {
             if existing.origin != found.origin {
                 return Err(format!(
@@ -306,27 +303,24 @@ fn adopt(found: &external::ExternalPlugin, agent_dir: &Path) -> Result<String, S
             }
         }
         let previous = file.plugins.get(&found.key).cloned();
-        file.plugins.insert(
-            found.key.clone(),
-            InstalledPlugin {
-                origin: found.origin,
-                install_path: None,
-                version: found.version.clone(),
-                enabled: true,
-                hooks_approved: previous.and_then(|p| p.hooks_approved),
-                installed_at: store::now_ms(),
-            },
-        );
-        Ok(())
+        let record = InstalledPlugin {
+            origin: found.origin,
+            install_path: None,
+            version: found.version.clone(),
+            enabled: previous.as_ref().is_none_or(|p| p.enabled),
+            hooks_approved: previous.and_then(|p| p.hooks_approved),
+            installed_at: store::now_ms(),
+        };
+        file.plugins.insert(found.key.clone(), record.clone());
+        Ok(record)
     })?;
-    let record = &store::load(agent_dir).plugins[&found.key];
     let mut out = format!(
         "Adopted {} from {} ({}).",
         found.key,
         found.origin.label(),
         plugin.component_summary()
     );
-    append_hook_notice(&mut out, &found.key, record, &plugin);
+    append_hook_notice(&mut out, &found.key, &record, &plugin);
     Ok(out)
 }
 
@@ -359,7 +353,7 @@ fn import_one(tool: Option<&str>, key: &str, agent_dir: &Path) -> Result<String,
 }
 
 fn import_all(tool: Option<&str>, agent_dir: &Path) -> Result<String, String> {
-    let installed = store::load(agent_dir);
+    let installed = store::load(agent_dir)?;
     let mut seen = std::collections::BTreeSet::new();
     let mut lines = Vec::new();
     // Claude Code first: a plugin present in both tools is adopted once.
@@ -387,7 +381,7 @@ fn load_installed(
     agent_dir: &Path,
     target: &str,
 ) -> Result<(String, InstalledPlugin, Plugin), String> {
-    let file = store::load(agent_dir);
+    let file = store::load(agent_dir)?;
     let key = file.resolve_key(target)?;
     let record = file.plugins[&key].clone();
     let plugin = super::locate(&key, &record).and_then(|path| manifest::load_plugin(&path))?;
@@ -513,7 +507,7 @@ fn test_hooks(agent_dir: &Path, target: &str, cwd: &Path) -> Result<String, Stri
 }
 
 fn revoke(agent_dir: &Path, target: &str) -> Result<String, String> {
-    let file = store::load(agent_dir);
+    let file = store::load(agent_dir)?;
     let key = file.resolve_key(target)?;
     store::update(agent_dir, |file| {
         if let Some(record) = file.plugins.get_mut(&key) {
@@ -525,7 +519,7 @@ fn revoke(agent_dir: &Path, target: &str) -> Result<String, String> {
 }
 
 fn set_enabled(agent_dir: &Path, target: &str, enabled: bool) -> Result<String, String> {
-    let file = store::load(agent_dir);
+    let file = store::load(agent_dir)?;
     let key = file.resolve_key(target)?;
     store::update(agent_dir, |file| {
         if let Some(record) = file.plugins.get_mut(&key) {
@@ -540,7 +534,7 @@ fn set_enabled(agent_dir: &Path, target: &str, enabled: bool) -> Result<String, 
 }
 
 fn update(agent_dir: &Path, target: &str) -> Result<String, String> {
-    let file = store::load(agent_dir);
+    let file = store::load(agent_dir)?;
     let key = file.resolve_key(target)?;
     let record = &file.plugins[&key];
     if record.origin != Origin::Davinci {
@@ -550,12 +544,12 @@ fn update(agent_dir: &Path, target: &str) -> Result<String, String> {
         ));
     }
     let (_, market) = store::split_key(&key);
-    let _ = marketplace::update(agent_dir, Some(market));
+    marketplace::update(agent_dir, Some(market))?;
     install(agent_dir, &key)
 }
 
 fn uninstall(agent_dir: &Path, target: &str) -> Result<String, String> {
-    let file = store::load(agent_dir);
+    let file = store::load(agent_dir)?;
     let key = file.resolve_key(target)?;
     let record = store::update(agent_dir, |file| {
         file.plugins
@@ -577,10 +571,10 @@ fn uninstall(agent_dir: &Path, target: &str) -> Result<String, String> {
     })
 }
 
-fn marketplaces(agent_dir: &Path) -> String {
-    let registry = marketplace::load_registry(agent_dir);
+fn marketplaces(agent_dir: &Path) -> Result<String, String> {
+    let registry = marketplace::load_registry(agent_dir)?;
     let mut out = String::new();
-    for catalog in marketplace::catalogs(agent_dir) {
+    for catalog in marketplace::catalogs(agent_dir)? {
         let source = registry
             .get(&catalog.name)
             .map(|entry| entry.source.describe())
@@ -594,9 +588,9 @@ fn marketplaces(agent_dir: &Path) -> String {
         );
     }
     if out.is_empty() {
-        "No marketplaces known. Add one with `plugin marketplace add <owner/repo>`.".into()
+        Ok("No marketplaces known. Add one with `plugin marketplace add <owner/repo>`.".into())
     } else {
-        format!("Marketplaces:\n{out}")
+        Ok(format!("Marketplaces:\n{out}"))
     }
 }
 
@@ -645,11 +639,13 @@ mod tests {
         assert!(run_cmd(&["list"]).unwrap().contains("hooks: approved"));
 
         run_cmd(&["disable", "guard"]).unwrap();
+        run_cmd(&["update", "guard"]).unwrap();
+        assert!(!store::load(&agent_dir).unwrap().plugins["guard@mk"].enabled);
         assert!(super::super::active(&agent_dir).plugins.is_empty());
         run_cmd(&["enable", "guard"]).unwrap();
         assert_eq!(super::super::active(&agent_dir).plugins.len(), 1);
 
-        let cache = store::load(&agent_dir).plugins["guard@mk"]
+        let cache = store::load(&agent_dir).unwrap().plugins["guard@mk"]
             .install_path
             .clone()
             .unwrap();
@@ -657,6 +653,73 @@ mod tests {
         assert!(!cache.exists());
         assert!(run_cmd(&["list"]).unwrap().contains("No plugins installed"));
         assert!(run_cmd(&["frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn audit_failed_refresh_and_publication_preserve_the_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent = dir.path().join("agent");
+        let market = dir.path().join("market");
+        write(
+            &market.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"mk","plugins":[{"name":"demo","source":"./demo"}]}"#,
+        );
+        write(
+            &market.join("demo/.claude-plugin/plugin.json"),
+            r#"{"name":"demo","version":"1"}"#,
+        );
+        write(&market.join("demo/data.txt"), "working");
+        marketplace::add(&agent, market.to_str().unwrap(), dir.path()).unwrap();
+        install(&agent, "demo").unwrap();
+        set_enabled(&agent, "demo", false).unwrap();
+        let before = store::load(&agent).unwrap();
+        let old = before.plugins["demo@mk"].install_path.as_ref().unwrap();
+        write(&market.join("demo/data.txt"), "replacement");
+
+        // A readable cached catalog whose Git checkout cannot be refreshed.
+        let registry_path = store::plugins_dir(&agent).join("marketplaces.json");
+        let local_registry = std::fs::read(&registry_path).unwrap();
+        let mut registry = marketplace::load_registry(&agent).unwrap();
+        registry.get_mut("mk").unwrap().source = marketplace::MarketplaceSource::Git {
+            url: "https://invalid.example/fixture.git".into(),
+        };
+        store::write_json_atomic(&registry_path, &registry).unwrap();
+        let error = update(&agent, "demo").unwrap_err();
+        assert!(error.contains("refresh failed"), "{error}");
+        assert_eq!(store::load(&agent).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(old.join("data.txt")).unwrap(),
+            "working"
+        );
+        std::fs::write(&registry_path, local_registry).unwrap();
+
+        // Windows permits reading this registry but refuses its atomic replacement.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let locked = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(store::plugins_dir(&agent).join("installed.json"))
+                .unwrap();
+            let error = install(&agent, "demo").unwrap_err();
+            assert!(error.contains("could not save"), "{error}");
+            assert_eq!(store::load(&agent).unwrap(), before);
+            assert_eq!(
+                std::fs::read_to_string(old.join("data.txt")).unwrap(),
+                "working"
+            );
+            drop(locked);
+        }
+        update(&agent, "demo").unwrap();
+        let after = store::load(&agent).unwrap();
+        assert!(!after.plugins["demo@mk"].enabled);
+        assert_ne!(after.plugins["demo@mk"].install_path.as_ref().unwrap(), old);
+        assert_eq!(
+            std::fs::read_to_string(old.join("data.txt")).unwrap(),
+            "working"
+        );
     }
 
     #[test]

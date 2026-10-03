@@ -22,11 +22,40 @@ SPEC.loader.exec_module(bench)
 
 
 class StreamTelemetryTests(unittest.TestCase):
+    def test_harness_stage_stats_are_content_free_and_not_summed_twice(self):
+        event = {"type": "harness_stats", "schema_version": 1, "runtime": {
+            "wallMs": 20, "providerMs": 10, "verificationWorkMs": 40, "queueMs": None,
+            "diagnosticsMs": 3, "repeatedReads": 2, "workerDuplicateOperations": 1,
+            "diagnosticUnknownOperations": 5,
+            "secret": "must not enter aggregate telemetry"}}
+        result = bench.parse_stream("davinci", "\n".join([json.dumps(event)] * 2))
+        self.assertEqual(result["runtime_stats"]["wallMs"], 20)
+        self.assertEqual(result["runtime_stats"]["verificationWorkMs"], 40)
+        self.assertIsNone(result["runtime_stats"]["queueMs"])
+        self.assertEqual(result["runtime_stats"]["diagnosticsMs"], 3)
+        self.assertEqual(result["runtime_stats"]["repeatedReads"], 2)
+        self.assertEqual(result["runtime_stats"]["workerDuplicateOperations"], 1)
+        self.assertEqual(result["runtime_stats"]["diagnosticUnknownOperations"], 5)
+        self.assertNotIn("secret", result["runtime_stats"])
+        self.assertIsNone(bench.parse_stream("davinci", "")["runtime_stats"])
+
+    def test_harness_conflicting_raw_receipt_cannot_remain_complete(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        events = self.observed_stream([(1, "completed", usage)])
+        duplicate = json.loads(json.dumps(events[2]))
+        events[2]["observation"]["raw_usage"] = {"output": 5}
+        duplicate["observation"]["raw_usage"] = {"output": 6}
+        events.append(duplicate)
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertIsNone(result["output"])
+        self.assertEqual(result["usage_complete_attempts"], 0)
+
     def observed_stream(self, attempts, terminal_usage=None):
         def observation(kind, attempt=None, status="completed", usage=None):
             return {"type": "provider_observation", "observation": {
                 "schema_version": 1, "logical_request_id": "r1", "purpose": "coding",
-                "kind": kind, "attempt_id": attempt, "status": status, "usage": usage}}
+                "kind": kind, "attempt_id": attempt, "status": status, "usage": usage,
+                "usage_complete": usage is not None}}
         events = [observation("logical_start", status="started")]
         for attempt, status, usage in attempts:
             events.append(observation("attempt_start", attempt, "started"))
@@ -38,11 +67,37 @@ class StreamTelemetryTests(unittest.TestCase):
                 "input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}})
         return events
 
+    def test_harness_missing_raw_counters_cannot_become_measured_zeros(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        for completeness in (None, False):
+            with self.subTest(completeness=completeness):
+                events = self.observed_stream([(1, "completed", usage)])
+                events[2]["observation"]["usage_complete"] = completeness
+                result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+                self.assertFalse(result["usage_available"])
+                self.assertIsNone(result["input"])
+
+    def test_harness_nonforeground_attempts_reconcile_once(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        events = []
+        for purpose in ("coding", "worker", "reviewer", "compaction", "learning", "security_watch"):
+            block = self.observed_stream([(1, "completed", usage)])[:-1]
+            for event in block:
+                event["observation"].update(purpose=purpose, root_id="root", logical_request_id=purpose)
+            events.extend(block + block)
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertEqual(result["provider_attempts"], 6)
+        self.assertEqual(result["input"], 60)
+        self.assertEqual(result["output"], 30)
+
     def test_observed_failed_retry_missing_usage_cannot_be_an_exact_total(self):
         usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
         events = self.observed_stream([(1, "failed", None), (2, "completed", usage)])
         result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
         self.assertEqual(result["provider_attempts"], 2)
+        self.assertEqual(result["usage_complete_attempts"], 1)
+        self.assertEqual(result["usage_unknown_attempts"], 1)
+        self.assertEqual(result["usage_completeness_ratio"], .5)
         self.assertFalse(result["usage_available"])
         for field in ("input", "cached", "cache_write", "output", "first_request_input_tokens"):
             self.assertIsNone(result[field], field)

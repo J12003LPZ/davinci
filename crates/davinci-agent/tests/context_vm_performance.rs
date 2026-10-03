@@ -29,8 +29,8 @@ fn quantiles(mut samples: Vec<u64>) -> serde_json::Value {
 #[test]
 #[ignore = "paired context latency and logical memory measurement; run with --ignored --nocapture"]
 fn context_image_cold_and_warm_performance() {
-    const SAMPLES: usize = 16;
-    for turns in [100, 300] {
+    const SAMPLES: usize = 30;
+    for turns in [10, 100, 300] {
         let directory = tempfile::tempdir().unwrap();
         let mut session =
             JsonlSession::create(directory.path(), "benchmark-fixture", None).unwrap();
@@ -59,6 +59,24 @@ fn context_image_cold_and_warm_performance() {
         );
         let mut agent = Agent::new("Keep source evidence traceable.");
         agent.load_from_session(session).unwrap();
+        agent.set_context_vm_mode(ContextVmMode::Off);
+        let mut off = Vec::new();
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            let messages = agent.messages_for_provider();
+            off.push(started.elapsed().as_micros() as u64);
+            assert!(!messages.is_empty());
+        }
+        assert_eq!(
+            agent
+                .runtime
+                .as_ref()
+                .unwrap()
+                .context_vm
+                .metrics()
+                .images_compiled,
+            0
+        );
         agent.set_context_vm_mode(ContextVmMode::Active);
         let history_bytes: usize = agent
             .messages
@@ -118,7 +136,9 @@ fn context_image_cold_and_warm_performance() {
             "CONTEXT_VM_PERF {}",
             serde_json::json!({
                 "turns": turns, "samples": SAMPLES, "first_cold_us": cold[0],
-                "recompiled": quantiles(cold), "reused": quantiles(warm),
+                "recompiled": quantiles(cold.clone()), "reused": quantiles(warm.clone()),
+                "off_samples_us": off, "recompiled_samples_us": cold, "reused_samples_us": warm,
+                "scope": "local accessor timings; Context VM opt-in measured separately; tails below 100 samples are not release evidence",
                 "images_compiled": agent.runtime.as_ref().unwrap().context_vm.metrics().images_compiled,
                 "history_body_bytes": history_bytes, "vm_retained_source_body_bytes": retained,
                 "old_two_copy_body_bytes": history_bytes * 2,

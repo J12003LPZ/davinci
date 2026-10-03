@@ -46,6 +46,8 @@ fn forbid_patterns() -> &'static [Regex] {
             format!(r"\bwithout\s+(?:using\s+|any\s+)*{WORKER}{TAIL}"),
             // "don't delegate", "do not delegate this"
             r"\b(?:don'?t|do not|dont|never)\s+delegate\b".to_string(),
+            format!(r"\b(?:not (?:allowed|permitted|authorized) to|may not|cannot|can'?t|must not)\s+{START}\s+(?:any\s+|the\s+)?{WORKER}{TAIL}"),
+            format!(r"\b{WORKER}\s+(?:are|is)\s+not\s+(?:allowed|permitted|authorized)\b"),
         ]
         .iter()
         .map(|pattern| Regex::new(&format!("(?i){pattern}")).expect("valid forbid pattern"))
@@ -83,14 +85,83 @@ fn is_path_mention(text: &str, end: usize) -> bool {
         || rest.starts_with('\\')
 }
 
+/// Only direct, unconditional instructions can revoke a sticky ban. Do not
+/// promote quoted examples, questions, conditionals or negated substrings
+/// into authority. Ambiguous prose leaves the existing policy intact.
+fn unambiguous_allow(text: &str, start: usize) -> bool {
+    static AMBIGUOUS: OnceLock<Regex> = OnceLock::new();
+    static CONTEXT: OnceLock<Regex> = OnceLock::new();
+    static PREFIX: OnceLock<Regex> = OnceLock::new();
+    let has_quote = text.char_indices().any(|(index, ch)| {
+        matches!(ch, '\'' | '‘' | '’')
+            && !(text[..index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                && text[index + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric))
+    });
+    let context = CONTEXT.get_or_init(|| Regex::new(
+        r"(?i)\b(?:if|unless|until|when|whether|example|suppose|maybe|perhaps|could|would|should|provided|assuming|conditional|hypothetical)\b"
+    ).expect("valid conditional context pattern"));
+    if text.contains(['"', '`', '“', '”', '?'])
+        || text.lines().any(|line| line.trim_start().starts_with('>'))
+        || has_quote
+        || context.is_match(text)
+    {
+        return false;
+    }
+    let boundary = text[..start]
+        .rfind(['.', '!', '\n', ';'])
+        .map_or(0, |index| index + 1);
+    let clause = &text[boundary..];
+    // An explicit reversal after a previous directive is a new clause.
+    let boundary = clause[..start - boundary]
+        .to_ascii_lowercase()
+        .rfind(", but ")
+        .map_or(boundary, |index| boundary + index + 6);
+    let clause_end = text[start..]
+        .find(['.', '!', '\n', ';'])
+        .map_or(text.len(), |index| start + index);
+    let clause = &text[boundary..clause_end];
+    let ambiguous = AMBIGUOUS.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:not|never|no|don'?t|cannot|can'?t|only|except|after|once|but)\b")
+            .expect("valid ambiguity pattern")
+    });
+    let prefix = PREFIX.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(?:(?:ok(?:ay)?|now|please|you are)(?:\s*,\s*|\s+))*$")
+            .expect("valid directive prefix")
+    });
+    !ambiguous.is_match(clause) && prefix.is_match(&text[boundary..start])
+}
+
 /// The last delegation directive in `text`, if it states one.
 pub fn delegation_directive(text: &str) -> Option<DelegationDirective> {
+    // User input commonly contains smart apostrophes. Normalize contractions
+    // before matching; standalone quotes still fail the authority check.
+    let normalized = text.replace(['\u{2018}', '\u{2019}'], "'");
+    let text = normalized.as_str();
     let mut last: Option<(usize, DelegationDirective)> = None;
     let mut consider = |patterns: &[Regex], directive: DelegationDirective| {
         for pattern in patterns {
             for found in pattern.find_iter(text) {
                 if is_path_mention(text, found.end()) {
                     continue;
+                }
+                if directive == DelegationDirective::Allow {
+                    // Imperative patterns include their sentence separator.
+                    let leading = found.as_str().len()
+                        - found
+                            .as_str()
+                            .trim_start_matches(|c: char| {
+                                c.is_whitespace() || matches!(c, '.' | '!' | ';')
+                            })
+                            .len();
+                    if !unambiguous_allow(text, found.start() + leading) {
+                        continue;
+                    }
                 }
                 if last.is_none_or(|(at, _)| found.start() >= at) {
                     last = Some((found.start(), directive));
@@ -131,6 +202,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn harness_negated_allow_never_revokes_delegation_ban() {
+        for text in [
+            "Don’t use subagents.",
+            "You can’t use subagents.",
+            "You are not allowed to use subagents.",
+            "You are not allowed to use subagents, even if needed.",
+        ] {
+            assert!(delegation_forbidden_after(false, [text]), "{text}");
+            assert!(delegation_forbidden_after(true, [text]), "{text}");
+        }
+        for text in [
+            "‘Use subagents.’",
+            "You can use subagents if necessary.",
+            "I didn’t say you can use subagents.",
+            "Example: you can use subagents.",
+        ] {
+            assert!(delegation_forbidden_after(true, [text]), "{text}");
+        }
+    }
+
+    #[test]
+    fn audit_negated_or_quoted_permission_never_lifts_a_ban() {
+        for text in [
+            "You are not allowed to use subagents.",
+            "You are not allowed to use subagents. Fix it yourself.",
+            "You may not use subagents.",
+            "You cannot use subagents.",
+            "If necessary, you can use subagents.",
+            "You can use subagents if I approve later.",
+            "You can use subagents?",
+            "You can use subagents, but not now.",
+            "The example says you can use subagents.",
+            "\"You can use subagents again.\" is a quoted example.",
+            "'You can use subagents again.'",
+            "```\nUse subagents.\n```",
+            "> Use subagents.\nThat is an example.",
+        ] {
+            assert!(delegation_forbidden_after(true, [text]), "{text}");
+        }
+        assert_eq!(
+            delegation_directive("You are not allowed to use subagents."),
+            Some(DelegationDirective::Forbid)
+        );
+    }
+
+    #[test]
     fn explicit_refusals_forbid() {
         for text in [
             "do not use subagents",
@@ -157,6 +274,8 @@ mod tests {
     #[test]
     fn explicit_permission_allows() {
         for text in [
+            "ok, you can use subagents again",
+            "Okay, you may use subagents now.",
             "you can use subagents again",
             "Feel free to spawn agents for the research",
             "go ahead and launch parallel agents",

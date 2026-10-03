@@ -8163,6 +8163,7 @@ mod graph_canvas_fact_tests {
                 exit_code: 1,
                 duration_ms: 1200,
                 output_tail: "PRIVATE_OUTPUT_SENTINEL".into(),
+                test_discovery: None,
                 skipped: false,
             }],
         });

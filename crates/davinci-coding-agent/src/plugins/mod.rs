@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{json, Value};
 
 use crate::agent_profiles::AgentProfile;
-use hooks::{HookContext, HookEvent, HookOutcome, PluginHook};
+use hooks::{HookContext, HookEvent, HookOutcome};
 use manifest::Plugin;
 use store::{InstalledPlugin, Origin};
 
@@ -41,10 +41,16 @@ pub struct ActivePlugin {
 impl ActivePlugin {
     /// Hooks run only when the approved digest matches the hooks on disk.
     pub fn hooks_approved(&self) -> bool {
+        #[cfg(test)]
+        tests::APPROVAL_CHECKS.with(|count| count.set(count.get() + 1));
         let Some(digest) = &self.plugin.hooks_digest else {
             return false;
         };
-        let installed = store::load(&self.agent_dir);
+        #[cfg(test)]
+        tests::REGISTRY_READS.with(|count| count.set(count.get() + 1));
+        let Ok(installed) = store::load(&self.agent_dir) else {
+            return false;
+        };
         let Some(record) = installed.plugins.get(&self.key) else {
             return false;
         };
@@ -55,8 +61,12 @@ impl ActivePlugin {
                 .and_then(|path| manifest::canonical(&path).ok())
                 .as_ref()
                 == Some(&self.plugin.root)
-            && hooks::digest_unless_unchanged(&self.plugin.root, &self.plugin.hooks).as_ref()
-                == Some(digest)
+            && {
+                #[cfg(test)]
+                tests::DIGEST_CHECKS.with(|count| count.set(count.get() + 1));
+                hooks::digest_unless_unchanged(&self.plugin.root, &self.plugin.hooks).as_ref()
+                    == Some(digest)
+            }
     }
 
     fn hook_context(&self, cwd: &Path) -> HookContext {
@@ -110,7 +120,14 @@ pub fn active(agent_dir: &Path) -> ActivePlugins {
     if disabled_by_env() {
         return out;
     }
-    for (key, record) in store::load(agent_dir).plugins {
+    let installed = match store::load(agent_dir) {
+        Ok(installed) => installed,
+        Err(err) => {
+            out.errors.push(("installed.json".into(), err));
+            return out;
+        }
+    };
+    for (key, record) in installed.plugins {
         if !record.enabled {
             continue;
         }
@@ -225,36 +242,37 @@ impl ActivePlugins {
         (out, errors)
     }
 
-    /// Approved hooks for one event, with the plugin that owns each.
-    fn hooks_for(&self, event: HookEvent) -> Vec<(&ActivePlugin, &PluginHook)> {
-        if !hooks_allowed_here() {
-            return Vec::new();
-        }
-        self.plugins
-            .iter()
-            .filter(|active| active.hooks_approved())
-            .flat_map(|active| {
-                active
-                    .plugin
-                    .hooks
-                    .iter()
-                    .filter(move |hook| hook.event == event)
-                    .map(move |hook| (active, hook))
-            })
-            .collect()
+    /// Check consent only for relevant plugins, once per synchronous query.
+    /// Callers must still recheck consent at execution time.
+    fn approved_plugins_for<'a>(
+        &'a self,
+        event: HookEvent,
+        subject: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a ActivePlugin> {
+        let allowed = hooks_allowed_here();
+        self.plugins.iter().filter(move |active| {
+            allowed
+                && active.plugin.hooks.iter().any(|hook| {
+                    hook.event == event
+                        && subject.map_or(true, |subject| {
+                            hooks::matcher_accepts(hook.matcher.as_deref(), subject)
+                        })
+                })
+                && active.hooks_approved()
+        })
     }
 
     pub fn has_hooks(&self, event: HookEvent) -> bool {
-        !self.hooks_for(event).is_empty()
+        self.approved_plugins_for(event, None).next().is_some()
     }
 
     /// Whether an approved hook for `event` would run for the Claude tool
     /// name `subject`. The harness asks this before reading a file on the
     /// model's behalf, since such a hook would never see that read.
     pub fn has_matching_hook(&self, event: HookEvent, subject: &str) -> bool {
-        self.hooks_for(event)
-            .iter()
-            .any(|(_, hook)| hooks::matcher_accepts(hook.matcher.as_deref(), subject))
+        self.approved_plugins_for(event, Some(subject))
+            .next()
+            .is_some()
     }
 
     /// Run every matching hook for `event`. Contexts are collected in order;
@@ -281,28 +299,33 @@ impl ActivePlugins {
             *last_session_id().lock().unwrap_or_else(|e| e.into_inner()) = input.session_id.clone();
         }
         let mut result = EventResult::default();
-        // `hooks_for` has just verified approval; re-check only once a hook
-        // has run, since it may have changed files or revoked approval.
-        let mut hook_ran = false;
-        for (active, hook) in self.hooks_for(event) {
-            if cancelled() {
+        if !hooks_allowed_here() {
+            return result;
+        }
+        // Candidate discovery is cheap and carries no execution consent.
+        let candidates = self.plugins.iter().flat_map(|active| {
+            active.plugin.hooks.iter().filter_map(move |hook| {
+                let matched = hook.event == event
+                    && match event {
+                        HookEvent::PreToolUse
+                        | HookEvent::PostToolUse
+                        | HookEvent::SessionStart => {
+                            hooks::matcher_accepts(hook.matcher.as_deref(), subject.unwrap_or(""))
+                        }
+                        _ => true,
+                    };
+                matched.then_some((active, hook))
+            })
+        });
+        for (active, hook) in candidates {
+            if cancelled() || !hooks_allowed_here() {
                 break;
             }
-            let matched = match event {
-                HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::SessionStart => {
-                    hooks::matcher_accepts(hook.matcher.as_deref(), subject.unwrap_or(""))
-                }
-                _ => true,
-            };
-            if !matched {
+            // Recheck even the first dispatch: cancellation callbacks and
+            // earlier hooks may revoke approval or change the plugin's files.
+            if !active.hooks_approved() {
                 continue;
             }
-            // An earlier hook may revoke approval or change files. Loaded
-            // references are discovery data, never continuing execution consent.
-            if hook_ran && (!hooks_allowed_here() || !active.hooks_approved()) {
-                continue;
-            }
-            hook_ran = true;
             let outcome: HookOutcome = hooks::run_cancellable(
                 hook,
                 &active.hook_context(&input.cwd),
@@ -421,13 +444,9 @@ pub fn session_start_context(
 ) -> SessionStartOutput {
     type Key = (PathBuf, String, String);
     static CACHE: OnceLock<Mutex<BTreeMap<Key, SessionStartOutput>>> = OnceLock::new();
-    let hooks = plugins.hooks_for(HookEvent::SessionStart);
-    if hooks.is_empty() {
-        return SessionStartOutput::default();
-    }
-    let fingerprint = hooks
-        .iter()
-        .map(|(active, _)| {
+    let fingerprint = plugins
+        .approved_plugins_for(HookEvent::SessionStart, Some("startup"))
+        .map(|active| {
             format!(
                 "{}@{}",
                 active.key,
@@ -436,6 +455,9 @@ pub fn session_start_context(
         })
         .collect::<Vec<_>>()
         .join(",");
+    if fingerprint.is_empty() {
+        return SessionStartOutput::default();
+    }
     let key = (cwd.to_path_buf(), session_id.to_string(), fingerprint);
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     if let Some(found) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -582,6 +604,239 @@ mod tests {
     use super::*;
     use crate::plugins::external::tests::{write, FakeHomes};
 
+    thread_local! {
+        pub(super) static APPROVAL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static REGISTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static DIGEST_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn selection_fixture(agent_dir: &Path, root: &Path, name: &str) {
+        write(
+            &root.join("plugin.json"),
+            &json!({"name": name}).to_string(),
+        );
+        write(
+            &root.join("hooks/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"command":"exit 2"}]}],"SessionStart":[{"matcher":"resume","hooks":[{"command":"exit 2"}]}]}}"#,
+        );
+        install_fixture(agent_dir, root, true);
+    }
+
+    #[test]
+    fn simplification_nonmatching_hook_performs_no_approval_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        selection_fixture(&agent_dir, &dir.path().join("plugin"), "selection");
+        let loaded = active(&agent_dir);
+        APPROVAL_CHECKS.with(|count| count.set(0));
+        assert!(!loaded.has_hooks(HookEvent::Stop));
+        assert!(!loaded.has_matching_hook(HookEvent::PreToolUse, "Read"));
+        assert_eq!(
+            session_start_context(&loaded, dir.path(), "selection-test"),
+            SessionStartOutput::default()
+        );
+        let result = loaded.run_event(HookEvent::PreToolUse, Some("Read"), &HookInput::default());
+        assert_eq!(result, EventResult::default());
+        assert_eq!(APPROVAL_CHECKS.with(|count| count.get()), 0);
+        assert!(loaded.has_matching_hook(HookEvent::PreToolUse, "Write"));
+        assert_eq!(APPROVAL_CHECKS.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn simplification_matching_hook_rechecks_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        selection_fixture(&agent_dir, &dir.path().join("plugin"), "selection");
+        let loaded = active(&agent_dir);
+        assert!(loaded.has_matching_hook(HookEvent::PreToolUse, "Write"));
+        let revoked = std::cell::Cell::new(false);
+        let result = loaded.run_event_cancellable(
+            HookEvent::PreToolUse,
+            Some("Write"),
+            &HookInput {
+                cwd: dir.path().into(),
+                ..Default::default()
+            },
+            &|| {
+                if !revoked.replace(true) {
+                    store::update(&agent_dir, |registry| {
+                        registry
+                            .plugins
+                            .get_mut("selection@local")
+                            .unwrap()
+                            .hooks_approved = None;
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                false
+            },
+        );
+        assert_eq!(
+            result,
+            EventResult::default(),
+            "revoked first hook must not execute"
+        );
+    }
+
+    #[test]
+    fn simplification_first_hook_mutation_invalidates_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("mutation");
+        let marker = root.join("changed.txt");
+        write(&root.join("plugin.json"), r#"{"name":"mutation"}"#);
+        #[cfg(windows)]
+        let command = format!(
+            "$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('{}', 'changed')",
+            marker.display()
+        );
+        #[cfg(not(windows))]
+        let command = format!("cat >/dev/null; echo changed > '{}'", marker.display());
+        write(&root.join("hooks/hooks.json"), &json!({"hooks": {"Stop": [{
+            "matcher": "ignored-for-stop",
+            "hooks": [
+                {"command": command, "shell": if cfg!(windows) { "powershell" } else { "bash" }},
+                {"command": "exit 2"}
+            ]
+        }]}}).to_string());
+        install_fixture(&agent_dir, &root, true);
+        let loaded = active(&agent_dir);
+        let result = loaded.run_event(
+            HookEvent::Stop,
+            None,
+            &HookInput {
+                cwd: dir.path().into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            marker.exists(),
+            "first hook must actually run despite its Stop matcher"
+        );
+        assert_eq!(
+            result,
+            EventResult::default(),
+            "changed plugin must not run its second hook"
+        );
+    }
+
+    #[test]
+    fn simplification_disabled_hooks_skip_dispatch_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        selection_fixture(&agent_dir, &dir.path().join("plugin"), "selection");
+        let loaded = active(&agent_dir);
+        let previous = std::env::var_os("DAVINCI_PLUGINS");
+        std::env::set_var("DAVINCI_PLUGINS", "off");
+        let callbacks = std::cell::Cell::new(0);
+        APPROVAL_CHECKS.with(|count| count.set(0));
+        let result = loaded.run_event_cancellable(
+            HookEvent::PreToolUse,
+            Some("Write"),
+            &HookInput::default(),
+            &|| {
+                callbacks.set(callbacks.get() + 1);
+                false
+            },
+        );
+        if let Some(value) = previous {
+            std::env::set_var("DAVINCI_PLUGINS", value);
+        } else {
+            std::env::remove_var("DAVINCI_PLUGINS");
+        }
+        assert_eq!(result, EventResult::default());
+        assert_eq!(APPROVAL_CHECKS.with(|count| count.get()), 0);
+        assert_eq!(callbacks.get(), 0);
+    }
+
+    #[test]
+    fn simplification_cancelled_event_performs_no_approval_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        selection_fixture(&agent_dir, &dir.path().join("plugin"), "selection");
+        let loaded = active(&agent_dir);
+        APPROVAL_CHECKS.with(|count| count.set(0));
+        assert_eq!(
+            loaded.run_event_cancellable(
+                HookEvent::PreToolUse,
+                Some("Write"),
+                &HookInput::default(),
+                &|| true
+            ),
+            EventResult::default()
+        );
+        assert_eq!(APPROVAL_CHECKS.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    #[ignore = "local paired timing probe; no network or provider calls"]
+    fn simplification_hook_selection_probe() {
+        for plugin_count in [0, 1, 24] {
+            let dir = tempfile::tempdir().unwrap();
+            let _homes = FakeHomes::new(dir.path());
+            let agent_dir = dir.path().join("agent");
+            for index in 0..plugin_count {
+                let name = format!("selection-{index}");
+                let root = dir.path().join(&name);
+                for file in 0..16 {
+                    write(
+                        &root.join(format!("resource-{file}.txt")),
+                        "fixture resource",
+                    );
+                }
+                selection_fixture(&agent_dir, &root, &name);
+            }
+            let loaded = active(&agent_dir);
+            for subject in ["Read", "Write"] {
+                for sample in 0..30 {
+                    APPROVAL_CHECKS.with(|count| count.set(0));
+                    REGISTRY_READS.with(|count| count.set(0));
+                    DIGEST_CHECKS.with(|count| count.set(0));
+                    let started = std::time::Instant::now();
+                    let matched = loaded.has_matching_hook(HookEvent::PreToolUse, subject);
+                    assert_eq!(matched, plugin_count > 0 && subject == "Write");
+                    println!(
+                        "SIMPLIFICATION_PROBE {}",
+                        json!({
+                            "plugins": plugin_count,
+                            "subject": subject, "sample": sample, "matched": matched,
+                            "elapsed_ns": started.elapsed().as_nanos(),
+                            "approval_checks": APPROVAL_CHECKS.with(|count| count.get()),
+                            "registry_reads": REGISTRY_READS.with(|count| count.get()),
+                            "digest_checks": DIGEST_CHECKS.with(|count| count.get()),
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audit_corrupt_registry_is_visible_in_loader_command_and_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let registry = dir.path().join("plugins/installed.json");
+        write(&registry, "{broken");
+        let loaded = active(dir.path());
+        assert!(loaded.plugins.is_empty());
+        assert_eq!(loaded.errors.len(), 1);
+        assert!(loaded.errors[0].1.contains("invalid registry"));
+        assert!(command::run(&[], dir.path(), dir.path())
+            .unwrap_err()
+            .contains("installed.json"));
+        let rows = manager::plugin_rows(dir.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].health, manager::Health::Failed);
+        assert!(!rows[0].can_toggle && !rows[0].can_approve && !rows[0].can_delete);
+        assert_eq!(std::fs::read_to_string(registry).unwrap(), "{broken");
+    }
+
     #[test]
     fn stop_payload_reports_continuation_only_for_stop() {
         for active in [false, true] {
@@ -700,6 +955,8 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
         if change == "env-off" {
             std::env::set_var("DAVINCI_PLUGINS", "off");
+        } else if change == "corrupt" {
+            write(&agent_dir.join("plugins/installed.json"), "{broken");
         } else {
             store::update(&agent_dir, |file| {
                 if change == "remove" {
@@ -752,6 +1009,11 @@ mod tests {
     #[test]
     fn loaded_hooks_recheck_environment_off() {
         loaded_hook_revocation("env-off");
+    }
+
+    #[test]
+    fn audit_loaded_hooks_stop_when_the_registry_is_corrupt() {
+        loaded_hook_revocation("corrupt");
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub struct Counter(Arc<Mutex<Totals>>);
 pub(crate) struct ProviderReceipts {
     attempts: Vec<Option<RequestUsage>>,
     indices: HashMap<(String, u64), usize>,
+    terminal_evidence: HashMap<usize, Value>,
     retries: usize,
     overflow: bool,
 }
@@ -51,8 +52,13 @@ impl ProviderReceipts {
             .filter(|logical| !logical.is_empty())
             .zip(observation["attempt_id"].as_u64())
         else {
+            self.overflow = true;
             return;
         };
+        if attempt == 0 {
+            self.overflow = true;
+            return;
+        }
         let key = (logical.to_string(), attempt);
         let index = if let Some(index) = self.indices.get(&key) {
             *index
@@ -62,10 +68,25 @@ impl ProviderReceipts {
             self.attempts.push(None);
             index
         };
-        if kind == Some("attempt_end") && self.attempts[index].is_none() {
-            let usage =
-                serde_json::from_value::<davinci_protocol::Usage>(observation["usage"].clone())
-                    .ok();
+        if kind == Some("attempt_end") {
+            // Compare only accounting evidence: transport timestamps can differ
+            // on redelivery. A disagreement is permanently uncertain.
+            let evidence = json!({"usage":observation["usage"],
+                "complete":observation["usage_complete"], "raw":observation["raw_usage"],
+                "status":observation["status"]});
+            if let Some(previous) = self.terminal_evidence.get(&index) {
+                if previous != &evidence {
+                    self.attempts[index] = Some(RequestUsage::new(None, 0, 0, true));
+                }
+                return;
+            }
+            self.terminal_evidence.insert(index, evidence);
+            let usage = (observation["usage_complete"] == true)
+                .then(|| {
+                    serde_json::from_value::<davinci_protocol::Usage>(observation["usage"].clone())
+                        .ok()
+                })
+                .flatten();
             self.attempts[index] = Some(RequestUsage::new(
                 usage.as_ref(),
                 0,
@@ -315,6 +336,43 @@ pub fn lsp_status(agent: &Agent) -> Option<Value> {
         .upgrade()?;
     let host = host.lock().unwrap_or_else(|e| e.into_inner());
     Some(host.language_intelligence.status())
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    fn receipt(total: u64) -> Value {
+        json!({"kind":"attempt_end", "logical_request_id":"root-request", "attempt_id":1,
+            "status":"completed", "usage_complete":true,
+            "usage":davinci_protocol::Usage { input:total, total_tokens:total, ..Default::default() }})
+    }
+
+    #[test]
+    fn harness_conflicting_receipts_remain_unknown_after_redelivery() {
+        let mut ledger = ProviderReceipts::default();
+        ledger.observe(&receipt(10));
+        ledger.observe(&receipt(11));
+        ledger.observe(&receipt(10));
+        let entries = ledger.take(None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].measured.is_none());
+    }
+
+    #[test]
+    fn harness_identical_receipts_are_counted_once_and_missing_identity_is_unknown() {
+        let mut ledger = ProviderReceipts::default();
+        ledger.observe(&receipt(10));
+        ledger.observe(&receipt(10));
+        assert_eq!(ledger.take(None).len(), 1);
+        ledger.observe(&receipt(10));
+        let mut invalid = receipt(20);
+        invalid["logical_request_id"] = Value::Null;
+        ledger.observe(&invalid);
+        let entries = ledger.take(None);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[1].measured.is_none());
+    }
 }
 
 pub fn render(background: &Value) -> String {

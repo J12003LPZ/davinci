@@ -69,6 +69,7 @@ impl Agent {
     }
 
     pub fn prepared_context_image(&self) -> Result<Arc<ContextImage>, String> {
+        let _timing = self.counters.digest_retrieval.start();
         let mut cache = self
             .prepared_context_image
             .lock()

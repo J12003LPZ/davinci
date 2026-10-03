@@ -1,5 +1,14 @@
 # Green source and installation identity
 
+For an exported checkout without Git, `scripts/release_identity.py snapshot`
+and `record-local` record a source file manifest, unchanged before/after build
+content, actual binary hash and launch path, platform, features and configuration
+digest. These local records have no source commit and are never release eligible.
+Store them outside the source tree so the evidence does not change its own
+identity. `test-fixtures` builds are also rejected by official campaign admission.
+See the [October 2 execution record](openai-harness-implementation.md) for local
+verification and the outstanding live/release gates.
+
 Production installation uses `scripts/install.sh` or
 `pwsh scripts/install-davinci.ps1`. Both require a clean checkout at the exact
 `v<workspace version>` tag and a completed successful full CI run for that

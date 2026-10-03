@@ -28,6 +28,7 @@ pub mod operations;
 pub mod progress_watchdog;
 pub mod registry;
 pub mod rewind;
+mod root_budget;
 pub mod session;
 pub mod source_manifest;
 mod task_migration;
@@ -136,9 +137,11 @@ pub use worktree::{has_uncommitted_changes, WorktreeError, WorktreeLease, Worktr
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
 #[derive(Clone)]
 pub struct RuntimeHandle {
+    pub(crate) read_diagnostics: Arc<crate::tool_diagnostics::ReadDiagnostics>,
     pub cache: cache::CacheRuntime,
     pub context_vm: context_vm::ContextVmRuntime,
     pub run_id: RunId,
+    pub root_budget: Option<capacity::RootBudget>,
     pub agent_id: AgentId,
     pub parent_agent_id: Option<AgentId>,
     pub session_id: Option<String>,
@@ -251,9 +254,11 @@ impl RuntimeHandle {
             ..Default::default()
         };
         Self {
+            read_diagnostics: Arc::default(),
             context_vm: context_vm::ContextVmRuntime::new(context_vm_config, cache.clone()),
             cache,
             run_id,
+            root_budget: None,
             agent_id,
             parent_agent_id: None,
             session_id: None,
@@ -384,6 +389,8 @@ impl RuntimeHandle {
     /// Continue a host-validated session with fresh turn observers and cancellation token.
     /// Retain live identities, coordination state, writer lease and event counters.
     pub fn with_session_state_from(mut self, previous: &Self) -> Self {
+        self.read_diagnostics = previous.read_diagnostics.clone();
+        self.root_budget = previous.root_budget.clone();
         self.cache = previous.cache.clone();
         self.context_vm = previous.context_vm.clone();
         self.run_id = previous.run_id;
@@ -418,6 +425,8 @@ impl RuntimeHandle {
 
     /// Preserve a host-bound worker's coordinator without replacing parent observers.
     pub fn with_worker_state_from(mut self, worker: &Self) -> Self {
+        self.read_diagnostics = worker.read_diagnostics.clone();
+        self.root_budget = worker.root_budget.clone();
         self.cache = worker.cache.clone();
         self.context_vm = worker.context_vm.clone();
         self.run_id = worker.run_id;

@@ -14,8 +14,8 @@ class CacheReportTests(unittest.TestCase):
     def test_missing_usage_is_unavailable_and_groups_use_summed_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for seq, usage in enumerate(({"input": 20, "cacheRead": 80},
-                                         {"input": 100, "cacheRead": 100}, None), 1):
+            for seq, usage in enumerate(({"input": 20, "cacheRead": 80, "cacheWrite": 0},
+                                         {"input": 100, "cacheRead": 100, "cacheWrite": 0}, None), 1):
                 (root / f"{seq}-123-logical.json").write_text(json.dumps({"input": []}))
                 if usage is not None:
                     (root / f"{seq}-123-usage.json").write_text(json.dumps(usage))
@@ -43,6 +43,15 @@ class CacheReportTests(unittest.TestCase):
         self.assertEqual(cache_report.first_request_cache_state([(100, 0), (100, 50)]), "yes")
         self.assertEqual(cache_report.first_request_cache_state([(100, 1)]), "no")
         self.assertEqual(cache_report.first_request_cache_state([(None, None)]), "unavailable")
+
+    def test_harness_missing_write_count_and_zero_input_are_unknown(self):
+        self.assertEqual(cache_report.token_pair({"input": 10, "cacheRead": 0}), (None, None))
+        self.assertEqual(cache_report.first_request_cache_state([(0, 0)]), "unavailable")
+
+    def test_harness_cache_diagnosis_includes_model_and_effective_settings(self):
+        body = {"model": "fixture", "reasoning": {"effort": "high"}, "input": []}
+        self.assertEqual(cache_report.first_break(body, dict(body, model="other"))[0], "model")
+        self.assertEqual(cache_report.first_break(body, dict(body, reasoning={"effort": "low"}))[0], "settings.reasoning")
 
 
 if __name__ == "__main__":

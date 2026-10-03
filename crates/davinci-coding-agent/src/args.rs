@@ -103,6 +103,8 @@ pub struct Args {
     /// `run` loads the JSON schema the final answer of a print or json run
     /// must match; this is the path as given.
     pub output_schema: Option<String>,
+    /// Host-approved finite root limits, shared with worker processes.
+    pub root_budget: Option<String>,
     /// `--approval-policy <abort|deny-continue>`: what print and json runs do
     /// when a call needs approval nobody can give.
     pub approval_policy: ApprovalPolicy,
@@ -533,6 +535,16 @@ pub fn parse_args(args: &[String]) -> Args {
             }
         } else if arg == "--fail-on-denied" {
             result.fail_on_denied = true;
+        } else if arg == "--root-budget" || arg.starts_with("--root-budget=") {
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            match path_flag_value("--root-budget", value) {
+                Ok(value) => result.root_budget = Some(value),
+                Err(message) => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message,
+                }),
+            }
         } else if arg == OUTPUT_SCHEMA_FLAG
             || arg
                 .strip_prefix(OUTPUT_SCHEMA_FLAG)

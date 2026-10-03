@@ -868,6 +868,7 @@ impl GraphController {
         json!({
             "active": active.is_some() && is_running(&self.cwd),
             "run": current.as_ref().map(run_for_display),
+            "delivery": current.as_ref().map(|run| delivery_for_status(run, &self.cwd)),
             "status": current.as_ref().map(render_now).unwrap_or_default(),
             "summary": current.as_ref().map(render_run_summary),
             "recent": recent,
@@ -1673,6 +1674,57 @@ impl GraphController {
 /// file baselines for resume and rollback; it stays on disk only.
 fn run_for_display(run: &types::GraphRun) -> Value {
     strip_continuation(serde_json::to_value(run).unwrap_or(Value::Null))
+}
+
+/// Status reports current evidence without upgrading model-authored criteria
+/// into host-owned acceptance receipts. Legacy graph checks remain visible.
+fn delivery_for_status(run: &types::GraphRun, cwd: &std::path::Path) -> Value {
+    use crate::completion_delivery::*;
+    use davinci_agent::verification::acceptance::ChangeRisk;
+    let source = operations::source_manifest_for_run(run, cwd)
+        .ok()
+        .flatten()
+        .filter(|manifest| manifest.complete_coverage);
+    if source.is_none() {
+        return json!({"schemaVersion": 1, "acceptance": null,
+        "gaps": ["No complete source identity is available for a delivery level."]});
+    }
+    let loaded = config::load_config(cwd);
+    let configuration = json!({"budgets": loaded.config.budgets, "models": loaded.config.models,
+        "verifyCommands": loaded.config.verify_commands, "workerExtensions": loaded.config.worker_extensions,
+        "workerExtraTools": loaded.config.worker_extra_tools, "security": loaded.config.security_verification});
+    let config_digest = if loaded.errors.is_empty() {
+        davinci_agent::runtime::checkpoints::compute_sha256(configuration.to_string().as_bytes())
+    } else {
+        String::new()
+    };
+    let record = delivery_record(&DeliveryInput {
+        identity: DeliveryIdentity {
+            source_digest: source.map(|s| s.digest).unwrap_or_default(),
+            configuration_digest: config_digest,
+            artifact_sha256: None,
+        },
+        requirements: vec![DeliveryRequirement {
+            id: "user_goal".into(),
+            risk: ChangeRisk::Unknown,
+        }],
+        receipts: Vec::new(),
+        operational_references: Vec::new(),
+        rollback_references: Vec::new(),
+        deployment_authorized: false,
+        installed_sha256: None,
+        installed_resolution_verified: false,
+    });
+    json!({"acceptance": record,
+        "requirementDescriptions": {"user_goal": davinci_agent::runtime::contracts::redact_secrets(&run.goal)},
+        "commandReceipts": run.verification.as_ref().map(|verification| verification.commands.iter().map(|c| json!({
+            "name": davinci_agent::runtime::contracts::redact_secrets(&c.name),
+            "command": davinci_agent::runtime::contracts::redact_secrets(&c.command),
+            "exitCode": c.exit_code, "testDiscovery": c.test_discovery, "verifiedExecution": c.verified(),
+            "skipped": c.skipped,
+        })).collect::<Vec<_>>()),
+        "scopedChanges": run.verification_bundle.as_ref().map(|b| &b.changed_files),
+        "note": "Command execution alone does not prove semantic requirement coverage. Acceptance gaps require host-owned, current evidence; deployment and publication retain separate authority."})
 }
 
 fn strip_continuation(mut value: Value) -> Value {

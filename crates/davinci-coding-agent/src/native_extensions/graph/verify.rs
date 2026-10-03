@@ -334,10 +334,11 @@ pub fn run_verification_with_progress_from(
     let start = completed.len();
     if start == commands.len() {
         let ran = completed.iter().filter(|result| !result.skipped).count();
-        let passed = ran > 0
+        let passed = !abort.load(Ordering::Relaxed)
+            && ran > 0
             && completed
                 .iter()
-                .all(|result| result.skipped || result.exit_code == 0);
+                .all(|result| result.skipped || result.verified());
         return VerificationResult {
             commands: completed,
             passed,
@@ -375,9 +376,7 @@ pub fn run_verification_with_progress_from(
     let ran = merged.iter().filter(|item| !item.skipped).count();
     let passed = !abort.load(Ordering::Relaxed)
         && ran > 0
-        && merged
-            .iter()
-            .all(|item| item.skipped || item.exit_code == 0);
+        && merged.iter().all(|item| item.skipped || item.verified());
     VerificationResult {
         commands: merged,
         passed,
@@ -449,6 +448,11 @@ pub fn run_verification_with_progress(
             command: spec.command.clone(),
             exit_code,
             duration_ms,
+            test_discovery: davinci_agent::verification::test_discovery(
+                &spec.command,
+                output.as_bytes(),
+                b"",
+            ),
             output_tail: format!("{prefix}{}", verification_excerpt(&output, exit_code != 0)),
             skipped,
         });
@@ -466,7 +470,7 @@ pub fn run_verification_with_progress(
         && ran > 0
         && results
             .iter()
-            .all(|result| result.skipped || result.exit_code == 0);
+            .all(|result| result.skipped || result.verified());
     VerificationResult {
         commands: results,
         passed,
@@ -481,6 +485,7 @@ fn deadline_failure() -> VerificationCommandResult {
         exit_code: 1,
         duration_ms: 0,
         output_tail: "root deadline exceeded".into(),
+        test_discovery: None,
         skipped: false,
     }
 }
@@ -508,7 +513,7 @@ pub fn is_valid_verification_proof(result: &VerificationResult) -> bool {
     if nothing_ran(result) {
         return false;
     }
-    result.passed
+    result.passed && result.commands.iter().all(|c| c.skipped || c.verified())
 }
 
 #[allow(dead_code)]
@@ -542,7 +547,7 @@ impl VerificationResult {
         let commands_failed = self
             .commands
             .iter()
-            .filter(|c| !c.skipped && c.exit_code != 0)
+            .filter(|c| !c.skipped && !c.verified())
             .count();
         crate::native_extensions::ecosystem::verification::VerificationBundle {
             commands_ran,
@@ -560,6 +565,27 @@ impl VerificationResult {
 mod tests {
     use super::*;
     use crate::native_extensions::graph::types::{PlanStep, PlanTest};
+
+    #[test]
+    fn harness_graph_zero_or_unknown_discovery_cannot_pass_after_resume() {
+        let abort = Arc::new(AtomicBool::new(false));
+        for output in [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.00s",
+            "all tests passed",
+        ] {
+            let commands = vec![VerifyCommandSpec {
+                name: "tests".into(),
+                command: "cargo --offline test --locked".into(),
+                from_plan: false,
+            }];
+            let result = run_verification(&commands, Path::new("."), &abort, 1000,
+                &|_, _, _, _| (0, output.into(), 1));
+            assert!(!result.passed, "unproven discovery: {output}");
+            let resumed = run_verification_with_progress_from(&commands, Path::new("."),
+                &abort, 1000, None, Some(&result), &|_, _, _, _| panic!("already executed"), |_| {});
+            assert!(!resumed.passed);
+        }
+    }
 
     #[test]
     fn abort_from_progress_prevents_command_dispatch() {
@@ -720,6 +746,7 @@ mod tests {
                 exit_code: 0,
                 duration_ms: 1,
                 output_tail: "ok".into(),
+                test_discovery: None,
                 skipped: false,
             }],
             passed: false,

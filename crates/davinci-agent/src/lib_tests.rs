@@ -2971,6 +2971,9 @@ fn source_edits_during_a_passing_check_cannot_verify_the_new_generation() {
 fn exhausted_inventory_recovers_with_a_fresh_suite_but_rejects_edits_during_it() {
     let dir = tempfile::tempdir().unwrap();
     let agent = verifying_agent(dir.path());
+    for id in ["suite", "editing-suite", "fresh-suite"] {
+        insert_suite_receipt_fixture(&agent, id);
+    }
     let paths = [PathBuf::from("changed.py")];
     std::fs::write(dir.path().join(&paths[0]), "x = 1").unwrap();
     agent.record_successful_mutation_paths(paths.to_vec());
@@ -3815,10 +3818,31 @@ fn shell_tool() -> &'static str {
 
 fn verifying_agent(dir: &std::path::Path) -> Agent {
     let mut agent = Agent::new(default_system_prompt());
+    agent.tool_context.foreground_supervisor = Some(crate::command_receipt::test_supervisor());
     agent.cwd = dir.to_path_buf();
     agent.set_permission_mode(PermissionMode::Ask);
     agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::AllowOnce)));
     agent
+}
+
+// Unit fixture for coverage-state transitions; actual process receipt creation
+// is exercised separately through the supervised command tests.
+fn insert_suite_receipt_fixture(agent: &Agent, operation_id: &str) {
+    agent.command_receipts.lock().unwrap().push_back(
+        crate::runtime::evidence_store::ExecutionReceipt {
+            operation_id: operation_id.into(),
+            argv: vec!["pytest -q".into()],
+            started: true,
+            exit_code: Some(0),
+            assertion_counts: Some(crate::runtime::AssertionCounts {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+            }),
+            ..Default::default()
+        },
+    );
 }
 
 fn harness_runs(agent: &Agent) -> usize {
@@ -3963,6 +3987,7 @@ fn shell_verification_requires_original_terminal_status_and_fresh_dispatch() {
     };
     agent.observe_shell_verification("check", dir.path(), shell_tool(), &args, &result, &veto);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    insert_suite_receipt_fixture(&agent, "check");
     agent
         .verification_starts
         .lock()
@@ -4065,7 +4090,7 @@ fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
         .unwrap();
 
     assert_eq!(agent.run_stats().completion_requirement_reminders, 1);
-    assert_eq!(harness_runs(&agent), 1);
+    assert_eq!(harness_runs(&agent), 1, "messages: {:?}", agent.messages);
     let reminders = reminders(&agent);
     assert_eq!(reminders.len(), 1, "{reminders:?}");
     assert!(
