@@ -3122,16 +3122,33 @@ mod tests {
         std::sync::mpsc::Sender<()>,
         std::thread::JoinHandle<bool>,
     ) {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            assert!(request.starts_with("POST "), "{request}");
+            // Drain the complete request before closing the socket. A single
+            // read can leave body bytes unread and turn close into a reset on
+            // Windows, discarding the final response frame nondeterministically.
+            stream.set_read_timeout(Some(patience)).unwrap();
+            let mut request = BufReader::new(&mut stream);
+            let mut first_line = String::new();
+            request.read_line(&mut first_line).unwrap();
+            assert!(first_line.starts_with("POST "), "{first_line}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(request.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            request.read_exact(&mut vec![0; length]).unwrap();
+            drop(request);
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",

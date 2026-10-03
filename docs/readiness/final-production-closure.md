@@ -19,6 +19,11 @@ It does not authorize publication or establish superiority over Codex.
   Focused unittest selectors and discovery patterns cannot claim the whole source
   tree merely because they name a test directory. Both defects have RED/GREEN
   regressions; the targeted verification group passed 46 tests.
+- The full workspace gate exposed an intermittent Windows loopback fixture
+  failure: its server read only one request chunk before closing. The fixture
+  now drains the declared request body before returning response frames, avoiding
+  resets from unread request bytes. Production transport is unchanged; all 46
+  targeted stream tests passed after the fixture correction.
 
 Historical completion-metrics traces included focused discovery and compound
 `cd scripts/bench/tests && python -m unittest discover` commands. The former
