@@ -38,6 +38,11 @@ test("only terminal usage observations are counted and API cost is ignored", () 
     JSON.stringify({ type: "message_update", message: { role: "assistant", usage: { input: 999 } } }),
     JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 20, cacheRead: 30, cacheWrite: 5, output: 7, cost: { total: 999 } } } }),
     JSON.stringify({ type: "message_end", message: { role: "user" } }),
+    JSON.stringify({ type: "provider_observation", observation: {
+      kind: "attempt_end", logical_request_id: "fixture", attempt_id: 1,
+      usage_complete: true,
+      raw_usage: { input_total: 55, cache_read: 30, cache_write: 5, output: 7 },
+    } }),
   ]);
   assert.equal(summary.usageRecords, 1);
   assert.equal(summary.inputTotal, 55);

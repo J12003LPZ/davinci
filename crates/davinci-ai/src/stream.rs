@@ -748,6 +748,18 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    if model.provider == crate::codex_models::CODEX_PROVIDER
+        && model.api == "openai-codex-responses"
+    {
+        let tier = options.service_tier.unwrap_or_default();
+        if tier == crate::CodexServiceTier::Fast {
+            let capability = crate::codex_models::fast_capability_for_model(
+                &davinci_sys::paths::default_agent_dir(),
+                &model.id,
+            );
+            tier.validate_capability(&model.id, capability)?;
+        }
+    }
     let options = options_with_auth_context(options, auth);
     let dump = crate::wire_dump::begin();
     if let Some(dump) = &dump {

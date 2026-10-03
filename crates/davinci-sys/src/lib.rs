@@ -4,4 +4,5 @@
 
 pub mod fs;
 pub mod lock;
+pub mod paths;
 pub mod process;

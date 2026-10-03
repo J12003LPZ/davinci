@@ -13,6 +13,19 @@ pub enum CodexServiceTier {
 }
 
 impl CodexServiceTier {
+    /// Unknown capability remains an explicit user choice; only a known denial
+    /// blocks Fast. Never silently change the selected model, effort, or tier.
+    pub fn validate_capability(
+        self,
+        model: &str,
+        capability: crate::codex_models::FastCapability,
+    ) -> Result<(), String> {
+        if self == Self::Fast && capability == crate::codex_models::FastCapability::Unsupported {
+            return Err(format!("Fast is not advertised for {model}"));
+        }
+        Ok(())
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "standard" | "default" => Some(Self::Standard),
@@ -83,5 +96,32 @@ mod tests {
         assert_eq!(models[3].fast_capability(), FastCapability::Unsupported);
         let cached = serde_json::to_value(&models).unwrap();
         assert_eq!(parse_codex_models(&cached), models);
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::codex_models::FastCapability;
+    #[test]
+    fn review_fast_capability_policy_is_consistent_and_never_downgrades() {
+        assert!(CodexServiceTier::Fast
+            .validate_capability("fixture", FastCapability::Unsupported)
+            .is_err());
+        for tier in [
+            CodexServiceTier::Standard,
+            CodexServiceTier::Fast,
+            CodexServiceTier::Flex,
+        ] {
+            for capability in [
+                FastCapability::Unknown,
+                FastCapability::Supported,
+                FastCapability::Unsupported,
+            ] {
+                if tier != CodexServiceTier::Fast || capability != FastCapability::Unsupported {
+                    assert!(tier.validate_capability("fixture", capability).is_ok());
+                }
+            }
+        }
     }
 }

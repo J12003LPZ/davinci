@@ -190,26 +190,7 @@ impl DesignModel for SubscriptionModel {
             &self.auth,
             Some(DESIGN_POLICY),
             &request.tools,
-            &davinci_ai::StreamOptions {
-                thinking_level: Some(self.effort),
-                thinking_budgets: agent.thinking_budgets.clone(),
-                timeout_ms: Some(
-                    agent
-                        .provider_timeout_ms
-                        .unwrap_or(remaining)
-                        .min(remaining),
-                ),
-                max_retries: Some(0),
-                max_tokens: Some(output),
-                transport: agent.transport.clone(),
-                abort_signal: Some(request.abort.clone()),
-                session_id: agent
-                    .session
-                    .as_ref()
-                    .map(|session| session.header.id.clone()),
-                install_telemetry: Some(agent.install_telemetry),
-                ..Default::default()
-            },
+            &stream_options(agent, request, self.effort, remaining, output),
             &mut |_| {},
         )
         .map(|envelope| CompleteOutput {
@@ -218,5 +199,69 @@ impl DesignModel for SubscriptionModel {
             native_responses_resume: None,
             streamed_live: false,
         })
+    }
+}
+
+fn stream_options(
+    agent: &Agent,
+    request: &DesignModelRequest,
+    effort: davinci_protocol::ThinkingLevel,
+    remaining: u64,
+    output: u64,
+) -> davinci_ai::StreamOptions {
+    davinci_ai::StreamOptions {
+        thinking_level: Some(effort),
+        service_tier: Some(agent.service_tier),
+        thinking_budgets: agent.thinking_budgets.clone(),
+        timeout_ms: Some(
+            agent
+                .provider_timeout_ms
+                .unwrap_or(remaining)
+                .min(remaining),
+        ),
+        max_retries: Some(0),
+        max_tokens: Some(output),
+        transport: agent.transport.clone(),
+        abort_signal: Some(request.abort.clone()),
+        session_id: agent
+            .session
+            .as_ref()
+            .map(|session| session.header.id.clone()),
+        install_telemetry: Some(agent.install_telemetry),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn review_design_inherits_all_service_tiers_without_changing_effort_or_abort() {
+        use davinci_ai::CodexServiceTier;
+        use davinci_protocol::ThinkingLevel;
+        let mut agent = Agent::new("fixture");
+        agent.provider_timeout_ms = Some(1200);
+        let request = DesignModelRequest {
+            messages: vec![],
+            tools: vec![],
+            deadline_ms: u64::MAX,
+            abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        for tier in [
+            CodexServiceTier::Standard,
+            CodexServiceTier::Fast,
+            CodexServiceTier::Flex,
+        ] {
+            agent.service_tier = tier;
+            let options = stream_options(&agent, &request, ThinkingLevel::High, 800, 64);
+            assert_eq!(options.service_tier, Some(tier));
+            assert_eq!(options.thinking_level, Some(ThinkingLevel::High));
+            assert_eq!(options.timeout_ms, Some(800));
+            assert_eq!(options.max_retries, Some(0));
+            assert!(std::sync::Arc::ptr_eq(
+                options.abort_signal.as_ref().unwrap(),
+                &request.abort
+            ));
+        }
     }
 }

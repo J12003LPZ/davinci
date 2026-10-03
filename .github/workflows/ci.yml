@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - name: Subscription usage evidence regressions
+        run: node --test scripts/tests/subscription-usage.test.mjs scripts/tests/subscription-usage-review.test.mjs
       - name: Bounded browser backend and network policy
         run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_host.test.cjs
       - name: Exported session tree traversal

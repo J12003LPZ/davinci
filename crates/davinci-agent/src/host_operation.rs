@@ -90,6 +90,17 @@ impl Agent {
         });
         for observation in events {
             self.stats.note_provider_observation(&observation);
+            if result.is_ok()
+                && observation.kind == "logical_end"
+                && observation.requested_service_tier.as_deref() == Some("priority")
+                && observation.service_tier_honored() == Some(false)
+            {
+                self.emit_live(crate::AgentEvent::CompletionNotice {
+                    reason_code: "service_tier_downgrade".into(),
+                    text: format!("Fast was requested, but the backend served this host operation at {} tier.",
+                        observation.returned_service_tier.as_deref().unwrap_or_default()),
+                });
+            }
             self.emit_live(crate::AgentEvent::ProviderObservation {
                 observation: Box::new(observation),
             });

@@ -14,13 +14,22 @@ The comparison runner is `scripts/compare-codex.mjs`. A valid result requires:
 
 Before collecting the full sample, verify the JSON event shapes and usage completeness
 on a bounded task per harness. Missing or invalid usage appears as `null`/unknown,
-never zero. Codex input includes cached input; DaVinci's normalized buckets are
-disjoint. Both are normalized before comparison. Zero can be a valid observation.
+never zero. Codex input includes cached input. DaVinci uses raw nullable counters
+from physical `provider_observation` attempt receipts, including retries and host
+operations present in the stream. Their normalized assistant copies and logical
+rollups are not counted again. Started but unfinished attempts and conflicting
+receipts remain unknown. Explicitly reported zero is still valid.
+
+The `usageSource` field distinguishes `provider_attempts`, `codex_turns`, and
+`legacy_unverified`. Legacy DaVinci assistant/session snapshots lack field-presence
+evidence; their normalized zeroes must not be presented as measured counters.
+`scripts/measure-codex-cache.mjs` follows the same rule. These different evidence
+scopes are not interchangeable measures of complete account consumption.
 
 Run the local parser regressions without making provider calls:
 
 ```powershell
-node --test scripts/tests/subscription-usage.test.mjs
+node --test scripts/tests/subscription-usage.test.mjs scripts/tests/subscription-usage-review.test.mjs
 ```
 
 The runner includes all attempts in pass rates. A pass requires a successful

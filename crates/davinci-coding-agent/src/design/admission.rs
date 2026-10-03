@@ -15,6 +15,7 @@ pub struct AuthorizedDesignContext {
     workspace: PathBuf,
     workspace_id: String,
     tools: ToolContext,
+    host_abort: Option<Arc<std::sync::atomic::AtomicBool>>,
     policy: Arc<PermissionState>,
     grant: Option<davinci_agent::host_operation::HostOperationGrant>,
     static_reads_allowed: bool,
@@ -39,6 +40,7 @@ impl AuthorizedDesignContext {
             workspace,
             workspace_id,
             tools: agent.tool_context.clone(),
+            host_abort: agent.abort_signal.clone(),
             policy: agent.permissions.clone(),
             grant: None,
             static_reads_allowed: !agent.named_file_hooks_active && agent.pre_tool.is_none(),
@@ -75,6 +77,13 @@ impl AuthorizedDesignContext {
             .as_ref()
             .ok_or_else(|| DesignError::Denied("host operation grant required".into()))
     }
+    fn is_aborted(&self) -> bool {
+        self.tools.is_aborted()
+            || self
+                .host_abort
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
     /// Static extraction must not bypass per-file policy or invisible read hooks.
     pub fn check_static_read(&self, path: &Path) -> DesignResult<()> {
         if !self.static_reads_allowed {
@@ -82,7 +91,7 @@ impl AuthorizedDesignContext {
                 "static reads are unavailable while read hooks are active".into(),
             ));
         }
-        if self.tools.is_aborted() {
+        if self.is_aborted() {
             return Err(DesignError::Cancelled);
         }
         let args = serde_json::json!({"path":path});
@@ -113,7 +122,7 @@ impl AuthorizedDesignContext {
         self
     }
     pub fn check(&self, operation: &str, args: &Value) -> DesignResult<()> {
-        if self.tools.is_aborted() {
+        if self.is_aborted() {
             return Err(DesignError::Cancelled);
         }
         if let Some(contract) = self
@@ -149,7 +158,7 @@ impl AuthorizedDesignContext {
         {
             return Err(DesignError::Denied("artifact owner mismatch".into()));
         }
-        if self.tools.is_aborted() {
+        if self.is_aborted() {
             return Err(DesignError::Cancelled);
         }
         if let Some(grant) = &self.grant {

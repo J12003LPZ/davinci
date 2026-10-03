@@ -12,11 +12,9 @@ pub fn toggle(agent: &mut davinci_agent::Agent, capability: FastCapability) -> R
     let next = if agent.service_tier == CodexServiceTier::Fast {
         CodexServiceTier::Standard
     } else {
-        if capability == FastCapability::Unsupported {
-            return Err(format!("Fast is not advertised for {}", agent.model_id));
-        }
         CodexServiceTier::Fast
     };
+    next.validate_capability(&agent.model_id, capability)?;
     agent.service_tier = next;
     Ok(())
 }
@@ -68,7 +66,10 @@ pub fn speed_label(agent: &davinci_agent::Agent, capability: FastCapability) -> 
         return String::new();
     }
     let label = agent.service_tier.label();
-    if agent.service_tier == CodexServiceTier::Fast && capability == FastCapability::Unknown {
+    if agent.service_tier == CodexServiceTier::Fast && capability == FastCapability::Unsupported {
+        format!("{label} · unavailable for this model")
+    } else if agent.service_tier == CodexServiceTier::Fast && capability == FastCapability::Unknown
+    {
         format!("{label} · capability unverified")
     } else {
         label.into()
