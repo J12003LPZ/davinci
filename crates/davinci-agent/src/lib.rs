@@ -6,6 +6,7 @@ pub mod cache_stability;
 pub mod decision;
 pub mod decisions;
 pub mod delegation;
+pub mod host_operation;
 mod permission_state;
 pub mod process_manager;
 pub mod subagent_progress;
@@ -946,6 +947,16 @@ impl Agent {
         }
         self.root_budget = Some(budget);
         Ok(())
+    }
+
+    /// Read the existing host-approved ledger; feature adapters must never
+    /// create a replacement budget or use unaccounted provider transports.
+    pub fn root_budget(&self) -> Option<&runtime::capacity::RootBudget> {
+        self.root_budget.as_ref().or_else(|| {
+            self.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.root_budget.as_ref())
+        })
     }
 
     pub(crate) fn provider_observation_scope(

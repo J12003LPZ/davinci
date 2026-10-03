@@ -1,0 +1,514 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-03T17:27:51.827676+00:00",
+  "status": "incomplete_draft_not_release_certified",
+  "baseline_commit": "d9725d0cb89db8ca07a7d3920ce1a3aaf55a825f",
+  "platform": "windows-x86_64",
+  "source_files_sha256": "ada08b53fdff987cb12253c0b0248bdded22d799200f1a6fd52a64ae658db0df",
+  "source_files": {
+    ".github/workflows/design-artifacts.yml": "e24fd87fe085e1f4abac012b8eb43cb2af3d904ef8fb9e1e6b8912bf036aaf3d",
+    "crates/davinci-agent/src/host_operation.rs": "9a7984ee65c0348337050b022c53b882890c6f1062065cab84f52d72ff0335a4",
+    "crates/davinci-agent/src/lib.rs": "523308e04d89fe194730764f2e1d0149dea134187515960c4818e83b9f45ec1d",
+    "crates/davinci-agent/src/permission.rs": "5fba4974f2445442545979f08585618dad21bc5f23569ec839abbc651fbb90ab",
+    "crates/davinci-agent/src/runtime/root_budget.rs": "afbfa9bb88531607103f37d1ba74649a8667836a88902e1f91a16b69cb59079d",
+    "crates/davinci-agent/src/runtime/worktree.rs": "a2fe12da26fbc94513cf0f0a37f1236de181326c9503411a2197bee9009fed88",
+    "crates/davinci-agent/src/turn.rs": "d6072cf972749b7f6807bc18a88b3f973241999c1179aa92fe22f98204615600",
+    "crates/davinci-coding-agent/design-resources/profiles/SOURCE.json": "5bfadc7061acdbcfc6b9e22fa8c58caace7e6cb0a468c18a89339fa49b8ed572",
+    "crates/davinci-coding-agent/design-resources/profiles/document.md": "07d5ef82cdb75c7ea2c2a9bb17b5386bf875ca213584328c0e363cc95e09ce5e",
+    "crates/davinci-coding-agent/design-resources/profiles/marketing.md": "78151bf081bbe2fbff6973468a1a7802d5150462c34a6746816fe46487913488",
+    "crates/davinci-coding-agent/design-resources/profiles/product.md": "eab8239f6bc374f02eeeb3bcd4c40b8a54d186700c205427cfa438d5a0128b95",
+    "crates/davinci-coding-agent/design-resources/runtime-LICENSES.txt": "5eb730240d35d57ccbfd357f629d8e1e7331a404d58452873f4a563283ad3b7d",
+    "crates/davinci-coding-agent/design-resources/taste-skill/LICENSE": "4575a543ab88dad12ccea7d97e563d0bce5b448b06072e65d3264497dad326df",
+    "crates/davinci-coding-agent/design-resources/taste-skill/SKILL.md": "aa194351b246b8b4799099d4ed7b033d29eab6e6e3d58d8d2172978be7b3ec89",
+    "crates/davinci-coding-agent/design-resources/taste-skill/SOURCE.json": "15ec603a2a16042f62798852fb5047bb34afc3ed7a588e68e6071505a5367418",
+    "crates/davinci-coding-agent/design-resources/toolchain-manifest.json": "d4c0c6883e87b07d067ddcd714a29f420ddb52dacb56021575efa6dd95f05621",
+    "crates/davinci-coding-agent/design-resources/ui/app.css": "9c7468184e01ea87af488f03b4bc8eaf181786baf0b12b241aa6cf93f02a6bb3",
+    "crates/davinci-coding-agent/design-resources/ui/app.js": "68500643072c33564ae38418160b607af4db04d2e5c500dcc6a4e4ff4963261c",
+    "crates/davinci-coding-agent/design-resources/ui/index.html": "8c66f331840225468365606b0441d2ecbcba1b25bcd19892412127a84b7e4805",
+    "crates/davinci-coding-agent/design-resources/ui/manifest.json": "bb91206293c329e5273cfdea3a687a60729d9e36ad9d297662130a05482aa2ee",
+    "crates/davinci-coding-agent/design-ui/.gitignore": "3c3d8ee71c7cb202a6b724b6c42b8e104651dfa767292c29592ae5e4679befbe",
+    "crates/davinci-coding-agent/design-ui/e2e/workspace.spec.cjs": "f17fb9bd6e679bc27655417aab4e35047676c9b84ac5d280772d97c28849d0f9",
+    "crates/davinci-coding-agent/design-ui/host/compile.cjs": "6f98b9420efb709828da64d2305b11b44279f1220a62411c90c23ad11a919ea2",
+    "crates/davinci-coding-agent/design-ui/host/compiler.cjs": "179a0ed861ecbde9bf63fc1410bc49ee84a48542c5471f81330a3f1a5e023d49",
+    "crates/davinci-coding-agent/design-ui/host/main.cjs": "1242d1ef6c2173b5e9cc61333e723087b4d7b127b961f97367ece6ff6a880d33",
+    "crates/davinci-coding-agent/design-ui/host/protocol.cjs": "29933219697578d804f748230e507d35ba12f183d7b2b2dd0b1ec59b36daf673",
+    "crates/davinci-coding-agent/design-ui/host/server.cjs": "3eba1b18ea2c966d5d897af7f4794fc94091999048434154ae1d70ffce5dcc5b",
+    "crates/davinci-coding-agent/design-ui/package-lock.json": "aed193f5bd61ab478a00e7788ebcf836c5c7fc4e8015066338df2ce228afba1e",
+    "crates/davinci-coding-agent/design-ui/package.json": "2169639b5c042a419c4dbf1defeacfa0420a64eec842706a51ac2a390711a2fb",
+    "crates/davinci-coding-agent/design-ui/playwright.config.cjs": "a5ec65340211d9e4d98dc1d47db2a79412b0d9dbe5918e1dc1d72103beb2b266",
+    "crates/davinci-coding-agent/design-ui/scripts/build.cjs": "eddd6ac3c9c0b56531d416640db03dfd7911137d39c066e21bb5ea67920d3d88",
+    "crates/davinci-coding-agent/design-ui/scripts/install-runtime.cjs": "8c82421253e75a738ac8b93500ae9ef7ee0ebd3ca015879f11d52433046e7a85",
+    "crates/davinci-coding-agent/design-ui/src/InteractionPanel.tsx": "f1039574ceeac5a36eb2c56538927fdb66b74abe6412a085cb3ad5005aee8e48",
+    "crates/davinci-coding-agent/design-ui/src/api.ts": "3b27f03b18b2f1b18439508e8750bf510da403dda3374dfa480e5d0e1dbdabfa",
+    "crates/davinci-coding-agent/design-ui/src/app.tsx": "756bc9600331b2fc8c93588ee1f9ffbf7c9b5f47cbb7db81a728c16ca98d4aa4",
+    "crates/davinci-coding-agent/design-ui/src/contracts.generated.ts": "2561f19ec38a79c6cadd16a35a2cb1226a77312fb548216b9eb68079dbaf92c2",
+    "crates/davinci-coding-agent/design-ui/src/style.css": "98bd4b868b31d6ff6eda032174c12464c2b86c1d53239e99c40c598748daa0f3",
+    "crates/davinci-coding-agent/design-ui/tests/compiler.test.cjs": "0502894f476e5434396aec3b3971be5b56d6969bb90916b92c8869282971afc5",
+    "crates/davinci-coding-agent/design-ui/tests/host.test.cjs": "75c66b6ed04ffe7cd314038ad8ca61e172f114cc102eea7c821b7ee7fc911156",
+    "crates/davinci-coding-agent/design-ui/tsconfig.json": "79627cf004b4c6e5448cd536e68bea5503712daec000a8b14241b5c5d80275d4",
+    "crates/davinci-coding-agent/src/args.rs": "5a8873fcb414cccc247f60e7473a7fef3f7f4d48e9dbf049a8c5e29d96819402",
+    "crates/davinci-coding-agent/src/davinci_interactive.rs": "c85a4266cca4f666a4752e3d2d40daa1833972f778acd2a3d948fb0283ce6de1",
+    "crates/davinci-coding-agent/src/design/acceptance.rs": "826e2b38a8998e415174cf95b2bed8d0c96344b6bdea2d178244e1d6878d7ae2",
+    "crates/davinci-coding-agent/src/design/admission.rs": "80e1cb3b043ef37f757046edf64c1cbb3820fb14728a8678817bc5761c9c1b95",
+    "crates/davinci-coding-agent/src/design/assets.rs": "a84fcf1619a9e6d7872a59508e74837db64808dc21081ae93d58ed77cc22e7f4",
+    "crates/davinci-coding-agent/src/design/blob.rs": "852e20472960095229c204d97a3d2c2e3bb201b81ce5a43f70487c46ca971c39",
+    "crates/davinci-coding-agent/src/design/commands.rs": "b7d98154d640d69bc2297e546a075853b44dbb8045f615565e08b0f0dc558540",
+    "crates/davinci-coding-agent/src/design/compile.rs": "e2071acf3182b9987e0e5ec503e9900ae1f956a44c131b0ce9bb6b9ada50a934",
+    "crates/davinci-coding-agent/src/design/confinement.rs": "61646c8af5c8e2bfab60f8ca958536a1f534dac632f2c8767794981884a7421b",
+    "crates/davinci-coding-agent/src/design/context.rs": "d8f42463fff9bd736e49fe365dd0e57a40a8fd7e88c50a04c9e699608432b29a",
+    "crates/davinci-coding-agent/src/design/controller.rs": "eb125362e83942f3b4a98acd77b725553114052a1159029c8feeb5c52ebd6a54",
+    "crates/davinci-coding-agent/src/design/edits.rs": "a3254b99662777aad72c592a52ddd5c0d211f4a4c1bc65fbd961666f4d8e6b68",
+    "crates/davinci-coding-agent/src/design/error.rs": "db19683c903fa38c1fa2c9afc30fff31f493992128ea348c903436b2383ffecd",
+    "crates/davinci-coding-agent/src/design/events.rs": "0fb342090f824523e76ea8d22f3e9f6e9ee440a968a7219b978215ff9656cb00",
+    "crates/davinci-coding-agent/src/design/export.rs": "bd515bfede0776848e0bc81729b477f553781729e28976d91cd0732040856d87",
+    "crates/davinci-coding-agent/src/design/generation.rs": "d9e99168b0d82d9f22a35b444efb8a4833567fd287c29c6548eb6ec34c142e86",
+    "crates/davinci-coding-agent/src/design/handoff.rs": "2256bee20ca9ca2e822c656f9dbea8a0407a19e3a9dda27cb142bf1e2db80341",
+    "crates/davinci-coding-agent/src/design/handoff_draft.rs": "1e03d22126c52ef767b39bce3c601272b159b1ec9c5304ec98a72e6016eff4fa",
+    "crates/davinci-coding-agent/src/design/host.rs": "fe966d867c579c141b93eeca50c19e4089007d27bd3e81bc837ce6c4042a243b",
+    "crates/davinci-coding-agent/src/design/interaction.rs": "fd209ae1d39b07031d8d27ac55a0e6286f4ad9d5e9d963d23bbe8730b1717928",
+    "crates/davinci-coding-agent/src/design/inventory.rs": "557fd67787252657718b7867ef0a99bf7eff29e714895d6e9681f8f565cbdc03",
+    "crates/davinci-coding-agent/src/design/mod.rs": "e1f2271dd5420d16224f7b1748cc57f568eba960dd8440f6e01d49579d5d621e",
+    "crates/davinci-coding-agent/src/design/model.rs": "cf6e0562dcb1d8b509e167377882aa46aed34fce4c9f8989d97549e419b68f20",
+    "crates/davinci-coding-agent/src/design/quality.rs": "6e5c2873ecf57524e5c40a6df0e821c534925ef7e6526c3801b6924f12202d1e",
+    "crates/davinci-coding-agent/src/design/records.rs": "3534e7a8150193dfd1c2d1eac070a2137d65fa7149256eba387719d9d5f27e83",
+    "crates/davinci-coding-agent/src/design/render.rs": "f4141b7b85893c5f155927ad78de1579a012c77b51687fa96fdd43f5129a30ed",
+    "crates/davinci-coding-agent/src/design/runtime.rs": "8bb6f276eb2fcde27fee05e326fc9b5c4452970bbd5e9ff18eb8bb3da901af26",
+    "crates/davinci-coding-agent/src/design/skills.rs": "1dd289f42da5684d4cc6898033bcdd660100efa779266e699b4b8157ebd3db8e",
+    "crates/davinci-coding-agent/src/design/store.rs": "e47944ec4008c30f831836584da1b7389afd351aa8c0f1d48ac3ec5a192a738e",
+    "crates/davinci-coding-agent/src/design/sync.rs": "808bbe2d7948ca568fe383866210f8f591f8c89e2be5501a8948d5b0aea2024e",
+    "crates/davinci-coding-agent/src/design/types.rs": "c9e04057b5431a424a908bd5a9d027828f0cd9a30cd09ae6e572e3be8a12b7ab",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_backend.js": "5032dd8b3aff64eb61bbffc672955185921db57fb523345c693bf0f33f65c12c",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "7b7e86a3bfc632272152cdba3db3dda2060ab81bb46869d1c45bc11af415e450",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5d22d9aac56ca403aab8634348ad3b2484190b128a391a6d7c1b1f71d060e02c",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "47e8cfc3d9b788a4a6baea4d6554c025fdaee534420e58bde5e7f39143ccb52f",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "0b00ff710cf4e4d12834f7f4f8c822f516dc001e9e2e03142bed8f5059e9ca6a",
+    "crates/davinci-coding-agent/src/lib.rs": "5a04308dddfc7e079be41712adf49497241a6163e93467a54526ff23085d6e8c",
+    "crates/davinci-coding-agent/src/main.rs": "724165913b5c5f969a3d25f4e28ab84a9de064810dddb189a27911b41cb026b7",
+    "crates/davinci-coding-agent/src/rpc.rs": "963bcb31a7bafc8e626526a90222ec4f82bd543bb252dede09f62f7641b57809",
+    "crates/davinci-coding-agent/src/sdk.rs": "d0c20039629d5b0cd3335df31a528f1df1aa6e8494585c34883972e98536831f",
+    "crates/davinci-coding-agent/tests/design_acceptance.rs": "bab8ef3644193f10512485102c58ce39229a8b6ff4c0b0ea4b3f469c551d8561",
+    "crates/davinci-coding-agent/tests/design_baseline.rs": "aba2aebae77d06c832a255e665a4aaeb2f3515c77eb2e48d344774e21c18daae",
+    "crates/davinci-coding-agent/tests/design_budget.rs": "09dbd2dd5f27082aeb3471c816e4a4815d131edb1202ddba68abe837866870fc",
+    "crates/davinci-coding-agent/tests/design_commands.rs": "162a275a2bb1433be459c644d7922d5ef70bc958f745fab6720bd0ba6c8934b7",
+    "crates/davinci-coding-agent/tests/design_controller.rs": "1dd39c0851082808bca5dcbb7785f31bf94654147bb5b1d6d29ed26f3e0405fd",
+    "crates/davinci-coding-agent/tests/design_export.rs": "d5036df933787252509d46c866915a9591ca791268a4cf1105a4b61b983369de",
+    "crates/davinci-coding-agent/tests/design_generation.rs": "2c14a2106fbbf1b58861c0e01030df9de9c7f54f4b468d115175800486635ca7",
+    "crates/davinci-coding-agent/tests/design_handoff.rs": "c728b1add3649e4415ed543512be337b6b7ddd4e66a647d7a3abcd4f891b2964",
+    "crates/davinci-coding-agent/tests/design_host.rs": "5909bf46c7a4a25460b089738464379240a9c97e5f62827e0b3e042abba107aa",
+    "crates/davinci-coding-agent/tests/design_interaction.rs": "cd2262b91ec128bbfc59d676b71559516935059ef72311423a9d5082e1b54e41",
+    "crates/davinci-coding-agent/tests/design_limits.rs": "e6d153af4b6646f78c820496ad55d80ceb82e4ccf2eec933d9804d8a05c5e87e",
+    "crates/davinci-coding-agent/tests/design_model.rs": "a0f51b7a745dd47632cd0fd09e413efa57e9b48a3ca62c329bc046f3aa2a33f0",
+    "crates/davinci-coding-agent/tests/design_profiles.rs": "87bfbbb82cdf537b551cead4ea3eac591ac13b4ec1f793fcfa55d8db95bf4e78",
+    "crates/davinci-coding-agent/tests/design_quality.rs": "f155c685c1e20344d8e77207fe2053ed3cf4ae04b0b8473b04d220bbc239c84b",
+    "crates/davinci-coding-agent/tests/design_recovery.rs": "94cf59aeb5c8f18f8fb6053e019f5bc2d4494bf9a30fa23b7f6ffe2d0ccd77ae",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "b40e09493487c0a8b369bce7e1212b73c5bc32b05038fd848a583ffa9a1591e5",
+    "crates/davinci-coding-agent/tests/design_security.rs": "eebe6ac654bb8ce9c2333cf29893f222985531b1377abdebd817c684291f100d",
+    "crates/davinci-coding-agent/tests/design_store.rs": "318695a83bb7b964499d268284642e47b1895a6aed168a5d200ba4b6a67a8b52",
+    "crates/davinci-coding-agent/tests/design_sync.rs": "2ccf22963689755acb1fd5d01bb7b23e7e50e5e1dc466d224e30abea2982093d",
+    "crates/davinci-coding-agent/tests/design_types.rs": "513b0899c1ccd5a9b0a3dec60686859510d41b5e7f0068a31ff3d1afc5749cab",
+    "crates/davinci-coding-agent/tests/fixtures/design/baseline-tools.json": "9abcdf49cbe1562ad122d85302663b5a69fbf9865be273f5bf773e4b9d6a63c3",
+    "crates/davinci-evals/src/design_quality.rs": "ceee5f769f42d9ece67e63cd882ff72ef548b4252570ae1cb4056472cdb8d53d",
+    "crates/davinci-evals/src/lib.rs": "4ccf8a923ffb67f7c7bd8a0bf947aac72d56704474d0e00040888230ab700647",
+    "crates/davinci-evals/tests/design_quality.rs": "c0ae61e6fe52d7663df9465f047f30d28d6ab74eb645e1c99edbf56095f7c8dc",
+    "crates/davinci-session/src/lib.rs": "39d0c6a989dbf060f0c0fc7fe0f82f02ba0df339cbcbad6c6e17787ad2dac231",
+    "docs/design-artifacts-baseline.md": "4f12f11d38417ce05d9c19952e1f2a7f8fc2fc1b0df3626b7ed70b333645b08f",
+    "docs/design-artifacts.md": "926b0e0bf40f8df5bb4677d363f60832632663d6ea2301f5aab2a9cae7357559",
+    "docs/evals/design/fixtures/reference.md": "ecc44ceb8207d6774e085942511ae00511b1e2ae61cad7dacecfbc7392cf4dd3",
+    "docs/evals/design/manifest.json": "b079888f8da41b4557ed5cd8620ae9b890f40beef042c636e2789d8a21c64f8a",
+    "docs/evals/design/protocol.md": "9ee664e7984d27fb1bb802f5ce6bb5ddeb05bb3546bd29bd594d662b688326ae",
+    "docs/superpowers/plans/2026-10-02-davinci-design-artifacts.md": "9553d8f0cb3aa0785e84a39ae3683fa630a1041474a79ba01f99b8277809f02a",
+    "docs/superpowers/specs/2026-10-02-davinci-design-artifacts-design.md": "ee52204acd5ae3701418103ce4a4a7329f772c414e7266ddc04443155fdd09ed",
+    "scripts/design-contracts.py": "fca6b0d6d13dc8171c20b7f3b8ffee9d0fef5efd185fd9f14aa987c831b96a7e",
+    "scripts/test-design.py": "5bb56c91919cfe0852a9f11bf705503ffc30dc380c4905da814127f6341ed3b6"
+  },
+  "git_source_blobs": {
+    ".github/workflows/design-artifacts.yml": "4640c6ba3e001babb9f7fc36f3f372457e8876ec",
+    "crates/davinci-agent/src/host_operation.rs": "dbd9a0145b991dbec5bac20ea0e5af9bf2aaa092",
+    "crates/davinci-agent/src/lib.rs": "02269cc3970fc9e7aca470f1fda028cd6af7ef77",
+    "crates/davinci-agent/src/permission.rs": "66c5c30ddeea64ef4eb776d19b671b3249ec4ce6",
+    "crates/davinci-agent/src/runtime/root_budget.rs": "06edbce54819f9d7cbceed4bae450109a04f47bd",
+    "crates/davinci-agent/src/runtime/worktree.rs": "5ec31409e4221542b4eff8cf63f951be4bae1ad0",
+    "crates/davinci-agent/src/turn.rs": "4a4a154c3c41ed20dbfa0542e6c065d2dde3700f",
+    "crates/davinci-coding-agent/design-resources/profiles/SOURCE.json": "fc3a23fc59cc0663f9ce42f24e291af784389674",
+    "crates/davinci-coding-agent/design-resources/profiles/document.md": "f258838d64ab214306fbcd82f16334bcf4d95112",
+    "crates/davinci-coding-agent/design-resources/profiles/marketing.md": "5dc6f22a2c627f196bdef13be549d4f5a60e6a03",
+    "crates/davinci-coding-agent/design-resources/profiles/product.md": "b46d63dcdda383a70d0f02267fc3f16aac291514",
+    "crates/davinci-coding-agent/design-resources/runtime-LICENSES.txt": "058a4c514ff7aa772c7ee31298c9b8b2170b36a2",
+    "crates/davinci-coding-agent/design-resources/taste-skill/LICENSE": "48a2f6640b81ff8eca9ce7f6a96337692713ef5b",
+    "crates/davinci-coding-agent/design-resources/taste-skill/SKILL.md": "b72132fcd466da605623ffe96e370b3991fc5285",
+    "crates/davinci-coding-agent/design-resources/taste-skill/SOURCE.json": "f61d0cd621d7a087f30cbbe2f6690842dad9cd5b",
+    "crates/davinci-coding-agent/design-resources/toolchain-manifest.json": "311d4bfe11336de685c3e878f867ae6598d84ec7",
+    "crates/davinci-coding-agent/design-resources/ui/app.css": "ef6b8ace8c70ea298035eb71436a3e7a28536f85",
+    "crates/davinci-coding-agent/design-resources/ui/app.js": "9fe671631b9187dc2108928dafefa3193411c854",
+    "crates/davinci-coding-agent/design-resources/ui/index.html": "cfa92fbd35cc744a1ea968ae944177c14f490fa4",
+    "crates/davinci-coding-agent/design-resources/ui/manifest.json": "ff8e2470f761dde3824600dacf4b896d05d54e9f",
+    "crates/davinci-coding-agent/design-ui/.gitignore": "9bbb2245b44a9b8ecbefe94d9e24a478c3fffb63",
+    "crates/davinci-coding-agent/design-ui/e2e/workspace.spec.cjs": "50f156f1c6b703fafcbf0aaf257f0210809a3734",
+    "crates/davinci-coding-agent/design-ui/host/compile.cjs": "bd56cdc3a75cae5170fc5d41a191da60961bc71e",
+    "crates/davinci-coding-agent/design-ui/host/compiler.cjs": "9806acd7880bf80986ad15a314b3abdf8b6ab5ef",
+    "crates/davinci-coding-agent/design-ui/host/main.cjs": "2b8aed56e411616df1ea8fb7ca9fa5646770c71b",
+    "crates/davinci-coding-agent/design-ui/host/protocol.cjs": "80c280d2c8504d3de7af5ad6b2138d646d8f2d53",
+    "crates/davinci-coding-agent/design-ui/host/server.cjs": "1f47fe60dab5701d4c4a627a3b8a790db45ede1e",
+    "crates/davinci-coding-agent/design-ui/package-lock.json": "4460b8bdc9bf874c01355a0b70648024cc3b64d6",
+    "crates/davinci-coding-agent/design-ui/package.json": "0bc220d91a2f7a7b1ad3210862bdf866f629f605",
+    "crates/davinci-coding-agent/design-ui/playwright.config.cjs": "af9a78b0caa51fb67116fd2d7da4a38ff93f2e25",
+    "crates/davinci-coding-agent/design-ui/scripts/build.cjs": "976366061e807880470cc438da2f62de84ddca04",
+    "crates/davinci-coding-agent/design-ui/scripts/install-runtime.cjs": "015122d18cf765a2700125bbae576e4d2110ba85",
+    "crates/davinci-coding-agent/design-ui/src/InteractionPanel.tsx": "618b5114e506f344d861d640c2556c56a0708260",
+    "crates/davinci-coding-agent/design-ui/src/api.ts": "bf410e8390b92d9143ce2b250cd06b852be68ad5",
+    "crates/davinci-coding-agent/design-ui/src/app.tsx": "3ad54833819c8016586d732071a9852118a4ad6f",
+    "crates/davinci-coding-agent/design-ui/src/contracts.generated.ts": "3b68f173178aec8a1b32685034c50a201d9106ac",
+    "crates/davinci-coding-agent/design-ui/src/style.css": "96b2b527232abfa65dd4d78d0403593672617a5c",
+    "crates/davinci-coding-agent/design-ui/tests/compiler.test.cjs": "b4750ebde3ca031abd4137b9bca7541e33887ccd",
+    "crates/davinci-coding-agent/design-ui/tests/host.test.cjs": "5c2ccf0827458547a833b2b2b409d7bf5b1f0398",
+    "crates/davinci-coding-agent/design-ui/tsconfig.json": "1e23694a90049240e170291097f768b2bd49dcee",
+    "crates/davinci-coding-agent/src/args.rs": "918fcf826ca669f639bb33180c0235e8f5471dfa",
+    "crates/davinci-coding-agent/src/davinci_interactive.rs": "037e8d358ef66433aed43872795167e4dc0208d0",
+    "crates/davinci-coding-agent/src/design/acceptance.rs": "e336b14225502208bfa21126f2c24119c8f2a337",
+    "crates/davinci-coding-agent/src/design/admission.rs": "50aba68ae6d2f0b6ea947e49218061fb8838248b",
+    "crates/davinci-coding-agent/src/design/assets.rs": "71db47c962fd435c69b2d7c7d6d1a28b8a1e1e2f",
+    "crates/davinci-coding-agent/src/design/blob.rs": "1bf32f2ecdad35e4d0e7f352fb2b1cdde3e44a2f",
+    "crates/davinci-coding-agent/src/design/commands.rs": "afc4cf8827aae6c3b68a614377e6de59eab3c514",
+    "crates/davinci-coding-agent/src/design/compile.rs": "fc8d9a280cb60a48502b983d39ac6269051eefc1",
+    "crates/davinci-coding-agent/src/design/confinement.rs": "e056dd212c704785c83c47bf012bb5d3b6e9f055",
+    "crates/davinci-coding-agent/src/design/context.rs": "86d43b7dcde2c293cdebabbdd2b77c8f37670fa6",
+    "crates/davinci-coding-agent/src/design/controller.rs": "604395cd366edad4c23679aa61133f9619360ef7",
+    "crates/davinci-coding-agent/src/design/edits.rs": "6faef800ca36addf540f6effbc019f20468e0404",
+    "crates/davinci-coding-agent/src/design/error.rs": "587ab8e5598324f62fc853624978d6ffe505a52a",
+    "crates/davinci-coding-agent/src/design/events.rs": "aa11835f0d3ad206e9b17e13a29d5164ca368f0a",
+    "crates/davinci-coding-agent/src/design/export.rs": "657263b912fa552416b29fee03cb6f5985293dbd",
+    "crates/davinci-coding-agent/src/design/generation.rs": "ba2c9f9375a3604d90b688a4971db5a3a83c434d",
+    "crates/davinci-coding-agent/src/design/handoff.rs": "b31f36e8710555d20e9bebe693d699fb5044b3c5",
+    "crates/davinci-coding-agent/src/design/handoff_draft.rs": "0539f9a406d32b96be0a5e7f9b840b38557d383f",
+    "crates/davinci-coding-agent/src/design/host.rs": "66b798338c27165cb47e0515fed1e4b7e13c928f",
+    "crates/davinci-coding-agent/src/design/interaction.rs": "458a9f78fed095ee0c63664c0579a0a22be3349b",
+    "crates/davinci-coding-agent/src/design/inventory.rs": "9d7d928988ed40d9053fa2674c4b118202735be3",
+    "crates/davinci-coding-agent/src/design/mod.rs": "8e07ba320b9549f3c94ce75c44b4a0e20a2e9d39",
+    "crates/davinci-coding-agent/src/design/model.rs": "64b6e8730aab18e9632b7b4d07b87f8436ac02e4",
+    "crates/davinci-coding-agent/src/design/quality.rs": "3e0c789dd7883b1db0a9abadaff7e9af8676d73d",
+    "crates/davinci-coding-agent/src/design/records.rs": "d33da9e64091acc61078e9a832110d15923e2580",
+    "crates/davinci-coding-agent/src/design/render.rs": "940151de8a45108302a6dcfa4443ad407df5580c",
+    "crates/davinci-coding-agent/src/design/runtime.rs": "eb99aff7e297c51365aa66bab895ea278555f078",
+    "crates/davinci-coding-agent/src/design/skills.rs": "28619b443441b34a8209991e4825a7e2ff7aa944",
+    "crates/davinci-coding-agent/src/design/store.rs": "6fb23887f51293a7699ed57bfd9b4c8844803906",
+    "crates/davinci-coding-agent/src/design/sync.rs": "38ce1fd7b61c230d62e77db384f7b19747251669",
+    "crates/davinci-coding-agent/src/design/types.rs": "4b481af769221ffce825b3ef9c64e1a5dcffbdeb",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_backend.js": "9e6e4cc2faf3edd4ff94a71f589abf176ad592b5",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "5d9b7c72adc08d20218853f10e50ec49658f85e7",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5dde53660692bbae94c14db823c6cd62c83fad0e",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "9f37aa86991f6508bbbb4ff1f1f927eabc9df4c3",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "9eaa0f08ac3f2fb8063a74af830ec1721c01d41a",
+    "crates/davinci-coding-agent/src/lib.rs": "ef46afbca2590acec87e68b6ac1210630f20e2db",
+    "crates/davinci-coding-agent/src/main.rs": "7b74685a2851e2c6756ae9fddbd31a76b13bb8c9",
+    "crates/davinci-coding-agent/src/rpc.rs": "29f1602ac5417ab1419182aebf800586dc868802",
+    "crates/davinci-coding-agent/src/sdk.rs": "1ae88e342f53a91c49ccb6c18949cd07d15c0250",
+    "crates/davinci-coding-agent/tests/design_acceptance.rs": "73b95e91876556a79f68d37e5195db839d00f03b",
+    "crates/davinci-coding-agent/tests/design_baseline.rs": "edcc642d78f0abe635b6637994d88b27c49587b9",
+    "crates/davinci-coding-agent/tests/design_budget.rs": "2fd66905e5cc489ba708afb61bd300ecaaa2507d",
+    "crates/davinci-coding-agent/tests/design_commands.rs": "cd2d25871c15687af2142f76f42a6f1e8126a114",
+    "crates/davinci-coding-agent/tests/design_controller.rs": "73da8ab68e5d523ee7a43fc1ce0afd7d06282272",
+    "crates/davinci-coding-agent/tests/design_export.rs": "5a9d580dce43f7514a32f2ea9efe4a85682a1a59",
+    "crates/davinci-coding-agent/tests/design_generation.rs": "523d70638acb83e730f6965c90ac2fa0012df2f3",
+    "crates/davinci-coding-agent/tests/design_handoff.rs": "b89579478ad79d9d26c83f1f326bedd3c02724e2",
+    "crates/davinci-coding-agent/tests/design_host.rs": "99646cf8aa52293132c22e6019ab8c891a3a7a69",
+    "crates/davinci-coding-agent/tests/design_interaction.rs": "99dd4e7bbf3b38b782e79123d423997088fa444a",
+    "crates/davinci-coding-agent/tests/design_limits.rs": "98a3f56b7f2861189f868ae539019cfcf343e609",
+    "crates/davinci-coding-agent/tests/design_model.rs": "2b01efa7205eac514b9543acfec0afffd443df56",
+    "crates/davinci-coding-agent/tests/design_profiles.rs": "840f318850036d81da8012797ab8a8575af87df7",
+    "crates/davinci-coding-agent/tests/design_quality.rs": "37ac7250520eadd009bbd61498208a2f376f625b",
+    "crates/davinci-coding-agent/tests/design_recovery.rs": "cfaf28c221c0ba0995eadaa8a561acf71c1a9178",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "a6caec452d47c4463af39b3a465654115359d440",
+    "crates/davinci-coding-agent/tests/design_security.rs": "597173705743307435ba93b35930a0bc70cd24bb",
+    "crates/davinci-coding-agent/tests/design_store.rs": "326910106b90ed10d0d6721c4d6610dd2105f1a3",
+    "crates/davinci-coding-agent/tests/design_sync.rs": "af5a1b10cd3a84fc516be2ca9327cf15fbdc94ea",
+    "crates/davinci-coding-agent/tests/design_types.rs": "fc6d906e19bd882d1154f417c71bd98c89ffb6e2",
+    "crates/davinci-coding-agent/tests/fixtures/design/baseline-tools.json": "d147f4d9f405cf36beeebe7d0c6bdd879f602e05",
+    "crates/davinci-evals/src/design_quality.rs": "e381009a9b5f802146446dcea8f069c63f32a323",
+    "crates/davinci-evals/src/lib.rs": "42943392ce22241ee7389d2bd89f48170546addf",
+    "crates/davinci-evals/tests/design_quality.rs": "1d35d74d0ffd1d3bc2f8f378672259e09b75c186",
+    "crates/davinci-session/src/lib.rs": "0e2f6b69d786f45b97768125e3ce14c5aa632311",
+    "docs/design-artifacts-baseline.md": "9abd9c704730753467c36fbe5d8800c1c9eef12f",
+    "docs/design-artifacts.md": "09c49c4dbf0cb4a62b5fd9059a338f3fb9c6d82b",
+    "docs/evals/design/fixtures/reference.md": "b863a75dd030ab30dd4717b32d34d0dfb31ea44f",
+    "docs/evals/design/manifest.json": "f5f5b04df2c6ad34b46e6bf5ccbd6ee3f08d57b7",
+    "docs/evals/design/protocol.md": "66feb72398419c4f827dc35f63bf76a26c6674c6",
+    "docs/superpowers/plans/2026-10-02-davinci-design-artifacts.md": "6d74803d4dbc8126cbab9e6e97494e5f647a0dc3",
+    "docs/superpowers/specs/2026-10-02-davinci-design-artifacts-design.md": "049938944f2d7e88714ae016085b937d130c9ade",
+    "scripts/design-contracts.py": "3c92527ba34e84fdf970e7553ffeae6a6727e7b4",
+    "scripts/test-design.py": "d9ee602b9b17ec86fabea73ecf9dcc0251669b3f"
+  },
+  "git_source_blobs_sha256": "1231e901db8e7fcfd932ede8dfe7b25e509c13e90c3c446e8eae09298d9557bc",
+  "local_test_binary": {
+    "path": "target/debug/davinci.exe",
+    "sha256": "7d8f26326d58349dccb84b36055dbf382d8ed5d42726c31fac21b45141d64b0e",
+    "installed_launch_path_verified": false
+  },
+  "runtime": {
+    "name": "runtime-v3",
+    "manifest_sha256": "2b14d337acfa160a95f19433237e27b1ba6cab1f8daada2b199ac628d56f20ea",
+    "node_sha256": "3602f2bb1a10f2cbab4c36886218a33c1ab3db87290e73b033c46c77147d0237",
+    "node_version": "24.19.0",
+    "files": 348,
+    "file_inventory_sha256": "bb870a2d2b3d577256495fe02608ea3770767c0ee51f7232445781f6e382bf47",
+    "browser_executable_sha256": "409805a16d6416087e6b2f778df1cf8f7bbb267d6b99f6b5bb0a618eace234f2",
+    "browser_inventory_sha256": "78d471d136b1112225f3d150330ca843c622284ef3f12c04b501d3a3bb7df5d5",
+    "browser_files": 310,
+    "font_inventory_sha256": "7aa9f951d2a14ef0380517924f9f04211d69ebaa4aacab382e9e116b0f5920e7",
+    "font_files": 345,
+    "native_capture_succeeded": false
+  },
+  "tests": {
+    "design_acceptance": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-inventory.log"
+    },
+    "design_baseline": {
+      "state": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-inventory.log"
+    },
+    "design_budget": {
+      "state": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-inventory.log"
+    },
+    "design_commands": {
+      "state": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-inventory.log"
+    },
+    "design_controller": {
+      "state": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-inventory.log"
+    },
+    "design_export": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_generation": {
+      "state": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_handoff": {
+      "state": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_host": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_interaction": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_limits": {
+      "state": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_model": {
+      "state": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_profiles": {
+      "state": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_quality": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_recovery": {
+      "state": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_runtime": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 2,
+      "log": "final-design-remaining.log"
+    },
+    "design_security": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_store": {
+      "state": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_sync": {
+      "state": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "design_types": {
+      "state": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "log": "final-design-remaining.log"
+    },
+    "eval/design_quality": {
+      "state": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log": "eval-green.log"
+    }
+  },
+  "logs": {
+    "final-design-inventory.log": {
+      "sha256": "5c3ab75e09a6e7e968b2e5cac19b2e93aab877cf8343490c134f0186e7742f16",
+      "bytes": 3531
+    },
+    "final-design-remaining.log": {
+      "sha256": "80eac692f3e2f542a7952a12984df29b3fc67e46e03138841c6570e9fbc701bc",
+      "bytes": 6333
+    },
+    "eval-green.log": {
+      "sha256": "bba3086ddeed6ad96dc04fc4f58eb9506d0b244751af7b9a99980a1a5e3598b8",
+      "bytes": 754
+    },
+    "final-session-tests.log": {
+      "sha256": "6027b1736823b13625e8ba724053e25bd2a4ccc000560c9b05491aaba9e51b4c",
+      "bytes": 5653
+    },
+    "recovery-red.log": {
+      "sha256": "dbd2e5dce5c5b947434ddc7585b51107b56eaad514acb08e9b45232dd5c07d46",
+      "bytes": 1276
+    },
+    "recovery-green.log": {
+      "sha256": "681f0a0090cf83d913700fa274618670665edfe92ffe67bf674cc3334ce6e824",
+      "bytes": 917
+    },
+    "final-check.log": {
+      "sha256": "22a15f5ed2ed9bcf7a390a064179104f94ebd85e6c9bf3e80f59c0c48da1038f",
+      "bytes": 1817
+    },
+    "final-clippy.log": {
+      "sha256": "8b461d6a9ee213557b7755e8f8d0cca56ddddc374ee3e741164250727bf671fd",
+      "bytes": 331
+    },
+    "final-workspace-tests.log": {
+      "sha256": "a972eb304411faa1fe9d7348eed72c6659ba202f097fc3b93fa5bce76e0b3845",
+      "bytes": 335187
+    },
+    "deadline-rerun.log": {
+      "sha256": "9cdccae8e26ef0d35c2505308cb2f0653adf7b47146efdec2e06965ed7b91ab6",
+      "bytes": 692
+    },
+    "final-ui-types.log": {
+      "sha256": "994b33e0e9ea5d9eedc5f731fd7172f56da555efa1f49efc522ec8f12be2ac8f",
+      "bytes": 54
+    },
+    "final-ui-build.log": {
+      "sha256": "465f6ee6d5efc30d228726185bb72ed0091cd6cdcc234bbcaf8edad2c6a85c1d",
+      "bytes": 60
+    },
+    "final-ui.log": {
+      "sha256": "f68fb65740517a03293dd75358ee9eea3aeb25b83deaf375fa471c67de3eca46",
+      "bytes": 940
+    },
+    "final-ui-browser.log": {
+      "sha256": "22e3964bfd0f6c045908c09016700cfe1eb49c9e204c129fe004ee4ee0d0fe76",
+      "bytes": 493
+    },
+    "final-browser-policy.log": {
+      "sha256": "dd296722a647a844d1ae8133749ba9d2828920cdd1771d7241a09e99e8166335",
+      "bytes": 2969
+    },
+    "final-export-html.log": {
+      "sha256": "546bd5c681582b4aee57c7c0e5dfceda72b778659ee4274282594efee97a5583",
+      "bytes": 440
+    },
+    "final-npm-audit.log": {
+      "sha256": "1aff6610cb692677a2a4f30dbbbbf505e6af7eb3ca8eb35121b63fa7a6533a35",
+      "bytes": 361
+    },
+    "native-browser.log": {
+      "sha256": "dbc72c87d45f824a53e4e0399d4e1dcd2ff7386ddabee0c055dbe7c308509893",
+      "bytes": 1259
+    },
+    "runtime-v3-setup.log": {
+      "sha256": "c88898fe89e4f079a2acadcbf022e1783c8932607229da6c11a4365a85df3e08",
+      "bytes": 146
+    },
+    "lease-red.log": {
+      "sha256": "7a66ff80dd0a7f62cd7514de2361ded23c3d7a5a0faa4591241d73cb770a2e6b",
+      "bytes": 2474
+    },
+    "offline-design-red.log": {
+      "sha256": "4d32ec9650c1d097cde27b63d9f5cf616270bfcca80bca1cd7126607f48cf47b",
+      "bytes": 1690
+    }
+  },
+  "counts": {
+    "design_integration_passed": 46,
+    "eval_passed": 2,
+    "native_ignored": 2,
+    "companion_unit_passed": 9,
+    "companion_browser_passed": 2,
+    "browser_policy_fixture_passed": 34,
+    "export_html_passed": 4,
+    "session_unit_passed": 58,
+    "session_integration_passed": 3
+  },
+  "limitations": [
+    "native Windows capture blocked by required sandbox capability",
+    "refreshed runtime inventoried but no successful generated-content render",
+    "full workspace suite stopped at one timeout test; exact isolated rerun passed",
+    "actual target JavaScript build/test/browser receipt orchestration incomplete",
+    "publication fault-injection and cross-platform process-tree matrix incomplete",
+    "Linux/macOS native behavior, live model quality, human preference, coverage and installed release unverified"
+  ]
+}

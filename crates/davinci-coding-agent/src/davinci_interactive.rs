@@ -2396,6 +2396,10 @@ fn graph_command_opens_view(name: &str, args: &str) -> bool {
 }
 
 fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -> Option<Next> {
+    if davinci_coding_agent::design::is_command(line) {
+        // The ordinary worker path keeps the UI alive while approval is pending.
+        return Some(submit_prompt(shell, line, &[]));
+    }
     let (name, args) = crate::parse_extension_command(line);
     if name.is_empty() {
         return None;

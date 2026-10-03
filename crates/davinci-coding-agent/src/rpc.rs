@@ -22,6 +22,8 @@ pub const STREAMING_PROMPT_ERROR: &str =
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RpcCommand {
     #[serde(default)]
+    pub design: Option<davinci_coding_agent::design::controller::DesignRequest>,
+    #[serde(default)]
     pub id: Option<String>,
     #[serde(rename = "type")]
     pub kind: String,
@@ -271,6 +273,22 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
     let id = command.id.clone();
     let kind = command.kind.clone();
     match kind.as_str() {
+        "design" => {
+            let Some(request) = command.design else {
+                return fail(id, &kind, "Missing typed design request".into());
+            };
+            if runtime.agent.is_streaming || runtime.agent.is_compacting {
+                return fail(id, &kind, "Session is busy".into());
+            }
+            match davinci_coding_agent::design::default_controller().execute(
+                &mut runtime.agent,
+                &runtime.cwd,
+                request,
+            ) {
+                Ok(value) => ok(id, &kind, Some(value)),
+                Err(error) => fail(id, &kind, error.to_string()),
+            }
+        }
         "prompt" => {
             runtime.prompt_needs_turn = false;
             let images = command

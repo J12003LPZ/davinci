@@ -2693,6 +2693,27 @@ fn complete_prompt_with_host(
     existing_host: Option<Arc<Mutex<ExtensionHost>>>,
     stream_json: bool,
 ) -> (String, Vec<AgentEvent>) {
+    let (design_text, _) = latest_user_prompt(agent);
+    if davinci_coding_agent::design::is_command(&design_text) {
+        let cwd = agent.cwd.clone();
+        let result = davinci_coding_agent::design::commands::parse_design_command(&design_text)
+            .and_then(|command| {
+                if matches!(&command, davinci_coding_agent::design::commands::DesignCommand::Create { .. } | davinci_coding_agent::design::commands::DesignCommand::Revise { .. })
+                    && (parsed.offline || parsed.api_key.is_some()) {
+                    return Err(davinci_coding_agent::design::error::DesignError::Denied("design generation requires the selected subscription route without offline mode or an API-key override".into()));
+                }
+                davinci_coding_agent::design::default_controller().command(agent, &cwd, command)
+            });
+        let text = match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .unwrap_or_else(|_| "Design response could not be encoded".into()),
+            Err(error) => error.to_string(),
+        };
+        let message = agent.record_custom_message(
+            &serde_json::json!({"customType":"design_result","content":text,"display":true}),
+        );
+        return (text, vec![AgentEvent::MessageEnd { message }]);
+    }
     // A session switch (`/new`, `/resume`, fork, RPC) gives SessionStart hooks
     // a new id; unchanged sessions hit the cache.
     apply_plugin_session_start(

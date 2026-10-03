@@ -1,0 +1,14 @@
+{
+  "index.html": {
+    "sha256": "8c66f331840225468365606b0441d2ecbcba1b25bcd19892412127a84b7e4805",
+    "media_type": "text/html; charset=utf-8"
+  },
+  "app.js": {
+    "sha256": "68500643072c33564ae38418160b607af4db04d2e5c500dcc6a4e4ff4963261c",
+    "media_type": "application/javascript"
+  },
+  "app.css": {
+    "sha256": "9c7468184e01ea87af488f03b4bc8eaf181786baf0b12b241aa6cf93f02a6bb3",
+    "media_type": "text/css"
+  }
+}

@@ -90,6 +90,18 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
+    /// Typed design entry point; uses this session's existing approval policy.
+    pub fn design(
+        &mut self,
+        request: crate::design::controller::DesignRequest,
+    ) -> crate::design::error::DesignResult<serde_json::Value> {
+        let controller = crate::design::controller::DesignController::new(
+            crate::design::store::DesignStore::new(self.agent_dir.join("design")),
+            crate::design::enabled(),
+        );
+        controller.execute(&mut self.agent, &self.cwd, request)
+    }
+
     pub fn subscribe(&mut self, listener: impl Fn(&davinci_agent::AgentEvent) + 'static) {
         self.listeners.push(Box::new(listener));
     }

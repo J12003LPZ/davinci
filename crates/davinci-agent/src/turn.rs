@@ -1261,6 +1261,35 @@ impl Agent {
         Err(last_error.unwrap_or_else(|| "Provider request failed".into()))
     }
 
+    /// Trusted host handoffs reuse the complete tool pipeline, including hooks,
+    /// contracts, permission prompts, durable transactions and plan persistence.
+    /// This does not add a provider-visible tool or change the active tool set.
+    pub fn execute_host_handoff_tool(
+        &mut self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: Value,
+    ) -> Result<ChatMessage, String> {
+        if !matches!(
+            name,
+            "propose_plan" | "patch_preview" | "patch_apply" | "patch_status"
+        ) {
+            return Err("tool is not a handoff operation".into());
+        }
+        if cwd.canonicalize().map_err(|e| e.to_string())?
+            != self.cwd.canonicalize().map_err(|e| e.to_string())?
+        {
+            return Err("handoff cannot change the agent workspace".into());
+        }
+        self.ensure_session_persistence()?;
+        let mut events = Vec::new();
+        self.execute_tool_batch(cwd, vec![(id.into(), name.into(), args)], &mut events)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "handoff tool returned no result".into())
+    }
+
     /// Run every tool call of one assistant message and return their
     /// result messages in source order.
     ///
@@ -3480,6 +3509,27 @@ impl Agent {
     /// block there wins) and after the unknown-tool check (nobody is asked
     /// about a tool that does not exist).
     fn permission_denial(&self, cwd: &Path, id: &str, name: &str, args: &Value) -> Option<String> {
+        self.permission_denial_inner(cwd, id, name, args, false)
+    }
+
+    pub(crate) fn host_permission_denial(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Option<String> {
+        self.permission_denial_inner(cwd, id, name, args, true)
+    }
+
+    fn permission_denial_inner(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        retain_host_consent: bool,
+    ) -> Option<String> {
         // A new preparation supersedes any abandoned consent for this call ID.
         self.approval_registry.take_dispatch(id);
         // Asking for user intent is a host interaction, not a repository or
@@ -3615,7 +3665,7 @@ impl Agent {
                         let current_digest = self.approval_registry.digest(&current, cwd, self.runtime.as_ref());
                         match pending.resolve(&reply, &current_digest, policy.revision(), davinci_session::now_ms()) {
                             Ok(crate::approval::GrantScope::Once) => {
-                                if crate::tools::is_managed_process_tool(name)
+                                if retain_host_consent || crate::tools::is_managed_process_tool(name)
                                     || crate::tools::is_coordinated_mutation(name)
                                     || crate::runtime::transactions::is_tool(name)
                                     || (!crate::tools::BUILTIN_TOOLS.contains(&name)

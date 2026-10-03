@@ -1,0 +1,59 @@
+# Design artifacts readiness
+
+Status: **incomplete; draft review, not release certification**. This record distinguishes implementation from verified behavior. The original plan's unchecked boxes remain historical acceptance criteria. The feature defaults off.
+
+The implementation was made in an isolated worktree from the user's current local source snapshot. Snapshot commit `d9725d0c` preserves 88 inherited paths separately from the design implementation, on remote main `f24ed1c744a31ee49c95802f982740fe59d2de6d`. The original source-only checkout was not modified. No subagents, live model requests, global installation or deployment were used.
+
+## Scope against the plan
+
+| Tasks | Implemented surface | Evidence and remaining limit |
+| --- | --- | --- |
+| 1–3 | Baseline, typed Rust/TypeScript contracts, session-owned revisions and immutable blobs | Contract generation, store, ownership, CAS, restart, branch retention and quota tests. No derived index is authoritative. |
+| 4–6 | CLI/interactive/SDK/RPC admission, paired loopback host and bounded virtual compiler | Disabled-mode tool/prompt parity, one-shot permission, host protocol and compiler tests. Real supervised compiler/host passed on the earlier runtime; the refreshed bundle is separately inventoried. |
+| 7–8 | Required native confinement, captures, prototype actions and separate quality states | Browser policy/transport unit fixtures pass. **Generated-content native capture is blocked on this Windows host before child start.** Fake geometry is not native evidence. |
+| 9–11 | React companion, source-backed edits, comments/history, Taste profiles and static repository sync | Real Chromium companion E2E uses a recorded Rust dispatcher. Profile provenance and source edits are tested; no end-to-end generated design screenshot or human visual acceptance is claimed. |
+| 12 | Subscription-only generation, durable checkpoints, exact route and root limits, bounded repairs | Recorded-model tests cover distinct concepts, repair bounds, unknown outcomes and resume. Offline dispatch and API-key/route changes are rejected. No live subscription generation or visual-quality score was measured. |
+| 13 | Source, HTML and PNG export with rights and fingerprint checks | Exact source/no-overwrite/export validation and existing HTML template tests. Successful native PNG and HTML target behavior are not certified. |
+| 14 | Accepted revision to native plan, isolated worktree and exact patch transaction | Tests cover acceptance, dirty/stale targets, authority, plan mode, hashes, accounted drafting and unrelated edits. Apply returns pending verification. **Target JavaScript build/test/browser receipt orchestration is not implemented.** |
+| 15 | Recovery, owner checks, cancellation, leases and bounded stores/bridge | Torn-tail preservation, terminated corruption, writer contention, all-branch retention, missing blobs, revocation and expiry are covered. **Complete publication fault injection and actual cross-platform process-tree coverage remain open.** |
+| 16 | Fourteen-brief offline evaluation manifest, record validation, setup/rollback docs and scoped CI | The live protocol retains blind order, ties, defects and unknowns. No paid trial, human preference campaign, installed-binary certification or cross-platform release claim. |
+
+## Validation performed
+
+Local environment: Windows x64, repository-pinned Rust 1.83, Node 24.19.0, React 19.3.0, esbuild 0.25.11 and Playwright 1.62.1. Exact hashes and per-target results are in [the evidence inventory](design-artifacts-evidence.json).
+
+- Workspace `cargo check --workspace --all-targets --offline --locked` passed before final hardening. Workspace Clippy with warnings denied passed after the provider/lease fixes and before the small session-tail backup change. Targeted session tests validate that last change.
+- The attempted full workspace test run stopped in the coding-agent library: 1,426 passed, one timeout test failed, 17 ignored in that target. `soft_deadline_leaves_time_for_one_retry_before_hard_deadline` then passed alone. **The full workspace suite is not recorded as passing.** The user subsequently requested only needed tests; broad reruns were not performed.
+- All 20 design integration targets ran: 46 tests passed, with two native-runtime tests intentionally ignored without a separately prepared trusted runtime. The offline evaluation target passed both tests. `scripts/test-design.py` enumerates every target; the local run resumed only the remaining targets after correcting the export fixture. Ignored native tests are not passes.
+- Session crate: 58 unit and three integration tests passed after adding durable torn-tail backups. The design recovery regression failed without preservation and passed with it.
+- Companion: typecheck/build passed; nine compiler/host unit tests and two real Chromium workspace tests passed. Lease expiry and ordinary-call cancellation regressions were first reproduced as failures. The workspace browser tests exercise pairing, revision edits, comments, exports, cancellation and refresh, with a fixture dispatcher.
+- Existing browser backend/network/transport/host fixtures: 34 passed. Existing export HTML template tests: four passed. Companion npm audit reported zero vulnerabilities at execution time. YAML parsed and generated contract parity passed.
+- Final `cargo fmt --all --check` and diff whitespace checks passed. The shipped UI manifest was checked against the actual bundle hashes.
+
+The Windows traversal export fixture originally normalized away `..` while constructing a verbatim `PathBuf`; it now preserves the raw request spelling. The validator already rejects those raw components. This was a test correction, not a relaxation of export authority.
+
+## Native rendering and release blockers
+
+The explicitly attempted generated-content capture failed with:
+
+```text
+MissingCapability: command launch failed before child start:
+SandboxUnavailable: no backend can enforce the requested sandbox policy
+```
+
+The required network-denied, filesystem-isolated, process-tree-owned policy was retained. No fallback ran generated JavaScript in the companion origin, trusted Node host or an unrestricted browser. The earlier real compiler/host test passed; it proves supervised compilation and host startup, not confined rendering.
+
+The refreshed `runtime-v3` bundle inventories 348 trusted files, the installed Chromium tree and local fonts. This is a prepared runtime, not a successful rendering receipt. Linux CI is defined, but this local record does not claim it ran. macOS is unverified. Cross-platform font metrics are not assumed identical.
+
+Before this can become release-ready:
+
+1. Obtain successful strict native capture, hostile network/process cleanup and primary prototype interaction receipts on supported Windows and Linux confinement backends. Mark macOS unverified until measured.
+2. Extend the existing coding receipt owner to verify actual target JavaScript builds/tests and browser flows, including source coverage and RSC/client boundaries. Mock API behavior, preview captures and applied patches must continue to leave implementation incomplete.
+3. Finish publication-boundary fault injection and the target mock/RSC/transaction-failure matrix. Coverage percentage was not measured; no 80% coverage claim is made.
+4. Review the full workspace test limitation and CI on the PR's exact source. Any later live comparison or installed release remains a separate explicitly authorized action.
+
+## Artifact binding and review
+
+The evidence inventory binds local executable, UI, compiler/lock manifest, runtime inventory, browser/font inventories, profile/fixture sources and retained check logs with SHA-256. It excludes the generated inventory itself and this readiness prose from its source-file set to avoid a circular hash. Local binaries, browser packages, screenshots and raw logs are not committed. The companion screenshot is UI-test evidence only and does not depict a generated native-rendered design.
+
+Review used the supplied specification and plan as the reference, a fresh diff inspection, deterministic contract checks, targeted regression failures/passes and browser interaction evidence. No independent reviewer agent was used because the user prohibited subagents. Self-assessment: **7/10; not release-ready** because the native rendering and target-verification gates above remain unresolved.

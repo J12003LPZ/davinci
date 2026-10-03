@@ -223,6 +223,13 @@ impl JsonlSession {
         Ok(session)
     }
 
+    /// Acquire the existing writer lock and refresh durable state before a
+    /// caller derives a compare-and-swap mutation. Keep this session borrowed
+    /// until append; callers must not create independent writers by cloning it.
+    pub fn prepare_mutation(&mut self) -> Result<(), SessionError> {
+        self.prepare_first_write()
+    }
+
     pub fn append_entry(&mut self, mut entry: SessionEntry) -> Result<(), SessionError> {
         self.prepare_first_write()?;
         entry.seq = self.max_seq.saturating_add(1);
@@ -578,6 +585,25 @@ fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
                 SessionError::storage(format!("Unable to terminate complete session tail: {err}"))
             })?;
     } else {
+        // The exclusive session writer owns this repair. Retain the exact torn
+        // bytes durably before removing them from the authoritative WAL; an
+        // interrupted or failed backup must leave the original evidence intact.
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(format!(".torn-{}.bak", uuid::Uuid::new_v4()));
+        let backup = PathBuf::from(backup);
+        let preserve = || -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup)?;
+            file.set_permissions(fs::metadata(path)?.permissions())?;
+            file.write_all(tail.as_bytes())?;
+            file.sync_all()?;
+            sync_parent(&backup)
+        };
+        preserve().map_err(|err| {
+            SessionError::storage(format!("Unable to preserve torn session tail: {err}"))
+        })?;
         davinci_sys::fs::truncate_torn_tail(path).map_err(|err| {
             SessionError::storage(format!("Unable to repair session tail: {err}"))
         })?;

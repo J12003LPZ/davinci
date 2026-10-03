@@ -10,7 +10,7 @@ function fixture() {
     return {version: () => 'fixture', async close() {counts.closes++;}, async newContext() {
       counts.contexts++;
       const handlers = new Map();
-      return {on(name, handler) {handlers.set(name, handler);}, async route() {}, async routeWebSocket() {}, async close() {},
+      return {on(name, handler) {handlers.set(name, handler);}, async route(_pattern, handler) {counts.route = handler;}, async routeWebSocket() {}, async close() {},
         async newPage() {
           const page = {on(name, handler) {counts.pageHandlers.set(name, handler);}, setDefaultTimeout() {}};
           handlers.get('page')?.(page); return page;
@@ -27,6 +27,28 @@ test('browser setup stays lazy and invalid origins or viewport do not launch', a
   await assert.rejects(backend.open({origins: ['file:///private']}));
   await assert.rejects(backend.open({origins: ['http://127.0.0.1:1'], viewport: {width: 100000, height: 10}}));
   assert.equal(counts.launches, 0);
+  await backend.close();
+});
+
+test('confined design serves retained raster bytes only at its virtual origin', async () => {
+  const {counts, playwright} = fixture();
+  const bytes = Buffer.from([137,80,78,71,0,255]); // Transport fixture, decoded in Rust before publication.
+  const design = {files:{'index.html':'<img src="assets/photo.png" alt="Fixture">'},
+    assets:{'assets/photo.png':{mediaType:'image/png',base64:bytes.toString('base64')}},
+    theme:'light',reducedMotion:true,executable:process.execPath};
+  const backend = createBrowserBackend(playwright, design);
+  await backend.open({origins:['https://design.invalid']});
+  let fulfilled, denied = false;
+  const route = url => ({request:()=>({url:()=>url,method:()=> 'GET'}),
+    fulfill:async value=>{fulfilled=value;},abort:async()=>{denied=true;}});
+  await counts.route(route('https://design.invalid/assets/photo.png'));
+  assert.equal(fulfilled.contentType,'image/png');
+  assert.deepEqual(fulfilled.body,bytes);
+  await counts.route(route('https://example.invalid/assets/photo.png'));
+  assert.equal(denied,true);
+  assert.throws(()=>createBrowserBackend(playwright,{...design,assets:{'index.html':design.assets['assets/photo.png']}}));
+  assert.throws(()=>createBrowserBackend(playwright,{...design,assets:{'../escape.png':design.assets['assets/photo.png']}}));
+  assert.throws(()=>createBrowserBackend(playwright,{...design,assets:{'a.png':{mediaType:'image/png',base64:'%%%'}}}));
   await backend.close();
 });
 

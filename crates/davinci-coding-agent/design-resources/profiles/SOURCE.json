@@ -1,0 +1,14 @@
+{
+  "document.md": {
+    "sha256": "07d5ef82cdb75c7ea2c2a9bb17b5386bf875ca213584328c0e363cc95e09ce5e",
+    "adaptation": "local v1; upstream scope applies only to marketing"
+  },
+  "marketing.md": {
+    "sha256": "78151bf081bbe2fbff6973468a1a7802d5150462c34a6746816fe46487913488",
+    "adaptation": "local v1; upstream scope applies only to marketing"
+  },
+  "product.md": {
+    "sha256": "eab8239f6bc374f02eeeb3bcd4c40b8a54d186700c205427cfa438d5a0128b95",
+    "adaptation": "local v1; upstream scope applies only to marketing"
+  }
+}

@@ -1,0 +1,103 @@
+name: Design artifacts
+
+on:
+  pull_request:
+    paths:
+      - 'crates/davinci-agent/**'
+      - 'crates/davinci-session/**'
+      - 'crates/davinci-coding-agent/**'
+      - 'crates/davinci-evals/**'
+      - 'scripts/*design*'
+      - 'docs/evals/design/**'
+      - '.github/workflows/design-artifacts.yml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+    inputs:
+      native_render:
+        description: 'Run the strict generated-content rendering gate on Linux (never a live model evaluation)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: design-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      PI_OFFLINE: '1'
+      CARGO_INCREMENTAL: '0'
+      RUST_TEST_THREADS: '4'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - run: rustup show
+      - run: python scripts/design-contracts.py --check
+      - name: Every design integration target and the offline evaluation manifest
+        run: python scripts/test-design.py
+      - name: Install locked companion development tools
+        run: npm --prefix crates/davinci-coding-agent/design-ui ci
+      - run: npm --prefix crates/davinci-coding-agent/design-ui run typecheck
+      - run: npm --prefix crates/davinci-coding-agent/design-ui test
+      - run: npm --prefix crates/davinci-coding-agent/design-ui run build
+      - name: Shipped UI matches the deterministic build
+        run: git diff --exit-code -- crates/davinci-coding-agent/design-resources/ui
+      - name: Browser confinement, transport and host policy fixtures
+        run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_host.test.cjs
+      - name: Install explicit CI browser fixture
+        working-directory: crates/davinci-coding-agent/design-ui
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Real companion browser with recorded Rust dispatcher
+        run: npm --prefix crates/davinci-coding-agent/design-ui run test:e2e
+      - name: Preserve companion browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-companion-${{ runner.os }}
+          path: crates/davinci-coding-agent/design-ui/test-results
+          if-no-files-found: warn
+
+  native-render:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_render
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PI_OFFLINE: '1'
+      CARGO_INCREMENTAL: '0'
+      DAVINCI_DESIGN_RUNTIME: ${{ runner.temp }}/design-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - run: rustup show
+      - name: Install explicit CI confinement and compiler fixtures
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          npm --prefix crates/davinci-coding-agent/design-ui ci
+          npm --prefix crates/davinci-coding-agent/design-ui run build
+      - name: Install explicit CI Chromium fixture
+        working-directory: crates/davinci-coding-agent/design-ui
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Pin the native runtime outside the workspace
+        run: |
+          node crates/davinci-coding-agent/design-ui/scripts/install-runtime.cjs "$DAVINCI_DESIGN_RUNTIME"
+          echo "DAVINCI_DESIGN_NODE=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
+      - name: Strict real compiler, host, confined capture and prototype actions
+        run: cargo test -p davinci-coding-agent --locked --test design_runtime -- --ignored --nocapture

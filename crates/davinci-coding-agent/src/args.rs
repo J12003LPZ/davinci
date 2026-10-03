@@ -250,7 +250,23 @@ pub fn parse_args(args: &[String]) -> Args {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
-        if arg == "--" {
+        if result.messages.is_empty()
+            && matches!(arg, "design" | "/design" | "design-sync" | "/design-sync")
+        {
+            let command = if arg.ends_with("-sync") {
+                "/design-sync"
+            } else {
+                "/design"
+            };
+            let tokens = args[i + 1..]
+                .iter()
+                .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect::<Vec<_>>();
+            result
+                .messages
+                .push(format!("{command} {}", tokens.join(" ")));
+            break;
+        } else if arg == "--" {
             for positional in &args[i + 1..] {
                 if let Some(path) = positional.strip_prefix('@') {
                     result.file_args.push(path.to_string());

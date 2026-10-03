@@ -6,7 +6,7 @@ const MAX_FRAME = 16 * 1024;
 const MAX_RESPONSE = 64 * 1024;
 const MAX_PENDING = 16;
 const ACTIONS = new Set(['navigate', 'click', 'type', 'select', 'snapshot',
-  'accessibility', 'console', 'network', 'screenshot']);
+  'accessibility', 'console', 'network', 'screenshot', 'design_geometry']);
 
 function fields(value, keys) {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||

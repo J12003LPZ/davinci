@@ -17,6 +17,7 @@ use std::{
 };
 
 use super::artifacts::{compute_sha256, ArtifactBudgetTracker};
+use crate::design::confinement::design_sandbox;
 
 const MAX_RESPONSE: usize = 64 * 1024;
 const MAX_REQUEST: usize = 16 * 1024;
@@ -112,6 +113,32 @@ impl BrowserProcess {
         host: &SupervisorCommand,
         config: BrowserProcessConfig<'_>,
     ) -> Result<Self, String> {
+        Self::start_inner(host, config, None)
+    }
+
+    /// Design pages require OS-enforced network denial, including non-HTTP egress.
+    /// The bundle is host-owned, immutable input; the workspace is never mounted.
+    pub fn start_design(
+        host: &SupervisorCommand,
+        config: BrowserProcessConfig<'_>,
+        bundle: &Value,
+    ) -> Result<Self, String> {
+        // 100 MiB of retained raster data after base64 plus the bounded compiled source.
+        if serde_json::to_vec(bundle)
+            .map_err(|_| "invalid design bundle")?
+            .len()
+            > 150 * 1024 * 1024
+        {
+            return Err("design bundle transfer limit".into());
+        }
+        Self::start_inner(host, config, Some(bundle))
+    }
+
+    fn start_inner(
+        host: &SupervisorCommand,
+        config: BrowserProcessConfig<'_>,
+        design: Option<&Value>,
+    ) -> Result<Self, String> {
         crate::execution_boundary::require_executor("browser process")?;
         let workspace = config
             .workspace
@@ -193,10 +220,19 @@ impl BrowserProcess {
                 fs::write(directory.join(name), bytes)
                     .map_err(|_| "cannot materialize browser host")?;
             }
+            if let Some(bundle) = design {
+                fs::write(
+                    directory.join("design.json"),
+                    serde_json::to_vec(bundle).map_err(|_| "invalid design bundle")?,
+                )
+                .map_err(|_| "cannot materialize design bundle")?;
+            }
             fs::write(
                 directory.join("config.json"),
                 serde_json::to_vec(&json!({
-                    "packagePath": package, "version": config.version, "workspace": workspace
+                    "packagePath": crate::design::runtime::node_path(&package), "version": config.version,
+                    "workspace": crate::design::runtime::node_path(&workspace),
+                    "design": design.is_some()
                 }))
                 .map_err(|_| "invalid browser host configuration")?,
             )
@@ -205,6 +241,11 @@ impl BrowserProcess {
             let event_state = state.clone();
             let owner: Arc<Mutex<Option<Weak<Supervisor>>>> = Arc::new(Mutex::new(None));
             let event_owner = owner.clone();
+            let sandbox = if design.is_some() {
+                Some(design_sandbox(&directory, &node, &package, &environment)?)
+            } else {
+                None
+            };
             let supervisor = Arc::new(
                 Supervisor::spawn_with_stderr(
                     host,
@@ -219,7 +260,7 @@ impl BrowserProcess {
                         ],
                         cwd: directory.clone(),
                         environment,
-                        sandbox: None,
+                        sandbox,
                         background: true,
                         service: true,
                         operation: None,
@@ -527,6 +568,7 @@ fn clean_directory(directory: &Path) {
         let _ = fs::remove_file(directory.join(name));
     }
     let _ = fs::remove_file(directory.join("config.json"));
+    let _ = fs::remove_file(directory.join("design.json"));
     if let Ok(entries) = fs::read_dir(directory) {
         for entry in entries.flatten() {
             let name = entry.file_name();
