@@ -54,9 +54,12 @@ fn adaptive_effort_follows_current_turn_evidence_and_resets_on_new_task() {
     assert_eq!(agent.request_thinking_level(), ThinkingLevel::Low);
     agent.thinking_level = ThinkingLevel::Off;
     for id in ["off-failure-1", "off-failure-2"] {
-        agent
-            .messages
-            .push(ChatMessage::tool_result(id, "bash", "fixture failure", true));
+        agent.messages.push(ChatMessage::tool_result(
+            id,
+            "bash",
+            "fixture failure",
+            true,
+        ));
     }
     assert_eq!(agent.request_thinking_level(), ThinkingLevel::Off);
     assert_eq!(agent.system_prompt, "stable system");

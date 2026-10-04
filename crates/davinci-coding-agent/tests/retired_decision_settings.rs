@@ -1,8 +1,8 @@
 use std::fs;
 
 use davinci_coding_agent::settings::{
-    load_merged_settings, load_settings_file, save_settings, to_interactive_config, update_settings,
-    Settings,
+    load_merged_settings, load_settings_file, save_settings, to_interactive_config,
+    update_settings, Settings,
 };
 use serde_json::{json, Value};
 
@@ -134,7 +134,10 @@ fn interactive_settings_expose_no_removed_feature_or_key_prompt() {
         let config = to_interactive_config(&settings, "dark");
         let list = davinci_tui::interactive_settings_list(&config);
         assert!(!list.items.iter().any(|item| {
-            matches!(item.id.as_str(), "decision-intelligence" | "typesafe-api-key")
+            matches!(
+                item.id.as_str(),
+                "decision-intelligence" | "typesafe-api-key"
+            )
         }));
         assert!(list.items.iter().any(|item| item.id == "transport"));
         assert!(list.items.iter().any(|item| item.id == "show-tool-output"));

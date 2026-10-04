@@ -3201,10 +3201,7 @@ fn scope_expansion_answer_key(
             Some((ScopeExpansionDecision::Deny, None))
         }
         Flow::Continue if model.overlay.is_none() => Some((ScopeExpansionDecision::Deny, None)),
-        Flow::Continue
-        | Flow::Choose(_)
-        | Flow::Submit(_)
-        | Flow::CyclePermissionMode => None,
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CyclePermissionMode => None,
     }
 }
 
@@ -3712,10 +3709,7 @@ fn approval_key(
             Some(ToolApprovalDecision::Deny)
         }
         Flow::Continue if model.overlay.is_none() => Some(ToolApprovalDecision::Deny),
-        Flow::Continue
-        | Flow::Choose(_)
-        | Flow::Submit(_)
-        | Flow::CyclePermissionMode => None,
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CyclePermissionMode => None,
     }
 }
 

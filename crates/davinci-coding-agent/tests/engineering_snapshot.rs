@@ -66,10 +66,7 @@ fn engineering_snapshot_reuses_facts_and_rechecks_permissions_and_changes() {
         .unwrap()
         .0;
     assert!(fresh.generation > first.generation);
-    assert_eq!(
-        fresh.workspace_dirty,
-        WorkspaceDirtyState::Unknown
-    );
+    assert_eq!(fresh.workspace_dirty, WorkspaceDirtyState::Unknown);
 }
 
 #[test]

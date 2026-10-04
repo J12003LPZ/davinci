@@ -627,7 +627,10 @@ mod tests {
     fn retired_decision_settings_are_not_exposed() {
         let list = interactive_settings_list(&InteractiveSettingsConfig::default());
         assert!(!list.items.iter().any(|item| {
-            matches!(item.id.as_str(), "decision-intelligence" | "typesafe-api-key")
+            matches!(
+                item.id.as_str(),
+                "decision-intelligence" | "typesafe-api-key"
+            )
         }));
         assert!(list.items.iter().any(|item| item.id == "transport"));
     }

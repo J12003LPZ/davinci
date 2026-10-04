@@ -18,8 +18,8 @@ use super::views::chrome::{self, Hint};
 use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_inspector, decision_modal, diff, disegno,
-    export, extensions, governor, grafo, graph_run, instrumenta, keys, login, mcp, memoria, mensura,
-    officina, opera, permissions, recovery, resume, rewind, securitas, settings, startup,
+    export, extensions, governor, grafo, graph_run, instrumenta, keys, login, mcp, memoria,
+    mensura, officina, opera, permissions, recovery, resume, rewind, securitas, settings, startup,
     task_board, transcript, tree, trust, vectors, workflows,
 };
 
