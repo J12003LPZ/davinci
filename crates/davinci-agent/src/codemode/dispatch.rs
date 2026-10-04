@@ -1,5 +1,8 @@
 use super::*;
-use crate::{runtime::operations::OperationId, Agent};
+use crate::{
+    runtime::{capacity::WorkerSlotCapacity, operations::OperationId},
+    Agent,
+};
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
@@ -20,7 +23,7 @@ pub struct AgentCodeModeBroker<'a> {
     parent: Option<OperationId>,
     policy: CapabilityPolicy,
     state: Mutex<RunState>,
-    dispatch: Mutex<()>,
+    dispatch: WorkerSlotCapacity,
 }
 
 impl<'a> AgentCodeModeBroker<'a> {
@@ -92,7 +95,7 @@ impl<'a> AgentCodeModeBroker<'a> {
                 terminal_code: "LIMIT_EXCEEDED",
                 children: vec![],
             }),
-            dispatch: Mutex::new(()),
+            dispatch: WorkerSlotCapacity::new(),
         })
     }
 
@@ -148,6 +151,11 @@ impl<'a> AgentCodeModeBroker<'a> {
             .unwrap_or_else(|error| error.into_inner())
             .children
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_request_count(&self) -> usize {
+        self.state.lock().unwrap().requests.len()
     }
 
     fn authorized_tools(&self) -> std::collections::BTreeSet<String> {
@@ -266,8 +274,10 @@ impl CodeModeBroker for AgentCodeModeBroker<'_> {
         // agent or admission-state locks while a child or approval waits.
         let _lane = self
             .dispatch
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .acquire(1, || {
+                self.context.cancellation.is_cancelled() || self.agent.abort_requested()
+            })
+            .ok_or_else(|| CodeModeError::new("CANCELLED", "queued child cancelled"))?;
         self.live()?;
         let id = format!("{}#codemode:{ordinal}", self.context.identity.invocation_id);
         let (result, structured, operation_ref) = self.agent.dispatch_script_child(

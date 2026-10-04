@@ -623,6 +623,187 @@ fn broker_records_projection_failure_with_durable_child_reference() {
 }
 
 #[test]
+fn broker_child_limit_is_terminal_after_guest_catches_error() {
+    use crate::codemode::*;
+    let (agent, _workspace, journal) = configured_agent();
+    let context = broker_context(&agent);
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    for request_id in 1..=64 {
+        let result = broker.call(CodeModeCall {
+            request_id,
+            tool: "read".into(),
+            args: json!({"path":"input.txt"}),
+        });
+        // Deduplication may report unavailable exact data, but never renews admission.
+        assert!(result.is_ok() || result.unwrap_err().code == "INCOMPLETE_DATA");
+    }
+    let operations = journal.snapshot().unwrap().operations.len();
+    for request_id in [65, 66, 1] {
+        assert_eq!(
+            broker
+                .call(CodeModeCall {
+                    request_id,
+                    tool: "read".into(),
+                    args: json!({"path":"input.txt"})
+                })
+                .unwrap_err()
+                .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+    assert_eq!(journal.snapshot().unwrap().operations.len(), operations);
+    assert_eq!(broker.children().len(), 64);
+}
+
+#[test]
+fn queued_codemode_child_rechecks_scoped_revocation() {
+    use crate::codemode::*;
+    let (mut agent, _workspace, journal) = configured_agent();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_calls = hooks.clone();
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |_, _| {
+        if hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        None
+    })));
+    let context = broker_context(&agent);
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            broker.call(CodeModeCall {
+                request_id: 1,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let second = scope.spawn(|| {
+            broker.call(CodeModeCall {
+                request_id: 2,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while broker.admitted_request_count() < 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            broker.admitted_request_count(),
+            2,
+            "second child must be queued before revocation"
+        );
+        agent
+            .permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(crate::permission::PermissionRule::parameter(
+                "read",
+                "path",
+                "input.txt",
+            ));
+        release_tx.send(()).unwrap();
+        // The first call is still in its pre-hook, before permission admission.
+        // Revocation therefore prevents both queued and pre-admission effects.
+        assert_eq!(first.join().unwrap().unwrap_err().code, "DENIED");
+        assert_eq!(second.join().unwrap().unwrap_err().code, "DENIED");
+    });
+    assert_eq!(
+        agent
+            .counters
+            .executed_leaf_operations
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(journal
+        .snapshot()
+        .unwrap()
+        .attempts
+        .iter()
+        .any(|attempt| attempt.state() == OperationState::Cancelled
+            && attempt.effect_status() == EffectStatus::NotStarted));
+}
+
+#[test]
+fn queued_codemode_child_cancels_before_active_child_returns() {
+    use crate::codemode::*;
+    let (mut agent, _workspace, _) = configured_agent();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |_, _| {
+        entered_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        None
+    })));
+    let context = broker_context(&agent);
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            broker.call(CodeModeCall {
+                request_id: 1,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let second = scope.spawn(|| {
+            result_tx
+                .send(broker.call(CodeModeCall {
+                    request_id: 2,
+                    tool: "read".into(),
+                    args: json!({"path":"input.txt"}),
+                }))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while broker.admitted_request_count() < 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(broker.admitted_request_count(), 2);
+        context.cancellation.cancel();
+        let queued_result = result_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Release even on failure so the regression cannot strand its worker.
+        release_tx.send(()).unwrap();
+        let _ = first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            queued_result
+                .expect("queued cancellation must not wait for the active callback")
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+    });
+    assert!(!agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .cancellation_token
+        .is_cancelled());
+    assert_eq!(broker.children().len(), 1);
+}
+
+#[test]
 fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     use crate::codemode::*;
     let (agent, workspace, journal) = configured_agent();
