@@ -497,9 +497,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export DAVINCI_CODEMODE_FIXTURE_NODE="$(node -p 'process.execPath')"
-          export DAVINCI_CODEMODE_FIXTURE_BUNDLE="$RUNNER_TEMP/codemode-bundle"
-          export DAVINCI_CODEMODE_FIXTURE_MANIFEST="$RUNNER_TEMP/codemode-manifest.json"
+          DAVINCI_CODEMODE_FIXTURE_NODE="$(node -p 'process.execPath')"
+          export DAVINCI_CODEMODE_FIXTURE_NODE
+          DAVINCI_CODEMODE_FIXTURE_BUNDLE="$RUNNER_TEMP/codemode-bundle"
+          export DAVINCI_CODEMODE_FIXTURE_BUNDLE
+          DAVINCI_CODEMODE_FIXTURE_MANIFEST="$RUNNER_TEMP/codemode-manifest.json"
+          export DAVINCI_CODEMODE_FIXTURE_MANIFEST
           cargo test -p davinci-coding-agent --test codemode_supervisor native_deadline_returns_when_broker_ignores_cancellation --locked -- --ignored --nocapture
           cargo test -p davinci-coding-agent --test codemode_supervisor native_host_runs_parallel_read_callbacks --locked -- --ignored --nocapture
       - name: Current dependency advisory report
