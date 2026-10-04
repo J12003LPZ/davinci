@@ -849,6 +849,12 @@ If an existing legacy Pi directory is present, DaVinci can continue using:
 
 Session history is JSONL-compatible. An optional SQLite layer provides derived indexing and branch/fact cache state. `--no-session` disables conversation persistence, not every cache, credential, diagnostic, or external-service side effect. Review exports before sharing; they may contain repository content and tool output.
 
+### Rewind code and conversation
+
+`/rewind` opens recent user prompts. Select the prompt whose work you want to undo, inspect the file preview, then restore **code**, **conversation**, or **both** to immediately before that prompt. Double-Escape with an empty composer opens the same flow unless you customize `doubleEscapeAction`.
+
+Rewind tracks file-tool `write`, `edit`, and `apply_patch` changes. **Shell commands and external processes are not tracked**, so this is not a Git reset or a whole-workspace backup. Stop background jobs/workers first. Overlapping later edits become conflicts rather than being overwritten; conversation-only restore remains available. Abandoned conversation messages remain in the session tree. Saved sessions retain checkpoint/effect evidence; unsaved conversations retain only the last ten conversation snapshots. See [rewind safety, persistence, and RPC commands](docs/rewind.md).
+
 Export a session to standalone HTML:
 
 ~~~bash
