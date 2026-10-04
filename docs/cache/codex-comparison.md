@@ -2,7 +2,7 @@
 
 Status: **pending live measurement**
 
-Prepared: 2026-09-24
+Updated: 2026-10-03
 
 The comparison runner is `scripts/compare-codex.mjs`. A valid result requires:
 
@@ -12,15 +12,38 @@ The comparison runner is `scripts/compare-codex.mjs`. A valid result requires:
 - three runs per harness per task;
 - task-specific check commands that return success only when the requested work is complete.
 
-Before collecting the full sample, run one task per harness and verify that both JSON usage pickers report non-zero input/output values. If either CLI has changed its JSON event shape, update the picker before recording results.
+Before collecting the full sample, verify the JSON event shapes and usage completeness
+on a bounded task per harness. Missing or invalid usage appears as `null`/unknown,
+never zero. Codex input includes cached input; DaVinci's normalized buckets are
+disjoint. Both are normalized before comparison. Zero can be a valid observation.
+
+Run the local parser regressions without making provider calls:
+
+```powershell
+node --test scripts/tests/subscription-usage.test.mjs
+```
+
+The runner includes all attempts in pass rates. A pass requires a successful
+harness process and successful task checks. Compare matched successful work as
+well as failures; lower tokens on an incomplete task are not an improvement.
+Transcripts may omit retries and auxiliary calls, so transcript totals are a
+screening measurement rather than complete account consumption.
+
+API catalog prices and API-dollar-to-credit conversion are not subscription
+measurements. The runner no longer estimates credits. Record account usage windows
+separately and account for concurrent sessions. Included allowance and purchased
+credits have different rules; use the
+[official pricing guidance](https://learn.chatgpt.com/docs/pricing) and account
+usage dashboard for those quantities.
 
 ## Results
 
-No results are committed yet. The connected development machine was offline while this branch was implemented, so no authenticated Codex CLI or ChatGPT-plan calls were made.
+No matched live results are recorded here. The October 3 changes were validated
+locally without authenticated Codex CLI or ChatGPT-plan calls.
 
 When measurements are available, record:
 
-| Harness | Model | Mean fresh input | Mean cached input | Mean output | Estimated credits | Mean wall time | Pass rate |
+| Harness | Model | Mean fresh input | Mean cached input | Mean output | Unknown-usage runs | Mean wall time | Pass rate |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Codex CLI | pending | pending | pending | pending | pending | pending | pending |
 | DaVinci | pending | pending | pending | pending | pending | pending | pending |
