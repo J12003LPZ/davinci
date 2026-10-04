@@ -1536,6 +1536,7 @@ fn run_turn(
     model.working = Some(Working {
         seconds: 0,
         tokens: 0,
+        shown_tokens: Some(0),
         thinking: thinking_effort(agent),
         interrupting: false,
         verb_seed,
@@ -1565,7 +1566,7 @@ fn run_turn(
         loop {
             let _ = session.reacquire();
             if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
-                model.tick = model.tick.wrapping_add(1);
+                model.advance_tick();
                 model.dirty = true;
                 last_tick = Instant::now();
                 poll_jobs(&jobs, model);
@@ -3361,7 +3362,7 @@ fn resolve_scope_expansion_modal(
     loop {
         let _ = session.reacquire();
         if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
-            model.tick = model.tick.wrapping_add(1);
+            model.advance_tick();
             model.dirty = true;
             last_tick = Instant::now();
         }
@@ -4783,7 +4784,7 @@ pub fn run(
             model.dirty = true;
         }
         if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
-            model.tick = model.tick.wrapping_add(1);
+            model.advance_tick();
             model.dirty = true;
             last_tick = Instant::now();
             poll_jobs(&agent.tool_context.jobs, &mut model);

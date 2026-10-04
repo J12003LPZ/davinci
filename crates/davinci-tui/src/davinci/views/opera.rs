@@ -43,7 +43,10 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
 
     let mut facts = vec![format!("{}s", working.seconds)];
     if working.tokens > 0 {
-        facts.push(format!("↓ {} tokens", thousands(working.tokens)));
+        facts.push(format!(
+            "↓ {} tokens",
+            thousands(working.displayed_tokens())
+        ));
     }
     let reasoning = match (&working.thinking, working.reasoning, working.thought_for) {
         (Some(effort), true, _) => Some(format!("thinking with {effort} effort")),
@@ -79,7 +82,13 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     vec![Line::from(truncate_run(spans, model.width))]
 }
 
-fn shimmer(word: &str, tick: u64, animate: bool, base: Color, light: Color) -> Vec<Span<'static>> {
+pub(super) fn shimmer(
+    word: &str,
+    tick: u64,
+    animate: bool,
+    base: Color,
+    light: Color,
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = word.chars().collect();
     if !animate || chars.is_empty() {
         return vec![span(word.to_string(), base)];
@@ -187,6 +196,36 @@ mod tests {
         }
         m.animate = false;
         assert!(text(&lines(&m)[0]).starts_with('✻'));
+    }
+
+    #[test]
+    fn the_token_count_rolls_up_one_tick_at_a_time_and_never_overshoots() {
+        let mut m = model(120);
+        m.working = Some(Working {
+            tokens: 900,
+            ..Working::new()
+        });
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            m.advance_tick();
+            seen.push(m.working.as_ref().unwrap().displayed_tokens());
+        }
+        assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]), "{seen:?}");
+        assert!(seen[0] > 0 && seen[0] < 900, "{seen:?}");
+        assert_eq!(*seen.last().unwrap(), 900, "{seen:?}");
+        m.working.as_mut().unwrap().tokens = 5;
+        assert_eq!(m.working.as_ref().unwrap().displayed_tokens(), 5);
+        m.working.as_mut().unwrap().seconds = 3;
+        assert!(text(&lines(&m)[0]).contains("↓ 5 tokens"));
+    }
+
+    #[test]
+    fn the_token_count_is_exact_when_animation_is_off() {
+        let mut m = model(120);
+        m.animate = false;
+        m.working = Some(working());
+        m.advance_tick();
+        assert!(text(&lines(&m)[0]).contains("↓ 423 tokens"));
     }
 
     #[test]
