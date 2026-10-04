@@ -138,6 +138,154 @@ fn watch_host(
     }
 }
 
+
+const MAX_CALLBACK_WORKERS: usize = 16;
+static ACTIVE_CALLBACK_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct CallbackWorkerPermit;
+
+impl CallbackWorkerPermit {
+    fn try_acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut current = ACTIVE_CALLBACK_WORKERS.load(Ordering::SeqCst);
+        loop {
+            if current >= MAX_CALLBACK_WORKERS {
+                return None;
+            }
+            match ACTIVE_CALLBACK_WORKERS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for CallbackWorkerPermit {
+    fn drop(&mut self) {
+        ACTIVE_CALLBACK_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct BrokerTask {
+    request_id: String,
+    call: CodeModeCall,
+}
+
+struct BrokerReply {
+    request_id: String,
+    result: Result<CodeModeToolValue, CodeModeError>,
+}
+
+fn start_broker_workers(
+    broker: Arc<dyn CodeModeBroker>,
+    requested_workers: usize,
+    pending_limit: usize,
+) -> Result<
+    (
+        mpsc::SyncSender<BrokerTask>,
+        mpsc::Receiver<BrokerReply>,
+        Vec<std::thread::JoinHandle<()>>,
+    ),
+    CodeModeError,
+> {
+    let worker_count = requested_workers.clamp(1, 4);
+    let mut permits = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        permits.push(CallbackWorkerPermit::try_acquire().ok_or_else(|| {
+            CodeModeError::new("UNAVAILABLE", "Codemode callback worker capacity exhausted")
+        })?);
+    }
+
+    let (task_sender, task_receiver) = mpsc::sync_channel(pending_limit.clamp(1, 64));
+    let task_receiver = Arc::new(Mutex::new(task_receiver));
+    let (reply_sender, reply_receiver) = mpsc::channel();
+    let mut workers = Vec::with_capacity(worker_count);
+    for (index, permit) in permits.into_iter().enumerate() {
+        let tasks = task_receiver.clone();
+        let replies = reply_sender.clone();
+        let broker = broker.clone();
+        let worker = std::thread::Builder::new()
+            .name(format!("davinci-codemode-callback-{index}"))
+            .spawn(move || {
+                let _permit = permit;
+                loop {
+                    let task = {
+                        let receiver = tasks.lock().unwrap_or_else(|error| error.into_inner());
+                        match receiver.recv() {
+                            Ok(task) => task,
+                            Err(_) => break,
+                        }
+                    };
+                    let result = broker.call(task.call);
+                    if replies
+                        .send(BrokerReply {
+                            request_id: task.request_id,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| {
+                CodeModeError::new("UNAVAILABLE", "unable to start Codemode callback worker")
+            })?;
+        workers.push(worker);
+    }
+    drop(reply_sender);
+    Ok((task_sender, reply_receiver, workers))
+}
+
+fn write_broker_reply(
+    input: &mut impl std::io::Write,
+    run_id: &str,
+    reply: BrokerReply,
+    pending: &mut std::collections::BTreeSet<String>,
+    limits: &CodeModeLimits,
+    result_bytes: &mut usize,
+) -> Result<(), CodeModeError> {
+    if !pending.remove(&reply.request_id) {
+        return Err(CodeModeError::new(
+            "PROTOCOL_ERROR",
+            "unexpected completed child request",
+        ));
+    }
+    let ok = reply.result.is_ok();
+    let value = match reply.result {
+        Ok(value) => serde_json::to_value(value)
+            .map_err(|_| CodeModeError::new("TOOL_FAILED", "result encoding failed"))?,
+        Err(error) => json!({"error":error}),
+    };
+    let bytes = davinci_agent::codemode::projection::serialized_size(
+        &value,
+        limits.child_result_bytes,
+    )
+    .map_err(|_| CodeModeError::new("LIMIT_EXCEEDED", "response byte budget"))?;
+    *result_bytes = result_bytes.saturating_add(bytes);
+    if *result_bytes > limits.total_result_bytes {
+        return Err(CodeModeError::new("LIMIT_EXCEEDED", "child result budget"));
+    }
+    write_frame(
+        input,
+        &json!({
+            "version":1,
+            "type":"tool_result",
+            "runId":run_id,
+            "requestId":reply.request_id,
+            "ok":ok,
+            "value":value
+        }),
+    )
+    .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "host write failed"))
+}
+
 impl NodeCodeModeHost {
     pub fn new(node: &Path, assets: HostAssets) -> io::Result<Self> {
         let fingerprint = node_fingerprint(node)?;
@@ -192,7 +340,7 @@ impl NodeCodeModeHost {
         &self,
         request: &CodeModeRequest,
         context: &CodeModeRunContext,
-        broker: &dyn CodeModeBroker,
+        broker: Arc<dyn CodeModeBroker>,
     ) -> Result<CodeModeOutcome, CodeModeError> {
         if matches!(context.mode, CodeModeMode::Off) {
             return Err(CodeModeError::new("UNAVAILABLE", "Codemode is disabled"));
@@ -269,6 +417,11 @@ impl NodeCodeModeHost {
             .ok_or_else(|| CodeModeError::new("SANDBOX_FAILED", "missing host output"))?;
         let child = Arc::new(Mutex::new(child));
         let limits = context.limits_for_request(request)?;
+        let (broker_tasks, broker_replies, _broker_workers) = start_broker_workers(
+            broker.clone(),
+            limits.parallelism,
+            limits.pending_calls,
+        )?;
         let watchdog = watch_host(
             child.clone(),
             context.cancellation.clone(),
@@ -290,6 +443,7 @@ impl NodeCodeModeHost {
         let mut metadata_bytes = 0usize;
         let mut tool_calls = 0u32;
         let mut result_bytes = 0usize;
+        let mut pending_broker = std::collections::BTreeSet::new();
         let outcome = (|| loop {
             if context.cancellation.is_cancelled() {
                 return Err(
@@ -302,6 +456,16 @@ impl NodeCodeModeHost {
             }
             if started.elapsed() > Duration::from_millis(limits.wall_ms + limits.cleanup_grace_ms) {
                 return Err(CodeModeError::new("TIMEOUT", "host deadline expired"));
+            }
+            while let Ok(reply) = broker_replies.try_recv() {
+                write_broker_reply(
+                    &mut input,
+                    run_id,
+                    reply,
+                    &mut pending_broker,
+                    &limits,
+                    &mut result_bytes,
+                )?;
             }
             let frame = match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(Ok(frame)) => frame,
@@ -337,6 +501,13 @@ impl NodeCodeModeHost {
                 ));
             }
             if kind == "finished" {
+                if !pending_broker.is_empty() {
+                    context.cancellation.cancel();
+                    return Err(CodeModeError::new(
+                        "CANCELLED",
+                        "script finished with unresolved child calls",
+                    ));
+                }
                 let result = &frame["result"];
                 let ok = result["ok"]
                     .as_bool()
@@ -419,19 +590,37 @@ impl NodeCodeModeHost {
                     if tool_calls > limits.tool_calls {
                         return Err(CodeModeError::new("LIMIT_EXCEEDED", "tool call limit"));
                     }
-                    broker
-                        .call(CodeModeCall {
-                            request_id: id.parse().map_err(|_| {
-                                CodeModeError::new("PROTOCOL_ERROR", "invalid request identity")
-                            })?,
-                            tool: name.into(),
-                            args: frame["arguments"].clone(),
+                    if pending_broker.len() >= limits.pending_calls {
+                        return Err(CodeModeError::new(
+                            "LIMIT_EXCEEDED",
+                            "pending child request limit",
+                        ));
+                    }
+                    let parsed_id = id.parse().map_err(|_| {
+                        CodeModeError::new("PROTOCOL_ERROR", "invalid request identity")
+                    })?;
+                    if !pending_broker.insert(id.to_owned()) {
+                        return Err(CodeModeError::new(
+                            "PROTOCOL_ERROR",
+                            "duplicate pending child request",
+                        ));
+                    }
+                    broker_tasks
+                        .try_send(BrokerTask {
+                            request_id: id.to_owned(),
+                            call: CodeModeCall {
+                                request_id: parsed_id,
+                                tool: name.into(),
+                                args: frame["arguments"].clone(),
+                            },
                         })
-                        .and_then(|value| {
-                            serde_json::to_value(value).map_err(|_| {
-                                CodeModeError::new("TOOL_FAILED", "result encoding failed")
-                            })
-                        })
+                        .map_err(|_| {
+                            CodeModeError::new(
+                                "LIMIT_EXCEEDED",
+                                "child callback queue is full",
+                            )
+                        })?;
+                    continue;
                 }
                 "metadata_query" => {
                     metadata_calls += 1;
@@ -497,6 +686,7 @@ impl NodeCodeModeHost {
                     "runId":run_id,"requestId":id,"ok":ok,"value":value}))
                     .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "host write failed"))?;
         })();
+        drop(broker_tasks);
         drop(input);
         {
             let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
@@ -514,7 +704,7 @@ impl CodeModeHost for NodeCodeModeHost {
         &self,
         request: &CodeModeRequest,
         context: &CodeModeRunContext,
-        broker: &dyn CodeModeBroker,
+        broker: Arc<dyn CodeModeBroker>,
     ) -> CodeModeOutcome {
         self.run(request, context, broker)
             .unwrap_or_else(|error| CodeModeOutcome {
