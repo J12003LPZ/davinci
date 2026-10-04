@@ -877,6 +877,70 @@ fn queued_codemode_child_cancels_before_active_child_returns() {
 }
 
 #[test]
+fn read_only_broker_allows_bounded_parallel_children() {
+    use crate::codemode::*;
+    let (mut agent, _workspace, _) = configured_agent();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_active = active.clone();
+    let hook_peak = peak.clone();
+    let hook_release = release_rx.clone();
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |_, _| {
+        let now = hook_active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        hook_peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        entered_tx.send(()).unwrap();
+        hook_release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        hook_active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    })));
+    let mut context = broker_context(&agent);
+    context.limits.parallelism = 2;
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            broker.call(CodeModeCall {
+                request_id: 1,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let second = scope.spawn(|| {
+            broker.call(CodeModeCall {
+                request_id: 2,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+        });
+        let second_entered = entered_rx.recv_timeout(std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        if second_entered.is_err() {
+            // Unblock the serialized second call so the regression exits cleanly.
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        assert!(
+            second_entered.is_ok(),
+            "read-only children should overlap up to the Codemode parallelism limit"
+        );
+        assert!(first.join().unwrap().is_ok());
+        assert!(second.join().unwrap().is_ok());
+    });
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
 fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     use crate::codemode::*;
     let (agent, workspace, journal) = configured_agent();
