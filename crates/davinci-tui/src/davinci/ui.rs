@@ -23,6 +23,31 @@ pub fn span(content: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(content.into(), Style::default().fg(color))
 }
 
+/// A color `t` of the way from `a` to `b`. Only truecolor has in-between
+/// shades; an indexed or named palette steps at the midpoint instead, so a
+/// fade on a 256-color terminal degrades to the old on/off switch.
+pub fn mix(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let lerp =
+                |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+            Color::Rgb(lerp(ar, br), lerp(ag, bg), lerp(ab, bb))
+        }
+        _ if t >= 0.5 => b,
+        _ => a,
+    }
+}
+
+/// A triangle wave on the shared clock: 0 → 1 → 0 once every `period` ticks.
+/// Used for slow breathing fades, which read calmer than a hard blink.
+pub fn breath(tick: u64, period: u64) -> f32 {
+    let period = period.max(2);
+    let half = period as f32 / 2.0;
+    let phase = (tick % period) as f32;
+    1.0 - (phase - half).abs() / half
+}
+
 /// Opaque newspaper clipping. Only display headings are uppercased; values,
 /// paths and command text retain their original spelling.
 pub fn paper_label(text: &str, theme: &Theme, accent: bool) -> Span<'static> {
@@ -519,7 +544,7 @@ pub fn tool_line(
         live && duration.is_none() && !failed && !matches!(state, State::Skipped | State::Queued);
     let mark = if theme.no_color {
         state.glyph()
-    } else if running && tick % 2 == 1 {
+    } else if running && (tick / 2) % 2 == 1 {
         " "
     } else {
         "●"
@@ -759,6 +784,32 @@ pub fn hint_row(
 /// `NO_COLOR` audit.
 pub fn is_strong(span: &Span<'_>) -> bool {
     span.style.add_modifier.contains(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn mix_blends_truecolor_and_steps_everything_else() {
+        let a = Color::Rgb(0, 100, 200);
+        let b = Color::Rgb(100, 200, 0);
+        assert_eq!(mix(a, b, 0.0), a);
+        assert_eq!(mix(a, b, 1.0), b);
+        assert_eq!(mix(a, b, 0.5), Color::Rgb(50, 150, 100));
+        assert_eq!(mix(a, b, 7.0), b, "t is clamped");
+        let (one, two) = (Color::Indexed(1), Color::Indexed(2));
+        assert_eq!(mix(one, two, 0.49), one);
+        assert_eq!(mix(one, two, 0.5), two);
+        assert_eq!(mix(a, Color::Reset, 0.2), a);
+    }
+
+    #[test]
+    fn breath_rises_and_falls_once_per_period() {
+        let wave: Vec<f32> = (0..9).map(|tick| breath(tick, 8)).collect();
+        assert_eq!(wave, [0.0, 0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25, 0.0]);
+        assert!((0..100).all(|tick| (0.0..=1.0).contains(&breath(tick, 0))));
+    }
 }
 
 #[cfg(test)]

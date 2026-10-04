@@ -13,7 +13,7 @@ use crate::davinci::model::{
 };
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, detail_line, failure_line, indent, run_width, span, tool_line,
+    blank, clip_ellipsis, detail_line, failure_line, indent, mix, run_width, span, tool_line,
     truncate_run, wrap, MEASURE,
 };
 
@@ -187,7 +187,11 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
         spans.extend(bold_numbers(&sentence, cc.inactive));
         return vec![Line::from(truncate_run(spans, width))];
     }
-    let bullet = if model.tick % 2 == 1 { "  " } else { "● " };
+    let bullet = if (model.tick / 2) % 2 == 1 {
+        "  "
+    } else {
+        "● "
+    };
     let mut spans = vec![span(bullet, cc.inactive)];
     spans.extend(bold_numbers(&format!("{sentence}…"), th.text));
     let (kind, target, _) = calls.last().expect("a group has a call");
@@ -348,18 +352,34 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::ContextUsage(view) => super::context_usage::lines(th, view, width),
 
-        Entry::Done { verb, seconds } => {
+        Entry::Done {
+            verb,
+            seconds,
+            landed,
+        } => {
             let cc = th.cc();
+            // The turn lands: the spinner winds down ✽ ✶ ✻ and the line
+            // cools from the accent to quiet ink over two seconds.
+            let age = model.tick.wrapping_sub(*landed);
+            let (glyph, warmth) = if model.animate && age < DONE_SETTLE {
+                let glyph = ["✽", "✶", "✻"][age.min(2) as usize];
+                (glyph, 1.0 - age as f32 / DONE_SETTLE as f32)
+            } else {
+                ("✻", 0.0)
+            };
             vec![Line::from(vec![
-                span("✻ ", cc.inactive),
+                span(format!("{glyph} "), mix(cc.inactive, cc.claude, warmth)),
                 span(
                     format!("{verb} for {}", duration_words(*seconds)),
-                    cc.inactive,
+                    mix(cc.inactive, cc.text, warmth),
                 ),
             ])]
         }
     }
 }
+
+/// Ticks the completion marker takes to settle and cool (two seconds).
+const DONE_SETTLE: u64 = 8;
 
 /// Recent calls shown for a lone running worker; `ctrl+t` shows more.
 const SUBAGENT_RECENT: usize = 3;
@@ -962,6 +982,36 @@ mod tests {
             recent: recent.iter().map(|call| call.to_string()).collect(),
             elapsed_secs: 41,
         }
+    }
+
+    #[test]
+    fn a_finished_turn_lands_warm_then_settles_into_quiet_ink() {
+        let mut m = model(80);
+        let done = Entry::Done {
+            verb: "Baked".into(),
+            seconds: 12,
+            landed: 100,
+        };
+        let cc = m.theme.cc();
+        let mut glyphs = Vec::new();
+        let mut inks = Vec::new();
+        for tick in 100..112 {
+            m.tick = tick;
+            let row = &entry_lines(&m, &done, 80)[0];
+            glyphs.push(row.spans[0].content.trim().to_string());
+            inks.push(row.spans[0].style.fg);
+            assert!(text(row).ends_with("Baked for 12s"), "{}", text(row));
+        }
+        assert_eq!(&glyphs[..4], ["✽", "✶", "✻", "✻"]);
+        assert_eq!(inks[0], Some(cc.claude));
+        assert_ne!(inks[4], inks[0]);
+        assert!(inks[8..].iter().all(|ink| *ink == Some(cc.inactive)));
+
+        m.animate = false;
+        m.tick = 100;
+        let row = &entry_lines(&m, &done, 80)[0];
+        assert_eq!(text(row), "✻ Baked for 12s");
+        assert_eq!(row.spans[0].style.fg, Some(cc.inactive));
     }
 
     fn drawn(model: &Model, rows: Vec<SubagentRow>) -> Vec<String> {

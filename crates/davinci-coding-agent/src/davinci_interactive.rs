@@ -1228,6 +1228,11 @@ fn thinking_effort(agent: &Agent) -> Option<String> {
 
 /// Fold one agent event into the transcript.
 fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
+    // Any event is a sign of life, including ones the token count cannot
+    // see: tool-call arguments streaming, a retry backing off, compaction.
+    if let Some(working) = model.working.as_mut() {
+        working.pulse();
+    }
     match event {
         AgentEvent::SubagentProgress {
             tool_call_id,
@@ -1537,6 +1542,9 @@ fn run_turn(
         seconds: 0,
         tokens: 0,
         shown_tokens: Some(0),
+        idle_ticks: 0,
+        seen_tokens: 0,
+        glint: 0,
         thinking: thinking_effort(agent),
         interrupting: false,
         verb_seed,
@@ -1821,6 +1829,7 @@ fn run_turn(
             model.transcript.push(Entry::Done {
                 verb: working.past_verb().to_string(),
                 seconds: started.elapsed().as_secs(),
+                landed: model.tick,
             });
         }
     }

@@ -395,9 +395,55 @@ pub struct Working {
     pub thought_for: Option<u64>,
     /// Whether reasoning is actively streaming.
     pub reasoning: bool,
+    /// Ticks since the turn last showed a sign of life: any agent event,
+    /// new tokens, active reasoning, a tool in flight, or an open prompt.
+    /// Drives the stall tint on the spinner.
+    pub idle_ticks: u32,
+    /// The token count at the last tick, to tell growth from silence.
+    pub seen_tokens: u64,
+    /// Ticks left on the glint drawn when the rolling count crosses a
+    /// thousand. Zero when there is nothing to celebrate.
+    pub glint: u8,
 }
 
+/// Quiet ticks before the spinner starts warming toward the error color.
+/// Ten seconds of no events at all: past ordinary first-token latency, so
+/// the tint means something is actually wrong.
+pub const STALL_AFTER: u32 = 40;
+/// Ticks the stall tint takes to go from the accent to fully alarmed.
+pub const STALL_RAMP: u32 = 20;
+/// Ticks a thousand-token glint lasts.
+pub const GLINT_TICKS: u8 = 3;
+
 impl Working {
+    /// How stalled the turn looks, from 0 (lively) to 1 (no sign of life for
+    /// `STALL_AFTER + STALL_RAMP` ticks).
+    pub fn stall(&self) -> f32 {
+        let over = self.idle_ticks.saturating_sub(STALL_AFTER);
+        (over as f32 / STALL_RAMP as f32).min(1.0)
+    }
+
+    /// Record a sign of life from the agent: the stall clock restarts.
+    pub fn pulse(&mut self) {
+        self.idle_ticks = 0;
+    }
+
+    /// Whole seconds without a sign of life (4 ticks a second).
+    pub fn quiet_seconds(&self) -> u64 {
+        u64::from(self.idle_ticks / 4)
+    }
+
+    /// One tick of the stall clock. `busy` is true while a tool runs, which
+    /// is work the token stream cannot see.
+    pub fn watch_for_stall(&mut self, busy: bool) {
+        if busy || self.reasoning || self.tokens > self.seen_tokens {
+            self.idle_ticks = 0;
+        } else {
+            self.idle_ticks = self.idle_ticks.saturating_add(1);
+        }
+        self.seen_tokens = self.tokens;
+    }
+
     /// The token count to draw: the rolling value while one is in flight.
     pub fn displayed_tokens(&self) -> u64 {
         self.shown_tokens.unwrap_or(self.tokens).min(self.tokens)
@@ -409,7 +455,15 @@ impl Working {
     pub fn roll_tokens(&mut self) {
         let shown = self.shown_tokens.unwrap_or(0).min(self.tokens);
         let gap = self.tokens - shown;
-        self.shown_tokens = Some(shown + (gap / 3).max(gap.min(4)));
+        let next = shown + (gap / 3).max(gap.min(4));
+        // A long roll crosses several thousands in a row; arm the glint only
+        // once it has faded, so it pulses instead of staying lit.
+        self.glint = if next / 1000 > shown / 1000 && self.glint == 0 {
+            GLINT_TICKS
+        } else {
+            self.glint.saturating_sub(1)
+        };
+        self.shown_tokens = Some(next);
     }
 
     pub fn new() -> Self {
@@ -568,6 +622,9 @@ pub enum Entry {
     Done {
         verb: String,
         seconds: u64,
+        /// The tick the turn settled on; the marker cools from the accent
+        /// to the quiet ink over the next couple of seconds.
+        landed: u64,
     },
     /// `/context`: the window as a grid of cells beside a per-category
     /// legend, hanging from the command's elbow as in Claude Code.
@@ -2832,11 +2889,36 @@ impl Model {
     /// animation is on, so every event loop animates the number the same way.
     pub fn advance_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        if self.animate {
-            if let Some(working) = self.working.as_mut() {
+        // A running tool or an open prompt is work the token stream cannot
+        // see; neither is a stall.
+        let busy = self.tool_in_flight() || self.overlay.is_some() || self.decision_modal.is_some();
+        if let Some(working) = self.working.as_mut() {
+            working.watch_for_stall(busy);
+            if self.animate {
                 working.roll_tokens();
             }
         }
+    }
+
+    /// Whether a tool call of the current turn is still running: a tool line
+    /// after the latest prompt with no duration yet. Notices never count, and
+    /// a call left open by an earlier, interrupted turn does not either.
+    pub fn tool_in_flight(&self) -> bool {
+        self.transcript
+            .iter()
+            .rev()
+            .take_while(|entry| !matches!(entry, Entry::User(_)))
+            .any(|entry| {
+                matches!(
+                    entry,
+                    Entry::Tool { state, instrument, duration: None, .. }
+                        if instrument != NOTICE_INSTRUMENT
+                            && !matches!(
+                                state,
+                                State::Failed | State::Attention | State::Skipped | State::Queued
+                            )
+                )
+            })
     }
 
     /// The caret blinks at ~1s, step-end, off the same clock as the spinner.
