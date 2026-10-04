@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    runtime::{capacity::WorkerSlotCapacity, operations::OperationId},
+    runtime::{capacity::WorkerSlotCapacity, operations::OperationId, ConcurrencyPolicy},
     Agent,
 };
 use serde_json::{json, Value};
@@ -253,7 +253,15 @@ impl CodeModeBroker for AgentCodeModeBroker<'_> {
     fn call(&self, call: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
         self.live()?;
         self.require_authorized(&call.tool)?;
-        let mutating = !self.policy.resolve(&call.tool)?.read_only;
+        let capability = self.policy.resolve(&call.tool)?;
+        let mutating = !capability.read_only;
+        let max_concurrency = if matches!(&self.context.mode, CodeModeMode::ReadOnly)
+            && capability.concurrency_policy == ConcurrencyPolicy::ParallelSafe
+        {
+            self.context.limits.parallelism.max(1)
+        } else {
+            1
+        };
         super::projection::validate_json(&call.args, self.context.limits.json_depth)?;
         if !call.args.is_object()
             || super::projection::serialized_size(&call.args, self.context.limits.argument_bytes)
@@ -283,7 +291,7 @@ impl CodeModeBroker for AgentCodeModeBroker<'_> {
         // agent or admission-state locks while a child or approval waits.
         let _lane = self
             .dispatch
-            .acquire(1, || {
+            .acquire(max_concurrency, || {
                 self.context.cancellation.is_cancelled()
                     || self.agent.abort_requested()
                     || super::remaining_root_wall_ms(self.context.root_budget.as_ref()).is_err()
