@@ -144,6 +144,72 @@ fn native_root_deadline_does_not_restart_after_host_setup() {
 
 #[test]
 #[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn native_deadline_returns_when_broker_ignores_cancellation() {
+    struct NonCooperativeBroker;
+    impl CodeModeBroker for NonCooperativeBroker {
+        fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+            Ok(ToolPage {
+                tools: vec![ToolMetadata {
+                    canonical_name: "stuck_read".into(),
+                    js_name: "stuck_read".into(),
+                    description: String::new(),
+                    read_only: true,
+                }],
+                total: 1,
+                cursor: None,
+            })
+        }
+        fn describe(&self, _: &str) -> Result<serde_json::Value, CodeModeError> {
+            unreachable!()
+        }
+        fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            Ok(CodeModeToolValue {
+                text: "late".into(),
+                structured_content: None,
+                complete: true,
+                artifact: None,
+                operation_ref: "fixture-child".into(),
+            })
+        }
+    }
+
+    let host = fixture_host();
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "noncooperative-fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: "fixture".into(),
+            runtime_run_id: "fixture".into(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: "fixture".into(),
+        cancellation: Default::default(),
+        root_budget: None,
+    };
+    let started = std::time::Instant::now();
+    let outcome = host.execute(
+        &CodeModeRequest {
+            code: "return await tools.stuck_read({})".into(),
+            timeout_ms: Some(100),
+            max_output_bytes: None,
+        },
+        &context,
+        &NonCooperativeBroker,
+    );
+    assert!(!outcome.script_completed);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a non-cooperative read adapter held Codemode past its deadline: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
 fn native_deadline_remains_active_while_rust_waits_for_a_child() {
     struct WaitingBroker(davinci_agent::runtime::CancellationToken);
     impl CodeModeBroker for WaitingBroker {
