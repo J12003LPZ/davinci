@@ -67,70 +67,6 @@ impl Keybindings {
         self.bindings.get(action).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Derive composer-only defaults without changing legacy/tree mappings or disk.
-    pub fn with_voice(&self, enabled: bool) -> (Self, Option<String>) {
-        let mut effective = self.clone();
-        let voice = "davinci.voice.toggle";
-        let tools = "davinci.tools.expand";
-        if !enabled {
-            if !self.explicit.contains(voice) {
-                effective.bindings.remove(voice);
-            }
-            if !self.explicit.contains(tools) {
-                effective
-                    .bindings
-                    .insert(tools.into(), vec!["ctrl+o".into()]);
-            }
-            return (effective, None);
-        }
-        if !self.explicit.contains(voice) {
-            effective
-                .bindings
-                .insert(voice.into(), vec!["ctrl+t".into()]);
-        }
-        if !self.explicit.contains(tools) {
-            effective
-                .bindings
-                .insert(tools.into(), vec!["ctrl+o".into()]);
-        }
-        let tools_conflict = !self.explicit.contains(tools)
-            && self.bindings.iter().any(|(action, keys)| {
-                action != tools
-                    && self.explicit.contains(action)
-                    && !action.starts_with("app.tree.")
-                    && !action.starts_with("app.models.")
-                    && !action.starts_with("app.session.")
-                    && keys.iter().any(|key| key_to_bytes(key) == "\x0f")
-            });
-        if tools_conflict {
-            effective.bindings.insert(tools.into(), Vec::new());
-        }
-        let collision = effective.keys_for(voice).iter().any(|key| {
-            effective.bindings.iter().any(|(action, keys)| {
-                action != voice
-                    && !action.starts_with("app.tree.")
-                    && !action.starts_with("app.session.")
-                    && !action.starts_with("app.models.")
-                    && !action.starts_with("tui.select.")
-                    && action != "app.thinking.toggle"
-                    && keys
-                        .iter()
-                        .any(|other| key_to_bytes(other) == key_to_bytes(key))
-            })
-        });
-        if collision {
-            effective.bindings.insert(voice.into(), Vec::new());
-            return (effective,Some("Voice shortcut conflicts with an existing binding; use the mic or choose a unique voice binding".into()));
-        }
-        (
-            effective,
-            tools_conflict.then(|| {
-                "Ctrl+O is explicitly assigned; choose a tool-expansion shortcut in keybindings"
-                    .into()
-            }),
-        )
-    }
-
     pub fn matches(&self, data: &str, action: &str) -> bool {
         self.keys_for(action)
             .iter()
@@ -164,7 +100,7 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("app.suspend", &["ctrl+z"]),
         // Intentional native divergence from vendor/davinci/packages/coding-agent/
         // src/core/keybindings.ts: Shift+Tab cycles permissions, not thinking.
-        // Alt+T already expands tools with voice enabled, so thinking uses Alt+Shift+T.
+        // Keep thinking on an explicit modified chord that does not shadow tool expansion.
         ("app.permissions.cycle", &["shift+tab", "ctrl+tab"]),
         ("app.thinking.cycle", &["alt+shift+t"]),
         ("app.model.cycleForward", &["ctrl+alt+n"]),
@@ -450,32 +386,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn voice_defaults_preserve_legacy_and_explicit_shortcuts() {
-        let original = Keybindings::defaults();
-        let (keys, notice) = original.with_voice(true);
-        assert!(notice.is_none());
-        assert!(keys.matches("\x14", "davinci.voice.toggle"));
-        assert!(keys.matches("\x1b[116;5u", "davinci.voice.toggle"));
-        assert!(keys.matches("\x0f", "davinci.tools.expand"));
-        assert!(keys.matches("\x14", "app.tree.filter.noTools"));
-        assert!(keys.matches("\x14", "app.thinking.toggle"));
-        assert_eq!(keys.with_voice(false).0, original);
-        let (keys, notice) =
-            Keybindings::from_json(r#"{"tui.editor.yank":"ctrl+o"}"#).with_voice(true);
-        assert!(notice.is_some());
-        assert!(keys.keys_for("davinci.tools.expand").is_empty());
-        assert!(keys.matches("\x0f", "tui.editor.yank"));
-        for raw in [
-            r#"{"davinci.tools.expand":"ctrl+t"}"#,
-            r#"{"davinci.voice.toggle":"ctrl+p"}"#,
-        ] {
-            let (keys, notice) = Keybindings::from_json(raw).with_voice(true);
-            assert!(notice.is_some());
-            assert!(keys.keys_for("davinci.voice.toggle").is_empty());
-        }
-    }
-
-    #[test]
     fn loads_user_overrides_from_json() {
         let bindings = Keybindings::from_json(
             r#"{"app.editor.external":"ctrl+e","app.message.followUp":["ctrl+q"]}"#,
@@ -497,11 +407,7 @@ mod tests {
         );
         assert!(Keybindings::defaults().matches("\x1b[Z", "app.permissions.cycle"));
         assert!(!Keybindings::defaults().matches("\x1b[Z", "app.thinking.cycle"));
-        // Alt+T belongs to tool expansion when voice is enabled.
         assert!(Keybindings::defaults().matches("\x1b[116;4u", "app.thinking.cycle"));
-        let (voice, notice) = Keybindings::defaults().with_voice(true);
-        assert!(notice.is_none());
-        assert!(!voice.matches("\x1bt", "app.thinking.cycle"));
         assert!(Keybindings::defaults().matches("\x1b[1;5D", "tui.editor.cursorWordLeft"));
         assert!(Keybindings::defaults().matches("\x17", "tui.editor.deleteWordBackward"));
         assert!(Keybindings::defaults().matches("\x7f", "tui.editor.deleteCharBackward"));

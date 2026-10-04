@@ -18,12 +18,11 @@ CLEAN_DIFF_HASH = hashlib.sha256(b"").hexdigest()
 PACKAGES = ("davinci-agent", "davinci-ai", "davinci-client", "davinci-coding-agent",
             "davinci-evals", "davinci-mcp", "davinci-protocol", "davinci-server",
             "davinci-session", "davinci-session-sqlite", "davinci-sys", "davinci-telemetry",
-            "davinci-tui", "davinci-voice")
+            "davinci-tui")
 EXPECTED_CI_JOBS = {"quality", "contracts", "workspace-tests"} | {
     f"workspace-test ({os}, {package})"
     for os in ("ubuntu-latest", "windows-latest") for package in PACKAGES
-    if not (os == "windows-latest" and package == "davinci-voice")
-} | {f"{job} ({os})" for job in ("test-impact-native", "p12-live-browser", "voice-native")
+} | {f"{job} ({os})" for job in ("test-impact-native", "p12-live-browser")
      for os in ("ubuntu-latest", "windows-latest", "macos-latest")} | {
     "python-tests (ubuntu-latest)", "python-tests (windows-latest)"}
 

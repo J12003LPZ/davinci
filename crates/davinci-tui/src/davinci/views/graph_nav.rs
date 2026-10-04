@@ -94,7 +94,6 @@ pub fn handle_mouse(
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     if model.screen != crate::davinci::model::Screen::GraphRun
         || model.overlay.is_some()
-        || model.voice.setup
         || frame.layout.mode == super::graph_layout::GraphResponsiveMode::Structured
     {
         return false;

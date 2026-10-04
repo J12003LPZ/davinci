@@ -794,7 +794,6 @@ fn f01_native_denial_editor_requires_confirmation_and_keeps_draft() {
             .is_none());
         }
         m.paste("must not enter either buffer");
-        assert!(!m.insert_dictation("late voice", m.composer_epoch).unwrap());
         assert_eq!(
             m.approval_instructions.as_ref().unwrap().to_string(),
             "try cafe\u{301}"
@@ -928,9 +927,6 @@ fn f01_modal_numeric_focus_preserves_draft_until_enter() {
             None
         );
         m.paste("\r\npasted instruction");
-        assert!(!m
-            .insert_dictation("voice instruction", m.composer_epoch)
-            .unwrap());
         assert_eq!(m.composer.to_string(), original);
         assert_eq!(m.composer.editor().get_cursor(), cursor);
         assert_eq!(m.permission_mode, permission);
