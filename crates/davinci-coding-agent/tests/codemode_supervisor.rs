@@ -1,0 +1,272 @@
+use davinci_agent::codemode::*;
+use davinci_coding_agent::codemode_host::{
+    assets::{AssetManifest, HostAssets},
+    NodeCodeModeHost,
+};
+use std::path::Path;
+
+fn fixture_host() -> NodeCodeModeHost {
+    let root = std::env::var("DAVINCI_CODEMODE_FIXTURE_BUNDLE").unwrap();
+    let node = std::env::var("DAVINCI_CODEMODE_FIXTURE_NODE").unwrap();
+    let manifest: AssetManifest = serde_json::from_slice(
+        &std::fs::read(std::env::var("DAVINCI_CODEMODE_FIXTURE_MANIFEST").unwrap()).unwrap(),
+    )
+    .unwrap();
+    NodeCodeModeHost::new(
+        Path::new(&node),
+        HostAssets::validate(Path::new(&root), &manifest).unwrap(),
+    )
+    .unwrap()
+}
+
+struct NoTools;
+impl CodeModeBroker for NoTools {
+    fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+        Ok(ToolPage {
+            tools: vec![],
+            total: 0,
+            cursor: None,
+        })
+    }
+    fn describe(&self, _: &str) -> Result<serde_json::Value, CodeModeError> {
+        panic!("no metadata expected")
+    }
+    fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+        panic!("no calls expected")
+    }
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn native_host_executes_without_model_or_capability_access() {
+    let root = std::env::var("DAVINCI_CODEMODE_FIXTURE_BUNDLE").unwrap();
+    let node = std::env::var("DAVINCI_CODEMODE_FIXTURE_NODE").unwrap();
+    let manifest: AssetManifest = serde_json::from_slice(
+        &std::fs::read(std::env::var("DAVINCI_CODEMODE_FIXTURE_MANIFEST").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let assets = HostAssets::validate(Path::new(&root), &manifest).unwrap();
+    let host = NodeCodeModeHost::new(Path::new(&node), assets).unwrap();
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: "fixture-workspace".into(),
+            runtime_run_id: "fixture-run".into(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: "fixture-revision".into(),
+        cancellation: Default::default(),
+        root_budget: None,
+    };
+    let outcome = host.execute(
+        &CodeModeRequest {
+            code: "return 42".into(),
+            timeout_ms: Some(1000),
+            max_output_bytes: None,
+        },
+        &context,
+        &NoTools,
+    );
+    assert!(
+        matches!(outcome.status, CodeModeStatus::Completed),
+        "{outcome:?}"
+    );
+    assert!(outcome.output_text.contains("42"));
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn native_deadline_remains_active_while_rust_waits_for_a_child() {
+    struct WaitingBroker(davinci_agent::runtime::CancellationToken);
+    impl CodeModeBroker for WaitingBroker {
+        fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+            Ok(ToolPage {
+                tools: vec![ToolMetadata {
+                    canonical_name: "waiting".into(),
+                    js_name: "waiting".into(),
+                    description: String::new(),
+                    read_only: true,
+                }],
+                total: 1,
+                cursor: None,
+            })
+        }
+        fn describe(&self, _: &str) -> Result<serde_json::Value, CodeModeError> {
+            unreachable!()
+        }
+        fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+            let started = std::time::Instant::now();
+            while !self.0.is_cancelled() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "watchdog did not cancel the child"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(CodeModeError::new("CANCELLED", "fixture child cancelled"))
+        }
+    }
+    let host = fixture_host();
+    let parent = davinci_agent::runtime::CancellationToken::new();
+    let cancellation = parent.child_token();
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "waiting-fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: "fixture".into(),
+            runtime_run_id: "fixture".into(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: "fixture".into(),
+        cancellation: cancellation.clone(),
+        root_budget: None,
+    };
+    let outcome = host.execute(
+        &CodeModeRequest {
+            code: "return await tools.waiting({})".into(),
+            timeout_ms: Some(500),
+            max_output_bytes: None,
+        },
+        &context,
+        &WaitingBroker(cancellation.clone()),
+    );
+    assert!(!outcome.script_completed);
+    assert!(cancellation.is_cancelled());
+    assert!(
+        !parent.is_cancelled(),
+        "script deadline must not cancel its parent"
+    );
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn read_only_real_quickjs_records_one_parent_and_two_guarded_children() {
+    use davinci_agent::runtime::operations::*;
+    use davinci_agent::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    use serde_json::json;
+    use std::sync::Arc;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("catalog.json"),
+        r#"{"path":"items.json"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("items.json"),
+        r#"[{"id":"A","active":true},{"id":"B","active":false}]"#,
+    )
+    .unwrap();
+    let namespace = RootNamespaceId::new();
+    let sessions = tempfile::tempdir().unwrap();
+    let session =
+        davinci_session::JsonlSession::create(sessions.path(), "codemode-fixture", None).unwrap();
+    let session_id = session.header.id.clone();
+    let identity = JournalIdentity::new(
+        JournalId::new(),
+        WorkspaceIdentity {
+            id: WorkspaceId::new(),
+            binding_version: 1,
+        },
+    )
+    .unwrap();
+    let run_id = RunId::new();
+    let agent_id = AgentId::new();
+    let context = OperationContext {
+        journal_id: identity.journal_id,
+        root_namespace_id: namespace,
+        session_id: session_id.clone(),
+        runtime_run_id: run_id,
+        parent_operation_id: None,
+        agent_id,
+        worker_id: None,
+        task_id: None,
+        graph: None,
+        workspace: identity.workspace.clone(),
+        caller: CallerType::ProviderToolCall,
+        wire_tool_call_id: None,
+    };
+    let journal = Arc::new(
+        OperationJournal::open(&workspace.path().join("journal"), identity, namespace).unwrap(),
+    );
+    let operations = ToolOperationRuntime::new(
+        journal.clone(),
+        context,
+        ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap(),
+        workspace.path(),
+    )
+    .unwrap();
+    let mut agent = davinci_agent::Agent::new("local Codemode fixture");
+    agent.cwd = workspace.path().into();
+    agent.tools = vec!["read".into()];
+    agent.set_permission_mode(davinci_agent::PermissionMode::ReadOnly);
+    agent.auto_compaction = false;
+    agent.set_runtime(
+        RuntimeHandle::new(run_id, agent_id, RuntimeBus::new())
+            .with_session(session_id)
+            .with_operation_runtime(operations),
+    );
+    agent.session = Some(session);
+    agent
+        .enable_read_only_codemode(Arc::new(fixture_host()))
+        .unwrap();
+    agent.prompt("Read the fixture and return active IDs");
+    let code = r#"const first = await tools.read({path:"catalog.json"});
+        const catalog = JSON.parse(first.text);
+        const second = await tools.read({path:catalog.path});
+        return JSON.parse(second.text).filter(item => item.active).map(item => item.id);"#;
+    let mut completions = 0;
+    agent.run_loop(|_| {
+        completions += 1;
+        assert!(completions <= 2, "unexpected fixture continuation");
+        serde_json::from_value::<davinci_ai::AssistantMessage>(if completions == 1 {
+            json!({"id":"script","role":"assistant","model":"fixture","stopReason":"toolUse",
+                "content":[{"type":"toolCall","id":"real-script","name":"codemode","arguments":{"code":code}}]})
+        } else {
+            json!({"id":"done","role":"assistant","model":"fixture","stopReason":"stop",
+                "content":[{"type":"text","text":"Done"}]})
+        }).map_err(|error| error.to_string())
+    }).unwrap();
+    let message = agent
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("real-script"))
+        .unwrap();
+    assert_eq!(message.is_error, Some(false), "{message:?}");
+    let outcome = &message.extra["details"]["codemode"];
+    assert_eq!(outcome["outputText"], "[\"A\"]");
+    assert_eq!(outcome["children"].as_array().unwrap().len(), 2);
+    let snapshot = journal.snapshot().unwrap();
+    assert_eq!(snapshot.operations.len(), 3);
+    assert_eq!(
+        snapshot
+            .operations
+            .iter()
+            .filter(|operation| operation.context().parent_operation_id.is_some())
+            .count(),
+        2
+    );
+    assert_eq!(completions, 2); // Offline fixture replies, zero provider requests.
+    let entries = &agent.session.as_ref().unwrap().entries;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.custom_type.as_deref() == Some("operation_result"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        agent
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .count(),
+        1
+    );
+}

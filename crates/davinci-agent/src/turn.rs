@@ -1819,6 +1819,20 @@ impl Agent {
                 Some(&capability),
                 contract_digest.as_deref(),
             ),
+            crate::ToolOperationOrigin::CodeModeChild {
+                parent,
+                child_index,
+            } => operation_runtime.plan_codemode_child(
+                runtime.run_id,
+                runtime.agent_id,
+                session_id,
+                parent,
+                child_index,
+                name,
+                args,
+                Some(&capability),
+                contract_digest.as_deref(),
+            ),
         };
         plan.map(|plan| (operation_runtime, plan))
             .map_err(|error| format!("operation intent could not be rebuilt: {error}"))
@@ -1902,13 +1916,27 @@ impl Agent {
         if depth > 0
             && matches!(
                 name,
-                "batch" | "agent" | "propose_plan" | "ask_user_question"
+                "batch" | "codemode" | "agent" | "propose_plan" | "ask_user_question"
             )
         {
             return immediate(
                 format!("`{name}` cannot run inside a batch; call it directly."),
                 false,
             );
+        }
+        if name == "codemode" {
+            // Historical output is still a disclosure. Revocation must apply
+            // before the journal can return a completed parent result.
+            self.sync_tool_authorization();
+            if !self
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(name)
+            {
+                return immediate("Codemode authorization has been revoked.".into(), true);
+            }
         }
         let operation_runtime = self.operation_runtime_for_tool(name);
         let journal_configured = operation_runtime.is_some();
@@ -2020,6 +2048,20 @@ impl Agent {
                     parent,
                     child_index,
                 } => operation_runtime.plan_batch_child(
+                    run_id,
+                    agent_id,
+                    session_id,
+                    parent,
+                    child_index,
+                    name,
+                    args,
+                    Some(&capability),
+                    contract_digest.as_deref(),
+                ),
+                crate::ToolOperationOrigin::CodeModeChild {
+                    parent,
+                    child_index,
+                } => operation_runtime.plan_codemode_child(
                     run_id,
                     agent_id,
                     session_id,
@@ -2231,6 +2273,18 @@ impl Agent {
         name: &str,
         args: &Value,
         depth: usize,
+    ) -> crate::ToolResult {
+        self.run_prepared_call_with_structured(cwd, id, name, args, depth, None)
+    }
+
+    fn run_prepared_call_with_structured(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        depth: usize,
+        mut structured: Option<&mut Option<Value>>,
     ) -> crate::ToolResult {
         let name = self.canonical_tool_name(name);
         let pending = self
@@ -2453,6 +2507,8 @@ impl Agent {
                         details: None,
                     },
                 }
+            } else if name == "codemode" && depth == 0 {
+                self.run_codemode(id, args, parent_operation_id)
             } else if name == "batch" && depth == 0 {
                 self.run_batch_with_parent_operation(cwd, id, args, parent_operation_id)
             } else {
@@ -2592,6 +2648,30 @@ impl Agent {
                         }
                     })
                     .map_err(crate::tools::ToolError::Failed)
+                } else if structured.is_some() && name.starts_with("mcp__") {
+                    match context.mcp.resolve_tool(name) {
+                        Some((server, tool)) => {
+                            context.mcp.call_full(&server, &tool, args).map(|full| {
+                                let unsupported = full.content.iter().any(|block| {
+                                    block.kind != "text"
+                                        && !(block.kind == "resource" && block.resource.as_ref()
+                                            .is_some_and(|resource| resource.get("text").is_some_and(Value::is_string)
+                                                && resource.get("blob").is_none()))
+                                });
+                                if let Some(target) = structured.as_mut() {
+                                    **target = if unsupported { None } else { full.structured_content.clone() };
+                                }
+                                crate::ToolResult {
+                                    content: if unsupported {
+                                        "MCP result contains unsupported content; no authorized artifact is available".into()
+                                    } else { full.text() },
+                                    is_error: unsupported || full.is_error.unwrap_or(false),
+                                    details: unsupported.then(|| serde_json::json!({"codemode_incomplete":true})),
+                                }
+                            })
+                        }
+                        None => Err(crate::tools::ToolError::Unknown(name.into())),
+                    }
                 } else {
                     execute_tool_with(cwd, name, args, &context)
                 };
@@ -2979,10 +3059,34 @@ impl Agent {
         id: &str,
         name: &str,
         args: &Value,
-        mut result: crate::ToolResult,
+        result: crate::ToolResult,
     ) -> (ChatMessage, Vec<AgentEvent>) {
+        let result = self.finalize_tool_result(cwd, id, name, args, result);
+        self.emit_tool_result(id, name, args, result)
+    }
+
+    pub(crate) fn finalize_tool_result(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        result: crate::ToolResult,
+    ) -> crate::ToolResult {
+        self.finalize_tool_result_for_delivery(cwd, id, name, args, result, None)
+    }
+
+    fn finalize_tool_result_for_delivery(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        mut result: crate::ToolResult,
+        structured: Option<&mut Option<Value>>,
+    ) -> crate::ToolResult {
         let name = self.canonical_tool_name(name);
-        let terminal_markers = ["denied", "cancelled"].map(|key| {
+        let terminal_markers = ["denied", "cancelled", "codemode_incomplete"].map(|key| {
             (
                 key,
                 result
@@ -3033,9 +3137,34 @@ impl Agent {
                 .unwrap_or(false);
         let pre_hook_error = result.is_error;
         let pre_hook_result = result.clone();
+        let codemode_facts = (name == "codemode")
+            .then(|| crate::codemode::mandatory_facts(&result))
+            .flatten();
         if !storage_failure {
-            if let Some(hook) = &self.post_tool {
+            if let Some(structured) = structured {
+                if let Some(hook) = &self.script_post_tool {
+                    (result, *structured) =
+                        (hook.0)(id, cwd, name, args, result, structured.take());
+                } else if let Some(hook) = &self.post_tool {
+                    result = (hook.0)(id, cwd, name, args, result);
+                    // Legacy text-only hooks cannot authorize the independent channel.
+                    *structured = None;
+                }
+            } else if let Some(hook) = &self.post_tool {
                 result = (hook.0)(id, cwd, name, args, result);
+            }
+        }
+        if name == "codemode" {
+            result.is_error |= pre_hook_error;
+            if let Some(facts) = codemode_facts {
+                if result.content != pre_hook_result.content {
+                    append_harness_note(&mut result, &format!("Codemode execution facts: {facts}"));
+                }
+                let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+                if !details.is_object() {
+                    *details = serde_json::json!({});
+                }
+                details["codemode_facts"] = facts;
             }
         }
         // Output decoration cannot turn an undispatched operation into success.
@@ -3087,7 +3216,102 @@ impl Agent {
         if operation_result_committed {
             self.cache_operation_presentation(id, result.clone());
         }
-        self.emit_tool_result(id, name, args, result)
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_script_child(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        parent: Option<crate::runtime::operations::OperationId>,
+        ordinal: usize,
+    ) -> (crate::ToolResult, Option<Value>, String) {
+        let origin = parent
+            .map(|parent| crate::ToolOperationOrigin::CodeModeChild {
+                parent,
+                child_index: ordinal,
+            })
+            .unwrap_or(crate::ToolOperationOrigin::ProviderCall);
+        let mut structured = None;
+        let preparation = self.prepare_tool_call_with_origin(cwd, id, name, args, 1, origin);
+        let operation_ref = self
+            .pending_tool_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .map(|pending| pending.admitted.spec.operation_id().to_string())
+            .or_else(|| {
+                let runtime = self.runtime.as_ref()?;
+                let snapshot = runtime
+                    .operations
+                    .as_ref()?
+                    .dispatcher()
+                    .journal()
+                    .snapshot()
+                    .ok()?;
+                let wire_id = parent
+                    .map(|parent| format!("{parent}#codemode:{ordinal}"))
+                    .unwrap_or_else(|| id.to_owned());
+                snapshot
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        let context = operation.context();
+                        context.wire_tool_call_id.as_deref() == Some(wire_id.as_str())
+                            && context.runtime_run_id == runtime.run_id
+                            && context.agent_id == runtime.agent_id
+                            && context.parent_operation_id == parent
+                    })
+                    .map(|operation| operation.operation_id().to_string())
+            })
+            .unwrap_or_else(|| format!("ephemeral:{id}"));
+        let mut result = match preparation {
+            Preparation::Immediate(result) => result,
+            Preparation::Wait { call_id, .. } => self.wait_for_tool_call(&call_id),
+            Preparation::Ready { .. } => self.run_prepared_call_with_structured(
+                cwd,
+                id,
+                name,
+                args,
+                1,
+                Some(&mut structured),
+            ),
+        };
+        if !result.is_error
+            && structured.is_none()
+            && result.details.as_ref().is_some_and(|details| {
+                ["replayed_from_ledger", "replayed_from_operation_journal"]
+                    .iter()
+                    .any(|key| details.get(key) == Some(&Value::Bool(true)))
+            })
+        {
+            // Cached model delivery does not establish exact script data. Do not
+            // rerun the adapter or claim that a digest is a complete result.
+            result.is_error = true;
+            result.content = "Exact script data is unavailable from the cached delivery; no authorized artifact is available. Refine or page the source explicitly.".into();
+            let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+            if !details.is_object() {
+                *details = serde_json::json!({});
+            }
+            details["codemode_incomplete"] = Value::Bool(true);
+        }
+        let result = self.finalize_tool_result_for_delivery(
+            cwd,
+            id,
+            name,
+            args,
+            result,
+            Some(&mut structured),
+        );
+        // A legacy hook cannot establish that its redaction covers independent
+        // structured fields. Never deliver that unproven channel to a script.
+        if result.is_error {
+            structured = None;
+        }
+        (result, structured, operation_ref)
     }
 
     pub(crate) fn record_shell_verification_start(
@@ -4268,8 +4492,11 @@ impl Agent {
             return Ok(None);
         }
 
-        let is_batch_child = ready.caller == CallerType::BatchToolCall;
-        let presentation = if is_batch_child {
+        let is_nested_child = matches!(
+            ready.caller,
+            CallerType::BatchToolCall | CallerType::CodeModeToolCall
+        );
+        let presentation = if is_nested_child {
             if let Some(presentation) = cached_presentation {
                 presentation
             } else {
@@ -4350,7 +4577,7 @@ impl Agent {
             raw
         };
 
-        let recovered_message = (!is_batch_child && current_message.is_none()).then(|| {
+        let recovered_message = (!is_nested_child && current_message.is_none()).then(|| {
             let mut message = tool_result_message(
                 &ready.tool_call_id,
                 tool_name,
@@ -4368,7 +4595,7 @@ impl Agent {
         let presentation_digest = PayloadDigest::of_json(&presentation_value)
             .map_err(|error| format!("operation presentation digest failed: {error}"))?;
         let mut entry = davinci_session::SessionEntry::message(
-            if is_batch_child {
+            if is_nested_child {
                 "operation_result"
             } else {
                 "toolResult"
@@ -4376,7 +4603,7 @@ impl Agent {
             Value::Null,
         );
         entry.message = Some(presentation_value.clone());
-        if is_batch_child {
+        if is_nested_child {
             entry.entry_type = "custom".into();
             entry.custom_type = Some("operation_result".into());
         }
@@ -4494,14 +4721,18 @@ impl Agent {
         };
 
         if ready.caller == crate::runtime::operations::CallerType::ProviderToolCall
-            && message.tool_name.as_deref() == Some("batch")
+            && matches!(message.tool_name.as_deref(), Some("batch" | "codemode"))
         {
             let mut children = Vec::new();
             for candidate in &pending {
                 let child = Self::decode_operation_outbox(candidate)?;
                 if child.session_id == session_id
                     && child.parent_operation_id == Some(ready.operation_id)
-                    && child.caller == crate::runtime::operations::CallerType::BatchToolCall
+                    && matches!(
+                        child.caller,
+                        crate::runtime::operations::CallerType::BatchToolCall
+                            | crate::runtime::operations::CallerType::CodeModeToolCall
+                    )
                 {
                     children.push((candidate.clone(), child));
                 }
@@ -4547,12 +4778,15 @@ impl Agent {
             }
             for outbox in pending {
                 let ready = Self::decode_operation_outbox(&outbox)?;
-                let presentation =
-                    if ready.caller == crate::runtime::operations::CallerType::BatchToolCall {
-                        self.operation_presentation(&ready.tool_call_id)
-                    } else {
-                        None
-                    };
+                let presentation = if matches!(
+                    ready.caller,
+                    crate::runtime::operations::CallerType::BatchToolCall
+                        | crate::runtime::operations::CallerType::CodeModeToolCall
+                ) {
+                    self.operation_presentation(&ready.tool_call_id)
+                } else {
+                    None
+                };
                 if let Some(message) = self.project_operation_result(
                     &ready,
                     Some(&outbox),

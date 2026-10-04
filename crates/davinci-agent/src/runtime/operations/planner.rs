@@ -111,6 +111,31 @@ impl ToolOperationPlanner {
         Self::plan(context, key, tool, args, capability, contract_digest)
     }
 
+    pub fn codemode_child(
+        mut context: OperationContext,
+        parent_operation_id: super::OperationId,
+        child_index: usize,
+        tool: &str,
+        args: &Value,
+        capability: Option<&RuntimeCapability>,
+        contract_digest: Option<&str>,
+    ) -> Result<PlannedToolOperation, ToolOperationPlanError> {
+        if child_index == 0 {
+            return Err(ToolOperationPlanError::InvalidBatchChildIndex);
+        }
+        if tool.trim().is_empty() {
+            return Err(ToolOperationPlanError::EmptyToolName);
+        }
+        context.caller = CallerType::CodeModeToolCall;
+        context.parent_operation_id = Some(parent_operation_id);
+        context.wire_tool_call_id = Some(format!("{parent_operation_id}#codemode:{child_index}"));
+        let key = ScopedIdempotencyKey::new(
+            IdempotencyScope::CodeModeChild,
+            format!("{parent_operation_id}:{child_index}"),
+        )?;
+        Self::plan(context, key, tool, args, capability, contract_digest)
+    }
+
     /// Whether a journaled call of this capability holds an effect claim while
     /// it runs. Claimed operations conflict with each other in the journal,
     /// so the scheduler must not overlap them.

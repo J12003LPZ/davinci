@@ -1316,6 +1316,18 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.set_active_contract(contract);
     }
     attach_tool_executor(&mut agent, &host);
+    // Worker agents retain the default-off feature and their inherited tool ceiling.
+    if graph_worker.is_none() {
+        if let Some(config) = davinci_coding_agent::codemode_host::config::resolve_config(
+            parsed.codemode.as_deref(),
+            settings.codemode.as_ref(),
+        )? {
+            let codemode = config.admit(cwd)?;
+            agent
+                .enable_read_only_codemode(Arc::new(codemode))
+                .map_err(|error| error.message)?;
+        }
+    }
     host.emit(ExtensionEvent::SessionStart);
     let _ = host.describe_js();
     apply_resolved_models(parsed, &mut agent)?;
@@ -3051,8 +3063,13 @@ fn complete_prompt_with_host(
     let post_plugin_hooks = plugin_hooks.clone();
     let post_plugin_base = plugin_hook_base.clone();
     let session_path = agent.session.as_ref().map(|session| session.path.clone());
-    agent.post_tool = Some(davinci_agent::PostToolHook(Arc::new(
-        move |tool_call_id, cwd, name, args, result| {
+    let structured_hooks_absent = post_hooks.post_tool.is_empty()
+        && post_hooks.post_tool_failure.is_empty()
+        && post_hooks.rules.is_empty()
+        && !post_plugin_hooks
+            .has_hooks(davinci_coding_agent::plugins::hooks::HookEvent::PostToolUse);
+    let safety_post =
+        davinci_agent::PostToolHook(Arc::new(move |tool_call_id, cwd, name, args, result| {
             // A call the gate refused never ran: no post hook, and the row
             // says `denied` so the ledger does not count it as a tool run.
             let denied = result
@@ -3075,7 +3092,7 @@ fn complete_prompt_with_host(
                 .and_then(|details| details.get("preToolBlocked"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let result = if denied || pre_blocked {
+            if denied || pre_blocked {
                 result
             } else {
                 // Reuse the runtime identity for the hook stdin contract;
@@ -3104,11 +3121,35 @@ fn complete_prompt_with_host(
                     result,
                 );
                 run_plugin_post_tool(&post_plugin_hooks, &post_plugin_base, name, args, result)
-            };
+            }
+        }));
+    let model_safety = safety_post.clone();
+    let script_host = post_host.clone();
+    agent.post_tool = Some(davinci_agent::PostToolHook(Arc::new(
+        move |id, cwd, name, args, result| {
+            let result = (model_safety.0)(id, cwd, name, args, result);
             match post_host.lock() {
                 Ok(host) => host.native_after_tool(name, args, result),
                 Err(_) => result,
             }
+        },
+    )));
+    agent.script_post_tool = Some(davinci_agent::ScriptPostToolHook(Arc::new(
+        move |id, cwd, name, args, result, structured| {
+            let result = (safety_post.0)(id, cwd, name, args, result);
+            if let Ok(host) = script_host.lock() {
+                host.native_after_script_tool(name);
+            }
+            // Existing external hooks only see text. Independent structured data
+            // requires a hook contract that can authorize both channels.
+            (
+                result,
+                if structured_hooks_absent {
+                    structured
+                } else {
+                    None
+                },
+            )
         },
     )));
     if stream_json {

@@ -1,6 +1,6 @@
 # Codemode fixture boundary
 
-Baseline: `08bf0038a40c469e57a5f12c9d753e580b198e0b`. No local checkout, dirty-state, or local Rust execution is claimed: repository inspection and writes use GitHub, and tests use GitHub Actions. Rust is pinned to 1.83.0. Default coding-agent features are empty; `test-fixtures`, `interaction-testing`, and `experimental-ipc` remain explicit.
+Historical baseline: `08bf0038a40c469e57a5f12c9d753e580b198e0b`. Current execution uses the existing feature branch reconciled with main `518ce448`; native Windows fixture checks run locally. Rust is pinned to 1.83.0. Default coding-agent features are empty; `test-fixtures`, `interaction-testing`, and `experimental-ipc` remain explicit. The adjacent approved plan and execution record distinguish current implementation from accepted gates.
 
 ## Current production ownership
 
@@ -10,7 +10,7 @@ Baseline: `08bf0038a40c469e57a5f12c9d753e580b198e0b`. No local checkout, dirty-s
 - Direct publication: `finalize_tool_call`; batch publication: `run_batch_with_parent_operation` in `batch.rs`. Both run post-hooks, mutation/verification observation, receipt handling and journal-presentation caching. These are the seams to consolidate, not bypass
 - Scheduling: `scheduler::run_lanes_with_cancel`, normal root/lane controls, and supervisor ownership. Read parallelism does not authorize parallel writes
 - Operation identities: `ToolOperationOrigin` in `lib.rs`; `ToolOperationPlanner`, `ToolOperationRuntime`, and `ToolOperationDispatcher` under `runtime/operations/`. The existing journal remains the sole authority
-- MCP projection: `McpRegistry::call` currently projects `result.text()` and `is_error`, dropping structured data. `davinci-mcp/src/types.rs` does not retain `structuredContent` or `outputSchema`. Supervised MCP ownership is `davinci-agent/src/mcp/sandboxed.rs`
+- MCP projection: ordinary `McpRegistry::call` preserves its existing text/error contract. The crate-private full-result path retains `structuredContent` and `outputSchema` for guarded script delivery. Supervised MCP ownership is `davinci-agent/src/mcp/sandboxed.rs`.
 - Governor: `TokenGovernor::after_tool`, `retrieve`, and `retrieve_artifact` in `native_extensions/token_governor.rs`; host integration through `extension_host::native_before_tool/native_after_tool`
 - Durable entry construction: `runtime_host::attach_operation_runtime` and `configure_session_workflow`. Sessionless use stays ephemeral
 - Packaging owners: `scripts/install.sh`, `scripts/install-davinci.ps1`, `scripts/release_identity.py`, and the existing CI/release workflows. Cargo-only installation must stay valid

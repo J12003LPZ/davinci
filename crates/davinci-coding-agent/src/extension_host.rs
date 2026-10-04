@@ -575,6 +575,12 @@ impl ExtensionHost {
         }
     }
 
+    pub fn native_after_script_tool(&self, name: &str) {
+        if let Ok(mut native) = self.native.lock() {
+            native.after_script_tool(name);
+        }
+    }
+
     /// Retrieve a bounded, untrusted memory block for the active prompt.
     /// Retrieval is deliberately best-effort: unavailable local/remote
     /// indexes must never make a normal prompt fail.

@@ -3,6 +3,7 @@
 pub mod apply_patch;
 pub mod approval;
 pub mod cache_stability;
+pub mod codemode;
 pub mod decisions;
 pub mod delegation;
 pub mod host_operation;
@@ -178,6 +179,20 @@ type CustomToolFn = dyn Fn(&Path, &str, &Value, Option<&ToolContext>) -> Result<
     + Sync;
 type PreToolFn = dyn Fn(&str, &Value) -> Option<String> + Send + Sync;
 type PostToolFn = dyn Fn(&str, &Path, &str, &Value, ToolResult) -> ToolResult + Send + Sync;
+type ScriptPostToolFn = dyn Fn(&str, &Path, &str, &Value, ToolResult, Option<Value>) -> (ToolResult, Option<Value>)
+    + Send
+    + Sync;
+
+/// Trusted script delivery hook. Receives both channels so redaction can cover
+/// structured data without applying model-only presentation transformations.
+#[derive(Clone)]
+pub struct ScriptPostToolHook(pub Arc<ScriptPostToolFn>);
+
+impl std::fmt::Debug for ScriptPostToolHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScriptPostToolHook")
+    }
+}
 
 /// Blocks a tool call when the hook returns a reason (TS `tool_call` `{ block: true }`).
 #[derive(Clone)]
@@ -373,6 +388,10 @@ pub(crate) enum ToolOperationOrigin {
         parent: crate::runtime::operations::OperationId,
         child_index: usize,
     },
+    CodeModeChild {
+        parent: crate::runtime::operations::OperationId,
+        child_index: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -448,6 +467,7 @@ impl std::fmt::Debug for AutoSandboxResolverHandle {
 
 #[derive(Debug, Clone)]
 pub struct Agent {
+    pub(crate) codemode: Option<codemode::CodeModeBinding>,
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
@@ -504,6 +524,7 @@ pub struct Agent {
     pub custom_tool_executor: Option<CustomToolExecutor>,
     pub pre_tool: Option<PreToolHook>,
     pub post_tool: Option<PostToolHook>,
+    pub script_post_tool: Option<ScriptPostToolHook>,
     /// Trusted host callback at attempted completion; bool is stop_hook_active.
     pub completion_hook: Option<CompletionHook>,
     /// Which tools may run without asking (`permission.rs`). Shared, because
@@ -706,8 +727,10 @@ impl Agent {
             // TS `runtimeOptions.toolExecution ?? "parallel"`.
             tool_execution_mode: ToolExecutionMode::Parallel,
             custom_tool_executor: None,
+            codemode: None,
             pre_tool: None,
             post_tool: None,
+            script_post_tool: None,
             completion_hook: None,
             permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,

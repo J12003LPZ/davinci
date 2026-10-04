@@ -467,6 +467,29 @@ impl ToolOperationRuntime {
             contract_digest,
         )
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_codemode_child(
+        &self,
+        run_id: RunId,
+        agent_id: AgentId,
+        session_id: Option<&str>,
+        parent: OperationId,
+        child_index: usize,
+        tool: &str,
+        args: &Value,
+        capability: Option<&RuntimeCapability>,
+        contract_digest: Option<&str>,
+    ) -> Result<PlannedToolOperation, ToolOperationPlanError> {
+        ToolOperationPlanner::codemode_child(
+            self.context_for(run_id, agent_id, session_id),
+            parent,
+            child_index,
+            tool,
+            args,
+            capability,
+            contract_digest,
+        )
+    }
 }
 
 fn now() -> Timestamp {

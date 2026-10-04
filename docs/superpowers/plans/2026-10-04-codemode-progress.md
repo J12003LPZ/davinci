@@ -4,9 +4,9 @@ Plan: [2026-10-04-codemode.md](2026-10-04-codemode.md)
 
 ## Baseline and scope
 
-- Source baseline: `08bf0038a40c469e57a5f12c9d753e580b198e0b` (current `main`, verified 2026-10-04)
-- Dedicated branch: `feat/codemode-sandbox`; all repository work uses the GitHub plugin and GitHub Actions. No local checkout or local execution is used
-- PRs #89 and #90 are merged into this baseline. Concurrent #91 (`remove-typesafe-jev`) is not merged and is not modified by this work
+- Main baseline: `518ce4489275246594978cbbab87b4dae2b40a0b`, reconciled by merge `dabd61ea` on the existing `feat/codemode-sandbox` branch.
+- Sole delivery PR: #92. Work uses the disposable local checkout and native Windows fixture execution. CI errors are nonblocking under the user's continuation instruction.
+- PR #91 is merged. Its removal of TypeSafe/Jev is preserved.
 - Rust remains 1.83.0 with current exact Rust dependency pins. Core defaults, subscription authentication, selected model/effort/tier, and installed binaries remain unchanged
 - Only fixture-based execution is authorized. No live provider/subscription probes, merge, release, credentials, or installed-binary changes
 - No nested AGENTS.md was found outside the vendored tree; root AGENTS.md applies
@@ -15,17 +15,17 @@ Plan: [2026-10-04-codemode.md](2026-10-04-codemode.md)
 
 | Task | Status | Evidence / gate |
 | --- | --- | --- |
-| C00 baseline and fixtures | In progress | Source seams inspected; focused baseline CI and new fixtures pending |
-| C01 dependency admission | Not started | Published artifacts, exact maintained Node runtime, complete lock/integrity, advisories, and platform smoke tests required |
-| C02 bounded host protocol | Not started | C01 admission required |
-| C03 structured MCP | Not started | C00 fixture boundary required |
-| C04 guarded child dispatch | Not started | C02 contracts and C03 required |
-| C05 safe script projection | Not started | C03/C04 required |
-| C06 opt-in read-only slice | Not started | C02/C04/C05 required |
-| C07 controlled execution | Not started | C06 required |
-| C08 recovery | Not started | C07 required; controlled mode must remain unavailable until this gate |
-| C09 supported surfaces | Not started | C06/C08 required |
-| C10 accounting and evidence | Not started | C05/C08/C09 required |
+| C00 baseline and fixtures | Implemented and tested | 111 focused tests and successful historical native-platform runs |
+| C01 dependency admission | Partial | Exact lock recovered; core bundle, trusted manifest and component notices implemented; new adapter platform admission pending |
+| C02 bounded host protocol | Partial | Worker collection cap, framing, fresh VM and Rust supervisor implemented; complete lifecycle/protocol gates pending |
+| C03 structured MCP | Partial | Typed retention, internal accessor, live schema lookup and guarded child seam implemented; complete delivery acceptance pending |
+| C04 guarded child dispatch | Partial | Broker reuses real admission/dispatch/hooks and sole journal; concurrency and all authority gates pending |
+| C05 safe script projection | Partial | Trusted delivery hook separates safety from Governor; bounded projection implemented; complete artifact/rehydration gates pending |
+| C06 opt-in read-only slice | Implemented; acceptance partial | CLI/user-only settings, SDK host injection and real QuickJS two-child execution passed on native Windows; full surface/recovery/platform gates pending |
+| C07 controlled execution | Partial internal dispatch | Guarded mutation and denial fixtures passed; operator-controlled mode remains unavailable pending C08 |
+| C08 recovery | Partial groundwork | Broker closes admission on durable unresolved effects; parent lifecycle/recovery gates pending; controlled tool remains unavailable |
+| C09 supported surfaces | Partial | CLI, user-only settings and SDK injection implemented; remaining surface gates pending |
+| C10 accounting and evidence | Partial groundwork | Durable nested publication and protected status/lineage facts implemented; expanded progress/accounting pending |
 | C11 comparative fixtures | Not started | C10 required; live campaign remains unrun |
 | C12 platform/release gates | Not started | All earlier gates and independent branch review required |
 
@@ -36,12 +36,26 @@ Plan: [2026-10-04-codemode.md](2026-10-04-codemode.md)
 - C03 -> C05: MCP structured data must use an internal host-owned channel; `ToolResult.details` is model/UI-visible and includes reserved host bookkeeping
 - C04 -> C07/C08: reuse journal-before-effect ordering and current permission rechecks. No parent lock may be held while awaiting children; no script replay is permitted
 - C05 -> C10: reserve host-authored failure/recovery facts before output truncation and the final Governor pass
-- Ruling: use a dedicated remote branch and GitHub Actions instead of a local worktree/test runner because the user explicitly requested GitHub-plugin-only execution. Exact-head CI replaces local test evidence, without claiming local or installed-binary validation
+- Historical ruling: early work used GitHub-only execution. The continuation now uses local fixture execution and treats CI errors as nonblocking; see the current baseline above.
 - Ruling: retain this execution record next to the approved plan to preserve progress across remote commits. No alternate roadmap or product scope is introduced
 
 ## Actual verification
 
-Source inspection only so far. No test completion, package admission, platform support, performance improvement, or release readiness is claimed.
+Historical runs 37223771440 and 37223776122 passed at 4716c00. Current native Windows checks: 47 Node package/adapter/framing/host tests; zero known vulnerabilities from npm audit; 13 Rust contract/policy/projection tests; 18 shared Codemode dispatcher regressions; three structured MCP accessor/delivery tests; nine journal-publication tests; three real supervisor tests (constant, two real guarded children, deadline during child wait); and the Governor lossless regression. Library and coding-agent binary Clippy passed. Trusted bundle v7 contains 36 assets, and all 19 repository-owned staged asset hashes match the manifest. Complete feature and final platform acceptance remain pending.
+
+## Current continuation (supersedes historical baseline and workflow)
+
+- Main 518ce4489275246594978cbbab87b4dae2b40a0b was merged into the existing feat/codemode-sandbox branch. PR #91 removal of TypeSafe/Jev is preserved; PR #92 remains the sole delivery PR.
+- Current execution uses a disposable local checkout and native Windows fixture tests. The user directs CI errors to be non-blocking. Local safety checks remain required. No live subscription execution is authorized.
+- Work and review remain solo under the user's instruction, superseding skill recommendations for delegated review.
+- The required collection adapter checks guest string length before conversion, then enforces a shared UTF-8 text/console/return budget of 1,048,576 bytes. Exhaustion is terminal even when guest code catches it; subsequent capability calls are blocked. Images are rejected before collection. Tests failed against the published worker before passing against the adapter. Explicit read-only opt-in now exposes guarded capabilities; controlled operator mode remains unavailable.
+- Packaging refinement announced before implementation: retain the core engine and required notices, omit unused extension binaries, and preserve the original complete platform inventories as admission evidence.
+- Rust admission checks trusted manifest identities, streaming hashes, complete inventories, path traversal, workspace overrides, symlinks and Windows reparse points. Tests first failed for the missing module, then all ten passed.
+- The build-time packager emits a complete 36-file core inventory outside the runtime bundle. The Rust executable embeds the trusted manifest. Pi, engine, WASI libc components, allocator notices, LLVM and compiler-rt notices are retained with pinned provenance. Runtime never installs npm packages.
+- Script serialization builds validated snapshots using captured intrinsics. Sparse arrays, unsupported values, unsafe numbers, accessor properties and cycles fail before dispatch. Proxy getters and guest prototype serializers cannot alter validated arguments. The collector cap is enforced before worker messages retain output.
+- The guarded broker validates the host-created workspace/run/parent binding, requires the existing operation journal, freezes capabilities, rejects aliases/duplicates/orchestrators, and enforces call/result/metadata budgets. Child origins use a distinct journal caller and idempotency scope. A projection failure records a failed child with the actual operation reference.
+- The shared result owner runs authoritative script hooks on both text and structured channels without model presentation. Main preserves normal Governor delivery; script delivery invalidates native engineering state and skips Governor. Legacy text-only hooks drop independent structured content. Unsupported MCP content returns an explicit incomplete-data error rather than being described as complete text.
+- Read-only Codemode is registered through the real dispatcher, exposed by explicit SDK opt-in or --codemode read-only with user-controlled absolute paths. Off ignores unused paths and performs no host probe. Controlled CLI mode is explicitly unavailable until recovery gates pass. C06–C12 are not fully accepted. No final-head Linux/macOS adapter run, live subscription benchmark, installed-binary change, merge or release is claimed.
 
 ## C00 first CI observations
 
@@ -72,3 +86,22 @@ Source inspection only so far. No test completion, package admission, platform s
 - Implemented the crate-private full-result seam and made ordinary `call` project it through the unchanged text/error/details contract. RPC tool errors stay errors with bounded caller projection later; broken transports still drop the server. No server field is copied into host bookkeeping
 - Internal and supervised-adapter tests, unchanged direct/batch/Governor behavior, and full CI are pending on this implementation commit. This component does not expose Codemode or bypass the dispatch path
 - C01 CI now records every installed package asset hash and available license text in addition to the exact lock, runtime, advisory report and sandbox smoke fixtures. An evidence report is not a trusted/admitted runtime manifest
+
+## Read-only vertical slice continuation
+
+- Native Windows real QuickJS fixture returned filtered IDs after two actual reads through Rust admission. One parent and two child journal operations were recorded. Fixture replies made zero provider requests.
+- A separately owned host watchdog cancels the script token and kills its host while a cooperative Rust child is waiting; its native fixture passed. The script token is a child of the parent cancellation token. Noncooperative adapter cleanup still requires acceptance evidence.
+- Owner settings alone supply mode/nodePath/hostPath; project settings cannot change this configuration. Four CLI/configuration tests passed.
+- Mutation fixtures confirmed normal permissions, zero effects on denial, no duplicate replay, and retained durable references for pre-start denials. Controlled mode remains unexposed.
+- Bounded Rust serialization now counts bytes without allocating an unbounded JSON buffer. Empty source and option-header directives fail before host launch.
+
+## Read-only safety continuation
+
+- Native Windows real QuickJS execution passed with two durable custom child entries and one provider-visible parent result. The first child-publication assertion failed (zero child entries); nested journal publication now includes Codemode children while preserving existing batch behavior. All nine operation_publication integration tests passed.
+- Tool-wide denies now suppress broker search, describe and execution. The initial authorized snapshot remains a ceiling after later permission grants. Regression failed before the discovery fix and passed afterward.
+- Presentation hooks cannot turn failed Codemode into success or remove host-authored status and operation lineage; protected facts omit child text and error messages so redactions remain effective. Regression failed before the protection and passed afterward.
+- Cached child delivery without exact structured data returns explicit incomplete-data/storage-unavailable status and never reruns the adapter automatically. Regression failed before the change and passed afterward.
+- All 17 Codemode baseline regressions passed; the Governor lossless regression including Codemode passed; agent and coding-agent library Clippy passed after these changes. Controlled mode, complete artifact access, bounded concurrent read admission, the crash matrix, expanded accounting and final platform acceptance remain pending.
+
+- Completed parent replay executes the host only once; changed script payload collides. Revoking the parent tool blocks historical result disclosure before journal replay. The revocation assertion failed before the pre-replay check and passed afterward. Scoped child-source access on historical parent replay still requires its acceptance gate.
+- Current remote main is e890609bb147030aa1495d86ed3aedfe78d07578 (PR93 microphone removal); reconciliation into this branch is next. Packaging commit 73302afa preserves exact license bytes and LF runtime scripts; local Git hooks ran using Git Bash after the default Bash resolver selected unavailable WSL. No hook was disabled.

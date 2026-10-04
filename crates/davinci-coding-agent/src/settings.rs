@@ -174,6 +174,9 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    /// User-controlled only. Unused configuration remains opaque in Off mode.
+    #[serde(default)]
+    pub codemode: Option<serde_json::Value>,
     #[serde(
         default,
         rename = "browserVerification",
@@ -1094,6 +1097,10 @@ pub fn load_merged_settings_with_override(
         enforce_learning_user_boundary(&global, deep_merge_json(global_value.clone(), project));
     // Project trust does not authorize increased subscription consumption.
     if let Some(object) = merged.as_object_mut() {
+        object.remove("codemode");
+        if let Some(value) = global_value.get("codemode") {
+            object.insert("codemode".into(), value.clone());
+        }
         object.remove("serviceTier");
         if let Some(value) = global_value.get("serviceTier") {
             object.insert("serviceTier".into(), value.clone());

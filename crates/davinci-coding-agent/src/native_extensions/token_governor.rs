@@ -1852,7 +1852,7 @@ mod tests {
             .map(|n| format!("{n}: fn line_{n}() {{}}"))
             .collect::<Vec<_>>()
             .join("\n");
-        for tool in ["read", "edit", "write", "batch", "agent"] {
+        for tool in ["read", "edit", "write", "batch", "agent", "codemode"] {
             let result =
                 governor.after_tool(tool, &json!({"path": format!("{tool}.rs")}), ok(&big));
             assert_eq!(result.content, big, "{tool} must stay verbatim");

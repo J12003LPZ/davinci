@@ -67,6 +67,537 @@ fn configured_agent() -> (Agent, tempfile::TempDir, Arc<OperationJournal>) {
     (agent, workspace, journal)
 }
 
+#[test]
+fn codemode_child_uses_real_admission_and_post_hook() {
+    let (mut agent, workspace, journal) = configured_agent();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let pre = trace.clone();
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |_, _| {
+        pre.lock().unwrap().push("pre");
+        None
+    })));
+    let post = trace.clone();
+    agent.post_tool = Some(PostToolHook(Arc::new(move |_, _, _, _, mut result| {
+        post.lock().unwrap().push("post");
+        result.content = "sanitized".into();
+        result
+    })));
+    let (result, structured, _) = agent.dispatch_script_child(
+        workspace.path(),
+        "script#1",
+        "read",
+        &json!({"path":"input.txt"}),
+        None,
+        1,
+    );
+    assert_eq!(result.content, "sanitized");
+    assert!(structured.is_none());
+    assert_eq!(*trace.lock().unwrap(), vec!["pre", "post"]);
+    assert_eq!(journal.snapshot().unwrap().operations.len(), 1);
+}
+
+#[test]
+fn denied_codemode_child_has_zero_effects() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent.pre_tool = Some(PreToolHook(Arc::new(|_, _| Some("denied fixture".into()))));
+    let (result, _, _) = agent.dispatch_script_child(
+        workspace.path(),
+        "script#1",
+        "write",
+        &json!({"path":"forbidden.txt","content":"effect"}),
+        None,
+        1,
+    );
+    assert!(result.is_error);
+    assert!(!workspace.path().join("forbidden.txt").exists());
+}
+
+struct ReadOnlyFixtureHost;
+struct CountedReadOnlyFixtureHost(Arc<std::sync::atomic::AtomicUsize>);
+impl crate::codemode::CodeModeHost for CountedReadOnlyFixtureHost {
+    fn execute(
+        &self,
+        request: &crate::codemode::CodeModeRequest,
+        context: &crate::codemode::CodeModeRunContext,
+        broker: &dyn crate::codemode::CodeModeBroker,
+    ) -> crate::codemode::CodeModeOutcome {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::codemode::CodeModeHost::execute(&ReadOnlyFixtureHost, request, context, broker)
+    }
+}
+impl crate::codemode::CodeModeHost for ReadOnlyFixtureHost {
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        _context: &crate::codemode::CodeModeRunContext,
+        broker: &dyn crate::codemode::CodeModeBroker,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        for request_id in [1, 2] {
+            assert!(
+                broker
+                    .call(CodeModeCall {
+                        request_id,
+                        tool: "read".into(),
+                        args: json!({"path":"input.txt"})
+                    })
+                    .unwrap()
+                    .complete
+            );
+        }
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: "fixture".into(),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "forged".into(),
+            error: None,
+        }
+    }
+}
+
+#[test]
+fn completed_codemode_parent_replays_without_running_the_host() {
+    let (mut agent, workspace, journal) = configured_agent();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent
+        .enable_read_only_codemode(Arc::new(CountedReadOnlyFixtureHost(calls.clone())))
+        .unwrap();
+    let args = json!({"code":"return 1"});
+    let first = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![("same-parent".into(), "codemode".into(), args.clone())],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(first.is_error, Some(false), "{first:?}");
+    let second = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![("same-parent".into(), "codemode".into(), args)],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(second.is_error, Some(false), "{second:?}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(journal.snapshot().unwrap().operations.len(), 3);
+    assert_eq!(
+        format!("{:?}", first.content),
+        format!("{:?}", second.content)
+    );
+    let collision = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "same-parent".into(),
+                "codemode".into(),
+                json!({"code":"return 2"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(collision.is_error, Some(true));
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(crate::permission::PermissionRule::parse("codemode").unwrap());
+    let denied = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "same-parent".into(),
+                "codemode".into(),
+                json!({"code":"return 1"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(denied.is_error, Some(true));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn codemode_parent_uses_real_dispatch_and_authoritative_child_evidence() {
+    let (mut agent, workspace, journal) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    agent
+        .enable_read_only_codemode(Arc::new(ReadOnlyFixtureHost))
+        .unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "parent-script".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].is_error, Some(false));
+    let snapshot = journal.snapshot().unwrap();
+    assert_eq!(snapshot.operations.len(), 3);
+    let parent = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.context().wire_tool_call_id.as_deref() == Some("parent-script"))
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .operations
+            .iter()
+            .filter(
+                |operation| operation.context().parent_operation_id == Some(parent.operation_id())
+            )
+            .count(),
+        2
+    );
+    let rendered = format!("{:?}", messages[0]);
+    assert!(!rendered.contains("forged"));
+    assert!(rendered.contains("children"));
+}
+
+#[test]
+fn codemode_off_keeps_provider_schema_and_invalid_input_never_launches() {
+    struct NeverHost;
+    impl crate::codemode::CodeModeHost for NeverHost {
+        fn execute(
+            &self,
+            _: &crate::codemode::CodeModeRequest,
+            _: &crate::codemode::CodeModeRunContext,
+            _: &dyn crate::codemode::CodeModeBroker,
+        ) -> crate::codemode::CodeModeOutcome {
+            panic!("invalid input must not launch the host")
+        }
+    }
+    let (mut agent, workspace, journal) = configured_agent();
+    assert!(!agent
+        .provider_tool_specs()
+        .iter()
+        .any(|tool| tool.name == "codemode"));
+    agent
+        .enable_read_only_codemode(Arc::new(NeverHost))
+        .unwrap();
+    assert!(agent
+        .provider_tool_specs()
+        .iter()
+        .any(|tool| tool.name == "codemode"));
+    for args in [
+        json!({"code":""}),
+        json!({"code":"return 1","mode":"controlled"}),
+    ] {
+        let messages = agent.execute_tool_batch(
+            workspace.path(),
+            vec![(
+                format!("invalid-{}", journal.snapshot().unwrap().operations.len()),
+                "codemode".into(),
+                args,
+            )],
+            &mut Vec::new(),
+        );
+        assert_eq!(messages[0].is_error, Some(true));
+    }
+    assert!(journal
+        .snapshot()
+        .unwrap()
+        .operations
+        .iter()
+        .all(|operation| operation.context().parent_operation_id.is_none()));
+}
+
+fn broker_context(agent: &Agent) -> crate::codemode::CodeModeRunContext {
+    use crate::codemode::*;
+    let runtime = agent.runtime.as_ref().unwrap();
+    CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "broker-fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: agent
+                .cwd
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: runtime
+            .capability_registry
+            .hash_tool_capabilities(&agent.tools),
+        cancellation: Default::default(),
+        root_budget: None,
+    }
+}
+
+#[test]
+fn script_delivery_runs_authoritative_hook_without_model_presentation() {
+    let (mut agent, workspace, _) = configured_agent();
+    let model_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = model_calls.clone();
+    agent.post_tool = Some(PostToolHook(Arc::new(move |_, _, _, _, mut result| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        result.content = "model digest".into();
+        result
+    })));
+    agent.script_post_tool = Some(crate::ScriptPostToolHook(Arc::new(
+        |_, _, _, _, mut result, mut structured| {
+            result.content = result.content.replace("secret", "redacted");
+            if let Some(value) = structured.as_mut() {
+                value["value"] = json!("redacted");
+            }
+            (result, structured)
+        },
+    )));
+    let result = crate::ToolResult {
+        content: "secret".into(),
+        is_error: false,
+        details: None,
+    };
+    let mut structured = Some(json!({"value":"secret"}));
+    let script = agent.finalize_tool_result_for_delivery(
+        workspace.path(),
+        "script",
+        "read",
+        &json!({}),
+        result.clone(),
+        Some(&mut structured),
+    );
+    assert_eq!(script.content, "redacted");
+    assert_eq!(structured.unwrap()["value"], "redacted");
+    assert_eq!(model_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let model = agent.finalize_tool_result(workspace.path(), "model", "read", &json!({}), result);
+    assert_eq!(model.content, "model digest");
+    assert_eq!(model_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn legacy_post_hook_never_delivers_unredacted_structured_channel() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent.post_tool = Some(PostToolHook(Arc::new(|_, _, _, _, mut result| {
+        result.content = "redacted".into();
+        result
+    })));
+    let mut structured = Some(json!({"value":"secret"}));
+    let result = agent.finalize_tool_result_for_delivery(
+        workspace.path(),
+        "script",
+        "read",
+        &json!({}),
+        crate::ToolResult {
+            content: "secret".into(),
+            is_error: false,
+            details: None,
+        },
+        Some(&mut structured),
+    );
+    assert_eq!(result.content, "redacted");
+    assert!(structured.is_none());
+}
+
+#[test]
+fn replayed_script_child_reports_missing_exact_data() {
+    let (agent, workspace, journal) = configured_agent();
+    let args = json!({"path":"input.txt"});
+    let (first, _, _) =
+        agent.dispatch_script_child(workspace.path(), "same-child", "read", &args, None, 1);
+    assert!(!first.is_error);
+    let (replayed, structured, _) =
+        agent.dispatch_script_child(workspace.path(), "same-child", "read", &args, None, 1);
+    assert!(replayed.is_error);
+    assert_eq!(replayed.details.unwrap()["codemode_incomplete"], true);
+    assert!(structured.is_none());
+    assert_eq!(journal.snapshot().unwrap().operations.len(), 1);
+}
+
+#[test]
+fn codemode_failure_facts_survive_presentation_hooks() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent.post_tool = Some(PostToolHook(Arc::new(|_, _, _, _, _| crate::ToolResult {
+        content: "decorated output".into(),
+        is_error: false,
+        details: None,
+    })));
+    let result = agent.finalize_tool_result(workspace.path(), "parent", "codemode", &json!({}), crate::ToolResult {
+        content: "private child text".into(), is_error: true,
+        details: Some(json!({"codemode":{"status":"recoveryRequired","scriptCompleted":false,"operationRef":"parent-op","children":[{"requestId":1,"ordinal":1,"tool":"write","operationRef":"child-op","status":"recoveryRequired","error":{"message":"private child text"}}]}})),
+    });
+    assert!(result.is_error);
+    assert!(result.content.contains("recoveryRequired"));
+    assert!(result.content.contains("child-op"));
+    assert!(!result.content.contains("private child text"));
+    assert_eq!(
+        result.details.unwrap()["codemode_facts"]["operationRef"],
+        "parent-op"
+    );
+}
+
+#[test]
+fn broker_hides_revoked_tools_without_expanding_initial_authority() {
+    use crate::codemode::*;
+    let (agent, _workspace, _) = configured_agent();
+    let context = broker_context(&agent);
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    assert!(broker.describe("read").is_ok());
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(crate::permission::PermissionRule::parse("read").unwrap());
+    assert!(broker
+        .search(ToolQuery {
+            query: "read".into(),
+            limit: 20,
+            cursor: None
+        })
+        .unwrap()
+        .tools
+        .iter()
+        .all(|tool| tool.canonical_name != "read"));
+    assert_eq!(broker.describe("read").unwrap_err().code, "DENIED");
+    assert_eq!(
+        broker
+            .call(CodeModeCall {
+                request_id: 1,
+                tool: "read".into(),
+                args: json!({"path":"a.json"})
+            })
+            .unwrap_err()
+            .code,
+        "DENIED"
+    );
+    let initially_denied = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    agent.permissions.lock().unwrap().deny.clear();
+    assert_eq!(
+        initially_denied.describe("read").unwrap_err().code,
+        "DENIED"
+    );
+    assert!(initially_denied
+        .search(ToolQuery {
+            query: "read".into(),
+            limit: 20,
+            cursor: None,
+        })
+        .unwrap()
+        .tools
+        .iter()
+        .all(|tool| tool.canonical_name != "read"));
+}
+
+#[test]
+fn broker_records_projection_failure_with_durable_child_reference() {
+    use crate::codemode::*;
+    let (agent, _workspace, journal) = configured_agent();
+    let mut context = broker_context(&agent);
+    context.limits.child_result_bytes = 1;
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let error = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "read".into(),
+            args: json!({"path":"input.txt"}),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "INCOMPLETE_DATA");
+    assert!(error.operation_ref.is_some());
+    let children = broker.children();
+    assert_eq!(children.len(), 1);
+    assert!(matches!(children[0].status, CodeModeChildStatus::Failed));
+    assert_eq!(children[0].operation_ref, error.operation_ref.unwrap());
+    assert_eq!(journal.snapshot().unwrap().operations.len(), 1);
+}
+
+#[test]
+fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
+    use crate::codemode::*;
+    let (agent, workspace, journal) = configured_agent();
+    let context = broker_context(&agent);
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let call = CodeModeCall {
+        request_id: 1,
+        tool: "read".into(),
+        args: json!({"path":"input.txt"}),
+    };
+    assert!(broker.call(call.clone()).is_ok());
+    assert_eq!(broker.call(call).unwrap_err().code, "LIMIT_EXCEEDED");
+    assert!(broker
+        .call(CodeModeCall {
+            request_id: 2,
+            tool: "write".into(),
+            args: json!({"path":"forbidden.txt","content":"effect"})
+        })
+        .is_err());
+    assert!(!workspace.path().join("forbidden.txt").exists());
+    assert_eq!(journal.snapshot().unwrap().operations.len(), 1);
+}
+
+#[test]
+fn controlled_broker_uses_real_permissions_and_never_replays_a_mutation() {
+    use crate::codemode::*;
+    let (mut agent, workspace, journal) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    let mut context = broker_context(&agent);
+    context.mode = CodeModeMode::Controlled;
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let call = CodeModeCall {
+        request_id: 1,
+        tool: "write".into(),
+        args: json!({"path":"effect.txt","content":"once"}),
+    };
+    assert!(broker.call(call.clone()).is_ok());
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("effect.txt")).unwrap(),
+        "once"
+    );
+    assert!(broker.call(call).is_err());
+    assert_eq!(journal.snapshot().unwrap().operations.len(), 1);
+    assert_eq!(broker.children().len(), 1);
+}
+
+#[test]
+fn controlled_broker_denial_is_not_uncertain_mutation_evidence() {
+    use crate::codemode::*;
+    let (mut agent, workspace, journal) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    let mut context = broker_context(&agent);
+    context.mode = CodeModeMode::Controlled;
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let error = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "write".into(),
+            args: json!({"path":"denied.txt","content":"never"}),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "DENIED");
+    assert!(!workspace.path().join("denied.txt").exists());
+    assert!(matches!(
+        broker.children()[0].status,
+        CodeModeChildStatus::NotStarted
+    ));
+    assert!(journal
+        .snapshot()
+        .unwrap()
+        .operations
+        .iter()
+        .any(|operation| Some(operation.operation_id().to_string()) == error.operation_ref));
+    assert!(broker
+        .call(CodeModeCall {
+            request_id: 2,
+            tool: "read".into(),
+            args: json!({"path":"input.txt"})
+        })
+        .is_ok());
+}
+
 fn request(batch: bool, tool: &str, args: Value) -> (String, String, Value) {
     if batch {
         (
