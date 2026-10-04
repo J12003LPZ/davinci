@@ -144,6 +144,104 @@ fn native_root_deadline_does_not_restart_after_host_setup() {
 
 #[test]
 #[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn native_host_runs_parallel_read_callbacks() {
+    struct ParallelBroker {
+        gate: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl CodeModeBroker for ParallelBroker {
+        fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+            Ok(ToolPage {
+                tools: vec![ToolMetadata {
+                    canonical_name: "parallel_read".into(),
+                    js_name: "parallel_read".into(),
+                    description: String::new(),
+                    read_only: true,
+                }],
+                total: 1,
+                cursor: None,
+            })
+        }
+        fn describe(&self, _: &str) -> Result<serde_json::Value, CodeModeError> {
+            unreachable!()
+        }
+        fn call(&self, call: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+            let now = self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.peak
+                .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            let (lock, changed) = &*self.gate;
+            let mut entered = lock.lock().unwrap();
+            *entered += 1;
+            if *entered >= 2 {
+                changed.notify_all();
+            } else {
+                let (next, _) = changed
+                    .wait_timeout(entered, std::time::Duration::from_millis(700))
+                    .unwrap();
+                entered = next;
+            }
+            drop(entered);
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CodeModeToolValue {
+                text: call.request_id.to_string(),
+                structured_content: None,
+                complete: true,
+                artifact: None,
+                operation_ref: format!("fixture-child-{}", call.request_id),
+            })
+        }
+    }
+
+    let host = fixture_host();
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let broker = ParallelBroker {
+        gate: std::sync::Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
+        active: Default::default(),
+        peak: peak.clone(),
+    };
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "parallel-fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: "fixture".into(),
+            runtime_run_id: "fixture".into(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: "fixture".into(),
+        cancellation: Default::default(),
+        root_budget: None,
+    };
+    let outcome = host.execute(
+        &CodeModeRequest {
+            code: "return await Promise.all([tools.parallel_read({}), tools.parallel_read({})])"
+                .into(),
+            timeout_ms: Some(2000),
+            max_output_bytes: None,
+        },
+        &context,
+        &broker,
+    );
+    assert!(
+        matches!(outcome.status, CodeModeStatus::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        peak.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the Rust supervisor serialized independent read callbacks"
+    );
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
 fn native_deadline_returns_when_broker_ignores_cancellation() {
     struct NonCooperativeBroker;
     impl CodeModeBroker for NonCooperativeBroker {
