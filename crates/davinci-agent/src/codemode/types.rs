@@ -57,6 +57,7 @@ pub struct CodeModeLimits {
     pub cleanup_grace_ms: u64,
 }
 // Host-created only: never Deserialize this context from model or IPC input.
+#[derive(Clone)]
 pub struct CodeModeRunContext {
     pub identity: CodeModeIdentity,
     pub mode: CodeModeMode,
@@ -167,6 +168,6 @@ pub trait CodeModeHost: Send + Sync {
         &self,
         request: &CodeModeRequest,
         context: &CodeModeRunContext,
-        broker: &dyn CodeModeBroker,
+        broker: std::sync::Arc<dyn CodeModeBroker>,
     ) -> CodeModeOutcome;
 }
