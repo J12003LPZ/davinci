@@ -16,23 +16,11 @@ trap 'rm -rf "$stage"' EXIT
 python3 "$root/scripts/release_identity.py" preflight --repo "$root" --require-tag --output "$proof"
 
 cargo build --release -p davinci-coding-agent --locked --target-dir "$root/target"
-cargo build --release -p davinci-voice --features native --bin davinci-voice-worker --locked --target-dir "$root/target"
-# Build both before replacing either executable; both come from this checkout.
 cp "$root/target/release/davinci" "$stage/davinci"
-cp "$root/target/release/davinci-voice-worker" "$stage/davinci-voice-worker"
-# Freeze and verify both byte sets before changing the installation.
-for binary in davinci davinci-voice-worker; do
-	python3 "$root/scripts/release_identity.py" record --proof "$proof" --binary "$stage/$binary" --output "$stage/$binary.identity.json"
-done
+python3 "$root/scripts/release_identity.py" record --proof "$proof" --binary "$stage/davinci" --output "$stage/davinci.identity.json"
 bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$bin_dir"
-notice_dir="${CARGO_HOME:-$HOME/.cargo}/share/davinci-voice"
-mkdir -p "$notice_dir"
-cp "$root/crates/davinci-voice/THIRD_PARTY_NOTICES.md" "$notice_dir/"
-cp -R "$root/crates/davinci-voice/licenses" "$notice_dir/"
-for binary in davinci-voice-worker davinci; do
-	install -m 755 "$stage/$binary" "$bin_dir/$binary"
-	install -m 644 "$stage/$binary.identity.json" "$bin_dir/$binary.identity.json"
-done
+install -m 755 "$stage/davinci" "$bin_dir/davinci"
+install -m 644 "$stage/davinci.identity.json" "$bin_dir/davinci.identity.json"
 echo "Installed davinci $(davinci --version) to $(command -v davinci)"
 echo "TypeScript sources remain in vendor/davinci as the behavioral reference (legacy-pi)."

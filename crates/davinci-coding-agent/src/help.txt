@@ -4,9 +4,6 @@ Usage:
   davinci [options] [--] [@files...] [messages...]
 
 Commands:
-  davinci voice status|devices|model list   Experimental local CPU dictation setup
-  davinci voice model install <id>         Download an approved tiny/base/small model
-  davinci voice model import <id> <path>   Verify and import a local model (offline)
   davinci install <source> [-l]     Install extension source and add to settings
   davinci remove <source> [-l]      Remove extension source from settings
   davinci uninstall <source> [-l]   Alias for remove

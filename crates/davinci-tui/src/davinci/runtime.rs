@@ -356,7 +356,6 @@ pub struct Session {
     generation: Generation,
     keyboard: Keyboard,
     paste: PasteFilter,
-    mic_rect: Option<Rect>,
     rendered_lines: Vec<String>,
     selection_anchor: Option<(u16, u16)>,
     selection_focus: Option<(u16, u16)>,
@@ -402,7 +401,6 @@ impl Session {
                 burst: cfg!(windows).then(super::paste_burst::PasteBurst::default),
                 ..PasteFilter::default()
             },
-            mic_rect: None,
             rendered_lines: Vec::new(),
             selection_anchor: None,
             selection_focus: None,
@@ -445,9 +443,6 @@ impl Session {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(ready) = self.paste.next_ready() {
-                if matches!(ready, Event::Resize(..)) {
-                    self.mic_rect = None;
-                }
                 if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
                 {
                     continue;
@@ -490,9 +485,6 @@ impl Session {
                 self.paste.feed(event::read()?);
             }
             if let Some(ready) = self.paste.next_ready() {
-                if matches!(ready, Event::Resize(..)) {
-                    self.mic_rect = None;
-                }
                 if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
                 {
                     continue;
@@ -529,7 +521,6 @@ impl Session {
         if !HELD.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.mic_rect = None;
         let mouse = true;
         if mouse != MOUSE.load(Ordering::SeqCst) {
             #[cfg(unix)]
@@ -549,15 +540,11 @@ impl Session {
             MOUSE.store(mouse, Ordering::SeqCst);
         }
         let background = Style::default().bg(model.theme.background);
-        let mut mic_rect = None;
         let mut rendered_lines = Vec::new();
         let selection = self.selection_range();
         self.terminal.draw(|frame| {
             let area: Rect = frame.area();
             let composed = app::compose_frame(model, area.height);
-            mic_rect = composed
-                .mic_rect
-                .filter(|r| r.right() <= area.width && r.bottom() <= area.height);
             rendered_lines = composed.lines.iter().map(ToString::to_string).collect();
             frame.render_widget(Paragraph::new(composed.lines).style(background), area);
             if let Some((start, end)) = selection {
@@ -577,7 +564,6 @@ impl Session {
                 }
             }
         })?;
-        self.mic_rect = mic_rect;
         self.rendered_lines = rendered_lines;
         Ok(())
     }
@@ -594,18 +580,10 @@ impl Session {
 
     /// Own left-drag selection while mouse reporting is enabled. Releasing the
     /// button copies immediately, matching the upstream fullscreen terminal.
-    /// Returns true only when the microphone button was activated.
     pub fn handle_mouse(&mut self, mouse: event::MouseEvent) -> bool {
         use event::{MouseButton::Left, MouseEventKind};
         let point = (mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::Down(Left)
-                if self.mic_rect.is_some_and(|r| r.contains(point.into())) =>
-            {
-                self.selection_anchor = None;
-                self.selection_focus = None;
-                true
-            }
             MouseEventKind::Down(Left) => {
                 self.selection_anchor = Some(point);
                 self.selection_focus = Some(point);
@@ -626,13 +604,9 @@ impl Session {
         }
     }
 
-    /// Graph interaction shares the composed geometry. Microphone activation
-    /// keeps first refusal; other surfaces retain native text selection.
+    /// Graph interaction shares the composed geometry while other surfaces retain native text selection.
     pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
-        if self.mic_clicked(mouse) {
-            return self.handle_mouse(mouse);
-        }
-        if route_graph_mouse(model, mouse, self.mic_rect) {
+        if route_graph_mouse(model, mouse) {
             self.selection_anchor = None;
             self.selection_focus = None;
             return false;
@@ -662,17 +636,6 @@ impl Session {
         }
         let text = rows.join("\n");
         (!text.is_empty()).then_some(text)
-    }
-
-    pub fn mic_clicked(&self, mouse: event::MouseEvent) -> bool {
-        mouse.kind == event::MouseEventKind::Down(event::MouseButton::Left)
-            && self
-                .mic_rect
-                .is_some_and(|r| r.contains((mouse.column, mouse.row).into()))
-    }
-
-    pub fn mic_visible(&self) -> bool {
-        self.mic_rect.is_some()
     }
 
     pub fn input_pending(&self) -> bool {
@@ -711,13 +674,8 @@ impl Drop for Session {
     }
 }
 
-fn route_graph_mouse(model: &mut Model, mouse: event::MouseEvent, mic: Option<Rect>) -> bool {
-    if model.screen != super::model::Screen::GraphRun
-        || model.overlay.is_some()
-        || model.voice.setup
-        || (mouse.kind == event::MouseEventKind::Down(event::MouseButton::Left)
-            && mic.is_some_and(|r| r.contains((mouse.column, mouse.row).into())))
-    {
+fn route_graph_mouse(model: &mut Model, mouse: event::MouseEvent) -> bool {
+    if model.screen != super::model::Screen::GraphRun || model.overlay.is_some() {
         return false;
     }
     app::compose_frame(model, model.height)
@@ -798,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_mouse_preserves_microphone_and_other_surfaces() {
+    fn graph_mouse_preserves_other_surfaces() {
         let mut model = Model::new(
             super::super::theme::Theme::da_vinci(super::super::theme::ColorDepth::TrueColor, true),
             120,
@@ -824,13 +782,8 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(!route_graph_mouse(
-            &mut model,
-            click,
-            Some(Rect::new(column, row, 1, 1))
-        ));
         assert!(model.graph_canvas.follow_live);
-        assert!(route_graph_mouse(&mut model, click, None));
+        assert!(route_graph_mouse(&mut model, click));
         assert_eq!(
             model
                 .graph_run
@@ -845,10 +798,10 @@ mod tests {
             kind: event::MouseEventKind::ScrollDown,
             ..click
         };
-        assert!(route_graph_mouse(&mut model, wheel, None));
+        assert!(route_graph_mouse(&mut model, wheel));
         assert!(!model.graph_canvas.follow_live);
         model.screen = super::super::model::Screen::Agent;
-        assert!(!route_graph_mouse(&mut model, click, None));
+        assert!(!route_graph_mouse(&mut model, click));
     }
 
     #[test]

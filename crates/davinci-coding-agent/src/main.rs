@@ -17,8 +17,6 @@ mod fast;
 mod process_manager_integration_tests;
 #[cfg(test)]
 mod test_impact_integration_tests;
-mod voice_input;
-mod voice_models;
 #[cfg(not(all(unix, feature = "experimental-ipc")))]
 #[allow(dead_code)]
 mod experimental {
@@ -424,10 +422,6 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     apply_offline_mode(&raw);
     if let Some(result) = davinci_coding_agent::runtime_inspect::try_run(&raw) {
         return result;
-    }
-    let command_start = args::first_non_offline_argument(&raw).unwrap_or(0);
-    if raw.get(command_start).map(String::as_str) == Some("voice") {
-        return voice_models::cli(&raw[command_start + 1..]);
     }
     // `--davinci --screen <id>` renders a mockup screen against fixtures for
     // comparison with docs/ui. The davinci shell is what interactive pi opens;
