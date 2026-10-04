@@ -12,6 +12,7 @@ davinci-sys = { path = "../davinci-sys" }
 davinci-telemetry = { path = "../davinci-telemetry" }
 base64.workspace = true
 regex.workspace = true
+ring.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true

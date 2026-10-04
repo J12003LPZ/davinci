@@ -1173,22 +1173,24 @@ fn codex_fixture_login_persists_exact_provider_without_aliasing() {
     assert_eq!(credential.kind, CredentialKind::Oauth);
     assert!(storage.get("openai").is_none());
 
-    assert!(
-        davinci_ai::resolve_provider_auth(
-            "openai-codex",
-            &storage,
-            &std::collections::HashMap::new(),
-            false,
-        )
-        .is_none(),
-        "plain test fixture token must not bypass Codex account-bound JWT validation"
-    );
+    let resolved = davinci_ai::resolve_provider_auth(
+        "openai-codex",
+        &storage,
+        &std::collections::HashMap::new(),
+        false,
+    )
+    .expect("verified ChatGPT-plan fixture credential should resolve");
+    assert_eq!(resolved.source, "OAuth");
+    assert!(resolved
+        .headers
+        .get("Authorization")
+        .is_some_and(|value| value.starts_with("Bearer openai-plan-")));
     let payload = base64::Engine::encode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
         br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test-account"}}"#,
     );
-    let mut storage = AuthStorage::create().unwrap();
-    storage
+    let mut legacy_storage = AuthStorage::in_memory();
+    legacy_storage
         .login_oauth(
             "openai-codex",
             format!("e30.{payload}.signature"),
@@ -1196,6 +1198,16 @@ fn codex_fixture_login_persists_exact_provider_without_aliasing() {
             None,
         )
         .unwrap();
+    assert!(
+        davinci_ai::resolve_provider_auth(
+            "openai-codex",
+            &legacy_storage,
+            &std::collections::HashMap::new(),
+            false,
+        )
+        .is_none(),
+        "legacy Codex OAuth records must not become ChatGPT-plan credentials"
+    );
     let parsed = Args {
         no_extensions: true,
         ..Args::default()

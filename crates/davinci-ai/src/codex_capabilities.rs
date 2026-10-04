@@ -142,6 +142,12 @@ impl CodexCapabilities {
         if openai_provider
             && is_oauth
             && model.api == "openai-codex-responses"
+            && url.host_str() == Some("api.openai.com")
+        {
+            Self::for_public_responses(model)
+        } else if openai_provider
+            && is_oauth
+            && model.api == "openai-codex-responses"
             && url.host_str() == Some("chatgpt.com")
         {
             Self::for_chatgpt_codex(model)
@@ -188,15 +194,14 @@ mod tests {
     #[test]
     fn resolves_oauth_codex_profile() {
         let model = test_model("openai-codex-responses");
-        let caps =
-            CodexCapabilities::resolve(&model, Some("https://chatgpt.com/backend-api"), true);
+        let caps = CodexCapabilities::resolve(&model, Some("https://api.openai.com/v1"), true);
         assert!(caps.responses_items);
         assert!(caps.websocket_transport);
         assert!(caps.incremental_continuation);
-        assert!(caps.generate_false_prewarm);
-        assert!(caps.encrypted_reasoning);
-        assert!(caps.assistant_phases);
-        assert!(caps.custom_grammar_tools);
+        assert!(!caps.generate_false_prewarm);
+        assert!(!caps.encrypted_reasoning);
+        assert!(!caps.assistant_phases);
+        assert!(!caps.custom_grammar_tools);
         assert_eq!(caps.tool_search, ToolSearchMode::Emulated);
     }
 
@@ -208,13 +213,13 @@ mod tests {
             .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-astra")
             .expect("gpt-6-astra");
 
-        let caps = CodexCapabilities::resolve(astra, Some("https://chatgpt.com/backend-api"), true);
+        let caps = CodexCapabilities::resolve(astra, Some("https://api.openai.com/v1"), true);
 
         assert!(caps.responses_items);
         assert!(caps.websocket_transport);
         assert!(caps.incremental_continuation);
-        assert!(caps.encrypted_reasoning);
-        assert!(caps.assistant_phases);
+        assert!(!caps.encrypted_reasoning);
+        assert!(!caps.assistant_phases);
         assert!(caps.custom_grammar_tools);
     }
     #[test]

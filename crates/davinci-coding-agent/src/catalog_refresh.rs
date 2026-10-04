@@ -184,15 +184,12 @@ fn codex_access_token() -> Option<String> {
     let mut storage = davinci_ai::AuthStorage::create().ok()?;
     let _ = storage.maybe_refresh(PROVIDER, davinci_ai::now_ms(), 60_000, false);
     let credential = storage.get(PROVIDER)?;
-    if credential.kind != davinci_ai::CredentialKind::Oauth {
-        // An API key is not a ChatGPT login; the models route rejects it.
+    if credential.kind != davinci_ai::CredentialKind::Oauth
+        || davinci_ai::validate_openai_siwc_credential(credential).is_err()
+    {
         return None;
     }
-    credential
-        .access
-        .clone()
-        .or_else(|| credential.key.clone())
-        .filter(|token| !token.is_empty())
+    credential.access.clone().filter(|token| !token.is_empty())
 }
 
 fn refresh_provider(

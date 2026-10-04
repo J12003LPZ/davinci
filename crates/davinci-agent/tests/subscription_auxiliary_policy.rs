@@ -23,7 +23,7 @@ fn auxiliary_threads_cannot_replace_the_subscription_policy_or_root_allowance() 
     .unwrap();
     let model: Model = serde_json::from_value(serde_json::json!({
         "id":"gpt-6-luna","name":"fixture","api":"openai-codex-responses",
-        "provider":"openai-codex","baseUrl":"https://chatgpt.com/backend-api",
+        "provider":"openai-codex","baseUrl":"https://api.openai.com/v1",
         "reasoning":true,"input":["text"],
         "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
         "contextWindow":1000,"maxTokens":100
@@ -47,10 +47,7 @@ fn auxiliary_threads_cannot_replace_the_subscription_policy_or_root_allowance() 
                 ..Default::default()
             };
             let error = live_complete_with(&model, &[], &auth, None, &[], &options).unwrap_err();
-            assert!(
-                error.contains("subscription-only admission denied"),
-                "{error}"
-            );
+            assert!(error.contains("API-key fallback is disabled"), "{error}");
             assert_eq!(budget.snapshot().unwrap().requests, 0);
             assert_eq!(
                 provider_observation::process_budget_binding().unwrap().0,

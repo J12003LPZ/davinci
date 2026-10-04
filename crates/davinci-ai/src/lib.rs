@@ -50,6 +50,7 @@ mod oauth_callback;
 mod oauth_providers;
 pub mod openai_cache_diagnostics;
 pub mod openai_cache_policy;
+pub mod openai_siwc;
 mod provider_retry;
 mod providers;
 pub mod request_shape;
@@ -148,9 +149,11 @@ pub use oauth_callback::{
 };
 pub use oauth_providers::{
     authorize_request, device_status_from_error, exchange_authorization_code,
-    fresh_authorize_request, generate_pkce, oauth_providers, parse_authorization_input,
-    refresh_oauth_token, save_pending_login, take_pending_login, token_exchange_request,
-    token_refresh_request, AuthorizeRequest, OauthTokens, Pkce, TokenExchangeRequest,
+    fresh_authorize_request, fresh_authorize_request_checked, generate_pkce, oauth_providers,
+    parse_authorization_callback, parse_authorization_input, refresh_oauth_token,
+    save_pending_login, take_pending_login, token_exchange_request, token_refresh_request,
+    AuthorizationCallbackInput, AuthorizeRequest, OauthTokens, OpenAiSiwcAuthorizeContext, Pkce,
+    TokenExchangeRequest,
 };
 pub use openai_cache_diagnostics::{
     configured_comparison_response_id, diagnostics_every_n_from_env, latest_applied_policy,
@@ -162,6 +165,18 @@ pub use openai_cache_policy::{
     BoundaryStrategy, CacheCapabilitySource, CacheControlFamily, CacheIntent,
     CachePartitionSemantics, EffectiveCacheMode, EffectiveOpenAiCachePolicy,
     OpenAiCacheCapabilities, PromptCacheWirePlan, OPENAI_CACHE_CONTRACT_REVISION,
+};
+pub use openai_siwc::{
+    build_authorization_url as build_openai_siwc_authorization_url,
+    exchange_authorization_code as exchange_openai_siwc_authorization_code,
+    load_or_create_host_id as load_or_create_openai_siwc_host_id,
+    refresh_access_token as refresh_openai_siwc_access_token,
+    registration_from_credential as openai_siwc_registration_from_credential,
+    validate_credential as validate_openai_siwc_credential, OpenAiSiwcIdentity,
+    OpenAiSiwcRegistration, OpenAiSiwcSession, OpenAiSiwcTokens, OPENAI_SIWC_AGENT_NAME,
+    OPENAI_SIWC_AUTHORIZE_URL, OPENAI_SIWC_DYNAMIC_CLIENT_ID, OPENAI_SIWC_ISSUER,
+    OPENAI_SIWC_JWKS_URL, OPENAI_SIWC_REDIRECT, OPENAI_SIWC_REQUIRED_SCOPE, OPENAI_SIWC_RESOURCE,
+    OPENAI_SIWC_SCOPES, OPENAI_SIWC_TOKEN_URL,
 };
 pub use provider_retry::{
     is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,

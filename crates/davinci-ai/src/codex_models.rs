@@ -31,7 +31,7 @@ pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const CODEX_MODELS_FILE: &str = "codex-models.json";
 /// Same cadence as the pi.dev catalog refresh.
 pub const CODEX_MODELS_REFRESH_INTERVAL_MS: u64 = 4 * 60 * 60 * 1000;
-const DEFAULT_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+const DEFAULT_MODELS_URL: &str = "https://api.openai.com/v1/models";
 
 /// One model as the Codex backend describes it. Only the fields this module
 /// reads are kept, so the saved file stays small.
@@ -337,22 +337,12 @@ pub fn refresh_codex_models(
     {
         return Ok(CodexModelsRefresh::Skipped);
     }
-    let separator = if base.contains('?') { '&' } else { '?' };
-    // The backend requires a client version; Davinci's own passes its checks.
-    let url = format!(
-        "{base}{separator}client_version={}",
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = base;
     let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .set("accept", "application/json")
-        .set("authorization", &format!("Bearer {token}"))
-        .set("originator", crate::codex::CODEX_ORIGINATOR)
-        .set("user-agent", &crate::codex::pi_user_agent());
-    if let Ok(account) = crate::codex::extract_account_id(token) {
-        request = request.set("chatgpt-account-id", &account);
-    }
+        .set("authorization", &format!("Bearer {token}"));
     if let Some(etag) = saved.as_ref().and_then(|saved| saved.etag.as_deref()) {
         request = request.set("if-none-match", etag);
     }
@@ -650,7 +640,7 @@ mod tests {
         std::env::remove_var("DAVINCI_CODEX_MODELS_REPLY");
         std::env::set_var(
             "DAVINCI_CODEX_MODELS_URL",
-            format!("http://{addr}/codex/models"),
+            format!("http://{addr}/v1/models"),
         );
         let first = refresh_codex_models(dir.path(), Some("tok-1"), true, true);
         let second = refresh_codex_models(dir.path(), Some("tok-1"), true, true);
@@ -658,9 +648,9 @@ mod tests {
         assert_eq!(first, Ok(CodexModelsRefresh::Updated(4)));
         assert_eq!(second, Ok(CodexModelsRefresh::Unchanged));
         let requests = server.join().unwrap();
-        assert!(requests[0].starts_with("get /codex/models?client_version="));
+        assert!(requests[0].starts_with("get /v1/models "));
         assert!(requests[0].contains("authorization: bearer tok-1"));
-        assert!(requests[0].contains("originator: "));
+        assert!(!requests[0].contains("originator: "));
         assert!(!requests[0].contains("if-none-match"));
         assert!(requests[1].contains("if-none-match: \"v1\""));
         // A fresh file skips the network unless forced.

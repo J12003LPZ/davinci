@@ -748,6 +748,31 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    if model.provider == "openai-codex" {
+        if !crate::openai_siwc::is_public_plan_model(model) {
+            return Err("OpenAI Codex subscription requests must use the documented https://api.openai.com/v1 Responses route".into());
+        }
+        if !auth.source.eq_ignore_ascii_case("oauth") {
+            return Err("OpenAI Codex subscription requests require verified Sign in with ChatGPT OAuth; API-key fallback is disabled".into());
+        }
+        let access = auth
+            .api_key
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or(
+                "OpenAI Codex subscription requests require a verified ChatGPT-plan access token",
+            )?;
+        if let Some((_, authorization)) = auth
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            let expected = format!("Bearer {access}");
+            if authorization != &expected {
+                return Err("OpenAI Codex subscription Authorization header does not match the verified ChatGPT-plan access token; API-key/header overrides are disabled".into());
+            }
+        }
+    }
     options
         .service_tier
         .unwrap_or_default()
@@ -828,7 +853,7 @@ fn live_complete_streaming_with_sink_envelope_inner(
             prepared.manifest().request_bytes_before_compression
         ));
     }
-    if model.api == "openai-codex-responses" {
+    if model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model) {
         if let Some(token) = auth.api_key.as_deref() {
             let mut collected = Vec::new();
             let codex_affinity_id = codex_responses_affinity_id(options);
@@ -896,7 +921,8 @@ fn live_complete_streaming_with_sink_envelope_inner(
         &collect_request_headers(model, auth, options),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
-    let compress_zstd = model.api == "openai-codex-responses";
+    let compress_zstd =
+        model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model);
     crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
     let (response, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
@@ -1045,7 +1071,9 @@ pub fn raw_provider_post(
         request = request.set(key, value);
     }
 
-    let result = if model.api == "openai-codex-responses" {
+    let result = if model.api == "openai-codex-responses"
+        && !crate::openai_siwc::is_public_plan_model(model)
+    {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
             request = request.set("content-encoding", "zstd");
@@ -1085,7 +1113,7 @@ fn collect_request_headers(
 ) -> Vec<(String, String)> {
     let session_id = options.session_id.as_deref().filter(|id| !id.is_empty());
     let codex_affinity_id = codex_responses_affinity_id(options);
-    if model.api == "openai-codex-responses" {
+    if model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model) {
         if let Some(token) = &auth.api_key {
             if let Ok(account_id) = crate::codex::extract_account_id(token) {
                 let extra: Vec<(String, String)> = auth
@@ -1297,7 +1325,64 @@ pub fn request_body_with(
     };
     apply_max_tokens_override(model, &mut body, options);
     apply_native_responses_resume(&mut body, model, messages, options);
+    apply_chatgpt_plan_preview_constraints(model, &mut body);
     body
+}
+
+fn apply_chatgpt_plan_preview_constraints(model: &Model, body: &mut Value) {
+    if !crate::openai_siwc::is_public_plan_model(model) {
+        return;
+    }
+    let Value::Object(map) = body else {
+        return;
+    };
+
+    // Sign in with ChatGPT plan usage is a stateless HTTP streaming contract.
+    map.insert("store".into(), Value::Bool(false));
+    map.insert("stream".into(), Value::Bool(true));
+    for unsupported in [
+        "background",
+        "conversation",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "moderation",
+        "multi_agent",
+        "prompt",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "temperature",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
+        "previous_response_id",
+    ] {
+        map.remove(unsupported);
+    }
+
+    // The plan-sharing preview rejects explicit system input items. Keep the
+    // same instruction content, but express it as a developer message.
+    if let Some(Value::Array(input)) = map.get_mut("input") {
+        for item in input {
+            if item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("system")
+            {
+                item["role"] = Value::String("developer".into());
+            }
+        }
+    }
+
+    // Hosted Responses tools are not enabled for this flow. DaVinci's local
+    // agent tools use function/custom entries and remain available.
+    if let Some(Value::Array(tools)) = map.get_mut("tools") {
+        tools.retain(|tool| {
+            matches!(
+                tool.get("type").and_then(Value::as_str),
+                Some("function" | "custom" | "web_search" | "web_search_preview")
+            )
+        });
+    }
 }
 
 /// OpenAI Responses API body (TS `openai-responses.ts` `buildParams` /
@@ -1585,7 +1670,7 @@ fn openai_responses_body(
             }
         }
         // openai-codex-responses.ts:267-268, 557 — key unless retention none.
-        "openai-codex-responses" => {
+        "openai-codex-responses" if !crate::openai_siwc::is_public_plan_model(model) => {
             if retention != crate::cache::CacheRetention::None {
                 if let Some(key) = session_key {
                     body["prompt_cache_key"] = Value::String(key);
@@ -2844,103 +2929,40 @@ mod tests {
     }
 
     #[test]
-    fn fast_service_tier_reaches_oauth_sse_without_api_key() {
-        use std::io::{BufRead, BufReader, Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = BufReader::new(&mut socket);
-            let mut length = 0;
-            let mut headers = String::new();
-            loop {
-                let mut line = String::new();
-                assert!(request.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse::<usize>().unwrap();
-                }
-                headers.push_str(&line);
-            }
-            let mut body = vec![0; length];
-            if headers
-                .to_ascii_lowercase()
-                .contains("transfer-encoding: chunked")
-            {
-                loop {
-                    let mut size = String::new();
-                    request.read_line(&mut size).unwrap();
-                    let size =
-                        usize::from_str_radix(size.trim().split(';').next().unwrap(), 16).unwrap();
-                    if size == 0 {
-                        request.read_exact(&mut [0; 2]).unwrap();
-                        break;
-                    }
-                    let start = body.len();
-                    body.resize(start + size, 0);
-                    request.read_exact(&mut body[start..]).unwrap();
-                    request.read_exact(&mut [0; 2]).unwrap();
-                }
-            } else {
-                request.read_exact(&mut body).unwrap();
-            }
-            drop(request);
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture\",\"status\":\"completed\",\"service_tier\":\"priority\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n").unwrap();
-            let body = if headers
-                .to_ascii_lowercase()
-                .contains("content-encoding: zstd")
-            {
-                zstd::stream::decode_all(body.as_slice()).unwrap()
-            } else {
-                body
-            };
-            let body = serde_json::from_slice::<Value>(&body).unwrap();
-            (headers, body)
-        });
+    fn fast_service_tier_is_preserved_on_public_plan_body_and_bearer_headers() {
         let mut model = load_builtin_models()
             .into_iter()
-            .find(|m| m.api == "openai-codex-responses")
+            .find(|model| model.api == "openai-codex-responses")
             .unwrap();
-        model.base_url = Some(base);
+        model.base_url = Some(crate::openai_siwc::OPENAI_SIWC_RESOURCE.into());
         let auth = ResolvedAuth {
-            api_key: None,
+            api_key: Some("fixture-oauth".into()),
             headers: [("Authorization".into(), "Bearer fixture-oauth".into())]
                 .into_iter()
                 .collect(),
             source: "oauth".into(),
         };
-        let scope = crate::provider_observation::ObservationScope::capture();
-        live_complete_streaming_with_sink(
+        let options = StreamOptions {
+            service_tier: Some(crate::CodexServiceTier::Fast),
+            transport: Some("sse".into()),
+            max_retries: Some(0),
+            ..Default::default()
+        };
+        let body = request_body_with(
             &model,
             &[ChatMessage::text("user", "hi")],
-            &auth,
             None,
             &[],
-            &StreamOptions {
-                service_tier: Some(crate::CodexServiceTier::Fast),
-                transport: Some("sse".into()),
-                max_retries: Some(0),
-                ..Default::default()
-            },
-            &mut |_| {},
-        )
-        .unwrap();
-        let (headers, body) = server.join().unwrap();
-        assert!(headers
-            .to_ascii_lowercase()
-            .contains("authorization: bearer fixture-oauth"));
-        assert_eq!(body["service_tier"], "priority");
-        assert_eq!(body["model"], model.id);
-        let observations = scope.finish("completed");
-        assert_eq!(
-            observations.last().unwrap().service_tier_honored(),
-            Some(true)
+            &options,
         );
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["model"], model.id);
+        let headers = collect_request_headers(&model, &auth, &options);
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer fixture-oauth"
+        }));
     }
 
     fn output_schema_fixture() -> Value {
@@ -5099,5 +5121,108 @@ mod openai_cache_wire_tests {
         assert_eq!(body["prompt_cache_key"], "legacy-key");
         assert_eq!(body["prompt_cache_retention"], "24h");
         assert!(body.get("prompt_cache_options").is_none());
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_plan_preview_tests {
+    use super::*;
+
+    fn public_plan_model() -> Model {
+        let mut model = crate::catalog::load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-codex-responses")
+            .expect("openai-codex model");
+        model.base_url = Some(crate::openai_siwc::OPENAI_SIWC_RESOURCE.into());
+        model
+    }
+
+    #[test]
+    fn public_plan_body_is_streaming_stateless_and_keeps_fast() {
+        let model = public_plan_model();
+        let body = request_body_with(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            None,
+            &[],
+            &StreamOptions {
+                service_tier: Some(crate::CodexServiceTier::Fast),
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["service_tier"], "priority");
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn public_plan_rejects_authorization_header_override_before_transport() {
+        let model = public_plan_model();
+        let auth = ResolvedAuth {
+            api_key: Some("verified-plan-token".into()),
+            headers: [(
+                "Authorization".into(),
+                "Bearer sk-configured-api-key".into(),
+            )]
+            .into_iter()
+            .collect(),
+            source: "OAuth".into(),
+        };
+        let error = live_complete_streaming_with_sink_envelope(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &auth,
+            None,
+            &[],
+            &StreamOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("Authorization header"));
+        assert!(error.contains("API-key/header overrides are disabled"));
+    }
+
+    #[test]
+    fn public_plan_constraints_rewrite_system_and_drop_unsupported_fields_and_tools() {
+        let model = public_plan_model();
+        let mut body = serde_json::json!({
+            "store": true,
+            "stream": false,
+            "previous_response_id": "resp_1",
+            "max_output_tokens": 100,
+            "prompt_cache_retention": "24h",
+            "metadata": {"x":"y"},
+            "input": [
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"policy"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ],
+            "tools": [
+                {"type":"function","name":"shell","parameters":{"type":"object"}},
+                {"type":"custom","name":"apply_patch","format":{"type":"grammar"}},
+                {"type":"file_search","vector_store_ids":["vs_1"]},
+                {"type":"tool_search"}
+            ]
+        });
+        apply_chatgpt_plan_preview_constraints(&model, &mut body);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["input"][0]["role"], "developer");
+        for key in [
+            "previous_response_id",
+            "max_output_tokens",
+            "prompt_cache_retention",
+            "metadata",
+        ] {
+            assert!(body.get(key).is_none(), "{key}");
+        }
+        let tool_types = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["type"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_types, vec!["function", "custom"]);
     }
 }

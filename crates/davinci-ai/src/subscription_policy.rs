@@ -37,18 +37,17 @@ impl CodexSubscriptionPolicy {
             || body.get("model").and_then(Value::as_str) != Some(&self.model)
             || body.pointer("/reasoning/effort").and_then(Value::as_str) != Some(&self.effort)
             || !auth.source.eq_ignore_ascii_case("oauth")
-            || auth
-                .api_key
-                .as_deref()
-                .is_none_or(|token| crate::codex::extract_account_id(token).is_err())
-            || url != "https://chatgpt.com/backend-api/codex/responses"
+            || auth.api_key.as_deref().is_none_or(str::is_empty)
+            || url != "https://api.openai.com/v1/responses"
+            || body.get("store").and_then(Value::as_bool) != Some(false)
+            || body.get("stream").and_then(Value::as_bool) != Some(true)
             || options.transport.as_deref() != Some("sse")
             || options.max_retries.unwrap_or(0) != 0
             || ["max_output_tokens", "max_completion_tokens", "max_tokens"]
                 .iter()
                 .any(|key| body.get(key).is_some())
         {
-            return Err("subscription-only admission denied: pinned Codex OAuth route, model, effort and SSE transport required; API billing and fallback are forbidden".into());
+            return Err("subscription-only admission denied: verified ChatGPT-plan OAuth, public /v1/responses, pinned model/effort and SSE transport required; API-key billing and fallback are forbidden".into());
         }
         Ok(())
     }
@@ -57,7 +56,6 @@ impl CodexSubscriptionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
 
     #[test]
     fn subscription_policy_rejects_every_billing_or_baseline_change() {
@@ -67,14 +65,13 @@ mod tests {
         };
         let model: crate::Model = serde_json::from_value(serde_json::json!({
             "id":"gpt-6-luna", "name":"fixture", "api":"openai-codex-responses",
-            "provider":"openai-codex", "baseUrl":"https://chatgpt.com/backend-api", "reasoning":true,
+            "provider":"openai-codex", "baseUrl":"https://api.openai.com/v1", "reasoning":true,
             "input":["text"], "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
             "contextWindow":1000,"maxTokens":100
-        })).unwrap();
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture"}}"#);
+        }))
+        .unwrap();
         let auth = crate::ResolvedAuth {
-            api_key: Some(format!("fixture.{payload}.fixture")),
+            api_key: Some("fixture-plan-access".into()),
             headers: Default::default(),
             source: "OAuth".into(),
         };
@@ -83,8 +80,13 @@ mod tests {
             max_retries: Some(0),
             ..Default::default()
         };
-        let body = serde_json::json!({"model":"gpt-6-luna","reasoning":{"effort":"high"}});
-        let url = "https://chatgpt.com/backend-api/codex/responses";
+        let body = serde_json::json!({
+            "model":"gpt-6-luna",
+            "reasoning":{"effort":"high"},
+            "store":false,
+            "stream":true
+        });
+        let url = "https://api.openai.com/v1/responses";
         assert!(policy
             .validate_request(&model, &auth, &options, &body, url)
             .is_ok());
@@ -101,8 +103,8 @@ mod tests {
                 3 => b["model"] = "other".into(),
                 4 => b["reasoning"]["effort"] = "low".into(),
                 5 => a.source = "configured API key".into(),
-                6 => a.api_key = Some("invalid-fixture".into()),
-                7 => u = "https://api.openai.com/v1/responses",
+                6 => a.api_key = None,
+                7 => u = "https://chatgpt.com/backend-api/codex/responses",
                 8 => o.transport = None,
                 9 => o.max_retries = Some(1),
                 _ => b["max_output_tokens"] = 100.into(),
