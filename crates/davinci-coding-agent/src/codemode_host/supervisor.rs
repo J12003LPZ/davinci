@@ -197,7 +197,7 @@ impl NodeCodeModeHost {
         if matches!(context.mode, CodeModeMode::Off) {
             return Err(CodeModeError::new("UNAVAILABLE", "Codemode is disabled"));
         }
-        let limits = context.limits.for_request(request)?;
+        context.limits_for_request(request)?;
         if node_fingerprint(&self.node)
             .map_err(|_| CodeModeError::new("UNAVAILABLE", "Node executable binding unavailable"))?
             != self.node_fingerprint
@@ -268,6 +268,7 @@ impl NodeCodeModeHost {
             .take()
             .ok_or_else(|| CodeModeError::new("SANDBOX_FAILED", "missing host output"))?;
         let child = Arc::new(Mutex::new(child));
+        let limits = context.limits_for_request(request)?;
         let watchdog = watch_host(
             child.clone(),
             context.cancellation.clone(),

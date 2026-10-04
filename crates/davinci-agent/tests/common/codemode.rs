@@ -371,6 +371,79 @@ fn codemode_parent_uses_real_dispatch_and_authoritative_child_evidence() {
 }
 
 #[test]
+fn codemode_inherits_root_deadline_before_host_launch() {
+    struct DeadlineHost(Arc<std::sync::atomic::AtomicU64>);
+    impl crate::codemode::CodeModeHost for DeadlineHost {
+        fn execute(
+            &self,
+            request: &crate::codemode::CodeModeRequest,
+            context: &crate::codemode::CodeModeRunContext,
+            broker: &dyn crate::codemode::CodeModeBroker,
+        ) -> crate::codemode::CodeModeOutcome {
+            assert!(context.limits.wall_ms <= 5000 && context.limits.wall_ms > 0);
+            self.0
+                .store(context.limits.wall_ms, std::sync::atomic::Ordering::SeqCst);
+            crate::codemode::CodeModeHost::execute(&ReadOnlyFixtureHost, request, context, broker)
+        }
+    }
+    for expired in [true, false] {
+        let (mut agent, workspace, journal) = configured_agent();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let budget = crate::runtime::capacity::RootBudget::open(
+            workspace.path().join("budget.json"),
+            "codemode-root-fixture",
+            crate::runtime::capacity::BudgetLimits {
+                max_requests: 1,
+                max_output_tokens: Some(100),
+                max_cost_microusd: None,
+                codex_subscription: None,
+                deadline_unix_ms: if expired { 1 } else { now + 5000 },
+            },
+        )
+        .unwrap();
+        agent.runtime.as_mut().unwrap().root_budget = Some(budget);
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        agent
+            .enable_read_only_codemode(Arc::new(DeadlineHost(wall.clone())))
+            .unwrap();
+        let result = agent.execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "root-deadline".into(),
+                "codemode".into(),
+                json!({"code":"return 1"}),
+            )],
+            &mut Vec::new(),
+        );
+        assert_eq!(result[0].is_error, Some(expired), "{result:?}");
+        assert_eq!(wall.load(std::sync::atomic::Ordering::SeqCst) == 0, expired);
+        assert_eq!(
+            agent
+                .counters
+                .executed_leaf_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            if expired { 0 } else { 2 }
+        );
+        if expired {
+            let parent = journal.snapshot().unwrap().operations[0].operation_id();
+            let result =
+                agent.run_codemode("root-deadline", &json!({"code":"return 1"}), Some(parent));
+            assert_eq!(
+                result.details.as_ref().unwrap()["codemode"]["status"],
+                "cancelled"
+            );
+            assert_eq!(
+                crate::codemode::mandatory_facts(&result).unwrap()["operationRef"],
+                parent.to_string()
+            );
+        }
+    }
+}
+
+#[test]
 fn codemode_off_keeps_provider_schema_and_invalid_input_never_launches() {
     struct NeverHost;
     impl crate::codemode::CodeModeHost for NeverHost {
@@ -441,7 +514,7 @@ fn broker_context(agent: &Agent) -> crate::codemode::CodeModeRunContext {
             .capability_registry
             .hash_tool_capabilities(&agent.tools),
         cancellation: Default::default(),
-        root_budget: None,
+        root_budget: runtime.root_budget.clone(),
     }
 }
 

@@ -51,6 +51,14 @@ impl<'a> AgentCodeModeBroker<'a> {
         if context.identity.workspace_binding != binding
             || context.identity.runtime_run_id != runtime.run_id.to_string()
             || context.identity.parent_operation_ref != parent.map(|id| id.to_string())
+            || context
+                .root_budget
+                .as_ref()
+                .map(|budget| budget.binding_identity())
+                != runtime
+                    .root_budget
+                    .as_ref()
+                    .map(|budget| budget.binding_identity())
         {
             return Err(CodeModeError::new(
                 "DENIED",
@@ -100,6 +108,7 @@ impl<'a> AgentCodeModeBroker<'a> {
     }
 
     fn live(&self) -> Result<(), CodeModeError> {
+        super::remaining_root_wall_ms(self.context.root_budget.as_ref())?;
         if self.context.cancellation.is_cancelled() || self.agent.abort_requested() {
             return Err(CodeModeError::new("CANCELLED", "parent run cancelled"));
         }
@@ -275,7 +284,9 @@ impl CodeModeBroker for AgentCodeModeBroker<'_> {
         let _lane = self
             .dispatch
             .acquire(1, || {
-                self.context.cancellation.is_cancelled() || self.agent.abort_requested()
+                self.context.cancellation.is_cancelled()
+                    || self.agent.abort_requested()
+                    || super::remaining_root_wall_ms(self.context.root_budget.as_ref()).is_err()
             })
             .ok_or_else(|| CodeModeError::new("CANCELLED", "queued child cancelled"))?;
         self.live()?;

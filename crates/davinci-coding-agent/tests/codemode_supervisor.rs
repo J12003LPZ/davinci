@@ -80,6 +80,70 @@ fn native_host_executes_without_model_or_capability_access() {
 
 #[test]
 #[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn native_root_deadline_does_not_restart_after_host_setup() {
+    use davinci_agent::runtime::capacity::{BudgetLimits, RootBudget};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    let host = fixture_host();
+    let workspace = tempfile::tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let budget = RootBudget::open(
+        workspace.path().join("budget.json"),
+        "native-root-deadline",
+        BudgetLimits {
+            max_requests: 1,
+            max_output_tokens: Some(100),
+            max_cost_microusd: None,
+            codex_subscription: None,
+            deadline_unix_ms: now + 1000,
+        },
+    )
+    .unwrap();
+    let parent = davinci_agent::runtime::CancellationToken::new();
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "root-deadline-fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: "fixture".into(),
+            runtime_run_id: "fixture".into(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: "fixture".into(),
+        cancellation: parent.child_token(),
+        root_budget: Some(budget),
+    };
+    let started = Instant::now();
+    let outcome = host.execute(
+        &CodeModeRequest {
+            code: "while (true) {}".into(),
+            timeout_ms: None,
+            max_output_bytes: None,
+        },
+        &context,
+        &NoTools,
+    );
+    assert!(!outcome.script_completed);
+    assert!(
+        matches!(
+            outcome.error.as_ref().map(|error| error.code.as_str()),
+            Some("CANCELLED" | "TIMEOUT")
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "root deadline was replaced by the default wall allowance"
+    );
+    assert!(!parent.is_cancelled());
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
 fn native_deadline_remains_active_while_rust_waits_for_a_child() {
     struct WaitingBroker(davinci_agent::runtime::CancellationToken);
     impl CodeModeBroker for WaitingBroker {

@@ -93,7 +93,7 @@ impl Agent {
         let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
             let request: CodeModeRequest = serde_json::from_value(args.clone())
                 .map_err(|_| CodeModeError::new("INVALID_INPUT", "invalid Codemode request"))?;
-            let limits = CodeModeLimits::default().for_request(&request)?;
+            let mut limits = CodeModeLimits::default().for_request(&request)?;
             let binding = self
                 .codemode
                 .as_ref()
@@ -102,6 +102,9 @@ impl Agent {
                 .runtime
                 .as_ref()
                 .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "parent runtime unavailable"))?;
+            if let Some(remaining) = super::remaining_root_wall_ms(runtime.root_budget.as_ref())? {
+                limits.wall_ms = limits.wall_ms.min(remaining);
+            }
             let parent = parent
                 .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "parent operation unavailable"))?;
             let context = CodeModeRunContext {
@@ -162,11 +165,33 @@ impl Agent {
                 is_error: !matches!(outcome.status, CodeModeStatus::Completed),
                 details: Some(json!({"codemode":outcome,"_codemode_authority":authority})),
             },
-            Err(error) => ToolResult {
-                content: error.message.clone(),
-                is_error: true,
-                details: Some(json!({"codemode_error":error})),
-            },
+            Err(mut error) => {
+                error.operation_ref = parent.map(|parent| parent.to_string());
+                let outcome = CodeModeOutcome {
+                    status: match error.code.as_str() {
+                        "CANCELLED" => CodeModeStatus::Cancelled,
+                        "RECOVERY_REQUIRED" => CodeModeStatus::RecoveryRequired,
+                        _ => CodeModeStatus::Failed,
+                    },
+                    script_completed: false,
+                    output_text: String::new(),
+                    output_complete: false,
+                    output_artifact: None,
+                    children: vec![],
+                    host_notes: vec![],
+                    operation_ref: error
+                        .operation_ref
+                        .clone()
+                        .unwrap_or_else(|| "unavailable".into()),
+                    error: Some(error.clone()),
+                };
+                ToolResult {
+                    content: serde_json::to_string(&outcome)
+                        .unwrap_or_else(|_| error.message.clone()),
+                    is_error: true,
+                    details: Some(json!({"codemode":outcome,"codemode_error":error})),
+                }
+            }
         }
     }
 }

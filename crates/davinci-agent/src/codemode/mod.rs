@@ -1,11 +1,13 @@
 //! Default-off sandbox execution contracts and Rust-owned capability policy.
 mod authority;
+mod deadline;
 mod dispatch;
 mod execution;
 mod policy;
 pub mod projection;
 mod types;
 pub(crate) use authority::fingerprint as authority_fingerprint;
+pub(crate) use deadline::remaining_root_wall_ms;
 pub use dispatch::AgentCodeModeBroker;
 pub(crate) use execution::mandatory_facts;
 pub(crate) use execution::CodeModeBinding;
