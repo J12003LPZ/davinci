@@ -4841,7 +4841,7 @@ pub fn run(
             team_mail_since = None;
             if let Some(text) = team_wake_text(agent) {
                 let mut shell = Shell {
-        parsed,
+                    parsed,
                     agent,
                     model: &mut model,
                     terminal: &mut terminal,
@@ -4972,7 +4972,7 @@ pub fn run(
                             });
                             if taken {
                                 let mut shell = Shell {
-                                        parsed,
+                                    parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
@@ -5069,7 +5069,7 @@ pub fn run(
                                     action @ (davinci_tui::DoubleEscapeAction::Fork
                                     | davinci_tui::DoubleEscapeAction::Rewind) => {
                                         let mut shell = Shell {
-                                                        parsed,
+                                            parsed,
                                             agent,
                                             model: &mut model,
                                             terminal: &mut terminal,
@@ -5118,7 +5118,7 @@ pub fn run(
                                 });
                                 if doubled {
                                     run_stop_hooks(&mut Shell {
-                                                parsed,
+                                        parsed,
                                         agent,
                                         model: &mut model,
                                         terminal: &mut terminal,
@@ -5140,7 +5140,7 @@ pub fn run(
                             }
                             Flow::Quit => {
                                 run_stop_hooks(&mut Shell {
-                                        parsed,
+                                    parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
@@ -5154,7 +5154,7 @@ pub fn run(
                             }
                             Flow::Submit(line) => on_line(
                                 &mut Shell {
-                                        parsed,
+                                    parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
@@ -5168,7 +5168,7 @@ pub fn run(
                             ),
                             Flow::Choose(choice) => on_choice(
                                 &mut Shell {
-                                        parsed,
+                                    parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
