@@ -7786,3 +7786,7 @@ mod checker_quote_regressions {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/codemode.rs"]
+mod codemode_baseline;

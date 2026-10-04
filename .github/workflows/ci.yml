@@ -404,3 +404,35 @@ jobs:
       - name: Require all workspace test shards
         shell: bash
         run: test "${{ needs['workspace-test-shards'].result }}" = "success"
+
+  codemode-baseline:
+    name: codemode-baseline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record source and toolchain identity
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git status --porcelain
+          rustc --version
+          cargo --version
+          echo "RTK unavailable in this job; using raw Cargo for fixture validation"
+      - name: Prepare exact Rust dependency cache
+        run: cargo fetch --locked
+      - name: Existing batch and tool-ledger baseline
+        run: |
+          cargo test -p davinci-agent batch::tests --lib --offline --locked
+          cargo test -p davinci-agent tool_ledger::tests --lib --offline --locked
+      - name: MCP and production-dispatch characterization
+        run: |
+          cargo test -p davinci-mcp --lib --offline --locked
+          cargo test -p davinci-agent codemode_baseline --lib --offline --locked
+          cargo test -p davinci-agent --test operation_dispatch --offline --locked
+      - name: Existing reversible Governor baseline
+        run: cargo test -p davinci-coding-agent token_governor::tests --lib --offline --locked
