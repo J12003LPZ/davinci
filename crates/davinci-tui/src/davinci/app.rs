@@ -1734,7 +1734,6 @@ mod tests {
     use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
 
-
     fn model(width: u16, height: u16) -> Model {
         let mut model = Model::new(
             Theme::da_vinci(ColorDepth::TrueColor, false),
