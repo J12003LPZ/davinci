@@ -8329,15 +8329,15 @@ fn login_provider_with_wait(
             return Err(davinci_ai::ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into());
         }
         if looks_like_oauth_input(key) {
-            let (code, pasted_state) = davinci_ai::parse_authorization_input(key);
-            let code = code.ok_or_else(|| "Missing authorization code.".to_string())?;
+            let callback = davinci_ai::parse_authorization_callback(key);
             let pending = davinci_ai::take_pending_login(&default_agent_dir(), provider)
                 .ok_or_else(|| {
                     format!(
                         "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
                     )
                 })?;
-            if let (Some(expected), Some(got)) = (pending.state.as_deref(), pasted_state.as_deref())
+            if let (Some(expected), Some(got)) =
+                (pending.state.as_deref(), callback.state.as_deref())
             {
                 if expected != got {
                     return Err(
@@ -8346,13 +8346,10 @@ fn login_provider_with_wait(
                     );
                 }
             }
-            let tokens = davinci_ai::exchange_authorization_code(
-                provider,
-                &code,
-                pending.pkce.as_ref(),
-                pending.state.as_deref(),
-            )?;
-            return store_oauth_tokens(&mut storage, provider, tokens);
+            return exchange_and_store_oauth(&mut storage, provider, &pending, callback);
+        }
+        if provider == "openai-codex" {
+            return Err("OpenAI Codex is subscription-only in this build. Use /login openai-codex and Continue with ChatGPT; API keys are not accepted for this provider.".into());
         }
         storage
             .login_api_key(provider, key)
@@ -8364,24 +8361,33 @@ fn login_provider_with_wait(
         println!("Usage: /login <provider> <api-key>");
         return Ok(false);
     }
-    if let Some(request) = davinci_ai::fresh_authorize_request(provider) {
+    if let Some(request) = davinci_ai::fresh_authorize_request_checked(provider)? {
         if let Ok(code) = std::env::var("PI_OAUTH_CODE") {
-            let tokens = davinci_ai::exchange_authorization_code(
-                provider,
-                &code,
-                request.pkce.as_ref(),
-                request.state.as_deref(),
-            )?;
-            return store_oauth_tokens(&mut storage, provider, tokens);
+            let callback = davinci_ai::AuthorizationCallbackInput {
+                code: Some(code),
+                state: request.state.clone(),
+                client_id: request
+                    .openai_siwc
+                    .as_ref()
+                    .filter(|context| context.dynamic_registration)
+                    .map(|_| "oaiapp_fixture".to_string()),
+                ..Default::default()
+            };
+            return exchange_and_store_oauth(&mut storage, provider, &request, callback);
         }
         let should_wait = wait_for_oauth_callback || std::env::var("PI_OAUTH_WAIT").is_ok();
         if should_wait {
             if let Some(kind) = davinci_ai::CallbackProvider::parse(provider) {
-                let host = davinci_ai::callback_host();
-                let port = std::env::var("PI_OAUTH_CALLBACK_PORT")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or_else(|| kind.default_port());
+                let (host, port) = if provider == "openai-codex" {
+                    ("127.0.0.1".to_string(), kind.default_port())
+                } else {
+                    let host = davinci_ai::callback_host();
+                    let port = std::env::var("PI_OAUTH_CALLBACK_PORT")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or_else(|| kind.default_port());
+                    (host, port)
+                };
                 let expected = request
                     .state
                     .clone()
@@ -8395,13 +8401,14 @@ fn login_provider_with_wait(
                     std::time::Instant::now() + std::time::Duration::from_secs(300),
                 )?;
                 if let Some(code) = response.code {
-                    let tokens = davinci_ai::exchange_authorization_code(
-                        provider,
-                        &code,
-                        request.pkce.as_ref(),
-                        request.state.as_deref(),
-                    )?;
-                    return store_oauth_tokens(&mut storage, provider, tokens);
+                    let callback = davinci_ai::AuthorizationCallbackInput {
+                        code: Some(code),
+                        state: response.state,
+                        client_id: response.client_id,
+                        scope: response.scope,
+                        error: None,
+                    };
+                    return exchange_and_store_oauth(&mut storage, provider, &request, callback);
                 }
                 return Err("OAuth callback did not include an authorization code.".into());
             }
@@ -8410,6 +8417,9 @@ fn login_provider_with_wait(
         println!("{}", request.url);
         println!("{}", request.instructions);
         return Ok(false);
+    }
+    if provider == "openai-codex" && std::env::var("PI_OAUTH_ACCESS").is_ok() {
+        return Err("Direct OAuth-token injection is disabled for openai-codex because it cannot prove the issued client, identity, nonce and granted ChatGPT-plan scope. Sign in through DaVinci instead.".into());
     }
     if let (Ok(access), refresh) = (
         std::env::var("PI_OAUTH_ACCESS"),
@@ -8427,6 +8437,80 @@ fn login_provider_with_wait(
     }
     println!("Usage: /login <provider> <api-key>");
     Ok(false)
+}
+
+fn exchange_and_store_oauth(
+    storage: &mut AuthStorage,
+    provider: &str,
+    pending: &davinci_ai::AuthorizeRequest,
+    callback: davinci_ai::AuthorizationCallbackInput,
+) -> Result<bool, String> {
+    if let Some(error) = callback.error {
+        return Err(format!("OAuth authorization failed: {error}"));
+    }
+    let code = callback
+        .code
+        .ok_or_else(|| "Missing authorization code.".to_string())?;
+    if provider != "openai-codex" {
+        let tokens = davinci_ai::exchange_authorization_code(
+            provider,
+            &code,
+            pending.pkce.as_ref(),
+            pending.state.as_deref(),
+        )?;
+        return store_oauth_tokens(storage, provider, tokens);
+    }
+
+    let context = pending
+        .openai_siwc
+        .as_ref()
+        .ok_or("Missing Sign in with ChatGPT transaction context; start login again.")?;
+    let issued_client_id = if context.dynamic_registration {
+        let issued = callback
+            .client_id
+            .as_deref()
+            .or_else(|| {
+                (davinci_ai::fixtures::enabled() && code.starts_with("pi-fixture-"))
+                    .then_some("oaiapp_fixture")
+            })
+            .ok_or(
+                "The first ChatGPT registration must return its issued client_id. Paste the complete redirect URL or use the loopback callback.",
+            )?;
+        davinci_ai::openai_siwc::save_issued_client_id(&default_agent_dir(), issued)?;
+        issued
+    } else {
+        if callback
+            .client_id
+            .as_deref()
+            .is_some_and(|client_id| client_id != context.client_id)
+        {
+            return Err(
+                "The ChatGPT callback returned a different client registration; login was rejected."
+                    .into(),
+            );
+        }
+        &context.client_id
+    };
+    let verifier = pending
+        .pkce
+        .as_ref()
+        .map(|pkce| pkce.verifier.as_str())
+        .ok_or("Missing PKCE verifier; start ChatGPT login again.")?;
+    let session = davinci_ai::exchange_openai_siwc_authorization_code(
+        &code,
+        issued_client_id,
+        verifier,
+        &context.redirect_uri,
+        &context.nonce,
+        &context.ext_agent_host_id,
+        context.expected_subject.as_deref(),
+    )?;
+    storage
+        .login_openai_siwc(session)
+        .map_err(|err| err.to_string())?;
+    davinci_ai::openai_siwc::clear_issued_client_id(&default_agent_dir());
+    println!("stored verified ChatGPT-plan login for openai-codex");
+    Ok(true)
 }
 
 /// Write an exchanged or refreshed OAuth credential. The expiry is what makes
@@ -12547,7 +12631,8 @@ fn start_login(
         }
         return Ok(());
     }
-    if let Some(request) = davinci_ai::fresh_authorize_request(provider) {
+    if let Some(request) = davinci_ai::fresh_authorize_request_checked(provider)? {
+        davinci_ai::save_pending_login(&default_agent_dir(), provider, &request)?;
         if let Some(dialog) = &mut session.chrome.login_dialog {
             dialog.show_auth(&request.url, Some(request.instructions.as_str()));
             dialog.show_manual_input("Paste the redirect URL or authorization code");

@@ -15,14 +15,24 @@ fn credential_directory_eval_keeps_logged_in_models_discoverable() {
             _ => home.path().join("explicit"),
         };
         fs::create_dir_all(&auth_dir).unwrap();
-        let payload = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#,
-        );
         fs::write(
             auth_dir.join("auth.json"),
             serde_json::json!({
-                "openai-codex": {"type": "oauth", "access": format!("e30.{payload}.signature")}
+                "openai-codex": {
+                    "type": "oauth",
+                    "access": "fixture-plan-access",
+                    "expires": u64::MAX,
+                    "env": {
+                        "OPENAI_SIWC_CLIENT_ID": "oaiapp_fixture",
+                        "OPENAI_SIWC_EXT_AGENT_HOST_ID": "urn:uuid:00000000-0000-4000-8000-000000000001",
+                        "OPENAI_SIWC_ISSUER": "https://auth.openai.com",
+                        "OPENAI_SIWC_SUBJECT": "fixture-subject",
+                        "OPENAI_SIWC_EMAIL": "fixture@example.test",
+                        "OPENAI_SIWC_ID_TOKEN": "fixture-id-token",
+                        "OPENAI_SIWC_SCOPES": "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
+                        "OPENAI_SIWC_RESOURCE": "https://api.openai.com/v1"
+                    }
+                }
             })
             .to_string(),
         )

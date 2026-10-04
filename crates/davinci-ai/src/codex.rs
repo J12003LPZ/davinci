@@ -13,7 +13,7 @@ use crate::catalog::Model;
 use crate::responses_ledger::NativeResponsesOutput;
 use crate::stream::{AssistantMessage, AssistantMessageEvent};
 
-pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+pub const DEFAULT_CODEX_BASE_URL: &str = "https://api.openai.com/v1";
 pub const WEBSOCKET_CONNECTION_LIMIT_REACHED: &str = "websocket_connection_limit_reached";
 pub const PREVIOUS_RESPONSE_NOT_FOUND: &str = "previous_response_not_found";
 pub const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE: u16 = 1009;
@@ -143,12 +143,10 @@ pub fn resolve_codex_url(base_url: Option<&str>) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_CODEX_BASE_URL);
     let normalized = raw.trim_end_matches('/');
-    if normalized.ends_with("/codex/responses") {
+    if normalized.ends_with("/responses") {
         normalized.to_string()
-    } else if normalized.ends_with("/codex") {
-        format!("{normalized}/responses")
     } else {
-        format!("{normalized}/codex/responses")
+        format!("{normalized}/responses")
     }
 }
 
@@ -1022,30 +1020,26 @@ data: {"type":"response.completed","response":{"status":"completed"}}
     }
 
     #[test]
-    fn resolve_codex_urls_match_ts() {
+    fn resolve_codex_urls_use_public_responses_default() {
         assert_eq!(
             resolve_codex_url(None),
-            "https://chatgpt.com/backend-api/codex/responses"
+            "https://api.openai.com/v1/responses"
         );
         assert_eq!(
-            resolve_codex_url(Some("https://chatgpt.com/backend-api")),
-            "https://chatgpt.com/backend-api/codex/responses"
+            resolve_codex_url(Some("https://api.openai.com/v1")),
+            "https://api.openai.com/v1/responses"
         );
         assert_eq!(
-            resolve_codex_url(Some("https://chatgpt.com/backend-api/codex")),
-            "https://chatgpt.com/backend-api/codex/responses"
+            resolve_codex_url(Some("https://api.openai.com/v1/responses")),
+            "https://api.openai.com/v1/responses"
         );
         assert_eq!(
-            resolve_codex_url(Some("https://chatgpt.com/backend-api/codex/responses")),
-            "https://chatgpt.com/backend-api/codex/responses"
+            resolve_codex_websocket_url(Some("https://api.openai.com/v1")),
+            "wss://api.openai.com/v1/responses"
         );
         assert_eq!(
-            resolve_codex_websocket_url(Some("https://chatgpt.com/backend-api")),
-            "wss://chatgpt.com/backend-api/codex/responses"
-        );
-        assert_eq!(
-            resolve_codex_websocket_url(Some("http://127.0.0.1:9/backend-api")),
-            "ws://127.0.0.1:9/backend-api/codex/responses"
+            resolve_codex_websocket_url(Some("http://127.0.0.1:9/v1")),
+            "ws://127.0.0.1:9/v1/responses"
         );
     }
 

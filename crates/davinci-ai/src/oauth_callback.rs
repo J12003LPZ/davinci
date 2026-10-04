@@ -94,6 +94,8 @@ pub struct CallbackResponse {
     pub body: String,
     pub code: Option<String>,
     pub state: Option<String>,
+    pub client_id: Option<String>,
+    pub scope: Option<String>,
 }
 
 fn escape_html(value: &str) -> String {
@@ -205,6 +207,8 @@ fn html_response(status: u16, body: String) -> CallbackResponse {
         body,
         code: None,
         state: None,
+        client_id: None,
+        scope: None,
     }
 }
 
@@ -262,12 +266,18 @@ fn handle_codex(pathname: &str, query: &str, expected_state: &str) -> CallbackRe
     if query_param(query, "state").as_deref() != Some(expected_state) {
         return html_response(400, oauth_error_html(ERR_STATE_MISMATCH, None));
     }
+    if let Some(error) = query_param(query, "error") {
+        let description = query_param(query, "error_description").unwrap_or(error);
+        return html_response(400, oauth_error_html(&description, None));
+    }
     let Some(code) = query_param(query, "code") else {
         return html_response(400, oauth_error_html(ERR_MISSING_AUTHORIZATION_CODE, None));
     };
     let mut response = html_response(200, oauth_success_html(MSG_CODEX_SUCCESS));
     response.code = Some(code);
     response.state = Some(expected_state.into());
+    response.client_id = query_param(query, "client_id");
+    response.scope = query_param(query, "scope");
     response
 }
 
@@ -457,6 +467,8 @@ impl CallbackServer {
                 body: ERR_INTERNAL_PLAIN.into(),
                 code: None,
                 state: None,
+                client_id: None,
+                scope: None,
             },
         };
         if response.code.is_some() {

@@ -86,11 +86,11 @@ pub const PROVIDER_SPECS: &[ProviderSpec] = &[
     ProviderSpec {
         id: "openai-codex",
         name: "OpenAI Codex",
-        base_url: "https://chatgpt.com/backend-api",
+        base_url: "https://api.openai.com/v1",
         api: "openai-codex-responses",
-        env_vars: &["OPENAI_API_KEY"],
+        env_vars: &[],
         oauth: true,
-        oauth_name: Some("ChatGPT Codex"),
+        oauth_name: Some("ChatGPT plan"),
     },
     ProviderSpec {
         id: "radius",

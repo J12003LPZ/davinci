@@ -375,7 +375,6 @@ pub fn empty_catalog_error(snapshot: &ModelRuntimeSnapshot) -> Option<String> {
 mod tests {
     use super::*;
     use crate::catalog::ModelCost;
-    use base64::Engine as _;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -534,30 +533,6 @@ mod tests {
             &Default::default(),
         )
         .is_none());
-
-        let encode =
-            |value: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
-        let access = format!(
-            "{}.{}.signature",
-            encode(r#"{"alg":"none"}"#),
-            encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc-test"}}"#)
-        );
-        storage
-            .login_oauth(
-                "openai-codex",
-                access,
-                Some("refresh".into()),
-                Some(u64::MAX),
-            )
-            .unwrap();
-
-        assert!(check_auth(
-            "openai-codex",
-            &ModelConfig::empty(),
-            &storage,
-            &Default::default(),
-        )
-        .is_some());
     }
 
     #[test]

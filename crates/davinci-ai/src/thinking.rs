@@ -257,10 +257,7 @@ mod tests {
             .expect("openai-codex/gpt-6-astra must be in the built-in catalog");
 
         assert_eq!(astra.api, "openai-codex-responses");
-        assert_eq!(
-            astra.base_url.as_deref(),
-            Some("https://chatgpt.com/backend-api")
-        );
+        assert_eq!(astra.base_url.as_deref(), Some("https://api.openai.com/v1"));
         assert_eq!(astra.context_window, 1_050_000);
         assert_eq!(astra.max_tokens, 128_000);
         assert_eq!(astra.cost.input, 10.0);

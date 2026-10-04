@@ -10,7 +10,7 @@ use std::{
 };
 
 #[test]
-fn codex_simple_completion_streams_and_preserves_compaction_options() {
+fn responses_simple_completion_preserves_compaction_options() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -68,9 +68,9 @@ fn codex_simple_completion_streams_and_preserves_compaction_options() {
             ))
         } else {
             (
-                "400 Bad Request",
+                "200 OK",
                 "application/json",
-                "{\"detail\":\"Stream must be set to true\"}",
+                "{\"id\":\"resp_fixture\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Preserved audit code\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}",
             )
         };
         write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
@@ -81,13 +81,15 @@ fn codex_simple_completion_streams_and_preserves_compaction_options() {
         .find(|model| model.api == "openai-codex-responses")
         .unwrap();
     model.id = "gpt-6-luna".into();
+    model.provider = "openai".into();
+    model.api = "openai-responses".into();
     model.base_url = Some(format!("http://{address}"));
     let result = complete_simple(
         &model,
         "Summarize the conversation",
         Some("Preserve the audit code"),
         &ResolvedAuth {
-            api_key: None,
+            api_key: Some("fixture-api-key".into()),
             headers: Default::default(),
             source: "test".into(),
         },
@@ -100,7 +102,10 @@ fn codex_simple_completion_streams_and_preserves_compaction_options() {
         },
     );
     let body = server.join().unwrap();
-    assert_eq!(body["stream"], true, "Codex requires a streaming request");
+    assert_eq!(
+        body["stream"], false,
+        "complete_simple uses the non-streaming public Responses shape"
+    );
     assert_eq!(body["reasoning"]["effort"], "low");
     assert_eq!(body["instructions"], "Preserve the audit code");
     assert!(body.get("prompt_cache_key").is_none());

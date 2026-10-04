@@ -137,9 +137,15 @@ impl OpenAiCacheCapabilities {
         }
 
         let public_openai =
-            model.provider == "openai" && model.api == "openai-responses" && !is_oauth;
-        let chatgpt_codex =
-            model.provider == "openai-codex" && model.api == "openai-codex-responses" && is_oauth;
+            (model.provider == "openai" && model.api == "openai-responses" && !is_oauth)
+                || (is_oauth && crate::openai_siwc::is_public_plan_model(model));
+        let chatgpt_codex = model.provider == "openai-codex"
+            && model.api == "openai-codex-responses"
+            && is_oauth
+            && model
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.contains("chatgpt.com"));
 
         if public_openai {
             let explicit = codex.explicit_cache_breakpoints;

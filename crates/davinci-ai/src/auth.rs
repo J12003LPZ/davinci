@@ -61,6 +61,9 @@ impl Drop for Credential {
         if let Some(refresh) = &mut self.refresh {
             refresh.zeroize();
         }
+        for value in self.env.values_mut() {
+            value.zeroize();
+        }
     }
 }
 
@@ -169,6 +172,20 @@ impl AuthStorage {
         )
     }
 
+    pub fn login_openai_siwc(
+        &mut self,
+        session: crate::openai_siwc::OpenAiSiwcSession,
+    ) -> Result<(), AuthStorageError> {
+        let mut credential = Self::oauth_credential(
+            "openai-codex",
+            session.tokens.access.clone(),
+            session.tokens.refresh.clone(),
+            session.tokens.expires,
+        );
+        credential.env = crate::openai_siwc::credential_metadata(&session);
+        self.set("openai-codex", credential)
+    }
+
     fn oauth_credential(
         provider: &str,
         access: String,
@@ -229,6 +246,26 @@ impl AuthStorage {
         }
 
         let refresh = cred.refresh.clone().unwrap_or_default();
+        if provider == "openai-codex" {
+            crate::openai_siwc::validate_credential(&cred).map_err(AuthStorageError::Invalid)?;
+            if refresh.is_empty() {
+                return Ok(false);
+            }
+            let registration =
+                crate::openai_siwc::registration_from_credential(&cred).ok_or_else(|| {
+                    AuthStorageError::Invalid(
+                        "stored ChatGPT registration metadata is missing".into(),
+                    )
+                })?;
+            let tokens =
+                crate::openai_siwc::refresh_access_token(&registration.client_id, &refresh)
+                    .map_err(AuthStorageError::Read)?;
+            let mut credential =
+                Self::oauth_credential(provider, tokens.access, tokens.refresh, tokens.expires);
+            credential.env = cred.env.clone();
+            self.store_locked(provider, Some(credential))?;
+            return Ok(true);
+        }
         let fixture = crate::fixtures::enabled()
             && (refresh.starts_with("pi-fixture-")
                 || matches!(
@@ -405,12 +442,10 @@ pub(crate) fn oauth_credential_usable(provider: &str, credential: &Credential) -
     if provider == "anthropic" {
         return false;
     }
-    provider != "openai-codex"
-        || credential
-            .access
-            .as_deref()
-            .or(credential.key.as_deref())
-            .is_some_and(|access| crate::codex::extract_account_id(access).is_ok())
+    if provider == "openai-codex" {
+        return crate::openai_siwc::validate_credential(credential).is_ok();
+    }
+    true
 }
 
 pub fn resolve_provider_auth(
@@ -419,16 +454,21 @@ pub fn resolve_provider_auth(
     env: &HashMap<String, String>,
     include_env: bool,
 ) -> Option<ResolvedAuth> {
-    if let Some(key) = storage.runtime_overrides.get(provider) {
-        return Some(ResolvedAuth {
-            api_key: Some(key.clone()),
-            headers: HashMap::new(),
-            source: "runtime override".into(),
-        });
+    if provider != "openai-codex" {
+        if let Some(key) = storage.runtime_overrides.get(provider) {
+            return Some(ResolvedAuth {
+                api_key: Some(key.clone()),
+                headers: HashMap::new(),
+                source: "runtime override".into(),
+            });
+        }
     }
     if let Some(cred) = storage.get(provider) {
         match cred.kind {
             CredentialKind::ApiKey => {
+                if provider == "openai-codex" {
+                    return None;
+                }
                 if let Some(key) = &cred.key {
                     if !key.is_empty() {
                         return Some(ResolvedAuth {
@@ -997,16 +1037,14 @@ mod tests {
         let mut storage = AuthStorage::open(&path).unwrap();
         storage
             .login_oauth(
-                "openai-codex",
+                "xai",
                 jwt_expiring_at(1_000),
                 Some("pi-fixture-refresh".into()),
                 None,
             )
             .unwrap();
-        assert!(storage
-            .maybe_refresh("openai-codex", 2_000_000, 0, false)
-            .unwrap());
-        let cred = storage.get("openai-codex").unwrap();
+        assert!(storage.maybe_refresh("xai", 2_000_000, 0, false).unwrap());
+        let cred = storage.get("xai").unwrap();
         assert_eq!(cred.access.as_deref(), Some("pi-fixture-refresh-access"));
         assert!(cred.expires.unwrap() > 2_000_000);
         assert_eq!(cred.refresh.as_deref(), Some("pi-fixture-refresh"));
@@ -1019,18 +1057,18 @@ mod tests {
         let mut storage = AuthStorage::open(&path).unwrap();
         storage
             .login_oauth(
-                "openai-codex",
+                "xai",
                 "access",
                 Some("pi-fixture-refresh".into()),
                 Some(1_000_000),
             )
             .unwrap();
         assert!(!storage
-            .maybe_refresh("openai-codex", 500_000, 60_000, false)
+            .maybe_refresh("xai", 500_000, 60_000, false)
             .unwrap());
-        // Within the five-minute window the TS resolver uses, it renews early.
+        // Within the five-minute window the resolver uses, it renews early.
         assert!(storage
-            .maybe_refresh("openai-codex", 700_000, 300_000, false)
+            .maybe_refresh("xai", 700_000, 300_000, false)
             .unwrap());
     }
 
