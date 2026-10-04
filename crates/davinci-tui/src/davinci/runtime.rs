@@ -443,8 +443,6 @@ impl Session {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(ready) = self.paste.next_ready() {
-                if matches!(ready, Event::Resize(..)) {
-                }
                 if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
                 {
                     continue;
@@ -487,8 +485,6 @@ impl Session {
                 self.paste.feed(event::read()?);
             }
             if let Some(ready) = self.paste.next_ready() {
-                if matches!(ready, Event::Resize(..)) {
-                }
                 if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
                 {
                     continue;
@@ -679,9 +675,7 @@ impl Drop for Session {
 }
 
 fn route_graph_mouse(model: &mut Model, mouse: event::MouseEvent) -> bool {
-    if model.screen != super::model::Screen::GraphRun
-        || model.overlay.is_some()
-    {
+    if model.screen != super::model::Screen::GraphRun || model.overlay.is_some() {
         return false;
     }
     app::compose_frame(model, model.height)
@@ -788,13 +782,8 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(!route_graph_mouse(
-            &mut model,
-            click,
-            Some(Rect::new(column, row, 1, 1))
-        ));
         assert!(model.graph_canvas.follow_live);
-        assert!(route_graph_mouse(&mut model, click, None));
+        assert!(route_graph_mouse(&mut model, click));
         assert_eq!(
             model
                 .graph_run
@@ -809,10 +798,10 @@ mod tests {
             kind: event::MouseEventKind::ScrollDown,
             ..click
         };
-        assert!(route_graph_mouse(&mut model, wheel, None));
+        assert!(route_graph_mouse(&mut model, wheel));
         assert!(!model.graph_canvas.follow_live);
         model.screen = super::super::model::Screen::Agent;
-        assert!(!route_graph_mouse(&mut model, click, None));
+        assert!(!route_graph_mouse(&mut model, click));
     }
 
     #[test]
