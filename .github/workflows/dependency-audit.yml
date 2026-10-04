@@ -1,0 +1,25 @@
+name: Dependency audit
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # New advisories land without any commit here; check weekly as well.
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned cargo-deny
+        # cargo-deny needs a newer compiler than the repository's pinned 1.83.
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-deny --version 0.20.2 --locked
+      - name: Advisories and sources
+        run: cargo deny check advisories sources

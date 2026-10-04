@@ -25,8 +25,9 @@ on:
         required: true
         default: '3'
         type: string
-  schedule:
-    - cron: '0 3 * * 0'
+  # No schedule: live runs spend provider API credit, which needs an explicit
+  # request (AGENTS.md), and the repository holds no provider secrets. An
+  # unattended weekly run could only fail at "Check provider configuration".
 
 permissions:
   contents: read
@@ -57,7 +58,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Record unselected matrix entry
         if: github.event_name == 'workflow_dispatch' && matrix.provider != inputs.provider
@@ -144,7 +145,7 @@ jobs:
 
       - name: Upload behavioral evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: behavior-live-${{ matrix.provider }}
           path: target/behavior-evals/live-${{ matrix.provider }}
@@ -157,7 +158,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download matrix evidence
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: behavior-live-*
           path: target/behavior-evals
