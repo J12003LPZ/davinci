@@ -501,6 +501,7 @@ jobs:
           export DAVINCI_CODEMODE_FIXTURE_BUNDLE="$RUNNER_TEMP/codemode-bundle"
           export DAVINCI_CODEMODE_FIXTURE_MANIFEST="$RUNNER_TEMP/codemode-manifest.json"
           cargo test -p davinci-coding-agent --test codemode_supervisor native_deadline_returns_when_broker_ignores_cancellation --locked -- --ignored --nocapture
+          cargo test -p davinci-coding-agent --test codemode_supervisor native_host_runs_parallel_read_callbacks --locked -- --ignored --nocapture
       - name: Current dependency advisory report
         working-directory: crates/davinci-coding-agent/codemode-host
         run: npm audit --omit=dev --json
