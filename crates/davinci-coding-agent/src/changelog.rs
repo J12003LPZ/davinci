@@ -168,55 +168,6 @@ pub fn format_startup_changelog(markdown: &str, collapse: bool, current_version:
     format!("What's New\n\n{}", markdown.trim())
 }
 
-pub fn install_telemetry_url(version: &str) -> String {
-    format!(
-        "https://pi.dev/api/report-install?version={}",
-        urlencoding_version(version)
-    )
-}
-
-pub fn report_install_telemetry(version: &str, enabled: bool) {
-    if std::env::var("PI_OFFLINE").is_ok() || !enabled {
-        return;
-    }
-    if let Ok(path) = std::env::var("PI_INSTALL_TELEMETRY_REPLY") {
-        let _ = std::fs::write(path, format!("version={version}"));
-        return;
-    }
-    if cfg!(test) {
-        return;
-    }
-    let url = install_telemetry_url(version);
-    let _ = ureq::get(&url)
-        .set("User-Agent", &pi_user_agent(version))
-        .timeout(std::time::Duration::from_secs(5))
-        .call();
-}
-
-pub fn pi_user_agent(version: &str) -> String {
-    format!(
-        "pi/{version} ({}; rust/{}; {})",
-        std::env::consts::OS,
-        rustc_version_meta(),
-        std::env::consts::ARCH
-    )
-}
-
-fn rustc_version_meta() -> &'static str {
-    option_env!("CARGO_PKG_RUST_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
-}
-
-fn urlencoding_version(version: &str) -> String {
-    let mut out = String::new();
-    for ch in version.chars() {
-        match ch {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
-            _ => out.push_str(&format!("%{:02X}", ch as u32)),
-        }
-    }
-    out
-}
-
 const GITHUB_REPO: &str = "earendil-works/pi";
 const CHANGELOG_LINK_BASE: &str = "packages/coding-agent";
 
@@ -402,9 +353,5 @@ mod tests {
         );
         assert!(normalize_changelog_links("[docs](README.md)", &entries[0])
             .contains("github.com/earendil-works/pi/blob/v0.84.4/packages/coding-agent/README.md"));
-        assert_eq!(
-            install_telemetry_url("0.84.4"),
-            "https://pi.dev/api/report-install?version=0.84.4"
-        );
     }
 }

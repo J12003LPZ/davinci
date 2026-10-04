@@ -89,10 +89,10 @@ impl SubscriptionModel {
             ));
         }
         let directory = davinci_session::default_agent_dir();
-        let mut models = davinci_ai::load_builtin_models();
-        for entry in davinci_ai::load_models_store(&directory).providers.values() {
-            models = davinci_ai::merge_models(&models, &entry.models);
-        }
+        let mut models = davinci_ai::merge_models_store(
+            &davinci_ai::load_builtin_models(),
+            &davinci_ai::load_models_store(&directory),
+        );
         models = davinci_ai::overlay_codex_models(&models, &directory);
         let config = davinci_ai::ModelConfig::load(&davinci_ai::models_json_path(&directory));
         models = davinci_ai::apply_models_config(&models, &config)

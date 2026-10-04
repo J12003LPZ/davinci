@@ -2925,6 +2925,29 @@ fn status_includes_behavior_telemetry_metrics_when_runs_exist() {
 }
 
 #[test]
+fn share_never_defaults_to_an_upstream_viewer() {
+    assert_eq!(
+        share_message("https://gist.github.com/u/abc123", None),
+        "Share URL: https://gist.github.com/u/abc123"
+    );
+    assert_eq!(
+        share_message(
+            "https://gist.github.com/u/abc123",
+            Some("https://viewer.example/s/")
+        ),
+        "Share URL: https://viewer.example/s/abc123\nGist: https://gist.github.com/u/abc123"
+    );
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    std::env::remove_var("PI_SHARE_VIEWER_URL");
+    std::env::set_var("PI_SHARE_DRY_RUN", "1");
+    let shared = share_current_session(&Agent::new("sys")).expect("share");
+    std::env::remove_var("PI_SHARE_DRY_RUN");
+    assert!(!shared.contains("pi.dev"), "{shared}");
+}
+
+#[test]
 fn radius_share_uses_fixture_url() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()

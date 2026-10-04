@@ -4,9 +4,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use davinci_ai::{
-    builtin_provider_ids, catalog_url, load_builtin_models, load_models_store, merge_models,
-    parse_remote_catalog, save_models_store, Model, ModelsStore, ModelsStoreEntry,
-    DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS,
+    builtin_provider_ids, catalog_url, harden_remote_models, load_builtin_models,
+    load_models_store, merge_models, merge_models_store, parse_remote_catalog, save_models_store,
+    Model, ModelsStore, ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL,
+    REMOTE_CATALOG_REFRESH_INTERVAL_MS,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,10 +97,13 @@ pub fn refresh_model_catalogs(
     }
     let mut store = load_models_store(agent_dir);
     let mut errors = Vec::new();
-    let mut models = load_builtin_models();
+    let builtin = load_builtin_models();
+    let mut models = builtin.clone();
     for provider in builtin_provider_ids() {
         match refresh_provider(provider, agent_dir, &mut store, allow_network, force) {
-            Ok(extra) => models = merge_models(&models, &extra),
+            Ok(extra) => {
+                models = merge_models(&models, &harden_remote_models(provider, &extra, &builtin))
+            }
             Err(err) => errors.push((provider.to_string(), err)),
         }
     }
@@ -150,11 +154,7 @@ pub fn refresh_js_providers(
 }
 
 fn load_cached_or_builtin(agent_dir: &Path) -> Vec<Model> {
-    let store = load_models_store(agent_dir);
-    let mut models = load_builtin_models();
-    for entry in store.providers.values() {
-        models = merge_models(&models, &entry.models);
-    }
+    let models = merge_models_store(&load_builtin_models(), &load_models_store(agent_dir));
     davinci_ai::overlay_codex_models(&models, agent_dir)
 }
 

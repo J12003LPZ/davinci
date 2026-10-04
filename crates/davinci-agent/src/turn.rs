@@ -3641,10 +3641,16 @@ impl Agent {
         }
         use crate::PermissionVerdict;
         let (issued_policy, issued_revision) = {
-            let state = self
+            let mut state = self
                 .permissions
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
+            // Writing bumps the revision, so only a real sandbox change
+            // invalidates approvals already pending.
+            let isolated = self.execution_isolated();
+            if state.execution_isolated != isolated {
+                state.execution_isolated = isolated;
+            }
             (state.clone(), state.revision())
         };
         let verdict = issued_policy.decide(id, name, args, cwd);

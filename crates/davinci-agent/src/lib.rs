@@ -1523,6 +1523,18 @@ impl Agent {
         self.auto_sandbox_unavailable_reason.as_deref()
     }
 
+    /// Whether an OS boundary confines this agent's subprocesses. Full access
+    /// and the unconfined host backend make no isolation claim.
+    pub fn execution_isolated(&self) -> bool {
+        self.tool_context.sandbox.as_ref().is_some_and(|spec| {
+            matches!(
+                spec.mode,
+                davinci_protocol::SandboxMode::Restricted
+                    | davinci_protocol::SandboxMode::WorkspaceWrite
+            ) && spec.backend != davinci_protocol::SandboxBackendKind::Host
+        })
+    }
+
     fn activate_auto_sandbox(&mut self, mode: PermissionMode) {
         if mode == PermissionMode::Auto && self.tool_context.sandbox.is_none() {
             if let Some(resolver) = self.auto_sandbox_resolver.take() {

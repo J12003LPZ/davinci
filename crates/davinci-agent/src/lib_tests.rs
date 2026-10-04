@@ -4586,3 +4586,44 @@ fn gate_reason_distinguishes_failed_and_incomplete_checks() {
         );
     }
 }
+
+#[test]
+fn execution_isolation_requires_a_confining_sandbox() {
+    use davinci_protocol::{SandboxBackendKind, SandboxId, SandboxMode, SandboxSpec};
+    let spec = |mode, backend| SandboxSpec {
+        id: SandboxId("isolation-fixture".into()),
+        mode,
+        backend,
+        container: None,
+        workspace: ".".into(),
+        filesystem: Default::default(),
+        network: Default::default(),
+        environment: Default::default(),
+        resources: Default::default(),
+        process: Default::default(),
+        required_capabilities: Default::default(),
+    };
+    let mut agent = Agent::new("x");
+    assert!(!agent.execution_isolated());
+    for (mode, backend, isolated) in [
+        (
+            SandboxMode::WorkspaceWrite,
+            SandboxBackendKind::LinuxBubblewrap,
+            true,
+        ),
+        (
+            SandboxMode::Restricted,
+            SandboxBackendKind::MacosSeatbelt,
+            true,
+        ),
+        (SandboxMode::WorkspaceWrite, SandboxBackendKind::Host, false),
+        (
+            SandboxMode::FullAccess,
+            SandboxBackendKind::LinuxBubblewrap,
+            false,
+        ),
+    ] {
+        agent.tool_context.sandbox = Some(spec(mode, backend));
+        assert_eq!(agent.execution_isolated(), isolated, "{mode:?} {backend:?}");
+    }
+}

@@ -309,7 +309,7 @@ pub fn load_radius_models() -> Vec<Model> {
     } else if std::env::var("PI_RADIUS_DRY_RUN").is_ok() || cfg!(test) {
         None
     } else {
-        fetch_radius_config()
+        cached_radius_config()
     };
     let Some(raw) = config else {
         return Vec::new();
@@ -318,6 +318,40 @@ pub fn load_radius_models() -> Vec<Model> {
         return Vec::new();
     };
     radius_models_from_config(&value)
+}
+
+/// Radius is an opt-in gateway run by a third party. Contact it only when the
+/// user configured a Radius account or gateway, never while offline, and at
+/// most once per process: `load_builtin_models` has many callers.
+fn cached_radius_config() -> Option<String> {
+    static CONFIG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let env = |name: &str| std::env::var(name).ok();
+            let stored_login = || {
+                crate::AuthStorage::create()
+                    .ok()
+                    .is_some_and(|storage| storage.get("radius").is_some())
+            };
+            radius_fetch_allowed(env, stored_login)
+                .then(fetch_radius_config)
+                .flatten()
+        })
+        .clone()
+}
+
+pub(crate) fn radius_fetch_allowed(
+    env: impl Fn(&str) -> Option<String>,
+    stored_login: impl FnOnce() -> bool,
+) -> bool {
+    if ["DAVINCI_OFFLINE", "PI_OFFLINE", "PI_DISABLE_NETWORK"]
+        .iter()
+        .any(|name| env(name).is_some())
+    {
+        return false;
+    }
+    let set = |name: &str| env(name).is_some_and(|value| !value.trim().is_empty());
+    set("RADIUS_API_KEY") || set("PI_RADIUS_TOKEN") || set("PI_RADIUS_GATEWAY") || stored_login()
 }
 
 fn fetch_radius_config() -> Option<String> {
@@ -401,6 +435,44 @@ mod tests {
         assert_eq!(rates.cache_read, 7.0);
         assert_eq!(rates.cache_write, 8.0);
         assert_eq!(rates.tier_input_tokens_above, None);
+    }
+
+    #[test]
+    fn radius_is_contacted_only_for_a_configured_account_and_never_offline() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(!radius_fetch_allowed(env(&[]), || false));
+        assert!(!radius_fetch_allowed(
+            env(&[("RADIUS_API_KEY", " ")]),
+            || false
+        ));
+        assert!(radius_fetch_allowed(
+            env(&[("RADIUS_API_KEY", "k")]),
+            || false
+        ));
+        assert!(radius_fetch_allowed(
+            env(&[("PI_RADIUS_TOKEN", "t")]),
+            || false
+        ));
+        assert!(radius_fetch_allowed(
+            env(&[("PI_RADIUS_GATEWAY", "https://gw.example")]),
+            || false
+        ));
+        assert!(radius_fetch_allowed(env(&[]), || true));
+        for offline in ["DAVINCI_OFFLINE", "PI_OFFLINE", "PI_DISABLE_NETWORK"] {
+            let pairs: &'static [(&'static str, &'static str)] = match offline {
+                "DAVINCI_OFFLINE" => &[("DAVINCI_OFFLINE", "1"), ("RADIUS_API_KEY", "k")],
+                "PI_OFFLINE" => &[("PI_OFFLINE", "1"), ("RADIUS_API_KEY", "k")],
+                _ => &[("PI_DISABLE_NETWORK", "1"), ("RADIUS_API_KEY", "k")],
+            };
+            assert!(!radius_fetch_allowed(env(pairs), || true), "{offline}");
+        }
     }
 
     #[test]
