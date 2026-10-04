@@ -595,8 +595,7 @@ mod tests {
     const TEST_JWKS: &str = r#"{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","use":"sig","n":"l3yceVsk-ZGuFqgw_GtPgQKo6NNA3e6-J15iE2vzBmK6rSd8GnSjkdStRl5-nyDJsk_kffnas8N8iO2PtM7swbYVjmh0ogv0cozcmcy5aIy1421tOtXIYom4I-gCaX1HNQxyHtuKG09u8ddrIzh9jlCAGWTEV09IIK4iF19a1xpS_iaRJtufC4kZmMI0LPQj8Sc2Kfyna_4jGdSoGSOw2i5O399VXiUdd-Vnicl6QhqyB6SK8oTBP9yPgCtfioGraFOOC_CmwcBhRplhK8pvfwFggrWHM_3ccLcTgahsgSFgCzpV2vg9nDU1jGcF-_mAsBPK1uUCTayAyRZwPc8RTQ","e":"AQAB"}]}"#;
     // Keep the signed JWT fixture split into its three wire components so
     // secret scanners do not mistake this public test vector for a credential.
-    const TEST_ID_HEADER: &str =
-        "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5IiwidHlwIjoiSldUIn0";
+    const TEST_ID_HEADER: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5IiwidHlwIjoiSldUIn0";
     const TEST_ID_CLAIMS: &str =
         "eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSIsImF1ZCI6Im9haWFwcF90ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJpYXQiOjE3MDAwMDAwMDAsIm5vbmNlIjoibm9uY2UtdGVzdCIsInN1YiI6InN1YmplY3QtdGVzdCIsImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9";
     const TEST_ID_SIGNATURE: &str =
@@ -645,14 +644,9 @@ mod tests {
     fn verifies_signature_issuer_audience_nonce_and_subject() {
         let jwks: Value = serde_json::from_str(TEST_JWKS).unwrap();
         let token = test_id_token();
-        let identity = verify_id_token_with_jwks(
-            &token,
-            "oaiapp_test",
-            "nonce-test",
-            &jwks,
-            1_800_000_000,
-        )
-        .unwrap();
+        let identity =
+            verify_id_token_with_jwks(&token, "oaiapp_test", "nonce-test", &jwks, 1_800_000_000)
+                .unwrap();
         assert_eq!(identity.subject, "subject-test");
         assert_eq!(identity.email.as_deref(), Some("user@example.com"));
         assert!(verify_id_token_with_jwks(
@@ -663,13 +657,9 @@ mod tests {
             1_800_000_000,
         )
         .is_err());
-        assert!(verify_id_token_with_jwks(
-            &token,
-            "oaiapp_test",
-            "wrong",
-            &jwks,
-            1_800_000_000,
-        )
-        .is_err());
+        assert!(
+            verify_id_token_with_jwks(&token, "oaiapp_test", "wrong", &jwks, 1_800_000_000,)
+                .is_err()
+        );
     }
 }
