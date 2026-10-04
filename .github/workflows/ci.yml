@@ -423,8 +423,10 @@ jobs:
           rustc --version
           cargo --version
           echo "RTK unavailable in this job; using raw Cargo for fixture validation"
-      - name: Prepare exact Rust dependency cache
-        run: cargo fetch --locked
+      - name: Compile only the tested dependency graph
+        run: |
+          cargo test -p davinci-agent -p davinci-mcp -p davinci-coding-agent --lib --no-run --locked
+          cargo test -p davinci-agent --test operation_dispatch --no-run --locked
       - name: Existing batch and tool-ledger baseline
         run: |
           cargo test -p davinci-agent batch::tests --lib --offline --locked
@@ -436,3 +438,48 @@ jobs:
           cargo test -p davinci-agent --test operation_dispatch --offline --locked
       - name: Existing reversible Governor baseline
         run: cargo test -p davinci-coding-agent token_governor::tests --lib --offline --locked
+
+  codemode-package-admission:
+    name: codemode-package-admission (${{ matrix.os }})
+    needs: codemode-baseline
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+      - name: Resolve exact package identities without lifecycle scripts
+        working-directory: crates/davinci-coding-agent/codemode-host
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          npm view @earendil-works/pi-codemode@1.0.2 version dist engines license --json
+          npm view quickjs-wasi@3.6.2 version dist engines license --json
+          npm install --package-lock-only --ignore-scripts --no-audit --fund=false
+          npm ci --ignore-scripts --no-audit --fund=false
+          npm ls --all --json
+          cat package-lock.json
+      - name: Published package sandbox characterization with fake tools
+        working-directory: crates/davinci-coding-agent/codemode-host
+        run: node --test package-smoke.test.mjs
+      - name: Current dependency advisory report
+        working-directory: crates/davinci-coding-agent/codemode-host
+        run: npm audit --omit=dev --json
+      - name: Preserve resolved dependency evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemode-dependency-evidence-${{ runner.os }}
+          path: crates/davinci-coding-agent/codemode-host/package-lock.json
+          if-no-files-found: warn

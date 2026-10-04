@@ -42,3 +42,10 @@ Plan: [2026-10-04-codemode.md](2026-10-04-codemode.md)
 ## Actual verification
 
 Source inspection only so far. No test completion, package admission, platform support, performance improvement, or release readiness is claimed.
+
+## C00 first CI observations
+
+- Head `c64e9e15a6f7656f3130846584909a680a62b4cf`: Rust formatting identified two fixture-only line-wrap differences; applied exactly as rustfmt reported
+- The added unrestricted `cargo fetch --locked` step fails before tests on an existing optional dependency, `toml_parser 1.1.3+spec-1.1.0`, whose edition-2024 manifest Cargo 1.83 cannot parse. The product uses pinned `toml_edit 0.22.27`; the incompatible parser belongs to another already-locked graph
+- Ruling: prepare only the actual tested package/target graph with `cargo test --no-run --locked`, then run the planned `--offline --locked` tests. Do not change Rust pins or lockfile to make an unrelated all-features/all-targets fetch succeed
+- Package characterization job is gated on successful C00 baselines across the three native operating systems. Proposed Node identity is 24.21.0, listed as the current maintained LTS on https://nodejs.org/en/about/previous-releases at inspection. No package has been admitted yet

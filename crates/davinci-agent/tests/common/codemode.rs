@@ -12,7 +12,11 @@ use std::sync::{Arc, Mutex};
 
 fn configured_agent() -> (Agent, tempfile::TempDir, Arc<OperationJournal>) {
     let workspace = tempfile::tempdir().unwrap();
-    std::fs::write(workspace.path().join("input.txt"), "codemode baseline sentinel").unwrap();
+    std::fs::write(
+        workspace.path().join("input.txt"),
+        "codemode baseline sentinel",
+    )
+    .unwrap();
     let root_namespace_id = RootNamespaceId::new();
     let identity = JournalIdentity::new(
         JournalId::new(),
@@ -162,8 +166,10 @@ fn direct_and_batch_denied_mutations_have_zero_effects() {
 
 #[test]
 fn sanitized_mcp_corpus_preserves_baseline_text_and_errors() {
-    let corpus: Value =
-        serde_json::from_str(include_str!("../../../../fixtures/codemode/mcp-results.json")).unwrap();
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/codemode/mcp-results.json"
+    ))
+    .unwrap();
     for case in corpus["results"].as_array().unwrap() {
         let result: davinci_mcp::CallToolResult =
             serde_json::from_value(case["wire"].clone()).unwrap();
