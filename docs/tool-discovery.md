@@ -59,8 +59,7 @@ family. Nested workers retain their existing exposure policy.
 Activation is additive across requests and user turns. It filters the current
 tool selection, tool-wide denial rules, and schema availability. Scoped path
 and argument permissions still run at dispatch. An unknown family has no
-effect. Optional decision advice uses the same `Agent::activate_tool_families`
-boundary and cannot grant authority or remove the core.
+effect.
 
 ## Patch and edit inputs
 

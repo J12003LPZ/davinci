@@ -79,7 +79,6 @@ fn main() {
         ("context", "Context inspector", 100, 30, false),
         ("plugin", "Plugins, skills and MCP servers", 100, 30, false),
         ("plugin", "Plugins — narrow", 40, 20, false),
-        ("secret", "Masked credential dialog", 100, 30, false),
         ("ask", "Question dialog", 100, 30, false),
         ("3b", "Settings — narrow", 40, 12, false),
         ("5a", "Graph — narrow", 40, 12, false),
@@ -94,11 +93,7 @@ fn main() {
         let theme = Theme::da_vinci(ColorDepth::TrueColor, no_color).with_name(&name);
         let mut model = Model::new(theme, width, height, false);
         fixtures::dress_screen(&mut model, id);
-        if id == "secret" {
-            model.screen = Screen::Agent;
-            model.overlay = Some(Overlay::SecretInput);
-            model.secret_input = Some(Default::default());
-        } else if id == "ask" {
+        if id == "ask" {
             model.screen = Screen::Agent;
             model.ask.title = "Continue this operation?".into();
             model.ask.note = "Fixture question. No operation will run.".into();

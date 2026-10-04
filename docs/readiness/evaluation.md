@@ -95,7 +95,7 @@ first-arm order (`campaign.schedule` / `readiness_protocol.prepare`). Measure:
 | Token governor digests | Existing digests off/on | No measured subtraction/promotion claimed |
 | Specialist repo/LSP/package/build/git tools | Existing tool selection off/on for each family | No measured subtraction/promotion claimed |
 | Graph | Existing graph advertising/selection off/on | No measured subtraction/promotion claimed |
-| Context VM | Dedicated long sessions that compact at least twice; existing compaction versus VM | Off; JEV stays off |
+| Context VM | Dedicated long sessions that compact at least twice; existing compaction versus VM | Off |
 
 All result cells are **not run** until campaign directories, binary hashes and
 commit identities exist. No public hidden example determines a new default.
@@ -115,7 +115,7 @@ regressions, prices or background receipts are unavailable, never zero. Cache
 write tokens need a separate provider price when nonzero. Print background cost
 is explicitly unmeasured; interactive/RPC background counters stay separate.
 When provider observations exist, token totals come from unique transport-attempt
-receipts, including failed attempts and prewarm/JEV calls. Replayed receipts are
+receipts, including failed attempts and prewarm calls. Replayed receipts are
 counted once; conflicting, missing, malformed or unfinished receipts keep usage
 and estimated cost unavailable. Final-message usage is a fallback only for
 legacy streams without provider observations or retry markers. First/later cache

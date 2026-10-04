@@ -476,11 +476,6 @@ impl Agent {
                 self.append_turn_context(None);
             }
 
-            // Advice can expose additional schemas. Apply ready additions before
-            // context selection and its final admission gate; request 1 remains
-            // unchanged, and no reader fallback can bypass the updated budget.
-            self.poll_decision_advice(turns_this_run > 0);
-
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
             // The legacy path prunes tool output before deciding whether to
             // summarize. Active Context VM keeps Agent.messages untouched and
@@ -576,10 +571,6 @@ impl Agent {
             }
 
             self.ensure_session_persistence()?;
-            if turns_this_run > 0 {
-                self.enqueue_completion_advice();
-            }
-            self.record_decision_request_effort();
             self.stats.model_turns += 1;
             turns_this_run += 1;
             crate::RunStats::add_elapsed(
@@ -664,9 +655,6 @@ impl Agent {
                 }
                 native_responses_resume = None;
             }
-            // A response that arrived during this provider request may inform
-            // later requests or the current completion observation. Never wait.
-            self.poll_decision_advice(true);
             let mut chat = assistant_to_chat(&assistant);
             if let Some(record) = &native_responses_resume {
                 davinci_ai::attach_native_items(

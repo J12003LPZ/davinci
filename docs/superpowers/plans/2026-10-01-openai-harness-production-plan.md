@@ -643,7 +643,7 @@ Evidence for future execution belongs outside the repository under an operator-c
 
 ### A04 — OpenAI-only model/effort routing with cache-aware evaluation
 
-**Depends on:** A01–A03, C01–C06, E01. **Modify:** `crates/davinci-agent/src/effort.rs`, `crates/davinci-agent/src/decision/policy.rs`, existing OpenAI model resolution, `crates/davinci-coding-agent/src/native_extensions/graph/config.rs`. **Tests:** worker contract and OpenAI prefix fixtures.
+**Depends on:** A01–A03, C01–C06, E01. **Modify:** `crates/davinci-agent/src/effort.rs`, existing OpenAI model resolution, `crates/davinci-coding-agent/src/native_extensions/graph/config.rs`. **Tests:** worker contract and OpenAI prefix fixtures.
 
 **Contract:** first establish harness improvements with the user's selected model and effort fixed. Routing is a separate explicitly selected policy; it never silently downgrades a requested model or routes to another provider. Exact model capability, context budget, pricing, and output contract must be known.
 

@@ -204,8 +204,8 @@ telemetry as unestablished. A parent-only DaVinci campaign is valid: its absent
 Codex control is unavailable rather than an error or a fabricated comparison.
 
 DaVinci uses copied credentials and explicit settings. `--settings` selects an
-experimental configuration; defaults disable decision intelligence, use fixed
-effort, stable prompt profile, full tools, and automatic verification. For a
+experimental configuration; defaults use fixed effort, stable prompt profile,
+full tools, and automatic verification. For a
 model outside the binary's catalog, `--model-store` pins only the exact public
 Codex model record and rechecks its hash. Coding-model mismatch stops a run.
 Inherited product/provider/OTEL overrides are stripped. Codex uses
@@ -290,8 +290,8 @@ hidden-grader secrecy. Independent acceptance remains a separate gate.
   network retrieval, memory contamination, or concealed content leak.
 - **Requests:** coding logical requests and actual provider attempts remain
   distinct; retries share logical identity. Codex user turns are not request
-  counts. Prewarm and Jev are separate. No Jev observations means unavailable,
-  even if coding telemetry exists. Reports show available and complete row
+  counts. Prewarm attempts are reported separately. Unknown purpose values keep
+  totals unavailable. Reports show available and complete row
   denominators; incomplete request telemetry cannot pass request-reduction rules.
 - **Tokens:** input is normalized total input including cached input. Uncached
   input is computed per row as `input_tokens - cached_tokens`; missing or invalid

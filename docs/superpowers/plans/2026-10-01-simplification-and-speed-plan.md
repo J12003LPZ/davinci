@@ -76,7 +76,7 @@ The workspace is live and has changed since the first audit. Old findings are re
 |---|---|---|
 | Keep | Permission authority, mutation journals, recovery, current-source verification, exact evidence, root budgets | Optimize representation or duplicate computation, not their guarantees |
 | Simplify first | Optional startup, hook filtering, prepared-request reuse, repeated scans, redundant model steps, overlapping tool exposure | One measured bottleneck and one responsible owner per change |
-| Keep opt-in | Graph/team execution, Context VM, background learning, security watch, optional decision advice | Off means no unnecessary initialization, scan, timer, or model call; preserve explicit user activation |
+| Keep opt-in | Graph/team execution, Context VM, background learning, security watch | Off means no unnecessary initialization, scan, timer, or model call; preserve explicit user activation |
 | Defer | Prewarming, adaptive cache economics, speculative parallel model attempts, autonomous learning promotion, broad scheduler rewrites | Require workload evidence after simpler changes are exhausted |
 | Remove when proven redundant | Duplicate internal adapters, unused private modules, equivalent repeated transforms, retired experiment branches and flags | First establish reachability, supported contract, migration, tests, and rollback |
 | Preserve as compatibility | Public aliases, legacy session readers, non-OpenAI adapters, documented alternate UI paths | Not runtime bloat merely because unused; consider lazy loading or compile-time exclusion only after separate evidence and approval |
@@ -243,7 +243,7 @@ Provider reuse depends on a matching rendered prefix and compatible settings. Pr
 
 ### O09 — Keep one lead path and invoke orchestration only when useful
 
-**Depends on:** O01, O02. **Files:** `crates/davinci-agent/src/subagent.rs`, `runtime/team.rs`, `runtime/workflow/limits.rs`, `decision/policy.rs`; `crates/davinci-coding-agent/src/turn_decision.rs`, `native_extensions/graph/config.rs`, `native_extensions/graph/controller.rs` only at observed dispatch boundaries.
+**Depends on:** O01, O02. **Files:** `crates/davinci-agent/src/subagent.rs`, `runtime/team.rs`, `runtime/workflow/limits.rs`; `crates/davinci-coding-agent/src/native_extensions/graph/config.rs`, `native_extensions/graph/controller.rs` only at observed dispatch boundaries.
 
 **Interfaces:** existing lead agent, worker contract, capacity/budget ownership, and explicit graph/workflow entry points. Do not create a planner above the graph, team, and workflow controllers to choose among them on every task.
 

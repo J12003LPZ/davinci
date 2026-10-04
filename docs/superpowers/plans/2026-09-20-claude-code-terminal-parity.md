@@ -82,7 +82,7 @@ All paths below are repository-relative. `TUI` in prose means `crates/davinci-tu
 | Shell and focus | `crates/davinci-tui/src/davinci/{app.rs,model.rs,runtime.rs,term.rs}` | `crates/davinci-tui/src/davinci/{focus.rs,shell.rs}` | Region allocation, view lifecycle, focus; no execution |
 | Conversation | `crates/davinci-tui/src/davinci/views/{startup.rs,chrome.rs,transcript.rs,markdown.rs,highlight.rs,semantic.rs,opera.rs,studio.rs}` | `crates/davinci-tui/tests/terminal_parity/conversation.rs` | Welcome, prompt, messages, tools, streaming |
 | Pickers | `crates/davinci-tui/src/davinci/views/{completion.rs,instrumenta.rs,settings.rs,cogitator.rs,thinking.rs,resume.rs}` | `crates/davinci-tui/src/davinci/selection.rs` | Stable selection IDs and shared reference navigation |
-| Safety | `crates/davinci-tui/src/davinci/views/{approval_modal.rs,decision_modal.rs,ask.rs,permissions.rs,trust.rs,login.rs,secret_input.rs}` | `crates/davinci-tui/tests/terminal_parity/safety.rs` | Dialog presentation without changing authority |
+| Safety | `crates/davinci-tui/src/davinci/views/{approval_modal.rs,decision_modal.rs,ask.rs,permissions.rs,trust.rs,login.rs}` | `crates/davinci-tui/tests/terminal_parity/safety.rs` | Dialog presentation without changing authority |
 | Runtime adapter | `crates/davinci-coding-agent/src/davinci_interactive.rs`, `crates/davinci-coding-agent/src/davinci_interactive/{graph_feedback.rs,graph_setup.rs}` | `crates/davinci-coding-agent/src/davinci_interactive/task_routing.rs`, `crates/davinci-tui/src/davinci/workspace.rs` | Per-target drafts, per-run events, explicit controls |
 | Graph | `crates/davinci-tui/src/davinci/views/{grafo.rs,graph_canvas.rs,graph_inspector.rs,graph_layout.rs,graph_nav.rs,graph_perf.rs,graph_run.rs}` | `crates/davinci-tui/tests/terminal_parity/graph.rs` | Optional graph presentation and hit testing |
 | Other surfaces | Every remaining module in `crates/davinci-tui/src/davinci/views/mod.rs` | `crates/davinci-tui/tests/terminal_parity/surfaces.rs` | Full inventory coverage, including extension and voice states |
@@ -322,7 +322,7 @@ Also select the second ID, reverse catalog order, then press Enter: the host mus
 
 ## Task 9: Match safety, questions, login, and credentials
 
-**Files:** Modify `views/{approval_modal.rs,decision_modal.rs,permissions.rs,trust.rs,ask.rs,login.rs,secret_input.rs}` and focused routing. Preserve host `NativeApproval`, `wait_native_approval`, and `NativeDecision` authority.
+**Files:** Modify `views/{approval_modal.rs,decision_modal.rs,permissions.rs,trust.rs,ask.rs,login.rs}` and focused routing. Preserve host `NativeApproval`, `wait_native_approval`, and `NativeDecision` authority.
 
 **Consumes:** Existing request identity, expiry, reply channel and cancellation state. **Produces:** Matched dialogs that cannot grant anything through a layout operation.
 
@@ -384,7 +384,7 @@ for (width, height) in [(40, 12), (80, 24), (100, 30), (120, 40), (160, 50)] {
 - [ ] Run the new cases before migration. Replace individual decorative frames with shared dialogs/rows. Name a specific equivalent reference component for each DaVinci-only extension; do not label an invented screen as a literal Claude match.
 - [ ] Sanitize extension titles, messages and copy output. Bound oversized extension widgets so they cannot push the editor out of the terminal. Test zero lines and thousands of lines.
 - [ ] Voice setup, recording, failure and send-blocking continue to reflect actual state; redesign must not start the microphone. Test that opening a graph cannot bypass `voice.blocks_send`.
-- [ ] Update the surface matrix to include all 28 screens, five overlays, nested dialogs, startup/voice states and extension positions. Rerun every mapped case; commit.
+- [ ] Update the surface matrix to include all 28 screens, four overlays, nested dialogs, startup/voice states and extension positions. Rerun every mapped case; commit.
 
 ## Task 12: Add real per-target drafts and task-aware routing
 

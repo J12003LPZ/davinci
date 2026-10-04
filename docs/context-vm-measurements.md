@@ -1,8 +1,8 @@
-# Context VM / Jev hardening measurements
+# Context VM and graph hardening measurements
 
 Measured on this Windows host in an optimized release build, September 19, 2026.
 Baseline source: main 1106b1be2bffa1fb7de6e8c0708cc59d1ca2e576.
-These are deterministic local fixtures. No live TypeSafe/API calls, paid model
+These are deterministic local fixtures. No live API calls, paid model
 evals, cross-platform CI run or terminal transport measurements are implied.
 
 ## Context preparation: 16 paired samples per history size
@@ -48,30 +48,13 @@ terminal transport, slower hardware and other DAG shapes can cost more. Memory
 is an owned-layout estimate, not total allocations or RSS. Zero-microsecond
 hit-test samples mean below the measurement resolution.
 
-## TypeSafe connection reuse
-
-Thirty-two requests per mode use a loopback HTTP fixture.
-
-| Mode | TCP connections | p50 / p95 / p99 ms |
-| --- | ---: | --- |
-| New client per request | 32 | 1.565 / 1.645 / 1.910 |
-| Persistent client | 1 | 0.189 / 0.250 / 0.320 |
-
-The persistent client reused one connection for all requests. The fixture uses
-plain HTTP and a one-millisecond server accept poll, which contributes to cold
-latency. These numbers demonstrate connection reuse, not production TypeSafe
-latency, TLS cost or a user-visible TTFT improvement. Separate deterministic
-tests cover nonblocking shadow admission, one-job capacity, stale completions,
-body limits and caller deadlines when a provider ignores its timeout.
-
 ## Reproduction
 
 Run the following from the repository root with RTK installed. These are the
-commands used for this run. Offline mode needs cached Cargo dependencies. These three ignored tests emit JSON and assert their invariants.
+commands used for this run. Offline mode needs cached Cargo dependencies. These two ignored tests emit JSON and assert their invariants.
 
 ```sh
 rtk proxy cargo test -p davinci-agent --release --test context_vm_performance --offline --locked -- --ignored --nocapture
-rtk proxy cargo test -p davinci-coding-agent --release --lib cold_and_warm_http_performance --offline --locked -- --ignored --nocapture
 rtk proxy cargo test -p davinci-tui --release --lib graph_dag_performance --offline --locked -- --ignored --nocapture
 ```
 
@@ -86,13 +69,12 @@ in that target passed on the focused rerun. No production code changed after the
 workspace run. The later permission-mode cache regression also passed.
 
 Workspace all-target check, Clippy with warnings denied, formatting, 37 Node
-tests and all three release benchmarks passed. This is a full run plus focused
-reruns, not a claim that the original workspace command was green. A zero-match
-Jev invocation was rejected as evidence and rerun against the library target.
+tests and the Context VM and graph release benchmarks passed. This is a full run
+plus focused reruns, not a claim that the original workspace command was green.
 
 Independent code/security reviewers passed their reviewed scopes. The performance
-reviewer checked all three measurement tables against recorded output and
-confirmed their stated limitations.
+reviewer checked the Context VM and graph measurement tables against recorded
+output and confirmed their stated limitations.
 Coverage tooling was unavailable, so no percentage is claimed. Live-provider
 wire acceptance, real model fold quality and cross-platform CI remain unverified.
 
@@ -116,5 +98,4 @@ quality. Fake-summarizer integration separately verifies the prompt/parser path.
 
 Local raw logs/JSON and independent review verdicts are retained under
 `C:\Users\sergi\AppData\Local\Temp\davinci-repo-audit-01a0bc03`.
-The implementation contract and caveats are in [Context VM](context-vm.md) and
-[Jev decision intelligence](decision-intelligence.md).
+The implementation contract and caveats are in [Context VM](context-vm.md).

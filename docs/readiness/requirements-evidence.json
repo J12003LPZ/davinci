@@ -3,7 +3,7 @@
   "authoritative_plan_sha256": "003f29097f92d2ac99b80ebce0f266f35f685e06252e577327e2847bbf9d5380",
   "baseline_sha": "2e52d0f68f9cc989fc69a6114409e237e1990158",
   "branch": "codex/production-readiness-cloud-20260930",
-  "scope": "Implementation and evidence are separate; no production superiority or completed live acceptance claim.",
+  "scope": "Implementation and evidence are separate; no production superiority or completed live acceptance claim. The authoritative plan hash and line references identify the original attachment before subsequent documentation cleanup.",
   "requirements": [
     {
       "id": "0.1.1",
@@ -1391,7 +1391,7 @@
         "documents",
         "evaluation"
       ],
-      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM/JEV remain off."
+      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM remains off."
     },
     {
       "id": "5.4.2",
@@ -1408,7 +1408,7 @@
         "documents",
         "evaluation"
       ],
-      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM/JEV remain off."
+      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM remains off."
     },
     {
       "id": "5.4.3",
@@ -1425,13 +1425,13 @@
         "documents",
         "evaluation"
       ],
-      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM/JEV remain off."
+      "remaining": "Subsystem on/off and dedicated long-session campaigns not run. Table explicitly records unavailable results; Context VM remains off."
     },
     {
       "id": "5.4.4",
       "task": "5.4",
       "plan_line": 319,
-      "requirement": "Context VM and JEV stay off. Evaluate Context VM only on a dedicated long-session set (sessions long enough to compact at least twice) against current compaction; change the default only on a measured win.",
+      "requirement": "Context VM stays off. Evaluate Context VM only on a dedicated long-session set (sessions long enough to compact at least twice) against current compaction; change the default only on a measured win.",
       "status": "implemented-verified",
       "implementation": [
         "docs/readiness/evaluation.md",

@@ -439,7 +439,7 @@ def parse_stream(harness, stdout):
         if harness == "davinci":
             stats["request_metrics_available"] = stats["request_metrics_complete"] = False
             for field in ("logical_requests", "requests", "provider_attempts", "coding_provider_attempts",
-                          "prewarm_attempts", "jev_attempts", "requests_after_first_reminder"):
+                          "prewarm_attempts", "requests_after_first_reminder"):
                 stats[field] = None
     stats["usage_available"] = usage_seen and not missing
     stats["reasoning_tokens"] = (sum(reasoning_values) if reasoning_values and not usage_conflict
@@ -579,7 +579,7 @@ def run_one(harness, tid, rep, campaign=None):
         result.update({key: spec["private_provenance"][key] for key in
                        ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes")})
         result["task_set"] = "private"
-    for key in ("logical_requests", "provider_attempts", "prewarm_attempts", "jev_attempts",
+    for key in ("logical_requests", "provider_attempts", "prewarm_attempts",
                 "runtime_stats",
                 "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",
@@ -719,7 +719,6 @@ def summarize(rows):
             "logical_requests": aggregate_available(rs, "logical_requests"),
             "provider_attempts": aggregate_available(rs, "provider_attempts"),
             "prewarm_attempts": aggregate_available(rs, "prewarm_attempts"),
-            "jev_attempts": aggregate_available(rs, "jev_attempts"),
             "auto_verify_runs": aggregate_available(rs, "auto_verify_runs"),
             "unrelated_runs": aggregate_available(rs, "unrelated", lambda values: sum(bool(v) for v in values)),
             "transaction_leak_runs": aggregate_available(rs, "transaction_leak"),
@@ -727,7 +726,7 @@ def summarize(rows):
             "cleanup_complete_runs": sum(row.get("cleanup_complete") is True for row in rs),
             "telemetry_availability": {field: {"available_runs": sum(metric(row, field) is not None for row in rs),
                                                "total_runs": len(rs)} for field in
-                ("logical_requests", "provider_attempts", "jev_attempts", "uncached_input_tokens", "reasoning_tokens")},
+                ("logical_requests", "provider_attempts", "uncached_input_tokens", "reasoning_tokens")},
             "complete_request_telemetry_runs": sum(row.get("request_metrics_complete") is True for row in rs),
         }
         for name in ("first", "later"):

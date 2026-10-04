@@ -678,7 +678,7 @@ class RunnerTests(unittest.TestCase):
             (source / "auth.json").write_text('{"fixture":"synthetic-secret"}')
             (source / "settings.json").write_text('{"uncontrolled":true}')
             target = root / "isolated"
-            settings = {"autoVerify": True, "decisionIntelligence": {"enabled": False}}
+            settings = {"autoVerify": True, "effortPolicy": "fixed"}
             record = runner.isolate_settings(source, target, settings)
             self.assertEqual(sorted(p.name for p in target.iterdir()),
                              ["auth.json", "settings.json"])

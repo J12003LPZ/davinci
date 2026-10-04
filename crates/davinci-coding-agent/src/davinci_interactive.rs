@@ -3201,11 +3201,7 @@ fn scope_expansion_answer_key(
             Some((ScopeExpansionDecision::Deny, None))
         }
         Flow::Continue if model.overlay.is_none() => Some((ScopeExpansionDecision::Deny, None)),
-        Flow::Continue
-        | Flow::Choose(_)
-        | Flow::Submit(_)
-        | Flow::CyclePermissionMode
-        | Flow::SecretInputSubmitted(_) => None,
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CyclePermissionMode => None,
     }
 }
 
@@ -3713,11 +3709,7 @@ fn approval_key(
             Some(ToolApprovalDecision::Deny)
         }
         Flow::Continue if model.overlay.is_none() => Some(ToolApprovalDecision::Deny),
-        Flow::Continue
-        | Flow::Choose(_)
-        | Flow::Submit(_)
-        | Flow::CyclePermissionMode
-        | Flow::SecretInputSubmitted(_) => None,
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CyclePermissionMode => None,
     }
 }
 
@@ -5010,47 +5002,6 @@ pub fn run(
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {
-                        // A credential overlay owns every key. Do this before
-                        // voice, extension shortcuts, clipboard handling, and
-                        // terminal hooks so the candidate cannot enter any other
-                        // input path or transcript.
-                        if model.overlay == Some(Overlay::SecretInput) {
-                            if paste_secret_clipboard(
-                                &mut model,
-                                key,
-                                crate::external_editor::clipboard_text,
-                            ) {
-                                continue;
-                            }
-                            let next = match app::handle_key(&mut model, key) {
-                                Flow::SecretInputSubmitted(candidate) => on_secret_input(
-                                    &mut Shell {
-                                        voice: &mut voice,
-                                        parsed,
-                                        agent,
-                                        model: &mut model,
-                                        terminal: &mut terminal,
-                                        host: &host,
-                                        pending: &mut pending,
-                                        cwd: &cwd,
-                                        dresser: &dresser,
-                                        images: &mut attached_images,
-                                    },
-                                    candidate.into_inner(),
-                                ),
-                                Flow::Quit => Next::Leave,
-                                Flow::Interrupt | Flow::Continue => Next::Go,
-                                Flow::Submit(_) | Flow::Choose(_) | Flow::CyclePermissionMode => {
-                                    Next::Go
-                                }
-                            };
-                            match next {
-                                Next::Go => {}
-                                Next::Leave => break Ok(0),
-                                Next::Fail(err) => break Err(err),
-                            }
-                            continue;
-                        }
                         if graph_setup::key(&mut model, &mut pending, agent, key) {
                             continue;
                         }
@@ -5316,21 +5267,6 @@ pub fn run(
                                 cycle_permission_mode(agent, &mut model);
                                 Next::Go
                             }
-                            Flow::SecretInputSubmitted(candidate) => on_secret_input(
-                                &mut Shell {
-                                    voice: &mut voice,
-                                    parsed,
-                                    agent,
-                                    model: &mut model,
-                                    terminal: &mut terminal,
-                                    host: &host,
-                                    pending: &mut pending,
-                                    cwd: &cwd,
-                                    dresser: &dresser,
-                                    images: &mut attached_images,
-                                },
-                                candidate.into_inner(),
-                            ),
                             Flow::Continue => Next::Go,
                         };
                         // Recall is a search, so it runs when the instrument is
@@ -5364,9 +5300,7 @@ pub fn run(
                         if graph_setup::paste(&mut model, &mut pending, agent, &text) {
                             continue;
                         }
-                        if model.overlay == Some(Overlay::SecretInput)
-                            || !voice.paste(&mut model, &text)
-                        {
+                        if !voice.paste(&mut model, &text) {
                             model.paste(&text);
                         }
                     }
@@ -8809,83 +8743,10 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
             return Next::Go;
         }
     }
-    // Only already-held metadata belongs on submission. Optional background
-    // advice never delays request 1 or scans the workspace from this path.
-    let recent_paths = shell
-        .model
-        .changes_list
-        .iter()
-        .map(|change| change.path.clone())
-        .collect::<Vec<_>>();
-    let capability_names = shell
-        .agent
-        .runtime
-        .as_ref()
-        .map(|runtime| {
-            runtime
-                .capability_registry
-                .list()
-                .into_iter()
-                .map(|capability| capability.name)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let metadata = davinci_coding_agent::decision_state::DecisionMetadata::from_workspace(
-        shell.cwd,
-        &recent_paths,
-        &capability_names,
-    );
     shell.agent.prompt_user_with(&expanded, &images);
-    let evidence_revision = shell.agent.messages.len() as u64;
-    let mutation_revision = shell
-        .agent
-        .mutation_verification_state()
-        .mutation_generation;
-    let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
-        shell.agent,
-        davinci_coding_agent::turn_decision::DecisionSnapshot {
-            request_id: davinci_agent::new_message_id(),
-            task: expanded.clone(),
-            decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
-            metadata,
-            evidence_revision,
-            mutation_revision,
-        },
-    );
-    if let Some(runtime) = shell.agent.decision_runtime() {
-        if let Some(health) = runtime.take_health_transition() {
-            if let Some(notice) = decision_health_notice(health) {
-                shell.note(notice);
-            }
-        }
-    }
     let next = run_turns(shell);
     shell.redress();
     next
-}
-
-fn decision_health_notice(
-    health: davinci_agent::decision::provider::DecisionProviderHealth,
-) -> Option<&'static str> {
-    use davinci_agent::decision::provider::DecisionProviderHealth;
-    match health {
-        DecisionProviderHealth::CredentialInvalid => Some(
-            "TypeSafe decision intelligence credential is invalid; deterministic routing remains active. Reconfigure it in /settings.",
-        ),
-        DecisionProviderHealth::RateLimited => Some(
-            "TypeSafe decision intelligence is rate limited; deterministic routing remains active.",
-        ),
-        DecisionProviderHealth::Overloaded => Some(
-            "TypeSafe decision intelligence is overloaded; deterministic routing remains active.",
-        ),
-        DecisionProviderHealth::Unavailable => Some(
-            "TypeSafe decision intelligence is unavailable; deterministic routing remains active.",
-        ),
-        DecisionProviderHealth::SchemaMismatch => Some(
-            "TypeSafe decision intelligence returned an incompatible response; deterministic routing remains active.",
-        ),
-        DecisionProviderHealth::Disabled | DecisionProviderHealth::Ready => None,
-    }
 }
 
 /// One row of an open instrument, chosen with enter.
@@ -9240,23 +9101,6 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
         return Next::Go;
     }
     let key = row.key.clone();
-    let current = row.value.clone();
-    let project = row.project;
-    if key == "typesafe-api-key" {
-        if let Some(reason) = typesafe_key_replacement_blocker(
-            &shell.model.settings_rows,
-            std::env::var_os("TYPESAFE_API_KEY").is_some(),
-        ) {
-            shell.note(reason);
-            return Next::Go;
-        }
-        shell.model.settings_index = index;
-        open_typesafe_key_input(shell.model);
-        return Next::Go;
-    }
-    if key == "decision-intelligence" {
-        return cycle_decision_intelligence(shell, index, current == "on", project);
-    }
     let Some(row) = shell.model.settings_rows.get_mut(index) else {
         return Next::Go;
     };
@@ -9285,185 +9129,6 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
         "double-escape-action" => shell.model.double_escape_action = effective,
         "show-tool-output" => shell.model.show_tool_output = effective == "true",
         _ => {}
-    }
-    Next::Go
-}
-
-fn typesafe_key_replacement_blocker(
-    rows: &[SettingRow],
-    environment_override: bool,
-) -> Option<&'static str> {
-    if environment_override {
-        return Some(
-            "TYPESAFE_API_KEY controls the current TypeSafe credential. Unset or change that environment variable, then restart DaVinci.",
-        );
-    }
-    if rows
-        .iter()
-        .any(|row| row.key == "decision-intelligence" && row.project && row.value == "off")
-    {
-        return Some("TypeSafe / Jev decision intelligence is disabled by project settings");
-    }
-    None
-}
-
-fn paste_secret_clipboard(
-    model: &mut Model,
-    key: crossterm::event::KeyEvent,
-    read_text: impl FnOnce() -> Option<String>,
-) -> bool {
-    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-    if model.overlay != Some(Overlay::SecretInput)
-        || key.kind == KeyEventKind::Release
-        || key.code != KeyCode::Char('v')
-        || !key.modifiers.contains(KeyModifiers::CONTROL)
-    {
-        return false;
-    }
-    if let Some(text) = read_text() {
-        let text = zeroize::Zeroizing::new(text);
-        model.paste(&text);
-    }
-    true
-}
-
-fn open_typesafe_key_input(model: &mut Model) {
-    model.secret_input = Some(davinci_tui::davinci::views::secret_input::SecretInputState::new());
-    model.overlay = Some(Overlay::SecretInput);
-}
-
-fn cycle_decision_intelligence(
-    shell: &mut Shell<'_>,
-    index: usize,
-    enabled: bool,
-    project_disabled: bool,
-) -> Next {
-    if enabled {
-        if let Err(error) = crate::persist_interactive_setting("decision-intelligence=off") {
-            shell.note(&error);
-            return Next::Go;
-        }
-        shell.agent.disable_decision_runtime();
-        crate::sync_agent_from_settings(shell.agent);
-        open_settings_sheet(shell.agent, shell.model);
-        shell.model.settings_index = index.min(shell.model.settings_rows.len().saturating_sub(1));
-        return Next::Go;
-    }
-
-    if project_disabled {
-        shell.note("TypeSafe / Jev decision intelligence is disabled by project settings");
-        return Next::Go;
-    }
-
-    let auth = match davinci_ai::AuthStorage::create() {
-        Ok(auth) => auth,
-        Err(error) => {
-            shell.note(&format!("TypeSafe credential storage unavailable: {error}"));
-            return Next::Go;
-        }
-    };
-    let key = match davinci_coding_agent::decision_providers::typesafe::resolve_api_key(&auth) {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            open_typesafe_key_input(shell.model);
-            return Next::Go;
-        }
-        Err(error) => {
-            shell.note(&error.to_string());
-            return Next::Go;
-        }
-    };
-    enable_typesafe_with_key(shell, index, key, false)
-}
-
-fn on_secret_input(shell: &mut Shell<'_>, candidate: String) -> Next {
-    enable_typesafe_with_key(shell, shell.model.settings_index, candidate, true)
-}
-
-fn enable_typesafe_with_key(
-    shell: &mut Shell<'_>,
-    index: usize,
-    candidate: String,
-    persist_credential: bool,
-) -> Next {
-    let raw_candidate = zeroize::Zeroizing::new(candidate);
-    let candidate = match davinci_coding_agent::decision_providers::typesafe::normalize_api_key(
-        raw_candidate.as_str(),
-    ) {
-        Some(candidate) => zeroize::Zeroizing::new(candidate.to_owned()),
-        None => {
-            shell.note("TypeSafe credential validation failed: TypeSafe credential is empty");
-            return Next::Go;
-        }
-    };
-    drop(raw_candidate);
-    if let Err(error) =
-        davinci_coding_agent::decision_providers::typesafe::TypeSafeProvider::validate_api_key(
-            &candidate,
-        )
-    {
-        shell.note(&format!("TypeSafe credential validation failed: {error}"));
-        return Next::Go;
-    }
-
-    let mut auth = match davinci_ai::AuthStorage::create() {
-        Ok(auth) => auth,
-        Err(error) => {
-            shell.note(&format!("TypeSafe credential storage unavailable: {error}"));
-            return Next::Go;
-        }
-    };
-    let previous = zeroize::Zeroizing::new(
-        auth.get("typesafe")
-            .and_then(|credential| credential.key.clone()),
-    );
-    if persist_credential {
-        if let Err(error) = auth.login_api_key("typesafe", candidate.to_string()) {
-            shell.note(&format!("TypeSafe credential was not saved: {error}"));
-            return Next::Go;
-        }
-    }
-
-    let dir = crate::default_agent_dir();
-    let mut settings = crate::settings::load_settings(&dir);
-    settings.set_decision_intelligence_enabled(true);
-    if let Err(error) = crate::settings::save_settings(&dir, &settings) {
-        if persist_credential {
-            let rollback = match previous.as_ref() {
-                Some(previous) => auth.login_api_key("typesafe", previous.clone()),
-                None => auth.remove("typesafe"),
-            };
-            if let Err(rollback_error) = rollback {
-                shell.note(&format!(
-                    "TypeSafe enable failed and credential rollback failed: {rollback_error}"
-                ));
-                return Next::Go;
-            }
-        }
-        shell.note(&format!("TypeSafe decision setting was not saved: {error}"));
-        return Next::Go;
-    }
-
-    let provider = Arc::new(
-        davinci_coding_agent::decision_providers::typesafe::TypeSafeProvider::new(
-            candidate.to_string(),
-        ),
-    );
-    if let Some(runtime) = shell.agent.decision_runtime() {
-        runtime.replace_provider(provider);
-        runtime.enable();
-    } else {
-        let runtime = Arc::new(davinci_agent::decision::DecisionRuntime::new(provider));
-        runtime.enable();
-        shell.agent.set_decision_runtime(runtime);
-    }
-    crate::sync_agent_from_settings(shell.agent);
-    open_settings_sheet(shell.agent, shell.model);
-    shell.model.settings_index = index.min(shell.model.settings_rows.len().saturating_sub(1));
-    if persist_credential {
-        shell.say("TypeSafe / Jev API key saved and decision intelligence enabled");
-    } else {
-        shell.say("TypeSafe / Jev decision intelligence enabled");
     }
     Next::Go
 }

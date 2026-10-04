@@ -40,7 +40,7 @@ Every row below is required. For a Claude-equivalent surface, reproduce the capt
 | Settings and themes | Recreate the reference settings interaction and layout, including navigation, values, descriptions and applicable search. No independently designed dashboard. | `settings`, `sheet`, `theme` |
 | Models and reasoning | Recreate the full model picker and quick switcher, including focus/current distinction and effort controls. Use real providers and preserve selection identity after filtering. | `cogitator`, `thinking` |
 | Permissions and questions | Match trust prompts, permission choices, explanations, question forms, selection and cancellation; never weaken authorization. | `approval_modal`, `decision_modal`, `permissions`, `trust`, `ask` |
-| Login and credentials | Use the same dialog language for provider selection, progress, errors and masked input. Preserve DaVinci authentication, never send its secrets to another product. | `login`, `secret_input` |
+| Login and credentials | Use the same dialog language for provider selection, progress, errors and masked input. Preserve DaVinci authentication, never send its secrets to another product. | `login` |
 | Sessions and history | Match resume, search, session selection, history navigation and rewind presentation; retain session-tree functionality. | `resume`, `tree`, `rewind`, session overlays |
 | Changes and diffs | Match changed-file lists, additions/deletions, diff focus, scrolling and expanded views. Keep source paths, branch and worktree truthful. | `diff`, `codex`, `studio` |
 | Tasks and agents | Match activity and task-list conventions, details, background controls and attention states. Graph navigation remains optional. | `task_board`, `agents`, `workflows` |
@@ -50,7 +50,7 @@ Every row below is required. For a Claude-equivalent surface, reproduce the capt
 
 The inspected `Screen` inventory is: `Agent`, `Plan`, `Grafo`, `Memoria`, `Mensura`, `Models`, `Settings`, `Thinking`, `Login`, `Keys`, `Resume`, `Tree`, `Compact`, `Export`, `GraphRun`, `Vectors`, `Governor`, `Securitas`, `Trust`, `Officina`, `Recovery`, `Diff`, `Mcp`, `Permissions`, `Workflows`, `TaskBoard`, `Agents`, `ContextInspector`.
 
-The inspected `Overlay` inventory is: `Instrumenta`, `Sessions`, `Cogitator`, `SecretInput`, `Ask`. Also audit nested dialogs, empty/loading/error states, and extension/voice-owned rendering that are not separate enum variants. Every current surface must map to a captured reference or a named DaVinci extension; no unmapped entries may ship. [D1, D2]
+The inspected `Overlay` inventory is: `Instrumenta`, `Sessions`, `Cogitator`, `Ask`. Also audit nested dialogs, empty/loading/error states, and extension/voice-owned rendering that are not separate enum variants. Every current surface must map to a captured reference or a named DaVinci extension; no unmapped entries may ship. [D1, D2]
 
 ## 4. Interaction parity, not just screenshots
 

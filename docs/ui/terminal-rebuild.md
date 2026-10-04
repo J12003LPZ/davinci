@@ -59,7 +59,7 @@ cargo run --locked -p davinci-tui --example editorial_preview -- light > termina
 ```
 
 The filename is kept for compatibility with the existing preview command. The
-40 gallery cases cover the 28 screens, five overlays, graph variants, narrow
+gallery cases cover the screens, overlays, graph variants, narrow
 windows and monochrome rendering. They contain explicitly labeled offline
 fixture data. They are not recordings of live agents and are not proof of exact
 reference parity. No fonts or compiled outputs are committed.

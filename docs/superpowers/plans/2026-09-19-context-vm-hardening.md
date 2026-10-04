@@ -1,4 +1,4 @@
-# Context VM and Jev hardening
+# Context VM and graph hardening
 
 Baseline: fetched `origin/main` and HEAD both `1106b1be2bffa1fb7de6e8c0708cc59d1ca2e576`.
 Continue the existing isolated audit worktree; preserve all previous audit fixes.
@@ -22,27 +22,20 @@ The initial workspace Clippy run with warnings denied passes with those fixes.
 7. Lookup misses, rebuild attempts/results and semantic retrieval metrics have
    distinct meanings. Adversarial evals exercise corrections, rejected hypotheses,
    failures followed by success, provenance and resident/pageable evidence.
-8. Jev shadow cannot delay main-provider startup or apply decisions. Work is
-   bounded, stale completions are rejected, and telemetry still records outcomes.
-9. TypeSafe reuses its HTTP client. Its soft target is 800 ms and absolute hard
-   deadline is 1500 ms across attempts; shadow uses one attempt. Loopback fixtures
-   verify cancellation/deadlines and connection reuse without paid calls.
-10. Workspace/capability facts preserve typed uncertainty and reuse an existing
-    per-turn engineering snapshot. Privacy copy accurately describes task text;
-    source-like pasted bodies are excluded where feasible without hiding policy.
-11. Graph layout is measured at 25/100/500/1000 nodes. Any cache must preserve
-    layout/navigation/hit-test results and invalidate on graph, folds and geometry.
-12. Relevant tests/evals, workspace check/Clippy/formatting, release and installed
+8. Workspace facts preserve typed uncertainty and reuse an existing per-turn
+   engineering snapshot.
+9. Graph layout is measured at 25/100/500/1000 nodes. Any cache must preserve
+   layout/navigation/hit-test results and invalidate on graph, folds and geometry.
+10. Relevant tests/evals, workspace check/Clippy/formatting, release and installed
     executable verification pass. No live-provider or hardware claim without a
-    real check. Keep Jev in its existing opt-in/shadow rollout.
+    real check.
 
 ## Ordered work
 
-- Confirm baseline and inspect independent Context VM, Jev, graph/snapshot paths.
+- Confirm baseline and inspect independent Context VM and graph/snapshot paths.
 - Fix budget and wire protocol; add regression tests before implementation.
 - Integrate folding/materialization, prepared images, authoritative retrieval and
   metrics; add lifecycle and cold/warm evals.
-- Integrate bounded shadow jobs, pooled HTTP/deadlines, facts and privacy.
 - Share snapshot computation and benchmark/cache graph work as measurements justify.
 - Independent review, proportional verification, documentation and local delivery.
 
@@ -76,29 +69,18 @@ Performance measurements use deterministic fixtures and report their limits.
 7. Lookup, rebuild and semantic retrieval metrics are separate. Nine mixed-role
    eval scenarios cover corrections, rejected hypotheses, verification state,
    pageable evidence and provenance.
-8. Shadow preparation/inference runs behind a single background slot. It does
-   not gate main-provider startup or apply decisions; stale generations are
-   rejected and occupied capacity produces a fallback.
-9. A persistent HTTP agent reuses connections. Soft-target telemetry and the
-   absolute caller deadline are distinct; shadow makes one attempt. Loopback
-   release measurements used 32 connections with fresh clients and one with a
-   pooled client. An uninterruptible resolver/provider may retain one worker,
-   but cannot accumulate more or extend the caller deadline.
-10. Git state and registered capabilities use typed facts/unknown values.
-    EngineeringSnapshot shares available index/metadata with impact, build,
-    verification and Jev consumers. Reuse rechecks authorization/freshness.
-    Source-like pasted blocks are suppressed and privacy copy names residual
-    redacted task text accurately.
-11. The graph fixture covers all four requested sizes. A 1,000-node simulated
-    key-to-frame p95 of 10.177 ms does not justify a cache on its own. No layout
-    cache or navigation refactor was added.
-12. Workspace tests and the focused fixture correction, all-target check,
+8. Git state uses typed facts/unknown values. EngineeringSnapshot shares
+   available index/metadata with impact, build and verification consumers.
+   Reuse rechecks authorization/freshness.
+9. The graph fixture covers all four requested sizes. A 1,000-node simulated
+   key-to-frame p95 of 10.177 ms does not justify a cache on its own. No layout
+   cache or navigation refactor was added.
+10. Workspace tests and the focused fixture correction, all-target check,
     warnings-denied Clippy, formatting, Node tests and release benchmarks are
     complete. The release build and local install passed; the installed binary
     matches the build SHA-256 and passes version/help smoke checks. The old
-    executable has a distinct verified backup. Jev remains in its existing
-    opt-in/shadow rollout.
+    executable has a distinct verified backup.
 
-See [measurements and verification](../../context-vm-jev-measurements.md) and
+See [measurements and verification](../../context-vm-measurements.md) and
 [Context VM contracts](../../context-vm.md) for evidence and limitations. No
 commit, push, remote CI result or live-provider acceptance is claimed.
