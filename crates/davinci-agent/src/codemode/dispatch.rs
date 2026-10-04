@@ -17,19 +17,19 @@ struct RunState {
 }
 
 /// Borrows the actual parent agent. IPC never supplies its identity or policy.
-pub struct AgentCodeModeBroker<'a> {
-    agent: &'a Agent,
-    context: &'a CodeModeRunContext,
+pub struct AgentCodeModeBroker {
+    agent: Agent,
+    context: CodeModeRunContext,
     parent: Option<OperationId>,
     policy: CapabilityPolicy,
     state: Mutex<RunState>,
     dispatch: WorkerSlotCapacity,
 }
 
-impl<'a> AgentCodeModeBroker<'a> {
+impl AgentCodeModeBroker {
     pub fn new(
-        agent: &'a Agent,
-        context: &'a CodeModeRunContext,
+        agent: Agent,
+        context: CodeModeRunContext,
         parent: Option<OperationId>,
     ) -> Result<Self, CodeModeError> {
         let runtime = agent
@@ -155,11 +155,14 @@ impl<'a> AgentCodeModeBroker<'a> {
     }
 
     pub fn children(&self) -> Vec<CodeModeChildOutcome> {
-        self.state
+        let mut children = self
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .children
-            .clone()
+            .clone();
+        children.sort_by_key(|child| child.ordinal);
+        children
     }
 
     #[cfg(test)]
@@ -189,7 +192,7 @@ impl<'a> AgentCodeModeBroker<'a> {
     }
 }
 
-impl CodeModeBroker for AgentCodeModeBroker<'_> {
+impl CodeModeBroker for AgentCodeModeBroker {
     fn search(&self, query: ToolQuery) -> Result<ToolPage, CodeModeError> {
         self.live()?;
         if query.query.len() > 4096 || query.limit == 0 || query.limit > 20 {
