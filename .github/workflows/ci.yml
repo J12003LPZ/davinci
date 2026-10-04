@@ -476,7 +476,7 @@ jobs:
         run: |
           node --input-type=module <<'JS'
           import { readdir, readFile, writeFile, lstat } from "node:fs/promises";
-          import { join, relative } from "node:path";
+          import { join, relative, sep } from "node:path";
           import { createHash } from "node:crypto";
           const root = process.cwd();
           const files = [];
@@ -488,7 +488,7 @@ jobs:
               if (stat.isDirectory()) await walk(path);
               else if (stat.isFile()) {
                 const bytes = await readFile(path);
-                files.push({ path: relative(root, path).replaceAll("\\\\", "/"), bytes: bytes.length,
+                files.push({ path: relative(root, path).split(sep).join("/"), bytes: bytes.length,
                   sha256: createHash("sha256").update(bytes).digest("hex") });
               } else throw new Error("unexpected asset type");
             }
@@ -496,7 +496,7 @@ jobs:
           await walk(join(root, "node_modules"));
           const report = { schemaVersion: 1, admitted: false, node: process.version,
             platform: process.platform, architecture: process.arch, assets: files };
-          await writeFile("package-assets-report.json", JSON.stringify(report, null, 2) + "\\n");
+          await writeFile("package-assets-report.json", JSON.stringify(report, null, 2) + String.fromCharCode(10));
           console.log(JSON.stringify(report));
           for (const file of files.filter(file => /license|copying|notice/i.test(file.path))) {
             console.log(JSON.stringify({ licenseFile: file.path,
