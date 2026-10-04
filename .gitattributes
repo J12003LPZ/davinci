@@ -5,3 +5,9 @@ docs/superpowers/specs/2026-09-17-engineering-program-requirements.md -text conf
 # Frozen benchmark hashes use the same LF bytes on every checkout platform.
 scripts/bench/specialist_fixtures/**/*.json text eol=lf
 scripts/bench/large_manifest.json text eol=lf
+
+# Provenance, compiler and evaluation fingerprints bind the checked-in bytes.
+crates/davinci-coding-agent/design-resources/** text eol=lf
+crates/davinci-coding-agent/design-ui/host/** text eol=lf
+crates/davinci-coding-agent/design-ui/package-lock.json text eol=lf
+docs/evals/design/** text eol=lf

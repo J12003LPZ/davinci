@@ -2689,6 +2689,48 @@ fn complete_prompt_with_host(
     existing_host: Option<Arc<Mutex<ExtensionHost>>>,
     stream_json: bool,
 ) -> (String, Vec<AgentEvent>) {
+    let (design_text, _) = latest_user_prompt(agent);
+    if davinci_coding_agent::design::is_command(&design_text) {
+        let cwd = agent.cwd.clone();
+        let result = davinci_coding_agent::design::commands::parse_design_command(&design_text)
+            .and_then(|command| {
+                if matches!(&command, davinci_coding_agent::design::commands::DesignCommand::Create { .. } | davinci_coding_agent::design::commands::DesignCommand::Revise { .. })
+                    && (parsed.offline || parsed.api_key.is_some()) {
+                    return Err(davinci_coding_agent::design::error::DesignError::Denied("design generation requires the selected subscription route without offline mode or an API-key override".into()));
+                }
+                davinci_coding_agent::design::default_controller().command(agent, &cwd, command)
+            });
+        let (text, failed) = match result.map_err(|error| error.to_string()).and_then(|value| {
+            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+        }) {
+            Ok(text) => (text, false),
+            Err(error) => (error, true),
+        };
+        let custom_type = if failed {
+            "design_error"
+        } else {
+            "design_result"
+        };
+        let mut message = agent.record_custom_message(
+            &serde_json::json!({"customType":custom_type,"content":text,"display":true}),
+        );
+        if failed {
+            // This is a host result, not a provider failure or an assistant reply.
+            message
+                .extra
+                .insert("designCommandError".into(), serde_json::json!(text));
+        }
+        let event = AgentEvent::MessageEnd { message };
+        // Design returns before the ordinary provider event sink is installed.
+        if stream_json {
+            if let Ok(encoded) = to_json_print_event(&event)
+                .and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
+            {
+                let _ = output::write_raw_stdout_line(&encoded);
+            }
+        }
+        return (text, vec![event]);
+    }
     // A session switch (`/new`, `/resume`, fork, RPC) gives SessionStart hooks
     // a new id; unchanged sessions hit the cache.
     apply_plugin_session_start(
@@ -3917,6 +3959,7 @@ fn run_print_turns(
     for extra in &prepared.remaining_messages {
         if approval_required.is_some()
             || agent.ensure_session_persistence().is_err()
+            || print_text_exit(&all_events).0 != 0
             || runtime_blocked(last_reply)
         {
             break;
@@ -4256,6 +4299,15 @@ fn to_json_print_event(event: &AgentEvent) -> Result<serde_json::Value, String> 
 
 fn print_text_exit(events: &[AgentEvent]) -> (i32, Option<String>) {
     for event in events.iter().rev() {
+        if let AgentEvent::MessageEnd { message } = event {
+            if let Some(error) = message
+                .extra
+                .get("designCommandError")
+                .and_then(serde_json::Value::as_str)
+            {
+                return (1, Some(error.to_owned()));
+            }
+        }
         if let AgentEvent::AgentEnd { messages, .. } = event {
             if let Some(error) = messages.iter().find_map(|message| {
                 message
@@ -4673,7 +4725,13 @@ fn run_rpc_with_host(
                 continue;
             }
         }
-        let mut response = handle_rpc(&mut runtime, command.clone());
+        let mut response = if command.kind == "design" {
+            with_rpc_operation_watch(&mut runtime, &leftover, &rx, &ui_abort, |runtime| {
+                handle_rpc(runtime, command.clone())
+            })
+        } else {
+            handle_rpc(&mut runtime, command.clone())
+        };
         if matches!(
             command.kind.as_str(),
             "new_session" | "clone" | "fork" | "switch_session"
@@ -4715,46 +4773,20 @@ fn run_rpc_with_host(
                 no_extensions: parsed.no_extensions,
                 ..Args::default()
             };
-            let signal = Arc::new(std::sync::atomic::AtomicBool::new(
-                runtime.agent.abort_requested(),
-            ));
-            let previous_abort = runtime.agent.abort_signal.replace(signal.clone());
-            *ui_abort.lock().unwrap_or_else(|err| err.into_inner()) = Some(signal);
-            let remote = runtime.agent.remote_queue();
-            let skills = runtime.agent.skills.clone();
-            let templates = runtime.agent.templates.clone();
-            let stop = std::sync::atomic::AtomicBool::new(false);
-            let (_reply, events) = std::thread::scope(|scope| {
-                let stop_ref = &stop;
-                let leftover_ref = &leftover;
-                let rx_ref = &rx;
-                let ui_abort_ref = &ui_abort;
-                let remote_ref = &remote;
-                let skills_ref = &skills;
-                let templates_ref = &templates;
-                let watcher = scope.spawn(move || {
-                    rpc_watch_during_turn(
-                        leftover_ref,
-                        rx_ref,
-                        ui_abort_ref,
-                        remote_ref,
-                        skills_ref,
-                        templates_ref,
-                        stop_ref,
+            let (_reply, events) =
+                with_rpc_operation_watch(&mut runtime, &leftover, &rx, &ui_abort, |runtime| {
+                    complete_prompt_with_host(
+                        &prompt_args,
+                        &mut runtime.agent,
+                        Some(host.clone()),
+                        false,
                     )
                 });
-                let result = complete_prompt_with_host(
-                    &prompt_args,
-                    &mut runtime.agent,
-                    Some(host.clone()),
-                    false,
-                );
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = watcher.join();
-                result
-            });
-            *ui_abort.lock().unwrap_or_else(|err| err.into_inner()) = None;
-            runtime.agent.abort_signal = previous_abort;
+            if let (code, Some(error)) = print_text_exit(&events) {
+                if code != 0 {
+                    response = rpc::fail_response(command.id.clone(), "prompt", error);
+                }
+            }
             if let Some(preview) = scope_expansion_preview_from_events(&runtime.agent, &events) {
                 let (report, failed) = rpc_scope_expansion_result(command.id.clone(), &preview);
                 output::write_raw_stdout_line(
@@ -5073,6 +5105,52 @@ fn rpc_watch_during_turn(
 }
 
 type RpcUiAbort = Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>;
+
+/// Supervise synchronous host operations with the same RPC input watcher as a
+/// provider turn. Always stop the watcher and restore prior abort bindings,
+/// including when the operation unwinds.
+fn with_rpc_operation_watch<T>(
+    runtime: &mut RpcRuntime,
+    leftover: &Mutex<std::collections::VecDeque<String>>,
+    rx: &Mutex<std::sync::mpsc::Receiver<String>>,
+    active: &RpcUiAbort,
+    operation: impl FnOnce(&mut RpcRuntime) -> T,
+) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let signal = Arc::new(AtomicBool::new(runtime.agent.abort_requested()));
+    let previous_abort = runtime.agent.abort_signal.replace(signal.clone());
+    let previous_active = active
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace(signal);
+    let remote = runtime.agent.remote_queue();
+    let skills = runtime.agent.skills.clone();
+    let templates = runtime.agent.templates.clone();
+    let stop = AtomicBool::new(false);
+    let outcome = std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            rpc_watch_during_turn(leftover, rx, active, &remote, &skills, &templates, &stop)
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(runtime)));
+        stop.store(true, Ordering::Release);
+        let watcher_outcome = watcher.join();
+        // A watcher panic must not be reported as a successfully supervised call.
+        match (outcome, watcher_outcome) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    });
+    *active.lock().unwrap_or_else(|error| error.into_inner()) = previous_active;
+    runtime.agent.abort_signal = previous_abort;
+    match outcome {
+        Ok(value) => value,
+        Err(error) => std::panic::resume_unwind(error),
+    }
+}
+
+#[cfg(test)]
+#[path = "review_regression_tests.rs"]
+mod review_regression_tests;
 
 #[cfg(test)]
 fn rpc_with_ui_abort<T>(

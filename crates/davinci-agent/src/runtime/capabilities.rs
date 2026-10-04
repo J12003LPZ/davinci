@@ -250,7 +250,9 @@ pub fn default_declared_effects(name: &str, class: ToolClass) -> Vec<DeclaredEff
             ]
         }
         "mcp_read" => vec![DeclaredEffect::McpRead],
-        "ask_user_question" => vec![DeclaredEffect::HostInteraction],
+        // Host orchestration admits each command and managed browser action
+        // separately. This profile grants no executable, path or network scope.
+        "ask_user_question" | "design_check" => vec![DeclaredEffect::HostInteraction],
         _ => match class {
             ToolClass::Read => vec![DeclaredEffect::FileSystemRead],
             ToolClass::Edit => vec![DeclaredEffect::FileSystemWrite],

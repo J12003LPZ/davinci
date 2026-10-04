@@ -1283,6 +1283,124 @@ impl Agent {
         Err(last_error.unwrap_or_else(|| "Provider request failed".into()))
     }
 
+    /// Collect an actual foreground check through the existing permission, hook,
+    /// process and receipt owners. Command success does not establish coverage.
+    pub fn execute_host_verification_command(
+        &mut self,
+        cwd: &Path,
+        command: &str,
+        timeout_ms: u64,
+        abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::runtime::evidence_store::ExecutionReceipt, String> {
+        if command.trim().is_empty() || command.len() > 2048 || !(1..=600_000).contains(&timeout_ms)
+        {
+            return Err("invalid verification command bounds".into());
+        }
+        if self.is_plan_mode() {
+            return Err("leave Plan Mode before running implementation checks".into());
+        }
+        if cwd.canonicalize().map_err(|e| e.to_string())?
+            != self.cwd.canonicalize().map_err(|e| e.to_string())?
+        {
+            return Err("verification cannot change the agent workspace".into());
+        }
+        self.ensure_session_persistence()?;
+        if self.abort_requested() || abort.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("verification cancelled".into());
+        }
+        let id = format!("host-check-{}", uuid::Uuid::new_v4());
+        let name = if cfg!(windows) { "powershell" } else { "bash" };
+        let mut events = Vec::new();
+        let parents: Vec<_> = [
+            self.abort_signal.clone(),
+            self.tool_context.abort.clone(),
+            self.runtime
+                .as_ref()
+                .map(|rt| rt.cancellation_token.as_atomic_bool()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let previous = self.host_command_abort.replace(abort.clone());
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let results = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                use std::sync::atomic::Ordering;
+                while !stopped.load(Ordering::Acquire) {
+                    if parents.iter().any(|flag| flag.load(Ordering::Acquire)) {
+                        abort.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            });
+            struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Stop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _stop = Stop(&stopped);
+            self.execute_tool_batch(
+                cwd,
+                vec![(
+                    id.clone(),
+                    name.into(),
+                    serde_json::json!({"command":command,"timeout_ms":timeout_ms}),
+                )],
+                &mut events,
+            )
+        });
+        self.host_command_abort = previous;
+        if abort.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("verification cancelled; inspect the recorded process outcome".into());
+        }
+        let result = results
+            .into_iter()
+            .next()
+            .ok_or("verification returned no tool result")?;
+        let receipt = self
+            .command_receipts
+            .lock()
+            .map_err(|_| "command receipts unavailable")?
+            .iter()
+            .find(|receipt| receipt.operation_id == id)
+            .cloned()
+            .ok_or("no actual foreground execution receipt; check was denied or unavailable")?;
+        if receipt.argv != [command] || (result.is_error == Some(true) && receipt.is_passed()) {
+            return Err("verification receipt does not match the finalized tool result".into());
+        }
+        Ok(receipt)
+    }
+
+    /// Trusted host handoffs reuse hooks, contracts, permission prompts and
+    /// durable transactions without adding a provider-visible tool.
+    pub fn execute_host_handoff_tool(
+        &mut self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: Value,
+    ) -> Result<ChatMessage, String> {
+        if !matches!(
+            name,
+            "propose_plan" | "patch_preview" | "patch_apply" | "patch_status"
+        ) {
+            return Err("tool is not a handoff operation".into());
+        }
+        if cwd.canonicalize().map_err(|e| e.to_string())?
+            != self.cwd.canonicalize().map_err(|e| e.to_string())?
+        {
+            return Err("handoff cannot change the agent workspace".into());
+        }
+        self.ensure_session_persistence()?;
+        let mut events = Vec::new();
+        self.execute_tool_batch(cwd, vec![(id.into(), name.into(), args)], &mut events)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "handoff tool returned no result".into())
+    }
+
     /// Run every tool call of one assistant message and return their
     /// result messages in source order.
     ///
@@ -2448,11 +2566,12 @@ impl Agent {
                         ),
                     );
                 }
-                context.abort = self
-                    .runtime
-                    .as_ref()
-                    .map(|rt| rt.cancellation_token.as_atomic_bool())
-                    .or_else(|| self.abort_signal.clone());
+                context.abort = self.host_command_abort.clone().or_else(|| {
+                    self.runtime
+                        .as_ref()
+                        .map(|rt| rt.cancellation_token.as_atomic_bool())
+                        .or_else(|| self.abort_signal.clone())
+                });
                 self.begin_transaction_verification(cwd, id, name, args, &context);
                 if context.command_receipt.is_some() {
                     if let Ok(mut receipts) = self.command_receipts.lock() {
@@ -3503,6 +3622,27 @@ impl Agent {
     /// block there wins) and after the unknown-tool check (nobody is asked
     /// about a tool that does not exist).
     fn permission_denial(&self, cwd: &Path, id: &str, name: &str, args: &Value) -> Option<String> {
+        self.permission_denial_inner(cwd, id, name, args, false)
+    }
+
+    pub(crate) fn host_permission_denial(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Option<String> {
+        self.permission_denial_inner(cwd, id, name, args, true)
+    }
+
+    fn permission_denial_inner(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        retain_host_consent: bool,
+    ) -> Option<String> {
         // A new preparation supersedes any abandoned consent for this call ID.
         self.approval_registry.take_dispatch(id);
         // Asking for user intent is a host interaction, not a repository or
@@ -3638,7 +3778,7 @@ impl Agent {
                         let current_digest = self.approval_registry.digest(&current, cwd, self.runtime.as_ref());
                         match pending.resolve(&reply, &current_digest, policy.revision(), davinci_session::now_ms()) {
                             Ok(crate::approval::GrantScope::Once) => {
-                                if crate::tools::is_managed_process_tool(name)
+                                if retain_host_consent || crate::tools::is_managed_process_tool(name)
                                     || crate::tools::is_coordinated_mutation(name)
                                     || crate::runtime::transactions::is_tool(name)
                                     || (!crate::tools::BUILTIN_TOOLS.contains(&name)

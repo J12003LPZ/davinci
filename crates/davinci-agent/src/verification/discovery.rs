@@ -30,6 +30,16 @@ pub(crate) fn runner_words(words: &[String]) -> Option<&'static str> {
         return None;
     }
     match words {
+        [name, args @ ..]
+            if matches!(name.as_str(), "node" | "node.exe")
+                && args.iter().any(|arg| arg == "--test") =>
+        {
+            Some(if args.iter().any(|arg| arg == "--test-reporter=tap") {
+                "node-tap"
+            } else {
+                "unknown"
+            })
+        }
         [name, action, ..] if name == "cargo" && action == "test" => Some("rust"),
         [name, module, runner, ..]
             if super::python_name(name) && module == "-m" && runner == "unittest" =>
@@ -59,6 +69,34 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
     let stderr = std::str::from_utf8(stderr).ok()?;
     let mut counts = AssertionCounts::default();
     match runner(command)? {
+        "node-tap" => {
+            // Node prefixes test stdout with an extra '# ', so emitted text
+            // cannot masquerade as its own top-level discovery summary.
+            let mut values = std::collections::BTreeMap::new();
+            for line in stdout.lines() {
+                let Some((key, value)) = line.strip_prefix("# ").and_then(|s| s.split_once(' '))
+                else {
+                    continue;
+                };
+                if ["tests", "pass", "fail", "cancelled", "skipped", "todo"].contains(&key)
+                    && values.insert(key, value.parse::<u32>().ok()?).is_some()
+                {
+                    return None;
+                }
+            }
+            counts.total = *values.get("tests")?;
+            counts.passed = *values.get("pass")?;
+            counts.failed = values.get("fail")?.checked_add(*values.get("cancelled")?)?;
+            counts.skipped = values.get("skipped")?.checked_add(*values.get("todo")?)?;
+            if counts
+                .passed
+                .checked_add(counts.failed)?
+                .checked_add(counts.skipped)?
+                != counts.total
+            {
+                return None;
+            }
+        }
         "rust" => {
             static SUMMARY: OnceLock<regex::Regex> = OnceLock::new();
             let pattern = SUMMARY.get_or_init(|| regex::Regex::new(
@@ -117,6 +155,27 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn node_tap_requires_complete_consistent_nonempty_discovery() {
+        let command = "node --test --test-reporter=tap tests/app.test.cjs";
+        let summary = b"TAP version 13\n1..2\n# tests 2\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 1\n# todo 0\n# duration_ms 12.5\n";
+        let result = counts(command, summary, b"").expect("actual Node TAP summary");
+        assert_eq!((result.total, result.passed, result.skipped), (2, 1, 1));
+        assert!(counts(command, b"all tests passed", b"").is_none());
+        assert!(counts("node --test tests/app.test.cjs", summary, b"").is_none());
+        assert!(counts("echo node --test --test-reporter=tap", summary, b"").is_none());
+        for invalid in [
+            String::from_utf8_lossy(summary).replace("# pass 1", "# pass 3"),
+            String::from_utf8_lossy(summary).replace("# todo 0\n", ""),
+            String::from_utf8_lossy(summary).replace("# fail 0", "# fail 0\n# fail 0"),
+        ] {
+            assert!(counts(command, invalid.as_bytes(), b"").is_none());
+        }
+        let zero = b"TAP version 13\n1..0\n# tests 0\n# suites 0\n# pass 0\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 1\n";
+        assert!(!crate::verification::tests_passed(
+            &counts(command, zero, b"").unwrap()
+        ));
+    }
     #[test]
     fn standard_unittest_summaries_preserve_actual_pass_and_skip_counts() {
         let command = "python -m unittest discover";

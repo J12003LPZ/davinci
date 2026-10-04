@@ -20,6 +20,24 @@ function harness(backend, artifact) {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test('prototype keys and text assertions reach the backend with correlated responses', async () => {
+  const executed = [];
+  const commands = [{action: 'key', key: 'Tab'}, {action: 'expect_text', text: 'Saved locally'}];
+  const h = harness({open: async () => ({browserVersion: 'test', close: async () => {},
+    execute: async command => {executed.push(command); return {done: true};}}), close: async () => {}});
+  h.send({id: 1, op: 'open', options: {origins: ['https://design.invalid']}});
+  await tick();
+  for (const [index, command] of commands.entries()) {
+    h.send({id: index + 2, op: 'execute', resource: 1, command});
+    await tick();
+  }
+  h.input.end();
+  const outcome = await h.transport.done;
+  assert.deepEqual(executed, commands);
+  assert.equal(outcome.failed, false);
+  assert.deepEqual(h.responses.map(response => [response.id, response.ok]), [[1, true], [2, true], [3, true]]);
+});
+
 test('cancel interrupts only the targeted action and preserves another context', async () => {
   let release;
   let opened = 0;
