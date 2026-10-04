@@ -725,7 +725,7 @@ impl Agent {
             auto_resize_images: true,
             retry_aborted: false,
             transport: None,
-            install_telemetry: true,
+            install_telemetry: false,
             reload_count: 0,
             event_sink: None,
             abort_signal: None,

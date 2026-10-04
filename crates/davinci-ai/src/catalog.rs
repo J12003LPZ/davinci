@@ -321,23 +321,75 @@ pub fn load_radius_models() -> Vec<Model> {
 }
 
 /// Radius is an opt-in gateway run by a third party. Contact it only when the
-/// user configured a Radius account or gateway, never while offline, and at
-/// most once per process: `load_builtin_models` has many callers.
+/// user configured a Radius account or gateway and never while offline.
+/// `load_builtin_models` has many callers, so a fetched config is kept for the
+/// process. Opt-in is re-checked until a fetch succeeds, so `/login radius`
+/// mid-session works, and a failed fetch is retried after a cooldown instead
+/// of on every catalog load.
 fn cached_radius_config() -> Option<String> {
-    static CONFIG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let env = |name: &str| std::env::var(name).ok();
-            let stored_login = || {
-                crate::AuthStorage::create()
-                    .ok()
-                    .is_some_and(|storage| storage.get("radius").is_some())
-            };
-            radius_fetch_allowed(env, stored_login)
-                .then(fetch_radius_config)
-                .flatten()
-        })
-        .clone()
+    static CACHE: std::sync::Mutex<RadiusConfigCache> =
+        std::sync::Mutex::new(RadiusConfigCache::new());
+    let allowed = || {
+        let env = |name: &str| std::env::var(name).ok();
+        let stored_login = || {
+            crate::AuthStorage::create()
+                .ok()
+                .is_some_and(|storage| storage.get("radius").is_some())
+        };
+        radius_fetch_allowed(env, stored_login)
+    };
+    CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(std::time::Instant::now(), allowed, fetch_radius_config)
+}
+
+const RADIUS_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(crate) struct RadiusConfigCache {
+    config: Option<String>,
+    last_failure: Option<std::time::Instant>,
+}
+
+impl RadiusConfigCache {
+    pub(crate) const fn new() -> Self {
+        Self {
+            config: None,
+            last_failure: None,
+        }
+    }
+
+    /// Returns the cached config, or fetches it when the user opted in and no
+    /// fetch failed within `RADIUS_RETRY_AFTER`. Only a success is cached.
+    pub(crate) fn get(
+        &mut self,
+        now: std::time::Instant,
+        allowed: impl FnOnce() -> bool,
+        fetch: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        if let Some(config) = &self.config {
+            return Some(config.clone());
+        }
+        if self
+            .last_failure
+            .is_some_and(|failed| now.saturating_duration_since(failed) < RADIUS_RETRY_AFTER)
+        {
+            return None;
+        }
+        if !allowed() {
+            return None;
+        }
+        match fetch() {
+            Some(config) => {
+                self.config = Some(config.clone());
+                Some(config)
+            }
+            None => {
+                self.last_failure = Some(now);
+                None
+            }
+        }
+    }
 }
 
 pub(crate) fn radius_fetch_allowed(
@@ -473,6 +525,41 @@ mod tests {
             };
             assert!(!radius_fetch_allowed(env(pairs), || true), "{offline}");
         }
+    }
+
+    #[test]
+    fn radius_config_cache_keeps_only_successes() {
+        use std::cell::Cell;
+        let start = std::time::Instant::now();
+        let mut cache = RadiusConfigCache::new();
+        let fetches = Cell::new(0);
+        let fetch_ok = || {
+            fetches.set(fetches.get() + 1);
+            Some("{}".to_string())
+        };
+        let fetch_fail = || {
+            fetches.set(fetches.get() + 1);
+            None
+        };
+
+        // Not opted in: no fetch, and nothing is remembered.
+        assert_eq!(cache.get(start, || false, fetch_ok), None);
+        assert_eq!(fetches.get(), 0);
+
+        // Opting in later in the same process (e.g. `/login radius`) works.
+        assert_eq!(cache.get(start, || true, fetch_fail), None);
+        assert_eq!(fetches.get(), 1);
+
+        // A failure is not retried on every load, only after the cooldown.
+        assert_eq!(cache.get(start, || true, fetch_ok), None);
+        assert_eq!(fetches.get(), 1);
+        let later = start + RADIUS_RETRY_AFTER;
+        assert_eq!(cache.get(later, || true, fetch_ok), Some("{}".into()));
+        assert_eq!(fetches.get(), 2);
+
+        // A success is kept and never refetched.
+        assert_eq!(cache.get(later, || false, fetch_fail), Some("{}".into()));
+        assert_eq!(fetches.get(), 2);
     }
 
     #[test]

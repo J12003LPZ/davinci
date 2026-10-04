@@ -11,8 +11,8 @@ Changes on `main` since `v1.0.71`.
 
 ### Privacy
 - Removed the install ping to `https://pi.dev/api/report-install`. DaVinci sends no install or usage telemetry.
-- Provider attribution headers (OpenRouter, NVIDIA NIM, Cloudflare) are now opt-in: `enableInstallTelemetry: true` or `PI_TELEMETRY=1`.
-- The Radius gateway config (`https://radius.pi.dev/v1/config`) is fetched only for a configured Radius account, never while offline, and at most once per process. It was previously requested on every built-in catalog load.
+- Provider attribution headers (OpenRouter, NVIDIA NIM, Cloudflare) are now opt-in: `enableInstallTelemetry: true` or `PI_TELEMETRY=1`. Subagents follow the same setting.
+- The Radius gateway config (`https://radius.pi.dev/v1/config`) is fetched only for a configured Radius account and never while offline. A fetched config is kept for the process; a failed fetch is retried after 60 seconds, not on every catalog load. Logging in to Radius mid-session takes effect without a restart.
 - `/share` prints the secret gist URL and no longer defaults to a `https://pi.dev/session/` viewer link. Set `PI_SHARE_VIEWER_URL` to get one.
 
 ### Fixed

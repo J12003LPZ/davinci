@@ -435,6 +435,12 @@ fn in_process_workers_compact_at_the_configured_threshold_with_a_summary() {
 }
 
 #[test]
+fn worker_agents_do_not_send_provider_attribution_by_default() {
+    let worker = super::new_worker_agent("worker attribution fixture");
+    assert!(!worker.install_telemetry);
+}
+
+#[test]
 fn worker_agents_use_the_lower_model_turn_default() {
     let worker = super::new_worker_agent("worker turn limit fixture");
     assert_eq!(worker.max_model_turns, Some(60));

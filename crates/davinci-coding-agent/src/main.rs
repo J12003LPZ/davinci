@@ -2349,6 +2349,7 @@ fn build_worker_agent(
         )
     };
     let mut child = new_worker_agent(system_prompt);
+    child.install_telemetry = settings.install_telemetry_enabled();
     child.service_tier = req.service_tier;
     if let Some(max_turns) = req.max_turns {
         child.max_model_turns = Some(max_turns.clamp(1, 60) as u32);

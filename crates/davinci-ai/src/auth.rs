@@ -425,7 +425,7 @@ fn resolve_auth_path(
         Some(home) => Ok(auth_path_for(home, override_dir)),
         None if !needs_home => Ok(auth_path_for(Path::new(""), override_dir)),
         None => Err(AuthStorageError::Read(
-            "no home directory is set (HOME or USERPROFILE); set DAVINCI_CODING_AGENT_DIR              to choose where credentials are stored"
+            "no home directory is set (HOME or USERPROFILE); set DAVINCI_CODING_AGENT_DIR to choose where credentials are stored"
                 .into(),
         )),
     }
@@ -941,7 +941,12 @@ mod tests {
 
     #[test]
     fn missing_home_never_puts_credentials_in_the_working_directory() {
-        assert!(resolve_auth_path(None, None).is_err());
+        let message = resolve_auth_path(None, None).unwrap_err().to_string();
+        assert!(
+            message.contains("set DAVINCI_CODING_AGENT_DIR to choose"),
+            "{message}"
+        );
+        assert!(!message.contains("  "), "{message}");
         assert!(resolve_auth_path(None, Some("~")).is_err());
         assert!(resolve_auth_path(None, Some("~/agent")).is_err());
         assert_eq!(

@@ -4627,3 +4627,10 @@ fn execution_isolation_requires_a_confining_sandbox() {
         assert_eq!(agent.execution_isolated(), isolated, "{mode:?} {backend:?}");
     }
 }
+
+#[test]
+fn provider_attribution_is_off_unless_the_host_opts_in() {
+    // Hosts copy the user's setting onto the agents they configure. Any agent
+    // they do not configure, such as a subagent, must not attribute by default.
+    assert!(!Agent::new("x").install_telemetry);
+}
