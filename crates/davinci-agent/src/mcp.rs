@@ -713,3 +713,56 @@ mod tests {
         assert_eq!(registry.rows()[0].status, "disabled");
     }
 }
+
+#[cfg(test)]
+mod codemode_structured_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct FixtureTransport;
+
+    impl davinci_mcp::RpcTransport for FixtureTransport {
+        fn call(&mut self, method: &str, _params: Value) -> davinci_mcp::Result<Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({"tools": [{"name": "items"}]})),
+                "tools/call" => Ok(json!({
+                    "content": [{"type": "text", "text": "visible fixture text"}],
+                    "structuredContent": {"items": [{"id": "A"}]},
+                    "_meta": {"private": "must not be projected"},
+                    "_operation_result_committed": true
+                })),
+                _ => Err(davinci_mcp::Error::Protocol("unexpected fixture method".into())),
+            }
+        }
+
+        fn notify(&mut self, method: &str, _params: Value) -> davinci_mcp::Result<()> {
+            assert_eq!(method, "notifications/initialized");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_accessor_preserves_data_while_direct_presentation_is_unchanged() {
+        let client =
+            davinci_mcp::Client::connect_transport("fixture", Box::new(FixtureTransport)).unwrap();
+        let registry = McpRegistry::default();
+        registry
+            .lock()
+            .clients
+            .insert("fixture".into(), Arc::new(Mutex::new(client)));
+        let full = registry.call_full("fixture", "items", &json!({})).unwrap();
+        assert_eq!(full.text(), "visible fixture text");
+        let encoded = serde_json::to_value(full).unwrap();
+        assert_eq!(encoded["structuredContent"], json!({"items": [{"id": "A"}]}));
+        assert!(encoded.get("_meta").is_none());
+        assert!(encoded.get("_operation_result_committed").is_none());
+        let direct = registry.call("fixture", "items", &json!({})).unwrap();
+        assert_eq!(direct.content, "visible fixture text");
+        assert!(!direct.is_error);
+        assert!(direct.details.is_none());
+    }
+}
