@@ -279,14 +279,23 @@ pub fn parse_args(args: &[String]) -> Args {
             result.help = true;
         } else if arg == "--version" || arg == "-v" {
             result.version = true;
-        } else if arg == "--mode" && i + 1 < args.len() {
-            i += 1;
-            result.mode = match args[i].as_str() {
-                "text" => Some(Mode::Text),
-                "json" => Some(Mode::Json),
-                "rpc" => Some(Mode::Rpc),
-                _ => result.mode,
-            };
+        } else if arg == "--mode" || arg.starts_with("--mode=") {
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            match value {
+                Some("text") => result.mode = Some(Mode::Text),
+                Some("json") => result.mode = Some(Mode::Json),
+                Some("rpc") => result.mode = Some(Mode::Rpc),
+                _ => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: match value {
+                        Some(value) if !value.is_empty() => {
+                            format!("Invalid mode \"{value}\". Valid values: text, json, rpc")
+                        }
+                        _ => "--mode requires one of: text, json, rpc".into(),
+                    },
+                }),
+            }
         } else if arg == "--continue" || arg == "-c" {
             result.continue_session = true;
         } else if arg == "--resume" || arg == "-r" {

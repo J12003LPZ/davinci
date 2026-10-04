@@ -2142,10 +2142,9 @@ fn export_session(parsed: &Args, export: &str) -> Result<i32, String> {
     let session = if Path::new(export).exists() {
         JsonlSession::open(Path::new(export)).map_err(|err| err.to_string())?
     } else {
-        match resolve_or_create_session(parsed, &session_dir, &cwd) {
-            Err(err) if err == NO_SESSION_SELECTED => return Ok(0),
-            other => other?,
-        }
+        let summary = resolve_session_ref(&session_dir, Some(&cwd.to_string_lossy()), export)
+            .map_err(|err| err.to_string())?;
+        JsonlSession::open(&summary.path).map_err(|err| err.to_string())?
     };
     let output = if let Some(next) = parsed.messages.first() {
         PathBuf::from(next)
