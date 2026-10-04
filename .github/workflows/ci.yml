@@ -493,6 +493,14 @@ jobs:
           set -euo pipefail
           node package-bundle.mjs "$RUNNER_TEMP/codemode-bundle" "$RUNNER_TEMP/codemode-manifest.json"
           cmp "$RUNNER_TEMP/codemode-manifest.json" ../src/codemode_host/assets-manifest.json
+      - name: Native Codemode noncooperative deadline regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DAVINCI_CODEMODE_FIXTURE_NODE="$(node -p 'process.execPath')"
+          export DAVINCI_CODEMODE_FIXTURE_BUNDLE="$RUNNER_TEMP/codemode-bundle"
+          export DAVINCI_CODEMODE_FIXTURE_MANIFEST="$RUNNER_TEMP/codemode-manifest.json"
+          cargo test -p davinci-coding-agent --test codemode_supervisor native_deadline_returns_when_broker_ignores_cancellation --locked -- --ignored --nocapture
       - name: Current dependency advisory report
         working-directory: crates/davinci-coding-agent/codemode-host
         run: npm audit --omit=dev --json
