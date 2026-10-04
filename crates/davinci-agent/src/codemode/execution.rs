@@ -90,7 +90,7 @@ impl Agent {
         args: &Value,
         parent: Option<OperationId>,
     ) -> ToolResult {
-        let run = || -> Result<CodeModeOutcome, CodeModeError> {
+        let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
             let request: CodeModeRequest = serde_json::from_value(args.clone())
                 .map_err(|_| CodeModeError::new("INVALID_INPUT", "invalid Codemode request"))?;
             let limits = CodeModeLimits::default().for_request(&request)?;
@@ -134,6 +134,7 @@ impl Agent {
                     .with_cancellation_token(context.cancellation.clone()),
             );
             let broker = AgentCodeModeBroker::new(&leaf_agent, &context, Some(parent))?;
+            let authority = super::authority_fingerprint(self)?;
             let mut outcome = binding.host.execute(&request, &context, &broker);
             // Guest and host output cannot forge the authoritative child evidence.
             outcome.children = broker.children();
@@ -152,14 +153,14 @@ impl Agent {
             {
                 outcome.status = CodeModeStatus::Partial;
             }
-            Ok(outcome)
+            Ok((outcome, authority))
         };
         match run() {
-            Ok(outcome) => ToolResult {
+            Ok((outcome, authority)) => ToolResult {
                 content: serde_json::to_string(&outcome)
                     .unwrap_or_else(|_| "Codemode outcome serialization failed".into()),
                 is_error: !matches!(outcome.status, CodeModeStatus::Completed),
-                details: Some(json!({"codemode":outcome})),
+                details: Some(json!({"codemode":outcome,"_codemode_authority":authority})),
             },
             Err(error) => ToolResult {
                 content: error.message.clone(),

@@ -2102,7 +2102,15 @@ impl Agent {
                 }
                 crate::runtime::operations::OperationAdmission::ExistingResult(admitted) => {
                     return match operation_runtime.dispatcher().replay_result(&admitted) {
-                        Ok(result) => Preparation::Immediate(result),
+                        Ok(result) => {
+                            if name == "codemode"
+                                && !matches!((result.details.as_ref().and_then(|details| details.get("_codemode_authority")).and_then(Value::as_str), crate::codemode::authority_fingerprint(self)),
+                                (Some(stored), Ok(current)) if stored == current)
+                            {
+                                return immediate("Cached Codemode data cannot be authorized under the current source policy; script replay remains blocked.".into(), true);
+                            }
+                            Preparation::Immediate(result)
+                        }
                         Err(error) => {
                             immediate(format!("Operation replay blocked: {error}"), false)
                         }
@@ -3140,6 +3148,15 @@ impl Agent {
         let codemode_facts = (name == "codemode")
             .then(|| crate::codemode::mandatory_facts(&result))
             .flatten();
+        let codemode_authority = (name == "codemode")
+            .then(|| {
+                result
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("_codemode_authority"))
+                    .cloned()
+            })
+            .flatten();
         if !storage_failure {
             if let Some(structured) = structured {
                 if let Some(hook) = &self.script_post_tool {
@@ -3156,6 +3173,13 @@ impl Agent {
         }
         if name == "codemode" {
             result.is_error |= pre_hook_error;
+            if let Some(authority) = codemode_authority {
+                let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+                if !details.is_object() {
+                    *details = serde_json::json!({});
+                }
+                details["_codemode_authority"] = authority;
+            }
             if let Some(facts) = codemode_facts {
                 if result.content != pre_hook_result.content {
                     append_harness_note(&mut result, &format!("Codemode execution facts: {facts}"));

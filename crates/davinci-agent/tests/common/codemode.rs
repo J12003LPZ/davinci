@@ -206,6 +206,46 @@ fn completed_codemode_parent_replays_without_running_the_host() {
         .lock()
         .unwrap()
         .deny
+        .push(crate::permission::PermissionRule::parameter(
+            "read",
+            "path",
+            "input.txt",
+        ));
+    let source_denied = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "same-parent".into(),
+                "codemode".into(),
+                json!({"code":"return 1"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(
+        source_denied.is_error,
+        Some(true),
+        "cached child data must obey current source permissions"
+    );
+    agent.permissions.lock().unwrap().deny.clear();
+    let restored = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "same-parent".into(),
+                "codemode".into(),
+                json!({"code":"return 1"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(restored.is_error, Some(false));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
         .push(crate::permission::PermissionRule::parse("codemode").unwrap());
     let denied = agent
         .execute_tool_batch(
@@ -220,6 +260,74 @@ fn completed_codemode_parent_replays_without_running_the_host() {
         .remove(0);
     assert_eq!(denied.is_error, Some(true));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn completed_codemode_reopens_with_source_access_binding() {
+    let (mut agent, workspace, journal) = configured_agent();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent
+        .enable_read_only_codemode(Arc::new(CountedReadOnlyFixtureHost(calls.clone())))
+        .unwrap();
+    let request = || {
+        vec![(
+            "reopened-parent".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )]
+    };
+    let first = agent.execute_tool_batch(workspace.path(), request(), &mut Vec::new());
+    assert_eq!(first[0].is_error, Some(false));
+    let context = agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .operations
+        .as_ref()
+        .unwrap()
+        .operation_context()
+        .clone();
+    let identity = journal.identity().clone();
+    let root = journal.root_namespace_id();
+    drop(agent);
+    drop(journal);
+    let journal = Arc::new(
+        OperationJournal::open(&workspace.path().join("journal"), identity, root).unwrap(),
+    );
+    let operations = ToolOperationRuntime::new(
+        journal.clone(),
+        context.clone(),
+        ExecutionOwner::new(ExecutionOwnerId::new(), 2).unwrap(),
+        workspace.path(),
+    )
+    .unwrap();
+    let runtime = RuntimeHandle::new(context.runtime_run_id, context.agent_id, RuntimeBus::new())
+        .with_operation_runtime(operations);
+    let mut agent = Agent::new("codemode reopened fixture");
+    agent.tools = vec!["read".into(), "write".into(), "batch".into()];
+    agent.tool_execution_mode = ToolExecutionMode::Sequential;
+    agent.cwd = workspace.path().to_path_buf();
+    agent.set_runtime(runtime);
+    agent
+        .enable_read_only_codemode(Arc::new(CountedReadOnlyFixtureHost(calls.clone())))
+        .unwrap();
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(crate::permission::PermissionRule::parameter(
+            "read",
+            "path",
+            "input.txt",
+        ));
+    let denied = agent.execute_tool_batch(workspace.path(), request(), &mut Vec::new());
+    assert_eq!(denied[0].is_error, Some(true));
+    agent.permissions.lock().unwrap().deny.clear();
+    let replay = agent.execute_tool_batch(workspace.path(), request(), &mut Vec::new());
+    assert_eq!(replay[0].is_error, Some(false), "{replay:?}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(journal.snapshot().unwrap().operations.len(), 3);
 }
 
 #[test]
@@ -427,16 +535,15 @@ fn codemode_failure_facts_survive_presentation_hooks() {
     })));
     let result = agent.finalize_tool_result(workspace.path(), "parent", "codemode", &json!({}), crate::ToolResult {
         content: "private child text".into(), is_error: true,
-        details: Some(json!({"codemode":{"status":"recoveryRequired","scriptCompleted":false,"operationRef":"parent-op","children":[{"requestId":1,"ordinal":1,"tool":"write","operationRef":"child-op","status":"recoveryRequired","error":{"message":"private child text"}}]}})),
+        details: Some(json!({"_codemode_authority":"host-binding","codemode":{"status":"recoveryRequired","scriptCompleted":false,"operationRef":"parent-op","children":[{"requestId":1,"ordinal":1,"tool":"write","operationRef":"child-op","status":"recoveryRequired","error":{"message":"private child text"}}]}})),
     });
     assert!(result.is_error);
     assert!(result.content.contains("recoveryRequired"));
     assert!(result.content.contains("child-op"));
     assert!(!result.content.contains("private child text"));
-    assert_eq!(
-        result.details.unwrap()["codemode_facts"]["operationRef"],
-        "parent-op"
-    );
+    let details = result.details.unwrap();
+    assert_eq!(details["_codemode_authority"], "host-binding");
+    assert_eq!(details["codemode_facts"]["operationRef"], "parent-op");
 }
 
 #[test]
