@@ -7,7 +7,7 @@
 
 **DaVinci is a native Rust AI coding-agent harness for the terminal.**
 
-> **Terminal rebuild branch:** see the [implementation and review guide](docs/ui/terminal-rebuild.md) for the new shell, settings/model selectors, optional graph input, rendered previews and verification limitations.
+> **Current terminal:** see the [implementation and review guide](docs/ui/terminal-rebuild.md) for the default shell, settings/model selectors, optional graph view, rendered previews, and verification limitations.
 
 It combines an interactive coding assistant, multi-provider model runtime, permission system, persistent sessions, engineering intelligence, multi-agent orchestration, deterministic verification, security analysis, memory and learning, MCP, extensions, and optional local voice input in one CLI.
 
@@ -15,7 +15,10 @@ DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github
 
 > **Workspace version:** 1.0.71
 > **Rust toolchain:** 1.83.0  
-> **Primary executable:** davinci
+> **Primary executable:** `davinci`  
+> **Documentation baseline:** `main` at [`0a57e476`](https://github.com/J12003LPZ/davinci/commit/0a57e476c2088250299438c91d582571614f0687), including merged [PR #88](https://github.com/J12003LPZ/davinci/pull/88)
+
+The version string alone does not identify the installed source: different commits can report **1.0.71**. Features described here require a binary built from the corresponding source. Rebuild and restart after updating; use `/doctor` to inspect the actual installation identity.
 
 ---
 
@@ -25,6 +28,7 @@ DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Models and authentication](#models-and-authentication)
+- [Command reference](#command-reference)
 - [Permissions and project trust](#permissions-and-project-trust)
 - [Execution modes](#execution-modes)
 - [Major capabilities](#major-capabilities)
@@ -37,6 +41,7 @@ DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github
 - [Development](#development)
 - [Documentation](#documentation)
 - [Compatibility](#compatibility)
+- [Troubleshooting and limitations](#troubleshooting-and-limitations)
 - [Security notes](#security-notes)
 - [License](#license)
 
@@ -72,7 +77,7 @@ At a high level, DaVinci can:
 | --print / -p | Run one prompt non-interactively and exit |
 | --mode json | Stream newline-delimited machine-readable events |
 | --mode rpc | JSON-RPC over stdio for embedding and integrations |
-| davinci server / client | Experimental typed client/server transport |
+| davinci server / client | Experimental Unix transport; requires an `experimental-ipc` build |
 | Rust library | Programmatic embedding through davinci-coding-agent |
 | MCP | Native MCP client |
 | JavaScript extensions | Optional Node-hosted compatibility/extension layer |
@@ -107,9 +112,9 @@ git clone https://github.com/J12003LPZ/davinci.git
 cd davinci
 ~~~
 
-### 2. Install the core CLI
+### 2. Build or install the core CLI from source
 
-If you only want the davinci executable:
+For a development/source installation of only the `davinci` executable:
 
 ~~~bash
 cargo install --path crates/davinci-coding-agent --locked --force
@@ -129,9 +134,19 @@ cargo build --release -p davinci-coding-agent --locked
 .\target\release\davinci.exe --version
 ~~~
 
-### 3. Install DaVinci with local voice support
+A direct Cargo build/install does not produce the CI-backed installation identity used by the release scripts. Keep the checkout commit with your test results; do not describe a source build as a verified release.
 
-The repository install scripts build both davinci and the matching davinci-voice-worker.
+### 3. Verified installation with local voice support
+
+The repository install scripts build both `davinci` and the matching `davinci-voice-worker`, then install both with identity sidecars. They are **release-gated**, not a shortcut for installing any arbitrary `main` checkout.
+
+In addition to Rust and voice build dependencies, they require Python 3 and an authenticated GitHub CLI (`gh`). Before building they verify:
+
+- a clean, committed checkout;
+- the exact product-version tag (`v<workspace-version>`) points at that commit;
+- completed green full CI and workflow-lint evidence for that exact commit.
+
+Fetch tags and select the intended tagged checkout before running them. A missing tag, dirty checkout, missing GitHub access, or non-green/missing CI makes preflight fail. See [release identity enforcement](scripts/release_identity.py) and [release discipline](docs/readiness/release-discipline.md).
 
 Linux/macOS:
 
@@ -168,9 +183,19 @@ davinci --version
 davinci --help
 ~~~
 
+Inside the TUI, run `/doctor` and `/status`. Check which binary your shell resolves with `command -v davinci` on Linux/macOS or `Get-Command davinci` in PowerShell.
+
+### Update an existing installation
+
+For a source checkout, preserve local changes, update with `git pull --ff-only`, then repeat the appropriate build/install path above and restart. A release-script installation must still satisfy the tag and CI gates.
+
+`davinci update` updates extension packages by default. `davinci update --models` refreshes model catalogs. **`davinci update self` is currently unsupported** and does not rebuild this Rust CLI; see [package dispatch](crates/davinci-coding-agent/src/packages.rs).
+
 ---
 
 ## Quick start
+
+For ChatGPT subscription use, complete [the OpenAI Codex login](#chatgpt-subscription-openai-codex) first. Use a model that your account actually offers.
 
 Start the interactive TUI in the current repository:
 
@@ -199,7 +224,7 @@ davinci @README.md @screenshot.png "Review these."
 Choose a provider/model:
 
 ~~~bash
-davinci --model openai/gpt-4o "Review this repository."
+davinci --model openai-codex/gpt-6-astra "Review this repository."
 ~~~
 
 Set a reasoning level:
@@ -208,11 +233,13 @@ Set a reasoning level:
 davinci --thinking high "Investigate this bug."
 ~~~
 
-Run with a restricted tool surface:
+Run a read-only review with a restricted tool surface:
 
 ~~~bash
-davinci --tools read,grep,find,ls -p "Review the code without changing anything."
+davinci --permission-mode plan-mode --tools read,grep,find,ls -p "Review the code without changing anything."
 ~~~
+
+A tool allowlist controls exposure; the permission mode supplies the read-only policy.
 
 Continue or resume work:
 
@@ -259,65 +286,227 @@ JSON-RPC over stdio:
 davinci --mode rpc
 ~~~
 
-Disable supported startup network work:
+Offline harness smoke test:
 
 ~~~bash
-davinci --offline
+davinci --offline --no-mcp --no-extensions -p "Check the terminal path."
 ~~~
+
+**Offline is a fixture path, not local-model inference.** In the ordinary agent loop, `--offline` (or `PI_OFFLINE=1`) replaces the live provider response with a deterministic stub such as `(offline) received 24 characters`. It also disables supported startup network work. It cannot validate login, model reasoning, live provider behavior, or real task completion, and it is not an OS network sandbox. See [provider dispatch and offline stub](crates/davinci-coding-agent/src/main.rs).
 
 ---
 
 ## Models and authentication
 
-DaVinci ships a compiled model/provider catalog and native request/streaming support for multiple provider protocols.
+### ChatGPT subscription (`openai-codex`)
 
-Examples:
+This is the repository's primary workflow. **A ChatGPT subscription login and an OpenAI API key are different authentication routes.**
+
+1. Start `davinci`.
+2. Enter `/login openai-codex`.
+3. Follow the printed authorization URL and choose **Continue with ChatGPT**. The interactive flow waits up to five minutes for a callback on `http://127.0.0.1:1455/auth/callback`, on the machine running DaVinci.
+4. Wait for the credential-stored confirmation. Merely opening the URL is not a successful login.
+5. Use `/model` to choose an available `openai-codex` model, or specify one explicitly on the next launch.
 
 ~~~bash
-davinci --list-models
-davinci --list-models claude
+davinci --list-models openai-codex
+davinci --provider openai-codex --model gpt-6-astra --thinking high
+davinci auth check --provider openai-codex --json --no-refresh
+~~~
+
+The model above is in the source catalog; catalog presence does not guarantee account access. `/model` and `davinci --list-models` show the catalog visible to your installation. Refresh with `davinci update --models` when needed.
+
+Current `main` uses DaVinci's Sign in with ChatGPT flow, validates the issued registration and identity, and requires the `chatgpt.tokens.use.direct` scope. Its `openai-codex` catalog targets `https://api.openai.com/v1` using the subscription OAuth credential. The endpoint name does not make this an API-key workflow. The implementation is in [openai_siwc.rs](crates/davinci-ai/src/openai_siwc.rs), [OAuth providers](crates/davinci-ai/src/oauth_providers.rs), and [login dispatch](crates/davinci-coding-agent/src/main.rs).
+
+Important boundaries:
+
+- No `OPENAI_API_KEY` is required for `openai-codex`; API keys are explicitly rejected for this provider.
+- Legacy Codex tokens or copied credentials are not a substitute for the verified DaVinci login. Older saved credentials may require signing in again.
+- Do not change to `--provider openai` as a login workaround unless you intentionally want the separate API-key route.
+- Browser/account/backend support is required. Source code and offline tests do not establish a successful live authorization or a working subscription entitlement.
+- A browser on another machine cannot reach the running CLI's loopback callback directly. If the flow reports a callback or registration error, preserve the non-secret error and retry the supported login on the same machine. Do not paste credentials or authorization URLs into issues.
+- `auth check` checks credential readiness, not a live model completion. It refreshes expired OAuth credentials unless `--no-refresh` is supplied.
+
+### Other providers and API-key use
+
+The compiled catalog includes OpenAI API, Anthropic, Google, Azure OpenAI, Amazon Bedrock, GitHub Copilot, OpenRouter, and other providers. Protocol support, available models, credentials, and service terms differ by provider; use the [catalog](crates/davinci-ai/src/catalog.rs) and `davinci --help` for the current list.
+
+For intentional API-key use:
+
+~~~bash
 davinci --provider openai --model gpt-4o
 davinci --model anthropic/claude-sonnet-4
 ~~~
 
-Supported reasoning-level names are:
+Supply the selected provider's credential through its environment variable or supported login flow. Common variables include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, and `CEREBRAS_API_KEY`. Bedrock supports its configured AWS credentials/profile. Avoid putting secrets in command-line arguments or committed settings.
 
-~~~text
-off
-minimal
-low
-medium
-high
-xhigh
-max
+A local llama.cpp server can be configured with `/login llama.cpp http://127.0.0.1:8080` or `LLAMA_BASE_URL`. This still requires an actual running model server; `--offline` does not start one or run inference.
+
+Credentials saved by login live in `auth.json` under the [resolved agent directory](#user-directory-resolution). `/logout <provider>` removes stored authentication; it does not unset shell environment variables or remove credentials configured in `models.json`.
+
+### Models, reasoning, speed, and usage
+
+~~~bash
+davinci --list-models
+davinci --list-models claude
+davinci --model openai-codex/gpt-6-astra:high
 ~~~
 
-The effective levels depend on the selected provider and model.
+Reasoning levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; support and mapping depend on the model. Use `/thinking <level>` or its alias `/effort <level>` interactively.
 
-### Credentials
+`/fast` toggles Fast/Standard for OpenAI Codex while keeping the selected model and reasoning level. It requests a service tier, not a guaranteed latency result. Availability depends on the model/backend/account; Fast may consume subscription limits faster. See [configuration](#useful-environment-variables).
 
-DaVinci can use provider API keys from environment variables and supports OAuth/authentication flows for providers that implement them.
+Use `/status`, `/cost`, and `/context` to inspect session state and usage. USD estimates and cached-token counts do not measure remaining included subscription allowance. Missing usage is unknown, not zero. See [subscription efficiency](docs/openai-efficiency.md).
 
-Common variables include:
+### Credential command safety
 
-~~~text
-ANTHROPIC_API_KEY
-OPENAI_API_KEY
-GEMINI_API_KEY
-OPENROUTER_API_KEY
-XAI_API_KEY
-MISTRAL_API_KEY
-GROQ_API_KEY
-CEREBRAS_API_KEY
-AWS_PROFILE
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-AWS_REGION
+~~~bash
+davinci auth help
+davinci auth check --provider openai-codex --json
 ~~~
 
-Run davinci --help for the current complete provider/environment list.
+`auth print-api-key`, `auth print-bearer-token`, and `auth check --credentials` deliberately print secrets. Use them only for a deliberate private integration; never include their output in screenshots, logs, bug reports, or chat. They are unnecessary for ordinary DaVinci use.
 
-When an interactive authentication flow stores credentials, they are written under the resolved DaVinci agent directory.
+---
+
+## Command reference
+
+Shell commands below run in your terminal. Slash commands run inside the DaVinci composer. Extension, skill, and prompt-template commands depend on what is installed and trusted.
+
+For your actual binary, start with `davinci --help`, `davinci plugin help`, `davinci auth help`, and interactive `/help` / `/hotkeys`. The reference below is checked against [argument parsing](crates/davinci-coding-agent/src/args.rs), [CLI help](crates/davinci-coding-agent/src/help.txt), [built-in slash commands](crates/davinci-coding-agent/src/slash.rs), and [native commands](crates/davinci-coding-agent/src/native_extensions/mod.rs). Maintenance and feature-gated commands have their own parsers.
+
+### CLI options
+
+| Area | Options | What to know |
+| --- | --- | --- |
+| Model | `--provider <name>`, `--model <id-or-pattern>`, `--thinking <level>` | Model accepts `provider/id` and an optional `:thinking` suffix. |
+| Model cycling | `--models <patterns>` | Comma-separated model patterns. |
+| API credentials | `--api-key <key>` | For supported API routes, not `openai-codex`; prefer a private environment variable. |
+| Prompts | `--system-prompt <text>`, `--append-system-prompt <text-or-file>`, `--prompt-profile stable` | Append is repeatable; profiles also include `preview` and `legacy-v1`. |
+| Input | `@file`, `@image`, `--` | Attach files to the initial message; `--` ends option parsing. RPC rejects CLI file attachments. |
+| Output | `--print` / `-p`, `--mode text`, `--mode json`, `--mode rpc` | JSON streams events; RPC uses stdio. |
+| Final output | `--output-last-message <file>` / `-o`, `--output-schema <file>` | Non-interactive runs only; see [quick start](#quick-start) for schema limits and path rules. |
+| Directory | `--cd <dir>` / `-C`, `--add-dir <dir>` | Extra writable directories must already exist; `--add-dir` is repeatable and does not override denials or worker isolation. |
+| Approval | `--permission-mode <mode>`, `--sandbox <preset>` | Approval presets; separate from OS isolation. |
+| OS isolation | `--execution-sandbox <mode>` | `none`, `restricted`, `workspace-write`, `full-access`; see [permissions](#permissions-and-project-trust). |
+| Non-interactive approval | `--approval-policy abort`, `--approval-policy deny-continue`, `--fail-on-denied` | Does not grant permission; details below. |
+| Budget | `--root-budget <file>` | Durable shared request/time admission budget; [configuration contract](docs/readiness/openai-harness-implementation.md#budget-operation). Subscription budgets do not claim an API-dollar limit. |
+| Sessions | `--continue` / `-c`, `--resume` / `-r`, `--session <path-or-id>`, `--session-id <id>`, `--fork <path-or-id>` | Continue latest, choose, address, or fork a session. |
+| Session storage | `--session-dir <dir>`, `--no-session`, `--name <name>` / `-n` | Override location, avoid conversation persistence, or name a session. |
+| Tool selection | `--tools <names>` / `-t`, `--exclude-tools <names>` / `-xt` | Comma-separated allow/deny lists. |
+| Disable tools | `--no-tools` / `-nt`, `--no-builtin-tools` / `-nbt` | All tools off by default, or built-ins off while retaining custom tools. |
+| Extensions/MCP | `--extension <path>` / `-e`, `--no-extensions` / `-ne`, `--no-mcp` | Disabling JS discovery does not disable native Rust intelligence. |
+| Skills/prompts | `--skill <path>`, `--prompt-template <path>`, `--no-skills` / `-ns`, `--no-prompt-templates` / `-np` | Explicit file/directory options are repeatable. |
+| Themes | `--theme <path>`, `--use-theme <name[/name]>`, `--no-themes` | Load a theme resource versus select an initial theme. |
+| Project trust | `--approve` / `-a`, `--no-approve` / `-na`, `--no-context-files` / `-nc` | Trust/ignore project resources for this run; context discovery is separately switchable. |
+| Terminal | `--tui-mode regular`, `--tui-mode fullscreen`, `--legacy-tui`, `--verbose` | Terminal mode, previous chrome, or verbose startup. |
+| Utilities | `--export <session-file>`, `--list-models [query]`, `--offline`, `--help` / `-h`, `--version` / `-v` | Offline runs use the deterministic fixture response, not real inference. |
+
+### Non-interactive approvals and exit status
+
+Print/JSON runs cannot answer an interactive approval dialog. The default `--approval-policy abort` reports `approval_required` and exits **1** when an action needs approval. `deny-continue` returns the denial to the model and continues; repeated denials of the same action are bounded. Add `--fail-on-denied` to make an otherwise successful run with denied actions exit **3**.
+
+~~~bash
+davinci --permission-mode plan-mode --approval-policy deny-continue --fail-on-denied \
+  --mode json -p "Inspect this repository and report what you can verify."
+~~~
+
+A final assistant reply is not proof that every requested action ran. Check the exit status, denial events, and actual verification evidence. Model/provider/output-validation failures can also exit **1**. Runtime inspection has its own exit-code meaning described below.
+
+### Shell subcommands
+
+| Command | Purpose / caveat |
+| --- | --- |
+| `davinci install <source> [-l]` | Install an extension package and record it in settings; `-l` selects project-local scope. |
+| `davinci remove <source> [-l]` | Remove an extension package; `uninstall` is an alias. |
+| `davinci list`, `davinci config [-l]` | List configured extensions or choose enabled package resources. |
+| `davinci update [source]` | Update extension packages, optionally one source. |
+| `davinci update --models [provider]` | Refresh model catalogs. |
+| `davinci update --extensions`, `davinci update --all` | Update extensions; `--all` updates models and extensions, not the Rust executable. |
+| `davinci update self` | Currently returns an unsupported-self-update error; rebuild from source instead. |
+| `davinci plugin help` | Plugin/marketplace operations listed below. |
+| `davinci auth check --provider <provider> [--json] [--no-refresh]` | Check credential readiness without printing secrets. |
+| `davinci voice status`, `davinci voice devices`, `davinci voice model list` | Inspect local voice prerequisites/devices/models. |
+| `davinci voice model install <tiny\|base\|small>` | Download an approved voice model. |
+| `davinci voice model import <id> <path>` | Verify and import an existing local model. |
+| `davinci inspect run <uuid> [--json]` | Read runtime evidence for a run. |
+| `davinci inspect operation <uuid> [--json]` | Read one operation's evidence. |
+| `davinci inspect session <id> [--json]` | Read session runtime evidence. |
+| `davinci doctor runtime [--json]` | Read-only runtime health/evidence inspection; distinct from TUI `/doctor`. |
+| `davinci design ...`, `davinci design-sync ...` | Experimental design artifacts; put global flags before the command and read [setup/limits](docs/design-artifacts.md). |
+| `davinci server --listen unix:///path`, `davinci client --connect unix:///path` | Experimental Unix-only IPC; compile with `--features experimental-ipc`. Not enabled in the default build. |
+
+The [runtime inspector](crates/davinci-coding-agent/src/runtime_inspect.rs) is read-only. Exit **3** means unavailable or inconsistent evidence, including invalid inspection input; it is not permission to delete journals or retry a possibly completed mutation. Follow the [recovery playbook](docs/runtime/recovery-playbook.md).
+
+### Interactive slash commands
+
+| Command | Purpose |
+| --- | --- |
+| `/help`, `/hotkeys` | Discover commands and the active keyboard bindings. |
+| `/init [focus]` | Ask the agent to inspect the project and create/update `AGENTS.md`; normal model, tool, and permission rules apply. |
+| `/setup check` | Check workspace setup without applying the setup changes. |
+| `/setup`, `/setup trust` | Apply workspace setup or explicitly trust project resources. Setup can update `.gitignore`, memory/index state, and local service/model setup; review the output first. |
+| `/settings`, `/config` | Open the settings panel. |
+| `/model [provider/model]` | Open model selection or switch directly. |
+| `/thinking <level>`, `/effort <level>` | Select reasoning effort. |
+| `/fast` | Toggle requested Fast/Standard speed for OpenAI Codex. |
+| `/login [provider]`, `/logout [provider]` | Choose/configure or remove stored provider authentication. |
+| `/permissions [mode]` | Inspect or change the approval policy. |
+| `/plan`, `/plan show`, `/plan diff` | Enter read-only planning or inspect its revisions. |
+| `/plan edit <id> <text>`, `/plan accept <id>`, `/plan reject <id>` | Edit/accept/reject plan decisions; `all` selects all decisions. |
+| `/plan approve`, `/plan accept [mode]`, `/act` | Approve a complete plan, approve and choose execution mode, or leave planning without implicit approval. |
+| `/new`, `/resume`, `/name <name>` | Start, switch, or name sessions. |
+| `/tree`, `/fork`, `/clone` | Navigate branches, fork from an earlier prompt, or duplicate the current position. |
+| `/rewind` | Restore code, conversation, or both from a recent prompt; inspect the proposed restore before accepting. |
+| `/compact [instructions]` | Manually compact context. |
+| `/context [inspect]` | Inspect usage or the prepared-context manifest. |
+| `/export [path]`, `/import <path>` | Export HTML/JSONL or import/resume JSONL. |
+| `/share` | Upload a session as a secret GitHub gist. Review/redact first: a secret gist is accessible to anyone with its URL. |
+| `/copy` | Copy the latest assistant reply. |
+| `/reload` | Reload keybindings, extensions, skills, prompts, themes, and context files. |
+| `/mcp`, `/status`, `/doctor`, `/cost` | Inspect connected services, session state, setup/install identity, and usage. |
+| `/sandbox-status` | Inspect execution-isolation policy and evidence. |
+| `/agents [msg <name> <text>\|stop <name>]`, `/tasks` | Inspect profiles/live teams, message/stop a worker, or inspect task state. |
+| `/workflow [status <id>\|cancel <id>]` | Inspect workflow runs; available when dynamic workflows are enabled. |
+| `/graph [goal]` | Start a graph for a goal or inspect the current run. Also supports `save <name>`, `run <name>`, `--simple`, `--complex`, and `--dry-run`; consult the live graph controls for run-specific actions. |
+| `/security-scan [path] [--changed\|--diff base..head] [--mode quick\|standard\|deep]` | Start/inspect/resume security analysis; `--new`, `--report`, `--finding <id>`, and `--format terminal\|json\|sarif` are also supported. |
+| `/memory-search <query>`, `/memory-page [--no-open] [query]` | Search durable local memory or inspect it in a generated page. |
+| `/memory-reindex`, `/memory-clear` | Rebuild memory indexing/embeddings or clear local records; the latter is destructive. |
+| `/governor-reset` | Reset the session's Token Governor state. |
+| `/learning-pending`, `/learning-approve <id\|all>`, `/learning-reject <id\|all> [reason]` | Review and accept/reject learned skill candidates. |
+| `/skill-list [query]`, `/skill-view <name> [file]` | Find or read reusable skills. |
+| `/plugin ...` | The plugin operations below, inside the TUI. |
+| `/design ...`, `/design-sync ...` | Feature-gated [design artifact operations](docs/design-artifacts.md#commands-and-controls). |
+| `/quit` | Exit; `/exit` and `/q` are aliases. |
+
+`/sessions` and `/session` are compatibility aliases for `/resume`; `/session info` and `/session stats` inspect the session. `/workflows` and `/plugins` are also accepted aliases. Native service diagnostics are consolidated in `/status`; older commands such as `/cache-status`, `/lsp-status`, `/repo-index-status`, `/memory-status`, and `/governor-status` remain internal/compatibility entry points rather than the public command-menu inventory.
+
+Keyboard bindings can be customized. In the default model picker, Enter persists the default and `s` selects for the current session only. Shift+Tab cycles permission modes at the idle composer. Use `/hotkeys` rather than assuming shortcuts are identical across the default and legacy TUIs.
+
+### Plugin commands
+
+These work as `davinci plugin ...` in the shell or `/plugin ...` in the TUI:
+
+~~~text
+list
+browse [query]
+install <name>[@marketplace]
+import [claude|codex] [<key>|--all]
+info <plugin>
+approve <plugin>
+revoke <plugin>
+test <plugin>
+enable <plugin>
+disable <plugin>
+update <plugin>
+uninstall <plugin>
+marketplace add <owner/repo|git-url|directory>
+marketplace list
+marketplace update [name]
+marketplace remove <name>
+~~~
+
+A bare `plugin import` lists candidates; an explicit key or `--all` adopts them. Installing/enabling a plugin is separate from approving its executable hooks. `approve` allows the listed hooks, `revoke` withdraws that approval, and `test` executes approved SessionStart hooks once. Changes apply after `/reload` or in a new session. Read [plugin behavior and limitations](docs/plugins.md) before importing third-party code.
 
 ---
 
@@ -351,7 +540,18 @@ davinci --sandbox workspace-write
 davinci --sandbox full-access
 ~~~
 
-These are **application policy presets, not an operating-system sandbox**.
+These are **application policy presets, not an operating-system sandbox**. OS execution policy is configured separately:
+
+~~~bash
+davinci --permission-mode manual --execution-sandbox restricted
+davinci --permission-mode manual --execution-sandbox workspace-write
+~~~
+
+`restricted` requests read-only execution; `workspace-write` requests workspace writes with protected control paths and network denied by default. `none` means **no subprocess execution**, not “turn off isolation”; `full-access` is an explicit host escape hatch and makes no filesystem/network isolation claim.
+
+Without an explicit execution policy, Auto attempts a bounded native capability probe and activates workspace-write isolation with network denied when supported. Current Auto-default activation requires usable Linux bubblewrap; native Windows should use an appropriately configured WSL2 environment for this path. Unsupported systems can retain approval policy without active isolation. Earlier unowned JS/MCP execution can prevent later activation, so start directly in Auto when that boundary is required.
+
+Always inspect `/sandbox-status` and `/status` instead of assuming confinement. Approval does not widen an active sandbox. See [sandbox modes, platform coverage, and limitations](docs/sandbox.md).
 
 ### Project trust
 
@@ -386,11 +586,11 @@ Bounded isolated workers for delegated research or implementation. Workers use a
 
 ### Agent teams
 
-Persistent collaborating agents with typed mailboxes, task tracking, atomic task claims, and event-driven coordination.
+Persistent collaborating agents with typed mailboxes, task tracking, atomic task claims, and event-driven coordination. Opt in with `"agentTeams": true` in user settings or the corresponding `/settings` control; the default is off.
 
 ### Workflows
 
-Repeatable DAG-based orchestration for structured multi-phase work. Workflows support bounded state, artifact handoff, retries, and fan-out/fan-in join policies.
+Repeatable DAG-based orchestration for structured multi-phase work. Workflows support bounded state, artifact handoff, retries, and fan-out/fan-in join policies. Opt in with `"dynamicWorkflows": true`; the default is off. See [subagents, teams, and workflow controls](docs/agent-teams.md), including how to prohibit delegation.
 
 ### Graph engineering
 
@@ -590,11 +790,17 @@ See [Security scan](docs/security-scan.md).
 
 TypeSafe / Jev is an optional provider-neutral decision-observation layer.
 
-The current Phase 1 implementation is shadow-only: validated observations and telemetry may be collected, but they do not weaken or replace deterministic routing, permissions, verification, security, or workspace boundaries.
+Its optional observations/advice do not replace deterministic permissions, verification, security, or workspace boundaries. Individual advice features have separate configuration and readiness constraints; consult the current guide before enabling them.
 
 It is disabled by default.
 
 See [Decision intelligence](docs/decision-intelligence.md).
+
+### Design artifacts (experimental)
+
+`/design` manages session-owned UI concepts, revisions, evidence, exports, and reviewed implementation proposals. It is disabled by default. Generation requires an explicitly enabled feature, a selected `openai-codex` subscription/model/effort, and an existing root-budget configuration. The browser companion additionally needs a separately prepared pinned Node/Chromium runtime; native generated-content rendering currently fails closed on Windows. No automatic API-key fallback or package installation occurs.
+
+Start with [design setup, commands, and limitations](docs/design-artifacts.md) and [readiness](docs/readiness/design-artifacts.md), not an ordinary `/design new` invocation without prerequisites.
 
 ### Browser and interaction tooling
 
@@ -641,7 +847,7 @@ If an existing legacy Pi directory is present, DaVinci can continue using:
 ~/.pi/agent/
 ~~~
 
-Session history is JSONL-compatible. An optional SQLite layer provides derived indexing and branch/fact cache state.
+Session history is JSONL-compatible. An optional SQLite layer provides derived indexing and branch/fact cache state. `--no-session` disables conversation persistence, not every cache, credential, diagnostic, or external-service side effect. Review exports before sharing; they may contain repository content and tool output.
 
 Export a session to standalone HTML:
 
@@ -663,7 +869,7 @@ DaVinci resolves its user agent directory in this order:
 4. existing legacy ~/.pi/agent
 5. otherwise ~/.davinci/agent
 
-Session-directory overrides use the same DaVinci-first, Pi-compatible policy.
+Session lookup/storage precedence is `--session-dir`, then `DAVINCI_CODING_AGENT_SESSION_DIR` (legacy `PI_CODING_AGENT_SESSION_DIR`), then `settings.json`'s `sessionDir`, then `<agent-dir>/sessions`. Sessions are grouped by encoded working directory, so `--cd` affects which sessions you find. See [path resolution](crates/davinci-session/src/discovery.rs).
 
 ### Common user files
 
@@ -689,7 +895,27 @@ Not every installation will contain every path.
 
 ### Project configuration
 
-Project-local resources are supported under DaVinci/Pi-compatible project directories and are subject to project trust. Depending on the subsystem, project resources may contain settings, graph/workflow configuration, skills, memory, and other scoped state.
+User settings live at `<agent-dir>/settings.json`. Project files resolve from `.davinci/<name>` first, then legacy `.pi/<name>`, per file. Directory resources such as skills, prompts, agents, and extensions can be merged from both locations. Trusted project settings overlay user settings subject to field-specific restrictions; project data cannot grant itself trust or widen the execution sandbox.
+
+A minimal user-level subscription configuration:
+
+~~~json
+{
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-6-astra",
+  "defaultThinkingLevel": "high",
+  "serviceTier": "standard",
+  "effortPolicy": "fixed",
+  "toolSurface": "full",
+  "autoVerify": true,
+  "agentTeams": false,
+  "dynamicWorkflows": false
+}
+~~~
+
+Select a model available to your account; these are example choices, not mandatory defaults. Merge fields into existing settings rather than replacing unrelated configuration. Keep authentication in the private credential store/environment, not this example. `/settings` exposes common options; restart after manually editing startup-only settings.
+
+Other resources include `models.json` for custom model/provider configuration, `mcp.json` for server connections, `keybindings.json`, `hooks.json`, and resource directories. Inspect [settings fields](crates/davinci-coding-agent/src/settings.rs) and [project resolution](crates/davinci-coding-agent/src/project_config.rs) for exact behavior.
 
 ### Useful environment variables
 
@@ -740,7 +966,7 @@ PI_OFFLINE
 PI_NODE
 ~~~
 
-Provider-specific credentials use the provider's normal environment variables.
+Provider-specific credentials use the provider's normal environment variables. Additional opt-ins include `DAVINCI_EXPERIMENTAL_AGENT_TEAMS`, `DAVINCI_EXPERIMENTAL_WORKFLOWS`, `DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS`, and `DAVINCI_PLUGINS=off` to disable plugin loading. `DAVINCI_MCP_CONFIG` (legacy `PI_MCP_CONFIG`) selects an explicit MCP configuration file.
 
 ---
 
@@ -779,9 +1005,9 @@ User MCP configuration is loaded from the resolved agent directory, normally:
 ~/.davinci/agent/mcp.json
 ~~~
 
-Project-local MCP/configuration is subject to trust and permission policy.
+Enabled plugin servers form the base layer, user entries override matching names, and trusted project `.davinci/mcp.json` (or legacy `.pi/mcp.json`) entries override those. An explicit `DAVINCI_MCP_CONFIG` / `PI_MCP_CONFIG` file replaces that discovery path.
 
-See [davinci-mcp](crates/davinci-mcp).
+Use `/mcp` for connection/tool errors and `--no-mcp` to skip all MCP connections for a run. Local MCP processes may execute third-party code; project trust, permissions, and active sandbox policy matter. See [MCP loader](crates/davinci-coding-agent/src/mcp.rs), [davinci-mcp](crates/davinci-mcp), and [sandbox service boundaries](docs/sandbox.md).
 
 ---
 
@@ -846,6 +1072,7 @@ Primary crate responsibilities:
 | davinci-client | Client transport and handshake |
 | davinci-server | Background session/controller server |
 | davinci-telemetry | Runtime telemetry contracts |
+| davinci-sys | Shared filesystem/platform primitives |
 | davinci-evals | Behavioral and engineering evaluation harnesses |
 
 For entry points and control flow, start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -895,7 +1122,7 @@ cargo build --release -p davinci-coding-agent --locked
 All active workspace crates:
 
 ~~~bash
-cargo test --workspace
+cargo test --workspace --locked
 ~~~
 
 Static checks:
@@ -940,7 +1167,16 @@ cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
 cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
 ~~~
 
-Some tests intentionally require external software, a browser, language server, audio stack, or live provider credentials. Offline fixture tests do not prove those external integrations.
+Some tests intentionally require external software, a browser, language server, audio stack, or live provider credentials. Offline fixture tests do not prove those external integrations. Read [AGENTS.md](AGENTS.md) before contributing; use focused checks for small changes and the relevant CI gates for shared runtime contracts. The commands here describe how to validate a checkout, not a claim that every listed test passed for the reader's installation.
+
+Useful starting points:
+
+- [CI workflow and exact job commands](.github/workflows/ci.yml)
+- [Behavioral evaluation and live/offline distinction](docs/behavioral-evals.md)
+- [Production-readiness evidence and remaining gates](docs/readiness/README.md)
+- [Runtime recovery and safe retry](docs/runtime/recovery-playbook.md)
+
+Live model evaluations consume account usage. Run them only with an explicit provider, scope, and budget; do not treat an offline fixture pass as a measured subscription saving.
 
 ---
 
@@ -951,6 +1187,13 @@ Start here:
 - [Architecture and navigation](docs/ARCHITECTURE.md)
 - [Documentation index](docs/README.md)
 - [Runtime orchestration](docs/runtime-orchestration.md)
+- [Subagents, teams, and workflow controls](docs/agent-teams.md)
+- [Permissions and planning](docs/permission-modes.md)
+- [Execution sandbox](docs/sandbox.md)
+- [Plugins and marketplaces](docs/plugins.md)
+- [Design artifacts](docs/design-artifacts.md)
+- [Session diagnostics](docs/session-diagnostics.md)
+- [OpenAI subscription efficiency](docs/openai-efficiency.md)
 - [Context VM](docs/context-vm.md)
 - [Closed ecosystem integration](docs/ecosystem.md)
 - [Repository intelligence](docs/repo-intelligence.md)
@@ -994,18 +1237,51 @@ Existing legacy state does not need to be migrated immediately.
 
 ---
 
+## Troubleshooting and limitations
+
+| Symptom | Check / next step |
+| --- | --- |
+| A new command is missing although `--version` says 1.0.71 | Check the PATH-resolved executable and `/doctor` installation identity. Compare its source commit with this README baseline; rebuild/restart from the intended source. |
+| Release installation fails before compilation | Read the preflight error. Check a clean checkout, exact version tag, Python, authenticated `gh`, and completed green CI/lint for that commit. A development build and a verified release have different provenance. |
+| `davinci update self` fails | This Rust product has no self-update package. Use the source or release installation workflow. |
+| `openai-codex` reports no usable credential | Run `/login openai-codex` in the new binary and wait for a stored-login confirmation. Legacy tokens and API keys are not accepted substitutes. |
+| Browser login returns an OAuth/registration/callback error | Confirm the browser and CLI can share the loopback callback, port 1455 is available, and the system clock is correct. Preserve the non-secret error. Do not treat a printed URL or `auth check` alone as a live completion test. |
+| An API-key prompt appears during intended subscription use | Check `/status` and select provider `openai-codex`. Provider `openai` is a separate API-key route. Do not purchase/use API access merely to mask a subscription-login failure. |
+| Model unavailable or missing from selection | Check `--list-models`, refresh with `update --models`, and confirm account entitlement. A catalog entry or cached Codex model name does not prove access. |
+| `(offline) received ... characters` | Expected fixture response. Remove `--offline` and unset `PI_OFFLINE` for real provider inference. |
+| Print/JSON stops for approval | Inspect `approval_required` and the chosen policy. Use an appropriate authorized mode, or `deny-continue` when partial read-only results are acceptable; do not assume the blocked action completed. |
+| A shell command is denied after approval | An explicit denial or OS boundary can still block it. Inspect `/sandbox-status`; permission approval does not expand isolation. |
+| A project setting, skill, hook, or server is missing | Check the working directory, trust choice, `.davinci`/legacy `.pi` paths, enabled plugin state, and hook approval. Use `/setup check`, `/doctor`, and `/mcp`. |
+| A language server is unavailable | Install/configure the supported local server yourself; DaVinci does not provision it automatically. See [language intelligence](docs/language-intelligence.md). |
+| Dictation is unavailable | Check `voice status`, the matching native worker, an installed/imported model, microphone permissions, and platform build dependencies. |
+| Native inspector exits 3 | Evidence is unavailable/inconsistent, not an instruction to remove it. Preserve state and follow the [recovery playbook](docs/runtime/recovery-playbook.md). |
+
+Current limits to keep in mind:
+
+- ChatGPT login, Fast support, model access, and live task completion depend on actual backend/account behavior; offline/source verification cannot certify them.
+- Agent teams, dynamic workflows, Context VM modes, design artifacts, and IPC have distinct opt-ins or build/runtime prerequisites.
+- The default and legacy TUIs have different feature coverage. Terminal previews and mockup fixtures are not live integration evidence.
+- Security reports, language diagnostics, and verification plans are advisory inputs. Actual verification commands, current workspace state, and retained evidence determine what was checked.
+- Browser, Node, language-server, voice, and OS-sandbox support vary by platform. See the individual capability/readiness guides rather than assuming uniform support.
+- There is no published prebuilt release or working Rust self-updater documented here. Rebuilding source does not automatically refresh an already running session.
+
+For a bug report, include OS/terminal, the executable path, version and source identity if known, exact non-secret command, expected/actual behavior, and the relevant redacted error. Never attach `auth.json`, bearer tokens, API keys, or complete OAuth redirect URLs.
+
+---
+
 ## Security notes
 
 DaVinci can execute model-requested shell commands and can modify files when the active permission policy allows it.
 
 Important boundaries:
 
-- approval modes are application-level policy, not an OS sandbox;
+- approval modes and OS execution isolation are separate; inspect the actual sandbox status;
 - project-local executable/configurable resources are protected by project trust;
 - credentials should never be committed to the repository;
-- language servers, MCP servers, extensions, build tools, browsers, and child processes run with the user's OS permissions unless separately sandboxed;
+- without a verified execution boundary, local services and child processes can run with the user's OS permissions; an active boundary constrains only its supported execution paths;
 - security-scan results are evidence, not a guarantee that vulnerabilities are absent;
-- use --offline when you explicitly want supported startup network operations disabled.
+- `--offline` uses fixture responses and disables supported startup network work; it is neither a local inference engine nor a complete network-isolation control;
+- review exported sessions and `/share` uploads for private code, personal information, and secrets before sharing.
 
 Review [docs/security](docs/security/) before deploying DaVinci in a sensitive environment.
 
