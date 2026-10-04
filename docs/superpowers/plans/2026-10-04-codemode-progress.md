@@ -56,3 +56,11 @@ Source inspection only so far. No test completion, package admission, platform s
 - Format and full-workspace clippy passed at that head. Windows/macOS validation remains ongoing, not assumed
 - Added an executable counted-effect/delayed/lost-response MCP transport fixture to finish the reusable C00 corpus; it invokes the actual MCP client and checks that a lost response does not automatically repeat the effect
 - C03 may proceed independently of C01/C02, as the approved plan explicitly permits. Added test-first retention cases against the existing decoder/client; production changes follow only after the expected loss-of-structured-data failures are observed
+
+## C03 production wire retention
+
+- Red evidence: [structured MCP regression job](https://github.com/J12003LPZ/davinci/actions/runs/37222884787/job/111496669159) at head `ff326c1283197ede2328110434abe24602261713`: 9 tests ran, 5 failed for missing structured/output-schema fields and 4 passed. These are expected task C03 failures, not a passing suite
+- Implemented optional typed `structured_content` / `output_schema` retention at the wire source. `CallToolResult::text()` is unchanged; private `_meta` and forged bookkeeping remain unmodeled
+- Repository-wide MCP type-reference search found no other Rust struct literals requiring new fields. Full CI remains the construction/compatibility check
+- Internal full-result accessor tests are committed first and intentionally await the new accessor; C03 is not complete until those tests and supervised-delivery characterization pass
+- Ruling disclosed before applying: focused C00 is repeated on Linux to avoid three duplicate full Rust compiles on every test-first edit. All original required CI jobs remain unchanged; package admission and final native Windows/macOS/Linux gates remain required. This changes validation scheduling, not supported platforms or feature scope

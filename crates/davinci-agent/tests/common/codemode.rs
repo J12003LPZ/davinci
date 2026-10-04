@@ -209,7 +209,9 @@ impl davinci_mcp::RpcTransport for CountedMcpFixture {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(self.delay);
                 if self.lose_response {
-                    Err(davinci_mcp::Error::Transport("fixture response lost".into()))
+                    Err(davinci_mcp::Error::Transport(
+                        "fixture response lost".into(),
+                    ))
                 } else {
                     Ok(json!({
                         "content": [{"type": "text", "text": "fixture effect recorded"}],

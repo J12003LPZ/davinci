@@ -21,7 +21,10 @@ fn retains_optional_output_schema() {
     let wire = corpus()["tool"].clone();
     let expected = wire["outputSchema"].clone();
     let tool: ToolSpec = serde_json::from_value(wire).unwrap();
-    assert_eq!(serde_json::to_value(tool).unwrap()["outputSchema"], expected);
+    assert_eq!(
+        serde_json::to_value(tool).unwrap()["outputSchema"],
+        expected
+    );
 }
 
 #[test]
@@ -59,18 +62,16 @@ fn private_metadata_cannot_forge_host_authority() {
 #[test]
 fn mixed_content_text_presentation_is_unchanged() {
     for case in corpus()["results"].as_array().unwrap() {
-        let result: CallToolResult =
-            serde_json::from_value(case["wire"].clone()).unwrap();
+        let result: CallToolResult = serde_json::from_value(case["wire"].clone()).unwrap();
         assert_eq!(result.text(), case["expectedText"].as_str().unwrap());
     }
 }
 
 #[test]
 fn large_integer_identifiers_are_not_rounded_by_wire_decoding() {
-    let result: CallToolResult = serde_json::from_str(
-        r#"{"content":[],"structuredContent":{"id":9007199254740993}}"#,
-    )
-    .unwrap();
+    let result: CallToolResult =
+        serde_json::from_str(r#"{"content":[],"structuredContent":{"id":9007199254740993}}"#)
+            .unwrap();
     assert_eq!(
         serde_json::to_value(result).unwrap()["structuredContent"]["id"].as_u64(),
         Some(9_007_199_254_740_993)
@@ -80,10 +81,8 @@ fn large_integer_identifiers_are_not_rounded_by_wire_decoding() {
 
 #[test]
 fn null_structured_content_is_explicitly_absent_and_malformed_types_fail() {
-    let result: CallToolResult = serde_json::from_value(
-        json!({"content": [], "structuredContent": null}),
-    )
-    .unwrap();
+    let result: CallToolResult =
+        serde_json::from_value(json!({"content": [], "structuredContent": null})).unwrap();
     assert!(serde_json::to_value(result).unwrap()["structuredContent"].is_null());
     assert!(serde_json::from_value::<CallToolResult>(json!({"isError": "false"})).is_err());
     assert!(serde_json::from_value::<CallToolResult>(json!({"content": {}})).is_err());
@@ -102,7 +101,9 @@ impl RpcTransport for FixtureTransport {
             })),
             "tools/list" => Ok(json!({"tools": [corpus()["tool"].clone()]})),
             "tools/call" => Ok(self.result.clone()),
-            _ => Err(davinci_mcp::Error::Protocol("unexpected fixture method".into())),
+            _ => Err(davinci_mcp::Error::Protocol(
+                "unexpected fixture method".into(),
+            )),
         }
     }
 
@@ -115,11 +116,8 @@ impl RpcTransport for FixtureTransport {
 #[test]
 fn external_transport_preserves_same_full_result_as_native_decoder() {
     let wire = corpus()["results"][0]["wire"].clone();
-    let mut client = Client::connect_transport(
-        "fixture",
-        Box::new(FixtureTransport { result: wire }),
-    )
-    .unwrap();
+    let mut client =
+        Client::connect_transport("fixture", Box::new(FixtureTransport { result: wire })).unwrap();
     assert_eq!(client.tools.len(), 1);
     assert_eq!(
         serde_json::to_value(&client.tools[0]).unwrap()["outputSchema"],

@@ -735,7 +735,9 @@ mod codemode_structured_tests {
                     "_meta": {"private": "must not be projected"},
                     "_operation_result_committed": true
                 })),
-                _ => Err(davinci_mcp::Error::Protocol("unexpected fixture method".into())),
+                _ => Err(davinci_mcp::Error::Protocol(
+                    "unexpected fixture method".into(),
+                )),
             }
         }
 
@@ -757,7 +759,10 @@ mod codemode_structured_tests {
         let full = registry.call_full("fixture", "items", &json!({})).unwrap();
         assert_eq!(full.text(), "visible fixture text");
         let encoded = serde_json::to_value(full).unwrap();
-        assert_eq!(encoded["structuredContent"], json!({"items": [{"id": "A"}]}));
+        assert_eq!(
+            encoded["structuredContent"],
+            json!({"items": [{"id": "A"}]})
+        );
         assert!(encoded.get("_meta").is_none());
         assert!(encoded.get("_operation_result_committed").is_none());
         let direct = registry.call("fixture", "items", &json!({})).unwrap();
