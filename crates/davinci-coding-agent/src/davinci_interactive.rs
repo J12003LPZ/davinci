@@ -1443,13 +1443,7 @@ fn mid_turn_key(
 /// bypassed every check: a queued `/command` went to the provider verbatim.
 fn run_turns(shell: &mut Shell<'_>) -> Next {
     let host = shell.host.clone();
-    if let Err(err) = run_turn(
-        shell.parsed,
-        shell.agent,
-        shell.model,
-        shell.terminal,
-        host,
-    ) {
+    if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
         return Next::Fail(err.to_string());
     }
     while !shell.model.queued.is_empty() {
@@ -1897,13 +1891,9 @@ fn run_turn(
         if let Some(preview) = scope_expansion.take() {
             let task_guard = capture_scope_expansion_task_guard(agent, &preview)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            if let Some(guidance) = resolve_scope_expansion_modal(
-                agent,
-                model,
-                session,
-                &preview,
-                task_guard.as_ref(),
-            )? {
+            if let Some(guidance) =
+                resolve_scope_expansion_modal(agent, model, session, &preview, task_guard.as_ref())?
+            {
                 model.transcript.push(Entry::Detail(guidance.clone()));
                 model.queued.insert(0, guidance);
             }
@@ -3406,8 +3396,7 @@ fn resolve_scope_expansion_modal(
                 model.paste(&text);
             }
             crossterm::event::Event::Mouse(mouse) => {
-                if session.handle_model_mouse(model, mouse) {
-                }
+                session.handle_model_mouse(model, mouse);
             }
             _ => {}
         }
@@ -4852,7 +4841,7 @@ pub fn run(
             team_mail_since = None;
             if let Some(text) = team_wake_text(agent) {
                 let mut shell = Shell {
-                            parsed,
+        parsed,
                     agent,
                     model: &mut model,
                     terminal: &mut terminal,
@@ -4956,7 +4945,7 @@ pub fn run(
                         });
                         if let Some((chord, path)) = claimed {
                             let mut shell = Shell {
-                                                    parsed,
+                                parsed,
                                 agent,
                                 model: &mut model,
                                 terminal: &mut terminal,
@@ -4983,7 +4972,7 @@ pub fn run(
                             });
                             if taken {
                                 let mut shell = Shell {
-                                                            parsed,
+                                        parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
@@ -5080,7 +5069,7 @@ pub fn run(
                                     action @ (davinci_tui::DoubleEscapeAction::Fork
                                     | davinci_tui::DoubleEscapeAction::Rewind) => {
                                         let mut shell = Shell {
-                                                                            parsed,
+                                                        parsed,
                                             agent,
                                             model: &mut model,
                                             terminal: &mut terminal,
@@ -5129,7 +5118,7 @@ pub fn run(
                                 });
                                 if doubled {
                                     run_stop_hooks(&mut Shell {
-                                                                    parsed,
+                                                parsed,
                                         agent,
                                         model: &mut model,
                                         terminal: &mut terminal,
@@ -5151,7 +5140,7 @@ pub fn run(
                             }
                             Flow::Quit => {
                                 run_stop_hooks(&mut Shell {
-                                                            parsed,
+                                        parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
@@ -5165,7 +5154,7 @@ pub fn run(
                             }
                             Flow::Submit(line) => on_line(
                                 &mut Shell {
-                                                            parsed,
+                                        parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
@@ -5179,7 +5168,7 @@ pub fn run(
                             ),
                             Flow::Choose(choice) => on_choice(
                                 &mut Shell {
-                                                            parsed,
+                                        parsed,
                                     agent,
                                     model: &mut model,
                                     terminal: &mut terminal,
