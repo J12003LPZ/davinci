@@ -508,6 +508,49 @@ impl Working {
     }
 }
 
+/// The typewriter on the newest reply: how much of one prose entry is on
+/// screen. Deltas land in the transcript whole; the reveal walks behind them
+/// so a burst of text is written out rather than dropped in.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Reveal {
+    /// The `Entry::Prose` being written, by transcript index.
+    pub index: usize,
+    /// Characters on screen.
+    pub shown: usize,
+    /// Fractional characters owed from the last step.
+    pub carry: f32,
+    /// Characters a second. It only rises while text is owed, so a burst
+    /// is written out at one steady speed, and drops back to `REVEAL_CPS`
+    /// once the reveal has caught up.
+    pub rate: f32,
+    /// A fingerprint of the first `head_len` characters already typed. If
+    /// the entry at `index` stops starting with them, the transcript was
+    /// replaced under the reveal and it lets go.
+    pub head: u64,
+    pub head_len: usize,
+}
+
+/// Characters of typed text the reveal fingerprints.
+const REVEAL_HEAD: usize = 32;
+
+fn prefix_hash(text: &str, chars: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let end = text
+        .char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(byte, _)| byte);
+    text[..end].hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The slowest the reply is written, in characters a second. Faster than
+/// reading, slow enough to read as writing.
+pub const REVEAL_CPS: f32 = 160.0;
+/// The most the reveal may trail the stream: any backlog is written out
+/// within this many seconds, so a fast model is never held back.
+pub const REVEAL_LAG_SECS: f32 = 0.35;
+
 /// One Studio step: a ledger row of ✓ / ◉ / ○ (design.md §6).
 #[derive(Debug, Clone)]
 pub struct Step {
@@ -2348,6 +2391,15 @@ pub struct Model {
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
     pub caret_moved_at: u64,
+    /// The typewriter on the newest reply, when one is being written.
+    pub reveal: Option<Reveal>,
+    /// When the reveal last stepped; the step is sized from real time.
+    pub reveal_clock: Option<std::time::Instant>,
+    /// The first transcript index the live turn may type: just past its
+    /// prompt. `None` between turns once everything is on screen.
+    pub reveal_floor: Option<usize>,
+    /// The transcript length at the last step, to notice it shrinking.
+    pub reveal_seen_len: usize,
     pub animate: bool,
     pub theme: Theme,
 
@@ -2574,6 +2626,10 @@ impl Model {
             overlay_offset: None,
             section_notice: None,
             caret_moved_at: 0,
+            reveal: None,
+            reveal_clock: None,
+            reveal_floor: None,
+            reveal_seen_len: 0,
             animate,
             theme,
             screen: Screen::Agent,
@@ -2889,6 +2945,7 @@ impl Model {
     /// animation is on, so every event loop animates the number the same way.
     pub fn advance_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.advance_reveal();
         // A running tool or an open prompt is work the token stream cannot
         // see; neither is a stall.
         let busy = self.tool_in_flight() || self.overlay.is_some() || self.decision_modal.is_some();
@@ -2898,6 +2955,183 @@ impl Model {
                 working.roll_tokens();
             }
         }
+    }
+
+    /// Step the typewriter by the real time since its last step. Called
+    /// before every draw, so frames come as fast as the loop draws them.
+    pub fn advance_reveal(&mut self) {
+        let now = std::time::Instant::now();
+        let ms = self
+            .reveal_clock
+            .map_or(0, |last| now.duration_since(last).as_millis());
+        self.reveal_clock = Some(now);
+        self.advance_reveal_by(u64::try_from(ms).unwrap_or(u64::MAX).min(1_000));
+    }
+
+    /// Step the typewriter by `ms` milliseconds.
+    ///
+    /// Only prose written by the live turn is typed: the turn's floor is set
+    /// just past its prompt (`Entry::User`, or the `Entry::Agent` a wake-up
+    /// turn opens with), and anything older, a restored session, and all
+    /// prose with animation off are drawn whole. Blocks are typed in order:
+    /// a block that arrives while an earlier one is still being written waits
+    /// its turn, hidden. The rate is `REVEAL_CPS`, raised to clear any
+    /// backlog within `REVEAL_LAG_SECS`.
+    ///
+    /// The reveal checks its footing every step. A transcript that shrank
+    /// (`/clear`, rewind, a resumed session) or an entry whose text no longer
+    /// begins with what was already typed drops the reveal, so a replaced
+    /// transcript is drawn whole rather than re-typed from a stale cut.
+    pub fn advance_reveal_by(&mut self, ms: u64) {
+        if !self.animate {
+            self.reset_reveal();
+            return;
+        }
+        let len = self.transcript.len();
+        if len < self.reveal_seen_len {
+            self.replaced_under_reveal();
+        }
+        self.reveal_seen_len = len;
+
+        // An entry inserted above the reply (a subagent block takes its slot
+        // that way) shifts it down; follow it rather than restart the typing.
+        if let Some(reveal) = self.reveal.as_mut() {
+            if !matches!(self.transcript.get(reveal.index), Some(Entry::Prose(_))) {
+                if let Some(moved) = (reveal.index + 1..len.min(reveal.index + 5))
+                    .find(|&index| matches!(self.transcript[index], Entry::Prose(_)))
+                {
+                    reveal.index = moved;
+                }
+            }
+        }
+        if let Some(reveal) = self.reveal {
+            let intact = matches!(
+                self.transcript.get(reveal.index),
+                Some(Entry::Prose(text)) if prefix_hash(text, reveal.head_len) == reveal.head
+            );
+            if !intact {
+                self.replaced_under_reveal();
+            }
+        }
+
+        if self.working.is_some() && self.reveal_floor.is_none() {
+            let prompt = self
+                .transcript
+                .iter()
+                .rposition(|entry| matches!(entry, Entry::User(_) | Entry::Agent(_)));
+            self.reveal_floor = Some(prompt.map_or(len, |index| index + 1));
+        }
+
+        // Move on to the next block once the one in hand is fully typed.
+        if !self.revealing() {
+            if let Some(next) = self.next_reveal() {
+                self.reveal = Some(Reveal {
+                    index: next,
+                    head: prefix_hash("", 0),
+                    ..Reveal::default()
+                });
+                // The first frame of a new block shows nothing yet.
+                return;
+            }
+        }
+
+        if let Some(reveal) = self.reveal.as_mut() {
+            if let Some(Entry::Prose(text)) = self.transcript.get(reveal.index) {
+                let total = text.chars().count();
+                let backlog = total.saturating_sub(reveal.shown);
+                if backlog == 0 {
+                    reveal.shown = total;
+                    reveal.carry = 0.0;
+                    reveal.rate = REVEAL_CPS;
+                } else {
+                    reveal.rate = reveal
+                        .rate
+                        .max(REVEAL_CPS)
+                        .max(backlog as f32 / REVEAL_LAG_SECS);
+                    let step = reveal.rate * ms as f32 / 1000.0 + reveal.carry;
+                    let whole = step.floor();
+                    reveal.carry = step - whole;
+                    reveal.shown = (reveal.shown + whole as usize).min(total);
+                }
+                reveal.head_len = reveal.shown.min(REVEAL_HEAD);
+                reveal.head = prefix_hash(text, reveal.head_len);
+            }
+        }
+
+        // The turn is over and everything it wrote is on screen.
+        if self.working.is_none() && !self.revealing() && self.next_reveal().is_none() {
+            self.reveal_floor = None;
+        }
+    }
+
+    /// The next prose block of the live turn waiting to be typed.
+    fn next_reveal(&self) -> Option<usize> {
+        let floor = self.reveal_floor?;
+        let after = self
+            .reveal
+            .map_or(floor, |reveal| (reveal.index + 1).max(floor));
+        (after..self.transcript.len())
+            .find(|&index| matches!(self.transcript[index], Entry::Prose(_)))
+    }
+
+    /// The transcript changed under the reveal (cleared, rewound, resumed,
+    /// rewritten). What is there now is drawn whole; a live turn types only
+    /// entries added from here on.
+    fn replaced_under_reveal(&mut self) {
+        self.reset_reveal();
+        if self.working.is_some() {
+            self.reveal_floor = Some(self.transcript.len());
+        }
+    }
+
+    /// Forget the typewriter: the transcript was replaced or animation is
+    /// off, so everything is drawn whole.
+    pub fn reset_reveal(&mut self) {
+        self.reveal = None;
+        self.reveal_floor = None;
+        self.reveal_seen_len = self.transcript.len();
+    }
+
+    /// How many characters of transcript entry `index` to draw while the
+    /// typewriter owns it; `None` draws it whole. A block of the live turn
+    /// still waiting behind the one being typed draws nothing yet.
+    pub fn revealed(&self, index: usize) -> Option<usize> {
+        if !self.animate {
+            return None;
+        }
+        match (self.reveal, self.reveal_floor) {
+            (Some(reveal), _) if reveal.index == index => Some(reveal.shown),
+            (reveal, Some(floor))
+                if index >= floor
+                    && reveal.is_none_or(|reveal| index > reveal.index)
+                    && matches!(self.transcript.get(index), Some(Entry::Prose(_))) =>
+            {
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the typewriter is on entry `index` (rather than holding it).
+    pub fn writing(&self, index: usize) -> bool {
+        self.animate && self.reveal.is_some_and(|reveal| reveal.index == index)
+    }
+
+    /// Whether the reveal is still writing out text it already has.
+    pub fn revealing(&self) -> bool {
+        match self.reveal {
+            Some(reveal) if self.animate => matches!(
+                self.transcript.get(reveal.index),
+                Some(Entry::Prose(text)) if text.chars().count() > reveal.shown
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether the typewriter has text typed or queued that is not yet on
+    /// screen, so the loop should keep drawing.
+    pub fn reveal_pending(&self) -> bool {
+        self.revealing() || (self.animate && self.next_reveal().is_some())
     }
 
     /// Whether a tool call of the current turn is still running: a tool line
@@ -3298,6 +3532,15 @@ impl Model {
             .find(|&index| matches!(self.transcript[index], Entry::Gap))
             .unwrap_or(minimum);
         self.transcript.drain(..cut);
+        // Indices into the transcript move with it.
+        self.reveal = self.reveal.and_then(|reveal| {
+            reveal
+                .index
+                .checked_sub(cut)
+                .map(|index| Reveal { index, ..reveal })
+        });
+        self.reveal_floor = self.reveal_floor.map(|floor| floor.saturating_sub(cut));
+        self.reveal_seen_len = self.transcript.len();
     }
 
     /// esc closes the instrument in hand and returns to the transcript.

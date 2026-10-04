@@ -1619,6 +1619,11 @@ fn run_turn(
             if let Some(working) = model.working.as_mut() {
                 working.seconds = started.elapsed().as_secs();
             }
+            // The typewriter steps on real time, every pass of this loop.
+            model.advance_reveal();
+            if model.reveal_pending() {
+                model.dirty = true;
+            }
             if model.dirty {
                 session.draw(model)?;
                 model.dirty = false;
@@ -4925,6 +4930,13 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        // A reply still being written after its turn ended finishes at the
+        // typewriter's own pace, not the 250ms clock's.
+        model.advance_reveal();
+        let revealing = model.reveal_pending();
+        if revealing {
+            model.dirty = true;
+        }
         if model.dirty {
             if let Err(err) = terminal.draw(&model) {
                 break Err(err.to_string());
@@ -4932,7 +4944,11 @@ pub fn run(
             model.dirty = false;
         }
 
-        let timeout = davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed());
+        let timeout = if revealing {
+            Duration::from_millis(40)
+        } else {
+            davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed())
+        };
         match terminal.poll_event(timeout) {
             Ok(Some(event)) => {
                 model.dirty = true;
