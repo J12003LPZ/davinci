@@ -75,8 +75,8 @@ flowchart TD
    not exact provider token counts. See [Context VM](context-vm.md).
 5. Native engineering tools share an immutable repository/metadata snapshot.
    Mutations and new turns invalidate it; cache hits recheck authorization and
-   observed changes. Jev reads available facts in a bounded background job.
-   Unobserved Git and capability facts remain unknown.
+   observed changes.
+   Unobserved Git facts remain unknown.
 6. Execution receipts reference immutable, content-addressed artifacts.
    Publication is atomic and no-clobber; retrieval verifies size and SHA-256.
 

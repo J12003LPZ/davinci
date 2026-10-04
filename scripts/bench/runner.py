@@ -26,8 +26,7 @@ _release_spec.loader.exec_module(release_identity)
 CLEAN_DIFF_HASH = hashlib.sha256(b"").hexdigest()
 _campaign_owner = None
 
-BASE_SETTINGS = {"decisionIntelligence": {"enabled": False},
-    "compaction": {"enabled": True, "reserveTokens": 16384, "keepRecentTokens": 20000},
+BASE_SETTINGS = {"compaction": {"enabled": True, "reserveTokens": 16384, "keepRecentTokens": 20000},
     "showCacheMissNotices": False, "transport": "auto", "serviceTier": None,
     "effortPolicy": "fixed", "toolSurface": "full", "autoVerify": True,
     "promptProfile": "stable"}

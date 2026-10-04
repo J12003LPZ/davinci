@@ -39,7 +39,6 @@ pub mod picker;
 pub mod recovery;
 pub mod resume;
 pub mod rewind;
-pub mod secret_input;
 pub mod securitas;
 pub mod semantic;
 pub mod settings;

@@ -99,7 +99,7 @@ retrieval only. A successful rebuild after a missing page remains a lookup miss.
 `EngineeringSnapshots` is owned by the native extension host. Test Impact
 and Change Impact reuse repository indexing and workspace metadata; Verification
 Planner and Build Intelligence reuse available metadata without initiating a
-snapshot scan. Jev uses already available facts in its background worker.
+snapshot scan.
 
 Native mutations and new turns invalidate the snapshot. Reuse checks workspace
 identity, known file/directory stamps and existing read permissions; indexed
@@ -109,10 +109,9 @@ of an externally modified file whose size and timestamp were preserved.
 
 Git dirty state is typed `Clean/Dirty/Unknown`; this snapshot currently
 reports `Unknown` without an authoritative Git observation. Missing
-build/LSP/transaction revisions remain absent. Capability IDs come from exact
-registered tool sets, not name substrings. The snapshot shares facts already
+build/LSP/transaction revisions remain absent. The snapshot shares facts already
 produced by these consumers; it does not claim every subsystem has been
 consolidated into one scan.
 
-See [measurements and validation](context-vm-jev-measurements.md) for the
+See [measurements and validation](context-vm-measurements.md) for the
 deterministic eval corpus, release benchmarks and remaining live-provider gates.

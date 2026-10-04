@@ -29,7 +29,7 @@ The work is isolated in the cloud branch `codex/production-readiness-cloud-20260
 | 5.1 Background cost | Learning/security-watch off by default, opt-in; separate measured/unknown foreground and background receipts, failed attempts and process/session ownership. [Diagnostics](../session-diagnostics.md). | Interactive/RPC benefit and cost campaign. |
 | 5.2 Learning scope | Project/global auto-apply require approval by default; project policy may narrow global policy. | No measured justification for automatic promotion. |
 | 5.3 Tool surface | Full stays default; Lean plus tool_search remains selectable. | Both-provider Full/Lean A/B before any default change. |
-| 5.4 Measure-or-cut | Complete on/off matrix below; Context VM and JEV stay off. | All live subsystem arms and long-session Context VM set pending. |
+| 5.4 Measure-or-cut | Complete on/off matrix below; Context VM stays off. | All live subsystem arms and long-session Context VM set pending. |
 | 5.5 Status | Fourteen native status commands folded into /status; internal RPC/sheet handlers retained; read-only /doctor checks observed health and local install identity. | Final integrated checks; a matching local sidecar alone cannot prove release CI. |
 | 5.6 Facts | Crate counts and new behavior documented in CLAUDE.md. | Counts refreshed after final integration. |
 | 6 Claude adapter | Conditional work remains inactive. | Requires same-Claude-model traces showing a deficit. |
@@ -49,7 +49,6 @@ Learning background review and security watch are **off by default, opt-in**. Bo
 | Full vs Lean+tool_search | Full default; Lean selectable | OpenAI and Claude A/B not run | No default promotion |
 | Auto sandbox | Capable backend only, truthful unsupported status | Approval-count/success/wall-time A/B not run | No autonomy success claim |
 | Context VM | Off | Dedicated sessions with at least two compactions not run | No default change |
-| JEV | Off | Not run | Remains off |
 
 ## Validation boundaries
 

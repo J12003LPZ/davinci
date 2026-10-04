@@ -923,29 +923,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         .tools
         .retain(|tool| !parsed.exclude_tools.contains(tool));
     agent.cwd = cwd.to_path_buf();
-    agent.set_decision_effort_advice_enabled(settings.decision_effort_advice_enabled());
-    agent.set_decision_completion_advice_enabled(settings.decision_completion_advice_enabled());
-    agent.set_decision_tool_family_advice_enabled(settings.decision_tool_family_advice_enabled());
-    if settings.decision_intelligence_enabled() {
-        match AuthStorage::create()
-            .map_err(|error| error.to_string())
-            .and_then(|auth| {
-                davinci_coding_agent::decision_providers::typesafe::TypeSafeProvider::from_auth(
-                    &auth,
-                )
-                .map_err(|error| error.to_string())
-            }) {
-            Ok(Some(provider)) => {
-                let runtime = Arc::new(davinci_agent::decision::DecisionRuntime::new(provider));
-                runtime.enable();
-                agent.set_decision_runtime(runtime);
-            }
-            Ok(None) => eprintln!(
-                "TypeSafe decision intelligence is enabled but has no credential; remaining off"
-            ),
-            Err(error) => eprintln!("TypeSafe decision intelligence unavailable: {error}"),
-        }
-    }
     // The product default is `ask`; the library default (every tool runs)
     // is only for embedders. Who answers an ask is the mode's business:
     // davinci, RPC and the legacy chrome each install an approver, and a
@@ -3925,20 +3902,6 @@ fn run_print_turns(
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
                     agent.prompt_user_with(&text, &images);
-                    let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
-                        agent,
-                        davinci_coding_agent::turn_decision::DecisionSnapshot {
-                            request_id: davinci_agent::new_message_id(),
-                            task: text.clone(),
-                            decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
-                            metadata:
-                                davinci_coding_agent::decision_state::DecisionMetadata::default(),
-                            evidence_revision: agent.messages.len() as u64,
-                            mutation_revision: agent
-                                .mutation_verification_state()
-                                .mutation_generation,
-                        },
-                    );
                     if json_mode {
                         write_prompt_manifest_json_event(agent)?;
                     }
@@ -3971,17 +3934,6 @@ fn run_print_turns(
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
                 agent.prompt_user_with(&text, &images);
-                let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
-                    agent,
-                    davinci_coding_agent::turn_decision::DecisionSnapshot {
-                        request_id: davinci_agent::new_message_id(),
-                        task: text.clone(),
-                        decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
-                        metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
-                        evidence_revision: agent.messages.len() as u64,
-                        mutation_revision: agent.mutation_verification_state().mutation_generation,
-                    },
-                );
                 if json_mode {
                     write_prompt_manifest_json_event(agent)?;
                 }
@@ -7202,17 +7154,6 @@ fn submit_user_message(
     };
     session.chrome.transcript.push("user", &text);
     agent.prompt_user_with(&text, &images);
-    let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
-        agent,
-        davinci_coding_agent::turn_decision::DecisionSnapshot {
-            request_id: davinci_agent::new_message_id(),
-            task: text.clone(),
-            decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
-            metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
-            evidence_revision: agent.messages.len() as u64,
-            mutation_revision: agent.mutation_verification_state().mutation_generation,
-        },
-    );
     // Inside the raw-mode TUI the turn runs on a worker thread so the
     // interface keeps painting (spinner, live tool lines, Esc interrupt).
     let streaming = with_active_panes(|panes| panes.cloned());
@@ -8061,9 +8002,6 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         }
         "steering-mode" => stored.steering_mode = Some(value.to_string()),
         "follow-up-mode" => stored.follow_up_mode = Some(value.to_string()),
-        "decision-intelligence" => {
-            stored.set_decision_intelligence_enabled(value == "on");
-        }
         "transport" => stored.transport = Some(value.to_string()),
         "http-idle-timeout" => stored.http_idle_timeout_ms = parse_http_idle_timeout(value),
         "hide-thinking" => stored.hide_thinking_block = Some(value == "true"),
@@ -8139,12 +8077,6 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     agent.transport = stored.transport.clone();
     agent.install_telemetry = stored.install_telemetry_enabled();
     agent.auto_retry = stored.retry_enabled();
-    agent.set_decision_effort_advice_enabled(stored.decision_effort_advice_enabled());
-    agent.set_decision_completion_advice_enabled(stored.decision_completion_advice_enabled());
-    agent.set_decision_tool_family_advice_enabled(stored.decision_tool_family_advice_enabled());
-    if !stored.decision_intelligence_enabled() {
-        agent.disable_decision_runtime();
-    }
 }
 
 fn fixtures_enabled() -> bool {

@@ -786,16 +786,6 @@ Security analysis does not replace independent review, and an empty report is no
 
 See [Security scan](docs/security-scan.md).
 
-### Decision intelligence
-
-TypeSafe / Jev is an optional provider-neutral decision-observation layer.
-
-Its optional observations/advice do not replace deterministic permissions, verification, security, or workspace boundaries. Individual advice features have separate configuration and readiness constraints; consult the current guide before enabling them.
-
-It is disabled by default.
-
-See [Decision intelligence](docs/decision-intelligence.md).
-
 ### Design artifacts (experimental)
 
 `/design` manages session-owned UI concepts, revisions, evidence, exports, and reviewed implementation proposals. It is disabled by default. Generation requires an explicitly enabled feature, a selected `openai-codex` subscription/model/effort, and an existing root-budget configuration. The browser companion additionally needs a separately prepared pinned Node/Chromium runtime; native generated-content rendering currently fails closed on Windows. No automatic API-key fallback or package installation occurs.
@@ -1210,7 +1200,6 @@ Start here:
 - [Security scan](docs/security-scan.md)
 - [Learning](docs/learning.md)
 - [Local voice input](docs/voice-input.md)
-- [Decision intelligence](docs/decision-intelligence.md)
 - [Prompt engineering](docs/prompt-engineering.md)
 - [Behavioral evaluations](docs/behavioral-evals.md)
 

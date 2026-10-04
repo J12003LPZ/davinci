@@ -3,12 +3,21 @@ use super::{
     repo_intelligence::{RepoIndex, RepoIntelligence},
     workspace_metadata::WorkspaceMetadata,
 };
-use davinci_agent::decision::request::WorkspaceDirtyState;
 use davinci_agent::runtime::cache::digest;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+/// Authoritative workspace state. No observation is represented as unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDirtyState {
+    Clean,
+    Dirty,
+    #[default]
+    Unknown,
+}
 
 #[derive(Debug)]
 pub struct EngineeringSnapshot {
@@ -44,7 +53,7 @@ impl EngineeringSnapshots {
         state.snapshot = None;
     }
 
-    /// Jev and inspectors may use facts already computed by engineering tools.
+    /// Inspectors may use facts already computed by engineering tools.
     /// They never trigger a filesystem scan or wait for one in progress.
     pub fn peek(&self) -> Option<Arc<EngineeringSnapshot>> {
         self.0.try_lock().ok()?.snapshot.clone()

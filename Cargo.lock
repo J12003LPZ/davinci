@@ -543,7 +543,6 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
- "zeroize",
 ]
 
 [[package]]
@@ -664,7 +663,6 @@ dependencies = [
  "tempfile",
  "unicode-segmentation",
  "unicode-width 0.2.0",
- "zeroize",
 ]
 
 [[package]]

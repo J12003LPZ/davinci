@@ -89,7 +89,7 @@ The current benchmark implementation makes the failure modes explicit:
   Imported comparisons check timestamp envelopes across every arm, including Codex.
 - Summaries separate harnesses, legacy/large strata, and tasks. Uncached input is
   computed from per-row total minus cached. Missing metrics and incomplete
-  telemetry keep explicit denominators; uninstrumented Jev usage is unavailable.
+  telemetry keep explicit denominators.
 - Paired all-run and both-successful results are separate. Deterministic
   task-cluster bootstrap intervals and each promotion rule's pass/fail/unavailable
   status are emitted. One paired diagnostic window cannot certify promotion.

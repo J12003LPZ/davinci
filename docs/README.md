@@ -12,8 +12,8 @@ Native capability guides: [repository intelligence](repo-intelligence.md),
 [managed processes](process-manager.md), [transactional edits](transactional-edits.md),
 and [browser verification](browser-verification.md).
 Agent orchestration: [subagents, agent teams and workflows](agent-teams.md) and [runtime routing](runtime-orchestration.md).
-Context and routing: [Context VM](context-vm.md), [Jev](decision-intelligence.md),
-and [hardening measurements](context-vm-jev-measurements.md).
+Context: [Context VM](context-vm.md) and
+[hardening measurements](context-vm-measurements.md).
 OpenAI provider operations: [cache and Responses efficiency](openai-efficiency.md).
 CLI and request safety: [harness hardening and offline evidence](perf/harness-release-hardening.md).
 Session visibility: [status, doctor, and background cost accounting](session-diagnostics.md).

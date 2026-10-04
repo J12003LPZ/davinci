@@ -80,15 +80,16 @@ class StreamTelemetryTests(unittest.TestCase):
     def test_harness_nonforeground_attempts_reconcile_once(self):
         usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
         events = []
-        for purpose in ("coding", "worker", "reviewer", "compaction", "learning", "security_watch"):
+        for purpose in ("coding", "worker", "reviewer", "compaction", "learning", "security_watch", "prewarm"):
             block = self.observed_stream([(1, "completed", usage)])[:-1]
             for event in block:
                 event["observation"].update(purpose=purpose, root_id="root", logical_request_id=purpose)
             events.extend(block + block)
         result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
-        self.assertEqual(result["provider_attempts"], 6)
-        self.assertEqual(result["input"], 60)
-        self.assertEqual(result["output"], 30)
+        self.assertEqual(result["provider_attempts"], 7)
+        self.assertEqual(result["prewarm_attempts"], 1)
+        self.assertEqual(result["input"], 70)
+        self.assertEqual(result["output"], 35)
 
     def test_observed_failed_retry_missing_usage_cannot_be_an_exact_total(self):
         usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
@@ -208,13 +209,20 @@ class StreamTelemetryTests(unittest.TestCase):
         self.assertIsNone(result["cache_write"])
         self.assertFalse(result["usage_available"])
 
-    def test_uninstrumented_jev_is_unavailable_when_coding_telemetry_exists(self):
-        event = {"type": "provider_observation", "observation": {
-            "schema_version": 1, "logical_request_id": "coding", "purpose": "coding",
-            "kind": "logical_start", "status": "started"}}
-        stats = bench.parse_stream("davinci", json.dumps(event))
-        self.assertEqual(stats["logical_requests"], 1)
-        self.assertIsNone(stats["jev_attempts"])
+    def test_unknown_provider_purpose_keeps_totals_unavailable(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        events = self.observed_stream([(1, "completed", usage)])
+        unknown = json.loads(json.dumps(events[:-1]))
+        for event in unknown:
+            event["observation"].update(purpose="unknown_provider",
+                                        logical_request_id="unknown")
+        stats = bench.parse_stream("davinci", "\n".join(map(json.dumps, events + unknown)))
+        self.assertFalse(stats["request_metrics_available"])
+        self.assertFalse(stats["request_metrics_complete"])
+        self.assertIsNone(stats["logical_requests"])
+        self.assertIsNone(stats["provider_attempts"])
+        self.assertFalse(stats["usage_available"])
+        self.assertIsNone(stats["input"])
 
     def test_reports_separate_harnesses_strata_real_uncached_and_availability(self):
         rows = [dict(campaign_row("davinci"), input_tokens=100, cached_tokens=90, requests=9,

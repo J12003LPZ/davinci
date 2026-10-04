@@ -323,66 +323,6 @@ fn failed_setting_persistence_does_not_change_the_displayed_row() {
 }
 
 #[test]
-fn typesafe_key_clipboard_paste_stays_in_secret_input() {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use davinci_tui::davinci::app::{self, Flow};
-    let mut model = model();
-    open_typesafe_key_input(&mut model);
-    assert!(paste_secret_clipboard(
-        &mut model,
-        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
-        || Some("test_KEY".into()),
-    ));
-    assert_eq!(model.composer.to_string(), "");
-    let Flow::SecretInputSubmitted(value) = app::handle_key(
-        &mut model,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    ) else {
-        panic!("credential was not submitted")
-    };
-    assert_eq!(value.into_inner(), "test_KEY");
-    assert!(!paste_secret_clipboard(
-        &mut model,
-        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
-        || panic!("clipboard must not be read without secret overlay"),
-    ));
-}
-
-#[test]
-fn opening_typesafe_key_replacement_uses_the_masked_secret_overlay() {
-    let mut model = model();
-
-    open_typesafe_key_input(&mut model);
-
-    assert_eq!(model.overlay, Some(Overlay::SecretInput));
-    assert!(model.secret_input.is_some());
-    assert_eq!(model.composer.to_string(), "");
-}
-
-#[test]
-fn typesafe_key_replacement_respects_environment_and_project_overrides() {
-    let enabled = SettingRow {
-        key: "decision-intelligence".into(),
-        value: "on".into(),
-        ..SettingRow::default()
-    };
-    assert_eq!(typesafe_key_replacement_blocker(&[enabled], false), None);
-
-    let project_disabled = SettingRow {
-        key: "decision-intelligence".into(),
-        value: "off".into(),
-        project: true,
-        ..SettingRow::default()
-    };
-    assert!(typesafe_key_replacement_blocker(&[project_disabled], false)
-        .unwrap()
-        .contains("project settings"));
-    assert!(typesafe_key_replacement_blocker(&[], true)
-        .unwrap()
-        .contains("TYPESAFE_API_KEY"));
-}
-
-#[test]
 fn section_notices_are_only_attached_to_open_sheets() {
     let mut sheet = model();
     sheet.screen = Screen::Settings;

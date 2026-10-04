@@ -316,7 +316,7 @@ For each subsystem that is on by default or advertised to the model (vector memo
 - [ ] Keep it on by default only if it improves success, tokens or latency without hurting the others.
 - [ ] Otherwise move it off the default path and document it as opt-in.
 - [ ] Record each result in a table in this plan.
-- [ ] Context VM and JEV stay off. Evaluate Context VM only on a dedicated long-session set (sessions long enough to compact at least twice) against current compaction; change the default only on a measured win.
+- [ ] Context VM stays off. Evaluate Context VM only on a dedicated long-session set (sessions long enough to compact at least twice) against current compaction; change the default only on a measured win.
 
 ### Task 5.5: Collapse the status surface
 
@@ -340,7 +340,7 @@ Start this only if Task 1.3 shows DaVinci behind Claude Code on the same Claude 
 
 ## Explicitly not in this plan
 
-- New subsystems (new memory layers, new orchestration modes, JEV activation, more graph features).
+- New subsystems (new memory layers, new orchestration modes, more graph features).
 - A separate reviewer subagent on every task. Task 2.1 gets the benefit from one extra turn of the same agent.
 - A trained or LLM-based requirement extractor. The main model writes the checklist; the runtime only enforces that the step happens.
 - IDE extensions, cloud execution, and a GitHub Action wrapper. Revisit after Phases 0–3 if users ask.
@@ -409,7 +409,7 @@ DaVinci may be called "better than Codex" or "Claude Code level" for a model onl
 
 ## Execution record (added September 30, 2026)
 
-The original attachment above is preserved byte-for-byte as the first 27,547 bytes (406 lines), SHA-256 `003f29097f92d2ac99b80ebce0f266f35f685e06252e577327e2847bbf9d5380`. This appendix is implementation evidence, not a replacement specification. Full coverage and checks are recorded in [readiness evidence](README.md) and the [99-requirement ledger](requirements-evidence.json).
+The original attachment was recorded as 27,547 bytes (406 lines), SHA-256 `003f29097f92d2ac99b80ebce0f266f35f685e06252e577327e2847bbf9d5380`. That hash identifies the original source before subsequent documentation cleanup, not the current edited text. This appendix is implementation evidence, not a replacement specification. Full coverage and checks are recorded in [readiness evidence](README.md) and the [99-requirement ledger](requirements-evidence.json).
 
 Task 5.1 default: **off by default, opt-in** for learning background review and security watch. Task 5.2: both global and project skill activation require approval absent evaluation evidence. Windows: document WSL2 now; native Windows has no isolation claim. The proposed 25% token ceiling has not been approved by the owner. Repository selection, human prompts and campaign budget remain outstanding. No paid campaigns were run.
 
@@ -429,6 +429,5 @@ Task 5.4 audit results:
 | Git specialist | Not run; private inputs/budget pending | Existing control retained; no measured keep/cut claim |
 | Graph | Not run; private inputs/budget pending | Existing control retained; no measured keep/cut claim |
 | Context VM | Not run; dedicated sessions with at least two compactions required | Off |
-| JEV | Not run | Off |
 
 No results justify selecting Preview, promoting Lean, adding a Claude adapter, or claiming competitor superiority. Native Seatbelt filesystem/network restrictions cannot establish whole-process-tree ownership, so macOS Auto acceptance is blocked rather than advertised.

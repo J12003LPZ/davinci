@@ -172,27 +172,6 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     Ok(value.map(LanguageIntelligenceConfig::from_value))
 }
 
-fn parse_decision_intelligence<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<DecisionIntelligenceSettings>, D::Error> {
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.map(|value| serde_json::from_value(value).unwrap_or_default()))
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub struct DecisionIntelligenceSettings {
-    pub enabled: bool,
-    /// Allow ready current-turn Jev advice to raise later adaptive requests' effort.
-    pub effort_advice: bool,
-    /// Evaluate current public completion evidence in shadow mode. A calibrated
-    /// reminder policy is required before these observations can add requests.
-    pub completion_advice: bool,
-    /// Allow ready current-turn relevance advice to expose authorized tool
-    /// families after the first coding request.
-    pub tool_family_advice: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(
@@ -217,12 +196,6 @@ pub struct Settings {
     /// approval so application consent cannot be confused with confinement.
     #[serde(default)]
     pub sandbox: Option<crate::sandbox_config::SandboxSettings>,
-    #[serde(
-        default,
-        rename = "decisionIntelligence",
-        deserialize_with = "parse_decision_intelligence"
-    )]
-    pub decision_intelligence: Option<DecisionIntelligenceSettings>,
     #[serde(default, rename = "testImpact", deserialize_with = "parse_test_impact")]
     pub test_impact: Option<crate::native_extensions::test_impact::TestImpactConfig>,
     #[serde(
@@ -456,10 +429,39 @@ pub struct Settings {
     #[serde(default, rename = "languageServers")]
     pub language_servers: Option<HashMap<String, LspServerConfigSetting>>,
     /// Settings keys this struct does not model (for example `subagents`,
-    /// written by extensions). They are carried through untouched so a rewrite
-    /// by `pi install`/`pi remove` cannot silently drop another tool's config.
-    #[serde(flatten, default)]
+    /// written by extensions). Except for retired keys, they are carried through
+    /// untouched so `pi install`/`pi remove` cannot drop another tool's config.
+    #[serde(
+        flatten,
+        default,
+        deserialize_with = "parse_extra_settings",
+        serialize_with = "serialize_extra_settings"
+    )]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+// Retired settings must not survive through the extension settings passthrough.
+fn parse_extra_settings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<serde_json::Map<String, serde_json::Value>, D::Error> {
+    let mut extra = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+    extra.remove("decisionIntelligence");
+    Ok(extra)
+}
+
+fn serialize_extra_settings<S: serde::Serializer>(
+    extra: &serde_json::Map<String, serde_json::Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(None)?;
+    for (key, value) in extra {
+        if key != "decisionIntelligence" {
+            map.serialize_entry(key, value)?;
+        }
+    }
+    map.end()
 }
 
 /// Language server configuration from settings.
@@ -1088,13 +1090,8 @@ pub fn load_merged_settings_with_override(
     let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
     let project_path = if current.exists() { current } else { legacy };
     let project = load_settings_value(&project_path);
-    let mut merged = enforce_learning_user_boundary(
-        &global,
-        enforce_decision_intelligence_user_boundary(
-            &global_value,
-            deep_merge_json(global_value.clone(), project),
-        ),
-    );
+    let mut merged =
+        enforce_learning_user_boundary(&global, deep_merge_json(global_value.clone(), project));
     // Project trust does not authorize increased subscription consumption.
     if let Some(object) = merged.as_object_mut() {
         object.remove("serviceTier");
@@ -1152,39 +1149,6 @@ fn enforce_learning_user_boundary(
                 .and_then(|value| value.as_object().cloned())
             {
                 learning.extend(limits);
-            }
-        }
-    }
-    merged
-}
-
-fn enforce_decision_intelligence_user_boundary(
-    global: &serde_json::Value,
-    mut merged: serde_json::Value,
-) -> serde_json::Value {
-    // Project configuration can narrow every consented feature, never grant it.
-    // Intersect flags independently: enabling intelligence is not consent to
-    // effort changes, completion experiments, or expanded tool families.
-    if let Some(object) = merged.as_object_mut() {
-        let settings = object
-            .entry("decisionIntelligence")
-            .or_insert_with(|| serde_json::json!({}));
-        if !settings.is_object() {
-            *settings = serde_json::json!({});
-        }
-        for flag in [
-            "enabled",
-            "effortAdvice",
-            "completionAdvice",
-            "toolFamilyAdvice",
-        ] {
-            let consented = global
-                .get("decisionIntelligence")
-                .and_then(|value| value.get(flag))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if !consented {
-                settings[flag] = serde_json::Value::Bool(false);
             }
         }
     }
@@ -1365,43 +1329,6 @@ impl Settings {
     pub fn named_file_context_enabled(&self, environment: Option<&str>) -> bool {
         self.named_file_context.unwrap_or(true)
             && !matches!(environment, Some("0" | "false" | "off"))
-    }
-
-    pub fn decision_intelligence_enabled(&self) -> bool {
-        self.decision_intelligence
-            .as_ref()
-            .is_some_and(|settings| settings.enabled)
-    }
-
-    pub fn decision_effort_advice_enabled(&self) -> bool {
-        self.decision_intelligence_enabled()
-            && self
-                .decision_intelligence
-                .as_ref()
-                .is_some_and(|settings| settings.effort_advice)
-    }
-
-    pub fn decision_completion_advice_enabled(&self) -> bool {
-        self.decision_intelligence_enabled()
-            && self
-                .decision_intelligence
-                .as_ref()
-                .is_some_and(|settings| settings.completion_advice)
-    }
-
-    pub fn decision_tool_family_advice_enabled(&self) -> bool {
-        self.decision_intelligence_enabled()
-            && self
-                .decision_intelligence
-                .as_ref()
-                .is_some_and(|settings| settings.tool_family_advice)
-    }
-
-    /// Toggle the parent consent without discarding the user's experiment choices.
-    pub fn set_decision_intelligence_enabled(&mut self, enabled: bool) {
-        self.decision_intelligence
-            .get_or_insert_with(Default::default)
-            .enabled = enabled;
     }
 
     pub fn compaction_enabled(&self) -> bool {
@@ -1786,7 +1713,6 @@ pub fn to_interactive_config(
             .follow_up_mode
             .clone()
             .unwrap_or_else(|| "one-at-a-time".into()),
-        decision_intelligence: settings.decision_intelligence_enabled(),
         transport: settings.transport.clone().unwrap_or_else(|| "auto".into()),
         http_idle_timeout: davinci_tui::format_http_idle_timeout(
             settings.http_idle_timeout_ms.unwrap_or(300_000),

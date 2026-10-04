@@ -207,7 +207,6 @@ fn model_session_only_choice_does_not_request_a_default_save() {
 #[test]
 fn every_screen_and_overlay_is_bounded_in_both_themes() {
     use davinci_tui::davinci::model::Overlay;
-    use davinci_tui::davinci::views::secret_input::SecretInputState;
     let screens = [
         Screen::Agent,
         Screen::Plan,
@@ -242,7 +241,6 @@ fn every_screen_and_overlay_is_bounded_in_both_themes() {
         Overlay::Instrumenta,
         Overlay::Sessions,
         Overlay::Cogitator,
-        Overlay::SecretInput,
         Overlay::Ask,
     ];
     for theme_name in ["dark", "light", "vox"] {
@@ -258,9 +256,6 @@ fn every_screen_and_overlay_is_bounded_in_both_themes() {
                 m.theme = m.theme.with_name(theme_name);
                 m.screen = screen;
                 m.overlay = overlay;
-                if overlay == Some(Overlay::SecretInput) {
-                    m.secret_input = Some(SecretInputState::new());
-                }
                 let rows = app::compose(&m, height);
                 assert_eq!(rows.len(), height as usize, "{screen:?}/{overlay:?}");
                 for row in rows {

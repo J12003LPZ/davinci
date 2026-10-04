@@ -208,8 +208,6 @@ pub enum Overlay {
     Sessions,
     /// `1f` — Cogitator, the model picker.
     Cogitator,
-    /// TypeSafe credential entry; the key never enters the composer.
-    SecretInput,
     /// The one-question instrument: a titled list, one row chosen. Trust,
     /// thinking level and stored credentials all borrow it rather than each
     /// growing a panel of its own (design.md §1 — one panel at a time).
@@ -2352,8 +2350,6 @@ pub struct Model {
     pub decision_modal: Option<crate::davinci::views::decision_modal::DecisionModalState>,
     /// Task rewind confirmation modal state.
     pub rewind_modal: Option<crate::davinci::views::rewind::RewindModalState>,
-    /// Ephemeral masked TypeSafe credential input.
-    pub secret_input: Option<crate::davinci::views::secret_input::SecretInputState>,
 
     pub cwd: String,
     pub branch: String,
@@ -2551,7 +2547,6 @@ impl Model {
             approval_instructions: None,
             decision_modal: None,
             rewind_modal: None,
-            secret_input: None,
             cwd: String::new(),
             branch: String::new(),
             model_name: String::new(),
@@ -2666,7 +2661,6 @@ impl Model {
             Some(Overlay::Instrumenta) => self.palette_index,
             Some(Overlay::Sessions) => self.session_index,
             Some(Overlay::Cogitator) => self.model_index,
-            Some(Overlay::SecretInput) => 0,
             Some(Overlay::Ask) => self.ask_index,
             None => self.recall_index,
         };
@@ -2689,7 +2683,6 @@ impl Model {
             }
             Some(Overlay::Sessions) => self.selection(self.sessions.len()).map(Choice::Session),
             Some(Overlay::Cogitator) => self.selection(self.models.len()).map(Choice::Model),
-            Some(Overlay::SecretInput) => None,
             Some(Overlay::Ask) => self.selection(self.ask.items.len()).map(Choice::Ask),
             None => None,
         }
@@ -2712,7 +2705,6 @@ impl Model {
             Some(Overlay::Ask) => {
                 self.ask_index = wrap_index(self.ask_index, delta, self.ask.items.len());
             }
-            Some(Overlay::SecretInput) => {}
             None => {}
         }
     }
@@ -2868,12 +2860,6 @@ impl Model {
     /// composer — the block was pasted, not typed, so none of them is a
     /// submit — and are flattened in a query, which is one line by definition.
     pub fn paste(&mut self, text: &str) {
-        if self.overlay == Some(Overlay::SecretInput) {
-            if let Some(secret) = self.secret_input.as_mut() {
-                secret.insert_text(text);
-            }
-            return;
-        }
         // Selectors own their search input independently of the conversation.
         // Bracketed paste must not silently replace a preserved chat draft.
         if self.overlay.is_none() && !self.codex_open() {
