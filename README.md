@@ -9,7 +9,7 @@
 
 > **Current terminal:** see the [implementation and review guide](docs/ui/terminal-rebuild.md) for the default shell, settings/model selectors, optional graph view, rendered previews, and verification limitations.
 
-It combines an interactive coding assistant, multi-provider model runtime, permission system, persistent sessions, engineering intelligence, multi-agent orchestration, deterministic verification, security analysis, memory and learning, MCP, extensions, and optional local voice input in one CLI.
+It combines an interactive coding assistant, multi-provider model runtime, permission system, persistent sessions, engineering intelligence, multi-agent orchestration, deterministic verification, security analysis, memory and learning, MCP, and extensions in one CLI.
 
 DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github.com/earendil-works/pi) coding agent and has grown into a larger native harness. The pinned TypeScript source under [vendor/davinci](vendor/davinci) remains a behavioral compatibility reference. The active product is the Rust workspace in this repository.
 
@@ -35,7 +35,7 @@ The version string alone does not identify the installed source: different commi
 - [Sessions and persistence](#sessions-and-persistence)
 - [Configuration](#configuration)
 - [Extensions and MCP](#extensions-and-mcp)
-- [Local voice input](#local-voice-input)
+- [Network use and privacy](#network-use-and-privacy)
 - [Architecture](#architecture)
 - [Repository layout](#repository-layout)
 - [Development](#development)
@@ -101,8 +101,6 @@ The repository pins the toolchain in [rust-toolchain.toml](rust-toolchain.toml).
 Optional dependencies:
 
 - **Node.js** — required only for JavaScript extensions, selected compatibility features, and some test fixtures. The core Rust CLI does not require Node.
-- **CMake and a C++17 compiler** — required to build the native local voice worker.
-- **Linux local voice builds** — ALSA development headers and pkg-config.
 - **Language intelligence** — optional local servers: TypeScript/typescript-language-server, rust-analyzer, and BasedPyright or Pyright. DaVinci discovers installed tools but never installs them automatically; see [docs/language-intelligence.md](docs/language-intelligence.md).
 
 ### 1. Clone the repository
@@ -110,6 +108,12 @@ Optional dependencies:
 ~~~bash
 git clone https://github.com/J12003LPZ/davinci.git
 cd davinci
+~~~
+
+On Windows, some test-fixture paths are up to 140 characters. If the clone lives in a deep directory, checkout can fail with `Filename too long`. Clone into a short path, or enable long paths for Git:
+
+~~~powershell
+git clone -c core.longpaths=true https://github.com/J12003LPZ/davinci.git
 ~~~
 
 ### 2. Build or install the core CLI from source
@@ -136,17 +140,23 @@ cargo build --release -p davinci-coding-agent --locked
 
 A direct Cargo build/install does not produce the CI-backed installation identity used by the release scripts. Keep the checkout commit with your test results; do not describe a source build as a verified release.
 
-### 3. Verified installation with local voice support
+### 3. Verified installation
 
-The repository install scripts build both `davinci` and the matching `davinci-voice-worker`, then install both with identity sidecars. They are **release-gated**, not a shortcut for installing any arbitrary `main` checkout.
+The repository install scripts build `davinci`, then install it with an identity sidecar. They are **release-gated**, not a shortcut for installing any arbitrary `main` checkout.
 
-In addition to Rust and voice build dependencies, they require Python 3 and an authenticated GitHub CLI (`gh`). Before building they verify:
+In addition to Rust, they require Python 3 and an authenticated GitHub CLI (`gh`). Before building they verify:
 
 - a clean, committed checkout;
 - the exact product-version tag (`v<workspace-version>`) points at that commit;
 - completed green full CI and workflow-lint evidence for that exact commit.
 
-Fetch tags and select the intended tagged checkout before running them. A missing tag, dirty checkout, missing GitHub access, or non-green/missing CI makes preflight fail. See [release identity enforcement](scripts/release_identity.py) and [release discipline](docs/readiness/release-discipline.md).
+Fetch tags and select the intended tagged checkout before running them. A plain clone of `main` is usually ahead of the latest tag, so the scripts refuse it:
+
+~~~bash
+git fetch --tags
+git checkout "v$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
+~~~
+ A missing tag, dirty checkout, missing GitHub access, or non-green/missing CI makes preflight fail. See [release identity enforcement](scripts/release_identity.py) and [release discipline](docs/readiness/release-discipline.md).
 
 Linux/macOS:
 
@@ -166,15 +176,6 @@ The scripts install into Cargo's binary directory, normally:
 - Windows: %USERPROFILE%\.cargo\bin
 
 Make sure that directory is on PATH.
-
-### Linux packages for local voice
-
-On Debian/Ubuntu-family systems:
-
-~~~bash
-sudo apt-get update
-sudo apt-get install -y build-essential cmake pkg-config libasound2-dev
-~~~
 
 ### Verify the installation
 
@@ -426,9 +427,6 @@ A final assistant reply is not proof that every requested action ran. Check the 
 | `davinci update self` | Currently returns an unsupported-self-update error; rebuild from source instead. |
 | `davinci plugin help` | Plugin/marketplace operations listed below. |
 | `davinci auth check --provider <provider> [--json] [--no-refresh]` | Check credential readiness without printing secrets. |
-| `davinci voice status`, `davinci voice devices`, `davinci voice model list` | Inspect local voice prerequisites/devices/models. |
-| `davinci voice model install <tiny\|base\|small>` | Download an approved voice model. |
-| `davinci voice model import <id> <path>` | Verify and import an existing local model. |
 | `davinci inspect run <uuid> [--json]` | Read runtime evidence for a run. |
 | `davinci inspect operation <uuid> [--json]` | Read one operation's evidence. |
 | `davinci inspect session <id> [--json]` | Read session runtime evidence. |
@@ -521,7 +519,7 @@ DaVinci treats tool execution as a controlled runtime boundary.
 | manual | Ask before protected actions |
 | accept-edits | Allow normal edits while retaining stronger gates |
 | plan-mode | Read-only planning; mutations are denied |
-| auto | Allow lower-risk actions and escalate higher-risk ones |
+| auto | Allow lower-risk actions and escalate higher-risk ones. Builds and tests ask unless an OS sandbox is active |
 | always-approve | Remove harness approval prompts while retaining explicit policy and OS boundaries |
 
 Examples:
@@ -883,7 +881,6 @@ skills/
 themes/
 workflows/
 learning/
-voice/
 security-scans/
 ~~~
 
@@ -1007,25 +1004,16 @@ Use `/mcp` for connection/tool errors and `--no-mcp` to skip all MCP connections
 
 ---
 
-## Local voice input
+## Network use and privacy
 
-Local voice input is experimental and is available in the default interactive DaVinci terminal composer.
+DaVinci contacts these services only:
 
-It uses a separate davinci-voice-worker and local CPU speech recognition. Dictation inserts editable text at the cursor; it does **not** automatically send or execute the transcription.
+- **Your selected model provider**, at the endpoint in the built-in catalog or in your own `models.json`.
+- **Model catalog refresh** (`davinci update --models`, the model picker): `https://pi.dev/api/models/providers/<provider>`, the upstream pi project's catalog. Set `PI_CATALOG_BASE_URL` to use another source, or `PI_OFFLINE=1` to skip it. A remote catalog can add or rename models but cannot change where requests or credentials go: entries keep the built-in endpoint, API and headers of their provider, and entries with an unknown endpoint are dropped.
+- **Radius gateway** (`https://radius.pi.dev`), only when you configured a Radius account (`RADIUS_API_KEY`, `PI_RADIUS_TOKEN`, `PI_RADIUS_GATEWAY` or a stored `radius` login), and never while offline.
+- **`/share`**, which uploads the exported session as a secret GitHub gist through `gh`. It prints the gist URL; set `PI_SHARE_VIEWER_URL` to also print a viewer link.
 
-Useful commands:
-
-~~~bash
-davinci voice status
-davinci voice devices
-davinci voice model list
-davinci voice model install base
-davinci voice model import base /path/to/ggml-base.bin
-~~~
-
-Supported local model sizes are tiny, base, and small.
-
-For setup, privacy behavior, platform requirements, model verification, and current limitations, see [Local voice input](docs/voice-input.md).
+DaVinci sends no install or usage telemetry. Provider attribution headers (OpenRouter, NVIDIA NIM, Cloudflare) are off unless you set `"enableInstallTelemetry": true` or `PI_TELEMETRY=1`.
 
 ---
 
@@ -1059,8 +1047,7 @@ Primary crate responsibilities:
 | davinci-coding-agent | CLI, startup, TUI integration, settings/trust, extensions, SDK |
 | davinci-agent | Turns, tools, permissions, planning, jobs, orchestration, context/evidence runtime |
 | davinci-ai | Models, auth/OAuth, provider requests, retries, streaming, usage |
-| davinci-tui | Terminal UI, editor, instruments, themes, voice UI state |
-| davinci-voice | Local speech worker and audio contracts |
+| davinci-tui | Terminal UI, editor, instruments, themes |
 | davinci-session | Session discovery, JSONL history, branches |
 | davinci-session-sqlite | SQLite persistence, migrations, branch/fact caches |
 | davinci-mcp | MCP client and transports |
@@ -1084,7 +1071,6 @@ davinci/
 │   ├── davinci-agent/          # Agent/runtime/orchestration engine
 │   ├── davinci-ai/             # Providers, models, auth, streaming
 │   ├── davinci-tui/            # Terminal interface
-│   ├── davinci-voice/          # Local voice worker
 │   └── ...                     # Protocol, sessions, MCP, server, evals, etc.
 ├── docs/                       # Architecture and capability documentation
 ├── scripts/                    # Installation and validation scripts
@@ -1199,7 +1185,6 @@ Start here:
 - [Transactional edits](docs/transactional-edits.md)
 - [Security scan](docs/security-scan.md)
 - [Learning](docs/learning.md)
-- [Local voice input](docs/voice-input.md)
 - [Prompt engineering](docs/prompt-engineering.md)
 - [Behavioral evaluations](docs/behavioral-evals.md)
 
@@ -1248,7 +1233,6 @@ Existing legacy state does not need to be migrated immediately.
 | A shell command is denied after approval | An explicit denial or OS boundary can still block it. Inspect `/sandbox-status`; permission approval does not expand isolation. |
 | A project setting, skill, hook, or server is missing | Check the working directory, trust choice, `.davinci`/legacy `.pi` paths, enabled plugin state, and hook approval. Use `/setup check`, `/doctor`, and `/mcp`. |
 | A language server is unavailable | Install/configure the supported local server yourself; DaVinci does not provision it automatically. See [language intelligence](docs/language-intelligence.md). |
-| Dictation is unavailable | Check `voice status`, the matching native worker, an installed/imported model, microphone permissions, and platform build dependencies. |
 | Native inspector exits 3 | Evidence is unavailable/inconsistent, not an instruction to remove it. Preserve state and follow the [recovery playbook](docs/runtime/recovery-playbook.md). |
 
 Current limits to keep in mind:
@@ -1257,7 +1241,7 @@ Current limits to keep in mind:
 - Agent teams, dynamic workflows, Context VM modes, design artifacts, and IPC have distinct opt-ins or build/runtime prerequisites.
 - The default and legacy TUIs have different feature coverage. Terminal previews and mockup fixtures are not live integration evidence.
 - Security reports, language diagnostics, and verification plans are advisory inputs. Actual verification commands, current workspace state, and retained evidence determine what was checked.
-- Browser, Node, language-server, voice, and OS-sandbox support vary by platform. See the individual capability/readiness guides rather than assuming uniform support.
+- Browser, Node, language-server, and OS-sandbox support vary by platform. See the individual capability/readiness guides rather than assuming uniform support.
 - There is no published prebuilt release or working Rust self-updater documented here. Rebuilding source does not automatically refresh an already running session.
 
 For a bug report, include OS/terminal, the executable path, version and source identity if known, exact non-secret command, expected/actual behavior, and the relevant redacted error. Never attach `auth.json`, bearer tokens, API keys, or complete OAuth redirect URLs.
@@ -1286,4 +1270,4 @@ Review [docs/security](docs/security/) before deploying DaVinci in a sensitive e
 
 DaVinci is licensed under the [MIT License](LICENSE).
 
-The repository also contains vendored/reference components with their own licenses and notices. Local voice native dependencies and model provenance are documented under [crates/davinci-voice](crates/davinci-voice) and [docs/voice-input.md](docs/voice-input.md).
+The repository also contains vendored/reference components with their own licenses and notices.
