@@ -1,7 +1,6 @@
 //! Offline validation of CLI modes and existing-session exports.
 use davinci_coding_agent::args::{parse_args, Mode};
-use davinci_session::{JsonlSession, SessionEntry};
-use serde_json::json;
+use davinci_session::JsonlSession;
 use std::{
     fs,
     path::Path,
@@ -42,16 +41,22 @@ fn describe(output: &Output) -> String {
 }
 
 fn session(root: &Path) -> JsonlSession {
-    let cwd = davinci_agent::strip_verbatim_prefix(&root.canonicalize().unwrap());
-    let mut session =
-        JsonlSession::create(&root.join("sessions"), &cwd.to_string_lossy(), None).unwrap();
-    session
-        .append_entry(SessionEntry::message(
-            "user",
-            json!([{"type":"text","text":"export regression marker"}]),
-        ))
+    // Use the CLI's own cwd spelling and session namespace. Canonicalizing only
+    // the fixture can expand a Windows path alias that the child still uses.
+    let output = davinci(root)
+        .args([
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--no-tools",
+            "--print",
+            "export regression marker",
+        ])
+        .output()
         .unwrap();
-    session
+    assert!(output.status.success(), "{}", describe(&output));
+    let sessions = davinci_session::discover_sessions(&root.join("sessions"), None).unwrap();
+    assert_eq!(sessions.len(), 1);
+    JsonlSession::open(&sessions[0].path).unwrap()
 }
 
 #[test]
