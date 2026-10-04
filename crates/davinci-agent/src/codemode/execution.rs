@@ -136,9 +136,13 @@ impl Agent {
                     .clone()
                     .with_cancellation_token(context.cancellation.clone()),
             );
-            let broker = AgentCodeModeBroker::new(&leaf_agent, &context, Some(parent))?;
+            let broker = Arc::new(AgentCodeModeBroker::new(
+                leaf_agent,
+                context.clone(),
+                Some(parent),
+            )?);
             let authority = super::authority_fingerprint(self)?;
-            let mut outcome = binding.host.execute(&request, &context, &broker);
+            let mut outcome = binding.host.execute(&request, &context, broker.clone());
             // Guest and host output cannot forge the authoritative child evidence.
             outcome.children = broker.children();
             outcome.operation_ref = parent.to_string();
