@@ -119,7 +119,7 @@ impl crate::codemode::CodeModeHost for CountedReadOnlyFixtureHost {
         &self,
         request: &crate::codemode::CodeModeRequest,
         context: &crate::codemode::CodeModeRunContext,
-        broker: &dyn crate::codemode::CodeModeBroker,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
     ) -> crate::codemode::CodeModeOutcome {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::codemode::CodeModeHost::execute(&ReadOnlyFixtureHost, request, context, broker)
@@ -130,7 +130,7 @@ impl crate::codemode::CodeModeHost for ReadOnlyFixtureHost {
         &self,
         _: &crate::codemode::CodeModeRequest,
         _context: &crate::codemode::CodeModeRunContext,
-        broker: &dyn crate::codemode::CodeModeBroker,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
     ) -> crate::codemode::CodeModeOutcome {
         use crate::codemode::*;
         for request_id in [1, 2] {
@@ -378,7 +378,7 @@ fn codemode_inherits_root_deadline_before_host_launch() {
             &self,
             request: &crate::codemode::CodeModeRequest,
             context: &crate::codemode::CodeModeRunContext,
-            broker: &dyn crate::codemode::CodeModeBroker,
+            broker: Arc<dyn crate::codemode::CodeModeBroker>,
         ) -> crate::codemode::CodeModeOutcome {
             assert!(context.limits.wall_ms <= 5000 && context.limits.wall_ms > 0);
             self.0
@@ -624,7 +624,7 @@ fn broker_hides_revoked_tools_without_expanding_initial_authority() {
     use crate::codemode::*;
     let (agent, _workspace, _) = configured_agent();
     let context = broker_context(&agent);
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     assert!(broker.describe("read").is_ok());
     agent
         .permissions
@@ -654,7 +654,7 @@ fn broker_hides_revoked_tools_without_expanding_initial_authority() {
             .code,
         "DENIED"
     );
-    let initially_denied = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let initially_denied = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     agent.permissions.lock().unwrap().deny.clear();
     assert_eq!(
         initially_denied.describe("read").unwrap_err().code,
@@ -678,7 +678,7 @@ fn broker_records_projection_failure_with_durable_child_reference() {
     let (agent, _workspace, journal) = configured_agent();
     let mut context = broker_context(&agent);
     context.limits.child_result_bytes = 1;
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let error = broker
         .call(CodeModeCall {
             request_id: 1,
@@ -700,7 +700,7 @@ fn broker_child_limit_is_terminal_after_guest_catches_error() {
     use crate::codemode::*;
     let (agent, _workspace, journal) = configured_agent();
     let context = broker_context(&agent);
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     for request_id in 1..=64 {
         let result = broker.call(CodeModeCall {
             request_id,
@@ -749,7 +749,7 @@ fn queued_codemode_child_rechecks_scoped_revocation() {
         None
     })));
     let context = broker_context(&agent);
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     std::thread::scope(|scope| {
         let first = scope.spawn(|| {
             broker.call(CodeModeCall {
@@ -826,7 +826,7 @@ fn queued_codemode_child_cancels_before_active_child_returns() {
         None
     })));
     let context = broker_context(&agent);
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let first = scope.spawn(|| {
@@ -902,7 +902,7 @@ fn read_only_broker_allows_bounded_parallel_children() {
     })));
     let mut context = broker_context(&agent);
     context.limits.parallelism = 2;
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     std::thread::scope(|scope| {
         let first = scope.spawn(|| {
             broker.call(CodeModeCall {
@@ -945,7 +945,7 @@ fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     use crate::codemode::*;
     let (agent, workspace, journal) = configured_agent();
     let context = broker_context(&agent);
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let call = CodeModeCall {
         request_id: 1,
         tool: "read".into(),
@@ -971,7 +971,7 @@ fn controlled_broker_uses_real_permissions_and_never_replays_a_mutation() {
     agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
     let mut context = broker_context(&agent);
     context.mode = CodeModeMode::Controlled;
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let call = CodeModeCall {
         request_id: 1,
         tool: "write".into(),
@@ -994,7 +994,7 @@ fn controlled_broker_denial_is_not_uncertain_mutation_evidence() {
     agent.set_permission_mode(crate::PermissionMode::ReadOnly);
     let mut context = broker_context(&agent);
     context.mode = CodeModeMode::Controlled;
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let error = broker
         .call(CodeModeCall {
             request_id: 1,
