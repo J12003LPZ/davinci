@@ -78,6 +78,11 @@ fn command(node: &Path) -> Command {
     command
 }
 
+enum HostEvent {
+    Frame(io::Result<Value>),
+    Child(String, Result<Value, CodeModeError>),
+}
+
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
     fn drop(&mut self) {
@@ -192,7 +197,7 @@ impl NodeCodeModeHost {
         &self,
         request: &CodeModeRequest,
         context: &CodeModeRunContext,
-        broker: &dyn CodeModeBroker,
+        broker: Arc<dyn CodeModeBroker>,
     ) -> Result<CodeModeOutcome, CodeModeError> {
         if matches!(context.mode, CodeModeMode::Off) {
             return Err(CodeModeError::new("UNAVAILABLE", "Codemode is disabled"));
@@ -274,11 +279,12 @@ impl NodeCodeModeHost {
             context.cancellation.clone(),
             Duration::from_millis(limits.wall_ms),
         );
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel::<HostEvent>(1);
+        let frames = sender.clone();
         let reader = std::thread::spawn(move || loop {
             let frame = read_frame(&mut output);
             let failed = frame.is_err();
-            if sender.send(frame).is_err() || failed {
+            if frames.send(HostEvent::Frame(frame)).is_err() || failed {
                 break;
             }
         });
@@ -290,22 +296,64 @@ impl NodeCodeModeHost {
         let mut metadata_bytes = 0usize;
         let mut tool_calls = 0u32;
         let mut result_bytes = 0usize;
+        let mut in_flight = 0usize;
+        let mut respond = |input: &mut std::process::ChildStdin,
+                           kind: &str,
+                           id: &str,
+                           result: Result<Value, CodeModeError>| {
+            let ok = result.is_ok();
+            let value = match result {
+                Ok(value) => value,
+                Err(error) => json!({"error":error}),
+            };
+            let bytes = davinci_agent::codemode::projection::serialized_size(
+                &value,
+                if kind == "tool_call" {
+                    limits.child_result_bytes
+                } else {
+                    limits.metadata_bytes
+                },
+            )
+            .map_err(|_| CodeModeError::new("LIMIT_EXCEEDED", "response byte budget"))?;
+            if kind == "tool_call" {
+                result_bytes = result_bytes.saturating_add(bytes);
+                if result_bytes > limits.total_result_bytes {
+                    return Err(CodeModeError::new("LIMIT_EXCEEDED", "child result budget"));
+                }
+            } else {
+                metadata_bytes = metadata_bytes.saturating_add(bytes);
+                if metadata_bytes > limits.metadata_bytes {
+                    return Err(CodeModeError::new("LIMIT_EXCEEDED", "metadata byte budget"));
+                }
+            }
+            write_frame(input, &json!({"version":1,"type":if kind == "tool_call" {"tool_result"} else {"metadata_result"},
+                    "runId":run_id,"requestId":id,"ok":ok,"value":value}))
+                    .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "host write failed"))
+        };
+        let stopped = || {
+            if watchdog.expired.load(std::sync::atomic::Ordering::SeqCst) {
+                CodeModeError::new("TIMEOUT", "host deadline expired")
+            } else {
+                CodeModeError::new("CANCELLED", "run cancelled")
+            }
+        };
         let outcome = (|| loop {
             if context.cancellation.is_cancelled() {
-                return Err(
-                    if watchdog.expired.load(std::sync::atomic::Ordering::SeqCst) {
-                        CodeModeError::new("TIMEOUT", "host deadline expired")
-                    } else {
-                        CodeModeError::new("CANCELLED", "run cancelled")
-                    },
-                );
+                return Err(stopped());
             }
             if started.elapsed() > Duration::from_millis(limits.wall_ms + limits.cleanup_grace_ms) {
                 return Err(CodeModeError::new("TIMEOUT", "host deadline expired"));
             }
             let frame = match receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(Ok(frame)) => frame,
+                Ok(HostEvent::Frame(Ok(frame))) => frame,
+                Ok(HostEvent::Child(id, result)) => {
+                    in_flight -= 1;
+                    respond(&mut input, "tool_call", &id, result)?;
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                // The watchdog's kill closes the transport; report why it stopped.
+                _ if context.cancellation.is_cancelled() => return Err(stopped()),
                 _ => {
                     return Err(CodeModeError::new(
                         "PROTOCOL_ERROR",
@@ -367,14 +415,7 @@ impl NodeCodeModeHost {
                     }
                     text.push_str(&value);
                 }
-                let complete = text.len() <= limits.output_bytes;
-                if !complete {
-                    let mut end = limits.output_bytes;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                }
+                // The parent bounds model-visible text and retains the overflow.
                 return Ok(CodeModeOutcome {
                     status: if ok {
                         CodeModeStatus::Completed
@@ -383,14 +424,10 @@ impl NodeCodeModeHost {
                     },
                     script_completed: ok,
                     output_text: text,
-                    output_complete: complete,
+                    output_complete: true,
                     output_artifact: None,
                     children: vec![],
-                    host_notes: if complete {
-                        vec![]
-                    } else {
-                        vec!["Script output was truncated.".into()]
-                    },
+                    host_notes: vec![],
                     operation_ref: context
                         .identity
                         .parent_operation_ref
@@ -416,22 +453,36 @@ impl NodeCodeModeHost {
             let result: Result<Value, CodeModeError> = match kind {
                 "tool_call" => {
                     tool_calls += 1;
-                    if tool_calls > limits.tool_calls {
+                    if tool_calls > limits.tool_calls || in_flight >= limits.pending_calls {
                         return Err(CodeModeError::new("LIMIT_EXCEEDED", "tool call limit"));
                     }
-                    broker
-                        .call(CodeModeCall {
-                            request_id: id.parse().map_err(|_| {
-                                CodeModeError::new("PROTOCOL_ERROR", "invalid request identity")
-                            })?,
-                            tool: name.into(),
-                            args: frame["arguments"].clone(),
+                    let call = CodeModeCall {
+                        request_id: id.parse().map_err(|_| {
+                            CodeModeError::new("PROTOCOL_ERROR", "invalid request identity")
+                        })?,
+                        tool: name.into(),
+                        args: frame["arguments"].clone(),
+                    };
+                    // The broker bounds parallelism; this loop keeps enforcing the
+                    // deadline even if an adapter never observes cancellation.
+                    let broker = broker.clone();
+                    let completions = sender.clone();
+                    let id = id.to_owned();
+                    std::thread::Builder::new()
+                        .name("codemode-child".into())
+                        .spawn(move || {
+                            let result = broker.call(call).and_then(|value| {
+                                serde_json::to_value(value).map_err(|_| {
+                                    CodeModeError::new("TOOL_FAILED", "result encoding failed")
+                                })
+                            });
+                            let _ = completions.send(HostEvent::Child(id, result));
                         })
-                        .and_then(|value| {
-                            serde_json::to_value(value).map_err(|_| {
-                                CodeModeError::new("TOOL_FAILED", "result encoding failed")
-                            })
-                        })
+                        .map_err(|_| {
+                            CodeModeError::new("UNAVAILABLE", "child worker unavailable")
+                        })?;
+                    in_flight += 1;
+                    continue;
                 }
                 "metadata_query" => {
                     metadata_calls += 1;
@@ -468,34 +519,7 @@ impl NodeCodeModeHost {
                     ))
                 }
             };
-            let ok = result.is_ok();
-            let value = match result {
-                Ok(value) => value,
-                Err(error) => json!({"error":error}),
-            };
-            let bytes = davinci_agent::codemode::projection::serialized_size(
-                &value,
-                if kind == "tool_call" {
-                    limits.child_result_bytes
-                } else {
-                    limits.metadata_bytes
-                },
-            )
-            .map_err(|_| CodeModeError::new("LIMIT_EXCEEDED", "response byte budget"))?;
-            if kind == "tool_call" {
-                result_bytes = result_bytes.saturating_add(bytes);
-                if result_bytes > limits.total_result_bytes {
-                    return Err(CodeModeError::new("LIMIT_EXCEEDED", "child result budget"));
-                }
-            } else {
-                metadata_bytes = metadata_bytes.saturating_add(bytes);
-                if metadata_bytes > limits.metadata_bytes {
-                    return Err(CodeModeError::new("LIMIT_EXCEEDED", "metadata byte budget"));
-                }
-            }
-            write_frame(&mut input, &json!({"version":1,"type":if kind == "tool_call" {"tool_result"} else {"metadata_result"},
-                    "runId":run_id,"requestId":id,"ok":ok,"value":value}))
-                    .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "host write failed"))?;
+            respond(&mut input, kind, id, result)?;
         })();
         drop(input);
         {
@@ -514,7 +538,7 @@ impl CodeModeHost for NodeCodeModeHost {
         &self,
         request: &CodeModeRequest,
         context: &CodeModeRunContext,
-        broker: &dyn CodeModeBroker,
+        broker: Arc<dyn CodeModeBroker>,
     ) -> CodeModeOutcome {
         self.run(request, context, broker)
             .unwrap_or_else(|error| CodeModeOutcome {

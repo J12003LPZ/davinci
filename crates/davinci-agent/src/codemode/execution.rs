@@ -52,10 +52,7 @@ impl Agent {
                 "Codemode capability is already registered",
             ));
         }
-        let schema = json!({"type":"object","additionalProperties":false,"required":["code"],
-            "properties":{"code":{"type":"string","minLength":1,"maxLength":65536},
-            "timeoutMs":{"type":"integer","minimum":1,"maximum":300000},
-            "maxOutputBytes":{"type":"integer","minimum":4096,"maximum":65536}}});
+        let schema = CodeModeLimits::default().request_schema();
         let mut capability = RuntimeCapability::new(
             "codemode",
             CapabilitySource::Builtin,
@@ -82,6 +79,42 @@ impl Agent {
             .unwrap_or_else(|error| error.into_inner())
             .activate_authorized("codemode", authorized);
         Ok(())
+    }
+
+    /// Keep model-visible output within its limit. Overflow up to the collection
+    /// ceiling goes to the evidence store; a reference is never fabricated.
+    fn bound_codemode_output(&self, id: &str, outcome: &mut CodeModeOutcome, limit: usize) {
+        if outcome.output_text.len() <= limit {
+            return;
+        }
+        let artifact = if outcome.output_complete {
+            self.evidence.as_ref().and_then(|store| {
+                let path = store
+                    .store(&format!("codemode-{id}"), &outcome.output_text)
+                    .ok()?;
+                Some(CodeModeArtifact {
+                    id: path.display().to_string(),
+                    kind: CodeModeArtifactKind::ToolOutput,
+                    bytes: outcome.output_text.len() as u64,
+                })
+            })
+        } else {
+            None
+        };
+        let shown = crate::evidence::cut_at_char_boundary(&outcome.output_text, limit).len();
+        let omitted = outcome.output_text.len() - shown;
+        outcome.output_text.truncate(shown);
+        outcome.output_complete = false;
+        outcome.host_notes.push(match &artifact {
+            Some(artifact) => format!(
+                "Script output was truncated ({omitted} more bytes); full output saved to {} — read it with offset/limit.",
+                artifact.id
+            ),
+            None => format!(
+                "Script output was truncated ({omitted} more bytes); no full-output artifact is available."
+            ),
+        });
+        outcome.output_artifact = artifact;
     }
 
     pub(crate) fn run_codemode(
@@ -136,11 +169,28 @@ impl Agent {
                     .clone()
                     .with_cancellation_token(context.cancellation.clone()),
             );
-            let broker = AgentCodeModeBroker::new(&leaf_agent, &context, Some(parent))?;
+            let output_limit = context.limits.output_bytes;
+            let cleanup_grace = std::time::Duration::from_millis(context.limits.cleanup_grace_ms);
+            let cancellation = context.cancellation.clone();
+            let broker = Arc::new(AgentCodeModeBroker::owned(
+                leaf_agent,
+                context.clone(),
+                Some(parent),
+            )?);
             let authority = super::authority_fingerprint(self)?;
-            let mut outcome = binding.host.execute(&request, &context, &broker);
+            let mut outcome = binding.host.execute(&request, &context, broker.clone());
+            // The script has ended: stop cooperative stragglers, then wait a bounded
+            // grace for children a host abandoned at its deadline.
+            cancellation.cancel();
+            if !broker.wait_for_children(cleanup_grace) {
+                outcome.host_notes.push(
+                    "A child tool ignored cancellation and was abandoned; its result was discarded."
+                        .into(),
+                );
+            }
             // Guest and host output cannot forge the authoritative child evidence.
             outcome.children = broker.children();
+            self.bound_codemode_output(id, &mut outcome, output_limit);
             outcome.operation_ref = parent.to_string();
             if outcome
                 .children

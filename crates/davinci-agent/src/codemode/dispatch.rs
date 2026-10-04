@@ -4,7 +4,7 @@ use crate::{
     Agent,
 };
 use serde_json::{json, Value};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 struct RunState {
     requests: std::collections::BTreeSet<u32>,
@@ -14,22 +14,35 @@ struct RunState {
     terminal: bool,
     terminal_code: &'static str,
     children: Vec<CodeModeChildOutcome>,
+    /// Admitted children whose adapter has not returned, by ordinal.
+    active: std::collections::BTreeMap<u32, (u32, String)>,
 }
 
-/// Borrows the actual parent agent. IPC never supplies its identity or policy.
-pub struct AgentCodeModeBroker<'a> {
-    agent: &'a Agent,
-    context: &'a CodeModeRunContext,
+/// Owns a leaf clone of the parent agent so a host may return at its deadline
+/// while a non-cooperative child is still running. IPC never supplies its
+/// identity or policy.
+pub struct AgentCodeModeBroker {
+    agent: Agent,
+    context: CodeModeRunContext,
     parent: Option<OperationId>,
     policy: CapabilityPolicy,
     state: Mutex<RunState>,
+    drained: Condvar,
     dispatch: WorkerSlotCapacity,
 }
 
-impl<'a> AgentCodeModeBroker<'a> {
+impl AgentCodeModeBroker {
     pub fn new(
-        agent: &'a Agent,
-        context: &'a CodeModeRunContext,
+        agent: &Agent,
+        context: &CodeModeRunContext,
+        parent: Option<OperationId>,
+    ) -> Result<Self, CodeModeError> {
+        Self::owned(agent.clone(), context.clone(), parent)
+    }
+
+    pub fn owned(
+        agent: Agent,
+        context: CodeModeRunContext,
         parent: Option<OperationId>,
     ) -> Result<Self, CodeModeError> {
         let runtime = agent
@@ -102,7 +115,9 @@ impl<'a> AgentCodeModeBroker<'a> {
                 terminal: false,
                 terminal_code: "LIMIT_EXCEEDED",
                 children: vec![],
+                active: Default::default(),
             }),
+            drained: Condvar::new(),
             dispatch: WorkerSlotCapacity::new(),
         })
     }
@@ -154,12 +169,39 @@ impl<'a> AgentCodeModeBroker<'a> {
         Ok(value)
     }
 
+    /// Recorded outcomes plus any admitted child whose adapter has not returned.
     pub fn children(&self) -> Vec<CodeModeChildOutcome> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .children
-            .clone()
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut children = state.children.clone();
+        for (ordinal, (request_id, tool)) in &state.active {
+            let mut error = CodeModeError::new(
+                "CANCELLED",
+                "child was still running when the script ended; its result was discarded",
+            );
+            let reference = format!("{}#codemode:{ordinal}", self.context.identity.invocation_id);
+            error.operation_ref = Some(reference.clone());
+            children.push(CodeModeChildOutcome {
+                request_id: *request_id,
+                ordinal: *ordinal,
+                tool: tool.clone(),
+                operation_ref: reference,
+                status: CodeModeChildStatus::Cancelled,
+                error: Some(error),
+            });
+        }
+        children.sort_by_key(|child| child.ordinal);
+        children
+    }
+
+    /// Wait up to `timeout` for admitted children to return. False means at
+    /// least one adapter ignored cancellation and remains abandoned.
+    pub fn wait_for_children(&self, timeout: std::time::Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let (state, _) = self
+            .drained
+            .wait_timeout_while(state, timeout, |state| !state.active.is_empty())
+            .unwrap_or_else(|error| error.into_inner());
+        state.active.is_empty()
     }
 
     #[cfg(test)]
@@ -189,7 +231,7 @@ impl<'a> AgentCodeModeBroker<'a> {
     }
 }
 
-impl CodeModeBroker for AgentCodeModeBroker<'_> {
+impl CodeModeBroker for AgentCodeModeBroker {
     fn search(&self, query: ToolQuery) -> Result<ToolPage, CodeModeError> {
         self.live()?;
         if query.query.len() > 4096 || query.limit == 0 || query.limit > 20 {
@@ -285,8 +327,27 @@ impl CodeModeBroker for AgentCodeModeBroker<'_> {
                     "child request budget exhausted",
                 ));
             }
-            state.requests.len()
+            let ordinal = state.requests.len();
+            state
+                .active
+                .insert(ordinal as u32, (call.request_id, call.tool.clone()));
+            ordinal
         };
+        struct Active<'a>(&'a AgentCodeModeBroker, u32);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                let mut state = self
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                state.active.remove(&self.1);
+                if state.active.is_empty() {
+                    self.0.drained.notify_all();
+                }
+            }
+        }
+        let _active = Active(self, ordinal as u32);
         // A private leaf lane serializes effects without holding parent journal,
         // agent or admission-state locks while a child or approval waits.
         let _lane = self
@@ -369,11 +430,13 @@ impl CodeModeBroker for AgentCodeModeBroker<'_> {
             error
         });
         let value = if error.is_none() {
-            match super::projection::project_script_result(
+            match super::projection::project_script_result_with_artifact(
                 result,
                 structured,
                 operation_ref.clone(),
                 self.context.limits.child_result_bytes,
+                self.agent.evidence.as_ref(),
+                &id,
             ) {
                 Ok(value) => Some(value),
                 Err(mut projection_error) => {

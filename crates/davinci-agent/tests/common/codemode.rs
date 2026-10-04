@@ -119,7 +119,7 @@ impl crate::codemode::CodeModeHost for CountedReadOnlyFixtureHost {
         &self,
         request: &crate::codemode::CodeModeRequest,
         context: &crate::codemode::CodeModeRunContext,
-        broker: &dyn crate::codemode::CodeModeBroker,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
     ) -> crate::codemode::CodeModeOutcome {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::codemode::CodeModeHost::execute(&ReadOnlyFixtureHost, request, context, broker)
@@ -130,7 +130,7 @@ impl crate::codemode::CodeModeHost for ReadOnlyFixtureHost {
         &self,
         _: &crate::codemode::CodeModeRequest,
         _context: &crate::codemode::CodeModeRunContext,
-        broker: &dyn crate::codemode::CodeModeBroker,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
     ) -> crate::codemode::CodeModeOutcome {
         use crate::codemode::*;
         for request_id in [1, 2] {
@@ -378,7 +378,7 @@ fn codemode_inherits_root_deadline_before_host_launch() {
             &self,
             request: &crate::codemode::CodeModeRequest,
             context: &crate::codemode::CodeModeRunContext,
-            broker: &dyn crate::codemode::CodeModeBroker,
+            broker: Arc<dyn crate::codemode::CodeModeBroker>,
         ) -> crate::codemode::CodeModeOutcome {
             assert!(context.limits.wall_ms <= 5000 && context.limits.wall_ms > 0);
             self.0
@@ -451,7 +451,7 @@ fn codemode_off_keeps_provider_schema_and_invalid_input_never_launches() {
             &self,
             _: &crate::codemode::CodeModeRequest,
             _: &crate::codemode::CodeModeRunContext,
-            _: &dyn crate::codemode::CodeModeBroker,
+            _: Arc<dyn crate::codemode::CodeModeBroker>,
         ) -> crate::codemode::CodeModeOutcome {
             panic!("invalid input must not launch the host")
         }
@@ -825,7 +825,9 @@ fn queued_codemode_child_cancels_before_active_child_returns() {
             .unwrap();
         None
     })));
-    let context = broker_context(&agent);
+    let mut context = broker_context(&agent);
+    // Parallel-safe reads would otherwise overlap; this regression needs a queue.
+    context.limits.parallelism = 1;
     let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
@@ -1206,6 +1208,142 @@ fn delayed_response_loss_is_not_no_effect_or_an_automatic_retry() {
             assert!(matches!(result, Err(davinci_mcp::Error::Transport(_))));
         } else {
             assert_eq!(result.unwrap().text(), "fixture effect recorded");
+        }
+    }
+}
+
+#[test]
+fn abandoned_child_is_reported_and_drain_is_bounded() {
+    use crate::codemode::*;
+    let (mut agent, _workspace, _) = configured_agent();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    // Ignores cancellation, like a non-cooperative adapter.
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |_, _| {
+        entered_tx.send(()).unwrap();
+        let _ = release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5));
+        None
+    })));
+    let context = broker_context(&agent);
+    let broker = Arc::new(AgentCodeModeBroker::new(&agent, &context, None).unwrap());
+    let worker = {
+        let broker = broker.clone();
+        std::thread::spawn(move || {
+            broker.call(CodeModeCall {
+                request_id: 7,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+        })
+    };
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    context.cancellation.cancel();
+    let started = std::time::Instant::now();
+    assert!(!broker.wait_for_children(std::time::Duration::from_millis(50)));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    let children = broker.children();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].request_id, 7);
+    assert!(matches!(children[0].status, CodeModeChildStatus::Cancelled));
+    release_tx.send(()).unwrap();
+    let _ = worker.join().unwrap();
+    assert!(broker.wait_for_children(std::time::Duration::from_secs(2)));
+    let children = broker.children();
+    assert_eq!(children.len(), 1, "{children:?}");
+}
+
+#[test]
+fn oversized_child_read_returns_artifact_from_evidence_store() {
+    use crate::codemode::*;
+    let (mut agent, workspace, _) = configured_agent();
+    let body = format!(
+        "{}TAIL-SENTINEL",
+        format!("{}\n", "d".repeat(100)).repeat(100)
+    );
+    std::fs::write(workspace.path().join("large.txt"), &body).unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(workspace.path().join("evidence")));
+    let mut context = broker_context(&agent);
+    context.limits.child_result_bytes = 4096;
+    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let value = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "read".into(),
+            args: json!({"path":"large.txt"}),
+        })
+        .unwrap();
+    assert!(!value.complete);
+    assert!(value.structured_content.is_none());
+    assert!(!value.text.contains("TAIL-SENTINEL"));
+    let artifact = value.artifact.unwrap();
+    assert!(std::fs::read_to_string(&artifact.id)
+        .unwrap()
+        .contains("TAIL-SENTINEL"));
+    assert!(matches!(
+        broker.children()[0].status,
+        CodeModeChildStatus::Succeeded
+    ));
+}
+
+#[test]
+fn codemode_output_over_limit_keeps_full_output_as_artifact() {
+    struct LargeOutputHost;
+    impl crate::codemode::CodeModeHost for LargeOutputHost {
+        fn execute(
+            &self,
+            _: &crate::codemode::CodeModeRequest,
+            _: &crate::codemode::CodeModeRunContext,
+            _: Arc<dyn crate::codemode::CodeModeBroker>,
+        ) -> crate::codemode::CodeModeOutcome {
+            use crate::codemode::*;
+            CodeModeOutcome {
+                status: CodeModeStatus::Completed,
+                script_completed: true,
+                output_text: format!("{}END-SENTINEL", "x".repeat(20000)),
+                output_complete: true,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "host".into(),
+                error: None,
+            }
+        }
+    }
+    for with_store in [true, false] {
+        let (mut agent, workspace, journal) = configured_agent();
+        if with_store {
+            agent.evidence = Some(crate::EvidenceStore::new(workspace.path().join("evidence")));
+        }
+        agent
+            .enable_read_only_codemode(Arc::new(LargeOutputHost))
+            .unwrap();
+        let args = json!({"code":"return 1","maxOutputBytes":4096});
+        agent.execute_tool_batch(
+            workspace.path(),
+            vec![("large-output".into(), "codemode".into(), args.clone())],
+            &mut Vec::new(),
+        );
+        let parent = journal.snapshot().unwrap().operations[0].operation_id();
+        let result = agent.run_codemode("large-output-direct", &args, Some(parent));
+        let outcome = &result.details.as_ref().unwrap()["codemode"];
+        assert_eq!(outcome["outputComplete"], false);
+        assert!(outcome["outputText"].as_str().unwrap().len() <= 4096);
+        let notes = outcome["hostNotes"].to_string();
+        if with_store {
+            let path = outcome["outputArtifact"]["id"].as_str().unwrap();
+            assert!(std::fs::read_to_string(path)
+                .unwrap()
+                .ends_with("END-SENTINEL"));
+            assert!(notes.contains(path));
+        } else {
+            assert!(outcome["outputArtifact"].is_null());
+            assert!(notes.contains("no full-output artifact"));
         }
     }
 }

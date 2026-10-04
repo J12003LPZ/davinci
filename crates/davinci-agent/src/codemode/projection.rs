@@ -71,6 +71,22 @@ pub fn project_script_result(
     operation_ref: String,
     maximum: usize,
 ) -> Result<CodeModeToolValue, CodeModeError> {
+    project_script_result_with_artifact(result, structured, operation_ref, maximum, None, "")
+}
+
+/// Project a child result for the script. Oversized data is never cut into
+/// invalid JSON: the full result goes to the evidence store and the script
+/// receives `complete: false`, `structuredContent: null`, a bounded text
+/// prefix and the host-issued artifact reference. Without a store, the
+/// failure stays explicit.
+pub fn project_script_result_with_artifact(
+    result: crate::ToolResult,
+    structured: Option<Value>,
+    operation_ref: String,
+    maximum: usize,
+    evidence: Option<&crate::EvidenceStore>,
+    tag: &str,
+) -> Result<CodeModeToolValue, CodeModeError> {
     if result.is_error {
         return Err(CodeModeError::new("TOOL_FAILED", &result.content));
     }
@@ -84,11 +100,53 @@ pub fn project_script_result(
         artifact: None,
         operation_ref,
     };
-    if serialized_size(&value, maximum).is_err() {
-        return Err(CodeModeError::new(
+    if serialized_size(&value, maximum).is_ok() {
+        return Ok(value);
+    }
+    let unavailable = || {
+        CodeModeError::new(
             "INCOMPLETE_DATA",
             "child output exceeds the script budget; no authorized artifact is available",
-        ));
+        )
+    };
+    let store = evidence.ok_or_else(unavailable)?;
+    let (full, extension_tag) = match &value.structured_content {
+        Some(structured) => (
+            serde_json::to_string(
+                &serde_json::json!({"text":value.text,"structuredContent":structured}),
+            )
+            .map_err(|_| unavailable())?,
+            "json",
+        ),
+        None => (value.text.clone(), "text"),
+    };
+    let path = store
+        .store(&format!("codemode-{extension_tag}-{tag}"), &full)
+        .map_err(|_| unavailable())?;
+    let mut incomplete = CodeModeToolValue {
+        text: String::new(),
+        structured_content: None,
+        complete: false,
+        artifact: Some(super::CodeModeArtifact {
+            id: path.display().to_string(),
+            kind: super::CodeModeArtifactKind::ToolOutput,
+            bytes: full.len() as u64,
+        }),
+        operation_ref: value.operation_ref,
+    };
+    if serialized_size(&incomplete, maximum).is_err() {
+        return Err(unavailable());
     }
-    Ok(value)
+    // Keep the largest text prefix that still fits; JSON escaping can expand it.
+    let mut cut = value.text.len().min(maximum);
+    while cut > 0 {
+        let prefix = crate::evidence::cut_at_char_boundary(&value.text, cut);
+        incomplete.text = prefix.to_owned();
+        if serialized_size(&incomplete, maximum).is_ok() {
+            return Ok(incomplete);
+        }
+        cut = prefix.len() / 2;
+    }
+    incomplete.text.clear();
+    Ok(incomplete)
 }

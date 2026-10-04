@@ -79,3 +79,51 @@ fn tool_errors_and_oversized_structured_data_fail_explicitly() {
     assert_eq!(error.code, "INCOMPLETE_DATA");
     assert!(error.message.contains("no authorized artifact"));
 }
+
+#[test]
+fn oversized_child_data_returns_authorized_artifact_instead_of_invalid_json() {
+    use davinci_agent::codemode::projection::{
+        project_script_result_with_artifact, serialized_size,
+    };
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = davinci_agent::EvidenceStore::new(store_dir.path());
+    let structured = json!({"rows":(0..2000).map(|n| json!({"n":n})).collect::<Vec<_>>()});
+    let value = project_script_result_with_artifact(
+        result(&"t".repeat(20000)),
+        Some(structured.clone()),
+        "op".into(),
+        4096,
+        Some(&store),
+        "child",
+    )
+    .unwrap();
+    assert!(!value.complete);
+    assert!(value.structured_content.is_none());
+    assert!(serialized_size(&value, 4096).is_ok());
+    assert!(value.text.len() < 4096 && value.text.chars().all(|c| c == 't'));
+    let artifact = value.artifact.unwrap();
+    assert!(std::path::Path::new(&artifact.id).starts_with(store_dir.path()));
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&artifact.id).unwrap()).unwrap();
+    assert_eq!(saved["structuredContent"], structured);
+    assert_eq!(saved["text"].as_str().unwrap().len(), 20000);
+    assert_eq!(
+        artifact.bytes,
+        std::fs::metadata(&artifact.id).unwrap().len()
+    );
+
+    // An envelope that cannot fit even without data stays an explicit failure.
+    assert_eq!(
+        project_script_result_with_artifact(
+            result("large"),
+            None,
+            "op".into(),
+            8,
+            Some(&store),
+            "x"
+        )
+        .unwrap_err()
+        .code,
+        "INCOMPLETE_DATA"
+    );
+}

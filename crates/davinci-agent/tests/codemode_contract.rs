@@ -69,3 +69,30 @@ fn invalid_source_is_rejected_before_host_admission() {
         assert!(CodeModeLimits::default().for_request(&request).is_err());
     }
 }
+
+#[test]
+fn advertised_schema_matches_effective_request_limits() {
+    let limits = CodeModeLimits::default();
+    let schema = limits.request_schema();
+    let maximum = |field: &str| schema["properties"][field]["maximum"].as_u64().unwrap();
+    assert_eq!(maximum("timeoutMs"), limits.wall_ms);
+    assert_eq!(maximum("maxOutputBytes"), limits.output_bytes as u64);
+    let request = |timeout_ms, max_output_bytes| CodeModeRequest {
+        code: "return 1".into(),
+        timeout_ms,
+        max_output_bytes,
+    };
+    let accepted = limits
+        .for_request(&request(Some(limits.wall_ms), Some(limits.output_bytes)))
+        .unwrap();
+    assert_eq!(accepted.wall_ms, limits.wall_ms);
+    assert_eq!(accepted.output_bytes, limits.output_bytes);
+    // Values above the advertised maximum are rejected, not silently clamped.
+    assert!(limits
+        .for_request(&request(Some(limits.wall_ms + 1), None))
+        .is_err());
+    assert!(limits
+        .for_request(&request(None, Some(limits.output_bytes + 1)))
+        .is_err());
+    assert!(limits.for_request(&request(None, Some(4095))).is_err());
+}

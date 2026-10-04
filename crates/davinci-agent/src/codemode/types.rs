@@ -57,6 +57,7 @@ pub struct CodeModeLimits {
     pub cleanup_grace_ms: u64,
 }
 // Host-created only: never Deserialize this context from model or IPC input.
+#[derive(Clone)]
 pub struct CodeModeRunContext {
     pub identity: CodeModeIdentity,
     pub mode: CodeModeMode,
@@ -83,6 +84,8 @@ pub enum CodeModeArtifactKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodeModeArtifact {
+    /// Evidence-store path issued by the Rust host. Retrieval goes through the
+    /// ordinary `read` tool, so its permission check applies on every access.
     pub id: String,
     pub kind: CodeModeArtifactKind,
     pub bytes: u64,
@@ -163,10 +166,12 @@ pub trait CodeModeBroker: Send + Sync {
     fn call(&self, call: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError>;
 }
 pub trait CodeModeHost: Send + Sync {
+    /// The broker is owned so a host can return at its deadline while a
+    /// non-cooperative child callback is still running on another thread.
     fn execute(
         &self,
         request: &CodeModeRequest,
         context: &CodeModeRunContext,
-        broker: &dyn CodeModeBroker,
+        broker: std::sync::Arc<dyn CodeModeBroker>,
     ) -> CodeModeOutcome;
 }

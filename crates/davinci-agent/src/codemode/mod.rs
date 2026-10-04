@@ -44,6 +44,14 @@ impl Default for CodeModeLimits {
 }
 
 impl CodeModeLimits {
+    /// The model-facing input schema advertises exactly these effective limits.
+    pub fn request_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["code"],
+            "properties":{"code":{"type":"string","minLength":1,"maxLength":self.script_bytes.min(65536)},
+            "timeoutMs":{"type":"integer","minimum":1,"maximum":self.wall_ms},
+            "maxOutputBytes":{"type":"integer","minimum":4096,"maximum":self.output_bytes.max(4096)}}})
+    }
+
     pub fn for_request(&self, request: &CodeModeRequest) -> Result<Self, CodeModeError> {
         let mut limits = self.clone();
         if request.code.trim().is_empty()
@@ -64,22 +72,23 @@ impl CodeModeLimits {
             ));
         }
         if let Some(timeout) = request.timeout_ms {
-            if timeout == 0 || timeout > 300000 {
+            // Request values may reduce the effective host limit, never exceed it.
+            if timeout == 0 || timeout > self.wall_ms {
                 return Err(CodeModeError::new(
                     "INVALID_INPUT",
                     "timeout exceeds admitted range",
                 ));
             }
-            limits.wall_ms = timeout.min(self.wall_ms);
+            limits.wall_ms = timeout;
         }
         if let Some(output) = request.max_output_bytes {
-            if !(4096..=65536).contains(&output) {
+            if output < 4096 || output > self.output_bytes {
                 return Err(CodeModeError::new(
                     "INVALID_INPUT",
                     "output limit exceeds admitted range",
                 ));
             }
-            limits.output_bytes = output.min(self.output_bytes);
+            limits.output_bytes = output;
         }
         Ok(limits)
     }
