@@ -423,7 +423,6 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     if let Some(result) = davinci_coding_agent::runtime_inspect::try_run(&raw) {
         return result;
     }
-    let command_start = args::first_non_offline_argument(&raw).unwrap_or(0);
     // `--davinci --screen <id>` renders a mockup screen against fixtures for
     // comparison with docs/ui. The davinci shell is what interactive pi opens;
     // `--legacy-tui` (or `PI_DAVINCI=0`) asks for the previous chrome, which
