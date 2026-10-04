@@ -49,3 +49,10 @@ Source inspection only so far. No test completion, package admission, platform s
 - The added unrestricted `cargo fetch --locked` step fails before tests on an existing optional dependency, `toml_parser 1.1.3+spec-1.1.0`, whose edition-2024 manifest Cargo 1.83 cannot parse. The product uses pinned `toml_edit 0.22.27`; the incompatible parser belongs to another already-locked graph
 - Ruling: prepare only the actual tested package/target graph with `cargo test --no-run --locked`, then run the planned `--offline --locked` tests. Do not change Rust pins or lockfile to make an unrelated all-features/all-targets fetch succeed
 - Package characterization job is gated on successful C00 baselines across the three native operating systems. Proposed Node identity is 24.21.0, listed as the current maintained LTS on https://nodejs.org/en/about/previous-releases at inspection. No package has been admitted yet
+
+## C00 verified baseline / C03 test-first
+
+- Linux passed 110 focused tests on PR head `817f39ff182a0866806f349242926196cb8f713e` (PR test-merge `6291326`): batch 4, tool ledger 20, MCP 38, new Codemode baseline 3, operation dispatch 11, Governor 34. [Job evidence](https://github.com/J12003LPZ/davinci/actions/runs/37221623922/job/111493006804)
+- Format and full-workspace clippy passed at that head. Windows/macOS validation remains ongoing, not assumed
+- Added an executable counted-effect/delayed/lost-response MCP transport fixture to finish the reusable C00 corpus; it invokes the actual MCP client and checks that a lost response does not automatically repeat the effect
+- C03 may proceed independently of C01/C02, as the approved plan explicitly permits. Added test-first retention cases against the existing decoder/client; production changes follow only after the expected loss-of-structured-data failures are observed

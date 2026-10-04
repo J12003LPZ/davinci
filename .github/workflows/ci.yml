@@ -483,3 +483,12 @@ jobs:
           name: codemode-dependency-evidence-${{ runner.os }}
           path: crates/davinci-coding-agent/codemode-host/package-lock.json
           if-no-files-found: warn
+
+  codemode-structured:
+    name: codemode-structured
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Structured MCP retention regression
+        run: cargo test -p davinci-mcp --test codemode_structured --locked

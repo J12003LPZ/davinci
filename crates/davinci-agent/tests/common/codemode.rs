@@ -185,3 +185,69 @@ fn sanitized_mcp_corpus_preserves_baseline_text_and_errors() {
     // C03 adds retention assertions. This baseline does not pretend that
     // structuredContent/outputSchema already survive the current decoder.
 }
+
+/// Reusable local transport: the mutation counter is changed before a lost
+/// response, so later recovery tests can distinguish failure from no effect.
+struct CountedMcpFixture {
+    effects: Arc<std::sync::atomic::AtomicUsize>,
+    delay: std::time::Duration,
+    lose_response: bool,
+}
+
+impl davinci_mcp::RpcTransport for CountedMcpFixture {
+    fn call(&mut self, method: &str, _params: Value) -> davinci_mcp::Result<Value> {
+        match method {
+            "initialize" => Ok(json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}}
+            })),
+            "tools/list" => Ok(json!({
+                "tools": [{"name": "counted_effect", "inputSchema": {"type": "object"}}]
+            })),
+            "tools/call" => {
+                self.effects
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                if self.lose_response {
+                    Err(davinci_mcp::Error::Transport("fixture response lost".into()))
+                } else {
+                    Ok(json!({
+                        "content": [{"type": "text", "text": "fixture effect recorded"}],
+                        "structuredContent": {"count": 1}
+                    }))
+                }
+            }
+            _ => Err(davinci_mcp::Error::Protocol(
+                "unexpected fixture method".into(),
+            )),
+        }
+    }
+
+    fn notify(&mut self, method: &str, _params: Value) -> davinci_mcp::Result<()> {
+        assert_eq!(method, "notifications/initialized");
+        Ok(())
+    }
+}
+
+#[test]
+fn delayed_response_loss_is_not_no_effect_or_an_automatic_retry() {
+    for lose_response in [false, true] {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = davinci_mcp::Client::connect_transport(
+            "counted_fixture",
+            Box::new(CountedMcpFixture {
+                effects: effects.clone(),
+                delay: std::time::Duration::from_millis(25),
+                lose_response,
+            }),
+        )
+        .unwrap();
+        let result = client.call_tool("counted_effect", json!({}));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if lose_response {
+            assert!(matches!(result, Err(davinci_mcp::Error::Transport(_))));
+        } else {
+            assert_eq!(result.unwrap().text(), "fixture effect recorded");
+        }
+    }
+}
