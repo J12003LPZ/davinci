@@ -69,7 +69,7 @@ fn native_host_executes_without_model_or_capability_access() {
             max_output_bytes: None,
         },
         &context,
-        &NoTools,
+        std::sync::Arc::new(NoTools),
     );
     assert!(
         matches!(outcome.status, CodeModeStatus::Completed),
@@ -125,7 +125,7 @@ fn native_root_deadline_does_not_restart_after_host_setup() {
             max_output_bytes: None,
         },
         &context,
-        &NoTools,
+        std::sync::Arc::new(NoTools),
     );
     assert!(!outcome.script_completed);
     assert!(
@@ -227,7 +227,7 @@ fn native_host_runs_parallel_read_callbacks() {
             max_output_bytes: None,
         },
         &context,
-        &broker,
+        std::sync::Arc::new(broker),
     );
     assert!(
         matches!(outcome.status, CodeModeStatus::Completed),
@@ -296,7 +296,7 @@ fn native_deadline_returns_when_broker_ignores_cancellation() {
             max_output_bytes: None,
         },
         &context,
-        &NonCooperativeBroker,
+        std::sync::Arc::new(NonCooperativeBroker),
     );
     assert!(!outcome.script_completed);
     assert!(
@@ -363,7 +363,7 @@ fn native_deadline_remains_active_while_rust_waits_for_a_child() {
             max_output_bytes: None,
         },
         &context,
-        &WaitingBroker(cancellation.clone()),
+        std::sync::Arc::new(WaitingBroker(cancellation.clone())),
     );
     assert!(!outcome.script_completed);
     assert!(cancellation.is_cancelled());
