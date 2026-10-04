@@ -64,7 +64,11 @@ fn export_missing_input_fails_without_creating_a_session_or_output() {
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("Session not found"), "{}", describe(&output));
+        assert!(
+            stderr.contains("Session not found"),
+            "{}",
+            describe(&output)
+        );
         assert!(stderr.contains(reference), "{}", describe(&output));
         assert!(output.stdout.is_empty(), "{}", describe(&output));
         assert!(!root.path().join("out.html").exists());
@@ -149,7 +153,11 @@ fn invalid_mode_fails_before_starting_a_session() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Invalid mode \"banana\""), "{}", describe(&output));
+    assert!(
+        stderr.contains("Invalid mode \"banana\""),
+        "{}",
+        describe(&output)
+    );
     assert!(stderr.contains("text, json, rpc"), "{}", describe(&output));
     assert!(output.stdout.is_empty(), "{}", describe(&output));
     assert!(!root.path().join("sessions").exists());
@@ -157,7 +165,11 @@ fn invalid_mode_fails_before_starting_a_session() {
 
 #[test]
 fn mode_accepts_text_json_and_rpc_in_spaced_and_equals_forms() {
-    for (value, expected) in [("text", Mode::Text), ("json", Mode::Json), ("rpc", Mode::Rpc)] {
+    for (value, expected) in [
+        ("text", Mode::Text),
+        ("json", Mode::Json),
+        ("rpc", Mode::Rpc),
+    ] {
         for raw in [
             vec!["--mode".to_string(), value.to_string()],
             vec![format!("--mode={value}")],
@@ -180,10 +192,17 @@ fn invalid_or_missing_modes_report_errors_without_swallowing_flags() {
         vec!["--mode", "--print", "hello"],
         vec!["--mode", "json", "--mode", "banana"],
     ] {
-        let parsed = parse_args(&raw.iter().map(|value| value.to_string()).collect::<Vec<_>>());
+        let parsed = parse_args(
+            &raw.iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+        );
         assert!(
-            parsed.diagnostics.iter().any(|diagnostic| diagnostic.kind == "error"
-                && diagnostic.message.contains("text, json, rpc")),
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "error"
+                    && diagnostic.message.contains("text, json, rpc")),
             "{raw:?}: {:?}",
             parsed.diagnostics
         );
