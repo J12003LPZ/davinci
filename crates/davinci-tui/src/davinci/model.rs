@@ -23,18 +23,6 @@ use super::theme::{State, Theme};
 /// belongs to visible (design.md §2).
 pub const SUGGESTION_ROWS: usize = 5;
 
-#[derive(Debug, Default, Clone)]
-pub struct VoiceView {
-    pub enabled: bool,
-    pub mouse: bool,
-    pub active: bool,
-    pub blocks_send: bool,
-    pub label: String,
-    pub notice: String,
-    pub setup: bool,
-    pub setup_rows: Vec<String>,
-}
-
 /// Da Vinci's composer text backed by the mature shared [`Editor`].
 ///
 /// `Deref<str>` and the string conversions keep the renderer/fixture surface
@@ -2298,9 +2286,6 @@ pub struct Model {
     pub placeholder: usize,
     /// `?` in an empty composer: the shortcuts panel replaces the footer.
     pub shortcuts_open: bool,
-    /// Lightweight host projection; never owns native/audio resources.
-    pub voice: VoiceView,
-    pub composer_epoch: u64,
     /// Configurable bindings shared with the regular TUI editor.
     pub keybindings: Keybindings,
     /// `(key, extension path)` for every `pi.registerShortcut` an extension
@@ -2523,8 +2508,6 @@ impl Model {
             composer: Composer::default(),
             placeholder: 0,
             shortcuts_open: false,
-            voice: VoiceView::default(),
-            composer_epoch: 0,
             keybindings: Keybindings::defaults(),
             extension_shortcuts: Vec::new(),
             terminal_input_registered: false,
@@ -3124,15 +3107,7 @@ impl Model {
         }
     }
 
-    pub fn voice_eligible(&self) -> bool {
-        self.screen == Screen::Agent
-            && self.overlay.is_none()
-            && !self.codex_open()
-            && !self.voice.setup
-    }
-
     pub fn replace_composer(&mut self, text: impl Into<String>) {
-        self.composer_epoch = self.composer_epoch.saturating_add(1);
         self.composer.set_text(text);
         self.mark_caret_moved();
         self.refresh_suggestions();
@@ -3152,36 +3127,13 @@ impl Model {
         true
     }
 
-    /// One editor transaction at the current caret, never a submission.
-    pub fn insert_dictation(
-        &mut self,
-        text: &str,
-        epoch: u64,
-    ) -> Result<bool, davinci_voice::normalize::TextError> {
-        if epoch != self.composer_epoch || !self.voice_eligible() {
-            return Ok(false);
-        }
-        let text = davinci_voice::normalize::insertion(
-            text,
-            &self.composer,
-            self.composer.editor().cursor,
-        )?;
-        if text.is_empty() {
-            return Ok(false);
-        }
-        self.composer.push_str(&text);
-        self.mark_caret_moved();
-        self.refresh_suggestions();
-        Ok(true)
-    }
-
     /// Enter sends. An empty composer sends nothing.
     ///
     /// The line goes through [`Editor::submit`], which is what records it in
     /// the composer history and expands any paste markers — taking the buffer
     /// directly shipped markers literally and remembered nothing.
     pub fn submit(&mut self) {
-        if self.voice.blocks_send || self.composer.trim().is_empty() {
+        if self.composer.trim().is_empty() {
             return;
         }
         self.mark_caret_moved();
@@ -3200,7 +3152,7 @@ impl Model {
     /// Returns whether anything was queued. Queued lines join the history
     /// too: they were typed and sent, only later.
     pub fn queue(&mut self) -> bool {
-        if self.voice.blocks_send || self.composer.trim().is_empty() {
+        if self.composer.trim().is_empty() {
             return false;
         }
         self.mark_caret_moved();
@@ -3332,23 +3284,6 @@ pub fn wrap_index(index: usize, delta: isize, len: usize) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn dictation_inserts_at_live_cursor_once_without_sending() {
-        let mut m = model(100);
-        m.composer.push_str("abXY");
-        m.composer.editor_mut().cursor = 2;
-        let entries = m.transcript.len();
-        assert!(m.insert_dictation("hello\n世界", m.composer_epoch).unwrap());
-        assert_eq!(m.composer.to_string(), "ab hello\n世界XY");
-        assert_eq!(m.transcript.len(), entries);
-        assert!(m.queued.is_empty());
-        m.composer.editor_mut().undo();
-        assert_eq!(m.composer.to_string(), "abXY");
-        m.replace_composer("new draft");
-        assert!(!m.insert_dictation("stale", 0).unwrap());
-        m.overlay = Some(Overlay::Instrumenta);
-        assert!(!m.insert_dictation("modal", m.composer_epoch).unwrap());
-    }
     use crate::davinci::theme::ColorDepth;
 
     fn model(width: u16) -> Model {

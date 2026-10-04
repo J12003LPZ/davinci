@@ -1389,9 +1389,6 @@ fn mid_turn_key(
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if model.voice.blocks_send && davinci_tui::davinci::app::voice_send_key(model, &key) {
-        return false;
-    }
     if let Some(data) = davinci_tui::key_event_bytes(&key) {
         if model.keybindings.matches(&data, "davinci.tools.expand") {
             model.show_tool_output = !model.show_tool_output;
@@ -1446,14 +1443,7 @@ fn mid_turn_key(
 /// bypassed every check: a queued `/command` went to the provider verbatim.
 fn run_turns(shell: &mut Shell<'_>) -> Next {
     let host = shell.host.clone();
-    if let Err(err) = run_turn(
-        shell.parsed,
-        shell.agent,
-        shell.model,
-        shell.terminal,
-        host,
-        shell.voice,
-    ) {
+    if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
         return Next::Fail(err.to_string());
     }
     while !shell.model.queued.is_empty() {
@@ -1485,7 +1475,6 @@ fn run_turn(
     model: &mut Model,
     session: &mut davinci_tui::davinci::runtime::Session,
     host: Arc<Mutex<ExtensionHost>>,
-    voice: &mut crate::voice_input::VoiceInput,
 ) -> std::io::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
     let abort = Arc::new(AtomicBool::new(false));
@@ -1609,31 +1598,21 @@ fn run_turn(
                     turn.await_approval(model, request);
                     model.ask = permission_ask_at(request, trusted, &cwd);
                     open_ask_overlay(model);
-                    voice.cancel(model);
                     approval = Some(pending);
                 } else if let Ok(pending) = decision_rx.try_recv() {
                     if !pending.is_live() {
                         continue;
                     }
                     open_decision_modal(model, &pending.request.question);
-                    voice.cancel(model);
                     decision = Some(pending);
                 }
             }
             if let Some(working) = model.working.as_mut() {
                 working.seconds = started.elapsed().as_secs();
             }
-            voice.tick(model, session.input_pending());
-            if voice.polling() {
-                model.dirty = true;
-            }
             if model.dirty {
                 session.draw(model)?;
                 model.dirty = false;
-                voice.drawn();
-                if model.voice.active && !session.mic_visible() {
-                    voice.cancel(model);
-                }
             }
 
             if worker.is_finished() {
@@ -1641,11 +1620,6 @@ fn run_turn(
             }
             if let Some(event) = session.poll_event(Duration::from_millis(40))? {
                 model.dirty = true;
-                if let crossterm::event::Event::Key(key) = event {
-                    if voice.key(model, key) {
-                        continue;
-                    }
-                }
                 match event {
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release
@@ -1773,14 +1747,10 @@ fn run_turn(
                         model.height = height.max(4);
                     }
                     crossterm::event::Event::Paste(text) => {
-                        if !voice.paste(model, &text) {
-                            model.paste(&text);
-                        }
+                        model.paste(&text);
                     }
                     crossterm::event::Event::Mouse(mouse) => {
-                        if session.handle_model_mouse(model, mouse) {
-                            voice.toggle(model);
-                        }
+                        session.handle_model_mouse(model, mouse);
                     }
                     _ => {}
                 }
@@ -1921,14 +1891,9 @@ fn run_turn(
         if let Some(preview) = scope_expansion.take() {
             let task_guard = capture_scope_expansion_task_guard(agent, &preview)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            if let Some(guidance) = resolve_scope_expansion_modal(
-                agent,
-                model,
-                session,
-                &preview,
-                task_guard.as_ref(),
-                voice,
-            )? {
+            if let Some(guidance) =
+                resolve_scope_expansion_modal(agent, model, session, &preview, task_guard.as_ref())?
+            {
                 model.transcript.push(Entry::Detail(guidance.clone()));
                 model.queued.insert(0, guidance);
             }
@@ -2207,11 +2172,6 @@ pub fn corpus(
         .collect();
 
     // Davinci's own commands, which no shared command list carries.
-    items.push(CorpusItem::new(
-        "Local voice setup",
-        "download or import an approved local speech model",
-        "voice",
-    ));
     items.push(CorpusItem::new(
         "/diff",
         "review every change in the working tree",
@@ -3392,13 +3352,11 @@ fn resolve_scope_expansion_modal(
     session: &mut davinci_tui::davinci::runtime::Session,
     preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
     task_guard: Option<&ScopeExpansionTaskGuard>,
-    voice: &mut crate::voice_input::VoiceInput,
 ) -> std::io::Result<Option<String>> {
     model.ask = scope_expansion_ask(preview);
     model.ask_index = 0;
     model.approval_instructions = None;
     open_ask_overlay(model);
-    voice.cancel(model);
     let mut last_tick = Instant::now();
     loop {
         let _ = session.reacquire();
@@ -3407,14 +3365,9 @@ fn resolve_scope_expansion_modal(
             model.dirty = true;
             last_tick = Instant::now();
         }
-        voice.tick(model, session.input_pending());
-        if voice.polling() {
-            model.dirty = true;
-        }
         if model.dirty {
             session.draw(model)?;
             model.dirty = false;
-            voice.drawn();
         }
         let Some(event) = session.poll_event(Duration::from_millis(40))? else {
             continue;
@@ -3443,9 +3396,7 @@ fn resolve_scope_expansion_modal(
                 model.paste(&text);
             }
             crossterm::event::Event::Mouse(mouse) => {
-                if session.handle_model_mouse(model, mouse) {
-                    voice.toggle(model);
-                }
+                session.handle_model_mouse(model, mouse);
             }
             _ => {}
         }
@@ -3764,7 +3715,6 @@ pub fn perform(
             let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(store)?;
-            model.composer_epoch = model.composer_epoch.saturating_add(1);
             model.transcript.clear();
             Ok(Done::Said("started a new session".into()))
         }
@@ -3936,7 +3886,6 @@ pub fn perform(
                 )
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
-            model.composer_epoch = model.composer_epoch.saturating_add(1);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("forked to {}", session_id(agent))))
         }
@@ -3949,7 +3898,6 @@ pub fn perform(
                 .clone_session(&session_dir)
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
-            model.composer_epoch = model.composer_epoch.saturating_add(1);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("cloned to {}", session_id(agent))))
         }
@@ -3960,7 +3908,6 @@ pub fn perform(
             let expanded = davinci_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
-            model.composer_epoch = model.composer_epoch.saturating_add(1);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("imported {}", session_id(agent))))
         }
@@ -4072,9 +4019,7 @@ pub fn perform(
         }
         SlashAction::Reload => {
             let keybindings_started = Instant::now();
-            model.keybindings = davinci_tui::Keybindings::load(&agent_dir)
-                .with_voice(model.voice.enabled)
-                .0;
+            model.keybindings = davinci_tui::Keybindings::load(&agent_dir);
             let keybindings_ms = keybindings_started.elapsed().as_millis();
             let resources_started = Instant::now();
             crate::apply_discovered_resources(parsed, agent);
@@ -4638,7 +4583,6 @@ pub fn run(
     // The user's own bindings, which davinci was rendering the defaults of
     // however `~/.pi/agent/keybindings.json` read.
     model.keybindings = davinci_tui::Keybindings::load(&crate::default_agent_dir());
-    let mut voice = crate::voice_input::VoiceInput::new(&mut model);
     // Every `pi.registerShortcut` an extension made, resolved against those
     // bindings so a shortcut never shadows a reserved chord. Without this,
     // every registered shortcut was dead under davinci.
@@ -4762,7 +4706,6 @@ pub fn run(
     );
     for (text, images) in openers {
         let mut shell = Shell {
-            voice: &mut voice,
             parsed,
             agent,
             model: &mut model,
@@ -4826,7 +4769,6 @@ pub fn run(
                     Ok(_) => {
                         if selection.transcript {
                             model.transcript = transcript_from(&agent.messages);
-                            model.composer_epoch = model.composer_epoch.saturating_add(1);
                         }
                         model.transcript.push(Entry::notice(
                             State::Attention,
@@ -4899,7 +4841,6 @@ pub fn run(
             team_mail_since = None;
             if let Some(text) = team_wake_text(agent) {
                 let mut shell = Shell {
-                    voice: &mut voice,
                     parsed,
                     agent,
                     model: &mut model,
@@ -4971,10 +4912,6 @@ pub fn run(
                 model.dirty = true;
             }
         }
-        voice.tick(&mut model, terminal.input_pending());
-        if voice.polling() {
-            model.dirty = true;
-        }
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
@@ -4983,18 +4920,9 @@ pub fn run(
                 break Err(err.to_string());
             }
             model.dirty = false;
-            voice.drawn();
-            if model.voice.active && !terminal.mic_visible() {
-                voice.cancel(&mut model);
-            }
         }
 
         let timeout = davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed());
-        let timeout = if voice.polling() {
-            timeout.min(Duration::from_millis(40))
-        } else {
-            timeout
-        };
         match terminal.poll_event(timeout) {
             Ok(Some(event)) => {
                 model.dirty = true;
@@ -5006,10 +4934,6 @@ pub fn run(
                             continue;
                         }
                         // An extension's registered shortcut gets the chord before
-                        if voice.key(&mut model, key) {
-                            last_escape = None;
-                            continue;
-                        }
                         // the shell's own keys, exactly as the legacy loop gives
                         // it. Resolution already refused the reserved chords.
                         let claimed = davinci_tui::key_event_bytes(&key).and_then(|data| {
@@ -5021,7 +4945,6 @@ pub fn run(
                         });
                         if let Some((chord, path)) = claimed {
                             let mut shell = Shell {
-                                voice: &mut voice,
                                 parsed,
                                 agent,
                                 model: &mut model,
@@ -5049,7 +4972,6 @@ pub fn run(
                             });
                             if taken {
                                 let mut shell = Shell {
-                                    voice: &mut voice,
                                     parsed,
                                     agent,
                                     model: &mut model,
@@ -5147,7 +5069,6 @@ pub fn run(
                                     action @ (davinci_tui::DoubleEscapeAction::Fork
                                     | davinci_tui::DoubleEscapeAction::Rewind) => {
                                         let mut shell = Shell {
-                                            voice: &mut voice,
                                             parsed,
                                             agent,
                                             model: &mut model,
@@ -5197,7 +5118,6 @@ pub fn run(
                                 });
                                 if doubled {
                                     run_stop_hooks(&mut Shell {
-                                        voice: &mut voice,
                                         parsed,
                                         agent,
                                         model: &mut model,
@@ -5220,7 +5140,6 @@ pub fn run(
                             }
                             Flow::Quit => {
                                 run_stop_hooks(&mut Shell {
-                                    voice: &mut voice,
                                     parsed,
                                     agent,
                                     model: &mut model,
@@ -5235,7 +5154,6 @@ pub fn run(
                             }
                             Flow::Submit(line) => on_line(
                                 &mut Shell {
-                                    voice: &mut voice,
                                     parsed,
                                     agent,
                                     model: &mut model,
@@ -5250,7 +5168,6 @@ pub fn run(
                             ),
                             Flow::Choose(choice) => on_choice(
                                 &mut Shell {
-                                    voice: &mut voice,
                                     parsed,
                                     agent,
                                     model: &mut model,
@@ -5300,14 +5217,10 @@ pub fn run(
                         if graph_setup::paste(&mut model, &mut pending, agent, &text) {
                             continue;
                         }
-                        if !voice.paste(&mut model, &text) {
-                            model.paste(&text);
-                        }
+                        model.paste(&text);
                     }
                     crossterm::event::Event::Mouse(mouse) => {
-                        if terminal.handle_model_mouse(&mut model, mouse) {
-                            voice.toggle(&mut model);
-                        }
+                        terminal.handle_model_mouse(&mut model, mouse);
                     }
                     _ => {}
                 }
@@ -6439,7 +6352,6 @@ fn humanize_action(action: &str) -> String {
             "mensura" => "token governor",
             "memoria" => "memory",
             "codex" => "workspace",
-            "voice" => "voice input",
             "tools" => "tool output",
             other => other,
         };
@@ -8325,7 +8237,6 @@ fn graph_public_text(value: &str) -> String {
 /// Everything a composer line or a chosen row may need. Bundled because the
 /// borrow checker will not let the loop hand out eight `&mut` pieces at once.
 struct Shell<'a> {
-    voice: &'a mut crate::voice_input::VoiceInput,
     parsed: &'a crate::args::Args,
     agent: &'a mut Agent,
     model: &'a mut Model,
@@ -8429,8 +8340,6 @@ impl Shell<'_> {
     /// then take it again. A browser handshake prints and prompts; it cannot
     /// do either underneath an alternate screen.
     fn detach(&mut self, detached: Detached) -> Next {
-        self.voice.terminal_handoff(self.model);
-        self.model.composer_epoch = self.model.composer_epoch.saturating_add(1);
         if let Err(err) = self.terminal.close() {
             return Next::Fail(err.to_string());
         }
@@ -8477,8 +8386,6 @@ impl Shell<'_> {
                     self.note(&error);
                     return Next::Go;
                 }
-                self.voice.cancel(self.model);
-                self.model.composer_epoch = self.model.composer_epoch.saturating_add(1);
                 self.model.transcript = transcript_from(&self.agent.messages);
                 self.model.running = false;
                 self.redress();
@@ -8753,11 +8660,6 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
 fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
     match choice {
         Choice::Command { name, kind } => match kind.as_str() {
-            "voice" => {
-                shell.model.close();
-                shell.voice.open_setup(shell.model);
-                Next::Go
-            }
             "command" => on_line(shell, &name),
             "session" => {
                 let label = name.trim_start_matches("memoria: ").to_string();
@@ -8971,8 +8873,6 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 .navigate_tree_entry(&target, false, None, false, 16_384)
             {
                 Ok(_) => {
-                    shell.voice.cancel(shell.model);
-                    shell.model.composer_epoch = shell.model.composer_epoch.saturating_add(1);
                     shell.model.close();
                     shell.model.transcript = transcript_from(&shell.agent.messages);
                     shell.say(&format!(

@@ -165,9 +165,6 @@ fn conversation_status(model: &Model) -> Line<'static> {
         let noun = if agents == 1 { "agent" } else { "agents" };
         left.push(span(format!(" · ← {agents} {noun}"), cc.inactive));
     }
-    if !model.voice.notice.is_empty() {
-        left.push(span(format!(" · {}", model.voice.notice), cc.inactive));
-    }
     if let Some(jobs) = jobs_note(model) {
         left.push(span(format!(" · {jobs}"), cc.inactive));
     }
@@ -744,24 +741,6 @@ fn composer_rule(
     hidden: usize,
     direction: &str,
 ) -> Line<'static> {
-    if direction == "above" {
-        if let Some((x, _)) = mic_geometry(model) {
-            let left = if hidden > 0 {
-                format!("─ {hidden} lines above ")
-            } else {
-                String::new()
-            };
-            let left = clip_ellipsis(&left, x);
-            let used = UnicodeWidthStr::width(left.as_str());
-            return Line::from(vec![
-                span(
-                    format!("{left}{}", "─".repeat((x as usize).saturating_sub(used))),
-                    color,
-                ),
-                span(mic_label(model), model.theme.primary),
-            ]);
-        }
-    }
     if hidden == 0 {
         return Line::from(span("─".repeat(model.width as usize), color));
     }
@@ -781,26 +760,6 @@ fn composer_rule(
         )],
         model.width,
     ))
-}
-
-fn mic_label(model: &Model) -> String {
-    if model.width >= 52 {
-        format!("[{}]", model.voice.label)
-    } else if model.voice.label.starts_with("REC ") {
-        "[REC / Esc cancel]".into()
-    } else if model.voice.active {
-        "[voice / Esc]".into()
-    } else {
-        "[mic]".into()
-    }
-}
-
-pub fn mic_geometry(model: &Model) -> Option<(u16, u16)> {
-    if !model.voice.enabled || !model.voice_eligible() || model.height < 4 {
-        return None;
-    }
-    let width = UnicodeWidthStr::width(mic_label(model).as_str()) as u16;
-    (width <= model.width).then_some((model.width.saturating_sub(width), width))
 }
 
 /// Scroll a long logical row to keep the editor's byte cursor visible. Display
@@ -1091,12 +1050,6 @@ pub fn composer_height(lines: Option<&[String]>, hinted: bool) -> u16 {
 /// split by hairline bars (`1b`, `1c`).
 fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
     let th = &model.theme;
-    if model.voice.enabled && model.voice_eligible() && !model.voice.notice.is_empty() {
-        return Line::from(span(
-            clip_ellipsis(&model.voice.notice, model.width),
-            th.muted,
-        ));
-    }
     if model.exit_armed {
         return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
     }

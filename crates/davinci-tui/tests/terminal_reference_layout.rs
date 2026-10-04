@@ -115,11 +115,6 @@ fn model_panel_uses_a_numbered_list_and_unboxed_reference_header() {
     assert!(!text.contains("╭"));
     assert!(rows.last().unwrap().to_string().contains("Enter"));
 }
-#[test]
-fn voice_does_not_take_the_verbose_output_shortcut() {
-    let (keys, _) = davinci_tui::Keybindings::defaults().with_voice(true);
-    assert!(keys.matches("\x0f", "davinci.tools.expand"));
-}
 
 #[test]
 fn utility_screens_share_the_unboxed_bottom_panel_and_keep_the_draft() {

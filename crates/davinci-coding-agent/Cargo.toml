@@ -15,7 +15,6 @@ name = "davinci"
 path = "src/main.rs"
 
 [dependencies]
-davinci-voice = { path = "../davinci-voice" }
 davinci-agent = { path = "../davinci-agent" }
 davinci-ai = { path = "../davinci-ai" }
 davinci-client = { path = "../davinci-client", optional = true }

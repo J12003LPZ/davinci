@@ -54,34 +54,14 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
 
 pub struct ComposedFrame {
     pub lines: Vec<Line<'static>>,
-    pub mic_rect: Option<ratatui::layout::Rect>,
     pub graph: Option<super::views::graph_nav::GraphFrame>,
 }
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let height = height as usize;
-    if model.voice.setup {
-        let rows = model
-            .voice
-            .setup_rows
-            .iter()
-            .map(|text| {
-                Line::from(ui::span(
-                    ui::clip_ellipsis(text, model.width),
-                    model.theme.text,
-                ))
-            })
-            .collect();
-        return ComposedFrame {
-            lines: pad_to(rows, height),
-            mic_rect: None,
-            graph: None,
-        };
-    }
     if height == 0 {
         return ComposedFrame {
             lines: Vec::new(),
-            mic_rect: None,
             graph: None,
         };
     }
@@ -103,7 +83,6 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         lines.extend(picker);
         return ComposedFrame {
             lines: pad_to(lines, height),
-            mic_rect: None,
             graph: None,
         };
     }
@@ -114,7 +93,6 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         if let Some(content) = section_rows(model) {
             return ComposedFrame {
                 lines: command_panel_frame(model, content, height),
-                mic_rect: None,
                 graph: None,
             };
         }
@@ -186,16 +164,6 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     rows.extend(working);
     rows.extend(notice);
     rows.extend(offered);
-    let mic_rect = chrome::mic_geometry(model).and_then(|(x, width)| {
-        // The conversation composer now starts with an effort row; the mic is
-        // rendered on the rule immediately below it. Hit testing must point at
-        // that rendered row rather than the start of the composer stack.
-        let composer_rule_offset =
-            usize::from(model.screen == Screen::Agent && model.overlay.is_none());
-        let y = rows.len().saturating_add(composer_rule_offset);
-        (height >= 4 && !composer_rows.is_empty() && y < height)
-            .then_some(ratatui::layout::Rect::new(x, y as u16, width, 1))
-    });
     rows.extend(composer_rows);
     rows.extend(below);
     rows.extend(chrome::footer(chrome_model));
@@ -209,7 +177,6 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     ComposedFrame {
         lines: pad_to(rows, height),
         graph,
-        mic_rect,
     }
 }
 
@@ -618,10 +585,6 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
 /// run and never the app (design.md §6).
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
-    if model.voice.blocks_send && voice_send_key(model, &key) {
-        model.voice.notice = "Finish or cancel voice before sending".into();
-        return Flow::Continue;
-    }
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
     }
@@ -692,7 +655,6 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
                 || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::CONTROL);
             return if key.kind == KeyEventKind::Press
                 && !model.running
-                && !model.voice.setup
                 && model.screen == Screen::Agent
                 && !model.codex_open()
                 && plain_tab_modifiers
@@ -748,17 +710,6 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         }
     }
     Flow::Continue
-}
-
-/// Shared preflight runs before extensions and autocomplete in the live loops.
-pub fn voice_send_key(model: &Model, key: &KeyEvent) -> bool {
-    let Some(data) = key_event_bytes(key) else {
-        return false;
-    };
-    !model.keybindings.matches(&data, "davinci.composer.newLine")
-        && (model.keybindings.matches(&data, "tui.input.submit")
-            || model.keybindings.matches(&data, "app.message.followUp")
-            || key.code == KeyCode::Enter)
 }
 
 /// Steer the open completion list. `None` hands the key back to the composer,
@@ -1783,25 +1734,6 @@ mod tests {
     use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
 
-    #[test]
-    fn voice_hit_rectangle_tracks_the_rendered_composer_rule() {
-        for width in [20, 40, 100] {
-            let mut m = model(width, 30);
-            m.screen = Screen::Agent;
-            m.overlay = None;
-            m.voice.enabled = true;
-            m.voice.label = "mic ctrl+t".into();
-            let frame = compose_frame(&m, 30);
-            let rect = frame.mic_rect.expect("visible mic");
-            assert!(frame.lines[rect.y as usize].to_string().contains("[mic"));
-            assert_eq!(rect.right(), width);
-            assert!(rect.y < 28, "short transcript follows its content");
-            assert!(compose_frame(&m, 1).mic_rect.is_none());
-            m.voice.setup = true;
-            assert!(compose_frame(&m, 30).mic_rect.is_none());
-        }
-    }
-
     fn model(width: u16, height: u16) -> Model {
         let mut model = Model::new(
             Theme::da_vinci(ColorDepth::TrueColor, false),
@@ -2145,8 +2077,6 @@ mod tests {
         m.toggle_codex();
         assert_eq!(handle_key(&mut m, key), Flow::Continue);
         m.toggle_codex();
-        m.voice.setup = true;
-        assert_eq!(handle_key(&mut m, key), Flow::Continue);
     }
 
     #[test]

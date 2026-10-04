@@ -1029,8 +1029,11 @@ pub fn run_tool(
                         );
                     }
                     if let Some(rt) = &rt_clone {
-                        crate::runtime::team::finish_agent(&rt.registry, cid, outcome.is_ok());
+                        // Remove the worker from the live roster before publishing its terminal
+                        // registry state. Otherwise observers can see Completed while is_member()
+                        // is still true for a brief race window.
                         rt.team.forget(&cid);
+                        crate::runtime::team::finish_agent(&rt.registry, cid, outcome.is_ok());
                     }
                 })
                 .map_err(|e| {
