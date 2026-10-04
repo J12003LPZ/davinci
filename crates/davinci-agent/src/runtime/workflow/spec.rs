@@ -117,6 +117,7 @@ pub const VALID_3_PHASE_WORKFLOW_JSON: &str = r#"{
 /// What the calling turn contributes to a workflow run.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowLaunch {
+    pub service_tier: davinci_ai::CodexServiceTier,
     pub parent_permission_mode: Option<crate::PermissionMode>,
     pub provider: Option<String>,
     pub model_id: Option<String>,

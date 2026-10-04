@@ -12,6 +12,7 @@ mod davinci_sources;
 mod davinci_surfaces;
 #[cfg(all(unix, feature = "experimental-ipc"))]
 mod experimental;
+mod fast;
 #[cfg(test)]
 mod process_manager_integration_tests;
 #[cfg(test)]
@@ -814,9 +815,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(value) = settings.openai_verbosity.as_deref() {
         std::env::set_var("DAVINCI_OPENAI_VERBOSITY", value);
     }
-    if let Some(tier) = settings.service_tier.as_deref() {
-        std::env::set_var("DAVINCI_OPENAI_SERVICE_TIER", tier);
-    }
     if let Some(value) = settings.reasoning_summary.as_deref() {
         std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
     }
@@ -897,6 +895,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.prompt_session = session;
         agent
     };
+    agent.service_tier = settings.resolved_service_tier();
     if let Some(level) = parsed.thinking {
         agent.thinking_level = level;
     } else if let Some(level) = settings
@@ -1368,24 +1367,20 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
 
 fn live_compaction_summarizer(parsed: &Args, agent: &Agent) -> Summarizer {
     let parsed = parsed.clone();
-    let timeout_ms = agent.provider_timeout_ms;
-    let max_retries = agent.provider_max_retries;
-    let max_retry_delay_ms = Some(agent.provider_max_retry_delay_ms);
-    let thinking_level = agent.thinking_level;
-    let thinking_budgets = agent.thinking_budgets.clone();
+    let options = StreamOptions {
+        timeout_ms: agent.provider_timeout_ms,
+        max_retries: agent.provider_max_retries,
+        max_retry_delay_ms: Some(agent.provider_max_retry_delay_ms),
+        thinking_level: Some(agent.thinking_level),
+        service_tier: Some(agent.service_tier),
+        thinking_budgets: agent.thinking_budgets.clone(),
+        ..Default::default()
+    };
     Summarizer::new(move |request| {
         if let Some(env) = env_summarizer() {
             return env.summarize(request);
         }
-        complete_simple_summarization(
-            &parsed,
-            request,
-            timeout_ms,
-            max_retries,
-            max_retry_delay_ms,
-            thinking_level,
-            thinking_budgets.clone(),
-        )
+        complete_simple_summarization(&parsed, request, &options)
     })
 }
 
@@ -1451,11 +1446,7 @@ pub(crate) fn resolve_model_and_auth(
 fn complete_simple_summarization(
     parsed: &Args,
     request: &SummarizeRequest,
-    timeout_ms: Option<u64>,
-    max_retries: Option<u32>,
-    max_retry_delay_ms: Option<u64>,
-    thinking_level: davinci_protocol::ThinkingLevel,
-    thinking_budgets: Option<davinci_ai::ThinkingBudgets>,
+    inherited_options: &StreamOptions,
 ) -> Result<SummarizeResponse, String> {
     let offline = parsed.offline
         || matches!(
@@ -1517,18 +1508,22 @@ fn complete_simple_summarization(
     if auth.api_key.is_none() && auth.headers.is_empty() && auth.source == "none" {
         return Err("Summarization failed: no credentials".into());
     }
+    let thinking_level = inherited_options
+        .thinking_level
+        .unwrap_or(davinci_protocol::ThinkingLevel::Off);
     let options = StreamOptions {
+        service_tier: inherited_options.service_tier,
         thinking_level: if model.reasoning && thinking_level != davinci_protocol::ThinkingLevel::Off
         {
             Some(thinking_level)
         } else {
             None
         },
-        thinking_budgets,
+        thinking_budgets: inherited_options.thinking_budgets.clone(),
         responses_is_oauth: None,
-        timeout_ms,
-        max_retries,
-        max_retry_delay_ms,
+        timeout_ms: inherited_options.timeout_ms,
+        max_retries: inherited_options.max_retries,
+        max_retry_delay_ms: inherited_options.max_retry_delay_ms,
         max_tokens: Some(request.max_tokens),
         websocket_connect_timeout_ms: load_settings(&default_agent_dir())
             .websocket_connect_timeout_ms,
@@ -2385,6 +2380,7 @@ fn build_worker_agent(
         )
     };
     let mut child = new_worker_agent(system_prompt);
+    child.service_tier = req.service_tier;
     if let Some(max_turns) = req.max_turns {
         child.max_model_turns = Some(max_turns.clamp(1, 60) as u32);
     }
@@ -3221,6 +3217,7 @@ fn complete_prompt_with_host(
                         &request_tools,
                         &StreamOptions {
                             thinking_level: Some(current.request_thinking_level()),
+                            service_tier: Some(current.service_tier),
                             thinking_budgets: current.thinking_budgets.clone(),
                             responses_is_oauth: None,
                             timeout_ms: current.provider_timeout_ms,
@@ -7312,6 +7309,11 @@ fn handle_user_line(
             println!("model={}/{}", agent.provider, agent.model_id);
             Ok(true)
         }
+        SlashAction::ToggleFast => {
+            println!("{}", toggle_fast(parsed, agent));
+            refresh_chrome_footer(session, agent);
+            Ok(true)
+        }
         SlashAction::SetThinking(level) => {
             let result = apply_thinking_level(agent, session, &level, false);
             loaded_extension_host(parsed).emit(ExtensionEvent::ThinkingLevelSelect {
@@ -8577,6 +8579,21 @@ pub fn format_session_doctor(parsed: &Args, agent: &Agent) -> String {
     serde_json::to_string_pretty(&report).unwrap_or_else(|_| "doctor: unavailable".into())
 }
 
+fn speed_label(agent: &Agent) -> String {
+    fast::speed_label(
+        agent,
+        davinci_ai::fast_capability_for_model(&default_agent_dir(), &agent.model_id),
+    )
+}
+
+fn toggle_fast(parsed: &Args, agent: &mut Agent) -> String {
+    let agent_dir = default_agent_dir();
+    let capability = davinci_ai::fast_capability_for_model(&agent_dir, &agent.model_id);
+    let text = fast::toggle_and_persist(agent, capability, &agent_dir);
+    agent.summarizer = Some(live_compaction_summarizer(parsed, agent));
+    text
+}
+
 pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
     let mode = agent
         .permissions
@@ -8626,6 +8643,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         if let Some(diag) = &agent.prompt_session.transition_diagnostic {
             text.push_str(&format!(" · transition: {diag}"));
         }
+    }
+    let speed = speed_label(agent);
+    if !speed.is_empty() {
+        text.push_str(&format!("\nSpeed       {speed}"));
     }
     if !cost_details.is_empty() {
         text.push('\n');
@@ -9950,8 +9971,10 @@ fn configure_security_review(
         &supported,
     )?;
     let provenance = serde_json::json!({"provider":model.provider,"modelId":model.id,"requestedThinkingLevel":agent.thinking_level.as_str(),"effectiveThinkingLevel":thinking.as_str(),"qualityEvaluation":"unmeasured"});
+    let service_tier = agent.service_tier;
     let runner = SecurityWorkerRunner::new(move |request| {
         let options = davinci_ai::StreamOptions {
+            service_tier: Some(service_tier),
             thinking_level: Some(thinking),
             timeout_ms: Some(120_000),
             max_retries: Some(0),
@@ -10014,6 +10037,7 @@ fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHos
             .graph
             .set_permissions(Some(agent.permissions.clone()));
         native.graph.set_task_contract(agent.active_contract());
+        native.graph.session_service_tier = agent.service_tier;
         native.graph.processes = agent.tool_context.processes.clone();
         native.graph.browser = agent
             .tool_context
@@ -10384,7 +10408,13 @@ fn refresh_chrome_footer(session: &mut InteractiveSession, agent: &Agent) {
     session.chrome.footer_model = Some(if agent.model_id.is_empty() {
         agent.provider.clone()
     } else {
-        format!("{}/{}", agent.provider, agent.model_id)
+        let speed = speed_label(agent);
+        let suffix = if speed.is_empty() {
+            String::new()
+        } else {
+            format!(" · {speed}")
+        };
+        format!("{}/{}{suffix}", agent.provider, agent.model_id)
     });
     session.chrome.footer_context = Some((
         davinci_agent::estimate_context_tokens(&agent.messages),

@@ -240,6 +240,7 @@ mod tests {
 
         // Ephemeral isolation verified: worker args omit session and carry --no-session
         let spec = WorkerSpec {
+            service_tier: davinci_ai::CodexServiceTier::Standard,
             task_id: "test-task".into(),
             role: Role::Researcher,
             tools: tools.clone(),
@@ -494,6 +495,7 @@ mod tests {
             },
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(memory))),
@@ -595,6 +597,7 @@ mod tests {
             },
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::clone(memory)),
@@ -984,6 +987,7 @@ mod tests {
             },
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(memory))),
@@ -1134,6 +1138,7 @@ mod tests {
             },
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(memory))),
@@ -1264,6 +1269,7 @@ mod tests {
             },
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: None,
@@ -1648,6 +1654,7 @@ mod tests {
             },
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(VectorMemory::new(
