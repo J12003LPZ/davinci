@@ -252,18 +252,47 @@ impl McpRegistry {
         tool: &str,
         arguments: &Value,
     ) -> Result<ToolResult, ToolError> {
+        let result = self.call_full(server, tool, arguments)?;
+        Ok(ToolResult {
+            content: result.text(),
+            is_error: result.is_error.unwrap_or(false),
+            details: None,
+        })
+    }
+
+    /// Host-owned data seam for programmatic consumers. Callers still have to
+    /// enter through the ordinary guarded dispatcher; this is not authority.
+    /// Server metadata never becomes ToolResult.details or a host receipt.
+    pub(crate) fn call_full(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<davinci_mcp::CallToolResult, ToolError> {
         let client = self.client(server)?;
         let result = client
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .call_tool(tool, arguments.clone());
         match result {
-            Ok(result) => Ok(ToolResult {
-                content: result.text(),
-                is_error: result.is_error.unwrap_or(false),
-                details: None,
-            }),
-            Err(err) => self.lock().failed(server, err),
+            Ok(result) => Ok(result),
+            Err(err) => {
+                // Preserve the direct path's distinction: an RPC error is a
+                // failed tool answer; transport/protocol failure drops the
+                // server and remains an error, not an empty structured value.
+                let result = self.lock().failed(server, err)?;
+                Ok(davinci_mcp::CallToolResult {
+                    content: vec![davinci_mcp::ContentBlock {
+                        kind: "text".into(),
+                        text: Some(result.content),
+                        mime_type: None,
+                        data: None,
+                        resource: None,
+                    }],
+                    structured_content: None,
+                    is_error: Some(result.is_error),
+                })
+            }
         }
     }
 

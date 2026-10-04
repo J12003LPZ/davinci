@@ -64,3 +64,11 @@ Source inspection only so far. No test completion, package admission, platform s
 - Repository-wide MCP type-reference search found no other Rust struct literals requiring new fields. Full CI remains the construction/compatibility check
 - Internal full-result accessor tests are committed first and intentionally await the new accessor; C03 is not complete until those tests and supervised-delivery characterization pass
 - Ruling disclosed before applying: focused C00 is repeated on Linux to avoid three duplicate full Rust compiles on every test-first edit. All original required CI jobs remain unchanged; package admission and final native Windows/macOS/Linux gates remain required. This changes validation scheduling, not supported platforms or feature scope
+
+## C03 accessor implementation
+
+- Wire retention is green: all 9 structured MCP integration tests passed at `2378530d15d1c5cfae76502d87db04369f69b804`. [Observed green run](https://github.com/J12003LPZ/davinci/actions/runs/37223219406/job/111497605416)
+- The test-first internal accessor failed exactly because `McpRegistry::call_full` did not exist. [Observed missing-implementation gate](https://github.com/J12003LPZ/davinci/actions/runs/37223216118/job/111497581837)
+- Implemented the crate-private full-result seam and made ordinary `call` project it through the unchanged text/error/details contract. RPC tool errors stay errors with bounded caller projection later; broken transports still drop the server. No server field is copied into host bookkeeping
+- Internal and supervised-adapter tests, unchanged direct/batch/Governor behavior, and full CI are pending on this implementation commit. This component does not expose Codemode or bypass the dispatch path
+- C01 CI now records every installed package asset hash and available license text in addition to the exact lock, runtime, advisory report and sandbox smoke fixtures. An evidence report is not a trusted/admitted runtime manifest

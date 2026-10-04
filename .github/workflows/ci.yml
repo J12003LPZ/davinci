@@ -470,6 +470,39 @@ jobs:
           npm ci --ignore-scripts --no-audit --fund=false
           npm ls --all --json
           cat package-lock.json
+      - name: Record complete package asset and license identities
+        working-directory: crates/davinci-coding-agent/codemode-host
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { readdir, readFile, writeFile, lstat } from "node:fs/promises";
+          import { join, relative } from "node:path";
+          import { createHash } from "node:crypto";
+          const root = process.cwd();
+          const files = [];
+          async function walk(directory) {
+            for (const name of (await readdir(directory)).sort()) {
+              const path = join(directory, name);
+              const stat = await lstat(path);
+              if (stat.isSymbolicLink()) throw new Error("unexpected asset symlink");
+              if (stat.isDirectory()) await walk(path);
+              else if (stat.isFile()) {
+                const bytes = await readFile(path);
+                files.push({ path: relative(root, path).replaceAll("\\\\", "/"), bytes: bytes.length,
+                  sha256: createHash("sha256").update(bytes).digest("hex") });
+              } else throw new Error("unexpected asset type");
+            }
+          }
+          await walk(join(root, "node_modules"));
+          const report = { schemaVersion: 1, admitted: false, node: process.version,
+            platform: process.platform, architecture: process.arch, assets: files };
+          await writeFile("package-assets-report.json", JSON.stringify(report, null, 2) + "\\n");
+          console.log(JSON.stringify(report));
+          for (const file of files.filter(file => /license|copying|notice/i.test(file.path))) {
+            console.log(JSON.stringify({ licenseFile: file.path,
+              text: (await readFile(join(root, file.path), "utf8")).slice(0,65536) }));
+          }
+          JS
       - name: Published package sandbox characterization with fake tools
         working-directory: crates/davinci-coding-agent/codemode-host
         run: node --test package-smoke.test.mjs
@@ -481,7 +514,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: codemode-dependency-evidence-${{ runner.os }}
-          path: crates/davinci-coding-agent/codemode-host/package-lock.json
+          path: |
+            crates/davinci-coding-agent/codemode-host/package-lock.json
+            crates/davinci-coding-agent/codemode-host/package-assets-report.json
           if-no-files-found: warn
 
   codemode-structured:
