@@ -466,7 +466,6 @@ jobs:
           npm --version
           npm view @earendil-works/pi-codemode@1.0.2 version dist engines license --json
           npm view quickjs-wasi@3.6.2 version dist engines license --json
-          npm install --package-lock-only --ignore-scripts --no-audit --fund=false
           npm ci --ignore-scripts --no-audit --fund=false
           npm ls --all --json
           cat package-lock.json
@@ -506,6 +505,16 @@ jobs:
       - name: Published package sandbox characterization with fake tools
         working-directory: crates/davinci-coding-agent/codemode-host
         run: node --test package-smoke.test.mjs
+      - name: Bounded adapter and framed host safety gates with fake tools
+        working-directory: crates/davinci-coding-agent/codemode-host
+        run: node --test bounded-worker.test.mjs framing.test.mjs host.test.mjs
+      - name: Verify reproducible trusted runtime bundle
+        working-directory: crates/davinci-coding-agent/codemode-host
+        shell: bash
+        run: |
+          set -euo pipefail
+          node package-bundle.mjs "$RUNNER_TEMP/codemode-bundle" "$RUNNER_TEMP/codemode-manifest.json"
+          cmp "$RUNNER_TEMP/codemode-manifest.json" ../src/codemode_host/assets-manifest.json
       - name: Current dependency advisory report
         working-directory: crates/davinci-coding-agent/codemode-host
         run: npm audit --omit=dev --json
