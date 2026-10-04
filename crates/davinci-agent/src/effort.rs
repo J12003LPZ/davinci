@@ -30,13 +30,6 @@ pub struct EffortSignals {
     pub consecutive_failures: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffortSource {
-    Fixed,
-    Deterministic,
-    JevAdvice,
-}
-
 impl EffortSignals {
     pub(crate) fn observe(&mut self, tool: Option<&str>, error: bool) {
         if error {
@@ -60,44 +53,6 @@ pub fn request_level(
         EffortPolicy::Adaptive if signals.consecutive_failures >= 2 => step_up(base),
         EffortPolicy::Adaptive if signals.mutations == 0 => step_down(base),
         EffortPolicy::Adaptive => base,
-    }
-}
-
-/// Resolve a request effort without allowing optional advice to lower the
-/// deterministic choice or override an explicit fixed/off policy.
-pub fn resolve_request_effort(
-    policy: EffortPolicy,
-    base: ThinkingLevel,
-    signals: EffortSignals,
-    advice: Option<ThinkingLevel>,
-) -> (ThinkingLevel, EffortSource) {
-    if base == ThinkingLevel::Off || policy == EffortPolicy::Fixed {
-        return (request_level(policy, base, signals), EffortSource::Fixed);
-    }
-    let deterministic = request_level(policy, base, signals);
-    let Some(advice) = advice else {
-        return (deterministic, EffortSource::Deterministic);
-    };
-    if level_rank(advice) > level_rank(deterministic) {
-        (advice, EffortSource::JevAdvice)
-    } else {
-        (deterministic, EffortSource::Deterministic)
-    }
-}
-
-pub fn favor_high_effort(level: ThinkingLevel) -> ThinkingLevel {
-    step_up(level)
-}
-
-fn level_rank(level: ThinkingLevel) -> u8 {
-    match level {
-        ThinkingLevel::Off => 0,
-        ThinkingLevel::Minimal => 1,
-        ThinkingLevel::Low => 2,
-        ThinkingLevel::Medium => 3,
-        ThinkingLevel::High => 4,
-        ThinkingLevel::Xhigh => 5,
-        ThinkingLevel::Max => 6,
     }
 }
 
@@ -166,25 +121,14 @@ mod tests {
     }
 
     #[test]
-    fn advice_can_only_raise_adaptive_effort() {
-        let (level, source) =
-            resolve_request_effort(EffortPolicy::Adaptive, Medium, signals(0, 0), Some(High));
-        assert_eq!((level, source), (High, EffortSource::JevAdvice));
-
-        let (level, source) =
-            resolve_request_effort(EffortPolicy::Adaptive, Medium, signals(1, 0), Some(Low));
-        assert_eq!((level, source), (Medium, EffortSource::Deterministic));
-    }
-
-    #[test]
-    fn fixed_and_off_ignore_advice() {
-        assert_eq!(
-            resolve_request_effort(EffortPolicy::Fixed, Medium, signals(0, 0), Some(Max)),
-            (Medium, EffortSource::Fixed)
-        );
-        assert_eq!(
-            resolve_request_effort(EffortPolicy::Adaptive, Off, signals(0, 0), Some(Max)),
-            (Off, EffortSource::Fixed)
-        );
+    fn adaptive_effort_respects_level_boundaries() {
+        let p = EffortPolicy::Adaptive;
+        for state in [signals(0, 0), signals(1, 0), signals(0, 2), signals(1, 2)] {
+            assert_eq!(request_level(p, Off, state), Off);
+        }
+        assert_eq!(request_level(p, Minimal, signals(0, 0)), Minimal);
+        assert_eq!(request_level(p, Max, signals(0, 0)), Xhigh);
+        assert_eq!(request_level(p, Xhigh, signals(1, 2)), Max);
+        assert_eq!(request_level(p, Max, signals(1, 2)), Max);
     }
 }

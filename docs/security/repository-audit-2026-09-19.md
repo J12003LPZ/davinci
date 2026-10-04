@@ -90,7 +90,7 @@ corrected. `vendor/davinci`, `packages/*` migration stubs and the archived
 | --- | --- |
 | `davinci-agent` | Permission and tool boundaries, web SSRF, task/graph dispatch callers, context/cache/evidence runtime, execution and session consumers |
 | `davinci-ai` | Active module/public export graph, auth/OAuth/request/stream boundaries, transport resources and dependency upgrades |
-| `davinci-coding-agent` | CLI/SDK wiring, package management, native/JS extension dispatch, learning/governor guards, export pipeline, settings and TypeSafe boundaries |
+| `davinci-coding-agent` | CLI/SDK wiring, package management, native/JS extension dispatch, learning/governor guards, export pipeline, settings boundaries |
 | `davinci-session` | JSONL/repository contracts, import and parent relationships, branch/context consumers |
 | `davinci-session-sqlite` | Persistence, sequence/fact/lane writes, branch-cache atomicity and failure recovery |
 | `davinci-client` | In-process/framed Hello, connection state and event application |
@@ -127,7 +127,7 @@ the scoped compatibility annotations address them.
 | Client + server + protocol + MCP library suites | 67 passed |
 | Coding-agent package-management selection | 5 passed, including the Windows directory-link fixture |
 | Coding-agent exporter selection / status projection | 6 passed / 1 passed |
-| TypeSafe settings/privacy/decision + repo-intelligence integrations | 19 passed |
+| Repo-intelligence integrations | Passed within a combined 19-test selection; no separate count recorded |
 | Context VM deterministic eval selection | 4 passed, covering seven replay scenarios |
 | Exported viewer Node tests | 4 passed; added to the existing CI matrix |
 | Final workspace all-target check | Passed |

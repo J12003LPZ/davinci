@@ -80,7 +80,7 @@ Paths below are relative to the repository. `TUI` is a documentation abbreviatio
 | Shell and focus | Modify `TUI/{app.rs,model.rs,runtime.rs}`; new `TUI/{layout.rs,focus.rs}`; modify shared `crates/davinci-tui/src/{interaction.rs,keybindings.rs,editor.rs}` where tests require it | Explicit region ownership, draft preservation and correct key routing |
 | Conversation | Modify `TUI/views/{startup.rs,chrome.rs,transcript.rs,markdown.rs,highlight.rs,semantic.rs,opera.rs,studio.rs,completion.rs}` | Welcome, editor, assistant/user content, tools, activity and suggestions |
 | Selectors | Modify `TUI/views/{settings.rs,cogitator.rs,thinking.rs,instrumenta.rs,resume.rs,tree.rs}` | Real configuration/model/session selection through matched components |
-| Safe dialogs | Modify `TUI/views/{approval_modal.rs,decision_modal.rs,ask.rs,trust.rs,permissions.rs,login.rs,secret_input.rs}` | Reference-style authorization/questions without changing policy |
+| Safe dialogs | Modify `TUI/views/{approval_modal.rs,decision_modal.rs,ask.rs,trust.rs,permissions.rs,login.rs}` | Reference-style authorization/questions without changing policy |
 | Remaining surfaces | Every remaining module in `TUI/views/mod.rs`, including help, recovery, MCP, voice-related chrome and utilities | No old UI islands |
 | Runtime adapter | Modify `HOST/davinci_interactive.rs`; new `HOST/davinci_interactive/{task_router.rs,view_events.rs}`; new `TUI/workspace.rs` | Scoped tasks, drafts, lifecycle and event reconciliation |
 | Graph extension | Modify `TUI/views/{grafo.rs,graph_run.rs,graph_layout.rs,graph_canvas.rs,graph_inspector.rs,graph_nav.rs,graph_perf.rs}` | Optional dock/list/canvas, meaningful activity and safe controls |
@@ -344,9 +344,9 @@ Keep the existing monotonic deadline and `NativeApproval::is_live` checks as wel
 | Agents | 7–8: agents |
 | ContextInspector | 7: context_inspector |
 
-Overlays: `Instrumenta` (5), `Sessions` (7), `Cogitator` (5), `SecretInput` (6), `Ask` (6). Also audit `budget`, `rewind`, all nested dialogs, notifications and voice setup/status; enum coverage alone is insufficient.
+Overlays: `Instrumenta` (5), `Sessions` (7), `Cogitator` (5), `Ask` (6). Also audit `budget`, `rewind`, all nested dialogs, notifications and voice setup/status; enum coverage alone is insufficient.
 
-- [ ] **1. Add an exhaustive `Screen` and `Overlay` match in fixture dispatch without a wildcard.** This makes newly added enum variants require coverage. Add case records for empty, loading, error and selected states. Count 28 current screens and five current overlays; compare their names, not only counts.
+- [ ] **1. Add an exhaustive `Screen` and `Overlay` match in fixture dispatch without a wildcard.** This makes newly added enum variants require coverage. Add case records for empty, loading, error and selected states. Count 28 current screens and four current overlays; compare their names, not only counts.
 - [ ] **2. Run red.** `cargo test --locked -p davinci-tui --test terminal_parity`; confirm old-layout variants fail and missing cases cannot silently pass.
 - [ ] **3. Convert sessions/history, help, context/memory, usage/budgets, exports/security/recovery, MCP/extensions, plans, tasks and agent views.** Reuse stable pickers and safe dialogs rather than custom full-width forms. Preserve session selection/search, rewind scope, export paths, real counters and diagnostics. For DaVinci-only functions, label them as extensions in the manifest instead of claiming a nonexistent reference screen.
 - [ ] **4. Audit extension-owned and voice-owned output.** Keep real callback/data contracts. Translate visual output through the new primitives, bound long extension rows and sanitize their text/copy. Test a voice-send block remains effective while panels are open and that completion does not silently send recorded audio.
@@ -450,7 +450,7 @@ Discover the workspace's existing evaluation commands from its manifests/docs an
 
 ## Plan Self-Review and Approval Handoff
 
-Coverage: spec sections 1–3 map to Tasks 1–7; section 4 to Tasks 3–6 and 8; section 5 to Tasks 8–9; section 6 to Tasks 2–3, 8 and 10; section 7 to Tasks 1 and 10. All 28 screens and five overlays have explicit owners. Five review-focus failure modes each have assigned tests. Capture-driven values are obtained in Task 1, not silently approximated in later tasks.
+Coverage: spec sections 1–3 map to Tasks 1–7; section 4 to Tasks 3–6 and 8; section 5 to Tasks 8–9; section 6 to Tasks 2–3, 8 and 10; section 7 to Tasks 1 and 10. All 28 screens and four overlays have explicit owners. Five review-focus failure modes each have assigned tests. Capture-driven values are obtained in Task 1, not silently approximated in later tasks.
 
 Recommended execution: **native, sequential execution in an isolated worktree**, since theme, frame geometry and focus are shared dependencies and the currently connected tools do not expose an independent builder/reviewer fleet. A final independent review remains a release requirement. Subagent-driven execution is an alternative in an environment that actually provides isolated workers and reviewers; do not simulate separate agents inside one context.
 

@@ -1,5 +1,5 @@
 use davinci_coding_agent::native_extensions::{
-    engineering_snapshot::EngineeringSnapshots,
+    engineering_snapshot::{EngineeringSnapshots, WorkspaceDirtyState},
     repo_intelligence::{RepoIntelligence, RepoIntelligenceConfig},
     NativeExtensionHost,
 };
@@ -68,7 +68,7 @@ fn engineering_snapshot_reuses_facts_and_rechecks_permissions_and_changes() {
     assert!(fresh.generation > first.generation);
     assert_eq!(
         fresh.workspace_dirty,
-        davinci_agent::decision::request::WorkspaceDirtyState::Unknown
+        WorkspaceDirtyState::Unknown
     );
 }
 
@@ -173,4 +173,21 @@ fn verification_and_build_consumers_reuse_metadata_without_changing_results() {
         changed["steps"], warm_plan["steps"],
         "external changes must bypass cached scripts"
     );
+}
+
+#[test]
+fn workspace_dirty_state_preserves_unknown_and_serialized_values() {
+    assert_eq!(WorkspaceDirtyState::default(), WorkspaceDirtyState::Unknown);
+    for (state, value) in [
+        (WorkspaceDirtyState::Clean, "clean"),
+        (WorkspaceDirtyState::Dirty, "dirty"),
+        (WorkspaceDirtyState::Unknown, "unknown"),
+    ] {
+        let encoded = serde_json::to_value(state).unwrap();
+        assert_eq!(encoded, value);
+        assert_eq!(
+            serde_json::from_value::<WorkspaceDirtyState>(encoded).unwrap(),
+            state
+        );
+    }
 }

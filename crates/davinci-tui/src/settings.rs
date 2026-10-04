@@ -134,7 +134,6 @@ pub struct InteractiveSettingsConfig {
     pub auto_compact_threshold: String,
     pub steering_mode: String,
     pub follow_up_mode: String,
-    pub decision_intelligence: bool,
     pub transport: String,
     pub http_idle_timeout: String,
     pub hide_thinking: bool,
@@ -184,7 +183,6 @@ impl Default for InteractiveSettingsConfig {
             auto_compact_threshold: "default".into(),
             steering_mode: "one-at-a-time".into(),
             follow_up_mode: "one-at-a-time".into(),
-            decision_intelligence: false,
             transport: "auto".into(),
             http_idle_timeout: "5 min".into(),
             hide_thinking: false,
@@ -372,29 +370,6 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 ),
                 current_value: config.follow_up_mode.clone(),
                 values: vec!["one-at-a-time".into(), "all".into()],
-            },
-            SettingItem {
-                id: "decision-intelligence".into(),
-                label: "TypeSafe / Jev decision intelligence".into(),
-                description: Some(
-                    "Use TypeSafe Jev for fast structured routing judgments. Sends the current task after secret/path redaction and removal of fenced code, patches, and stack dumps, plus bounded metadata. Does not automatically read or send repository source files. Unfenced source pasted into task prose may remain.".into(),
-                ),
-                current_value: if config.decision_intelligence {
-                    "on".into()
-                } else {
-                    "off".into()
-                },
-                values: vec!["off".into(), "on".into()],
-            },
-            SettingItem {
-                id: "typesafe-api-key".into(),
-                label: "TypeSafe / Jev API key".into(),
-                description: Some(
-                    "Replace the stored key through a masked prompt. DaVinci validates the new key before saving it and keeps the previous key if validation fails. A successful replacement enables decision intelligence."
-                        .into(),
-                ),
-                current_value: "replace".into(),
-                values: vec!["replace".into()],
             },
             SettingItem {
                 id: "transport".into(),
@@ -649,17 +624,11 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_key_replacement_is_an_explicit_secret_free_action() {
+    fn retired_decision_settings_are_not_exposed() {
         let list = interactive_settings_list(&InteractiveSettingsConfig::default());
-        let item = list
-            .items
-            .iter()
-            .find(|item| item.id == "typesafe-api-key")
-            .expect("TypeSafe API key action");
-
-        assert_eq!(item.label, "TypeSafe / Jev API key");
-        assert_eq!(item.current_value, "replace");
-        assert_eq!(item.values, vec!["replace"]);
-        assert!(!format!("{item:?}").contains("apikey_"));
+        assert!(!list.items.iter().any(|item| {
+            matches!(item.id.as_str(), "decision-intelligence" | "typesafe-api-key")
+        }));
+        assert!(list.items.iter().any(|item| item.id == "transport"));
     }
 }

@@ -102,7 +102,7 @@ All 37 advertised built-in command entry points were exercised across the termin
 | Existing evals extended | `scripts/eval-native-intelligence.py`, `scripts/eval-terminal-input.py` |
 | New reusable evals | `scripts/eval-harness-state.py`, `scripts/eval-live-governor.py`, `scripts/eval-slash-commands.py`, `scripts/eval-live-session.py` |
 
-No production dependency was added. Twenty-four existing Rust files, two existing Python scripts and one JavaScript fixture were modified; two Rust integration tests and six Python eval scripts were added, plus this report (36 files total). The behavior-preserving iterator cleanup in `crates/davinci-agent/src/decision/advice.rs` resolves a Clippy warning exposed by a narrower build; its seven existing tests were rerun.
+No production dependency was added. Twenty-four existing Rust files, two existing Python scripts and one JavaScript fixture were modified; two Rust integration tests and six Python eval scripts were added, plus this report (36 files total).
 
 ## Follow-up verification of the six reported gaps
 

@@ -76,7 +76,7 @@ The approved graph should reserve usable input, never fake concurrent execution.
 
 ## 4. Exact DaVinci coverage inventory
 
-The inventory below is transcribed from the inspected `Screen` and `Overlay` declarations and the view-module exports [R14], [R15]. It turns the whole-UI requirement into an explicit checklist, rather than assuming the graph, settings and model picker are the only surfaces. Coverage target: 28 screens, 5 overlays, and 49 view modules. These are inventory counts, not completed implementation counts.
+The inventory below is transcribed from the inspected `Screen` and `Overlay` declarations and the view-module exports [R14], [R15]. It turns the whole-UI requirement into an explicit checklist, rather than assuming the graph, settings and model picker are the only surfaces. Coverage target: 28 screens, 4 overlays, and 48 view modules. These are inventory counts, not completed implementation counts.
 
 | Screen | Existing surface | Required destination |
 | --- | --- | --- |
@@ -114,7 +114,6 @@ The inventory below is transcribed from the inspected `Screen` and `Overlay` dec
 | `Instrumenta` | Reference command palette and search |
 | `Sessions` | Reference compact session picker |
 | `Cogitator` | Reference quick model picker |
-| `SecretInput` | Consistent masked input; never transcript-backed |
 | `Ask` | Reference choice/question dialog |
 
 ### All view modules assigned
@@ -124,7 +123,7 @@ The inventory below is transcribed from the inspected `Screen` and `Overlay` dec
 | Shell and shared surfaces | `chrome`, `sheet`, `semantic`, `startup`, `studio` |
 | Conversation and results | `transcript`, `markdown`, `highlight`, `opera`, `diff`, `compact`, `export`, `recovery`, `rewind` |
 | Commands and configuration | `completion`, `instrumenta`, `settings`, `cogitator`, `thinking`, `keys` |
-| Security, identity, questions | `approval_modal`, `ask`, `decision_modal`, `login`, `permissions`, `secret_input`, `trust`, `securitas` |
+| Security, identity, questions | `approval_modal`, `ask`, `decision_modal`, `login`, `permissions`, `trust`, `securitas` |
 | Sessions and execution | `agents`, `codex`, `disegno`, `memoria`, `officina`, `resume`, `task_board`, `tree`, `workflows` |
 | Graph | `grafo`, `graph_canvas`, `graph_inspector`, `graph_layout`, `graph_nav`, `graph_run` |
 | Integrations and telemetry | `budget`, `context_inspector`, `governor`, `mcp`, `mensura`, `vectors` |

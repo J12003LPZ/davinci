@@ -3,7 +3,6 @@
 pub mod apply_patch;
 pub mod approval;
 pub mod cache_stability;
-pub mod decision;
 pub mod decisions;
 pub mod delegation;
 pub mod host_operation;
@@ -454,12 +453,6 @@ pub struct Agent {
     pub thinking_level: ThinkingLevel,
     pub service_tier: davinci_ai::CodexServiceTier,
     pub effort_policy: effort::EffortPolicy,
-    decision_effort_advice_enabled: bool,
-    decision_completion_advice_enabled: bool,
-    decision_tool_family_advice_enabled: bool,
-    decision_turn_advice: Option<decision::advice::TurnAdvice>,
-    decision_effort_advice: Option<ThinkingLevel>,
-    decision_advice_key: Option<decision::DecisionAdviceKey>,
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
@@ -636,9 +629,6 @@ pub struct Agent {
     /// The bus created solely for prompt checkpoints. Host-bound runtimes
     /// retain the conservative automatic-read fence, even before subscription.
     pub(crate) prompt_checkpoint_bus: Option<(Arc<()>, RuntimeBus)>,
-    /// Optional additive decision-intelligence runtime. It is deliberately
-    /// separate from deterministic routing and remains disabled by default.
-    pub decision_runtime: Option<Arc<decision::DecisionRuntime>>,
     /// Active prompt manifest identifying modules, hashes, and token budgets.
     pub prompt_manifest: Option<PromptManifest>,
     /// Active prompt session state distinguishing built-in profiles from custom replacement prompts.
@@ -673,12 +663,6 @@ impl Agent {
             thinking_level: ThinkingLevel::Off,
             service_tier: davinci_ai::CodexServiceTier::Standard,
             effort_policy: effort::EffortPolicy::default(),
-            decision_effort_advice_enabled: false,
-            decision_completion_advice_enabled: false,
-            decision_tool_family_advice_enabled: false,
-            decision_turn_advice: None,
-            decision_effort_advice: None,
-            decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
             requirement_review_enabled: true,
@@ -797,7 +781,6 @@ impl Agent {
             last_prepared_manifest: None,
             runtime: None,
             prompt_checkpoint_bus: None,
-            decision_runtime: None,
             runtime_session: None,
         };
         *agent
@@ -1019,72 +1002,6 @@ impl Agent {
                 observation: Box::new(observation),
             });
         }
-    }
-
-    pub fn set_decision_runtime(&mut self, runtime: Arc<decision::DecisionRuntime>) {
-        // Generations are local to a runtime. A distinct provider runtime may
-        // restart at the same number, so replacing it invalidates all advice.
-        self.clear_turn_decision();
-        self.decision_runtime = Some(runtime);
-    }
-
-    pub fn set_decision_effort_advice_enabled(&mut self, enabled: bool) {
-        if self.decision_effort_advice_enabled != enabled {
-            self.clear_turn_decision();
-        }
-        self.decision_effort_advice_enabled = enabled;
-    }
-
-    pub fn decision_effort_advice_enabled(&self) -> bool {
-        self.decision_effort_advice_enabled
-    }
-
-    pub fn set_decision_effort_advice(&mut self, advice: Option<ThinkingLevel>) {
-        self.decision_effort_advice = advice;
-    }
-
-    pub fn set_decision_advice_key(&mut self, key: Option<decision::DecisionAdviceKey>) {
-        self.decision_advice_key = key;
-    }
-
-    pub fn take_decision_advice_key(&mut self) -> Option<decision::DecisionAdviceKey> {
-        self.decision_advice_key.take()
-    }
-
-    pub fn decision_runtime(&self) -> Option<Arc<decision::DecisionRuntime>> {
-        self.decision_runtime.clone()
-    }
-
-    pub fn enable_decision_runtime(&mut self) {
-        if let Some(runtime) = &self.decision_runtime {
-            runtime.enable();
-        }
-    }
-
-    pub fn disable_decision_runtime(&mut self) {
-        if let Some(runtime) = &self.decision_runtime {
-            runtime.disable();
-        }
-    }
-
-    pub fn enqueue_decision_shadow(
-        &self,
-        request: &decision::request::DecisionRequest,
-    ) -> Result<(), decision::provider::DecisionError> {
-        self.decision_runtime
-            .as_ref()
-            .ok_or(decision::provider::DecisionError::Disabled)?
-            .enqueue_shadow(request.clone())
-    }
-
-    pub fn evaluate_decision_shadow(
-        &self,
-        request: &decision::request::DecisionRequest,
-    ) -> Result<decision::response::DecisionResponse, decision::provider::DecisionError> {
-        let Some(runtime) = &self.decision_runtime else {
-            return Err(decision::provider::DecisionError::Disabled);
-        };
-        runtime.evaluate(request)
     }
 
     /// Return the runtime bound to the current session, when reusable by the host.
@@ -1981,26 +1898,11 @@ impl Agent {
 
     /// The next request's effort; the configured level and prompt stay stable.
     pub fn request_thinking_level(&self) -> ThinkingLevel {
-        let advice = self
-            .decision_turn_advice
-            .as_ref()
-            .filter(|turn| {
-                self.decision_runtime.as_ref().is_some_and(|runtime| {
-                    runtime.is_enabled() && runtime.generation() == turn.task_key.generation
-                })
-            })
-            .filter(|turn| {
-                turn.effort_mutation_revision
-                    == Some(self.mutation_verification_state().mutation_generation)
-            })
-            .and(self.decision_effort_advice);
-        effort::resolve_request_effort(
+        effort::request_level(
             self.effort_policy,
             self.thinking_level,
             self.effort_signals(),
-            advice,
         )
-        .0
     }
 
     pub fn prompt_user_with(
@@ -2031,7 +1933,6 @@ impl Agent {
         } else {
             self.begin_completion_prompt(text);
         }
-        self.clear_turn_decision();
         let message = self.prompt_with_origin(text, images, true, correction);
         if let (Some(runtime), Some(budget)) = (&self.runtime, &self.root_budget) {
             let admitted = budget.snapshot().is_ok_and(|snapshot| {
@@ -3371,8 +3272,8 @@ impl Agent {
     }
 
     /// Add available family schemas without granting permission, clearing
-    /// denials, or hiding the core. Both discovery and optional advice use the
-    /// existing exposure state, so schema identity follows the effective set.
+    /// denials, or hiding the core. Discovery uses the existing exposure state,
+    /// so schema identity follows the effective set.
     pub fn activate_tool_families(&self, families: &[String]) -> Vec<String> {
         self.sync_tool_authorization();
         let authorized = self
