@@ -204,6 +204,11 @@ impl McpRegistry {
                     &tool.parameters,
                     None,
                 )
+                .with_declared_effects(vec![if is_read_only {
+                    crate::runtime::DeclaredEffect::McpRead
+                } else {
+                    crate::runtime::DeclaredEffect::McpMutation
+                }])
                 .with_description(tool.description)
                 .with_family(family.unwrap_or_default())
             })
@@ -515,6 +520,10 @@ mod tests {
         );
         assert_eq!(registry.capabilities()[0].tool_class, ToolClass::Other);
         assert!(!registry.capabilities()[0].read_only);
+        assert_eq!(
+            registry.capabilities()[0].declared_effects,
+            vec![crate::runtime::DeclaredEffect::McpMutation]
+        );
         use crate::permission::{
             PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
         };
@@ -583,6 +592,10 @@ mod tests {
         assert_eq!(capabilities[0].name, "mcp__memory__echo");
         assert_eq!(capabilities[0].source, crate::CapabilitySource::Mcp);
         assert!(capabilities[0].read_only);
+        assert_eq!(
+            capabilities[0].declared_effects,
+            vec![crate::runtime::DeclaredEffect::McpRead]
+        );
         assert_eq!(capabilities[0].tool_class, crate::ToolClass::Read);
         let runtime_registry = crate::RuntimeCapabilityRegistry::new();
         registry.register_with(&runtime_registry);
@@ -761,118 +774,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod codemode_structured_tests {
-    use super::*;
-    use serde_json::json;
-
-    struct FixtureTransport {
-        mixed: bool,
-        failed: bool,
-    }
-
-    impl davinci_mcp::RpcTransport for FixtureTransport {
-        fn call(&mut self, method: &str, _params: Value) -> davinci_mcp::Result<Value> {
-            match method {
-                "initialize" => Ok(json!({
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {"tools": {}}
-                })),
-                "tools/list" => Ok(
-                    json!({"tools": [{"name": "items", "outputSchema":{"type":"object","required":["items"]}}]}),
-                ),
-                "tools/call" => Ok(json!({
-                    "content": if self.mixed {json!([{"type":"image","data":"fixture","mimeType":"image/png"}])} else {json!([{"type": "text", "text": "visible fixture text"}])},
-                    "isError": self.failed,
-                    "structuredContent": {"items": [{"id": "A"}]},
-                    "_meta": {"private": "must not be projected"},
-                    "_operation_result_committed": true
-                })),
-                _ => Err(davinci_mcp::Error::Protocol(
-                    "unexpected fixture method".into(),
-                )),
-            }
-        }
-
-        fn notify(&mut self, method: &str, _params: Value) -> davinci_mcp::Result<()> {
-            assert_eq!(method, "notifications/initialized");
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn full_accessor_preserves_data_while_direct_presentation_is_unchanged() {
-        let client = davinci_mcp::Client::connect_transport(
-            "fixture",
-            Box::new(FixtureTransport {
-                mixed: false,
-                failed: false,
-            }),
-        )
-        .unwrap();
-        let registry = McpRegistry::default();
-        registry
-            .lock()
-            .clients
-            .insert("fixture".into(), Arc::new(Mutex::new(client)));
-        let full = registry.call_full("fixture", "items", &json!({})).unwrap();
-        assert_eq!(full.text(), "visible fixture text");
-        let encoded = serde_json::to_value(full).unwrap();
-        assert_eq!(
-            encoded["structuredContent"],
-            json!({"items": [{"id": "A"}]})
-        );
-        assert!(encoded.get("_meta").is_none());
-        assert!(encoded.get("_operation_result_committed").is_none());
-        let direct = registry.call("fixture", "items", &json!({})).unwrap();
-        assert_eq!(direct.content, "visible fixture text");
-        assert!(!direct.is_error);
-        assert!(direct.details.is_none());
-    }
-
-    #[test]
-    fn guarded_mcp_delivery_retains_schema_and_rejects_incomplete_or_failed_payloads() {
-        for (mixed, failed) in [(false, false), (true, false), (false, true)] {
-            let client = davinci_mcp::Client::connect_transport(
-                "fixture",
-                Box::new(FixtureTransport { mixed, failed }),
-            )
-            .unwrap();
-            let registry = McpRegistry::default();
-            {
-                let mut inner = registry.lock();
-                inner
-                    .clients
-                    .insert("fixture".into(), Arc::new(Mutex::new(client)));
-                inner.routes.insert(
-                    "mcp__fixture__items".into(),
-                    ("fixture".into(), "items".into()),
-                );
-            }
-            assert_eq!(
-                registry.output_schema("mcp__fixture__items").unwrap()["required"],
-                json!(["items"])
-            );
-            let workspace = tempfile::tempdir().unwrap();
-            let mut agent = crate::Agent::new("guarded MCP fixture");
-            agent.cwd = workspace.path().to_path_buf();
-            agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
-            agent.attach_mcp(registry);
-            let (result, structured, _) = agent.dispatch_script_child(
-                workspace.path(),
-                "mcp-child",
-                "mcp__fixture__items",
-                &json!({}),
-                None,
-                1,
-            );
-            assert_eq!(result.is_error, mixed || failed, "{result:?}");
-            if mixed || failed {
-                assert!(structured.is_none());
-            } else {
-                assert_eq!(structured.unwrap(), json!({"items":[{"id":"A"}]}));
-                assert_eq!(result.content, "visible fixture text");
-            }
-            assert!(!format!("{result:?}").contains("must not be projected"));
-        }
-    }
-}
+#[path = "../tests/common/codemode_mcp.rs"]
+mod codemode_structured_tests;
