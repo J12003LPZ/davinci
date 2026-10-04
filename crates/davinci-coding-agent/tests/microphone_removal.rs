@@ -24,11 +24,10 @@ fn help_no_longer_advertises_local_microphone_commands() {
     );
 }
 
-
 #[test]
 fn removed_voice_subsystem_is_absent_from_workspace() {
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace = crate_dir.parent().and_then(std::path::Path::parent).unwrap();
+    let workspace = crate_dir\n        .parent()\n        .and_then(std::path::Path::parent)\n        .unwrap();
 
     assert!(
         !workspace.join("crates/davinci-voice").exists(),
