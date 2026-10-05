@@ -281,47 +281,54 @@ mod native {
         Err(())
     }
     fn descriptors(pid: i32, remaining: usize) -> Result<Option<Vec<libc::proc_fdinfo>>, ()> {
-        // SAFETY: documented size-only query, no output buffer is dereferenced.
-        let size =
-            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-        if size == 0 {
-            // Other users' descriptors can be inaccessible. Their listener
-            // hashes still occur in the global table and require ownership.
-            return Ok(None);
+        let entry = size_of::<libc::proc_fdinfo>();
+        // Any process may open descriptors between the size query and the
+        // listing. A full buffer may have silently omitted some, so it is
+        // never trusted: ask again with more room. Failing at once let one
+        // concurrent open anywhere on the host void the whole proof.
+        for slack in [1, 8, 64, 512] {
+            // SAFETY: documented size-only query, no output buffer is dereferenced.
+            let size = unsafe {
+                libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
+            };
+            if size == 0 {
+                // Other users' descriptors can be inaccessible. Their listener
+                // hashes still occur in the global table and require ownership.
+                return Ok(None);
+            }
+            if size < 0 || size as usize > remaining * entry {
+                return Err(());
+            }
+            let capacity = (size as usize).div_ceil(entry) + slack;
+            let mut fds: Vec<_> = (0..capacity)
+                .map(|_| libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                })
+                .collect();
+            let size = fds.len() * entry;
+            // SAFETY: aligned output array allocated for the advertised byte count.
+            let count = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    fds.as_mut_ptr().cast(),
+                    size as i32,
+                )
+            };
+            if count == 0 {
+                return Ok(None);
+            }
+            if count < 0 || count as usize % entry != 0 {
+                return Err(());
+            }
+            if (count as usize) < size {
+                fds.truncate(count as usize / entry);
+                return Ok(Some(fds));
+            }
         }
-        if size < 0 || size as usize > remaining * size_of::<libc::proc_fdinfo>() {
-            return Err(());
-        }
-        let capacity = (size as usize).div_ceil(size_of::<libc::proc_fdinfo>()) + 1;
-        let mut fds: Vec<_> = (0..capacity)
-            .map(|_| libc::proc_fdinfo {
-                proc_fd: 0,
-                proc_fdtype: 0,
-            })
-            .collect();
-        let size = fds.len() * size_of::<libc::proc_fdinfo>();
-        // SAFETY: aligned output array allocated for the advertised byte count.
-        let count = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDLISTFDS,
-                0,
-                fds.as_mut_ptr().cast(),
-                size as i32,
-            )
-        };
-        // A full buffer may have silently omitted descriptors. Fail closed.
-        if count == 0 {
-            return Ok(None);
-        }
-        if count < 0
-            || count as usize >= size
-            || count as usize % size_of::<libc::proc_fdinfo>() != 0
-        {
-            return Err(());
-        }
-        fds.truncate(count as usize / size_of::<libc::proc_fdinfo>());
-        Ok(Some(fds))
+        Err(())
     }
     fn socket(pid: i32, fd: i32) -> Result<u64, ()> {
         // Larger than the current socket_fdinfo ABI; future growth beyond the
