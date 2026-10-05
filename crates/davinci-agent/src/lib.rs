@@ -468,6 +468,9 @@ impl std::fmt::Debug for AutoSandboxResolverHandle {
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub(crate) codemode: Option<codemode::CodeModeBinding>,
+    /// Admitted at startup, registered on each turn's runtime once it has an
+    /// operation journal (see `activate_staged_codemode`).
+    pub(crate) staged_codemode: Option<codemode::CodeModeBinding>,
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
@@ -728,6 +731,7 @@ impl Agent {
             tool_execution_mode: ToolExecutionMode::Parallel,
             custom_tool_executor: None,
             codemode: None,
+            staged_codemode: None,
             pre_tool: None,
             post_tool: None,
             script_post_tool: None,

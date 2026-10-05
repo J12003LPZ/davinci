@@ -1317,10 +1317,11 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             parsed.codemode.as_deref(),
             settings.codemode.as_ref(),
         )? {
+            if parsed.no_session {
+                return Err("Codemode records its operations in the session journal; remove --no-session to use it".into());
+            }
             let codemode = config.admit(cwd)?;
-            agent
-                .enable_read_only_codemode(Arc::new(codemode))
-                .map_err(|error| error.message)?;
+            agent.stage_read_only_codemode(Arc::new(codemode));
         }
     }
     host.emit(ExtensionEvent::SessionStart);
@@ -3004,6 +3005,28 @@ fn complete_prompt_with_host(
         .register_with(&runtime_handle.capability_registry);
     let post_hook_runtime = runtime_handle.clone();
     agent.set_runtime(runtime_handle);
+    // Codemode needs this turn's operation journal, so it registers here.
+    if let Err(error) = agent.activate_staged_codemode() {
+        let reply = format!("Codemode unavailable: {}", error.message);
+        let end = AgentEvent::AgentEnd {
+            messages: vec![davinci_ai::ChatMessage::text("assistant", &reply)],
+            will_retry: false,
+        };
+        if stream_json {
+            if let Ok(value) = to_json_print_event(&end) {
+                if let Ok(encoded) = serde_json::to_string(&value) {
+                    let _ = output::write_raw_stdout_line(&encoded);
+                }
+            }
+        } else {
+            agent.emit_live(end.clone());
+        }
+        let mut host = host.lock().unwrap_or_else(|error| error.into_inner());
+        host.emit(ExtensionEvent::TurnEnd);
+        host.emit(ExtensionEvent::AgentEnd);
+        host.emit(ExtensionEvent::AgentSettled);
+        return (reply, vec![end]);
+    }
     // After the runtime registry exists, so its tools are part of the frozen
     // prefix. A no-op outside cache-sensitive (appended) routes.
     agent.freeze_tools_for_cache();

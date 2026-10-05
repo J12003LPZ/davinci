@@ -331,6 +331,68 @@ fn completed_codemode_reopens_with_source_access_binding() {
 }
 
 #[test]
+fn staged_codemode_registers_on_each_turn_runtime_that_has_a_journal() {
+    // Hosts admit Codemode at startup but attach the operation journal per
+    // turn. Enabling at startup failed every time; staging must instead wait
+    // for the journal and register on each new turn runtime exactly once.
+    let mut early = Agent::new("startup without a journal");
+    early.stage_read_only_codemode(Arc::new(ReadOnlyFixtureHost));
+    assert!(early.activate_staged_codemode().is_err());
+
+    let (mut agent, workspace, _journal) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    let unstaged = agent.runtime.clone().unwrap();
+    agent.stage_read_only_codemode(Arc::new(ReadOnlyFixtureHost));
+    assert!(agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .get("codemode")
+        .is_none());
+    agent.activate_staged_codemode().unwrap();
+    agent.activate_staged_codemode().unwrap(); // idempotent within one runtime
+    assert!(agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .get("codemode")
+        .is_some());
+
+    // The next turn installs a fresh runtime without the capability.
+    let mut next_turn = unstaged;
+    next_turn.capability_registry = Default::default();
+    agent.set_runtime(next_turn);
+    assert!(agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .get("codemode")
+        .is_none());
+    agent.activate_staged_codemode().unwrap();
+    assert!(agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .get("codemode")
+        .is_some());
+
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "staged".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    assert_eq!(messages[0].is_error, Some(false), "{messages:?}");
+}
+
+#[test]
 fn codemode_parent_uses_real_dispatch_and_authoritative_child_evidence() {
     let (mut agent, workspace, journal) = configured_agent();
     agent.set_permission_mode(crate::PermissionMode::ReadOnly);
