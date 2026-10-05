@@ -1872,12 +1872,11 @@ fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
 }
 
 fn build_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
-    let mut models = load_builtin_models();
     let agent_dir = default_agent_dir();
-    let store = davinci_ai::load_models_store(&agent_dir);
-    for entry in store.providers.values() {
-        models = davinci_ai::merge_models(&models, &entry.models);
-    }
+    let mut models = davinci_ai::merge_models_store(
+        &load_builtin_models(),
+        &davinci_ai::load_models_store(&agent_dir),
+    );
     // Codex models discovered live or by Codex CLI; models.json still wins.
     models = davinci_ai::overlay_codex_models(&models, &agent_dir);
     let config = ModelConfig::load(&models_json_path(&agent_dir));
@@ -2362,6 +2361,7 @@ fn build_worker_agent(
         )
     };
     let mut child = new_worker_agent(system_prompt);
+    child.install_telemetry = settings.install_telemetry_enabled();
     child.service_tier = req.service_tier;
     if let Some(max_turns) = req.max_turns {
         child.max_model_turns = Some(max_turns.clamp(1, 60) as u32);
@@ -7704,12 +7704,30 @@ fn available_themes() -> Vec<Theme> {
     available_themes_with(None)
 }
 
+/// TS pi defaults the viewer to pi.dev, which would hand the upstream project
+/// every secret gist id. DaVinci prints only the gist unless a viewer is set.
+fn share_viewer_base() -> Option<String> {
+    std::env::var("PI_SHARE_VIEWER_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn share_message(gist_url: &str, viewer: Option<&str>) -> String {
+    match viewer {
+        Some(viewer) => {
+            let gist_id = gist_url.rsplit('/').next().unwrap_or_default();
+            format!("Share URL: {viewer}{gist_id}\nGist: {gist_url}")
+        }
+        None => format!("Share URL: {gist_url}"),
+    }
+}
+
 fn share_current_session(agent: &Agent) -> Result<String, String> {
     if std::env::var("PI_SHARE_DRY_RUN").is_ok() {
-        let viewer = std::env::var("PI_SHARE_VIEWER_URL")
-            .unwrap_or_else(|_| "https://pi.dev/session/".into());
-        let url = format!("{viewer}dry-run");
-        return Ok(format!("Share URL: {url}"));
+        return Ok(share_message(
+            "https://gist.github.com/dry-run",
+            share_viewer_base().as_deref(),
+        ));
     }
     if let Ok(url) = std::env::var("PI_SHARE_URL") {
         return Ok(format!("Share URL: {url}"));
@@ -7730,10 +7748,7 @@ fn share_current_session(agent: &Agent) -> Result<String, String> {
     match output {
         Ok(result) if result.status.success() => {
             let gist_url = String::from_utf8_lossy(&result.stdout).trim().to_string();
-            let gist_id = gist_url.rsplit('/').next().unwrap_or_default();
-            let viewer = std::env::var("PI_SHARE_VIEWER_URL")
-                .unwrap_or_else(|_| "https://pi.dev/session/".into());
-            Ok(format!("Share URL: {viewer}{gist_id}\nGist: {gist_url}"))
+            Ok(share_message(&gist_url, share_viewer_base().as_deref()))
         }
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -10508,9 +10523,8 @@ fn apply_changelog_overlay(
         stored.last_changelog_version = Some(version.clone());
         let _ = save_settings(agent_dir, &stored);
     }
-    if display.report_telemetry {
-        changelog::report_install_telemetry(VERSION, settings.install_telemetry_enabled());
-    }
+    // TS pi reports installs to pi.dev here. DaVinci has no install endpoint
+    // and never reports to the upstream project's servers.
     if let Some(markdown) = display.markdown {
         let text = changelog::format_startup_changelog(
             &markdown,

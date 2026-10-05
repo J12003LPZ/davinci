@@ -727,7 +727,7 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
         }
 
         if last_tick.elapsed() >= TICK {
-            model.tick = model.tick.wrapping_add(1);
+            model.advance_tick();
             model.dirty = true;
             last_tick = Instant::now();
         }

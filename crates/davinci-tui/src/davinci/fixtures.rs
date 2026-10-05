@@ -1977,6 +1977,10 @@ fn working() -> crate::davinci::model::Working {
     crate::davinci::model::Working {
         seconds: 12,
         tokens: 423,
+        shown_tokens: None,
+        idle_ticks: 0,
+        seen_tokens: 0,
+        glint: 0,
         thinking: Some("high".into()),
         interrupting: false,
         verb_seed: 0,

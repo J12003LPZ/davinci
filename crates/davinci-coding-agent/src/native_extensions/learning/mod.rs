@@ -26,7 +26,7 @@ use davinci_agent::runtime::events::AgentKind;
 use davinci_agent::{ToolError, ToolResult};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::native_extensions::vector_memory::content_hash;
 
@@ -499,7 +499,11 @@ impl LearningController {
                                 "body": body,
                                 "candidateId": candidate.id,
                             });
-                            let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                            let read_set_snapshot = self
+                                .read_set
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .clone();
                             let ctx = SkillManagerContext {
                                 project_skills_dir: &self.project_skills_dir,
                                 global_skills_dir: &self.global_skills_dir,
@@ -531,7 +535,11 @@ impl LearningController {
                                 "expectedHash": expected_hash,
                                 "candidateId": candidate.id,
                             });
-                            let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                            let read_set_snapshot = self
+                                .read_set
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .clone();
                             let ctx = SkillManagerContext {
                                 project_skills_dir: &self.project_skills_dir,
                                 global_skills_dir: &self.global_skills_dir,
@@ -563,7 +571,11 @@ impl LearningController {
                                 "expectedHash": expected_hash,
                                 "candidateId": candidate.id,
                             });
-                            let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                            let read_set_snapshot = self
+                                .read_set
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .clone();
                             let ctx = SkillManagerContext {
                                 project_skills_dir: &self.project_skills_dir,
                                 global_skills_dir: &self.global_skills_dir,
@@ -852,7 +864,11 @@ impl LearningController {
         _cwd: &Path,
         args: &Value,
     ) -> Result<ToolResult, ToolError> {
-        let read_set_snapshot = self.read_set.lock().unwrap().clone();
+        let read_set_snapshot = self
+            .read_set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let ctx = SkillManagerContext {
             project_skills_dir: &self.project_skills_dir,
             global_skills_dir: &self.global_skills_dir,
@@ -1099,7 +1115,11 @@ impl LearningController {
                         "body": body,
                         "candidateId": candidate.id,
                     });
-                    let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                    let read_set_snapshot = self
+                        .read_set
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
                     let ctx = SkillManagerContext {
                         project_skills_dir: &self.project_skills_dir,
                         global_skills_dir: &self.global_skills_dir,
@@ -1126,7 +1146,11 @@ impl LearningController {
                         "expectedHash": expected_hash,
                         "candidateId": candidate.id,
                     });
-                    let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                    let read_set_snapshot = self
+                        .read_set
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
                     let ctx = SkillManagerContext {
                         project_skills_dir: &self.project_skills_dir,
                         global_skills_dir: &self.global_skills_dir,
@@ -1155,7 +1179,11 @@ impl LearningController {
                     if let Some(hash) = expected_hash {
                         args["expectedHash"] = json!(hash);
                     }
-                    let read_set_snapshot = self.read_set.lock().unwrap().clone();
+                    let read_set_snapshot = self
+                        .read_set
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
                     let ctx = SkillManagerContext {
                         project_skills_dir: &self.project_skills_dir,
                         global_skills_dir: &self.global_skills_dir,

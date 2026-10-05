@@ -71,7 +71,7 @@ pub fn fresh_authorize_request_checked(provider: &str) -> Result<Option<Authoriz
     let state = uuid::Uuid::new_v4().simple().to_string();
 
     if provider == "openai-codex" {
-        let auth_path = crate::default_auth_path();
+        let auth_path = crate::try_default_auth_path().map_err(|err| err.to_string())?;
         let agent_dir = auth_path
             .parent()
             .ok_or("OpenAI sign-in could not resolve the DaVinci agent directory")?;

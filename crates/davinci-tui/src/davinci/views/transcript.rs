@@ -13,7 +13,7 @@ use crate::davinci::model::{
 };
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, detail_line, failure_line, indent, run_width, span, tool_line,
+    blank, clip_ellipsis, detail_line, failure_line, indent, mix, run_width, span, tool_line,
     truncate_run, wrap, MEASURE,
 };
 
@@ -26,24 +26,55 @@ pub const ELBOW: &str = "  ⎿ \u{a0}";
 /// Render a whole transcript, at a width that may be narrower than the window
 /// when the Codex sidebar is open.
 pub fn lines(model: &Model, entries: &[Entry], width: u16) -> Vec<Line<'static>> {
-    rendered_blocks(model, entries, width)
+    rendered_blocks(model, entries, width, own_base(model, entries))
         .into_iter()
         .flatten()
         .collect()
 }
 
+/// `Some(0)` when `entries` is the model's own transcript, so typewriter
+/// indices apply; `None` for any other list of entries.
+fn own_base(model: &Model, entries: &[Entry]) -> Option<usize> {
+    std::ptr::eq(entries.as_ptr(), model.transcript.as_ptr())
+        .then_some(0)
+        .filter(|_| entries.len() == model.transcript.len())
+}
+
 /// The last `height` rows of the transcript, rendered from the end.
 ///
-/// Every entry renders independently, so a window's worth can be built by
-/// walking backwards until enough rows exist — rendering the whole transcript
-/// four times a second grew with the session and was the frame's whole cost.
+/// Every entry renders independently, so a window's worth is built from a
+/// suffix: the last 64 entries, then 128, … until the suffix fills the
+/// window or reaches the start. A suffix only ever begins on an entry that
+/// cannot sit inside an explore group (anything but a tool line or a gap),
+/// so it groups exactly as the full transcript does. Rendering the whole
+/// transcript on every frame grew with the session and, at the typewriter's
+/// 25 frames a second, was the frame's whole cost.
 pub fn tail_lines(
     model: &Model,
     entries: &[Entry],
     width: u16,
     height: usize,
 ) -> Vec<Line<'static>> {
-    let blocks = rendered_blocks(model, entries, width);
+    let base = own_base(model, entries).unwrap_or(0);
+    let typed = own_base(model, entries).is_some();
+    let mut reach = 64usize;
+    let blocks = loop {
+        let mut start = entries.len().saturating_sub(reach);
+        while start > 0 && matches!(entries[start], Entry::Tool { .. } | Entry::Gap) {
+            start -= 1;
+        }
+        let blocks = rendered_blocks(
+            model,
+            &entries[start..],
+            width,
+            typed.then_some(base + start),
+        );
+        let rows: usize = blocks.iter().map(Vec::len).sum();
+        if rows >= height || start == 0 {
+            break blocks;
+        }
+        reach = reach.saturating_mul(2);
+    };
     let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
     let mut total = 0usize;
     for rows in blocks.into_iter().rev() {
@@ -80,7 +111,15 @@ fn explore_kind(instrument: &str, target: &str) -> Option<Explore> {
     }
 }
 
-fn rendered_blocks(model: &Model, entries: &[Entry], width: u16) -> Vec<Vec<Line<'static>>> {
+/// `base` is the transcript index of `entries[0]` when `entries` is (a
+/// suffix of) the model's own transcript, so typewriter indices line up;
+/// `None` draws every entry whole.
+fn rendered_blocks(
+    model: &Model,
+    entries: &[Entry],
+    width: u16,
+    base: Option<usize>,
+) -> Vec<Vec<Line<'static>>> {
     let mut out = Vec::new();
     let mut index = 0usize;
     while index < entries.len() {
@@ -131,10 +170,58 @@ fn rendered_blocks(model: &Model, entries: &[Entry], width: u16) -> Vec<Vec<Line
                 continue;
             }
         }
-        out.push(entry_lines(model, &entries[index], width));
+        // The reply being written draws only what the typewriter has
+        // reached. Reveal indices are transcript positions, so only the
+        // model's own transcript is cut.
+        let at = base.map(|base| base + index);
+        match (&entries[index], at.and_then(|at| model.revealed(at))) {
+            (Entry::Prose(text), Some(shown)) => {
+                let at = at.unwrap_or_default();
+                out.push(writing_lines(model, at, text, shown, width));
+            }
+            (entry, _) => out.push(entry_lines(model, entry, width)),
+        }
         index += 1;
     }
     out
+}
+
+/// A reply mid-typewriter: the first `shown` characters through the same
+/// markdown path as finished prose, then a soft caret where the next
+/// character lands. The caret blinks while the reveal has caught up and this
+/// block is still the newest thing on screen, and is gone otherwise. A block
+/// queued behind the one being typed draws nothing yet.
+fn writing_lines(
+    model: &Model,
+    index: usize,
+    text: &str,
+    shown: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if !model.writing(index) {
+        return Vec::new();
+    }
+    let th = &model.theme;
+    let cc = th.cc();
+    let cut = text
+        .char_indices()
+        .nth(shown)
+        .map_or(text.len(), |(byte, _)| byte);
+    let mut rows = entry_lines(model, &Entry::Prose(text[..cut].to_string()), width);
+    let typing = model.revealing();
+    let newest = model.transcript[index + 1..]
+        .iter()
+        .all(|entry| matches!(entry, Entry::Gap));
+    let waiting = model.working.is_some() && newest && (model.tick / 2) % 2 == 0;
+    if typing || waiting {
+        let caret = span(CARET, cc.claude);
+        match rows.last_mut() {
+            Some(row) if run_width(&row.spans) < width => row.spans.push(caret),
+            Some(_) => {}
+            None => rows.push(Line::from(vec![span("● ", th.text), caret])),
+        }
+    }
+    rows
 }
 
 fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec<Line<'static>> {
@@ -187,7 +274,11 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
         spans.extend(bold_numbers(&sentence, cc.inactive));
         return vec![Line::from(truncate_run(spans, width))];
     }
-    let bullet = if model.tick % 2 == 1 { "  " } else { "● " };
+    let bullet = if (model.tick / 2) % 2 == 1 {
+        "  "
+    } else {
+        "● "
+    };
     let mut spans = vec![span(bullet, cc.inactive)];
     spans.extend(bold_numbers(&format!("{sentence}…"), th.text));
     let (kind, target, _) = calls.last().expect("a group has a call");
@@ -244,7 +335,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             summary,
             output,
         } => {
-            let mut rows = vec![tool_line(
+            let mut line = tool_line(
                 width,
                 th,
                 *state,
@@ -253,7 +344,32 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 duration.as_deref(),
                 model.tick,
                 model.running,
-            )];
+            );
+            // A call in flight: light sweeps across its name, the way the
+            // working line's verb shimmers, until the call comes back.
+            let in_flight = model.running
+                && duration.is_none()
+                && !matches!(
+                    state,
+                    State::Failed | State::Attention | State::Skipped | State::Queued
+                );
+            if in_flight && model.animate && line.spans.len() > 2 {
+                let name = line.spans[1].clone();
+                let lit = super::opera::shimmer(
+                    name.content.as_ref(),
+                    model.tick,
+                    true,
+                    cc_text(th),
+                    th.cc().claude_shimmer,
+                )
+                .into_iter()
+                .map(|span| {
+                    let ink = span.style.fg.unwrap_or_default();
+                    span.patch_style(name.style.fg(ink))
+                });
+                line.spans.splice(1..2, lit);
+            }
+            let mut rows = vec![line];
             // A delegation's workers draw their own block below; its answer
             // stays behind `ctrl+t` like any other tool output.
             let delegated = target.starts_with("agent ") && *state != State::Failed;
@@ -348,18 +464,47 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::ContextUsage(view) => super::context_usage::lines(th, view, width),
 
-        Entry::Done { verb, seconds } => {
+        Entry::Done {
+            verb,
+            seconds,
+            landed,
+        } => {
             let cc = th.cc();
+            // The turn lands: the spinner winds down ✽ ✶ ✻ and the line
+            // cools from the accent to quiet ink over two seconds.
+            let age = model.tick.wrapping_sub(*landed);
+            let (glyph, warmth) = if model.animate && age < DONE_SETTLE {
+                let glyph = ["✽", "✶", "✻"][age.min(2) as usize];
+                (glyph, 1.0 - age as f32 / DONE_SETTLE as f32)
+            } else {
+                ("✻", 0.0)
+            };
             vec![Line::from(vec![
-                span("✻ ", cc.inactive),
+                span(format!("{glyph} "), mix(cc.inactive, cc.claude, warmth)),
                 span(
                     format!("{verb} for {}", duration_words(*seconds)),
-                    cc.inactive,
+                    mix(cc.inactive, cc.text, warmth),
                 ),
             ])]
         }
     }
 }
+
+/// The ink a tool name rests at while its light sweeps: the theme's text,
+/// or the truecolor white when the theme leaves text to the terminal, so the
+/// sweep has a color to fade from.
+fn cc_text(th: &Theme) -> ratatui::style::Color {
+    match th.text {
+        ratatui::style::Color::Reset => th.cc().text,
+        color => color,
+    }
+}
+
+/// Where the next character of a reply being written lands.
+const CARET: &str = "▍";
+
+/// Ticks the completion marker takes to settle and cool (two seconds).
+const DONE_SETTLE: u64 = 8;
 
 /// Recent calls shown for a lone running worker; `ctrl+t` shows more.
 const SUBAGENT_RECENT: usize = 3;
@@ -431,6 +576,17 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             width,
         ))
     };
+    let live = |lead: &str, body: String| {
+        let mut spans = vec![span(lead.to_string(), cc.inactive)];
+        spans.extend(super::opera::shimmer(
+            &clip_ellipsis(&body, width.saturating_sub(run_width(&spans))),
+            model.tick,
+            model.animate,
+            cc.inactive,
+            cc.inactive_shimmer,
+        ));
+        Line::from(truncate_run(spans, width))
+    };
     if let [row] = rows {
         let failed = row.state == SubagentRowState::Failed;
         let running = row.state == SubagentRowState::Running;
@@ -442,7 +598,7 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             } else {
                 format!("Initializing… · {tokens}")
             };
-            return vec![line(format!("{ELBOW}{text}"), false)];
+            return vec![live(ELBOW, text)];
         }
         if !running {
             return vec![line(format!("{ELBOW}{}", subagent_outcome(row)), failed)];
@@ -458,7 +614,11 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             .enumerate()
             .map(|(index, call)| {
                 let lead = if index == 0 { ELBOW } else { ELBOW_GAP };
-                line(format!("{lead}{call}"), false)
+                if index + 1 == shown.len() {
+                    live(lead, call.to_string())
+                } else {
+                    line(format!("{lead}{call}"), false)
+                }
             })
             .collect();
         // The live tally under the calls: `+3 more tool uses · 12.4k tokens`.
@@ -507,13 +667,20 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
         } else {
             format!("{label} · {stats}")
         };
-        let spans = vec![
-            span(format!("   {branch} "), cc.inactive),
-            span(
-                clip_ellipsis(&head, width.saturating_sub(6)),
-                if failed { cc.error } else { th.text },
-            ),
-        ];
+        let running = row.state == SubagentRowState::Running;
+        let mut spans = vec![span(format!("   {branch} "), cc.inactive)];
+        let head = clip_ellipsis(&head, width.saturating_sub(6));
+        if running {
+            spans.extend(super::opera::shimmer(
+                &head,
+                model.tick,
+                model.animate,
+                th.text,
+                cc.claude_shimmer,
+            ));
+        } else {
+            spans.push(span(head, if failed { cc.error } else { th.text }));
+        }
         out.push(Line::from(truncate_run(spans, width)));
         let detail = match row.state {
             SubagentRowState::Running => row
@@ -523,7 +690,20 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
                 .unwrap_or_else(|| "Initializing…".into()),
             _ => subagent_outcome(row),
         };
-        out.push(line(format!("   {rail}⎿  {detail}"), failed));
+        if running {
+            let mut spans = vec![span(format!("   {rail}⎿  "), cc.inactive)];
+            let room = width.saturating_sub(7);
+            spans.extend(super::opera::shimmer(
+                &clip_ellipsis(&detail, room),
+                model.tick,
+                model.animate,
+                cc.inactive,
+                cc.inactive_shimmer,
+            ));
+            out.push(Line::from(truncate_run(spans, width)));
+        } else {
+            out.push(line(format!("   {rail}⎿  {detail}"), failed));
+        }
     }
     out
 }
@@ -927,6 +1107,371 @@ mod tests {
             recent: recent.iter().map(|call| call.to_string()).collect(),
             elapsed_secs: 41,
         }
+    }
+
+    #[test]
+    fn a_finished_turn_lands_warm_then_settles_into_quiet_ink() {
+        let mut m = model(80);
+        let done = Entry::Done {
+            verb: "Baked".into(),
+            seconds: 12,
+            landed: 100,
+        };
+        let cc = m.theme.cc();
+        let mut glyphs = Vec::new();
+        let mut inks = Vec::new();
+        for tick in 100..112 {
+            m.tick = tick;
+            let row = &entry_lines(&m, &done, 80)[0];
+            glyphs.push(row.spans[0].content.trim().to_string());
+            inks.push(row.spans[0].style.fg);
+            assert!(text(row).ends_with("Baked for 12s"), "{}", text(row));
+        }
+        assert_eq!(&glyphs[..4], ["✽", "✶", "✻", "✻"]);
+        assert_eq!(inks[0], Some(cc.claude));
+        assert_ne!(inks[4], inks[0]);
+        assert!(inks[8..].iter().all(|ink| *ink == Some(cc.inactive)));
+
+        m.animate = false;
+        m.tick = 100;
+        let row = &entry_lines(&m, &done, 80)[0];
+        assert_eq!(text(row), "✻ Baked for 12s");
+        assert_eq!(row.spans[0].style.fg, Some(cc.inactive));
+    }
+
+    fn live_turn(m: &mut Model, reply: &str) {
+        m.transcript.push(Entry::User("explain".into()));
+        m.transcript.push(Entry::Gap);
+        m.working = Some(crate::davinci::model::Working::new());
+        m.transcript.push(Entry::Prose(reply.into()));
+    }
+
+    fn screen(m: &Model) -> String {
+        lines(m, &m.transcript, m.width)
+            .iter()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_new_reply_is_typed_out_behind_the_stream_with_a_caret() {
+        let mut m = model(80);
+        live_turn(&mut m, "The parser walks the tree once.");
+        m.advance_reveal_by(0);
+        assert_eq!(m.revealed(m.transcript.len() - 1), Some(0));
+        assert!(screen(&m).contains("● ▍"), "{}", screen(&m));
+
+        m.advance_reveal_by(40);
+        let shown = m.revealed(m.transcript.len() - 1).unwrap();
+        assert!(shown > 0 && shown < 31, "{shown}");
+        let drawn = screen(&m);
+        assert!(drawn.contains("The pa"), "{drawn}");
+        assert!(!drawn.contains("once."), "{drawn}");
+        assert!(drawn.trim_end().ends_with('▍'), "{drawn}");
+
+        // It never runs past the text, and catches up well inside half a second.
+        for _ in 0..12 {
+            m.advance_reveal_by(40);
+        }
+        assert_eq!(m.revealed(m.transcript.len() - 1), Some(31));
+        assert!(screen(&m).contains("The parser walks the tree once."));
+        assert!(!m.revealing());
+    }
+
+    #[test]
+    fn a_burst_of_text_is_cleared_within_the_lag_budget() {
+        let mut m = model(120);
+        live_turn(&mut m, "");
+        m.advance_reveal_by(0);
+        if let Some(Entry::Prose(text)) = m.transcript.last_mut() {
+            *text = "word ".repeat(400);
+        }
+        let steps = (crate::davinci::model::REVEAL_LAG_SECS * 1000.0 / 40.0).ceil() as usize + 2;
+        let mut seen = Vec::new();
+        for _ in 0..steps {
+            m.advance_reveal_by(40);
+            seen.push(m.revealed(m.transcript.len() - 1).unwrap());
+        }
+        assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]), "{seen:?}");
+        assert_eq!(*seen.last().unwrap(), 2000, "{seen:?}");
+    }
+
+    #[test]
+    fn text_streamed_later_keeps_being_typed_and_finishes_after_the_turn() {
+        let mut m = model(80);
+        live_turn(&mut m, "One.");
+        m.advance_reveal_by(0);
+        for _ in 0..10 {
+            m.advance_reveal_by(40);
+        }
+        // Caught up while the model is still producing: the caret blinks.
+        m.tick = 0;
+        assert!(screen(&m).contains("One.▍"));
+        m.tick = 2;
+        assert!(!screen(&m).contains('▍'));
+
+        if let Some(Entry::Prose(text)) = m.transcript.last_mut() {
+            text.push_str(" Two and three.");
+        }
+        m.working = None;
+        m.advance_reveal_by(40);
+        assert!(m.revealing());
+        assert!(!screen(&m).contains("three."));
+        for _ in 0..20 {
+            m.advance_reveal_by(40);
+        }
+        assert!(!m.revealing());
+        let drawn = screen(&m);
+        assert!(drawn.contains("One. Two and three."), "{drawn}");
+        assert!(!drawn.contains('▍'), "the turn is over: {drawn}");
+    }
+
+    #[test]
+    fn earlier_replies_and_reduced_motion_are_drawn_whole() {
+        let mut m = model(80);
+        m.transcript.push(Entry::User("first".into()));
+        m.transcript.push(Entry::Prose("An old answer.".into()));
+        live_turn(&mut m, "A new one.");
+        m.advance_reveal_by(0);
+        let drawn = screen(&m);
+        assert!(drawn.contains("An old answer."), "{drawn}");
+        assert!(!drawn.contains("A new one."), "{drawn}");
+
+        // A second block in the same turn takes over; the first stays whole.
+        for _ in 0..10 {
+            m.advance_reveal_by(40);
+        }
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::Prose("Then this.".into()));
+        m.advance_reveal_by(0);
+        let drawn = screen(&m);
+        assert!(drawn.contains("A new one."), "{drawn}");
+        assert!(!drawn.contains("Then this."), "{drawn}");
+
+        m.animate = false;
+        m.advance_reveal_by(0);
+        assert_eq!(m.revealed(m.transcript.len() - 1), None);
+        let drawn = screen(&m);
+        assert!(drawn.contains("Then this."), "{drawn}");
+        assert!(!drawn.contains('▍'), "{drawn}");
+    }
+
+    #[test]
+    fn a_block_inserted_above_the_reply_does_not_restart_the_typing() {
+        let mut m = model(80);
+        live_turn(&mut m, "Delegating the search now.");
+        m.advance_reveal_by(0);
+        for _ in 0..3 {
+            m.advance_reveal_by(40);
+        }
+        let before = m.reveal.unwrap().shown;
+        assert!(before > 0);
+        let reply = m.transcript.len() - 1;
+        m.transcript.insert(reply - 1, Entry::Subagents(Vec::new()));
+        m.advance_reveal_by(0);
+        assert_eq!(m.revealed(reply + 1), Some(before));
+    }
+
+    fn step(m: &mut Model, times: usize) {
+        for _ in 0..times {
+            m.advance_reveal_by(40);
+        }
+    }
+
+    #[test]
+    fn a_cleared_transcript_drops_the_reveal_and_types_the_next_reply_fresh() {
+        let mut m = model(80);
+        m.transcript.push(Entry::User("a".into()));
+        m.transcript.push(Entry::Gap);
+        live_turn(&mut m, &"long reply ".repeat(30));
+        m.advance_reveal_by(0);
+        step(&mut m, 2);
+        assert!(m.revealing());
+
+        // /clear mid-reveal, then the next turn.
+        m.working = None;
+        m.transcript.clear();
+        m.advance_reveal_by(40);
+        assert!(m.reveal.is_none() && m.reveal_floor.is_none());
+        live_turn(&mut m, "Fresh.");
+        m.advance_reveal_by(0);
+        assert_eq!(m.revealed(m.transcript.len() - 1), Some(0));
+        step(&mut m, 5);
+        assert!(screen(&m).contains("Fresh."));
+    }
+
+    #[test]
+    fn a_transcript_replaced_in_place_is_drawn_whole_not_retyped() {
+        let mut m = model(80);
+        live_turn(&mut m, "Original reply being typed out slowly here.");
+        m.advance_reveal_by(0);
+        step(&mut m, 2);
+        m.working = None;
+        // A resumed session of the same shape, different words.
+        let index = m.transcript.len() - 1;
+        m.transcript[index] = Entry::Prose("Another session entirely, already read.".into());
+        m.advance_reveal_by(40);
+        assert_eq!(m.revealed(index), None);
+        assert!(screen(&m).contains("Another session entirely, already read."));
+        assert!(!screen(&m).contains('▍'));
+    }
+
+    #[test]
+    fn trimming_the_front_keeps_the_reveal_on_its_reply() {
+        let mut m = model(80);
+        for n in 0..4_100 {
+            m.transcript.push(Entry::Detail(format!("old {n}")));
+            m.transcript.push(Entry::Gap);
+        }
+        live_turn(&mut m, &"tail of the reply ".repeat(10));
+        m.advance_reveal_by(0);
+        step(&mut m, 2);
+        let shown = m.reveal.unwrap().shown;
+        m.trim_transcript();
+        let reply = m.transcript.len() - 1;
+        assert_eq!(m.revealed(reply), Some(shown));
+        step(&mut m, 30);
+        assert!(!m.reveal_pending());
+        assert!(screen(&m).contains("tail of the reply"));
+    }
+
+    #[test]
+    fn a_wake_up_turn_never_retypes_the_previous_reply() {
+        let mut m = model(80);
+        m.transcript.push(Entry::User("earlier".into()));
+        m.transcript
+            .push(Entry::Prose("The earlier answer.".into()));
+        // A team wake-up opens with an agent anchor, not a prompt.
+        m.transcript.push(Entry::Agent("davinci".into()));
+        m.working = Some(crate::davinci::model::Working::new());
+        m.advance_reveal_by(0);
+        step(&mut m, 3);
+        assert_eq!(m.revealed(1), None);
+        assert!(screen(&m).contains("The earlier answer."));
+    }
+
+    #[test]
+    fn a_second_block_waits_hidden_until_the_first_is_typed() {
+        let mut m = model(80);
+        live_turn(&mut m, &"first block ".repeat(20));
+        m.advance_reveal_by(0);
+        step(&mut m, 1);
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::Prose("Second block.".into()));
+        m.advance_reveal_by(40);
+        let drawn = screen(&m);
+        assert!(!drawn.contains("Second block."), "{drawn}");
+        assert!(m.reveal_pending());
+        step(&mut m, 30);
+        let drawn = screen(&m);
+        assert!(drawn.contains("Second block."), "{drawn}");
+        assert!(drawn.contains("first block first block"), "{drawn}");
+    }
+
+    #[test]
+    fn the_caret_leaves_a_paragraph_once_something_follows_it() {
+        let mut m = model(80);
+        live_turn(&mut m, "Looking at the file.");
+        m.advance_reveal_by(0);
+        step(&mut m, 10);
+        m.tick = 0;
+        assert!(screen(&m).contains("file.▍"));
+        m.transcript.push(Entry::Gap);
+        m.transcript
+            .push(Entry::tool(State::Read, "lector", "read src/lib.rs", None));
+        assert!(!screen(&m).contains('▍'), "{}", screen(&m));
+    }
+
+    #[test]
+    fn the_tail_renders_a_suffix_that_matches_the_full_transcript() {
+        let mut m = model(80);
+        for n in 0..600 {
+            m.transcript.push(Entry::User(format!("q{n}")));
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::tool(
+                State::Read,
+                "lector",
+                &format!("read f{n}.rs"),
+                Some("0.1s"),
+            ));
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::tool(
+                State::Search,
+                "lector",
+                "search todo",
+                Some("0.1s"),
+            ));
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::Prose(format!("answer {n}")));
+        }
+        live_turn(&mut m, "Being typed now, word by word.");
+        m.advance_reveal_by(0);
+        step(&mut m, 2);
+        for height in [1usize, 5, 17, 40, 200, 2_000] {
+            let full = lines(&m, &m.transcript, 80);
+            let want = crate::davinci::ui::tail(full, height);
+            let got = tail_lines(&m, &m.transcript, 80, height);
+            assert_eq!(
+                got.iter().map(text).collect::<Vec<_>>(),
+                want.iter().map(text).collect::<Vec<_>>(),
+                "height {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn multibyte_replies_are_cut_on_character_boundaries() {
+        let mut m = model(80);
+        live_turn(&mut m, "naïve café — résumé ✻ done");
+        m.advance_reveal_by(0);
+        for shown in 0..=27 {
+            m.reveal.as_mut().unwrap().shown = shown;
+            let _ = screen(&m);
+        }
+    }
+
+    #[test]
+    fn a_running_tool_name_shimmers_and_a_finished_one_rests() {
+        let mut m = model(100);
+        m.running = true;
+        let running = Entry::tool(State::Done, "fabrica", "edit src/lib.rs", None);
+        let names = |m: &Model, entry: &Entry| -> Vec<Option<ratatui::style::Color>> {
+            (0..12u64)
+                .map(|tick| {
+                    let mut m = m.clone();
+                    m.tick = tick;
+                    entry_lines(&m, entry, 100)[0].spans[1].style.fg
+                })
+                .collect()
+        };
+        let lit = names(&m, &running);
+        assert!(
+            lit.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "{lit:?}"
+        );
+        let row = entry_lines(&m, &running, 100);
+        let word: String = row[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            word.contains("Update(src/lib.rs)") || word.contains("(src/lib.rs)"),
+            "{word}"
+        );
+        assert!(row[0].spans[1]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD));
+
+        let finished = Entry::tool(State::Done, "fabrica", "edit src/lib.rs", Some("0.4s"));
+        let rest = names(&m, &finished);
+        assert!(rest.iter().all(|ink| *ink == rest[0]), "{rest:?}");
+
+        m.animate = false;
+        let still = names(&m, &running);
+        assert!(still.iter().all(|ink| *ink == still[0]), "{still:?}");
     }
 
     fn drawn(model: &Model, rows: Vec<SubagentRow>) -> Vec<String> {
