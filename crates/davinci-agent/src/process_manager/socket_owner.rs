@@ -437,6 +437,41 @@ mod tests {
         drop(socket);
         assert!(super::verify_for(std::process::id(), port, true).is_err());
     }
+    /// Descriptors opened elsewhere while the proof lists them must not void
+    /// it. Each churn thread holds at most two extra descriptors at a time.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ownership_proof_survives_concurrent_descriptor_churn() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let first = std::net::TcpListener::bind("127.0.0.1:0");
+                        let second = std::net::UdpSocket::bind("127.0.0.1:0");
+                        drop((first, second));
+                    }
+                })
+            })
+            .collect();
+        let failures = (0..200)
+            .filter(|_| super::verify(std::process::id(), port).is_err())
+            .count();
+        stop.store(true, Ordering::Relaxed);
+        for thread in churn {
+            thread.join().unwrap();
+        }
+        assert_eq!(failures, 0, "ownership proof failed under descriptor churn");
+        drop(socket);
+    }
+
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn listener_requires_the_actual_live_owner() {
