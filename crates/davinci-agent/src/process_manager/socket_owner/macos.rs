@@ -536,6 +536,7 @@ int main(void) {{ return 0; }}
     #[cfg(test)]
     #[test]
     fn foreign_reuseport_listener_is_not_hidden_by_an_owned_listener() {
+        let _serial = super::super::listener_test_guard();
         use std::io::BufRead;
         let parent_listener = reuseport_listener(0);
         let port = parent_listener.local_addr().unwrap().port();

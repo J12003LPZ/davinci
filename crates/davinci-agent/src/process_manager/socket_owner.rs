@@ -19,6 +19,19 @@ pub(super) fn verify_for(pid: u32, port: u16, ipv6: bool) -> Result<(), String> 
         .map_err(|_| "managed listener ownership could not be proven".into())
 }
 
+/// Tests that bind loopback listeners and prove who owns them share one
+/// process. Run concurrently, one test's ephemeral listener can take the port
+/// number another test asserts is free, so they hold this lock.
+#[cfg(test)]
+static LISTENER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn listener_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    LISTENER_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(super) fn identity(pid: u32) -> Result<u64, String> {
     platform::birth(pid).map_err(|_| "managed process identity unavailable".into())
 }
@@ -429,6 +442,7 @@ mod tests {
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn ipv6_listener_requires_the_selected_family_and_live_owner() {
+        let _serial = super::listener_test_guard();
         let socket = std::net::TcpListener::bind("[::1]:0").unwrap();
         let port = socket.local_addr().unwrap().port();
         assert!(super::verify_for(std::process::id(), port, true).is_ok());
@@ -443,6 +457,7 @@ mod tests {
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn ownership_proof_survives_concurrent_descriptor_churn() {
+        let _serial = super::listener_test_guard();
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -477,6 +492,7 @@ mod tests {
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn listener_requires_the_actual_live_owner() {
+        let _serial = super::listener_test_guard();
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = socket.local_addr().unwrap().port();
         assert!(super::verify(std::process::id(), port).is_ok());
