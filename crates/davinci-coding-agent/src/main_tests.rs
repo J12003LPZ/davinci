@@ -4636,3 +4636,49 @@ fn compaction_summarizes_with_the_session_model_even_when_uncataloged() {
     let exact = super::summarization_model(&models, "openai-codex", "gpt-6-astra").unwrap();
     assert_eq!(exact.id, "gpt-6-astra");
 }
+
+#[test]
+fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let runtime = dir.path().join("runtime");
+    let node = runtime.join("node.exe").to_string_lossy().into_owned();
+    let host = runtime.join("host").to_string_lossy().into_owned();
+    std::fs::write(
+        dir.path().join("settings.json"),
+        serde_json::json!({"codemode": {"mode": "off", "nodePath": node, "hostPath": host}})
+            .to_string(),
+    )
+    .unwrap();
+    let saved = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap()
+    };
+
+    super::persist_interactive_setting("codemode=true").unwrap();
+    assert_eq!(saved()["codemode"]["mode"], "read-only");
+    assert_eq!(saved()["codemode"]["nodePath"], node.as_str());
+
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut agent = Agent::new("fixture");
+    agent.cwd = workspace.clone();
+    let sessionless = super::sync_codemode_from_settings(&mut agent).unwrap_err();
+    assert!(sessionless.contains("session"), "{sessionless}");
+
+    agent
+        .load_from_session(JsonlSession::create(&workspace, "fixture", None).unwrap())
+        .unwrap();
+    let missing = super::sync_codemode_from_settings(&mut agent).unwrap_err();
+    assert!(missing.contains("Node runtime unavailable"), "{missing}");
+    assert!(!agent.has_staged_codemode());
+
+    super::persist_interactive_setting("codemode=false").unwrap();
+    assert_eq!(saved()["codemode"]["mode"], "off");
+    assert_eq!(saved()["codemode"]["hostPath"], host.as_str());
+    super::sync_codemode_from_settings(&mut agent).unwrap();
+    assert!(!agent.has_staged_codemode());
+}

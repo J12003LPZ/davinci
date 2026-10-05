@@ -1771,6 +1771,12 @@ pub fn to_interactive_config(
             .max_concurrent_agents
             .to_string(),
         agent_teams: settings.agent_teams.unwrap_or(false),
+        codemode: settings
+            .codemode
+            .as_ref()
+            .and_then(|value| value.get("mode"))
+            .and_then(serde_json::Value::as_str)
+            == Some("read-only"),
     }
 }
 

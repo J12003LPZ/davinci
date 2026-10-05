@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `/config` has a **Codemode** switch. On, the model can run sandboxed read-only JavaScript over your tools from the next prompt; off removes the tool. Without explicit `nodePath`/`hostPath`, the runtime is expected in `<agent dir>/codemode` (Node 24.21.0 in `node/`, the host bundle in `host/`). See [docs/codemode.md](docs/codemode.md).
+
+### Changed
+- `/config` is the only way to open the settings panel; `/settings` is no longer a command.
+- Codemode enabled through settings no longer stops startup when its runtime is missing or the run has no session; DaVinci starts without it and says why. `--codemode read-only` still fails in those cases.
+
 ## 1.1.1
 
 Changes since `v1.1.0`. Found by live gpt-6-luna (medium) verification of the installed 1.1.0 on a Sign in with ChatGPT login.

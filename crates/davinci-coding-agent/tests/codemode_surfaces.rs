@@ -1,5 +1,9 @@
-use davinci_coding_agent::{args::parse_args, codemode_host::config::resolve_config};
+use davinci_coding_agent::{
+    args::parse_args,
+    codemode_host::config::{managed_paths, resolve_config, ReadOnlyConfig},
+};
 use serde_json::json;
+use std::path::Path;
 
 #[test]
 fn read_only_cli_is_explicit_and_default_is_off() {
@@ -20,25 +24,61 @@ fn read_only_off_ignores_unused_invalid_paths() {
         json!({"mode":"off","nodePath":23,"hostPath":"relative"}),
         json!(false),
     ] {
-        assert_eq!(resolve_config(None, Some(&config)).unwrap(), None);
-        assert_eq!(resolve_config(Some("off"), Some(&config)).unwrap(), None);
+        assert_eq!(
+            resolve_config(None, Some(&config), agent_dir()).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_config(Some("off"), Some(&config), agent_dir()).unwrap(),
+            None
+        );
     }
-    assert_eq!(resolve_config(None, None).unwrap(), None);
+    assert_eq!(resolve_config(None, None, agent_dir()).unwrap(), None);
+}
+
+fn agent_dir() -> &'static Path {
+    Path::new(if cfg!(windows) { r"C:\agent" } else { "/agent" })
 }
 
 #[test]
-fn read_only_requires_host_paths_and_controlled_is_explicitly_unavailable() {
-    assert!(resolve_config(Some("read-only"), None)
-        .unwrap_err()
-        .contains("nodePath"));
-    assert!(resolve_config(Some("controlled"), None)
+fn read_only_defaults_to_the_managed_runtime_and_controlled_is_unavailable() {
+    // `/config` only stores the mode, so missing paths mean the managed
+    // install under <agent dir>/codemode.
+    let managed = managed_paths(agent_dir());
+    assert!(managed
+        .node_path
+        .starts_with(agent_dir().join("codemode").join("node")));
+    assert_eq!(managed.host_path, agent_dir().join("codemode").join("host"));
+    for user in [None, Some(json!({"mode": "read-only"}))] {
+        assert_eq!(
+            resolve_config(Some("read-only"), user.as_ref(), agent_dir()).unwrap(),
+            Some(managed_paths(agent_dir()))
+        );
+    }
+    // Explicit absolute paths still win; relative or non-string ones fail.
+    let custom = if cfg!(windows) {
+        r"C:\custom\node.exe"
+    } else {
+        "/custom/node"
+    };
+    assert_eq!(
+        resolve_config(
+            None,
+            Some(&json!({"mode":"read-only","nodePath":custom})),
+            agent_dir()
+        )
+        .unwrap(),
+        Some(ReadOnlyConfig {
+            node_path: custom.into(),
+            host_path: managed_paths(agent_dir()).host_path,
+        })
+    );
+    for bad in [json!({"nodePath":"relative"}), json!({"hostPath": 7})] {
+        assert!(resolve_config(Some("read-only"), Some(&bad), agent_dir()).is_err());
+    }
+    assert!(resolve_config(Some("controlled"), None, agent_dir())
         .unwrap_err()
         .contains("acceptance gates"));
-    assert!(resolve_config(
-        Some("read-only"),
-        Some(&json!({"nodePath":"relative","hostPath":"relative"}))
-    )
-    .is_err());
 }
 
 #[test]

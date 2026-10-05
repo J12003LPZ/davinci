@@ -19,7 +19,7 @@ def main():
     artifact = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
     checks = [
         ("/help", "/setup", False),
-        ("/settings", "Search settings", 2),
+        ("/settings", "is not a command", False),
         ("/config", "Search settings", 2),
         ("/model", "Switch between configured models", True),
         ("/model openai-codex/gpt-6-luna", "model openai-codex / gpt-6-luna", False),

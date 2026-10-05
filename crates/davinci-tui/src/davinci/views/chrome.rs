@@ -893,7 +893,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::Grafo => Some("/graph path …"),
         Screen::Mensura => Some("/mensura policy frugal"),
         Screen::Models => Some("/model anthropic/claude-opus"),
-        Screen::Settings => Some("/settings"),
+        Screen::Settings => Some("/config"),
         Screen::Thinking => Some("/thinking high"),
         Screen::Login => Some("/login openai"),
         Screen::Keys => Some("/hotkeys"),

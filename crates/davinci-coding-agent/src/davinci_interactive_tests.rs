@@ -2234,7 +2234,7 @@ fn commands_with_a_home_reach_perform_which_opens_their_sheet() {
         Sent::Command(SlashAction::Resume)
     ));
     assert!(matches!(
-        classify("/settings"),
+        classify("/config"),
         Sent::Command(SlashAction::Settings)
     ));
     assert!(matches!(
