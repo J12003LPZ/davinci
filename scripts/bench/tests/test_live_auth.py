@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,6 +51,15 @@ class LiveAuthTests(unittest.TestCase):
         self.auth.write_text(json.dumps({"openai-codex": ROTATED}))
         self.assertFalse(live_auth.give_back(self.auth, lent))
         self.assertEqual(self.stored()["openai-codex"], newer)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_credential_files_are_owner_only(self):
+        self.store.chmod(0o600)
+        lent = live_auth.lend(self.auth)
+        self.assertEqual(self.auth.stat().st_mode & 0o777, 0o600)
+        self.auth.write_text(json.dumps({"openai-codex": ROTATED}))
+        live_auth.give_back(self.auth, lent)
+        self.assertEqual(self.store.stat().st_mode & 0o777, 0o600)
 
     def test_a_missing_eval_store_is_ignored(self):
         lent = live_auth.lend(self.auth)

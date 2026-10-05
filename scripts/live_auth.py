@@ -13,13 +13,20 @@ from pathlib import Path
 PROVIDER = "openai-codex"
 
 
+def write_private(path: Path, text: str) -> None:
+    """Credential files are owner-only (0600); write_text would use the umask."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def user_auth_path() -> Path:
     return Path.home() / ".pi/agent/auth.json"
 
 
 def lend(auth: Path) -> dict:
     lent = json.loads(user_auth_path().read_text(encoding="utf-8"))[PROVIDER]
-    auth.write_text(json.dumps({PROVIDER: lent}), encoding="utf-8")
+    write_private(auth, json.dumps({PROVIDER: lent}))
     return lent
 
 
@@ -36,6 +43,7 @@ def give_back(auth: Path, lent: dict) -> bool:
         return False  # A newer login replaced it while the eval ran; keep that.
     store[PROVIDER] = current
     temporary = path.with_name(path.name + ".eval-tmp")
-    temporary.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    temporary.unlink(missing_ok=True)  # O_CREAT keeps an old file's mode.
+    write_private(temporary, json.dumps(store, indent=2))
     os.replace(temporary, path)
     return True
