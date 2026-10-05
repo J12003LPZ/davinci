@@ -325,7 +325,9 @@ impl Builder {
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
-            | Tag::MetadataBlock(_) => {}
+            | Tag::MetadataBlock(_)
+            | Tag::Superscript
+            | Tag::Subscript => {}
         }
     }
 
@@ -376,7 +378,9 @@ impl Builder {
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
-            | TagEnd::MetadataBlock(_) => {}
+            | TagEnd::MetadataBlock(_)
+            | TagEnd::Superscript
+            | TagEnd::Subscript => {}
         }
     }
 
