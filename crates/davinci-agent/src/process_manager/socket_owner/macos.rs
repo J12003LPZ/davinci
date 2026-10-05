@@ -258,7 +258,9 @@ mod native {
             {
                 return Err(());
             }
-            let mut bytes = vec![0_u8; size];
+            // Headroom for sockets opened between the size query and the copy.
+            let mut bytes = vec![0_u8; (size + size / 4 + 4096).min(1024 * 1024)];
+            let mut size = bytes.len();
             // SAFETY: byte output buffer holds size writable bytes. The kernel
             // copies packed records; our parser never dereferences typed fields.
             let status = unsafe {
@@ -357,9 +359,24 @@ mod native {
         verify_for(root, port, false)
     }
 
+    /// The kernel copies the PCB table without holding it still, so a socket
+    /// opened or closed anywhere during the copy leaves the leading and
+    /// trailing generation records different. Such a snapshot is still never
+    /// trusted; take another until one is stable.
+    fn stable_snapshot() -> Result<Vec<u8>, ()> {
+        let frame = size_of::<Generation>();
+        for _ in 0..64 {
+            let bytes = snapshot()?;
+            if bytes.len() >= 2 * frame && bytes[..frame] == bytes[bytes.len() - frame..] {
+                return Ok(bytes);
+            }
+        }
+        Err(())
+    }
+
     pub(super) fn verify_for(root: u32, port: u16, ipv6: bool) -> Result<(), ()> {
         let birth = identity(root)?.1;
-        let handles = listeners_for(&snapshot()?, port, ipv6)?;
+        let handles = listeners_for(&stable_snapshot()?, port, ipv6)?;
         let mut pids = [0_i32; 4097];
         // SAFETY: writable aligned PID array; libproc returns the PID count,
         // unlike proc_pidinfo, which returns bytes.
@@ -405,7 +422,7 @@ mod native {
         }
         // Re-read the endpoint after descriptor inspection: a distinct listener
         // must not take over the port during this bounded observation.
-        if listeners_for(&snapshot()?, port, ipv6)? != handles {
+        if listeners_for(&stable_snapshot()?, port, ipv6)? != handles {
             return Err(());
         }
         Ok(())

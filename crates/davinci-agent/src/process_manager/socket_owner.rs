@@ -437,8 +437,9 @@ mod tests {
         drop(socket);
         assert!(super::verify_for(std::process::id(), port, true).is_err());
     }
-    /// Descriptors opened elsewhere while the proof lists them must not void
-    /// it. Each churn thread holds at most two extra descriptors at a time.
+    /// Sockets opened and closed elsewhere while the proof reads the kernel
+    /// tables must not void it. Four threads each create two sockets per
+    /// millisecond, roughly the load of a parallel test run on a busy host.
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn ownership_proof_survives_concurrent_descriptor_churn() {
@@ -457,6 +458,7 @@ mod tests {
                         let first = std::net::TcpListener::bind("127.0.0.1:0");
                         let second = std::net::UdpSocket::bind("127.0.0.1:0");
                         drop((first, second));
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 })
             })
