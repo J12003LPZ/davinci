@@ -498,3 +498,127 @@ fn read_only_real_quickjs_records_one_parent_and_two_guarded_children() {
         1
     );
 }
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn native_budget_failure_cancels_in_flight_children() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct BigBroker(std::sync::Arc<AtomicUsize>);
+    impl CodeModeBroker for BigBroker {
+        fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+            Ok(ToolPage {
+                tools: vec![ToolMetadata {
+                    canonical_name: "big".into(),
+                    js_name: "big".into(),
+                    description: String::new(),
+                    read_only: true,
+                }],
+                total: 1,
+                cursor: None,
+            })
+        }
+        fn describe(&self, _: &str) -> Result<serde_json::Value, CodeModeError> {
+            unreachable!()
+        }
+        fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Ok(CodeModeToolValue {
+                text: "x".repeat(900_000),
+                structured_content: None,
+                complete: true,
+                artifact: None,
+                operation_ref: "fixture-child".into(),
+            })
+        }
+    }
+
+    let host = fixture_host();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "budget-fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: "fixture".into(),
+            runtime_run_id: "fixture".into(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: "fixture".into(),
+        cancellation: Default::default(),
+        root_budget: None,
+    };
+    let outcome = host.execute(
+        &CodeModeRequest {
+            // 30 x 900KB exceeds the 8MB aggregate budget after about 9 replies.
+            code: "await Promise.all(Array.from({length: 30}, () => tools.big({}))); return 1"
+                .into(),
+            timeout_ms: Some(20_000),
+            max_output_bytes: None,
+        },
+        &context,
+        std::sync::Arc::new(BigBroker(calls.clone())),
+    );
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code.as_str()),
+        Some("LIMIT_EXCEEDED"),
+        "{outcome:?}"
+    );
+    // In-flight children observe the run token; an early host error must
+    // cancel it, not leave them running against a finished parent.
+    assert!(
+        context.cancellation.is_cancelled(),
+        "run token stayed live after the parent outcome returned"
+    );
+    let at_return = calls.load(Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let settled = calls.load(Ordering::SeqCst);
+    assert!(
+        at_return < 30,
+        "budget failure arrived after every child ran"
+    );
+    // A worker that passed the closed check just before the lane closed may
+    // still start one call; at most one per worker, never the queue.
+    assert!(
+        settled <= at_return + 4,
+        "queued children kept dispatching after the parent outcome returned: {at_return} -> {settled}"
+    );
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn native_escaped_output_beyond_frame_reports_limit_exceeded() {
+    let host = fixture_host();
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "escaped-fixture".into(),
+            session_id: None,
+            branch_leaf: None,
+            workspace_binding: "fixture".into(),
+            runtime_run_id: "fixture".into(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: "fixture".into(),
+        cancellation: Default::default(),
+        root_budget: None,
+    };
+    let outcome = host.execute(
+        &CodeModeRequest {
+            // Fits the 1MiB collector, but JSON-escapes past the 2MiB frame.
+            code: "text(String.fromCharCode(1).repeat(1000000)); return 1".into(),
+            timeout_ms: Some(5000),
+            max_output_bytes: None,
+        },
+        &context,
+        std::sync::Arc::new(NoTools),
+    );
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code.as_str()),
+        Some("LIMIT_EXCEEDED"),
+        "{outcome:?}"
+    );
+}

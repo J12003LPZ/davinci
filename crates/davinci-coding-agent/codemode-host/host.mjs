@@ -13,9 +13,10 @@ function send(message) {
   if (!terminal) process.stdout.write(encodeFrame({ version: 1, ...message }));
 }
 
-function fatal() {
+// `runId` lets Rust attribute the failure even after the run was cleared.
+function fatal(code = "PROTOCOL_ERROR", runId = active?.runId) {
   if (terminal) return;
-  send({ type: "fatal", code: "PROTOCOL_ERROR" });
+  send({ type: "fatal", code, ...(runId === undefined ? {} : { runId }) });
   terminal = true;
   active?.controller.abort();
   for (const waiter of pending.values()) waiter.reject(new Error("protocol closed"));
@@ -74,7 +75,12 @@ async function execute(message) {
 }
 
 function receive(message) {
-  if (message.type === "execute") { void execute(message).catch(fatal); return; }
+  if (message.type === "execute") {
+    // A finished frame can outgrow MAX_FRAME once JSON escaping expands output.
+    void execute(message).catch((error) => fatal(
+      error?.message === "frame limit" ? "LIMIT_EXCEEDED" : "PROTOCOL_ERROR", message.runId));
+    return;
+  }
   if (!active || message.runId !== active.runId) throw new Error("wrong run");
   if (message.type === "cancel") { active.controller.abort(); return; }
   const waiter = pending.get(message.requestId);
@@ -87,7 +93,7 @@ function receive(message) {
   else {
     const error = message.value?.error;
     if (!error || typeof error.code !== "string" || typeof error.message !== "string") {
-      fatal("PROTOCOL_ERROR: malformed broker error");
+      fatal();
       waiter.reject(new Error("PROTOCOL_ERROR: malformed broker error"));
       return;
     }
@@ -103,6 +109,6 @@ process.stdin.on("end", () => {
   try { decoder.finish(); } catch { fatal(); }
   active?.controller.abort();
 });
-process.stdin.on("error", fatal);
+process.stdin.on("error", () => fatal());
 process.stdout.on("error", () => { terminal = true; active?.controller.abort(); });
 send({ type: "hello", nodeVersion: process.version, protocolVersion: 1 });

@@ -4,8 +4,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { FrameDecoder, encodeFrame } from "./framing.mjs";
 
-function start() {
-  const child = spawn(process.execPath, [fileURLToPath(new URL("./host.mjs", import.meta.url))], { stdio: ["pipe", "pipe", "pipe"] });
+function start(flags = []) {
+  const child = spawn(process.execPath, [...flags, fileURLToPath(new URL("./host.mjs", import.meta.url))], { stdio: ["pipe", "pipe", "pipe"] });
   const decoder = new FrameDecoder();
   const messages = [];
   const waiters = [];
@@ -116,5 +116,30 @@ test("collector overflow stays bounded across the outer transport", async () => 
     assert.equal(finished.result.ok, false);
     assert.match(finished.result.error.message, /LIMIT_EXCEEDED/);
     assert.equal(finished.result.output.length, 0);
+  } finally { host.child.kill(); }
+});
+
+test("escaped output beyond the frame limit is reported as a limit, not a protocol fault", async () => {
+  const host = start();
+  try {
+    await host.next();
+    // 1MB of control characters fits the collector but JSON-escapes to ~6MB.
+    host.send({ type: "execute", runId: "escaped", code: "text('\u0001'.repeat(1000000)); return 1;", tools: [], timeoutMs: 5000, memoryBytes: 67108864 });
+    const fatal = await host.next();
+    assert.equal(fatal.type, "fatal");
+    assert.equal(fatal.code, "LIMIT_EXCEEDED");
+    assert.equal(fatal.runId, "escaped");
+  } finally { host.child.kill(); }
+});
+
+test("host runs under the Node permission model with read-only asset access", async () => {
+  const root = fileURLToPath(new URL(".", import.meta.url));
+  const host = start(["--permission", "--allow-worker", `--allow-fs-read=${root}`]);
+  try {
+    assert.equal((await host.next()).type, "hello");
+    host.send({ type: "execute", runId: "permission", code: "return 42;", tools: [], timeoutMs: 1000, memoryBytes: 67108864 });
+    const finished = await host.next();
+    assert.equal(finished.type, "finished");
+    assert.equal(finished.result.value, 42);
   } finally { host.child.kill(); }
 });

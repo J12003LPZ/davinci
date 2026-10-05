@@ -371,6 +371,133 @@ fn codemode_parent_uses_real_dispatch_and_authoritative_child_evidence() {
 }
 
 #[test]
+fn in_flight_child_is_awaited_before_parent_evidence_is_taken() {
+    use crate::codemode::*;
+    struct ReturnsEarlyHost(
+        Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
+    impl CodeModeHost for ReturnsEarlyHost {
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            broker: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            let worker = std::thread::spawn(move || {
+                let _ = broker.call(CodeModeCall {
+                    request_id: 1,
+                    tool: "read".into(),
+                    args: json!({"path":"input.txt"}),
+                });
+            });
+            *self.0.lock().unwrap() = Some(worker);
+            // The pre-tool hook raises the flag once the child is admitted.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !self.1.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Return while the child is still inside its (slow) dispatch, as a
+            // host does after an early error.
+            CodeModeOutcome {
+                status: CodeModeStatus::Failed,
+                script_completed: false,
+                output_text: String::new(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: Some(CodeModeError::new("LIMIT_EXCEEDED", "fixture early error")),
+            }
+        }
+    }
+    let worker = Arc::new(Mutex::new(None));
+    let (mut agent, workspace, _) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = admitted.clone();
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |name, _| {
+        if name == "read" {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        None
+    })));
+    agent
+        .enable_read_only_codemode(Arc::new(ReturnsEarlyHost(worker.clone(), admitted.clone())))
+        .unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "early-script".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    worker.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(admitted.load(std::sync::atomic::Ordering::SeqCst));
+    let rendered = format!("{:?}", messages[0]);
+    let details = messages[0].extra["details"]["codemode"].clone();
+    assert_eq!(
+        details["children"].as_array().map(Vec::len),
+        Some(1),
+        "the in-flight child was missing from the parent evidence: {rendered}"
+    );
+}
+
+#[test]
+fn retained_broker_cannot_dispatch_after_parent_outcome() {
+    use crate::codemode::*;
+    struct RetainingHost(Arc<Mutex<Option<Arc<dyn CodeModeBroker>>>>);
+    impl CodeModeHost for RetainingHost {
+        fn execute(
+            &self,
+            request: &CodeModeRequest,
+            context: &CodeModeRunContext,
+            broker: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            *self.0.lock().unwrap() = Some(broker.clone());
+            CodeModeHost::execute(&ReadOnlyFixtureHost, request, context, broker)
+        }
+    }
+    let retained = Arc::new(Mutex::new(None));
+    let (mut agent, workspace, journal) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    agent
+        .enable_read_only_codemode(Arc::new(RetainingHost(retained.clone())))
+        .unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "retaining-script".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    assert_eq!(messages[0].is_error, Some(false));
+    let operations = journal.snapshot().unwrap().operations.len();
+    let broker = retained.lock().unwrap().take().unwrap();
+    let error = broker
+        .call(CodeModeCall {
+            request_id: 3,
+            tool: "read".into(),
+            args: json!({"path":"input.txt"}),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "CANCELLED", "{error:?}");
+    assert_eq!(
+        journal.snapshot().unwrap().operations.len(),
+        operations,
+        "a retained broker dispatched a child after the parent outcome"
+    );
+}
+
+#[test]
 fn codemode_inherits_root_deadline_before_host_launch() {
     struct DeadlineHost(Arc<std::sync::atomic::AtomicU64>);
     impl crate::codemode::CodeModeHost for DeadlineHost {
@@ -451,7 +578,7 @@ fn codemode_off_keeps_provider_schema_and_invalid_input_never_launches() {
             &self,
             _: &crate::codemode::CodeModeRequest,
             _: &crate::codemode::CodeModeRunContext,
-            _: &dyn crate::codemode::CodeModeBroker,
+            _: Arc<dyn crate::codemode::CodeModeBroker>,
         ) -> crate::codemode::CodeModeOutcome {
             panic!("invalid input must not launch the host")
         }
@@ -464,10 +591,20 @@ fn codemode_off_keeps_provider_schema_and_invalid_input_never_launches() {
     agent
         .enable_read_only_codemode(Arc::new(NeverHost))
         .unwrap();
-    assert!(agent
+    let spec = agent
         .provider_tool_specs()
-        .iter()
-        .any(|tool| tool.name == "codemode"));
+        .into_iter()
+        .find(|tool| tool.name == "codemode")
+        .unwrap();
+    // The advertised ceilings are the effective ones, never silently clamped.
+    let limits = crate::codemode::CodeModeLimits::default();
+    let properties = &spec.parameters["properties"];
+    assert_eq!(properties["timeoutMs"]["maximum"], json!(limits.wall_ms));
+    assert_eq!(
+        properties["maxOutputBytes"]["maximum"],
+        json!(limits.output_bytes)
+    );
+    assert_eq!(properties["code"]["maxLength"], json!(limits.script_bytes));
     for args in [
         json!({"code":""}),
         json!({"code":"return 1","mode":"controlled"}),

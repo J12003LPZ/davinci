@@ -52,6 +52,8 @@ pub fn js_name(name: &str) -> String {
 
 pub struct CapabilityPolicy {
     capabilities: BTreeMap<String, RuntimeCapability>,
+    /// Admissible tools excluded because their JS aliases collide.
+    collisions: BTreeSet<String>,
 }
 
 impl CapabilityPolicy {
@@ -60,7 +62,7 @@ impl CapabilityPolicy {
         capabilities: Vec<RuntimeCapability>,
     ) -> Result<Self, CodeModeError> {
         let mut admitted = BTreeMap::new();
-        let mut aliases = BTreeSet::new();
+        let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for capability in capabilities {
             if matches!(mode, CodeModeMode::Off)
                 || EXCLUDED.contains(&capability.name.as_str())
@@ -93,16 +95,27 @@ impl CapabilityPolicy {
             if alias.is_empty() || EXCLUDED.contains(&alias.as_str()) {
                 continue;
             }
-            if capability.name.len() > 1024
-                || !aliases.insert(alias)
-                || admitted.contains_key(&capability.name)
-            {
+            if capability.name.len() > 1024 || admitted.contains_key(&capability.name) {
                 return Err(CodeModeError::new(
                     "UNAVAILABLE",
                     "ambiguous capability identity",
                 ));
             }
+            aliases
+                .entry(alias)
+                .or_default()
+                .push(capability.name.clone());
             admitted.insert(capability.name.clone(), capability);
+        }
+        // Tools whose JS aliases collide are unreachable by name, so exclude
+        // every member of the collision. The rest of the catalog stays usable,
+        // and the exclusion is reported rather than silent.
+        let mut collisions = BTreeSet::new();
+        for names in aliases.values().filter(|names| names.len() > 1) {
+            for name in names {
+                admitted.remove(name);
+                collisions.insert(name.clone());
+            }
         }
         if admitted.len() > 1024 {
             return Err(CodeModeError::new(
@@ -112,6 +125,7 @@ impl CapabilityPolicy {
         }
         Ok(Self {
             capabilities: admitted,
+            collisions,
         })
     }
 
@@ -119,7 +133,18 @@ impl CapabilityPolicy {
         self.capabilities.values().collect()
     }
 
+    /// Canonical names excluded because their script aliases collide.
+    pub fn alias_collisions(&self) -> Vec<String> {
+        self.collisions.iter().cloned().collect()
+    }
+
     pub fn resolve(&self, canonical_name: &str) -> Result<&RuntimeCapability, CodeModeError> {
+        if self.collisions.contains(canonical_name) {
+            return Err(CodeModeError::new(
+                "DENIED",
+                "capability script name collides with another tool",
+            ));
+        }
         self.capabilities
             .get(canonical_name)
             .ok_or_else(|| CodeModeError::new("DENIED", "capability is outside the run ceiling"))

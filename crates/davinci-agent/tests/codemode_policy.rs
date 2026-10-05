@@ -54,13 +54,37 @@ fn orchestrators_and_prototype_names_are_excluded() {
 }
 
 #[test]
-fn ambiguous_aliases_fail_before_discovery() {
-    assert!(CapabilityPolicy::new(
+fn ambiguous_aliases_are_excluded_without_disabling_other_tools() {
+    let policy = CapabilityPolicy::new(
         CodeModeMode::ReadOnly,
         vec![
             capability("mcp/server.tool", true),
-            capability("mcp_server_tool", true)
-        ]
+            capability("mcp_server_tool", true),
+            capability("read", true),
+        ],
+    )
+    .unwrap();
+    assert!(policy.resolve("mcp/server.tool").is_err());
+    assert!(policy.resolve("mcp_server_tool").is_err());
+    assert!(policy.resolve("read").is_ok());
+    assert_eq!(policy.tools().len(), 1);
+    // Exclusion is reported, and the refusal names the reason.
+    assert_eq!(
+        policy.alias_collisions(),
+        vec!["mcp/server.tool".to_string(), "mcp_server_tool".to_string()]
+    );
+    assert!(policy
+        .resolve("mcp_server_tool")
+        .unwrap_err()
+        .message
+        .contains("collides"));
+}
+
+#[test]
+fn duplicate_canonical_names_fail_before_discovery() {
+    assert!(CapabilityPolicy::new(
+        CodeModeMode::ReadOnly,
+        vec![capability("read", true), capability("read", true)]
     )
     .is_err());
 }

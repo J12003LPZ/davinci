@@ -115,7 +115,7 @@ fn controlled_broker_lost_mutation_response_closes_admission() {
         cancellation: Default::default(),
         root_budget: None,
     };
-    let broker = AgentCodeModeBroker::new(&agent, &context, None).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let error = broker
         .call(CodeModeCall {
             request_id: 1,

@@ -20,8 +20,8 @@
     },
     {
       "path": "host.mjs",
-      "bytes": 4754,
-      "sha256": "0d3581828cfd58b920f0bbba931134057e21f2681d055a94e9e689c502e69b33"
+      "bytes": 5064,
+      "sha256": "015185e8f21c0f188becddc79cace5f1710c1e187822c6c51fc392fed327a8f7"
     },
     {
       "path": "licenses/PROVENANCE.md",

@@ -14,6 +14,24 @@ struct RunState {
     terminal: bool,
     terminal_code: &'static str,
     children: Vec<CodeModeChildOutcome>,
+    /// Admitted children that have not yet recorded their outcome.
+    in_flight: usize,
+}
+
+/// Releases an admitted child's in-flight slot on every return path.
+struct InFlight<'a>(&'a AgentCodeModeBroker);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.in_flight -= 1;
+        drop(state);
+        self.0.drained.notify_all();
+    }
 }
 
 /// Borrows the actual parent agent. IPC never supplies its identity or policy.
@@ -23,6 +41,7 @@ pub struct AgentCodeModeBroker {
     parent: Option<OperationId>,
     policy: CapabilityPolicy,
     state: Mutex<RunState>,
+    drained: std::sync::Condvar,
     dispatch: WorkerSlotCapacity,
 }
 
@@ -102,7 +121,9 @@ impl AgentCodeModeBroker {
                 terminal: false,
                 terminal_code: "LIMIT_EXCEEDED",
                 children: vec![],
+                in_flight: 0,
             }),
+            drained: std::sync::Condvar::new(),
             dispatch: WorkerSlotCapacity::new(),
         })
     }
@@ -152,6 +173,34 @@ impl AgentCodeModeBroker {
             ));
         }
         Ok(value)
+    }
+
+    /// End admission once the parent outcome is decided, then wait up to
+    /// `grace` for children already admitted to record their outcome.
+    ///
+    /// Admission and the in-flight count share one lock, so every child is
+    /// either refused here or counted and awaited. Returns `false` when a
+    /// non-cooperative child is still running, so its evidence may be missing.
+    pub fn close(&self, grace: std::time::Duration) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.terminal {
+            state.terminal = true;
+            state.terminal_code = "CANCELLED";
+        }
+        drop(state);
+        // Cooperative children observe this and return promptly.
+        self.context.cancellation.cancel();
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let (state, _) = self
+            .drained
+            .wait_timeout_while(state, grace, |state| state.in_flight > 0)
+            .unwrap_or_else(|error| error.into_inner());
+        state.in_flight == 0
+    }
+
+    /// Tools hidden from the script because their aliases collide.
+    pub fn alias_collisions(&self) -> Vec<String> {
+        self.policy.alias_collisions()
     }
 
     pub fn children(&self) -> Vec<CodeModeChildOutcome> {
@@ -277,8 +326,13 @@ impl CodeModeBroker for AgentCodeModeBroker {
         }
         let ordinal = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if state.terminal
-                || call.request_id == 0
+            if state.terminal {
+                return Err(CodeModeError::new(
+                    state.terminal_code,
+                    "run admission is closed",
+                ));
+            }
+            if call.request_id == 0
                 || !state.requests.insert(call.request_id)
                 || state.requests.len() > self.context.limits.tool_calls as usize
             {
@@ -288,8 +342,10 @@ impl CodeModeBroker for AgentCodeModeBroker {
                     "child request budget exhausted",
                 ));
             }
+            state.in_flight += 1;
             state.requests.len()
         };
+        let _in_flight = InFlight(self);
         // A private leaf lane serializes effects without holding parent journal,
         // agent or admission-state locks while a child or approval waits.
         let _lane = self
@@ -389,8 +445,11 @@ impl CodeModeBroker for AgentCodeModeBroker {
             None
         };
         if let Some(value) = &value {
+            // The child already ran, so a sizing failure must still be recorded
+            // as its outcome below rather than returned early without evidence.
             let bytes =
-                super::projection::serialized_size(value, self.context.limits.child_result_bytes)?;
+                super::projection::serialized_size(value, self.context.limits.child_result_bytes)
+                    .unwrap_or(usize::MAX);
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.bytes = state.bytes.saturating_add(bytes);
             if state.bytes > self.context.limits.total_result_bytes {

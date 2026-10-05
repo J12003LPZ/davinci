@@ -52,10 +52,13 @@ impl Agent {
                 "Codemode capability is already registered",
             ));
         }
+        // Advertise the effective ceilings: larger values are clamped by
+        // `CodeModeLimits::for_request`, so the model must not be offered them.
+        let defaults = CodeModeLimits::default();
         let schema = json!({"type":"object","additionalProperties":false,"required":["code"],
-            "properties":{"code":{"type":"string","minLength":1,"maxLength":65536},
-            "timeoutMs":{"type":"integer","minimum":1,"maximum":300000},
-            "maxOutputBytes":{"type":"integer","minimum":4096,"maximum":65536}}});
+            "properties":{"code":{"type":"string","minLength":1,"maxLength":defaults.script_bytes},
+            "timeoutMs":{"type":"integer","minimum":1,"maximum":defaults.wall_ms},
+            "maxOutputBytes":{"type":"integer","minimum":4096,"maximum":defaults.output_bytes}}});
         let mut capability = RuntimeCapability::new(
             "codemode",
             CapabilitySource::Builtin,
@@ -143,8 +146,32 @@ impl Agent {
             )?);
             let authority = super::authority_fingerprint(self)?;
             let mut outcome = binding.host.execute(&request, &context, broker.clone());
+            let drained = broker.close(std::time::Duration::from_millis(
+                context.limits.cleanup_grace_ms,
+            ));
             // Guest and host output cannot forge the authoritative child evidence.
             outcome.children = broker.children();
+            let collisions = broker.alias_collisions();
+            if !collisions.is_empty() {
+                let shown = collisions.iter().take(16).cloned().collect::<Vec<_>>();
+                outcome.host_notes.push(format!(
+                    "Tools excluded because their script names collide: {}{}",
+                    shown.join(", "),
+                    if collisions.len() > shown.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if !drained {
+                outcome
+                    .host_notes
+                    .push("A child call was still running when the run closed; child evidence may be incomplete.".into());
+                if matches!(outcome.status, CodeModeStatus::Completed) {
+                    outcome.status = CodeModeStatus::Partial;
+                }
+            }
             outcome.operation_ref = parent.to_string();
             if outcome
                 .children

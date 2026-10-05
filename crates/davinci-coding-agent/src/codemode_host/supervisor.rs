@@ -78,6 +78,34 @@ fn command(node: &Path) -> Command {
     command
 }
 
+/// Node's module resolver and permission model both reject Windows verbatim
+/// (`\\?\`) paths, which `canonicalize` produces. Keep canonical identity
+/// internally and pass Node the equivalent ordinary path.
+fn node_path(path: &Path) -> PathBuf {
+    url::Url::from_file_path(path)
+        .ok()
+        .and_then(|url| url.to_file_path().ok())
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn allow_fs_read(root: &Path) -> std::ffi::OsString {
+    let mut flag = std::ffi::OsString::from("--allow-fs-read=");
+    flag.push(node_path(root));
+    flag
+}
+
+/// Defense in depth behind QuickJS/WASM: the host process may read only its
+/// admitted assets and start workers. No writes, child processes, addons,
+/// WASI or inspector.
+fn host_command(node: &Path, root: &Path, entry: &Path) -> Command {
+    let mut host = command(node);
+    host.arg("--permission")
+        .arg("--allow-worker")
+        .arg(allow_fs_read(root))
+        .arg(node_path(entry));
+    host
+}
+
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
     fn drop(&mut self) {
@@ -119,6 +147,9 @@ fn watch_host(
                 if !cancellation.is_cancelled() {
                     expiry.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                // Cancel before killing: the reader sees EOF as soon as the host
+                // dies, and that must not be reported as a transport failure.
+                cancellation.cancel();
                 // The watchdog keeps running while Rust is awaiting a child tool.
                 // Kill only this owned host; child adapters observe the run token.
                 let _ = child
@@ -126,7 +157,6 @@ fn watch_host(
                     .unwrap_or_else(|error| error.into_inner())
                     .0
                     .kill();
-                cancellation.cancel();
                 return;
             }
         }
@@ -137,7 +167,6 @@ fn watch_host(
         expired,
     }
 }
-
 
 const MAX_CALLBACK_WORKERS: usize = 16;
 static ACTIVE_CALLBACK_WORKERS: std::sync::atomic::AtomicUsize =
@@ -182,18 +211,37 @@ struct BrokerReply {
     result: Result<CodeModeToolValue, CodeModeError>,
 }
 
+/// Closes a run's callback lane on every exit path, including early errors.
+///
+/// Workers are detached so a non-cooperative child cannot hold the run past its
+/// deadline. Dropping the task sender alone does not discard buffered tasks, so
+/// without this flag workers would keep dispatching queued children after the
+/// parent outcome was already returned.
+struct CallbackLaneGuard {
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    cancellation: davinci_agent::runtime::CancellationToken,
+}
+
+impl Drop for CallbackLaneGuard {
+    fn drop(&mut self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // An in-flight child observes the run token through the broker.
+        self.cancellation.cancel();
+    }
+}
+
+/// Task sender, reply receiver and the lane's shared `closed` flag.
+type CallbackLane = (
+    mpsc::SyncSender<BrokerTask>,
+    mpsc::Receiver<BrokerReply>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
+
 fn start_broker_workers(
     broker: Arc<dyn CodeModeBroker>,
     requested_workers: usize,
     pending_limit: usize,
-) -> Result<
-    (
-        mpsc::SyncSender<BrokerTask>,
-        mpsc::Receiver<BrokerReply>,
-        Vec<std::thread::JoinHandle<()>>,
-    ),
-    CodeModeError,
-> {
+) -> Result<CallbackLane, CodeModeError> {
     let worker_count = requested_workers.clamp(1, 4);
     let mut permits = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
@@ -202,15 +250,16 @@ fn start_broker_workers(
         })?);
     }
 
-    let (task_sender, task_receiver) = mpsc::sync_channel(pending_limit.clamp(1, 64));
+    let (task_sender, task_receiver) = mpsc::sync_channel::<BrokerTask>(pending_limit.clamp(1, 64));
     let task_receiver = Arc::new(Mutex::new(task_receiver));
     let (reply_sender, reply_receiver) = mpsc::channel();
-    let mut workers = Vec::with_capacity(worker_count);
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for (index, permit) in permits.into_iter().enumerate() {
         let tasks = task_receiver.clone();
         let replies = reply_sender.clone();
         let broker = broker.clone();
-        let worker = std::thread::Builder::new()
+        let worker_closed = closed.clone();
+        std::thread::Builder::new()
             .name(format!("davinci-codemode-callback-{index}"))
             .spawn(move || {
                 let _permit = permit;
@@ -222,6 +271,10 @@ fn start_broker_workers(
                             Err(_) => break,
                         }
                     };
+                    // Remaining queued tasks are discarded with the last receiver.
+                    if worker_closed.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     let result = broker.call(task.call);
                     if replies
                         .send(BrokerReply {
@@ -235,12 +288,12 @@ fn start_broker_workers(
                 }
             })
             .map_err(|_| {
+                closed.store(true, std::sync::atomic::Ordering::SeqCst);
                 CodeModeError::new("UNAVAILABLE", "unable to start Codemode callback worker")
             })?;
-        workers.push(worker);
     }
     drop(reply_sender);
-    Ok((task_sender, reply_receiver, workers))
+    Ok((task_sender, reply_receiver, closed))
 }
 
 fn write_broker_reply(
@@ -263,11 +316,9 @@ fn write_broker_reply(
             .map_err(|_| CodeModeError::new("TOOL_FAILED", "result encoding failed"))?,
         Err(error) => json!({"error":error}),
     };
-    let bytes = davinci_agent::codemode::projection::serialized_size(
-        &value,
-        limits.child_result_bytes,
-    )
-    .map_err(|_| CodeModeError::new("LIMIT_EXCEEDED", "response byte budget"))?;
+    let bytes =
+        davinci_agent::codemode::projection::serialized_size(&value, limits.child_result_bytes)
+            .map_err(|_| CodeModeError::new("LIMIT_EXCEEDED", "response byte budget"))?;
     *result_bytes = result_bytes.saturating_add(bytes);
     if *result_bytes > limits.total_result_bytes {
         return Err(CodeModeError::new("LIMIT_EXCEEDED", "child result budget"));
@@ -399,8 +450,7 @@ impl NodeCodeModeHost {
         let private_cwd = tempfile::tempdir()
             .map_err(|_| CodeModeError::new("UNAVAILABLE", "private host directory unavailable"))?;
         let mut child = OwnedChild(
-            command(&self.node)
-                .arg(self.assets.entry())
+            host_command(&self.node, self.assets.root(), self.assets.entry())
                 .current_dir(private_cwd.path())
                 .spawn()
                 .map_err(|_| CodeModeError::new("UNAVAILABLE", "host launch failed"))?,
@@ -417,11 +467,12 @@ impl NodeCodeModeHost {
             .ok_or_else(|| CodeModeError::new("SANDBOX_FAILED", "missing host output"))?;
         let child = Arc::new(Mutex::new(child));
         let limits = context.limits_for_request(request)?;
-        let (broker_tasks, broker_replies, _broker_workers) = start_broker_workers(
-            broker.clone(),
-            limits.parallelism,
-            limits.pending_calls,
-        )?;
+        let (broker_tasks, broker_replies, closed) =
+            start_broker_workers(broker.clone(), limits.parallelism, limits.pending_calls)?;
+        let lane = CallbackLaneGuard {
+            closed,
+            cancellation: context.cancellation.clone(),
+        };
         let watchdog = watch_host(
             child.clone(),
             context.cancellation.clone(),
@@ -470,6 +521,8 @@ impl NodeCodeModeHost {
             let frame = match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(Ok(frame)) => frame,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                // A killed host closes its pipe; report why it was killed.
+                _ if context.cancellation.is_cancelled() => continue,
                 _ => {
                     return Err(CodeModeError::new(
                         "PROTOCOL_ERROR",
@@ -493,6 +546,14 @@ impl NodeCodeModeHost {
                         "code":request.code,"tools":tools,"timeoutMs":limits.wall_ms,"memoryBytes":limits.vm_heap_bytes}))
                         .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "host write failed"))?;
                 continue;
+            }
+            if kind == "fatal" {
+                // The host may have already cleared its run, so no runId is required.
+                return Err(if frame["code"] == "LIMIT_EXCEEDED" {
+                    CodeModeError::new("LIMIT_EXCEEDED", "host frame limit exceeded")
+                } else {
+                    CodeModeError::new("PROTOCOL_ERROR", "host reported a fatal protocol error")
+                });
             }
             if frame["runId"] != *run_id {
                 return Err(CodeModeError::new(
@@ -615,10 +676,7 @@ impl NodeCodeModeHost {
                             },
                         })
                         .map_err(|_| {
-                            CodeModeError::new(
-                                "LIMIT_EXCEEDED",
-                                "child callback queue is full",
-                            )
+                            CodeModeError::new("LIMIT_EXCEEDED", "child callback queue is full")
                         })?;
                     continue;
                 }
@@ -686,6 +744,7 @@ impl NodeCodeModeHost {
                     "runId":run_id,"requestId":id,"ok":ok,"value":value}))
                     .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "host write failed"))?;
         })();
+        drop(lane);
         drop(broker_tasks);
         drop(input);
         {
@@ -726,5 +785,93 @@ impl CodeModeHost for NodeCodeModeHost {
                     .unwrap_or_else(|| format!("ephemeral:{}", context.identity.invocation_id)),
                 error: Some(error),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingBroker(Arc<AtomicUsize>);
+    impl CodeModeBroker for CountingBroker {
+        fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+            unreachable!()
+        }
+        fn describe(&self, _: &str) -> Result<Value, CodeModeError> {
+            unreachable!()
+        }
+        fn call(&self, call: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(CodeModeToolValue {
+                text: String::new(),
+                structured_content: None,
+                complete: true,
+                artifact: None,
+                operation_ref: format!("child-{}", call.request_id),
+            })
+        }
+    }
+
+    #[test]
+    fn host_launch_uses_the_node_permission_model() {
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let entry = root.join("host.mjs");
+        let host = host_command(Path::new("node"), &root, &entry);
+        let args: Vec<_> = host
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "--permission");
+        assert_eq!(args[1], "--allow-worker");
+        assert!(args[2].starts_with("--allow-fs-read="), "{args:?}");
+        assert_eq!(args.len(), 4, "no other grants: {args:?}");
+        // Node rejects Windows verbatim paths in both positions.
+        assert!(!args[2].contains(r"\\?\"), "{args:?}");
+        assert!(!args[3].contains(r"\\?\"), "{args:?}");
+        assert_eq!(Path::new(&args[3]), node_path(&entry));
+        assert_eq!(
+            args[2].trim_start_matches("--allow-fs-read="),
+            node_path(&root).to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn closed_lane_never_dispatches_queued_children() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tasks, replies, closed) =
+            start_broker_workers(Arc::new(CountingBroker(calls.clone())), 1, 8).unwrap();
+        for request_id in 1..=6 {
+            tasks
+                .try_send(BrokerTask {
+                    request_id: request_id.to_string(),
+                    call: CodeModeCall {
+                        request_id,
+                        tool: "read".into(),
+                        args: json!({}),
+                    },
+                })
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let cancellation = davinci_agent::runtime::CancellationToken::new();
+        // The run exits (here: an early error) while five tasks are still queued.
+        drop(CallbackLaneGuard {
+            closed,
+            cancellation: cancellation.clone(),
+        });
+        drop(tasks);
+        assert!(cancellation.is_cancelled());
+        // The single worker finishes its in-flight child, then must stop.
+        while replies.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued children were dispatched after the run closed"
+        );
     }
 }
