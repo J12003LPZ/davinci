@@ -962,7 +962,10 @@ fn queued_codemode_child_cancels_before_active_child_returns() {
             .unwrap();
         None
     })));
-    let context = broker_context(&agent);
+    let mut context = broker_context(&agent);
+    // Parallel-safe reads otherwise run side by side; one lane makes the
+    // second call genuinely queued behind the active one.
+    context.limits.parallelism = 1;
     let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {

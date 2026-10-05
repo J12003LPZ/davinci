@@ -522,7 +522,9 @@ fn native_budget_failure_cancels_in_flight_children() {
         }
         fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            // Slow enough that the budget trips while calls are still queued,
+            // even when large replies are written quickly.
+            std::thread::sleep(std::time::Duration::from_millis(200));
             Ok(CodeModeToolValue {
                 text: "x".repeat(900_000),
                 structured_content: None,
