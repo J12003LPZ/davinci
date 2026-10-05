@@ -13,12 +13,12 @@ It combines an interactive coding assistant, multi-provider model runtime, permi
 
 DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github.com/earendil-works/pi) coding agent and has grown into a larger native harness. The pinned TypeScript source under [vendor/davinci](vendor/davinci) remains a behavioral compatibility reference. The active product is the Rust workspace in this repository.
 
-> **Workspace version:** 1.0.71
+> **Workspace version:** 1.1.0
 > **Rust toolchain:** 1.83.0  
 > **Primary executable:** `davinci`  
 > **Documentation baseline:** `main` at [`0a57e476`](https://github.com/J12003LPZ/davinci/commit/0a57e476c2088250299438c91d582571614f0687), including merged [PR #88](https://github.com/J12003LPZ/davinci/pull/88)
 
-The version string alone does not identify the installed source: different commits can report **1.0.71**. Features described here require a binary built from the corresponding source. Rebuild and restart after updating; use `/doctor` to inspect the actual installation identity.
+The version string alone does not identify the installed source: different commits can report **1.1.0**. Features described here require a binary built from the corresponding source. Rebuild and restart after updating; use `/doctor` to inspect the actual installation identity.
 
 ---
 
@@ -1221,7 +1221,7 @@ Existing legacy state does not need to be migrated immediately.
 
 | Symptom | Check / next step |
 | --- | --- |
-| A new command is missing although `--version` says 1.0.71 | Check the PATH-resolved executable and `/doctor` installation identity. Compare its source commit with this README baseline; rebuild/restart from the intended source. |
+| A new command is missing although `--version` says 1.1.0 | Check the PATH-resolved executable and `/doctor` installation identity. Compare its source commit with this README baseline; rebuild/restart from the intended source. |
 | Release installation fails before compilation | Read the preflight error. Check a clean checkout, exact version tag, Python, authenticated `gh`, and completed green CI/lint for that commit. A development build and a verified release have different provenance. |
 | `davinci update self` fails | This Rust product has no self-update package. Use the source or release installation workflow. |
 | `openai-codex` reports no usable credential | Run `/login openai-codex` in the new binary and wait for a stored-login confirmation. Legacy tokens and API keys are not accepted substitutes. |

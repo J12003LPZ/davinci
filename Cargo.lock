@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-agent"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "base64",
  "davinci-ai",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-ai"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "base64",
  "davinci-ai",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-client"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "davinci-protocol",
  "serde",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-coding-agent"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "base64",
  "clap",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-evals"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "clap",
  "davinci-agent",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-mcp"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "davinci-mcp",
  "serde",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-protocol"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-server"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "davinci-agent",
  "davinci-ai",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-session"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "davinci-protocol",
  "davinci-sys",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-session-sqlite"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "davinci-session",
  "rusqlite",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-sys"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-telemetry"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-tui"
-version = "1.0.71"
+version = "1.1.0"
 dependencies = [
  "base64",
  "crossterm",
