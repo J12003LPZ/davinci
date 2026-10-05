@@ -16,7 +16,9 @@ async function execute(code, options = {}) {
 }
 
 test("published package returns a constant from a fresh VM", async () => {
-  const result = await execute("return 42");
+  // The first VM in a process pays the QuickJS WASM compile. Hosted Windows
+  // runners took 1.87 s, past the 1 s default the deadline tests rely on.
+  const result = await execute("return 42", { timeoutMs: 15000 });
   assert.equal(result.ok, true);
   assert.equal(result.value, 42);
 });
