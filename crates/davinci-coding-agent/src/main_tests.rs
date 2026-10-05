@@ -4620,3 +4620,19 @@ fn runtime_status_renders_completion_counters_when_present() {
     assert!(format_runtime_stats(Some(&runtime))
         .contains("Completion: 2 requirement reminders, 3 hook blocks, 1 hook limit hits"));
 }
+
+#[test]
+fn compaction_summarizes_with_the_session_model_even_when_uncataloged() {
+    // Regression: `/compact` in a gpt-6-luna session sent gpt-5.3-codex-spark,
+    // the provider's first record, which the ChatGPT-plan route refuses.
+    use crate::model_resolver::mock_model;
+    let models = vec![
+        mock_model("openai-codex", "gpt-5.3-codex-spark", "Spark", true),
+        mock_model("openai-codex", "gpt-6-astra", "GPT-6 Astra", true),
+    ];
+    let model = super::summarization_model(&models, "openai-codex", "gpt-6-luna").unwrap();
+    assert_eq!(model.provider, "openai-codex");
+    assert_eq!(model.id, "gpt-6-luna");
+    let exact = super::summarization_model(&models, "openai-codex", "gpt-6-astra").unwrap();
+    assert_eq!(exact.id, "gpt-6-astra");
+}

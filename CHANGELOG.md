@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- `/compact` and automatic compaction now summarize with the session's own model. A model missing from the catalog, such as `gpt-6-luna`, fell back to the provider's first record, `gpt-5.3-codex-spark`, which the ChatGPT-plan route refuses, so every compaction failed.
 - A stored openai-codex login that predates Sign in with ChatGPT is now named as the cause, with `/login openai-codex` as the fix. Previously `--list-models` reported no models, a prompt failed with "No model matched", and `/model` said there was no credential.
 
 ### Changed
