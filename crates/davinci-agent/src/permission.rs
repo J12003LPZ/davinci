@@ -944,6 +944,10 @@ pub struct PermissionPolicy {
     pub mcp_read_only: BTreeSet<String>,
     /// Filesystem boundary enforcement configuration.
     pub filesystem_boundary: FilesystemBoundaryPolicy,
+    /// True only while an OS execution boundary confines subprocesses. The
+    /// agent derives it from its host-resolved sandbox; tool arguments never
+    /// set it. Auto runs builds and tests without asking only when this holds.
+    pub execution_isolated: bool,
 }
 
 impl Default for PermissionPolicy {
@@ -959,6 +963,7 @@ impl Default for PermissionPolicy {
             session_allow: Vec::new(),
             mcp_read_only: BTreeSet::new(),
             filesystem_boundary: FilesystemBoundaryPolicy::default(),
+            execution_isolated: false,
         }
     }
 }
@@ -1357,6 +1362,9 @@ impl PermissionPolicy {
         {
             return PermissionVerdict::Allow;
         }
+        // Builds and tests run workspace code (build scripts, proc macros,
+        // tests) that Auto may itself have just edited. Without an OS boundary
+        // that is arbitrary code execution, so it asks.
         if self.mode == PermissionMode::Auto
             && class == ToolClass::Shell
             && permission_risk::routine_local_shell(
@@ -1366,6 +1374,7 @@ impl PermissionPolicy {
                 cwd,
                 &self.filesystem_boundary,
             )
+            && (self.execution_isolated || !permission_risk::shell_executes_project_code(&subject))
         {
             return PermissionVerdict::Allow;
         }

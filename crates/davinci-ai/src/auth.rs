@@ -93,7 +93,7 @@ pub struct AuthStorage {
 
 impl AuthStorage {
     pub fn create() -> Result<Self, AuthStorageError> {
-        Self::open(&default_auth_path())
+        Self::open(&try_default_auth_path()?)
     }
 
     pub fn in_memory() -> Self {
@@ -400,12 +400,35 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// Display form of the credential path. Code that reads or writes
+/// credentials uses [`try_default_auth_path`].
 pub fn default_auth_path() -> PathBuf {
-    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+    try_default_auth_path().unwrap_or_else(|_| PathBuf::from(".davinci/agent/auth.json"))
+}
+
+/// The credential file. Without a home directory this fails instead of
+/// falling back to the working directory, which is usually a repository
+/// where `auth.json` could be committed.
+pub fn try_default_auth_path() -> Result<PathBuf, AuthStorageError> {
     let override_dir = std::env::var("DAVINCI_CODING_AGENT_DIR")
         .or_else(|_| std::env::var("PI_CODING_AGENT_DIR"))
         .ok();
-    auth_path_for(&home, override_dir.as_deref())
+    resolve_auth_path(home_dir().as_deref(), override_dir.as_deref())
+}
+
+fn resolve_auth_path(
+    home: Option<&Path>,
+    override_dir: Option<&str>,
+) -> Result<PathBuf, AuthStorageError> {
+    let needs_home = override_dir.is_none_or(|dir| dir == "~" || dir.starts_with("~/"));
+    match home {
+        Some(home) => Ok(auth_path_for(home, override_dir)),
+        None if !needs_home => Ok(auth_path_for(Path::new(""), override_dir)),
+        None => Err(AuthStorageError::Read(
+            "no home directory is set (HOME or USERPROFILE); set DAVINCI_CODING_AGENT_DIR to choose where credentials are stored"
+                .into(),
+        )),
+    }
 }
 
 fn auth_path_for(home: &Path, override_dir: Option<&str>) -> PathBuf {
@@ -914,6 +937,27 @@ mod tests {
         );
         fs::write(&current, "{}").unwrap();
         assert_eq!(auth_path_for(home.path(), None), current);
+    }
+
+    #[test]
+    fn missing_home_never_puts_credentials_in_the_working_directory() {
+        let message = resolve_auth_path(None, None).unwrap_err().to_string();
+        assert!(
+            message.contains("set DAVINCI_CODING_AGENT_DIR to choose"),
+            "{message}"
+        );
+        assert!(!message.contains("  "), "{message}");
+        assert!(resolve_auth_path(None, Some("~")).is_err());
+        assert!(resolve_auth_path(None, Some("~/agent")).is_err());
+        assert_eq!(
+            resolve_auth_path(None, Some("/srv/davinci")).unwrap(),
+            PathBuf::from("/srv/davinci/auth.json")
+        );
+        let home = tempdir().unwrap();
+        assert_eq!(
+            resolve_auth_path(Some(home.path()), None).unwrap(),
+            home.path().join(".davinci/agent/auth.json")
+        );
     }
 
     #[test]

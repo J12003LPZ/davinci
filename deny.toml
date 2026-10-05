@@ -1,0 +1,15 @@
+# Dependency policy, checked by .github/workflows/dependency-audit.yml with
+# `cargo deny check advisories sources`. Licenses and duplicate versions are
+# not gated yet.
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every ignored advisory needs a reason and a removal condition.
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

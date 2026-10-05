@@ -49,12 +49,19 @@ fn is_opencode_model(model: &Model) -> bool {
             .is_some_and(|url| matches_host(url, OPENCODE_HOST))
 }
 
+/// Provider attribution headers identify the client to third parties, so they
+/// are opt-in: `PI_TELEMETRY` wins, then the `enableInstallTelemetry` setting,
+/// and the default is off.
 pub fn is_install_telemetry_enabled(explicit: Option<bool>) -> bool {
-    if let Ok(value) = std::env::var("PI_TELEMETRY") {
+    install_telemetry_enabled(std::env::var("PI_TELEMETRY").ok().as_deref(), explicit)
+}
+
+fn install_telemetry_enabled(env: Option<&str>, explicit: Option<bool>) -> bool {
+    if let Some(value) = env {
         let lower = value.to_ascii_lowercase();
         return value == "1" || lower == "true" || lower == "yes";
     }
-    explicit.unwrap_or(true)
+    explicit.unwrap_or(false)
 }
 
 fn default_attribution_headers(model: &Model, install_telemetry: bool) -> Vec<(String, String)> {
@@ -142,6 +149,20 @@ mod tests {
             headers: Default::default(),
             thinking_level_map: Default::default(),
         }
+    }
+
+    #[test]
+    fn attribution_is_opt_in() {
+        assert!(!install_telemetry_enabled(None, None));
+        assert!(!install_telemetry_enabled(None, Some(false)));
+        assert!(install_telemetry_enabled(None, Some(true)));
+        assert!(install_telemetry_enabled(Some("yes"), None));
+        assert!(!install_telemetry_enabled(Some("0"), Some(true)));
+        let unset = default_attribution_headers(
+            &model("openrouter", "https://openrouter.ai/api/v1"),
+            false,
+        );
+        assert!(unset.is_empty());
     }
 
     #[test]

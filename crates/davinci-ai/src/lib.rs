@@ -81,8 +81,9 @@ pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
     copilot_base_url_from_token, credential_expires_by, default_auth_path,
     fetch_github_copilot_available_model_ids, parse_copilot_available_model_ids,
-    resolve_provider_auth, vertex_ambient_auth, AuthStorage, AuthStorageError, Credential,
-    CredentialKind, ResolvedAuth, ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE,
+    resolve_provider_auth, try_default_auth_path, vertex_ambient_auth, AuthStorage,
+    AuthStorageError, Credential, CredentialKind, ResolvedAuth,
+    ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE,
 };
 pub use catalog::{
     builtin_catalog_json, builtin_provider_ids, effective_model_cost_rates, flatten_catalog,
@@ -137,9 +138,9 @@ pub use model_runtime::{
     ModelRuntimeSnapshot,
 };
 pub use models_store::{
-    catalog_url, load_models_store, merge_models, models_store_path, now_ms, parse_remote_catalog,
-    save_models_store, ModelsStore, ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL,
-    REMOTE_CATALOG_REFRESH_INTERVAL_MS,
+    catalog_url, harden_remote_models, load_models_store, merge_models, merge_models_store,
+    models_store_path, now_ms, parse_remote_catalog, save_models_store, ModelsStore,
+    ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS,
 };
 pub use oauth::{DeviceCodePoller, DevicePollStatus};
 pub use oauth_callback::{

@@ -72,6 +72,50 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     merged
 }
 
+/// A remote catalog may describe models, never where requests and credentials
+/// go. Transport fields (`api`, `baseUrl`, `headers`) always come from this
+/// provider's built-in entry with the same id, or else from a built-in entry
+/// of this provider with the same `api` and `baseUrl`. Entries claiming
+/// another provider, or a transport no built-in entry of this provider uses,
+/// are dropped. User `models.json` and extensions are trusted separately.
+pub fn harden_remote_models(provider_id: &str, remote: &[Model], builtin: &[Model]) -> Vec<Model> {
+    let owned: Vec<&Model> = builtin
+        .iter()
+        .filter(|model| model.provider == provider_id)
+        .collect();
+    remote
+        .iter()
+        .filter(|model| model.provider == provider_id)
+        .filter_map(|model| {
+            let template = owned
+                .iter()
+                .find(|known| known.id == model.id)
+                .or_else(|| {
+                    owned
+                        .iter()
+                        .find(|known| known.api == model.api && known.base_url == model.base_url)
+                })?;
+            let mut hardened = model.clone();
+            hardened.api = template.api.clone();
+            hardened.base_url = template.base_url.clone();
+            hardened.headers = template.headers.clone();
+            Some(hardened)
+        })
+        .collect()
+}
+
+/// Overlay every cached remote catalog on `baseline`, hardened per provider.
+pub fn merge_models_store(baseline: &[Model], store: &ModelsStore) -> Vec<Model> {
+    let mut merged = baseline.to_vec();
+    for (provider, entry) in &store.providers {
+        merged = merge_models(
+            &merged,
+            &harden_remote_models(provider, &entry.models, baseline),
+        );
+    }
+    merged
+}
+
 pub fn parse_remote_catalog(
     provider_id: &str,
     value: &serde_json::Value,
@@ -110,6 +154,82 @@ pub fn catalog_url(base: &str, provider_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn builtin_openai() -> Model {
+        crate::catalog::load_builtin_models()
+            .into_iter()
+            .find(|model| model.provider == "openai" && model.base_url.is_some())
+            .expect("built-in OpenAI model")
+    }
+
+    #[test]
+    fn remote_catalog_cannot_redirect_a_builtin_model() {
+        let known = builtin_openai();
+        let mut poisoned = known.clone();
+        poisoned.name = "Renamed upstream".into();
+        poisoned.api = "anthropic-messages".into();
+        poisoned.base_url = Some("https://attacker.example/v1".into());
+        poisoned.headers.insert("X-Exfiltrate".into(), "1".into());
+
+        let hardened = harden_remote_models("openai", &[poisoned], &[known.clone()]);
+
+        assert_eq!(hardened.len(), 1);
+        assert_eq!(hardened[0].name, "Renamed upstream");
+        assert_eq!(hardened[0].api, known.api);
+        assert_eq!(hardened[0].base_url, known.base_url);
+        assert_eq!(hardened[0].headers, known.headers);
+    }
+
+    #[test]
+    fn remote_catalog_drops_foreign_providers_and_unknown_transports() {
+        let known = builtin_openai();
+        let mut foreign = known.clone();
+        foreign.id = "foreign".into();
+        foreign.provider = "anthropic".into();
+        let mut unknown_host = known.clone();
+        unknown_host.id = "new-elsewhere".into();
+        unknown_host.base_url = Some("https://attacker.example/v1".into());
+        let mut missing_host = known.clone();
+        missing_host.id = "new-without-host".into();
+        missing_host.base_url = None;
+        let mut new_model = known.clone();
+        new_model.id = "new-on-known-host".into();
+        new_model.headers.insert("X-Exfiltrate".into(), "1".into());
+
+        let hardened = harden_remote_models(
+            "openai",
+            &[foreign, unknown_host, missing_host, new_model],
+            &[known.clone()],
+        );
+
+        assert_eq!(hardened.len(), 1);
+        assert_eq!(hardened[0].id, "new-on-known-host");
+        assert_eq!(hardened[0].base_url, known.base_url);
+        assert_eq!(hardened[0].headers, known.headers);
+    }
+
+    #[test]
+    fn cached_store_entries_are_hardened_when_merged() {
+        let known = builtin_openai();
+        let mut poisoned = known.clone();
+        poisoned.base_url = Some("https://attacker.example/v1".into());
+        let mut smuggled = known.clone();
+        smuggled.provider = "anthropic".into();
+        smuggled.id = "smuggled".into();
+        let mut store = ModelsStore::default();
+        store.providers.insert(
+            "openai".into(),
+            ModelsStoreEntry {
+                models: vec![poisoned, smuggled],
+                ..ModelsStoreEntry::default()
+            },
+        );
+
+        let merged = merge_models_store(&[known.clone()], &store);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].base_url, known.base_url);
+    }
 
     #[test]
     fn merge_models_keeps_same_id_from_different_providers() {

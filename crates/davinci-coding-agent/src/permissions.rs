@@ -131,6 +131,7 @@ impl PermissionSources {
             session_allow: Vec::new(),
             mcp_read_only: Default::default(),
             filesystem_boundary: Default::default(),
+            execution_isolated: false,
         }
     }
 }

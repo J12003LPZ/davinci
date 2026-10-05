@@ -176,8 +176,61 @@ fn auto_escalates_external_destructive_and_sensitive_actions() {
         verdict(&p, "write", json!({"path":"src/main.rs"})),
         PermissionVerdict::Allow
     );
+    assert!(is_ask(&verdict(
+        &p,
+        "bash",
+        json!({"command":"cargo test --offline"})
+    )));
+    let mut isolated = p.clone();
+    isolated.execution_isolated = true;
     assert_eq!(
-        verdict(&p, "bash", json!({"command":"cargo test --offline"})),
+        verdict(&isolated, "bash", json!({"command":"cargo test --offline"})),
+        PermissionVerdict::Allow
+    );
+}
+
+#[test]
+fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
+    // Auto may edit build.rs or a test and then run it. Without isolation
+    // that chain is arbitrary code execution, so every code-running check asks.
+    let p = policy(PermissionMode::Auto);
+    let mut isolated = p.clone();
+    isolated.execution_isolated = true;
+    for command in ["cargo build --offline", "cargo clippy --offline"] {
+        assert!(
+            is_ask(&verdict(&p, "bash", json!({"command":command}))),
+            "unconfined Auto allowed {command}"
+        );
+    }
+    for command in [
+        "cargo test --offline",
+        "cargo check --offline",
+        "git status && cargo test --offline",
+    ] {
+        assert!(
+            is_ask(&verdict(&p, "bash", json!({"command":command}))),
+            "unconfined Auto allowed {command}"
+        );
+        assert_eq!(
+            verdict(&isolated, "bash", json!({"command":command})),
+            PermissionVerdict::Allow,
+            "isolated Auto asked for {command}"
+        );
+    }
+    for command in [
+        "cargo fmt --check",
+        "cargo tree --offline",
+        "cargo metadata --offline",
+        "git status",
+    ] {
+        assert_eq!(
+            verdict(&p, "bash", json!({"command":command})),
+            PermissionVerdict::Allow,
+            "{command}"
+        );
+    }
+    assert_eq!(
+        verdict(&p, "write", json!({"path":"build.rs"})),
         PermissionVerdict::Allow
     );
 }
@@ -402,7 +455,8 @@ fn patch_rules_and_risk_checks_inspect_each_target() {
 
 #[test]
 fn auto_shell_matrix_escalates_unknown_syntax_network_and_path_changes() {
-    let p = policy(PermissionMode::Auto);
+    let mut p = policy(PermissionMode::Auto);
+    p.execution_isolated = true;
     for command in [
         "git status && cargo test --offline",
         "cargo check --offline",

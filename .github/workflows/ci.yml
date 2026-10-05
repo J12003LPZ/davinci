@@ -20,8 +20,8 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
       - name: Bounded browser backend and network policy
@@ -90,7 +90,7 @@ jobs:
           DAVINCI_PROCESS_EVAL_ARTIFACT: ${{ runner.temp }}/process-evaluation.json
         run: cargo test -p davinci-coding-agent --locked --test process_manager -- --ignored --nocapture
       - name: Preserve native process measurements
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: process-evaluation-${{ runner.os }}
           path: ${{ runner.temp }}/process-evaluation.json
@@ -119,7 +119,7 @@ jobs:
           DAVINCI_TRANSACTION_EVAL_ARTIFACT: ${{ runner.temp }}/transaction-evaluation.json
         run: cargo test -p davinci-agent --locked --test transaction_eval
       - name: Preserve native transaction measurements
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: transaction-evaluation-${{ runner.os }}
           path: ${{ runner.temp }}/transaction-evaluation.json
@@ -133,11 +133,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.x'
       - name: Install pinned Playwright Chromium fixture
@@ -239,7 +239,7 @@ jobs:
           print(json.dumps(comparison, sort_keys=True))
           PY
       - name: Preserve P12 live evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: p12-live-login-${{ runner.os }}
           path: |
@@ -256,7 +256,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Use repository-pinned Rust
         run: rustup show
       - name: Format
@@ -275,7 +275,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Use repository-pinned Rust
         run: rustup show
       - name: Prompt contracts
@@ -299,8 +299,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Benchmark harness
@@ -344,7 +344,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Use repository-pinned Rust
         run: rustup show
       - name: Workspace package tests

@@ -5,7 +5,7 @@
 //! and cancellation trees.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -181,21 +181,27 @@ impl WorkflowExecutor {
 
     /// Retrieve the current execution state of a workflow.
     pub fn get_state(&self, wf_id: &WorkflowId) -> Option<WorkflowExecutionState> {
-        let execs = self.executions.read().unwrap();
+        let execs = self
+            .executions
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         execs.get(wf_id).cloned()
     }
 
     /// Cancel a running workflow and all its active workers.
     pub fn cancel(&self, wf_id: &WorkflowId) -> Result<(), WorkflowExecutionError> {
         let token = {
-            let tokens = self.tokens.read().unwrap();
+            let tokens = self.tokens.read().unwrap_or_else(PoisonError::into_inner);
             tokens.get(wf_id).cloned()
         };
         if let Some(tok) = token {
             tok.cancel();
         }
 
-        let mut execs = self.executions.write().unwrap();
+        let mut execs = self
+            .executions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(state) = execs.get_mut(wf_id) {
             if state.status == WorkflowStatus::Running || state.status == WorkflowStatus::Pending {
                 state.status = WorkflowStatus::Cancelled;
@@ -213,7 +219,10 @@ impl WorkflowExecutor {
 
     /// Pause a running workflow.
     pub fn pause(&self, wf_id: &WorkflowId) -> Result<(), WorkflowExecutionError> {
-        let mut execs = self.executions.write().unwrap();
+        let mut execs = self
+            .executions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(state) = execs.get_mut(wf_id) {
             if state.status == WorkflowStatus::Running {
                 state.status = WorkflowStatus::Paused;
@@ -228,7 +237,10 @@ impl WorkflowExecutor {
 
     /// Retrieve all tracked workflow executions.
     pub fn list_workflows(&self) -> Vec<WorkflowExecutionState> {
-        let execs = self.executions.read().unwrap();
+        let execs = self
+            .executions
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut list: Vec<_> = execs.values().cloned().collect();
         list.sort_by_key(|w| w.started_ms);
         list
@@ -236,7 +248,10 @@ impl WorkflowExecutor {
 
     /// Resume a paused workflow.
     pub fn resume(&self, wf_id: &WorkflowId) -> Result<(), WorkflowExecutionError> {
-        let mut execs = self.executions.write().unwrap();
+        let mut execs = self
+            .executions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(state) = execs.get_mut(wf_id) {
             if state.status == WorkflowStatus::Paused {
                 state.status = WorkflowStatus::Running;
@@ -286,11 +301,14 @@ impl WorkflowExecutor {
         };
 
         {
-            let mut execs = self.executions.write().unwrap();
+            let mut execs = self
+                .executions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             execs.insert(wf_id, initial_state);
-            let mut toks = self.tokens.write().unwrap();
+            let mut toks = self.tokens.write().unwrap_or_else(PoisonError::into_inner);
             toks.insert(wf_id, wf_token);
-            let mut sps = self.specs.write().unwrap();
+            let mut sps = self.specs.write().unwrap_or_else(PoisonError::into_inner);
             sps.insert(wf_id, spec.clone());
         }
 
@@ -329,7 +347,10 @@ impl WorkflowExecutor {
             .as_ref()
             .unwrap_or(&self.runtime.cancellation_token)
             .child_token();
-        self.launches.write().unwrap().insert(wf_id, launch.clone());
+        self.launches
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(wf_id, launch.clone());
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
         self.run_phases(spec, wf_id, wf_token)
     }
@@ -364,7 +385,10 @@ impl WorkflowExecutor {
         // Esc on the lead leaves it running while `/workflow cancel` and a
         // session switch still stop it.
         let wf_token = self.runtime.team.session_token().child_token();
-        self.launches.write().unwrap().insert(wf_id, launch.clone());
+        self.launches
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(wf_id, launch.clone());
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
 
         let this = self.clone();
@@ -480,11 +504,14 @@ impl WorkflowExecutor {
         };
 
         {
-            let mut execs = self.executions.write().unwrap();
+            let mut execs = self
+                .executions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             execs.insert(wf_id, initial_state);
-            let mut toks = self.tokens.write().unwrap();
+            let mut toks = self.tokens.write().unwrap_or_else(PoisonError::into_inner);
             toks.insert(wf_id, wf_token.clone());
-            let mut sps = self.specs.write().unwrap();
+            let mut sps = self.specs.write().unwrap_or_else(PoisonError::into_inner);
             sps.insert(wf_id, spec.clone());
         }
 
@@ -573,7 +600,10 @@ impl WorkflowExecutor {
                     });
 
                 {
-                    let mut execs = self.executions.write().unwrap();
+                    let mut execs = self
+                        .executions
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if let Some(wf_state) = execs.get_mut(&wf_id) {
                         if let Some(p_state) = wf_state.phases.get_mut(&phase.id) {
                             p_state.status = PhaseStatus::Running;
@@ -597,7 +627,10 @@ impl WorkflowExecutor {
 
                 completed_phase_ids.insert(phase.id.clone());
                 {
-                    let mut execs = self.executions.write().unwrap();
+                    let mut execs = self
+                        .executions
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if let Some(wf_state) = execs.get_mut(&wf_id) {
                         if let Some(p_state) = wf_state.phases.get_mut(&phase.id) {
                             p_state.status = PhaseStatus::Completed;
@@ -609,7 +642,10 @@ impl WorkflowExecutor {
 
         // 3. Mark workflow complete
         let final_state = {
-            let mut execs = self.executions.write().unwrap();
+            let mut execs = self
+                .executions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             let state = execs.get_mut(&wf_id).unwrap();
             state.status = WorkflowStatus::Completed;
             state.finished_ms = Some(now_ms());
@@ -625,7 +661,10 @@ impl WorkflowExecutor {
     }
 
     fn fail_workflow(&self, wf_id: &WorkflowId, error: &str) {
-        let mut execs = self.executions.write().unwrap();
+        let mut execs = self
+            .executions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(state) = execs.get_mut(wf_id) {
             state.status = WorkflowStatus::Failed;
             state.finished_ms = Some(now_ms());
@@ -1117,7 +1156,10 @@ impl WorkflowExecutor {
 
         // Update phase execution state
         {
-            let mut execs = self.executions.write().unwrap();
+            let mut execs = self
+                .executions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(wf_state) = execs.get_mut(wf_id) {
                 if let Some(p_state) = wf_state.phases.get_mut(&phase.id) {
                     p_state.completed_workers = successful_workers.clone();
@@ -1160,6 +1202,25 @@ mod tests {
             ),
             tmp,
         )
+    }
+
+    #[test]
+    fn a_poisoned_state_lock_does_not_cascade_into_every_later_call() {
+        let (executor, _tmp) = setup_executor(None);
+        let executions = executor.executions.clone();
+        let tokens = executor.tokens.clone();
+        let _ = std::thread::spawn(move || {
+            let _executions = executions.write().unwrap();
+            let _tokens = tokens.write().unwrap();
+            panic!("worker panicked while holding workflow state");
+        })
+        .join();
+        assert!(executor.executions.is_poisoned());
+        assert!(executor.tokens.is_poisoned());
+
+        let unknown = WorkflowId::new();
+        assert!(executor.get_state(&unknown).is_none());
+        let _ = executor.cancel(&unknown);
     }
 
     #[test]

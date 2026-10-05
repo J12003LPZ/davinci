@@ -301,6 +301,18 @@ fn ordinary_file_targets(
     Ok(Vec::new())
 }
 
+/// Recognized local checks that compile or run workspace code: build scripts,
+/// proc macros and tests. Approval-free in Auto only inside an OS sandbox.
+pub(super) fn shell_executes_project_code(command: &str) -> bool {
+    let (segments, _) = crate::shell_policy::split_shell_segments_with_diagnostic(command);
+    segments.iter().any(|segment| {
+        let mut words = segment.split_whitespace();
+        let program = words.next().unwrap_or_default().to_ascii_lowercase();
+        matches!(program.as_str(), "cargo" | "cargo.exe")
+            && matches!(words.next(), Some("test" | "check" | "build" | "clippy"))
+    })
+}
+
 /// Recognize a deliberately small literal command language. Quotes, expansion,
 /// response files, background jobs and interpreter injection require approval.
 /// The shared shell analyzer remains read-only and supplies the command profiles.
