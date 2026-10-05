@@ -3,6 +3,7 @@
 Usage: python scripts/eval-live-governor.py <davinci-executable> <artifact-dir>
 Creates only disposable workspace/configuration state. Does not log credentials.
 """
+import live_auth
 import json
 import os
 from pathlib import Path
@@ -24,10 +25,8 @@ def main():
         lines = [f"row {i:04d} routine measurement {i * 37:08d}" for i in range(900)]
         lines[451] = "AUDIT_HIDDEN_VALUE=sequoia-4827"
         (work / "large-log.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        original = json.loads((Path.home() / ".pi/agent/auth.json").read_text(encoding="utf-8"))
         auth = config / "auth.json"
-        auth.write_text(json.dumps({"openai-codex": original["openai-codex"]}), encoding="utf-8")
-        del original
+        lent = live_auth.lend(auth)
         (config / "settings.json").write_text(json.dumps({"maxModelTurns": 10}), encoding="utf-8")
         (config / "vector-memory.json").write_text(json.dumps({"enabled": False}), encoding="utf-8")
         (config / "token-governor.json").write_text(json.dumps({
@@ -70,6 +69,7 @@ def main():
             assert "GOVERNOR_OK" in result.stdout
             print(json.dumps(summary))
         finally:
+            live_auth.give_back(auth, lent)
             auth.unlink(missing_ok=True)
 
 
