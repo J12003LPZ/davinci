@@ -20,8 +20,7 @@ pub struct LearningStore {
 impl LearningStore {
     pub fn open(root: PathBuf) -> Result<Self, String> {
         if !root.exists() {
-            fs::create_dir_all(&root)
-                .map_err(|e| format!("failed to create dir {:?}: {}", root, e))?;
+            fs::create_dir_all(&root).map_err(|e| format!("failed to create dir {root:?}: {e}"))?;
         }
 
         let mut candidates = BTreeMap::new();
@@ -130,9 +129,9 @@ impl LearningStore {
             .create(true)
             .append(true)
             .open(&candidates_path)
-            .map_err(|e| format!("failed to open {:?}: {}", candidates_path, e))?;
-        writeln!(file, "{}", line)
-            .map_err(|e| format!("failed to append to {:?}: {}", candidates_path, e))?;
+            .map_err(|e| format!("failed to open {candidates_path:?}: {e}"))?;
+        writeln!(file, "{line}")
+            .map_err(|e| format!("failed to append to {candidates_path:?}: {e}"))?;
         let _ = self.save_state();
         Ok(())
     }
@@ -147,7 +146,7 @@ impl LearningStore {
             .candidates
             .get(id)
             .cloned()
-            .ok_or_else(|| format!("candidate not found: {}", id))?;
+            .ok_or_else(|| format!("candidate not found: {id}"))?;
         candidate.status = status;
         self.upsert_candidate(candidate.clone())?;
         Ok(candidate)
@@ -182,9 +181,9 @@ impl LearningStore {
             .create(true)
             .append(true)
             .open(&skills_path)
-            .map_err(|e| format!("failed to open {:?}: {}", skills_path, e))?;
-        writeln!(file, "{}", line)
-            .map_err(|e| format!("failed to append to {:?}: {}", skills_path, e))?;
+            .map_err(|e| format!("failed to open {skills_path:?}: {e}"))?;
+        writeln!(file, "{line}")
+            .map_err(|e| format!("failed to append to {skills_path:?}: {e}"))?;
         let _ = self.save_state();
         Ok(())
     }
@@ -377,7 +376,7 @@ mod tests {
         let candidates_path = dir.path().join("candidates.jsonl");
         let valid = fixture_candidate("cand-survivor");
         let valid_json = serde_json::to_string(&valid).unwrap();
-        fs::write(&candidates_path, format!("{}\n{{broken\n", valid_json)).unwrap();
+        fs::write(&candidates_path, format!("{valid_json}\n{{broken\n")).unwrap();
 
         let store = LearningStore::open(dir.path().to_path_buf()).unwrap();
         assert_eq!(store.candidate("cand-survivor"), Some(&valid));

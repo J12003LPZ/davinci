@@ -148,7 +148,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(result.len() * 2);
     for b in result {
         use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

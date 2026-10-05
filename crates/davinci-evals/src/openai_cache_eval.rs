@@ -75,7 +75,7 @@ pub struct OpenAiCacheBenchmarkManifest {
 impl OpenAiCacheBenchmarkManifest {
     pub fn fingerprint(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("benchmark manifest is JSON");
-        format!("{:x}", Sha256::digest(bytes))
+        format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
     }
 
     pub fn validate_offline(&self) -> Result<(), String> {
@@ -154,8 +154,7 @@ pub fn validate_live_authorization<'a>(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             format!(
-                "live benchmark requires explicit {} confirmation",
-                OPENAI_CACHE_LIVE_AUTHORIZATION_ENV
+                "live benchmark requires explicit {OPENAI_CACHE_LIVE_AUTHORIZATION_ENV} confirmation"
             )
         })?;
     if env != authorization.approval_id {

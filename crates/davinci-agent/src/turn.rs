@@ -620,10 +620,7 @@ impl Agent {
             }
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
             let (mut assistant, stream_events, streamed_live, mut native_responses_resume) =
-                match completion {
-                    Ok(output) => output,
-                    Err(err) => return Err(err),
-                };
+                completion?;
             // The decoder already drops partial calls on a length stop; the
             // provider flag records that the model tried to call a tool.
             let decoder_dropped_calls = assistant

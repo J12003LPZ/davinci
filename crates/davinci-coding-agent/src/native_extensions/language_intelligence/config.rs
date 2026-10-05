@@ -298,7 +298,7 @@ impl LanguageIntelligenceConfig {
         canonicalize(&mut value);
         let mut hasher = Sha256::new();
         hasher.update(serde_json::to_vec(&value).unwrap_or_default());
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 }
 

@@ -65,7 +65,7 @@ impl RootCause {
             hash.update((field.len() as u64).to_le_bytes());
             hash.update(field.as_bytes());
         }
-        serde_json::json!({"version":2,"value":format!("{:x}", hash.finalize())})
+        serde_json::json!({"version":2,"value":format!("{:x}", davinci_sys::hex::Lower(&hash.finalize()))})
     }
 }
 

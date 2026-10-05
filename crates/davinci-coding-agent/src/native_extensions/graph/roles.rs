@@ -625,8 +625,7 @@ mod tests {
             let tools = role_tools(*role);
             assert!(
                 tools.contains(&"retrieve_output".to_string()),
-                "Role {:?} should have retrieve_output",
-                role
+                "Role {role:?} should have retrieve_output"
             );
         }
 

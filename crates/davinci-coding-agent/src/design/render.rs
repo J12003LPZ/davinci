@@ -14,7 +14,7 @@ pub fn policy_hash() -> String {
     hash.update(b"davinci-design-confinement-v1:os-network-denied:private-workspace:virtual-origin:all-websockets-denied:service-workers-blocked");
     hash.update(include_bytes!("../interaction_testing/browser_backend.js"));
     hash.update(include_bytes!("confinement.rs"));
-    format!("{:x}", hash.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hash.finalize()))
 }
 
 /// Reports only checks actually measured by the capture; it does not imply WCAG conformance.

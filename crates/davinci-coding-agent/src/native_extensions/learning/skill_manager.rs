@@ -149,7 +149,7 @@ impl SkillManager {
             "archive" => Self::execute_status_change(ctx, name, ArtifactStatus::Archived),
             "activate" => Self::execute_status_change(ctx, name, ArtifactStatus::Active),
             "reject" => Self::execute_status_change(ctx, name, ArtifactStatus::Rejected),
-            other => Err(ToolError::Failed(format!("unknown action '{}'", other))),
+            other => Err(ToolError::Failed(format!("unknown action '{other}'"))),
         }
     }
 
@@ -160,8 +160,7 @@ impl SkillManager {
     ) -> Result<ToolResult, ToolError> {
         if !is_valid_skill_name(name) {
             return Err(ToolError::Failed(format!(
-                "invalid skill name '{}': must be lowercase alphanumeric and hyphens (up to 64 chars)",
-                name
+                "invalid skill name '{name}': must be lowercase alphanumeric and hyphens (up to 64 chars)"
             )));
         }
 
@@ -201,8 +200,7 @@ impl SkillManager {
 
         if skill_file.exists() {
             return Err(ToolError::Failed(format!(
-                "skill '{}' already exists; use patch instead",
-                name
+                "skill '{name}' already exists; use patch instead"
             )));
         }
 
@@ -221,8 +219,7 @@ impl SkillManager {
             if existing.status == ArtifactStatus::Active {
                 if existing.name == name {
                     return Err(ToolError::Failed(format!(
-                        "skill '{}' already exists; use patch instead",
-                        name
+                        "skill '{name}' already exists; use patch instead"
                     )));
                 }
                 let existing_tokens = existing
@@ -268,14 +265,11 @@ impl SkillManager {
             redact_secrets(raw_body)
         } else {
             let redacted = redact_secrets(raw_body);
-            format!(
-                "---\nname: {}\ndescription: {}\n---\n\n{}",
-                name, description, redacted
-            )
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n{redacted}")
         };
 
         atomic_write_file(&skill_file, &content)
-            .map_err(|e| ToolError::Failed(format!("failed to write skill file: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to write skill file: {e}")))?;
 
         let origin = match ctx.origin {
             SkillWriteOrigin::BackgroundReview => SkillOrigin::LearnedReview,
@@ -284,7 +278,7 @@ impl SkillManager {
 
         let content_hash_val = content_hash(&content);
         let record = SkillLedgerRecord {
-            skill_id: format!("skill-{}", name),
+            skill_id: format!("skill-{name}"),
             name: name.to_string(),
             scope,
             origin,
@@ -308,7 +302,7 @@ impl SkillManager {
         };
         store
             .upsert_skill(record)
-            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {e}")))?;
 
         let body = json!({
             "status": "created",
@@ -347,7 +341,7 @@ impl SkillManager {
                 None,
             )
         } else {
-            return Err(ToolError::Failed(format!("skill '{}' not found", name)));
+            return Err(ToolError::Failed(format!("skill '{name}' not found")));
         };
 
         let configured_root = match scope {
@@ -375,7 +369,7 @@ impl SkillManager {
         }
 
         let current = fs::read_to_string(&path)
-            .map_err(|e| ToolError::Failed(format!("failed to read {:?}: {}", path, e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to read {path:?}: {e}")))?;
         let current_hash = content_hash(&current);
 
         let expected_hash = args
@@ -434,7 +428,7 @@ impl SkillManager {
         let current_version = ledger_record.as_ref().map(|r| r.version).unwrap_or(1);
         let history_dir = store_root.join("history").join(name);
         if fs::create_dir_all(&history_dir).is_ok() {
-            let history_file = history_dir.join(format!("{}.md", current_version));
+            let history_file = history_dir.join(format!("{current_version}.md"));
             let _ = fs::write(&history_file, &current);
 
             // Bounded history: retain latest 5 versions sorted numerically
@@ -459,7 +453,7 @@ impl SkillManager {
 
         // Re-verify hash right before write to prevent race with concurrent modification on disk
         let disk_content = fs::read_to_string(&path)
-            .map_err(|e| ToolError::Failed(format!("failed to re-read {:?}: {}", path, e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to re-read {path:?}: {e}")))?;
         if content_hash(&disk_content) != current_hash {
             return Err(ToolError::Failed(
                 "skill was modified concurrently on disk; reload with skill_view".into(),
@@ -467,11 +461,11 @@ impl SkillManager {
         }
 
         atomic_write_file(&path, &patched)
-            .map_err(|e| ToolError::Failed(format!("failed to write patched skill: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to write patched skill: {e}")))?;
 
         let updated_version = current_version + 1;
         let mut rec = ledger_record.unwrap_or_else(|| SkillLedgerRecord {
-            skill_id: format!("skill-{}", name),
+            skill_id: format!("skill-{name}"),
             name: name.to_string(),
             scope,
             origin: match ctx.origin {
@@ -506,7 +500,7 @@ impl SkillManager {
         };
         store
             .upsert_skill(rec)
-            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {e}")))?;
 
         let body = json!({
             "status": "patched",
@@ -568,7 +562,7 @@ impl SkillManager {
                 None,
             )
         } else {
-            return Err(ToolError::Failed(format!("skill '{}' not found", name)));
+            return Err(ToolError::Failed(format!("skill '{name}' not found")));
         };
 
         let configured_root = match scope {
@@ -626,7 +620,7 @@ impl SkillManager {
         let content = redact_secrets(raw_content);
 
         atomic_write_file(&target_file, &content)
-            .map_err(|e| ToolError::Failed(format!("failed to write support file: {}", e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to write support file: {e}")))?;
 
         let hash_val = content_hash(&content);
         let body = json!({
@@ -663,13 +657,12 @@ impl SkillManager {
             r
         } else {
             return Err(ToolError::Failed(format!(
-                "skill '{}' not found in ledger",
-                name
+                "skill '{name}' not found in ledger"
             )));
         };
 
         let body = json!({
-            "status": format!("{:?}", status).to_lowercase(),
+            "status": format!("{status:?}").to_lowercase(),
             "name": name,
             "scope": record.scope,
         });
@@ -1166,11 +1159,7 @@ mod tests {
         let history_dir = p_store.root().join("history").join("learned-skill");
         fs::create_dir_all(&history_dir).unwrap();
         for v in 1..=8 {
-            fs::write(
-                history_dir.join(format!("{}.md", v)),
-                format!("Version {}", v),
-            )
-            .unwrap();
+            fs::write(history_dir.join(format!("{v}.md")), format!("Version {v}")).unwrap();
         }
 
         rec.version = 9;

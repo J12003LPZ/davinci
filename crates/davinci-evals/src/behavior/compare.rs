@@ -246,9 +246,9 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
     let c_pass = format!("{:.1}%", comparison.candidate.macro_pass_rate * 100.0);
     let d_pass_val = comparison.deltas.get("pass_rate").copied().unwrap_or(0.0) * 100.0;
     let d_pass = if d_pass_val >= 0.0 {
-        format!("+{:.1} pp", d_pass_val)
+        format!("+{d_pass_val:.1} pp")
     } else {
-        format!("{:.1} pp", d_pass_val)
+        format!("{d_pass_val:.1} pp")
     };
 
     let b_unv = format!("{:.1}%", comparison.baseline.unverified_claim_rate * 100.0);
@@ -260,9 +260,9 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
         .unwrap_or(0.0)
         * 100.0;
     let d_unv = if d_unv_val >= 0.0 {
-        format!("+{:.1} pp", d_unv_val)
+        format!("+{d_unv_val:.1} pp")
     } else {
-        format!("{:.1} pp", d_unv_val)
+        format!("{d_unv_val:.1} pp")
     };
 
     let b_unrel = format!("{:.1}%", comparison.baseline.unrelated_edit_rate * 100.0);
@@ -274,9 +274,9 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
         .unwrap_or(0.0)
         * 100.0;
     let d_unrel = if d_unrel_val >= 0.0 {
-        format!("+{:.1} pp", d_unrel_val)
+        format!("+{d_unrel_val:.1} pp")
     } else {
-        format!("{:.1} pp", d_unrel_val)
+        format!("{d_unrel_val:.1} pp")
     };
 
     let b_turns = format!("{:.0}", comparison.baseline.median_model_turns);
@@ -288,9 +288,9 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
         .unwrap_or(0.0)
         * 100.0;
     let d_turns = if d_turns_val >= 0.0 {
-        format!("+{:.1}%", d_turns_val)
+        format!("+{d_turns_val:.1}%")
     } else {
-        format!("{:.1}%", d_turns_val)
+        format!("{d_turns_val:.1}%")
     };
 
     let b_tools = format!("{:.0}", comparison.baseline.median_tool_calls);
@@ -302,9 +302,9 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
         .unwrap_or(0.0)
         * 100.0;
     let d_tools = if d_tools_val >= 0.0 {
-        format!("+{:.1}%", d_tools_val)
+        format!("+{d_tools_val:.1}%")
     } else {
-        format!("{:.1}%", d_tools_val)
+        format!("{d_tools_val:.1}%")
     };
 
     let b_prompt = format!(
@@ -322,9 +322,9 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
         .unwrap_or(0.0)
         * 100.0;
     let d_prompt = if d_prompt_val >= 0.0 {
-        format!("+{:.1} pp", d_prompt_val)
+        format!("+{d_prompt_val:.1} pp")
     } else {
-        format!("{:.1} pp", d_prompt_val)
+        format!("{d_prompt_val:.1} pp")
     };
 
     let mut out = String::new();
@@ -337,28 +337,22 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
     ));
     out.push_str("| :--- | :--- | :--- | :--- |\n");
     out.push_str(&format!(
-        "| Overall pass rate | {} | {} | {} |\n",
-        b_pass, c_pass, d_pass
+        "| Overall pass rate | {b_pass} | {c_pass} | {d_pass} |\n"
     ));
     out.push_str(&format!(
-        "| Unverified success claims | {} | {} | {} |\n",
-        b_unv, c_unv, d_unv
+        "| Unverified success claims | {b_unv} | {c_unv} | {d_unv} |\n"
     ));
     out.push_str(&format!(
-        "| Unrelated edit rate | {} | {} | {} |\n",
-        b_unrel, c_unrel, d_unrel
+        "| Unrelated edit rate | {b_unrel} | {c_unrel} | {d_unrel} |\n"
     ));
     out.push_str(&format!(
-        "| Median model turns | {} | {} | {} |\n",
-        b_turns, c_turns, d_turns
+        "| Median model turns | {b_turns} | {c_turns} | {d_turns} |\n"
     ));
     out.push_str(&format!(
-        "| Median tool calls | {} | {} | {} |\n",
-        b_tools, c_tools, d_tools
+        "| Median tool calls | {b_tools} | {c_tools} | {d_tools} |\n"
     ));
     out.push_str(&format!(
-        "| Permission prompts/task | {} | {} | {} |\n",
-        b_prompt, c_prompt, d_prompt
+        "| Permission prompts/task | {b_prompt} | {c_prompt} | {d_prompt} |\n"
     ));
 
     if comparison.provider_errors > 0 {

@@ -658,7 +658,7 @@ fn format_token_count(tokens: u64) -> String {
         formatted.push_str(&digits[..first_group]);
     }
     let start = first_group;
-    for (index, chunk) in digits[start..].as_bytes().chunks(3).enumerate() {
+    for (index, chunk) in digits.as_bytes()[start..].chunks(3).enumerate() {
         if start != 0 || index != 0 {
             formatted.push(',');
         }

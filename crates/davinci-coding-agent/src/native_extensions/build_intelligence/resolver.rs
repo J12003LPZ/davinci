@@ -426,7 +426,7 @@ impl BuildResolver {
                             best_match = Some(pkg);
                         }
                     } else if (normalized == *rel || normalized.starts_with(&format!("{rel}/")))
-                        && best_match.map_or(true, |bm| bm.relative_path.len() < rel.len())
+                        && best_match.is_none_or(|bm| bm.relative_path.len() < rel.len())
                     {
                         best_match = Some(pkg);
                     }

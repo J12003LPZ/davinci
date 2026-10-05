@@ -66,7 +66,7 @@ pub fn cells(view: &ContextUsageView) -> Vec<Cell> {
         let exact = category.tokens as f64 * CELLS as f64 / window;
         let full = exact.floor() as usize;
         let partial = exact - exact.floor() > 0.0 || full == 0;
-        grid.extend(std::iter::repeat(Cell::Full(category.kind)).take(full));
+        grid.extend(std::iter::repeat_n(Cell::Full(category.kind), full));
         if partial {
             grid.push(Cell::Partial(category.kind));
         }
@@ -79,8 +79,8 @@ pub fn cells(view: &ContextUsageView) -> Vec<Cell> {
     };
     let buffer = buffer.min(CELLS - grid.len());
     let free = CELLS - grid.len() - buffer;
-    grid.extend(std::iter::repeat(Cell::Free).take(free));
-    grid.extend(std::iter::repeat(Cell::Buffer).take(buffer));
+    grid.extend(std::iter::repeat_n(Cell::Free, free));
+    grid.extend(std::iter::repeat_n(Cell::Buffer, buffer));
     grid
 }
 

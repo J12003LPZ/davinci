@@ -185,7 +185,7 @@ impl Drop for HookDepthGuard {
 pub fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 pub fn matches_path(pattern: &str, candidate: &Path) -> bool {
@@ -379,9 +379,10 @@ impl HooksFile {
         !self.pre_tool.is_empty()
             || self.rules.iter().any(|rule| {
                 normalize_event_name(&rule.event) == "beforeTool"
-                    && rule.tool.as_deref().map_or(true, |name| {
-                        name.is_empty() || name.eq_ignore_ascii_case(tool)
-                    })
+                    && rule
+                        .tool
+                        .as_deref()
+                        .is_none_or(|name| name.is_empty() || name.eq_ignore_ascii_case(tool))
             })
     }
 
@@ -764,12 +765,10 @@ pub fn run_one_envelope(
     result: Option<&str>,
     envelope: Option<&davinci_agent::RuntimeEventEnvelope>,
 ) -> Option<String> {
-    match run_supervised_hook(
+    run_supervised_hook(
         argv, kind, tool, None, args, result, envelope, None, None, 3,
-    ) {
-        Ok(()) => None,
-        Err(err) => Some(err),
-    }
+    )
+    .err()
 }
 
 #[allow(clippy::too_many_arguments)]

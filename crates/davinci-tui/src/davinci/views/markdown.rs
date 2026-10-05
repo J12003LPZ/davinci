@@ -1253,8 +1253,8 @@ fn main() {}
                             input.chars().take(30).collect::<String>()
                         );
                     }
-                    assert!(rows.first().map_or(true, |row| !is_blank(row)));
-                    assert!(rows.last().map_or(true, |row| !is_blank(row)));
+                    assert!(rows.first().is_none_or(|row| !is_blank(row)));
+                    assert!(rows.last().is_none_or(|row| !is_blank(row)));
                 }
             }
         }

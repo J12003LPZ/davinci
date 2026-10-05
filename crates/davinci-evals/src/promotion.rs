@@ -89,27 +89,23 @@ pub fn validate_promotion_evidence_against_hashes(
 
     if !evidence.pass_rate_delta.is_finite() || evidence.pass_rate_delta < MIN_PASS_RATE_DELTA {
         failures.push(format!(
-            "pass-rate delta must be finite and at least {:.3}",
-            MIN_PASS_RATE_DELTA
+            "pass-rate delta must be finite and at least {MIN_PASS_RATE_DELTA:.3}"
         ));
     }
     if !bounded_rate(evidence.unverified_claim_rate, MAX_UNVERIFIED_CLAIM_RATE) {
         failures.push(format!(
-            "unverified claim rate must be in [0, {:.3}]",
-            MAX_UNVERIFIED_CLAIM_RATE
+            "unverified claim rate must be in [0, {MAX_UNVERIFIED_CLAIM_RATE:.3}]"
         ));
     }
     if !bounded_rate(evidence.unrelated_edit_rate, MAX_UNRELATED_EDIT_RATE) {
         failures.push(format!(
-            "unrelated edit rate must be in [0, {:.3}]",
-            MAX_UNRELATED_EDIT_RATE
+            "unrelated edit rate must be in [0, {MAX_UNRELATED_EDIT_RATE:.3}]"
         ));
     }
     if !evidence.median_turn_delta.is_finite() || evidence.median_turn_delta > MAX_MEDIAN_TURN_DELTA
     {
         failures.push(format!(
-            "median turn delta must be at most {:.3}",
-            MAX_MEDIAN_TURN_DELTA
+            "median turn delta must be at most {MAX_MEDIAN_TURN_DELTA:.3}"
         ));
     }
     if evidence.artifact_manifest_hashes.is_empty() {

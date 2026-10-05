@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned cargo-deny
-        # cargo-deny needs a newer compiler than the repository's pinned 1.83.
+        # cargo-deny needs a newer compiler than the repository's pinned 1.88.
         run: |
           rustup toolchain install stable --profile minimal
           cargo +stable install cargo-deny --version 0.20.2 --locked

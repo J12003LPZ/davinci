@@ -666,7 +666,10 @@ fn fingerprint(cwd: &Path, path: &str) -> Result<String, String> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(format!("Evidence grew beyond 1 MiB: {path}"));
     }
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    Ok(format!(
+        "{:x}",
+        davinci_sys::hex::Lower(&Sha256::digest(&bytes))
+    ))
 }
 
 pub fn tool_parameters() -> Value {

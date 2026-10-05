@@ -734,7 +734,9 @@ mod tests {
                 let scope = ObservationScope::capture();
                 let hash = format!(
                     "{:x}",
-                    sha2::Sha256::digest(serde_json::to_vec(&schema.get("tools")).unwrap())
+                    davinci_sys::hex::Lower(&sha2::Sha256::digest(
+                        serde_json::to_vec(&schema.get("tools")).unwrap()
+                    ))
                 );
                 begin_request("coding", "fixture", Some("medium"), &hash);
                 Attempt::start("http").finish("completed", Some(200), Some(Usage::default()));

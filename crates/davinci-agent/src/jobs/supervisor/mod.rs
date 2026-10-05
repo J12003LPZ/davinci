@@ -269,7 +269,7 @@ fn environment_evidence(environment: &BTreeMap<String, String>) -> EnvironmentEv
     }
     EnvironmentEvidence {
         references: environment.keys().cloned().collect(),
-        digest: format!("{:x}", hash.finalize()),
+        digest: format!("{:x}", davinci_sys::hex::Lower(&hash.finalize())),
     }
 }
 

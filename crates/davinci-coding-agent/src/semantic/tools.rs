@@ -17,18 +17,18 @@ pub fn path_to_uri(path: &Path) -> String {
             }
             b' ' => encoded.push_str("%20"),
             other => {
-                encoded.push_str(&format!("%{:02X}", other));
+                encoded.push_str(&format!("%{other:02X}"));
             }
         }
     }
 
     if encoded.starts_with("//") {
         // UNC path: //server/share -> file://server/share
-        format!("file:{}", encoded)
+        format!("file:{encoded}")
     } else if encoded.starts_with('/') {
-        format!("file://{}", encoded)
+        format!("file://{encoded}")
     } else {
-        format!("file:///{}", encoded)
+        format!("file:///{encoded}")
     }
 }
 

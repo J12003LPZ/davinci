@@ -254,7 +254,7 @@ impl ActivePlugins {
             allowed
                 && active.plugin.hooks.iter().any(|hook| {
                     hook.event == event
-                        && subject.map_or(true, |subject| {
+                        && subject.is_none_or(|subject| {
                             hooks::matcher_accepts(hook.matcher.as_deref(), subject)
                         })
                 })

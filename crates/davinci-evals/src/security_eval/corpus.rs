@@ -289,7 +289,12 @@ fn validate_case<'a>(
         if case_bytes > 16 * 1024 * 1024 || source.contains('\0') {
             return Err("corpus case exceeds text source limits".into());
         }
-        if case.files[path] != format!("{:x}", Sha256::digest(source.as_bytes())) {
+        if case.files[path]
+            != format!(
+                "{:x}",
+                davinci_sys::hex::Lower(&Sha256::digest(source.as_bytes()))
+            )
+        {
             return Err("corpus source digest mismatch".into());
         }
     }
@@ -354,7 +359,10 @@ mod tests {
                         .map(|(path, text): (&String, &String)| {
                             (
                                 path.clone(),
-                                format!("{:x}", Sha256::digest(text.as_bytes())),
+                                format!(
+                                    "{:x}",
+                                    davinci_sys::hex::Lower(&Sha256::digest(text.as_bytes()))
+                                ),
                             )
                         })
                         .collect();
@@ -694,7 +702,10 @@ mod tests {
             .insert("control.rs".into(), labeled.clone());
         corpus.pairs[0].vulnerable.files.insert(
             "control.rs".into(),
-            format!("{:x}", Sha256::digest(labeled.as_bytes())),
+            format!(
+                "{:x}",
+                davinci_sys::hex::Lower(&Sha256::digest(labeled.as_bytes()))
+            ),
         );
         let validated = corpus.validate(&sources).unwrap();
         let worker = validated.worker_files(&id).unwrap();

@@ -779,7 +779,7 @@ impl ExtensionHost {
     }
 
     pub fn execute_native_command(&self, name: &str, args: &str) -> Result<Option<Value>, String> {
-        if !NATIVE_COMMANDS.iter().any(|command| *command == name) {
+        if !NATIVE_COMMANDS.contains(&name) {
             return Ok(None);
         }
         if matches!(name, "security-scan" | "sec-status" | "sec-report") {

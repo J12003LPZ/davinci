@@ -207,7 +207,7 @@ pub fn record_codex_telemetry_event(event: &CodexTelemetryEvent) {
         let _ = create_dir_all(parent);
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{}", line);
+        let _ = writeln!(file, "{line}");
     }
 }
 

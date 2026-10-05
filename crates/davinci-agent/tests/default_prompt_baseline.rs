@@ -8,6 +8,9 @@ fn default_prompt_v1_matches_committed_baseline() {
 
     assert_eq!(actual, expected);
 
-    let hash = format!("{:x}", Sha256::digest(actual.as_bytes()));
+    let hash = format!(
+        "{:x}",
+        davinci_sys::hex::Lower(&Sha256::digest(actual.as_bytes()))
+    );
     assert!(!hash.is_empty());
 }

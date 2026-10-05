@@ -45,9 +45,9 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
 
     if let Some(rev) = state.plan_revision {
         if state.plan_approved {
-            lines.push(format!("Active plan revision: {}; approved.", rev));
+            lines.push(format!("Active plan revision: {rev}; approved."));
         } else {
-            lines.push(format!("Active plan revision: {}; not yet approved.", rev));
+            lines.push(format!("Active plan revision: {rev}; not yet approved."));
         }
     }
 

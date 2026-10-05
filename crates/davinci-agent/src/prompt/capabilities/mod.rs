@@ -149,9 +149,7 @@ mod tests {
             let tokens = estimate_tokens_from_str(&m.body);
             assert!(
                 tokens <= CAPABILITY_POLICY_MAX_TOKENS,
-                "Capability {:?} exceeds token budget: {}",
-                cap,
-                tokens
+                "Capability {cap:?} exceeds token budget: {tokens}"
             );
         }
     }
@@ -183,10 +181,7 @@ mod tests {
         let accuracy = (correct as f64) / (total as f64);
         assert!(
             accuracy >= 0.95,
-            "Frontend routing accuracy {} below 95% threshold ({}/{})",
-            accuracy,
-            correct,
-            total
+            "Frontend routing accuracy {accuracy} below 95% threshold ({correct}/{total})"
         );
     }
 
@@ -220,12 +215,12 @@ mod tests {
                 (true, true) => tp += 1,
                 (false, true) => {
                     fp += 1;
-                    eprintln!("Frontend FP on case {}: {:?}", id, req);
+                    eprintln!("Frontend FP on case {id}: {req:?}");
                 }
                 (false, false) => tn += 1,
                 (true, false) => {
                     fn_count += 1;
-                    eprintln!("Frontend FN on case {}: {:?}", id, req);
+                    eprintln!("Frontend FN on case {id}: {req:?}");
                 }
             }
         }
@@ -234,19 +229,16 @@ mod tests {
         let recall = tp as f64 / (tp + fn_count) as f64;
 
         eprintln!(
-            "Frontend routing metrics: TP={}, FP={}, TN={}, FN={}, Precision={:.3}, Recall={:.3}",
-            tp, fp, tn, fn_count, precision, recall
+            "Frontend routing metrics: TP={tp}, FP={fp}, TN={tn}, FN={fn_count}, Precision={precision:.3}, Recall={recall:.3}"
         );
 
         assert!(
             precision >= 0.97,
-            "Frontend precision {:.3} below 97% requirement",
-            precision
+            "Frontend precision {precision:.3} below 97% requirement"
         );
         assert!(
             recall >= 0.94,
-            "Frontend recall {:.3} below 94% requirement",
-            recall
+            "Frontend recall {recall:.3} below 94% requirement"
         );
     }
 
@@ -291,12 +283,12 @@ mod tests {
                 (true, true) => tp += 1,
                 (false, true) => {
                     fp += 1;
-                    eprintln!("Debugging FP on case {}: {:?}", id, req);
+                    eprintln!("Debugging FP on case {id}: {req:?}");
                 }
                 (false, false) => tn += 1,
                 (true, false) => {
                     fn_count += 1;
-                    eprintln!("Debugging FN on case {}: {:?}", id, req);
+                    eprintln!("Debugging FN on case {id}: {req:?}");
                 }
             }
         }
@@ -305,19 +297,16 @@ mod tests {
         let recall = tp as f64 / (tp + fn_count) as f64;
 
         eprintln!(
-            "Debugging routing metrics: TP={}, FP={}, TN={}, FN={}, Precision={:.3}, Recall={:.3}",
-            tp, fp, tn, fn_count, precision, recall
+            "Debugging routing metrics: TP={tp}, FP={fp}, TN={tn}, FN={fn_count}, Precision={precision:.3}, Recall={recall:.3}"
         );
 
         assert!(
             precision >= 0.97,
-            "Debugging precision {:.3} below 97% requirement",
-            precision
+            "Debugging precision {precision:.3} below 97% requirement"
         );
         assert!(
             recall >= 0.94,
-            "Debugging recall {:.3} below 94% requirement",
-            recall
+            "Debugging recall {recall:.3} below 94% requirement"
         );
     }
 
@@ -353,12 +342,12 @@ mod tests {
                 (true, true) => tp += 1,
                 (false, true) => {
                     fp += 1;
-                    eprintln!("Review FP on case {}: {:?}", id, req);
+                    eprintln!("Review FP on case {id}: {req:?}");
                 }
                 (false, false) => tn += 1,
                 (true, false) => {
                     fn_count += 1;
-                    eprintln!("Review FN on case {}: {:?}", id, req);
+                    eprintln!("Review FN on case {id}: {req:?}");
                 }
             }
         }
@@ -367,19 +356,16 @@ mod tests {
         let recall = tp as f64 / (tp + fn_count) as f64;
 
         eprintln!(
-            "Review routing metrics: TP={}, FP={}, TN={}, FN={}, Precision={:.3}, Recall={:.3}",
-            tp, fp, tn, fn_count, precision, recall
+            "Review routing metrics: TP={tp}, FP={fp}, TN={tn}, FN={fn_count}, Precision={precision:.3}, Recall={recall:.3}"
         );
 
         assert!(
             precision >= 0.97,
-            "Review precision {:.3} below 97% requirement",
-            precision
+            "Review precision {precision:.3} below 97% requirement"
         );
         assert!(
             recall >= 0.94,
-            "Review recall {:.3} below 94% requirement",
-            recall
+            "Review recall {recall:.3} below 94% requirement"
         );
     }
 
@@ -392,14 +378,12 @@ mod tests {
         assert!(
             rule_ids.contains(&"dbg.explicit.diagnose")
                 || rule_ids.contains(&"dbg.explicit.root_cause"),
-            "Expected diagnostic rule IDs, got: {:?}",
-            rule_ids
+            "Expected diagnostic rule IDs, got: {rule_ids:?}"
         );
         for reason in &decision.reasons {
             assert!(
                 reason.starts_with("capability.debugging: [dbg."),
-                "Reason should log capability and rule ID without chain-of-thought: {}",
-                reason
+                "Reason should log capability and rule ID without chain-of-thought: {reason}"
             );
         }
     }

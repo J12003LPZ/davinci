@@ -400,7 +400,7 @@ fn reaches(definition: &GraphDefinition, from: &str, to: &str) -> bool {
 /// Build the explicit graph topology definition for simple or complex runs.
 pub fn build_definition(mode: GraphMode, classification: &Classification) -> GraphDefinition {
     let version = 1;
-    let graph_id = format!("graph-{:?}-v{version}", mode).to_lowercase();
+    let graph_id = format!("graph-{mode:?}-v{version}").to_lowercase();
 
     match mode {
         GraphMode::Simple => {

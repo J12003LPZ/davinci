@@ -2435,8 +2435,8 @@ fn shell_readers_finished(
     stdout: &Option<std::thread::JoinHandle<std::io::Result<()>>>,
     stderr: &Option<std::thread::JoinHandle<std::io::Result<()>>>,
 ) -> bool {
-    stdout.as_ref().map_or(true, |handle| handle.is_finished())
-        && stderr.as_ref().map_or(true, |handle| handle.is_finished())
+    stdout.as_ref().is_none_or(|handle| handle.is_finished())
+        && stderr.as_ref().is_none_or(|handle| handle.is_finished())
 }
 
 fn join_finished_shell_stream(

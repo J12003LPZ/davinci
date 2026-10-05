@@ -65,7 +65,7 @@ fn visible_stack_entries(
             entry
                 .visible
                 .as_ref()
-                .map_or(true, |visible| visible(viewport))
+                .is_none_or(|visible| visible(viewport))
         })
         .collect()
 }

@@ -372,7 +372,7 @@ pub fn build_retry_context_delta(
     let diagnostic = bounded_chars(diagnostic_summary.trim(), 600);
     let mut derived_query = base_query.clone();
     derived_query.role = Some(role);
-    derived_query.failure_hint = Some(format!("{}: {}", failure_class, diagnostic));
+    derived_query.failure_hint = Some(format!("{failure_class}: {diagnostic}"));
     let rendered_query = derived_query.render();
     let retrieved = build_context_packet(
         memory,
@@ -393,10 +393,7 @@ pub fn build_retry_context_delta(
     );
     let rendered_query = xml_escape_bounded(&rendered_query, 480);
     let mut text = format!(
-        "<retry_context source=\"davinci\" untrusted=\"true\">\nfailure_class: {}\ndiagnostic: {}\nderived_query: {}",
-        failure_class,
-        diagnostic,
-        rendered_query
+        "<retry_context source=\"davinci\" untrusted=\"true\">\nfailure_class: {failure_class}\ndiagnostic: {diagnostic}\nderived_query: {rendered_query}"
     );
     let suffix = "\n</retry_context>";
     let retrieval_prefix = "\nretrieved_context:\n";
@@ -423,7 +420,7 @@ pub fn build_retry_context_delta(
     if text.is_empty() {
         return ContextPacket::empty();
     }
-    let estimated_tokens = (text.chars().count() + 3) / 4;
+    let estimated_tokens = text.chars().count().div_ceil(4);
     let (memory_refs, skill_refs, memory_tokens, skill_tokens, skill_candidates_considered) =
         if retrieval_fits {
             (

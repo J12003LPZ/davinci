@@ -967,7 +967,7 @@ fn source_hash(path: &Path) -> Option<String> {
     }
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    Some(format!("{:x}", hasher.finalize()))
+    Some(format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize())))
 }
 
 fn live_count(slots: &BTreeMap<SessionKey, Arc<Mutex<Slot>>>) -> usize {

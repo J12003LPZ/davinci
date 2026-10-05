@@ -224,7 +224,7 @@ pub fn rank_skills_with_embeddings(
 }
 
 pub fn role_bias(role: Role, skill_name: &str, skill_desc: &str) -> f32 {
-    let text = format!("{} {}", skill_name, skill_desc).to_lowercase();
+    let text = format!("{skill_name} {skill_desc}").to_lowercase();
     let keywords: &[&str] = match role {
         Role::Classifier => &["classify", "triage", "scope", "complexity", "label"],
         Role::Researcher => &[
@@ -380,7 +380,7 @@ pub fn select_graph_skill_candidates_with_embeddings(
         if selected_names.contains(&c.skill.name) {
             continue;
         }
-        let est_tokens = (c.skill.body.chars().count() + 3) / 4;
+        let est_tokens = c.skill.body.chars().count().div_ceil(4);
         if accumulated_tokens + est_tokens > token_cap {
             continue;
         }
@@ -429,7 +429,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             path: PathBuf::from(path),
-            body: format!("# {}\n{}", name, description),
+            body: format!("# {name}\n{description}"),
             base_dir: PathBuf::from(path)
                 .parent()
                 .unwrap_or(&PathBuf::from("."))
@@ -458,12 +458,12 @@ mod tests {
         failures: u64,
     ) -> SkillLedgerRecord {
         SkillLedgerRecord {
-            skill_id: format!("id-{}", name),
+            skill_id: format!("id-{name}"),
             name: name.to_string(),
             scope,
             origin: SkillOrigin::LearnedReview,
             status,
-            path: PathBuf::from(format!("/skills/{}/SKILL.md", name)),
+            path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
             content_hash: "hash".to_string(),
             version: 1,
             success_count: successes,
@@ -728,9 +728,9 @@ mod tests {
                 "procedure detail step text ".repeat(60)
             );
             skills.push(Skill {
-                name: format!("procedure-{}", i),
+                name: format!("procedure-{i}"),
                 description: "Procedure for test verification".into(),
-                path: PathBuf::from(format!("/skills/p{}/SKILL.md", i)),
+                path: PathBuf::from(format!("/skills/p{i}/SKILL.md")),
                 body,
                 base_dir: PathBuf::from("."),
             });

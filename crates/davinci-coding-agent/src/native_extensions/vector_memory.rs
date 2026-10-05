@@ -378,7 +378,7 @@ pub struct MemoryChunk {
 pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 pub fn content_hash(text: &str) -> String {
@@ -902,7 +902,7 @@ fn eligible_for_automatic_recall(record: &MemoryRecord) -> bool {
 const INJECTED_LINE_OVERHEAD_CHARS: usize = 31;
 
 fn injected_line_tokens(text: &str) -> usize {
-    (text.chars().count() + INJECTED_LINE_OVERHEAD_CHARS + 3) / 4
+    (text.chars().count() + INJECTED_LINE_OVERHEAD_CHARS).div_ceil(4)
 }
 
 fn source_anchor_current(record: &MemoryRecord, cwd: &Path) -> bool {
@@ -1473,7 +1473,10 @@ impl VectorMemory {
             kind: prior.kind,
             text: new_text,
             source: prior.source.clone(),
-            content_hash: format!("{:x}", sha2::Sha256::digest(prior.id.as_bytes())),
+            content_hash: format!(
+                "{:x}",
+                davinci_sys::hex::Lower(&sha2::Sha256::digest(prior.id.as_bytes()))
+            ),
             importance: prior.importance,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1720,7 +1723,7 @@ impl VectorMemory {
                 continue;
             }
             let text = redact_secrets(&hit.record.text);
-            let estimated_tokens = (text.chars().count() + hit.record.id.len() + 8 + 3) / 4;
+            let estimated_tokens = (text.chars().count() + hit.record.id.len() + 8).div_ceil(4);
             if estimated_tokens > token_cap.saturating_sub(accumulated_tokens) {
                 continue;
             }
@@ -2392,7 +2395,7 @@ impl VectorMemory {
             repo_id: self.repo_id.clone(),
             kind,
             text: text_redacted.clone(),
-            source: format!("learning-turn-{}", source_turn),
+            source: format!("learning-turn-{source_turn}"),
             content_hash: hash,
             importance,
             created_at: davinci_session::now_ms(),
@@ -3616,12 +3619,12 @@ pub(crate) mod tests {
         // Add 10 relevant records
         for i in 0..10 {
             let rec = MemoryRecord {
-                id: format!("mem-test-{:03}", i),
+                id: format!("mem-test-{i:03}"),
                 repo_id: memory.repo_id.clone(),
                 kind: MemoryKind::Discovery,
-                text: format!("Authentication service config details for database {}", i),
+                text: format!("Authentication service config details for database {i}"),
                 source: "user".into(),
-                content_hash: format!("hash-{}", i),
+                content_hash: format!("hash-{i}"),
                 importance: 0.8,
                 created_at: 1000 + i as u64,
                 embedding: None,
@@ -3955,7 +3958,7 @@ mod source_bound_freshness_regressions {
             "useCount": 0,
             "lastUsedAt": null
         });
-        std::fs::write(mem_dir.join("records.jsonl"), format!("{}\n", record)).unwrap();
+        std::fs::write(mem_dir.join("records.jsonl"), format!("{record}\n")).unwrap();
         let memory = VectorMemory::with_config(
             dir.path().to_path_buf(),
             VectorMemoryConfig {
@@ -3996,7 +3999,7 @@ mod source_bound_freshness_regressions {
         record["sourcePaths"] = json!(["src/auth.rs"]);
         record["sourceStateHash"] = json!(source_state_hash("src/auth.rs", b"v1"));
         record["verifiedAtRevision"] = json!("fixture-r1");
-        std::fs::write(mem_dir.join("records.jsonl"), format!("{}\n", record)).unwrap();
+        std::fs::write(mem_dir.join("records.jsonl"), format!("{record}\n")).unwrap();
 
         let memory = VectorMemory::with_config(
             dir.path().to_path_buf(),

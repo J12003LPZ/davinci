@@ -1160,7 +1160,7 @@ pub fn render_fork_preview(preview: &ForkPreview) -> String {
         preview.retained_spend_usd
     ));
     if let Some(rem) = preview.remaining_ceiling_ms {
-        lines.push(format!("Remaining deadline: {} ms", rem));
+        lines.push(format!("Remaining deadline: {rem} ms"));
     }
     lines.push(format!(
         "Preserved nodes: {}",
@@ -1176,7 +1176,7 @@ pub fn render_fork_preview(preview: &ForkPreview) -> String {
         "Preview only: repeat with --authorize to apply".to_string()
     });
     if let Some(cp) = &preview.checkpoint_ref {
-        lines.push(format!("Checkpoint: {}", cp));
+        lines.push(format!("Checkpoint: {cp}"));
     }
     lines.join("\n")
 }
@@ -1187,7 +1187,7 @@ pub fn render_rewind_preview(preview: &GraphRewindPreview) -> String {
     lines.push(format!("/graph rewind {}", preview.target_node_id));
     lines.push(format!("Run: {}", preview.run_id));
     if let Some(cp) = &preview.checkpoint_id {
-        lines.push(format!("Checkpoint: {}", cp));
+        lines.push(format!("Checkpoint: {cp}"));
     } else {
         lines.push("Checkpoint: [missing]".to_string());
     }
@@ -1590,12 +1590,12 @@ mod tests {
 
         let narrow_diff = render_diff_report(&diff, 30);
         for line in narrow_diff.lines() {
-            assert!(line.len() <= 30, "line exceeds narrow width: {:?}", line);
+            assert!(line.len() <= 30, "line exceeds narrow width: {line:?}");
         }
 
         let narrow_explain = render_explain_report(&explain, 30);
         for line in narrow_explain.lines() {
-            assert!(line.len() <= 30, "line exceeds narrow width: {:?}", line);
+            assert!(line.len() <= 30, "line exceeds narrow width: {line:?}");
         }
     }
 

@@ -19,7 +19,7 @@ pub fn proves_physical_keyboard(source: &str) -> bool {
 pub fn compute_screen_digest(screen_text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(screen_text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 /// Host-owned assertion record ensuring terminal output cannot fake metadata.
@@ -97,13 +97,13 @@ impl DeterministicRunner {
             }
 
             self.event_log
-                .push(format!("Step {}: executing {:?}", idx, step));
+                .push(format!("Step {idx}: executing {step:?}"));
 
             match step {
                 InteractionStep::Launch => {
                     if !session.is_running {
                         self.event_log
-                            .push(format!("Step {}: session not running", idx));
+                            .push(format!("Step {idx}: session not running"));
                         all_assertions_passed = false;
                         break;
                     }
@@ -113,7 +113,7 @@ impl DeterministicRunner {
                     let bytes = text.as_bytes();
                     if let Err(e) = session.send_input(bytes) {
                         self.event_log
-                            .push(format!("Step {}: send_input failed: {}", idx, e));
+                            .push(format!("Step {idx}: send_input failed: {e}"));
                         all_assertions_passed = false;
                         break;
                     }
@@ -125,31 +125,29 @@ impl DeterministicRunner {
                     Some(seq) => {
                         if let Err(e) = session.send_input(seq) {
                             self.event_log
-                                .push(format!("Step {}: send_input key failed: {}", idx, e));
+                                .push(format!("Step {idx}: send_input key failed: {e}"));
                             all_assertions_passed = false;
                             break;
                         }
                         self.elapsed_ms += 10;
                     }
                     None => {
-                        let err_msg = format!("Unknown key: {}", key_name);
-                        self.event_log.push(format!("Step {}: {}", idx, err_msg));
+                        let err_msg = format!("Unknown key: {key_name}");
+                        self.event_log.push(format!("Step {idx}: {err_msg}"));
                         all_assertions_passed = false;
                         break;
                     }
                 },
                 InteractionStep::Resize { cols, rows } => {
                     if !terminal_size_allowed(*cols, *rows) {
-                        self.event_log.push(format!(
-                            "Step {}: resize bounds rejected {}x{}",
-                            idx, cols, rows
-                        ));
+                        self.event_log
+                            .push(format!("Step {idx}: resize bounds rejected {cols}x{rows}"));
                         all_assertions_passed = false;
                         break;
                     }
                     if let Err(e) = session.resize(*cols, *rows) {
                         self.event_log
-                            .push(format!("Step {}: resize failed: {}", idx, e));
+                            .push(format!("Step {idx}: resize failed: {e}"));
                         all_assertions_passed = false;
                         break;
                     }
@@ -163,8 +161,7 @@ impl DeterministicRunner {
                     if self.elapsed_ms > self.scenario.time_budget_ms {
                         timed_out = true;
                         self.event_log.push(format!(
-                            "Condition `{}` timed out after {}ms",
-                            description, timeout_ms
+                            "Condition `{description}` timed out after {timeout_ms}ms"
                         ));
                         self.diagnostic_frames.push(session.screen.to_plain_text());
                         all_assertions_passed = false;
@@ -178,7 +175,7 @@ impl DeterministicRunner {
 
                     let record = AssertionRecord {
                         step_index: idx,
-                        description: format!("AssertScreen contains '{}'", pattern),
+                        description: format!("AssertScreen contains '{pattern}'"),
                         expected: pattern.clone(),
                         actual: if passed {
                             pattern.clone()
@@ -196,8 +193,7 @@ impl DeterministicRunner {
                         all_assertions_passed = false;
                         self.diagnostic_frames.push(screen_text);
                         self.event_log.push(format!(
-                            "Assertion failed at step {}: pattern '{}' not found",
-                            idx, pattern
+                            "Assertion failed at step {idx}: pattern '{pattern}' not found"
                         ));
                     }
                     self.elapsed_ms += 5;
@@ -206,7 +202,7 @@ impl DeterministicRunner {
                     // Terminal targets do not have DOM
                     let record = AssertionRecord {
                         step_index: idx,
-                        description: format!("AssertDom selector '{}'", selector),
+                        description: format!("AssertDom selector '{selector}'"),
                         expected: expected.clone(),
                         actual: "DOM unsupported on terminal target".to_string(),
                         passed: false,

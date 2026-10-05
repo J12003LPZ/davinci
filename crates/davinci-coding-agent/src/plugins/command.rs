@@ -258,7 +258,7 @@ fn importable(tool: Option<&str>, agent_dir: &Path) -> Result<String, String> {
     let installed = store::load(agent_dir)?;
     let found: Vec<_> = external::all_plugins()
         .into_iter()
-        .filter(|p| tool.map_or(true, |t| p.origin.label() == t))
+        .filter(|p| tool.is_none_or(|t| p.origin.label() == t))
         .collect();
     if found.is_empty() {
         return Ok("No Claude Code or Codex plugins found on this machine.".into());
@@ -327,7 +327,7 @@ fn adopt(found: &external::ExternalPlugin, agent_dir: &Path) -> Result<String, S
 fn import_one(tool: Option<&str>, key: &str, agent_dir: &Path) -> Result<String, String> {
     let candidates: Vec<_> = external::all_plugins()
         .into_iter()
-        .filter(|p| tool.map_or(true, |t| p.origin.label() == t))
+        .filter(|p| tool.is_none_or(|t| p.origin.label() == t))
         .filter(|p| p.key == key || store::split_key(&p.key).0 == key)
         .collect();
     // The same key in both tools is the same plugin: take Claude Code's copy,

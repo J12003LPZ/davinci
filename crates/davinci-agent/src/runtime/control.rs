@@ -357,7 +357,10 @@ struct ControlReceiptFrame {
 
 fn command_digest(command: &WorkerControlCommand) -> Result<String, String> {
     let encoded = serde_json::to_vec(command).map_err(|error| error.to_string())?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    Ok(format!(
+        "{:x}",
+        davinci_sys::hex::Lower(&Sha256::digest(encoded))
+    ))
 }
 
 fn load_control_receipts(

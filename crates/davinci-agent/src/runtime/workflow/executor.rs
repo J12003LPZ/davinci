@@ -393,7 +393,7 @@ impl WorkflowExecutor {
 
         let this = self.clone();
         std::thread::Builder::new()
-            .name(format!("wf-{}", wf_id))
+            .name(format!("wf-{wf_id}"))
             .spawn(move || {
                 let name = spec.name.clone();
                 let outcome = this.run_phases(spec, wf_id, wf_token);
@@ -1569,7 +1569,7 @@ mod tests {
 
         // 2. With validated fingerprint: resume is permitted
         let mut valid_fps = HashSet::new();
-        valid_fps.insert(format!("{}:write_code:writer-1", wf_id));
+        valid_fps.insert(format!("{wf_id}:write_code:writer-1"));
 
         let res = executor.resume_execution(wf_id, spec, &valid_fps);
         assert!(

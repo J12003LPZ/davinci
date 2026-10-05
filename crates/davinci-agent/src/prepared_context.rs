@@ -65,7 +65,7 @@ impl Agent {
                 runtime.context_vm.root(),
             ));
         }
-        format!("{:x}", out.0.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&out.0.finalize()))
     }
 
     pub fn prepared_context_image(&self) -> Result<Arc<ContextImage>, String> {

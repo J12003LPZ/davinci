@@ -256,8 +256,7 @@ fn every_screen_and_overlay_is_bounded_in_both_themes() {
                 for row in rows {
                     assert!(
                         davinci_tui::davinci::ui::run_width(&row.spans) <= width,
-                        "{screen:?}/{overlay:?} at {width}x{height}: {}",
-                        row
+                        "{screen:?}/{overlay:?} at {width}x{height}: {row}"
                     );
                 }
             }

@@ -71,7 +71,7 @@ fn parse_classic(content: &str) -> Result<LockfileData, String> {
                 let clean = item.trim().trim_matches(['"', '\'']);
                 let name = if let Some(stripped) = clean.strip_prefix('@') {
                     if let Some((scope_pkg, _)) = stripped.split_once('@') {
-                        format!("@{}", scope_pkg)
+                        format!("@{scope_pkg}")
                     } else {
                         clean.to_string()
                     }
@@ -189,7 +189,7 @@ fn parse_berry(content: &str) -> Result<LockfileData, String> {
             }
             let name = if let Some(stripped) = header.strip_prefix('@') {
                 if let Some((scope_pkg, _)) = stripped.split_once('@') {
-                    format!("@{}", scope_pkg)
+                    format!("@{scope_pkg}")
                 } else {
                     header.to_string()
                 }

@@ -323,7 +323,7 @@ pub fn provider_messages_fingerprint(messages: &[ChatMessage]) -> String {
     hasher.update(b"davinci.responses-provider-projection.v1\0");
     hasher.update((stripped.len() as u64).to_le_bytes());
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

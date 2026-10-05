@@ -30,6 +30,7 @@ mod experimental {
     pub fn experimental_tool_sampling() -> Option<serde_json::Value> {
         None
     }
+    #[allow(clippy::large_enum_variant)] // built once per CLI run / prompt
     pub enum ExperimentalCli {
         Pi {
             options: Args,
@@ -3769,7 +3770,7 @@ fn with_print_approval_policy<T>(
     let previous_headless = std::mem::replace(&mut agent.headless_approval, headless);
     let previous_responder = agent.approval_responder.replace(
         davinci_agent::approval::ApprovalResponder(Arc::new(move |request, challenge| {
-            let stop = denials.as_ref().map_or(true, |denials| {
+            let stop = denials.as_ref().is_none_or(|denials| {
                 denials
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
@@ -5706,6 +5707,7 @@ fn run_streaming_turn(
                 .recv()
                 .unwrap_or(davinci_agent::DecisionHostResponse::Cancelled)
         }));
+    #[allow(clippy::large_enum_variant)] // built once per CLI run / prompt
     enum LegacyDecisionState {
         Selecting {
             request: davinci_agent::DecisionHostRequest,
@@ -9364,7 +9366,7 @@ fn handle_custom_overlay_input(
             apply_custom_overlay_result(&mut session.chrome, &path, &name, result.as_ref());
             if session.chrome.custom_overlay_lines.is_none() {
                 if let Some(value) = result {
-                    session.chrome.status = format!("custom={}", value);
+                    session.chrome.status = format!("custom={value}");
                 }
             }
         }

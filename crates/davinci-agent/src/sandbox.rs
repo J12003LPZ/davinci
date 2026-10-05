@@ -277,7 +277,7 @@ impl ContainerBackend {
                 }
             })
             .collect::<String>();
-        format!("davinci-{}", suffix)
+        format!("davinci-{suffix}")
     }
 }
 
@@ -903,7 +903,10 @@ pub fn sandbox_spec_digest(spec: &SandboxSpec) -> Result<String, SandboxFailure>
             "cannot encode sandbox policy digest",
         )
     })?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(format!(
+        "{:x}",
+        davinci_sys::hex::Lower(&Sha256::digest(bytes))
+    ))
 }
 
 fn lifecycle_capabilities() -> SandboxCapabilities {

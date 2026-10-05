@@ -23,7 +23,7 @@
 
 ## Repository and validation
 
-- Rust workspace; `rust-toolchain.toml` pins Rust 1.83.0. Preserve exact dependency pins and existing architecture. Add no dependency without a demonstrated need.
+- Rust workspace; `rust-toolchain.toml` pins Rust 1.88.0. Preserve exact dependency pins and existing architecture. Add no dependency without a demonstrated need.
 - Use `rtk` for shell commands; `rtk proxy` preserves raw output when filtering is unsuitable. Do not claim RTK savings without measurement.
 - Check Git status before edits when metadata is available. Isolate concurrent sessions with a worktree; a source snapshot without `.git` needs an external rollback copy of touched files, not an invented branch or Git initialization.
 - Add regression coverage for behavior changes. Run the smallest affected tests, formatting, and applicable build/check. Broaden validation for shared contracts or safety-critical changes. Do not require a coverage percentage or paid eval for a documentation edit.

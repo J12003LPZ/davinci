@@ -32,7 +32,7 @@ impl AuthorizedDesignContext {
         }
         let workspace_id = format!(
             "{:x}",
-            Sha256::digest(workspace.to_string_lossy().as_bytes())
+            davinci_sys::hex::Lower(&Sha256::digest(workspace.to_string_lossy().as_bytes()))
         );
         Ok(Self {
             session_id: session.header.id.clone(),

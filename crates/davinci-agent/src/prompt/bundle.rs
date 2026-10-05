@@ -34,7 +34,7 @@ impl PromptBundle {
     pub fn stable_sha256(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.stable_text().as_bytes());
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 
     /// Composes this bundle into a full prompt with provider adapter and runtime state.

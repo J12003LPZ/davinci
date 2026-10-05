@@ -379,7 +379,7 @@ impl GraphExecution {
                 .last_progress_checkpoint
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let due = last.map_or(true, |at| at.elapsed() >= PROGRESS_CHECKPOINT_EVERY);
+            let due = last.is_none_or(|at| at.elapsed() >= PROGRESS_CHECKPOINT_EVERY);
             if due {
                 *last = Some(Instant::now());
             }

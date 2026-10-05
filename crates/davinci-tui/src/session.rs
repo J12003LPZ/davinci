@@ -1022,7 +1022,7 @@ impl InteractiveSession {
                     .strip_suffix('u')
                     .and_then(|sequence| sequence.split_once(';'))
                     .and_then(|(_, modifiers)| modifiers.split_once(':'))
-                    .map_or(true, |(_, kind)| kind == "1");
+                    .is_none_or(|(_, kind)| kind == "1");
                 return if press && !self.running && self.custom_editor_path.is_none() {
                     SessionAction::CyclePermissionMode
                 } else {

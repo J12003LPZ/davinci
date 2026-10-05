@@ -1,6 +1,38 @@
 use super::fixtures::{fixture, launch_args};
 use super::*;
 
+#[cfg(windows)]
+#[test]
+fn worker_artifact_binding_accepts_only_equivalent_windows_prefixes() {
+    for (ordinary, verbatim) in [
+        (
+            r"C:\workspace\.davinci\graph\runs\run\artifacts\task.json",
+            r"\\?\C:\workspace\.davinci\graph\runs\run\artifacts\task.json",
+        ),
+        (
+            r"\\server\share\artifacts\task.json",
+            r"\\?\UNC\server\share\artifacts\task.json",
+        ),
+    ] {
+        assert!(artifact_paths_match(
+            Path::new(ordinary),
+            Path::new(verbatim)
+        ));
+        assert!(artifact_paths_match(
+            Path::new(verbatim),
+            Path::new(ordinary)
+        ));
+        assert!(!artifact_paths_match(
+            &Path::new(ordinary).with_file_name("other-task.json"),
+            Path::new(verbatim),
+        ));
+        assert!(!artifact_paths_match(
+            &Path::new(ordinary).join(".."),
+            Path::new(verbatim),
+        ));
+    }
+}
+
 #[test]
 fn worker_binding_preserves_identity_and_refuses_changed_launch_inputs() {
     let dir = tempfile::tempdir().unwrap();

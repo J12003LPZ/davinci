@@ -1850,8 +1850,7 @@ impl TaskRegistry {
                 dep_task.blocked_reasons.push(BlockReason {
                     code: "dependency_rewound".into(),
                     message: format!(
-                        "Upstream task {} was rewound to checkpoint {}",
-                        task_id, checkpoint_id
+                        "Upstream task {task_id} was rewound to checkpoint {checkpoint_id}"
                     ),
                 });
                 dep_task.advance_revision(committed_at)?;
@@ -1909,14 +1908,14 @@ impl TaskRegistry {
                         t.state = TaskState::Blocked;
                         t.blocked_reasons.push(BlockReason {
                             code: "code_rewound".into(),
-                            message: format!("Code was rewound to checkpoint {}", checkpoint_id),
+                            message: format!("Code was rewound to checkpoint {checkpoint_id}"),
                         });
                         let _ = t.advance_revision(committed_at);
                     }
                 } else {
                     t.blocked_reasons.push(BlockReason {
                         code: "code_rewound".into(),
-                        message: format!("Code was rewound to checkpoint {}", checkpoint_id),
+                        message: format!("Code was rewound to checkpoint {checkpoint_id}"),
                     });
                     let _ = t.advance_revision(committed_at);
                 }
@@ -1966,7 +1965,7 @@ impl TaskRegistry {
                     if let Some(rec) = record {
                         tasks.insert(*task_id, rec.clone());
                     } else {
-                        let mut rec = TaskRecord::new(envelope.run_id, format!("task-{}", task_id));
+                        let mut rec = TaskRecord::new(envelope.run_id, format!("task-{task_id}"));
                         rec.id = *task_id;
                         rec.assigned_to = envelope.agent_id;
                         rec.created_at_ms = envelope.timestamp_ms;

@@ -1266,7 +1266,7 @@ fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
             use unicode_segmentation::UnicodeSegmentation;
             let start = query
                 .grapheme_indices(true)
-                .last()
+                .next_back()
                 .map(|(at, _)| at)
                 .unwrap_or(0);
             query.truncate(start);

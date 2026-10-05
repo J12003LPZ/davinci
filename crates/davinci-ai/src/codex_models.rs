@@ -226,7 +226,7 @@ fn closest_template<'a>(models: &'a [Model], slug: &str) -> Option<&'a Model> {
         .filter(|model| model.provider == CODEX_PROVIDER && model.api == "openai-codex-responses")
     {
         let score = shared(&model.id);
-        if best.map_or(true, |(_, top)| score > top) {
+        if best.is_none_or(|(_, top)| score > top) {
             best = Some((model, score));
         }
     }

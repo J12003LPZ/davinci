@@ -378,7 +378,7 @@ fn source_identity(root: &Path, paths: &[String], transaction_identity: Option<&
         digest.update(b"transaction:");
         digest.update(identity.as_bytes());
     }
-    format!("sha256:{:x}", digest.finalize())
+    format!("sha256:{:x}", davinci_sys::hex::Lower(&digest.finalize()))
 }
 
 fn detect_package_manager(root: &Path) -> PackageManager {

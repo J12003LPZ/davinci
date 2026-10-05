@@ -115,7 +115,7 @@ fn fingerprint_with_files(invocation: &ServerInvocation, files: &[PathBuf]) -> S
             }
         }
     }
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 #[cfg(test)]

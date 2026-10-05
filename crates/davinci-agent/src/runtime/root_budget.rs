@@ -211,7 +211,7 @@ impl RootBudget {
         use sha2::{Digest, Sha256};
         let bytes = serde_json::to_vec(&(&self.path, &self.root, &self.limits))
             .expect("budget identity contains only serializable fields");
-        format!("{:x}", Sha256::digest(bytes))
+        format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
     }
 
     fn lock(&self) -> Result<davinci_sys::lock::ExclusiveFileLock, String> {

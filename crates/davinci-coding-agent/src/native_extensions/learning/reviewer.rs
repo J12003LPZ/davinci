@@ -134,7 +134,7 @@ pub fn parse_review_fixture(
     max_candidates: usize,
 ) -> Result<ReviewResult, String> {
     let parsed: FixturePayload =
-        serde_json::from_str(raw).map_err(|e| format!("malformed review fixture: {}", e))?;
+        serde_json::from_str(raw).map_err(|e| format!("malformed review fixture: {e}"))?;
 
     let mut candidates = Vec::new();
     let now = now_ms();

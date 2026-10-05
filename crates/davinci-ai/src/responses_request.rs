@@ -309,7 +309,7 @@ fn fingerprint_segments(segments: &[WireSegmentManifest]) -> String {
         hasher.update(segment.digest.as_bytes());
         hasher.update([0]);
     }
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 fn json_bytes(value: &Value) -> Vec<u8> {
@@ -317,7 +317,7 @@ fn json_bytes(value: &Value) -> Vec<u8> {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }
 
 #[cfg(test)]

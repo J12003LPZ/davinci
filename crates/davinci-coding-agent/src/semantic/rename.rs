@@ -97,7 +97,7 @@ pub fn verify_file_unchanged(path: &Path, expected_hash: &str) -> Result<(), Str
         .map_err(|e| format!("Failed reading file {}: {}", path.display(), e))?;
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    let actual_hash = format!("{:x}", hasher.finalize());
+    let actual_hash = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
     if actual_hash != expected_hash {
         return Err(format!(
             "File {} has changed since rename preview was generated (expected {}, got {})",
@@ -258,7 +258,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(b"fn target() {}");
-        let original_hash = format!("{:x}", hasher.finalize());
+        let original_hash = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
 
         assert!(verify_file_unchanged(&file_path, &original_hash).is_ok());
 

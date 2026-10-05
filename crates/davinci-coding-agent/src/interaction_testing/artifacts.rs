@@ -21,7 +21,7 @@ pub fn proves_physical_keyboard(environment: &str) -> bool {
 pub fn compute_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 /// Redacts API keys, bearer tokens, and secrets from logs and text.
@@ -141,8 +141,7 @@ pub fn bind_receipt_provenance(
     // 1. Validate binary hash matches expected installed binary
     if binary_hash != expected_binary_hash {
         return Err(format!(
-            "Binary hash mismatch: expected {}, found {}",
-            expected_binary_hash, binary_hash
+            "Binary hash mismatch: expected {expected_binary_hash}, found {binary_hash}"
         ));
     }
 

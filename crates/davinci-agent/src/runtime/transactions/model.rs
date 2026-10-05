@@ -14,23 +14,13 @@ pub(super) const RECORD_SCHEMA: u32 = if cfg!(windows) { 3 } else { 1 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct TransactionOwner {
     pub agent_id: AgentId,
     pub parent_agent_id: Option<AgentId>,
     pub session_id: Option<String>,
     pub task_id: Option<TaskId>,
     pub graph_node: Option<String>,
-}
-impl Default for TransactionOwner {
-    fn default() -> Self {
-        Self {
-            agent_id: AgentId::new(),
-            parent_agent_id: None,
-            session_id: None,
-            task_id: None,
-            graph_node: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

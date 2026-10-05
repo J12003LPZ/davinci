@@ -2190,7 +2190,7 @@ mod tests {
                 );
                 assert_eq!(reply.host_event_id, "evt-123");
             }
-            other => panic!("expected Reply, got {:?}", other),
+            other => panic!("expected Reply, got {other:?}"),
         }
     }
 
@@ -2246,7 +2246,7 @@ mod tests {
                     )
                 );
             }
-            other => panic!("expected Reply with custom answer, got {:?}", other),
+            other => panic!("expected Reply with custom answer, got {other:?}"),
         }
     }
 

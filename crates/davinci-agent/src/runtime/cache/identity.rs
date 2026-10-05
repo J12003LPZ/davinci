@@ -72,14 +72,14 @@ impl CacheIdentity {
             h.update(role.as_bytes());
             h.update(b"\n");
         }
-        let hex = format!("{:x}", h.finalize());
+        let hex = format!("{:x}", davinci_sys::hex::Lower(&h.finalize()));
         let short = &hex[..16];
         let prefix = self
             .role
             .as_deref()
-            .map(|r| format!("{}-", r))
+            .map(|r| format!("{r}-"))
             .unwrap_or_default();
-        format!("ci-{}{}", prefix, short)
+        format!("ci-{prefix}{short}")
     }
 
     /// Compute a reason-coded diff describing what changed compared to a previous identity.
@@ -152,7 +152,7 @@ impl std::fmt::Display for CacheMissReason {
             CacheMissReason::RoleChanged => "role_changed",
             CacheMissReason::Unknown => "unknown",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -163,7 +163,7 @@ pub fn legacy_prompt_cache_key(domain: &str, fields: &[&str], prefix: &str) -> S
     hash.update(domain.as_bytes());
     hash.update(b"\n");
     hash.update(fields.join("\n").as_bytes());
-    let hex = format!("{:x}", hash.finalize());
+    let hex = format!("{:x}", davinci_sys::hex::Lower(&hash.finalize()));
     format!("{prefix}{}", &hex[..16])
 }
 
@@ -176,14 +176,14 @@ pub fn hash_tool_names(tools: &[&str]) -> String {
         h.update(t.as_bytes());
         h.update(b"\n");
     }
-    format!("{:x}", h.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&h.finalize()))
 }
 
 /// Compute a SHA-256 hash of a system prompt string.
 pub fn hash_system_prompt(prompt: &str) -> String {
     let mut h = Sha256::new();
     h.update(prompt.as_bytes());
-    format!("{:x}", h.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&h.finalize()))
 }
 
 /// Compute a SHA-256 hash of the effective provider instructions.

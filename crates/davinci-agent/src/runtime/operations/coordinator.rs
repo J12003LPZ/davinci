@@ -485,7 +485,7 @@ impl OperationJournal {
                 .map_err(|error| JournalError::Serialization(error.to_string()))?;
             if attempt
                 .authorization()
-                .map_or(true, |receipt| receipt.approved_payload_digest != intent_digest)
+                .is_none_or(|receipt| receipt.approved_payload_digest != intent_digest)
             {
                 return Err(JournalError::AuthorizationDigestMismatch);
             }

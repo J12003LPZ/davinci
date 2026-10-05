@@ -914,7 +914,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 fn now_ms() -> u64 {

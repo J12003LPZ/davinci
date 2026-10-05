@@ -82,7 +82,7 @@ impl CacheKey {
 }
 
 pub fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

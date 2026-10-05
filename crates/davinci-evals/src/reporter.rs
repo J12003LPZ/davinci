@@ -257,7 +257,7 @@ pub fn append_harness_run_report(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    file.write_all(format!("{}\n", record).as_bytes())
+    file.write_all(format!("{record}\n").as_bytes())
         .map_err(|err| err.to_string())?;
     Ok(Some(path))
 }

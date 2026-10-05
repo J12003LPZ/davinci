@@ -120,7 +120,7 @@ impl LearningController {
         let project_store = match LearningStore::open(project_root) {
             Ok(store) => store,
             Err(err) => {
-                diagnostics.push(format!("failed to open project learning store: {}", err));
+                diagnostics.push(format!("failed to open project learning store: {err}"));
                 let temp = std::env::temp_dir().join("davinci_learning_fallback_project");
                 LearningStore::open(temp)
                     .unwrap_or_else(|_| LearningStore::open(PathBuf::from(".")).unwrap())
@@ -150,7 +150,7 @@ impl LearningController {
         let global_store = match LearningStore::open(global_root) {
             Ok(store) => store,
             Err(err) => {
-                diagnostics.push(format!("failed to open global learning store: {}", err));
+                diagnostics.push(format!("failed to open global learning store: {err}"));
                 let temp = std::env::temp_dir().join("davinci_learning_fallback_global");
                 LearningStore::open(temp)
                     .unwrap_or_else(|_| LearningStore::open(PathBuf::from(".")).unwrap())
@@ -443,7 +443,7 @@ impl LearningController {
                 LearningArtifact::FailureLesson { .. } => "failure-lesson".to_string(),
             };
             self.notifications
-                .push(format!("learning · candidate saved: {}", art_name));
+                .push(format!("learning · candidate saved: {art_name}"));
 
             // Task 16 Step 3: Prefer patch over duplicate skill. A second
             // create of an active skill is kept as a candidate, never applied
@@ -518,7 +518,7 @@ impl LearningController {
                                 self.stats.skills_created += 1;
                                 self.stats.candidates_approved += 1;
                                 self.notifications
-                                    .push(format!("learning · skill activated: {}", name));
+                                    .push(format!("learning · skill activated: {name}"));
                             }
                         }
                         LearningArtifact::SkillPatch {
@@ -554,7 +554,7 @@ impl LearningController {
                                 self.stats.skills_patched += 1;
                                 self.stats.candidates_approved += 1;
                                 self.notifications
-                                    .push(format!("learning · skill activated: {}", name));
+                                    .push(format!("learning · skill activated: {name}"));
                             }
                         }
                         LearningArtifact::SkillSupportFile {
@@ -589,8 +589,7 @@ impl LearningController {
                             if SkillManager::execute(ctx, &args).is_ok() {
                                 self.stats.candidates_approved += 1;
                                 self.notifications.push(format!(
-                                    "learning · support file written: {}/{}",
-                                    name, relative_path
+                                    "learning · support file written: {name}/{relative_path}"
                                 ));
                             }
                         }
@@ -808,14 +807,13 @@ impl LearningController {
                 SkillOrigin::User,
             )
         } else {
-            return Err(ToolError::Failed(format!("skill '{}' not found", name)));
+            return Err(ToolError::Failed(format!("skill '{name}' not found")));
         };
 
         let target_path = skill_dir.join(&validated_rel);
         if !target_path.exists() {
             return Err(ToolError::Failed(format!(
-                "file {:?} not found for skill {}",
-                file_req, name
+                "file {file_req:?} not found for skill {name}"
             )));
         }
 
@@ -828,7 +826,7 @@ impl LearningController {
         }
 
         let content = std::fs::read_to_string(&target_path)
-            .map_err(|e| ToolError::Failed(format!("failed to read {:?}: {}", target_path, e)))?;
+            .map_err(|e| ToolError::Failed(format!("failed to read {target_path:?}: {e}")))?;
         let hash = content_hash(&content);
 
         if let Ok(mut set) = self.read_set.lock() {
@@ -1089,8 +1087,7 @@ impl LearningController {
 
         if to_process.is_empty() {
             return Err(format!(
-                "no matching pending candidate found for '{}'",
-                target
+                "no matching pending candidate found for '{target}'"
             ));
         }
 
@@ -1194,7 +1191,7 @@ impl LearningController {
                         origin: SkillWriteOrigin::ForegroundUserDirected,
                         read_set: &read_set_snapshot,
                     };
-                    SkillManager::execute(ctx, &args).map(|_| format!("{}/{}", name, relative_path))
+                    SkillManager::execute(ctx, &args).map(|_| format!("{name}/{relative_path}"))
                 }
                 _ => Ok("approved".into()),
             };
@@ -1208,11 +1205,11 @@ impl LearningController {
                     let _ = store.upsert_candidate(candidate);
                     self.stats.candidates_approved += 1;
                     self.notifications
-                        .push(format!("learning · skill activated: {}", name));
+                        .push(format!("learning · skill activated: {name}"));
                     approved_ids.push(cid);
                 }
                 Err(e) => {
-                    errors.push(format!("{}: {}", cid, e));
+                    errors.push(format!("{cid}: {e}"));
                 }
             }
         }
@@ -1251,7 +1248,7 @@ impl LearningController {
         };
 
         if to_reject.is_empty() {
-            return Err(format!("no matching candidate found for '{}'", target));
+            return Err(format!("no matching candidate found for '{target}'"));
         }
 
         for mut candidate in to_reject {

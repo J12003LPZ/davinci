@@ -74,8 +74,7 @@ impl SimulatedTerminalSession {
     pub fn resize(&mut self, new_cols: u16, new_rows: u16) -> Result<(), String> {
         if !terminal_size_allowed(new_cols, new_rows) {
             return Err(format!(
-                "Invalid terminal size: {}x{} exceeds bounds",
-                new_cols, new_rows
+                "Invalid terminal size: {new_cols}x{new_rows} exceeds bounds"
             ));
         }
         self.config.cols = new_cols;

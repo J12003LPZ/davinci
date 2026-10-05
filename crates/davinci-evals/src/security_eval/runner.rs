@@ -667,7 +667,10 @@ fn capture_nonce() -> String {
 fn value_digest(value: &Value) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(value).map_err(|err| err.to_string())?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(format!(
+        "{:x}",
+        davinci_sys::hex::Lower(&Sha256::digest(bytes))
+    ))
 }
 
 fn run_attestation(run: &HeldOutRun) -> Result<String, String> {
@@ -838,7 +841,7 @@ fn opaque_case_key(nonce: &str, value: &str) -> String {
     use sha2::{Digest, Sha256};
     format!(
         "{:x}",
-        Sha256::digest(format!("{nonce}\0{value}").as_bytes())
+        davinci_sys::hex::Lower(&Sha256::digest(format!("{nonce}\0{value}").as_bytes()))
     )
 }
 

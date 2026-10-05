@@ -441,7 +441,10 @@ pub fn agent_tool_name(server: &str, tool: &str) -> String {
         return full;
     }
     use sha2::{Digest, Sha256};
-    let digest = format!("{:x}", Sha256::digest(full.as_bytes()));
+    let digest = format!(
+        "{:x}",
+        davinci_sys::hex::Lower(&Sha256::digest(full.as_bytes()))
+    );
     let keep = MAX_AGENT_TOOL_NAME - 9;
     format!("{}_{}", &full[..keep], &digest[..8])
 }

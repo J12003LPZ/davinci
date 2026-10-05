@@ -3203,10 +3203,9 @@ impl Agent {
                                 Some(permission::RuleSpecifier::Wildcard) => true,
                                 Some(permission::RuleSpecifier::Subject(pattern)) => pattern == "*",
                                 Some(permission::RuleSpecifier::Parameter { .. }) => false,
-                                None => rule
-                                    .pattern
-                                    .as_deref()
-                                    .map_or(true, |pattern| pattern == "*"),
+                                None => {
+                                    rule.pattern.as_deref().is_none_or(|pattern| pattern == "*")
+                                }
                             }
                     })
                 })

@@ -61,5 +61,5 @@ pub struct RepoFile {
 
 pub(super) fn digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }

@@ -148,7 +148,7 @@ fn visible_indices(entries: &[StackLayoutEntry], viewport: LayoutViewport) -> Ve
             entry
                 .visible
                 .as_ref()
-                .map_or(true, |visible| visible(viewport))
+                .is_none_or(|visible| visible(viewport))
         })
         .map(|(index, _)| index)
         .collect()

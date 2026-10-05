@@ -51,7 +51,7 @@ pub fn byte_to_utf16(line: &str, byte_offset: usize) -> Option<usize> {
 pub fn sha256_digest(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 /// Tracks line start byte indices with CRLF, LF, and bare CR normalization.
