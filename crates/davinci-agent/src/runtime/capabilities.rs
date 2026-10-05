@@ -88,6 +88,7 @@ pub fn output_policy_for_tool(name: &str, tool_class: ToolClass) -> OutputPolicy
             | "write"
             | "notebook_edit"
             | "batch"
+            | "codemode"
             | "todo"
             | "agent"
             | "retrieve_output"

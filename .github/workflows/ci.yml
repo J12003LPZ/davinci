@@ -382,3 +382,148 @@ jobs:
       - name: Require all workspace test shards
         shell: bash
         run: test "${{ needs['workspace-test-shards'].result }}" = "success"
+
+  codemode-baseline:
+    name: codemode-baseline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Record source and toolchain identity
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git status --porcelain
+          rustc --version
+          cargo --version
+          echo "RTK unavailable in this job; using raw Cargo for fixture validation"
+      - name: Compile only the tested dependency graph
+        run: |
+          cargo test -p davinci-agent -p davinci-mcp -p davinci-coding-agent --lib --no-run --locked
+          cargo test -p davinci-agent --test operation_dispatch --no-run --locked
+      - name: Existing batch and tool-ledger baseline
+        run: |
+          cargo test -p davinci-agent batch::tests --lib --offline --locked
+          cargo test -p davinci-agent tool_ledger::tests --lib --offline --locked
+      - name: MCP and production-dispatch characterization
+        run: |
+          cargo test -p davinci-mcp --lib --offline --locked
+          cargo test -p davinci-agent codemode_baseline --lib --offline --locked
+          cargo test -p davinci-agent --test operation_dispatch --offline --locked
+      - name: Existing reversible Governor baseline
+        run: cargo test -p davinci-coding-agent token_governor::tests --lib --offline --locked
+
+  codemode-package-admission:
+    name: codemode-package-admission (${{ matrix.os }})
+    needs: codemode-baseline
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - name: Resolve exact package identities without lifecycle scripts
+        working-directory: crates/davinci-coding-agent/codemode-host
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          npm view @earendil-works/pi-codemode@1.0.2 version dist engines license --json
+          npm view quickjs-wasi@3.6.2 version dist engines license --json
+          npm ci --ignore-scripts --no-audit --fund=false
+          npm ls --all --json
+          cat package-lock.json
+      - name: Record complete package asset and license identities
+        working-directory: crates/davinci-coding-agent/codemode-host
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { readdir, readFile, writeFile, lstat } from "node:fs/promises";
+          import { join, relative, sep } from "node:path";
+          import { createHash } from "node:crypto";
+          const root = process.cwd();
+          const files = [];
+          async function walk(directory) {
+            for (const name of (await readdir(directory)).sort()) {
+              const path = join(directory, name);
+              const stat = await lstat(path);
+              if (stat.isSymbolicLink()) throw new Error("unexpected asset symlink");
+              if (stat.isDirectory()) await walk(path);
+              else if (stat.isFile()) {
+                const bytes = await readFile(path);
+                files.push({ path: relative(root, path).split(sep).join("/"), bytes: bytes.length,
+                  sha256: createHash("sha256").update(bytes).digest("hex") });
+              } else throw new Error("unexpected asset type");
+            }
+          }
+          await walk(join(root, "node_modules"));
+          const report = { schemaVersion: 1, admitted: false, node: process.version,
+            platform: process.platform, architecture: process.arch, assets: files };
+          await writeFile("package-assets-report.json", JSON.stringify(report, null, 2) + String.fromCharCode(10));
+          console.log(JSON.stringify(report));
+          for (const file of files.filter(file => /license|copying|notice/i.test(file.path))) {
+            console.log(JSON.stringify({ licenseFile: file.path,
+              text: (await readFile(join(root, file.path), "utf8")).slice(0,65536) }));
+          }
+          JS
+      - name: Published package sandbox characterization with fake tools
+        working-directory: crates/davinci-coding-agent/codemode-host
+        run: node --test package-smoke.test.mjs
+      - name: Bounded adapter and framed host safety gates with fake tools
+        working-directory: crates/davinci-coding-agent/codemode-host
+        run: node --test bounded-worker.test.mjs framing.test.mjs host.test.mjs
+      - name: Verify reproducible trusted runtime bundle
+        working-directory: crates/davinci-coding-agent/codemode-host
+        shell: bash
+        run: |
+          set -euo pipefail
+          node package-bundle.mjs "$RUNNER_TEMP/codemode-bundle" "$RUNNER_TEMP/codemode-manifest.json"
+          cmp "$RUNNER_TEMP/codemode-manifest.json" ../src/codemode_host/assets-manifest.json
+      - name: Native Codemode supervisor suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          DAVINCI_CODEMODE_FIXTURE_NODE="$(node -p 'process.execPath')"
+          export DAVINCI_CODEMODE_FIXTURE_NODE
+          DAVINCI_CODEMODE_FIXTURE_BUNDLE="$RUNNER_TEMP/codemode-bundle"
+          export DAVINCI_CODEMODE_FIXTURE_BUNDLE
+          DAVINCI_CODEMODE_FIXTURE_MANIFEST="$RUNNER_TEMP/codemode-manifest.json"
+          export DAVINCI_CODEMODE_FIXTURE_MANIFEST
+          # Every native case: deadlines, parallel reads, permission-model launch,
+          # run closure after early errors, and fatal frame mapping.
+          cargo test -p davinci-coding-agent --test codemode_supervisor --locked -- --ignored --nocapture --test-threads=1
+      - name: Current dependency advisory report
+        working-directory: crates/davinci-coding-agent/codemode-host
+        run: npm audit --omit=dev --json
+      - name: Preserve resolved dependency evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codemode-dependency-evidence-${{ runner.os }}
+          path: |
+            crates/davinci-coding-agent/codemode-host/package-lock.json
+            crates/davinci-coding-agent/codemode-host/package-assets-report.json
+          if-no-files-found: warn
+
+  codemode-structured:
+    name: codemode-structured
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Structured MCP retention regression
+        run: cargo test -p davinci-mcp --test codemode_structured --locked

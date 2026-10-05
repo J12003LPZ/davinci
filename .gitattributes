@@ -11,3 +11,10 @@ crates/davinci-coding-agent/design-resources/** text eol=lf
 crates/davinci-coding-agent/design-ui/host/** text eol=lf
 crates/davinci-coding-agent/design-ui/package-lock.json text eol=lf
 docs/evals/design/** text eol=lf
+
+# Codemode runtime admission hashes must match native-platform checkout bytes.
+crates/davinci-coding-agent/codemode-host/*.mjs text eol=lf
+crates/davinci-coding-agent/codemode-host/package-lock.json text eol=lf
+crates/davinci-coding-agent/src/codemode_host/assets-manifest.json text eol=lf
+# Upstream notices retain the exact collected bytes, including whitespace.
+crates/davinci-coding-agent/codemode-host/licenses/** -text

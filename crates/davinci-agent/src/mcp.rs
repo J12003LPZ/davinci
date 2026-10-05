@@ -150,6 +150,23 @@ impl McpRegistry {
             .collect()
     }
 
+    /// Host-only metadata retained from the current authenticated handshake.
+    pub(crate) fn output_schema(&self, canonical_name: &str) -> Option<Value> {
+        let inner = self.lock();
+        let (server, tool) = inner.routes.get(canonical_name)?;
+        let client = inner
+            .clients
+            .get(server)?
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        client
+            .tools
+            .iter()
+            .find(|spec| &spec.name == tool)?
+            .output_schema
+            .clone()
+    }
+
     /// Describe every connected MCP tool using the shared runtime capability contract.
     pub fn capabilities(&self) -> Vec<RuntimeCapability> {
         let read_only = self.read_only_names();
@@ -187,6 +204,11 @@ impl McpRegistry {
                     &tool.parameters,
                     None,
                 )
+                .with_declared_effects(vec![if is_read_only {
+                    crate::runtime::DeclaredEffect::McpRead
+                } else {
+                    crate::runtime::DeclaredEffect::McpMutation
+                }])
                 .with_description(tool.description)
                 .with_family(family.unwrap_or_default())
             })
@@ -252,18 +274,47 @@ impl McpRegistry {
         tool: &str,
         arguments: &Value,
     ) -> Result<ToolResult, ToolError> {
+        let result = self.call_full(server, tool, arguments)?;
+        Ok(ToolResult {
+            content: result.text(),
+            is_error: result.is_error.unwrap_or(false),
+            details: None,
+        })
+    }
+
+    /// Host-owned data seam for programmatic consumers. Callers still have to
+    /// enter through the ordinary guarded dispatcher; this is not authority.
+    /// Server metadata never becomes ToolResult.details or a host receipt.
+    pub(crate) fn call_full(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<davinci_mcp::CallToolResult, ToolError> {
         let client = self.client(server)?;
         let result = client
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .call_tool(tool, arguments.clone());
         match result {
-            Ok(result) => Ok(ToolResult {
-                content: result.text(),
-                is_error: result.is_error.unwrap_or(false),
-                details: None,
-            }),
-            Err(err) => self.lock().failed(server, err),
+            Ok(result) => Ok(result),
+            Err(err) => {
+                // Preserve the direct path's distinction: an RPC error is a
+                // failed tool answer; transport/protocol failure drops the
+                // server and remains an error, not an empty structured value.
+                let result = self.lock().failed(server, err)?;
+                Ok(davinci_mcp::CallToolResult {
+                    content: vec![davinci_mcp::ContentBlock {
+                        kind: "text".into(),
+                        text: Some(result.content),
+                        mime_type: None,
+                        data: None,
+                        resource: None,
+                    }],
+                    structured_content: None,
+                    is_error: Some(result.is_error),
+                })
+            }
         }
     }
 
@@ -469,6 +520,10 @@ mod tests {
         );
         assert_eq!(registry.capabilities()[0].tool_class, ToolClass::Other);
         assert!(!registry.capabilities()[0].read_only);
+        assert_eq!(
+            registry.capabilities()[0].declared_effects,
+            vec![crate::runtime::DeclaredEffect::McpMutation]
+        );
         use crate::permission::{
             PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
         };
@@ -537,6 +592,10 @@ mod tests {
         assert_eq!(capabilities[0].name, "mcp__memory__echo");
         assert_eq!(capabilities[0].source, crate::CapabilitySource::Mcp);
         assert!(capabilities[0].read_only);
+        assert_eq!(
+            capabilities[0].declared_effects,
+            vec![crate::runtime::DeclaredEffect::McpRead]
+        );
         assert_eq!(capabilities[0].tool_class, crate::ToolClass::Read);
         let runtime_registry = crate::RuntimeCapabilityRegistry::new();
         registry.register_with(&runtime_registry);
@@ -713,3 +772,7 @@ mod tests {
         assert_eq!(registry.rows()[0].status, "disabled");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/codemode_mcp.rs"]
+mod codemode_structured_tests;

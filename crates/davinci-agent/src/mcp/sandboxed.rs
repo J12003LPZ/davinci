@@ -518,3 +518,35 @@ mod tests {
             .is_some_and(|message| message.contains("exceeds")));
     }
 }
+
+#[cfg(test)]
+mod codemode_structured_tests {
+    use super::*;
+
+    #[test]
+    fn supervised_mcp_preserves_same_result() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "content": [{"type": "text", "text": "supervised fixture"}],
+                "structuredContent": {"items": [{"id": "A"}]},
+                "isError": false
+            }
+        });
+        let mut frame = serde_json::to_vec(&response).unwrap();
+        frame.push(b'\n');
+        let mut state = State::default();
+        for chunk in frame.chunks(3) {
+            state.receive_stdout(chunk);
+        }
+        assert!(state.failure.is_none());
+        let decoded = decode_response(state.responses.remove(&7).unwrap(), 7).unwrap();
+        let result: davinci_mcp::CallToolResult = serde_json::from_value(decoded).unwrap();
+        assert_eq!(result.text(), "supervised fixture");
+        assert_eq!(
+            serde_json::to_value(result).unwrap()["structuredContent"],
+            json!({"items": [{"id": "A"}]})
+        );
+    }
+}

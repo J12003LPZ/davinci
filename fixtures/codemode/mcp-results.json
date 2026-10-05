@@ -1,0 +1,152 @@
+{
+  "tool": {
+    "name": "fixture_items",
+    "description": "Local fixture only",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": "string"
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  "results": [
+    {
+      "id": "structured",
+      "wire": {
+        "content": [
+          {
+            "type": "text",
+            "text": "fixture text"
+          }
+        ],
+        "structuredContent": {
+          "items": [
+            {
+              "id": "A"
+            }
+          ]
+        },
+        "isError": false
+      },
+      "expectedText": "fixture text",
+      "expectedError": false
+    },
+    {
+      "id": "text-only",
+      "wire": {
+        "content": [
+          {
+            "type": "text",
+            "text": "legacy fixture"
+          }
+        ]
+      },
+      "expectedText": "legacy fixture",
+      "expectedError": false
+    },
+    {
+      "id": "error",
+      "wire": {
+        "content": [
+          {
+            "type": "text",
+            "text": "fixture denied"
+          }
+        ],
+        "structuredContent": {
+          "partial": true
+        },
+        "isError": true
+      },
+      "expectedText": "fixture denied",
+      "expectedError": true
+    },
+    {
+      "id": "mixed",
+      "wire": {
+        "content": [
+          {
+            "type": "text",
+            "text": "mixed"
+          },
+          {
+            "type": "image",
+            "mimeType": "image/png",
+            "data": "aGk="
+          },
+          {
+            "type": "resource",
+            "resource": {
+              "uri": "fixture://items",
+              "mimeType": "text/plain",
+              "text": "embedded"
+            }
+          }
+        ],
+        "structuredContent": null
+      },
+      "expectedText": "mixed\n[image image/png, 2 bytes]\nembedded",
+      "expectedError": false
+    },
+    {
+      "id": "untrusted-metadata",
+      "wire": {
+        "content": [
+          {
+            "type": "text",
+            "text": "not authority"
+          }
+        ],
+        "_meta": {
+          "fixture": "private"
+        },
+        "_operation_result_committed": true,
+        "replayed_from_operation_journal": true
+      },
+      "expectedText": "not authority",
+      "expectedError": false
+    },
+    {
+      "id": "large-id",
+      "wire": {
+        "content": [
+          {
+            "type": "text",
+            "text": "9007199254740993"
+          }
+        ],
+        "structuredContent": {
+          "id": "9007199254740993"
+        }
+      },
+      "expectedText": "9007199254740993",
+      "expectedError": false
+    }
+  ],
+  "effects": {
+    "denied": {
+      "expectedEffectCount": 0
+    },
+    "successThenLostResponse": {
+      "expectedEffectCount": 1,
+      "expectedState": "RecoveryRequired"
+    },
+    "delayed": {
+      "delayMs": 25,
+      "scope": "disposable fixture only"
+    }
+  }
+}

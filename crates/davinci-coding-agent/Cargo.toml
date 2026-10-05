@@ -48,12 +48,12 @@ ignore.workspace = true
 globset.workspace = true
 notify.workspace = true
 toml_edit.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 davinci-coding-agent = { path = ".", features = ["test-fixtures"] }
 davinci-ai = { path = "../davinci-ai", features = ["test-fixtures"] }
 davinci-mcp = { path = "../davinci-mcp", features = ["test-fixtures"] }
-tempfile.workspace = true
 
 [features]
 default = []

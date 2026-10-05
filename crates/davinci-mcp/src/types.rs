@@ -28,6 +28,9 @@ pub struct ToolSpec {
     /// non-object `inputSchema` becomes the empty object schema.
     #[serde(default = "default_input_schema")]
     pub input_schema: Value,
+    /// Optional server output contract. This describes data, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     #[serde(default)]
     pub annotations: Option<ToolAnnotations>,
 }
@@ -148,6 +151,10 @@ pub fn base64_decoded_len(encoded: &str) -> usize {
 pub struct CallToolResult {
     #[serde(default)]
     pub content: Vec<ContentBlock>,
+    /// Structured server data retained for host-owned programmatic delivery.
+    /// Private transport metadata and host bookkeeping are intentionally absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     #[serde(default)]
     pub is_error: Option<bool>,
 }

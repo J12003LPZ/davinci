@@ -622,6 +622,15 @@ impl NativeExtensionHost {
     }
 
     pub fn after_tool(&mut self, name: &str, args: &Value, result: ToolResult) -> ToolResult {
+        self.after_script_tool(name);
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .after_tool(name, args, result)
+    }
+
+    /// Shared state invalidation precedes either script or model delivery.
+    pub fn after_script_tool(&mut self, name: &str) {
         if !matches!(name, "read" | "grep" | "find" | "ls")
             && !test_impact::TOOL_NAMES.contains(&name)
             && !package_intelligence::TOOL_NAMES.contains(&name)
@@ -632,10 +641,6 @@ impl NativeExtensionHost {
         {
             self.engineering.invalidate();
         }
-        self.governor
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .after_tool(name, args, result)
     }
 
     /// Everything retrieved for the turn: vector memory, then the learned

@@ -2,6 +2,7 @@
 
 pub mod agent_profiles;
 pub mod args;
+pub mod codemode_host;
 pub mod completion_delivery;
 pub mod design;
 pub mod execution_boundary;

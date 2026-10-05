@@ -174,8 +174,10 @@ pub fn tool_class(tool: &str) -> ToolClass {
         // `memory_search` and `retrieve_output` read the memory index and
         // governor's store. Artifact submission is a mutation, not a read.
         "read" | "grep" | "find" | "ls" | "job_output" | "todo" | "mcp_read" | "batch"
-        | "memory_search" | "retrieve_output" | "update_plan" | "tool_search" | "agent_status"
-        | "task_list" | "task_get" | "workflow_status" | "propose_plan" => ToolClass::Read,
+        | "codemode" | "memory_search" | "retrieve_output" | "update_plan" | "tool_search"
+        | "agent_status" | "task_list" | "task_get" | "workflow_status" | "propose_plan" => {
+            ToolClass::Read
+        }
         // Process control, messages to workers, and task dispatch can cause effects.
         "job_kill" | "agent_message" | "agent_stop" | "task_create" | "task_update"
         | "graph_submit" => ToolClass::Other,

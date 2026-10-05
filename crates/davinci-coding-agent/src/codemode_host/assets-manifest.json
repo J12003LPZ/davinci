@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "protocol_version": 1,
+  "node_version": "24.21.0",
+  "pi_version": "1.0.2",
+  "quickjs_version": "3.6.2",
+  "entry": "host.mjs",
+  "worker": "bounded-worker.mjs",
+  "wasm": "node_modules/quickjs-wasi/quickjs.wasm",
+  "assets": [
+    {
+      "path": "bounded-worker.mjs",
+      "bytes": 5177,
+      "sha256": "20f16ad5273c18a9b1224f68a3dc6a7debcef8631c214985ed020286aab1dd64"
+    },
+    {
+      "path": "framing.mjs",
+      "bytes": 2223,
+      "sha256": "553f9677f1e8ee8e163ed38d163dddb34aecf58e646976065825ad759be3ba1d"
+    },
+    {
+      "path": "host.mjs",
+      "bytes": 5064,
+      "sha256": "015185e8f21c0f188becddc79cace5f1710c1e187822c6c51fc392fed327a8f7"
+    },
+    {
+      "path": "licenses/PROVENANCE.md",
+      "bytes": 1585,
+      "sha256": "9642c82d4c5775d881a9f45cde3a98939d27931fc5889ecd5b87cfe89615bb0c"
+    },
+    {
+      "path": "licenses/compiler-rt-LICENSE.TXT",
+      "bytes": 16708,
+      "sha256": "1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d"
+    },
+    {
+      "path": "licenses/dlmalloc-NOTICE",
+      "bytes": 493,
+      "sha256": "bf251d71f1186ae438bf847bff47cc29e6f737d7a6b8f142cd61e714808ff2b5"
+    },
+    {
+      "path": "licenses/emmalloc-NOTICE",
+      "bytes": 270,
+      "sha256": "86240b5e094885ceac54f89b22edfdd3a8170fe9d3988d1699ffbd368f39fc98"
+    },
+    {
+      "path": "licenses/llvm-LICENSE.TXT",
+      "bytes": 15141,
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+    },
+    {
+      "path": "licenses/pi-LICENSE",
+      "bytes": 1069,
+      "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48"
+    },
+    {
+      "path": "licenses/quickjs-ng-LICENSE",
+      "bytes": 1212,
+      "sha256": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
+    },
+    {
+      "path": "licenses/quickjs-wasi-LICENSE",
+      "bytes": 1069,
+      "sha256": "f7735da3b2531ddf451937117343cfadb853fd8054b499e7a70695dc57ffd184"
+    },
+    {
+      "path": "licenses/wasi-LICENSE-APACHE",
+      "bytes": 10847,
+      "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+    },
+    {
+      "path": "licenses/wasi-LICENSE-APACHE-LLVM",
+      "bytes": 12243,
+      "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+    },
+    {
+      "path": "licenses/wasi-LICENSE-MIT",
+      "bytes": 1023,
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+    },
+    {
+      "path": "licenses/wasi-fts-musl-fts-COPYING",
+      "bytes": 1514,
+      "sha256": "55af87e4017668f54467a3380e7ebbac5e672d8c763bfe95e6fc882a6fdc4046"
+    },
+    {
+      "path": "licenses/wasi-libc-LICENSE",
+      "bytes": 910,
+      "sha256": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a"
+    },
+    {
+      "path": "licenses/wasi-libc-bottom-half-cloudlibc-LICENSE",
+      "bytes": 1292,
+      "sha256": "c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0"
+    },
+    {
+      "path": "licenses/wasi-libc-top-half-musl-COPYRIGHT",
+      "bytes": 6204,
+      "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/declarations.js",
+      "bytes": 12956,
+      "sha256": "45d0ae10850b795ebc62d33161462151595310315a72a3c89e8495fe87ff506a"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/identifier.js",
+      "bytes": 524,
+      "sha256": "079ed84f0ff010a0208aa0d94ccdd18cc60ba93aa54c3dbd9995ec80b32eaa1b"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/index.js",
+      "bytes": 656,
+      "sha256": "f90b89dee4edf31f0cae0eaf607c5b32f2ffacc062fbdd039795c15bf07206a2"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/runtime/host.js",
+      "bytes": 11715,
+      "sha256": "c495f622a093638b6f93e95c1656ebe75ce6769308ba16fbb3d85dbba36566dd"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/runtime/prelude-source.js",
+      "bytes": 15166,
+      "sha256": "0cc0188f9ee2239983164b026dd2c4040d1317e443dc00a80b6b1ba1acfa5c3d"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/runtime/protocol.js",
+      "bytes": 409,
+      "sha256": "c81889612286f6af996b2831509eaa0717c5d1f0b712c50268dc36ea4d420c98"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/runtime/worker.js",
+      "bytes": 5653,
+      "sha256": "5682c50454fe32b17541be91c2e29e1bf592958bf08698f02801c5e26ef30717"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/source.js",
+      "bytes": 3900,
+      "sha256": "deb23a2c438b55406f89f920ab6ee788c35d87e1ce1c57d5a44352307d2c72e0"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/types.js",
+      "bytes": 44,
+      "sha256": "01ae2a5b120382f9a648ced7ee8507493a134f216d100fc61600c6c9738235d2"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/dist/wasm.js",
+      "bytes": 925,
+      "sha256": "69aec098994dd4f9f3d249e0e88e6d0cd89e88872b9446164963bf6e924228b2"
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-codemode/package.json",
+      "bytes": 1391,
+      "sha256": "bad688f86b82f63ba56381c9675caa8590f66c034dec7c397035a1947cece52d"
+    },
+    {
+      "path": "node_modules/quickjs-wasi/dist/extensions.js",
+      "bytes": 15720,
+      "sha256": "9662299693f6ddd8d56d6e2f91b4bd2202e2cfebe06e834bf9a2b16fa15c4e08"
+    },
+    {
+      "path": "node_modules/quickjs-wasi/dist/index.js",
+      "bytes": 115939,
+      "sha256": "91fcfc11e7f7372f3aee8d4373c0d4f969baac5cd12648663971550054217ae8"
+    },
+    {
+      "path": "node_modules/quickjs-wasi/dist/version.js",
+      "bytes": 131,
+      "sha256": "14dd0021bd1ba1f786a9833abd01b89c90a4175959d3b37b4d3bb62027a0b38d"
+    },
+    {
+      "path": "node_modules/quickjs-wasi/dist/wasi-shim.js",
+      "bytes": 4033,
+      "sha256": "79af15cf5158d181d11021158abb22541fd6d35beca569652317859819960eac"
+    },
+    {
+      "path": "node_modules/quickjs-wasi/package.json",
+      "bytes": 2730,
+      "sha256": "efa1d0d3b440dd7a31f55690d414f9c7f59e6a15395075efee884454c86715c2"
+    },
+    {
+      "path": "node_modules/quickjs-wasi/quickjs.wasm",
+      "bytes": 637405,
+      "sha256": "d4c9375f2b1ca4dc95f72c8aa2982a7a9951ac8011490d79c6582df732b4bbd9"
+    },
+    {
+      "path": "strict-prelude.mjs",
+      "bytes": 4085,
+      "sha256": "e73729e2a339393f58fbab70747234917d80cea20148b0e9264de3ae2f764604"
+    }
+  ]
+}

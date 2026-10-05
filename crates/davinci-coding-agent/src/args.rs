@@ -42,6 +42,7 @@ pub struct Diagnostic {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Args {
+    pub codemode: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
@@ -484,6 +485,17 @@ pub fn parse_args(args: &[String]) -> Args {
             // `--davinci --screen <id>`; `--legacy-tui` asks for the old
             // chrome. Both are read from the raw argv in `main`.
             result.legacy_tui = arg == "--legacy-tui";
+        } else if arg == "--codemode" {
+            match args.get(i + 1) {
+                Some(value) if matches!(value.as_str(), "off" | "read-only" | "controlled") => {
+                    result.codemode = Some(value.clone());
+                    i += 1;
+                }
+                _ => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: "--codemode requires off, read-only, or controlled".into(),
+                }),
+            }
         } else if arg == "--execution-sandbox" {
             match args.get(i + 1) {
                 None => result.diagnostics.push(Diagnostic {

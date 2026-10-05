@@ -32,6 +32,7 @@ pub struct GraphRunBinding {
 pub enum CallerType {
     ProviderToolCall,
     BatchToolCall,
+    CodeModeToolCall,
     HostControl,
     GraphWorker,
     Subagent,

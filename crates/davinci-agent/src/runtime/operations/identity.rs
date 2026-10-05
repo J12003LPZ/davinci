@@ -140,6 +140,7 @@ pub enum IdempotencyScope {
     Session,
     ProviderCall,
     BatchChild,
+    CodeModeChild,
     HostControl,
     WorkerLaunch,
     CallerDefined,

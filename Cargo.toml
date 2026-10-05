@@ -70,3 +70,9 @@ toml_edit = { version = "=0.22.27", default-features = false, features = ["parse
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Codemode re-hashes the admitted Node executable (~90-120MB) before every
+# launch. Unoptimized sha2 takes seconds in debug builds, which makes deadline
+# tests measure the hash instead of the sandbox. Release is unaffected.
+[profile.dev.package.sha2]
+opt-level = 3
