@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- A Codemode script stopped by its own sandbox deadline now reports `TIMEOUT`, and an aborted one `CANCELLED`. Both were reported as `SANDBOX_FAILED` ("script failed in the sandbox") whenever the sandbox deadline fired before the host watchdog.
 - `/compact` and automatic compaction now summarize with the session's own model. A model missing from the catalog, such as `gpt-6-luna`, fell back to the provider's first record, `gpt-5.3-codex-spark`, which the ChatGPT-plan route refuses, so every compaction failed.
 - Once the live Codex model list is available, built-in `openai-codex` models it does not offer (`gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini` today) are no longer listed or selectable. The ChatGPT-plan route refused them with "not supported when using Codex with a ChatGPT account".
 - Codemode can be enabled from the CLI again. `--codemode read-only` or `codemode` settings failed at startup with "Codemode requires the parent operation journal", because the journal is attached per turn. The admitted host is now registered on each turn's runtime. With `--no-session` (no journal), startup says so.
