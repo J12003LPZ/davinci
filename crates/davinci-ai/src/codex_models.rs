@@ -189,10 +189,28 @@ pub fn overlay_codex_models(models: &[Model], agent_dir: &Path) -> Vec<Model> {
     merge_codex_models(models, &load_codex_models(agent_dir))
 }
 
-/// Pure merge used by [`overlay_codex_models`]; existing records are kept.
+/// Pure merge used by [`overlay_codex_models`]. With a live list, it is the
+/// plan's own model list: a built-in Codex record it does not mention, or marks
+/// unsupported, is dropped, because the ChatGPT-plan route refuses it ("The
+/// 'gpt-5.3-codex-spark' model is not supported when using Codex with a
+/// ChatGPT account"). Hidden entries stay callable. Other records are kept
+/// unchanged, and with no list the catalog is returned as is.
 pub fn merge_codex_models(models: &[Model], discovered: &[CodexModelInfo]) -> Vec<Model> {
-    let mut merged = models.to_vec();
-    let mut known: HashSet<String> = models
+    let offered: HashSet<&str> = discovered
+        .iter()
+        .filter(|info| info.supported_in_api != Some(false))
+        .map(|info| info.slug.as_str())
+        .collect();
+    let mut merged: Vec<Model> = if discovered.is_empty() {
+        models.to_vec()
+    } else {
+        models
+            .iter()
+            .filter(|model| model.provider != CODEX_PROVIDER || offered.contains(model.id.as_str()))
+            .cloned()
+            .collect()
+    };
+    let mut known: HashSet<String> = merged
         .iter()
         .filter(|model| model.provider == CODEX_PROVIDER)
         .map(|model| model.id.clone())
@@ -484,6 +502,56 @@ mod tests {
     }
 
     #[test]
+    fn a_live_list_drops_built_in_models_the_plan_does_not_offer() {
+        let catalog = vec![
+            codex_record("gpt-6-astra"),
+            codex_record("gpt-5.5"),
+            Model {
+                provider: "openai".into(),
+                ..codex_record("gpt-5.5")
+            },
+        ];
+        let mut reply = live_reply();
+        reply["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"slug": "gpt-5.5", "visibility": "hide"}));
+        let pairs = |models: Vec<Model>| {
+            models
+                .into_iter()
+                .map(|m| format!("{}/{}", m.provider, m.id))
+                .collect::<Vec<_>>()
+        };
+        // gpt-5.5 is hidden but offered, so it stays; the openai API record is
+        // another provider and is untouched; luna is added from the list.
+        assert_eq!(
+            pairs(merge_codex_models(&catalog, &parse_codex_models(&reply))),
+            [
+                "openai-codex/gpt-6-astra",
+                "openai-codex/gpt-5.5",
+                "openai/gpt-5.5",
+                "openai-codex/gpt-6-luna"
+            ]
+        );
+        // A list without gpt-5.5, or marking it unsupported, drops it.
+        let mut without = live_reply();
+        without["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"slug": "gpt-5.5", "supported_in_api": false}));
+        assert_eq!(
+            pairs(merge_codex_models(&catalog, &parse_codex_models(&without))),
+            [
+                "openai-codex/gpt-6-astra",
+                "openai/gpt-5.5",
+                "openai-codex/gpt-6-luna"
+            ]
+        );
+        // No list at all: the built-in catalog is the only source.
+        assert_eq!(merge_codex_models(&catalog, &[]), catalog);
+    }
+
+    #[test]
     fn thinking_map_hides_levels_codex_does_not_accept() {
         let levels = ["low", "medium", "high", "xhigh"]
             .map(|effort| CodexReasoningLevel {
@@ -552,9 +620,10 @@ mod tests {
         let newer = json!({"fetchedAt": 1, "models": [
             {"slug": "gpt-6-sol", "display_name": "GPT-6-Sol", "visibility": "list"}]});
         fs::write(codex_models_path(dir.path()), newer.to_string()).unwrap();
+        // The newer list no longer offers astra, so the plan cannot use it.
         assert_eq!(
             ids(overlay_codex_models(&catalog, dir.path())),
-            ["gpt-6-astra", "gpt-6-sol"]
+            ["gpt-6-sol"]
         );
 
         std::env::set_var("DAVINCI_CODEX_MODEL_DISCOVERY", "off");
