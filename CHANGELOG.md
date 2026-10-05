@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-Changes on `main` since `v1.0.71`.
+## 1.1.0
+
+Changes since `v1.0.71`. Not tagged yet.
 
 ### Security
 - Remote model catalogs can no longer redirect requests or credentials. A catalog entry keeps the endpoint, API and headers of the built-in entry for its provider; entries for another provider, or with an endpoint no built-in entry of that provider uses, are dropped. Already-cached `models-store.json` entries are hardened the same way.
