@@ -18,7 +18,7 @@ Use the root `Cargo.toml` and each crate's `src/lib.rs` / `src/main.rs` to
 establish what is compiled. A Rust source file's presence alone does not make
 it part of a crate.
 
-Keep exact dependency pins and Rust 1.83 compatibility. Scope tests to changed
+Keep exact dependency pins and Rust 1.88 compatibility. Scope tests to changed
 behavior and its callers; most unit tests are inline, while larger integration
 and evaluation fixtures live in each crate's `tests/` directory. Some tests
 start local subprocesses or loopback servers. Platform-specific unsafe code

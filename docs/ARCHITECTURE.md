@@ -120,7 +120,7 @@ fixtures and source control.
 
 ## Validation
 
-Rust 1.83 is the baseline. Keep exact dependency pins and the lockfile consistent.
+Rust 1.88 is the baseline. Keep exact dependency pins and the lockfile consistent.
 Unit tests are usually inline; larger scenarios and deterministic evals live in
 each crate's `tests/` directory. Fixtures may use loopback servers, subprocesses
 or platform APIs. Live provider, browser, voice and benchmark runs are separate.

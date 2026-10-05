@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup show
-          rustup component add rust-src --toolchain 1.83.0
+          rustup component add rust-src --toolchain 1.88.0
       - name: Provision pinned Rust and Python language servers
         shell: bash
         env:

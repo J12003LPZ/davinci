@@ -14,7 +14,7 @@ It combines an interactive coding assistant, multi-provider model runtime, permi
 DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github.com/earendil-works/pi) coding agent and has grown into a larger native harness. The pinned TypeScript source under [vendor/davinci](vendor/davinci) remains a behavioral compatibility reference. The active product is the Rust workspace in this repository.
 
 > **Workspace version:** 1.1.0
-> **Rust toolchain:** 1.83.0  
+> **Rust toolchain:** 1.88.0\
 > **Primary executable:** `davinci`  
 > **Documentation baseline:** `main` at [`0a57e476`](https://github.com/J12003LPZ/davinci/commit/0a57e476c2088250299438c91d582571614f0687), including merged [PR #88](https://github.com/J12003LPZ/davinci/pull/88)
 
@@ -93,7 +93,7 @@ DaVinci is currently installed from source. This repository does not currently p
 For the core CLI:
 
 - Git
-- Rust **1.83.0** with Cargo
+- Rust **1.88.0** with Cargo
 - rustfmt and clippy for development
 
 The repository pins the toolchain in [rust-toolchain.toml](rust-toolchain.toml). A normal rustup installation will select the required Rust version automatically.
@@ -1078,7 +1078,7 @@ davinci/
 ├── .github/workflows/          # CI, behavior, security, lint, evaluation workflows
 ├── Cargo.toml                  # Rust workspace
 ├── Cargo.lock                  # Locked dependency graph
-├── rust-toolchain.toml         # Rust 1.83.0
+├── rust-toolchain.toml         # Rust 1.88.0
 └── README.md
 ~~~
 

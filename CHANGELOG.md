@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+- Require Rust 1.88.0 (previously 1.83.0).
+- Upgrade ratatui to 0.30.0, sha2 to 0.11.0, rusqlite to 0.40.2, tempfile to 3.27.0, and crossterm to 0.29.0. The ratatui upgrade removes the unmaintained paste dependency (RUSTSEC-2024-0436).
+
 ## 1.1.0
 
 Changes since `v1.0.71`. Not tagged yet.
