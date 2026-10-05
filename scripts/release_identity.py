@@ -188,7 +188,7 @@ def preflight(repo, require_tag=False, repository="J12003LPZ/davinci"):
             "release_tag": tag, "ci": ci, "checked_at": datetime.now(timezone.utc).isoformat()}
 
 
-def make_identity(binary, source, ci, tag, version="1.1.1", require_tag=True, build_features=()):
+def make_identity(binary, source, ci, tag, version="1.1.2", require_tag=True, build_features=()):
     if not isinstance(build_features, (list, tuple)) or any(
             not isinstance(feature, str) or not feature or feature.split("/")[-1] == "test-fixtures"
             for feature in build_features):

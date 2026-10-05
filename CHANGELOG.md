@@ -1,17 +1,23 @@
 # Changelog
 
-## Unreleased
+## 1.1.2
+
+Changes since `v1.1.1`.
 
 ### Added
 - `/config` has a **Codemode** switch. On, the model can run sandboxed read-only JavaScript over your tools from the next prompt; off removes the tool. Without explicit `nodePath`/`hostPath`, the runtime is expected in `<agent dir>/codemode` (Node 24.21.0 in `node/`, the host bundle in `host/`). See [docs/codemode.md](docs/codemode.md).
 
 ### Changed
 - `/config` is the only way to open the settings panel; `/settings` is no longer a command.
+- Update pulldown-cmark to 0.13.4, regex to 1.13.1, image to 0.25.10, unicode-width to 0.2.2 and webpki-roots to 1.0.9; CI actions setup-node and upload-artifact to v7.
 - Codemode enabled through settings no longer stops startup when its runtime is missing or the run has no session; DaVinci starts without it and says why. `--codemode read-only` still fails in those cases.
+
+### Fixed
+- The live governor, session and graph evals now write a rotated ChatGPT login back to your auth store (owner-only), instead of leaving it with a dead refresh token.
 
 ## 1.1.1
 
-Changes since `v1.1.0`. Found by live gpt-6-luna (medium) verification of the installed 1.1.0 on a Sign in with ChatGPT login.
+Changes since `v1.1.0`. Tagged `v1.1.1` at `027c3d8b`. Found by live gpt-6-luna (medium) verification of the installed 1.1.0 on a Sign in with ChatGPT login.
 
 ### Fixed
 - A Codemode script stopped by its own sandbox deadline now reports `TIMEOUT`, and an aborted one `CANCELLED`. Both were reported as `SANDBOX_FAILED` ("script failed in the sandbox") whenever the sandbox deadline fired before the host watchdog.
