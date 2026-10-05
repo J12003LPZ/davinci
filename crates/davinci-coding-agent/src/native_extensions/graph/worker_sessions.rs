@@ -498,7 +498,10 @@ pub fn runtime_from_env(
             .as_ref()
             .map(|contract| &contract.digest)
             != binding.contract_digest.as_ref()
-        || context.artifact_path != store::artifact_path(cwd, &binding.graph_run, &binding.task_id)
+        || !artifact_paths_match(
+            &context.artifact_path,
+            &store::artifact_path(cwd, &binding.graph_run, &binding.task_id),
+        )
         || std::env::var("DAVINCI_AGENT_ID").ok().as_deref() != Some(&binding.agent.to_string())
         || std::env::var("PI_GRAPH_AUTHORIZED_TOOLS").ok().as_deref()
             != Some(&binding.authorized_tools.join(","))
@@ -506,4 +509,18 @@ pub fn runtime_from_env(
         return Err("worker context disagrees with its private conversation binding".into());
     }
     Ok(Some(binding.runtime()))
+}
+
+fn artifact_paths_match(actual: &Path, expected: &Path) -> bool {
+    // canonicalize and current_dir can spell the same Windows path differently.
+    // Preserve exact matching of all components other than the verbatim prefix.
+    #[cfg(windows)]
+    {
+        davinci_agent::strip_verbatim_prefix(actual)
+            == davinci_agent::strip_verbatim_prefix(expected)
+    }
+    #[cfg(not(windows))]
+    {
+        actual == expected
+    }
 }
