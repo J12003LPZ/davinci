@@ -36,6 +36,16 @@ impl Agent {
         self.staged_codemode = Some(CodeModeBinding { host });
     }
 
+    pub fn has_staged_codemode(&self) -> bool {
+        self.staged_codemode.is_some()
+    }
+
+    /// Turn Codemode off: later turns no longer register or run it.
+    pub fn clear_codemode(&mut self) {
+        self.staged_codemode = None;
+        self.codemode = None;
+    }
+
     /// Register a staged host on the current runtime. Call after each new
     /// runtime is installed; a runtime that already has Codemode is left alone.
     pub fn activate_staged_codemode(&mut self) -> Result<(), CodeModeError> {

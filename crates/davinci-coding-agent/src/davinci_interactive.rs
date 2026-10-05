@@ -2332,7 +2332,7 @@ pub fn classify(line: &str) -> Sent {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        // Everything else — including /model, /settings, /hotkeys, /resume —
+        // Everything else — including /model, /config, /hotkeys, /resume —
         // reaches `perform`, which opens the sheet each one designs
         // (screens 3a–6d) with live data behind it.
         other => Sent::Command(other),
@@ -9031,6 +9031,20 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     }
 
     crate::sync_agent_from_settings(shell.agent);
+    if key == "codemode" {
+        match crate::sync_codemode_from_settings(shell.agent) {
+            Ok(()) if shell.agent.has_staged_codemode() => {
+                shell.note("Codemode on: available from the next prompt");
+            }
+            Ok(()) => shell.note("Codemode off"),
+            Err(error) => {
+                // Leave the switch showing what is true: the runtime is off.
+                let _ = crate::persist_interactive_setting("codemode=false");
+                shell.agent.clear_codemode();
+                shell.note(&format!("Codemode stays off: {error}"));
+            }
+        }
+    }
     open_settings_sheet(shell.agent, shell.model);
     shell.model.settings_index = index.min(shell.model.settings_rows.len().saturating_sub(1));
     let effective = shell
@@ -9794,7 +9808,7 @@ pub(crate) fn workflow_route(args: &str) -> WorkflowRoute {
 
 fn run_workflow_command(shell: &mut Shell<'_>, goal: &str) -> Next {
     if !davinci_agent::tools::workflow_tools_enabled() {
-        shell.note("dynamic workflows are off; turn them on in /settings (Dynamic workflows)");
+        shell.note("dynamic workflows are off; turn them on in /config (Dynamic workflows)");
         return Next::Go;
     }
     let trusted = shell

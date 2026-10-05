@@ -10,9 +10,26 @@ pub struct ReadOnlyConfig {
     pub host_path: PathBuf,
 }
 
+/// Where `/config` expects the Codemode runtime when settings name no paths:
+/// `<agent dir>/codemode/node` (the admitted Node build) and
+/// `<agent dir>/codemode/host` (the runtime bundle).
+pub fn managed_paths(agent_dir: &Path) -> ReadOnlyConfig {
+    let root = agent_dir.join("codemode");
+    let node = if cfg!(windows) {
+        root.join("node").join("node.exe")
+    } else {
+        root.join("node").join("bin").join("node")
+    };
+    ReadOnlyConfig {
+        node_path: node,
+        host_path: root.join("host"),
+    }
+}
+
 pub fn resolve_config(
     cli: Option<&str>,
     user: Option<&serde_json::Value>,
+    agent_dir: &Path,
 ) -> Result<Option<ReadOnlyConfig>, String> {
     let mode = cli
         .or_else(|| {
@@ -31,20 +48,23 @@ pub fn resolve_config(
         "read-only" => {}
         _ => return Err("Invalid Codemode mode".into()),
     }
-    let path = |key| -> Result<PathBuf, String> {
-        let path = user
-            .and_then(|value| value.get(key))
-            .and_then(|value| value.as_str())
+    let managed = managed_paths(agent_dir);
+    let path = |key, default: PathBuf| -> Result<PathBuf, String> {
+        let Some(value) = user.and_then(|value| value.get(key)) else {
+            return Ok(default);
+        };
+        let path = value
+            .as_str()
             .map(PathBuf::from)
-            .ok_or_else(|| format!("Codemode read-only requires user {key}"))?;
+            .ok_or_else(|| format!("Codemode {key} must be a path"))?;
         if !path.is_absolute() {
             return Err(format!("Codemode {key} must be absolute"));
         }
         Ok(path)
     };
     Ok(Some(ReadOnlyConfig {
-        node_path: path("nodePath")?,
-        host_path: path("hostPath")?,
+        node_path: path("nodePath", managed.node_path)?,
+        host_path: path("hostPath", managed.host_path)?,
     }))
 }
 

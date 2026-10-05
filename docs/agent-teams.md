@@ -4,16 +4,16 @@ Davinci delegates work the way Claude Code does: the model starts subagents on i
 
 ## Turning features on
 
-One-shot and background subagents are always available. Agent teams and dynamic workflows are opt-in. Turn them on in `/settings` (the behavior group) or in `~/.davinci/agent/settings.json`:
+One-shot and background subagents are always available. Agent teams and dynamic workflows are opt-in. Turn them on in `/config` (the behavior group) or in `~/.davinci/agent/settings.json`:
 
-| Setting | `/settings` row | Values | Default | Environment override |
+| Setting | `/config` row | Values | Default | Environment override |
 |---|---|---|---|---|
 | `agentTeams` | Agent teams | `true` / `false` | `false` | `DAVINCI_EXPERIMENTAL_AGENT_TEAMS` |
 | `dynamicWorkflows` | Dynamic workflows | `true` / `false` | `false` | `DAVINCI_EXPERIMENTAL_WORKFLOWS` |
 | `workflowSizeGuideline` | Dynamic workflow size | `unrestricted`, `small` (< 5 agents), `medium` (< 10), `large` (< 50) | `medium` | — |
 | `workflowMaxConcurrentAgents` | Workflow concurrent agents | 1–256 (the sheet cycles 4, 8, 16, 32, 64) | `16` | `DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS` |
 
-An environment variable, when set, wins over the setting, as Claude Code's environment variables do. A change in `/settings` applies to the running session: turning a feature on offers its tools (`agent_status`, `agent_message`, `agent_stop`, `task_*` for teams; `workflow_run`, `workflow_status` for workflows) to the lead at once, and turning it off withdraws them. Workers and explicit `--tools` lists keep exactly the tools they were given.
+An environment variable, when set, wins over the setting, as Claude Code's environment variables do. A change in `/config` applies to the running session: turning a feature on offers its tools (`agent_status`, `agent_message`, `agent_stop`, `task_*` for teams; `workflow_run`, `workflow_status` for workflows) to the lead at once, and turning it off withdraws them. Workers and explicit `--tools` lists keep exactly the tools they were given.
 
 ```json
 {

@@ -1313,15 +1313,28 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     attach_tool_executor(&mut agent, &host);
     // Worker agents retain the default-off feature and their inherited tool ceiling.
     if graph_worker.is_none() {
-        if let Some(config) = davinci_coding_agent::codemode_host::config::resolve_config(
+        // `--codemode` is an explicit request and fails loudly. The `/config`
+        // switch is a preference: a missing runtime or a sessionless run
+        // starts without Codemode and says why, rather than refusing to start.
+        let explicit = parsed.codemode.is_some();
+        let staged = davinci_coding_agent::codemode_host::config::resolve_config(
             parsed.codemode.as_deref(),
             settings.codemode.as_ref(),
-        )? {
-            if parsed.no_session {
-                return Err("Codemode records its operations in the session journal; remove --no-session to use it".into());
-            }
-            let codemode = config.admit(cwd)?;
-            agent.stage_read_only_codemode(Arc::new(codemode));
+            &default_agent_dir(),
+        )
+        .and_then(|config| match config {
+            None => Ok(None),
+            Some(_) if parsed.no_session => Err(
+                "Codemode records its operations in the session journal; remove --no-session to use it"
+                    .to_string(),
+            ),
+            Some(config) => config.admit(cwd).map(Some),
+        });
+        match staged {
+            Ok(Some(codemode)) => agent.stage_read_only_codemode(Arc::new(codemode)),
+            Ok(None) => {}
+            Err(error) if explicit => return Err(error),
+            Err(error) => eprintln!("Codemode is on in /config but stays off: {error}"),
         }
     }
     host.emit(ExtensionEvent::SessionStart);
@@ -8153,6 +8166,16 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
                 .filter(|count| (1..=256).contains(count));
         }
         "agent-teams" => stored.agent_teams = Some(value == "true"),
+        "codemode" => {
+            // Keep any custom nodePath/hostPath; only the mode changes.
+            let mut codemode = match stored.codemode.take() {
+                Some(serde_json::Value::Object(map)) => map,
+                _ => serde_json::Map::new(),
+            };
+            let mode = if value == "true" { "read-only" } else { "off" };
+            codemode.insert("mode".into(), mode.into());
+            stored.codemode = Some(serde_json::Value::Object(codemode));
+        }
         _ => {}
     }
     save_settings(&dir, &stored)?;
@@ -8173,6 +8196,33 @@ fn apply_orchestration_settings(agent: &mut Agent, settings: &settings::Settings
             .as_deref(),
     );
     agent.sync_orchestration_tools();
+}
+
+/// Bring a running agent's Codemode in line with settings after `/config`
+/// changes the switch. An error names why the runtime cannot be admitted.
+pub(crate) fn sync_codemode_from_settings(agent: &mut Agent) -> Result<(), String> {
+    let agent_dir = default_agent_dir();
+    let stored = load_merged_settings(&agent_dir, &agent.cwd);
+    let config = davinci_coding_agent::codemode_host::config::resolve_config(
+        None,
+        stored.codemode.as_ref(),
+        &agent_dir,
+    )?;
+    match config {
+        None => {
+            agent.clear_codemode();
+            Ok(())
+        }
+        Some(_) if agent.has_staged_codemode() => Ok(()),
+        Some(_) if agent.session.is_none() => {
+            Err("Codemode needs a session journal; this run has no session".into())
+        }
+        Some(config) => {
+            let host = config.admit(&agent.cwd)?;
+            agent.stage_read_only_codemode(Arc::new(host));
+            Ok(())
+        }
+    }
 }
 
 fn sync_agent_from_settings(agent: &mut Agent) {

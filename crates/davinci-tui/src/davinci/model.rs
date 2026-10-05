@@ -131,7 +131,7 @@ pub enum Screen {
     Mensura,
     /// `3a` — the full model catalog (`/model`).
     Models,
-    /// `3b` — settings (`/settings`).
+    /// `3b` — settings (`/config`).
     Settings,
     /// `3c` — thinking levels (`/thinking`).
     Thinking,

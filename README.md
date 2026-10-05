@@ -444,7 +444,7 @@ The [runtime inspector](crates/davinci-coding-agent/src/runtime_inspect.rs) is r
 | `/init [focus]` | Ask the agent to inspect the project and create/update `AGENTS.md`; normal model, tool, and permission rules apply. |
 | `/setup check` | Check workspace setup without applying the setup changes. |
 | `/setup`, `/setup trust` | Apply workspace setup or explicitly trust project resources. Setup can update `.gitignore`, memory/index state, and local service/model setup; review the output first. |
-| `/settings`, `/config` | Open the settings panel. |
+| `/config` | Open the settings panel, including the Codemode switch. |
 | `/model [provider/model]` | Open model selection or switch directly. |
 | `/thinking <level>`, `/effort <level>` | Select reasoning effort. |
 | `/fast` | Toggle requested Fast/Standard speed for OpenAI Codex. |
@@ -584,7 +584,7 @@ Bounded isolated workers for delegated research or implementation. Workers use a
 
 ### Agent teams
 
-Persistent collaborating agents with typed mailboxes, task tracking, atomic task claims, and event-driven coordination. Opt in with `"agentTeams": true` in user settings or the corresponding `/settings` control; the default is off.
+Persistent collaborating agents with typed mailboxes, task tracking, atomic task claims, and event-driven coordination. Opt in with `"agentTeams": true` in user settings or the corresponding `/config` control; the default is off.
 
 ### Workflows
 
@@ -906,7 +906,7 @@ A minimal user-level subscription configuration:
 }
 ~~~
 
-Select a model available to your account; these are example choices, not mandatory defaults. Merge fields into existing settings rather than replacing unrelated configuration. Keep authentication in the private credential store/environment, not this example. `/settings` exposes common options; restart after manually editing startup-only settings.
+Select a model available to your account; these are example choices, not mandatory defaults. Merge fields into existing settings rather than replacing unrelated configuration. Keep authentication in the private credential store/environment, not this example. `/config` exposes common options; restart after manually editing startup-only settings.
 
 Other resources include `models.json` for custom model/provider configuration, `mcp.json` for server connections, `keybindings.json`, `hooks.json`, and resource directories. Inspect [settings fields](crates/davinci-coding-agent/src/settings.rs) and [project resolution](crates/davinci-coding-agent/src/project_config.rs) for exact behavior.
 
@@ -1182,6 +1182,7 @@ Start here:
 - [Language intelligence](docs/language-intelligence.md)
 - [Test impact](docs/test-impact.md)
 - [Managed processes](docs/process-manager.md)
+- [Codemode](docs/codemode.md)
 - [Transactional edits](docs/transactional-edits.md)
 - [Security scan](docs/security-scan.md)
 - [Learning](docs/learning.md)

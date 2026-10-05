@@ -434,7 +434,7 @@ pub fn create_interactive_tui(options: InteractiveTuiOptions) -> InteractiveTui 
     }
 }
 
-/// Recreate the renderer when `/settings` switches `tuiMode`.
+/// Recreate the renderer when `/config` switches `tuiMode`.
 /// Returns `(tui, switched)` — `switched` is false when overlays block the change (TS).
 pub fn switch_tui_mode(
     current: InteractiveTui,

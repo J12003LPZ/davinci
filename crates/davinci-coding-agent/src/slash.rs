@@ -16,9 +16,8 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Analyze this project and create or update AGENTS.md",
             Some("[focus]"),
         ),
-        ("settings", "Open settings menu", None),
         ("fast", "Toggle Fast mode for OpenAI Codex", None),
-        ("config", "Open configuration (alias for /settings)", None),
+        ("config", "Open configuration", None),
         (
             "model",
             "Select model (opens selector UI)",
@@ -262,7 +261,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "reload" => SlashAction::Reload,
         "import" => SlashAction::Import(args.to_string()),
         "share" => SlashAction::Share,
-        "settings" | "config" => SlashAction::Settings,
+        "config" => SlashAction::Settings,
         "hotkeys" => SlashAction::Hotkeys,
         "session" if args == "info" || args == "stats" => SlashAction::SessionInfo,
         "session" => SlashAction::Resume,
@@ -544,9 +543,12 @@ mod tests {
         assert_eq!(parse_line("/graph"), SlashAction::Prompt("/graph".into()));
     }
     #[test]
-    fn terminal_config_alias_opens_the_existing_settings_without_new_storage() {
+    fn config_is_the_only_way_into_settings() {
         assert_eq!(parse_line("/config"), SlashAction::Settings);
-        assert_eq!(parse_line("/settings"), SlashAction::Settings);
+        assert_ne!(parse_line("/settings"), SlashAction::Settings);
+        assert!(!builtin_slash_commands()
+            .iter()
+            .any(|c| c.name == "settings"));
         assert_eq!(
             builtin_slash_commands()
                 .iter()

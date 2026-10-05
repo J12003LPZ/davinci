@@ -167,6 +167,7 @@ pub struct InteractiveSettingsConfig {
     pub workflow_max_concurrent: String,
     /// `agentTeams`: persistent teammates with messaging and a task board.
     pub agent_teams: bool,
+    pub codemode: bool,
 }
 
 impl Default for InteractiveSettingsConfig {
@@ -211,6 +212,7 @@ impl Default for InteractiveSettingsConfig {
             workflow_size: "medium".into(),
             workflow_max_concurrent: "16".into(),
             agent_teams: false,
+            codemode: false,
         }
     }
 }
@@ -580,6 +582,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Let the model start persistent teammates that message each other and share a task board (DAVINCI_EXPERIMENTAL_AGENT_TEAMS overrides)",
                 config.agent_teams,
             ),
+            bool_item(
+                "codemode",
+                "Codemode",
+                "Let the model run sandboxed read-only JavaScript over your tools. Needs Node 24.21.0 and the Codemode runtime in <agent dir>/codemode",
+                config.codemode,
+            ),
         ],
         12,
     )
@@ -621,6 +629,25 @@ mod tests {
         assert_eq!(item.label, "Tool output");
         assert_eq!(item.current_value, "false");
         assert_eq!(item.values, vec!["true", "false"]);
+    }
+
+    #[test]
+    fn the_codemode_switch_is_on_the_list_and_defaults_off() {
+        let list = interactive_settings_list(&InteractiveSettingsConfig::default());
+        let item = list
+            .items
+            .iter()
+            .find(|item| item.id == "codemode")
+            .expect("codemode");
+        assert_eq!(item.label, "Codemode");
+        assert_eq!(item.current_value, "false");
+        assert_eq!(item.values, vec!["true", "false"]);
+        let on = interactive_settings_list(&InteractiveSettingsConfig {
+            codemode: true,
+            ..InteractiveSettingsConfig::default()
+        });
+        let item = on.items.iter().find(|item| item.id == "codemode").unwrap();
+        assert_eq!(item.current_value, "true");
     }
 
     #[test]

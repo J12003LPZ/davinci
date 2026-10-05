@@ -9,7 +9,7 @@ verified improvements and remaining risks.
 Native capability guides: [repository intelligence](repo-intelligence.md),
 [language intelligence](language-intelligence.md), [language compatibility report](language-intelligence-compatibility.md),
 [test impact](test-impact.md),
-[managed processes](process-manager.md), [transactional edits](transactional-edits.md),
+[managed processes](process-manager.md), [Codemode](codemode.md), [transactional edits](transactional-edits.md),
 and [browser verification](browser-verification.md).
 Agent orchestration: [subagents, agent teams and workflows](agent-teams.md) and [runtime routing](runtime-orchestration.md).
 Context: [Context VM](context-vm.md) and
