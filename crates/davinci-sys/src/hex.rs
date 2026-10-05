@@ -23,7 +23,10 @@ mod tests {
 
     #[test]
     fn formats_bytes_as_two_lowercase_digits_each() {
-        assert_eq!(format!("{:x}", Lower(&[0x00, 0x0f, 0xab, 0xff])), "000fabff");
+        assert_eq!(
+            format!("{:x}", Lower(&[0x00, 0x0f, 0xab, 0xff])),
+            "000fabff"
+        );
         assert_eq!(format!("{:x}", Lower(&[])), "");
     }
 }

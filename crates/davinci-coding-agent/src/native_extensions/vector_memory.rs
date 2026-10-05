@@ -1473,7 +1473,10 @@ impl VectorMemory {
             kind: prior.kind,
             text: new_text,
             source: prior.source.clone(),
-            content_hash: format!("{:x}", davinci_sys::hex::Lower(&sha2::Sha256::digest(prior.id.as_bytes()))),
+            content_hash: format!(
+                "{:x}",
+                davinci_sys::hex::Lower(&sha2::Sha256::digest(prior.id.as_bytes()))
+            ),
             importance: prior.importance,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

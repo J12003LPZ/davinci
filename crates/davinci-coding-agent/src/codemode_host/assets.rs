@@ -156,7 +156,9 @@ impl HostAssets {
                 }
                 hash.update(&buffer[..count]);
             }
-            if bytes != asset.bytes || format!("{:x}", davinci_sys::hex::Lower(&hash.finalize())) != asset.sha256 {
+            if bytes != asset.bytes
+                || format!("{:x}", davinci_sys::hex::Lower(&hash.finalize())) != asset.sha256
+            {
                 return Err(invalid("Codemode asset digest mismatch"));
             }
         }

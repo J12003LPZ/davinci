@@ -99,7 +99,10 @@ fn materialize_case(id: String, handler: &str, routes: &str, sources: &mut Sourc
         .map(|(path, text): (&String, &String)| {
             (
                 path.clone(),
-                format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(text.as_bytes()))),
+                format!(
+                    "{:x}",
+                    davinci_sys::hex::Lower(&Sha256::digest(text.as_bytes()))
+                ),
             )
         })
         .collect();

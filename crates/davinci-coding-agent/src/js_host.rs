@@ -166,7 +166,10 @@ fn runner_path() -> Result<PathBuf, String> {
     static PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     PATH.get_or_init(|| {
         use sha2::{Digest, Sha256};
-        let digest = format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(RUNNER_JS.as_bytes())));
+        let digest = format!(
+            "{:x}",
+            davinci_sys::hex::Lower(&Sha256::digest(RUNNER_JS.as_bytes()))
+        );
         // Other CLI tests temporarily redirect and remove the agent directory.
         // Keep the cached runner alive independently of those environment fixtures.
         #[cfg(test)]
