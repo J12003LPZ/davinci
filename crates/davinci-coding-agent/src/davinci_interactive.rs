@@ -1228,6 +1228,11 @@ fn thinking_effort(agent: &Agent) -> Option<String> {
 
 /// Fold one agent event into the transcript.
 fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
+    // Any event is a sign of life, including ones the token count cannot
+    // see: tool-call arguments streaming, a retry backing off, compaction.
+    if let Some(working) = model.working.as_mut() {
+        working.pulse();
+    }
     match event {
         AgentEvent::SubagentProgress {
             tool_call_id,
@@ -1537,6 +1542,9 @@ fn run_turn(
         seconds: 0,
         tokens: 0,
         shown_tokens: Some(0),
+        idle_ticks: 0,
+        seen_tokens: 0,
+        glint: 0,
         thinking: thinking_effort(agent),
         interrupting: false,
         verb_seed,
@@ -1610,6 +1618,11 @@ fn run_turn(
             }
             if let Some(working) = model.working.as_mut() {
                 working.seconds = started.elapsed().as_secs();
+            }
+            // The typewriter steps on real time, every pass of this loop.
+            model.advance_reveal();
+            if model.reveal_pending() {
+                model.dirty = true;
             }
             if model.dirty {
                 session.draw(model)?;
@@ -1821,6 +1834,7 @@ fn run_turn(
             model.transcript.push(Entry::Done {
                 verb: working.past_verb().to_string(),
                 seconds: started.elapsed().as_secs(),
+                landed: model.tick,
             });
         }
     }
@@ -4916,6 +4930,13 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        // A reply still being written after its turn ended finishes at the
+        // typewriter's own pace, not the 250ms clock's.
+        model.advance_reveal();
+        let revealing = model.reveal_pending();
+        if revealing {
+            model.dirty = true;
+        }
         if model.dirty {
             if let Err(err) = terminal.draw(&model) {
                 break Err(err.to_string());
@@ -4923,7 +4944,11 @@ pub fn run(
             model.dirty = false;
         }
 
-        let timeout = davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed());
+        let timeout = if revealing {
+            Duration::from_millis(40)
+        } else {
+            davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed())
+        };
         match terminal.poll_event(timeout) {
             Ok(Some(event)) => {
                 model.dirty = true;

@@ -3,11 +3,29 @@
 //! Keeps startup discovery from the native shell; upstream interaction lives in
 //! vendor/davinci/packages/coding-agent/src/modes/interactive/interactive-mode.ts.
 
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
 
 use crate::davinci::model::{Model, Startup};
-use crate::davinci::ui::{blank, clip_ellipsis, span, truncate_run};
+use crate::davinci::ui::{blank, clip_ellipsis, mix, span, truncate_run};
+
+/// The masthead D, drawn in quadrant blocks on a 16×6 sub-cell grid: a
+/// two-cell stem, hairline bars, and a bowl that rounds off through ▜ ▌ ▟
+/// instead of meeting the stem at square corners. Every row is the same
+/// eleven columns, so the text beside it lines up.
+pub const MARK: [&str; 3] = [" ██▀▀▀▜▄   ", " ██    █▌  ", " ██▄▄▄▟▀   "];
+
+/// Terracotta lit from above: the top row catches the light, the bottom
+/// sits in shade. Truecolor only; other palettes draw the flat accent.
+fn mark_inks(model: &Model) -> [Color; 3] {
+    let cc = model.theme.cc();
+    const SHADE: Color = Color::Rgb(0x8E, 0x3F, 0x27);
+    [
+        mix(cc.claude, cc.claude_shimmer, 0.45),
+        cc.claude,
+        mix(cc.claude, SHADE, 0.4),
+    ]
+}
 
 /// Compact identity block, also kept above a short conversation. The path and
 /// selected model come from the running session, never from sample copy.
@@ -24,21 +42,22 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     } else {
         info.cwd.clone()
     };
+    let [top, middle, bottom] = mark_inks(model);
     let rows = [
         vec![
-            span(" ██████╗   ", cc.claude),
+            span(MARK[0], top),
             name,
             span(format!(" v{}", env!("CARGO_PKG_VERSION")), cc.inactive),
         ],
         vec![
-            span(" ██   ██║  ", cc.claude),
+            span(MARK[1], middle),
             span(
                 format!("{} with {} effort", model.model_name, model.thinking_level),
                 cc.inactive,
             ),
         ],
         vec![
-            span(" ██████╔╝  ", cc.claude),
+            span(MARK[2], bottom),
             span(
                 clip_ellipsis(&cwd, model.width.saturating_sub(12)),
                 cc.inactive,
@@ -118,6 +137,24 @@ mod tests {
         assert!(!drawn.contains("new session"));
         assert!(!drawn.contains("/help"));
         assert!(drawn.contains("/model"));
+    }
+
+    #[test]
+    fn the_mark_is_a_d_of_even_width_lit_from_above() {
+        use unicode_width::UnicodeWidthStr;
+        assert!(MARK.iter().all(|row| row.width() == 11), "{MARK:?}");
+        let m = model(100);
+        let rows = banner(&m, &m.startup);
+        let inks: Vec<_> = rows[..3].iter().map(|row| row.spans[0].style.fg).collect();
+        assert_ne!(inks[0], inks[1]);
+        assert_ne!(inks[1], inks[2]);
+        assert_eq!(inks[1], Some(m.theme.cc().claude));
+
+        // A 256-color palette has no in-between shades: the D is flat.
+        let flat = Model::new(Theme::da_vinci(ColorDepth::Ansi256, false), 100, 52, true);
+        let rows = banner(&flat, &flat.startup);
+        let accent = Some(flat.theme.cc().claude);
+        assert!(rows[..3].iter().all(|row| row.spans[0].style.fg == accent));
     }
 
     #[test]
