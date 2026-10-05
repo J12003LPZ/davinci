@@ -20,6 +20,17 @@ pub struct NodeCodeModeHost {
     node_fingerprint: [u8; 32],
 }
 
+/// The error for a script the sandbox reported as failed. The sandbox's own
+/// deadline can fire before the host watchdog; that is still a timeout, not a
+/// sandbox fault, so its kind decides the code.
+fn sandbox_failure(result: &Value) -> CodeModeError {
+    match result.pointer("/error/kind").and_then(Value::as_str) {
+        Some("timeout") => CodeModeError::new("TIMEOUT", "script deadline expired"),
+        Some("aborted") => CodeModeError::new("CANCELLED", "script was cancelled"),
+        _ => CodeModeError::new("SANDBOX_FAILED", "script failed in the sandbox"),
+    }
+}
+
 fn node_fingerprint(node: &Path) -> io::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -628,9 +639,7 @@ impl NodeCodeModeHost {
                         .parent_operation_ref
                         .clone()
                         .unwrap_or_else(|| format!("ephemeral:{run_id}")),
-                    error: (!ok).then(|| {
-                        CodeModeError::new("SANDBOX_FAILED", "script failed in the sandbox")
-                    }),
+                    error: (!ok).then(|| sandbox_failure(result)),
                 });
             }
             let id = frame["requestId"]
@@ -792,6 +801,26 @@ impl CodeModeHost for NodeCodeModeHost {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_sandbox_deadline_is_reported_as_a_timeout_not_a_sandbox_fault() {
+        // The sandbox deadline can beat the host watchdog when little root
+        // budget is left; that must still read as TIMEOUT.
+        let code = |result: Value| sandbox_failure(&result).code;
+        assert_eq!(
+            code(json!({"ok": false, "error": {"kind": "timeout"}})),
+            "TIMEOUT"
+        );
+        assert_eq!(
+            code(json!({"ok": false, "error": {"kind": "aborted"}})),
+            "CANCELLED"
+        );
+        assert_eq!(
+            code(json!({"ok": false, "error": {"kind": "script"}})),
+            "SANDBOX_FAILED"
+        );
+        assert_eq!(code(json!({"ok": false})), "SANDBOX_FAILED");
+    }
 
     struct CountingBroker(Arc<AtomicUsize>);
     impl CodeModeBroker for CountingBroker {
