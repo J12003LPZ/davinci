@@ -381,6 +381,8 @@ fn read_only_real_quickjs_records_one_parent_and_two_guarded_children() {
     use serde_json::json;
     use std::sync::Arc;
     let workspace = tempfile::tempdir().unwrap();
+    // The journal rejects symlinked ancestors; macOS temp paths can include /var.
+    let workspace_path = workspace.path().canonicalize().unwrap();
     std::fs::write(
         workspace.path().join("catalog.json"),
         r#"{"path":"items.json"}"#,
@@ -421,17 +423,17 @@ fn read_only_real_quickjs_records_one_parent_and_two_guarded_children() {
         wire_tool_call_id: None,
     };
     let journal = Arc::new(
-        OperationJournal::open(&workspace.path().join("journal"), identity, namespace).unwrap(),
+        OperationJournal::open(&workspace_path.join("journal"), identity, namespace).unwrap(),
     );
     let operations = ToolOperationRuntime::new(
         journal.clone(),
         context,
         ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap(),
-        workspace.path(),
+        &workspace_path,
     )
     .unwrap();
     let mut agent = davinci_agent::Agent::new("local Codemode fixture");
-    agent.cwd = workspace.path().into();
+    agent.cwd = workspace_path;
     agent.tools = vec!["read".into()];
     agent.set_permission_mode(davinci_agent::PermissionMode::ReadOnly);
     agent.auto_compaction = false;
