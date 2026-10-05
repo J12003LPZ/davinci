@@ -29,6 +29,29 @@ impl std::fmt::Debug for CodeModeBinding {
 }
 
 impl Agent {
+    /// Keep an admitted host for the turns to come. Hosts attach the operation
+    /// journal per turn, after startup, so enabling at startup always failed
+    /// with "Codemode requires the parent operation journal".
+    pub fn stage_read_only_codemode(&mut self, host: Arc<dyn CodeModeHost>) {
+        self.staged_codemode = Some(CodeModeBinding { host });
+    }
+
+    /// Register a staged host on the current runtime. Call after each new
+    /// runtime is installed; a runtime that already has Codemode is left alone.
+    pub fn activate_staged_codemode(&mut self) -> Result<(), CodeModeError> {
+        let Some(binding) = self.staged_codemode.clone() else {
+            return Ok(());
+        };
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.capability_registry.get("codemode").is_some())
+        {
+            return Ok(());
+        }
+        self.enable_read_only_codemode(binding.host)
+    }
+
     /// Explicit host-side opt-in. This never resolves or probes a runtime itself.
     /// Controlled mode is deliberately unavailable until its recovery gates pass.
     pub fn enable_read_only_codemode(
