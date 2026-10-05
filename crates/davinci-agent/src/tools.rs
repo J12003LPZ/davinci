@@ -4386,6 +4386,31 @@ fn code_rename_preview_tool(
 
 #[cfg(test)]
 mod tests {
+    /// PowerShell 7 must win whenever it is on PATH, including the Microsoft
+    /// Store build whose PATH entry is an App Execution Alias. Falling back to
+    /// Windows PowerShell 5.1 changes how native arguments are quoted.
+    #[test]
+    fn powershell_tool_prefers_pwsh_whenever_it_is_on_path() {
+        let pwsh = davinci_sys::process::resolve_program("pwsh");
+        if pwsh == std::path::Path::new("pwsh") {
+            return; // No PowerShell 7 on this host.
+        }
+        let cwd = tempfile::tempdir().unwrap();
+        let resolved = super::resolve_powershell_executable(cwd.path()).unwrap();
+        let stem = resolved
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert_eq!(
+            stem,
+            "pwsh",
+            "{} found, {} selected",
+            pwsh.display(),
+            resolved.display()
+        );
+    }
+
     #[test]
     fn planning_tools_are_reserved_for_long_tasks() {
         let specs = tool_specs();

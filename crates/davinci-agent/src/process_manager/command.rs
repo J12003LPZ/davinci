@@ -134,17 +134,14 @@ pub(crate) fn direct(name: &str, cwd: &Path) -> Result<PathBuf, String> {
             options = vec![path.with_extension("exe"), path.with_extension("com")];
         }
         for option in options {
-            if let Ok(canonical) = option.canonicalize() {
-                let extension = canonical
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if canonical.is_file()
-                    && (!cfg!(windows) || matches!(extension.as_str(), "exe" | "com"))
-                {
-                    return Ok(canonical);
+            match option.canonicalize() {
+                Ok(canonical) => {
+                    if canonical.is_file() && (!cfg!(windows) || has_native_extension(&canonical)) {
+                        return Ok(canonical);
+                    }
                 }
+                Err(error) if app_execution_alias(&option, &error) => return Ok(option),
+                Err(_) => {}
             }
         }
     }
@@ -152,6 +149,44 @@ pub(crate) fn direct(name: &str, cwd: &Path) -> Result<PathBuf, String> {
         "process executable unavailable; use an installed native executable and literal argv"
             .into(),
     )
+}
+
+fn has_native_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "exe" | "com"))
+}
+
+/// Store-installed programs, including PowerShell 7, reach PATH as App
+/// Execution Aliases: reparse points that CreateProcess launches but that
+/// cannot be opened, so canonicalization fails with ERROR_CANT_ACCESS_FILE.
+/// Rejecting them silently replaced `pwsh` with Windows PowerShell 5.1, whose
+/// native argument passing strips embedded double quotes.
+#[cfg(windows)]
+fn app_execution_alias(path: &Path, error: &std::io::Error) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let attributes = std::fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| metadata.file_attributes());
+    is_app_execution_alias(path, error.raw_os_error(), attributes)
+}
+
+#[cfg(not(windows))]
+fn app_execution_alias(_path: &Path, _error: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn is_app_execution_alias(path: &Path, error_code: Option<i32>, attributes: Option<u32>) -> bool {
+    const ERROR_CANT_ACCESS_FILE: i32 = 1920;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    error_code == Some(ERROR_CANT_ACCESS_FILE)
+        && path.is_absolute()
+        && has_native_extension(path)
+        && attributes.is_some_and(|value| {
+            value & FILE_ATTRIBUTE_REPARSE_POINT != 0 && value & FILE_ATTRIBUTE_DIRECTORY == 0
+        })
 }
 
 fn executable(name: &str, argv: Vec<String>, cwd: &Path) -> Result<(PathBuf, Vec<String>), String> {
@@ -206,4 +241,79 @@ fn executable(name: &str, argv: Vec<String>, cwd: &Path) -> Result<(PathBuf, Vec
         );
     }
     direct(name, cwd).map(|program| (program, argv))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REPARSE_FILE: u32 = 0x420;
+
+    #[test]
+    fn only_unopenable_executable_reparse_files_count_as_app_aliases() {
+        let alias = std::env::temp_dir().join("pwsh.exe");
+        assert!(is_app_execution_alias(
+            &alias,
+            Some(1920),
+            Some(REPARSE_FILE)
+        ));
+        // A missing or dangling target fails differently and stays rejected.
+        assert!(!is_app_execution_alias(&alias, Some(2), Some(REPARSE_FILE)));
+        assert!(!is_app_execution_alias(&alias, Some(1920), None));
+        // Ordinary files and reparse directories are not aliases.
+        assert!(!is_app_execution_alias(&alias, Some(1920), Some(0x20)));
+        assert!(!is_app_execution_alias(&alias, Some(1920), Some(0x410)));
+        // Scripts and relative names never bypass canonical resolution.
+        let script = std::env::temp_dir().join("pwsh.cmd");
+        assert!(!is_app_execution_alias(
+            &script,
+            Some(1920),
+            Some(REPARSE_FILE)
+        ));
+        assert!(!is_app_execution_alias(
+            Path::new("pwsh.exe"),
+            Some(1920),
+            Some(REPARSE_FILE)
+        ));
+    }
+
+    #[test]
+    fn missing_executable_is_still_unavailable() {
+        let cwd = tempfile::tempdir().unwrap();
+        let missing = cwd.path().join("davinci-missing-tool.exe");
+        assert!(direct(missing.to_str().unwrap(), cwd.path()).is_err());
+    }
+
+    /// Windows-only end-to-end check against a real Store alias such as
+    /// `pwsh.exe` or `winget.exe`. Hosts without any alias have nothing to prove.
+    #[cfg(windows)]
+    #[test]
+    fn installed_app_execution_alias_resolves_to_the_launchable_alias() {
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let directory = PathBuf::from(local).join("Microsoft").join("WindowsApps");
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return;
+        };
+        let alias = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                has_native_extension(path)
+                    && path
+                        .canonicalize()
+                        .err()
+                        .is_some_and(|error| app_execution_alias(path, &error))
+            });
+        let Some(alias) = alias else {
+            return;
+        };
+        let cwd = tempfile::tempdir().unwrap();
+        assert_eq!(
+            direct(alias.to_str().unwrap(), cwd.path()).unwrap(),
+            alias,
+            "a Store alias on PATH must not fall through to another program"
+        );
+    }
 }
