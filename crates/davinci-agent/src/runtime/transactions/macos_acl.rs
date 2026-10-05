@@ -111,6 +111,8 @@ mod platform {
             None
         };
         // _FILESEC_REMOVE_ACL is the documented pointer-valued sentinel 1.
+        #[allow(clippy::manual_dangling_ptr)]
+        // The ABI requires address 1, not arbitrary alignment.
         let raw = acl.as_ref().map_or(1usize as *mut c_void, |acl| acl.0);
         // SAFETY: private stage descriptor and owned ACL or documented sentinel.
         if unsafe { acl_set_fd_np(file.as_raw_fd(), raw, ACL_TYPE_EXTENDED) } != 0 {
