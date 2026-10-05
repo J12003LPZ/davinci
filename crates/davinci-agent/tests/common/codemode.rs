@@ -569,7 +569,7 @@ fn codemode_inherits_root_deadline_before_host_launch() {
             context: &crate::codemode::CodeModeRunContext,
             broker: Arc<dyn crate::codemode::CodeModeBroker>,
         ) -> crate::codemode::CodeModeOutcome {
-            assert!(context.limits.wall_ms <= 5000 && context.limits.wall_ms > 0);
+            assert!(context.limits.wall_ms <= 60_000 && context.limits.wall_ms > 0);
             self.0
                 .store(context.limits.wall_ms, std::sync::atomic::Ordering::SeqCst);
             crate::codemode::CodeModeHost::execute(&ReadOnlyFixtureHost, request, context, broker)
@@ -589,7 +589,9 @@ fn codemode_inherits_root_deadline_before_host_launch() {
                 max_output_tokens: Some(100),
                 max_cost_microusd: None,
                 codex_subscription: None,
-                deadline_unix_ms: if expired { 1 } else { now + 5000 },
+                // Generous: the fixture's two broker reads must finish inside
+                // it even on a loaded CI runner. Only inheritance is tested.
+                deadline_unix_ms: if expired { 1 } else { now + 60_000 },
             },
         )
         .unwrap();
