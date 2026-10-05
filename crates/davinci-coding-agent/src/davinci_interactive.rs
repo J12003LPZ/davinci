@@ -3956,9 +3956,7 @@ pub fn perform(
             // to refuse the same pair, or the switch succeeds and every turn
             // after it comes back unauthenticated.
             if !model_has_credential(parsed, &provider, &model_id) {
-                return Ok(Done::Note(format!(
-                    "no credential for {provider} — /login {provider} adds one"
-                )));
+                return Ok(Done::Note(crate::missing_credential_note(&provider)));
             }
             agent.provider = provider;
             agent.model_id = model_id;
@@ -8777,10 +8775,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 return Next::Go;
             };
             if row.credential == Credential::Absent {
-                shell.note(&format!(
-                    "no credential for {} — /login {} adds one",
-                    row.name, row.provider
-                ));
+                shell.note(&crate::missing_credential_note(&row.provider));
                 return Next::Go;
             }
             let session_only = shell.model.catalog_session_only;

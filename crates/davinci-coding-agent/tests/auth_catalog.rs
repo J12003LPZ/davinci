@@ -70,3 +70,61 @@ fn credential_directory_eval_keeps_logged_in_models_discoverable() {
         );
     }
 }
+
+/// A pre-Sign-in-with-ChatGPT login stays on disk after an upgrade but no
+/// longer resolves. Both the catalog and a prompt must say so and name the
+/// fix, instead of reporting an empty catalog or an unknown model.
+#[test]
+fn legacy_codex_login_is_named_with_its_fix() {
+    let home = tempfile::tempdir().unwrap();
+    let agent_dir = home.path().join("agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("auth.json"),
+        serde_json::json!({
+            "openai-codex": {
+                "type": "oauth",
+                "access": "legacy-fixture-access",
+                "refresh": "legacy-fixture-refresh",
+                "expires": u64::MAX
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_davinci"))
+            .current_dir(home.path())
+            .env("USERPROFILE", home.path())
+            .env("HOME", home.path())
+            .env("DAVINCI_CODING_AGENT_DIR", &agent_dir)
+            .env("PI_CODING_AGENT_DIR", &agent_dir)
+            .env_remove("PI_OFFLINE")
+            .env_remove("DAVINCI_OFFLINE")
+            .env_remove("OPENAI_API_KEY")
+            .args(args)
+            .output()
+            .unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let listing = run(&["--no-extensions", "--list-models"]);
+    assert!(listing.contains("legacy Codex login"), "{listing}");
+    assert!(listing.contains("/login openai-codex"), "{listing}");
+    let prompt = run(&[
+        "--no-extensions",
+        "--no-session",
+        "--provider",
+        "openai-codex",
+        "--model",
+        "gpt-6-luna",
+        "-p",
+        "ping",
+    ]);
+    assert!(prompt.contains("legacy Codex login"), "{prompt}");
+    assert!(prompt.contains("/login openai-codex"), "{prompt}");
+    assert!(!prompt.contains("No model matched"), "{prompt}");
+}
