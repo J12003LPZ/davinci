@@ -3,6 +3,7 @@
 Usage: python scripts/eval-live-session.py <davinci-executable> <artifact-dir>
 Uses existing OpenAI Codex credentials without changing the original auth store.
 """
+import live_auth
 import importlib.util
 import json
 from pathlib import Path
@@ -23,10 +24,8 @@ def main():
         config = root / "eval-config"
         config.mkdir()
         (config / "vector-memory.json").write_text(json.dumps({"enabled": False}), encoding="utf-8")
-        original = json.loads((Path.home() / ".pi/agent/auth.json").read_text(encoding="utf-8"))
         auth = config / "auth.json"
-        auth.write_text(json.dumps({"openai-codex": original["openai-codex"]}), encoding="utf-8")
-        del original
+        lent = live_auth.lend(auth)
         terminal = None
 
         def entries():
@@ -87,6 +86,7 @@ def main():
                 if terminal:
                     terminal.close()
             finally:
+                live_auth.give_back(auth, lent)
                 auth.unlink(missing_ok=True)
 
 

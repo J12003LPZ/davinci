@@ -4,6 +4,7 @@ Usage: python scripts/eval-live-graph.py <davinci-executable> <new-artifact-dir>
 Uses existing OpenAI Codex credentials; only their temporary copy is removed.
 Retains fixture journals for verification, never credentials, in the artifact dir.
 """
+import live_auth
 import collections
 import json, os, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -25,10 +26,8 @@ assert subprocess.run(['node','test.js'],cwd=WORK,capture_output=True).returncod
     'verifyCommands':[{'name':'sum-tests','command':'node test.js'}]}))
 with tempfile.TemporaryDirectory(prefix='davinci-live-graph-auth-') as temporary:
     config = Path(temporary)
-    original = json.loads((Path.home() / '.pi/agent/auth.json').read_text(encoding='utf-8'))
     auth = config / 'auth.json'
-    auth.write_text(json.dumps({'openai-codex':original['openai-codex']}), encoding='utf-8')
-    del original
+    lent = live_auth.lend(auth)
     (config / 'settings.json').write_text(json.dumps({'maxModelTurns':12,'defaultThinkingLevel':'low'}))
     (config / 'vector-memory.json').write_text(json.dumps({'enabled':False}))
     env = {k:v for k,v in os.environ.items() if not k.startswith(('PI_', 'DAVINCI_'))}
@@ -77,4 +76,5 @@ with tempfile.TemporaryDirectory(prefix='davinci-live-graph-auth-') as temporary
         (OUT/'verified-summary.json').write_text(json.dumps(verified,indent=2),encoding='utf-8')
         print(json.dumps(verified),flush=True)
     finally:
+        live_auth.give_back(auth, lent)
         auth.unlink(missing_ok=True)
