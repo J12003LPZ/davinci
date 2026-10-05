@@ -1,12 +1,12 @@
 # Rust workspace
 
-The active product consists of **14 workspace crates**. Start with the
+The active product consists of **13 workspace crates**. Start with the
 [architecture guide](../docs/ARCHITECTURE.md) for entry points, data flow,
 configuration, and the boundaries between them.
 
 | Area | Crates |
 | --- | --- |
-| Product assembly and UI | [davinci-coding-agent](davinci-coding-agent/), [davinci-tui](davinci-tui/), [davinci-voice](davinci-voice/) |
+| Product assembly and UI | [davinci-coding-agent](davinci-coding-agent/), [davinci-tui](davinci-tui/) |
 | Execution and provider access | [davinci-agent](davinci-agent/), [davinci-ai](davinci-ai/), [davinci-mcp](davinci-mcp/) |
 | Persistence | [davinci-session](davinci-session/), [davinci-session-sqlite](davinci-session-sqlite/) |
 | Typed IPC | [davinci-protocol](davinci-protocol/), [davinci-client](davinci-client/), [davinci-server](davinci-server/) |
@@ -22,5 +22,5 @@ Keep exact dependency pins and Rust 1.88 compatibility. Scope tests to changed
 behavior and its callers; most unit tests are inline, while larger integration
 and evaluation fixtures live in each crate's `tests/` directory. Some tests
 start local subprocesses or loopback servers. Platform-specific unsafe code
-exists for filesystem handles, process management, and voice bindings, so
+exists for filesystem handles and process management, so
 platform validation is a separate requirement from compiling on one host.

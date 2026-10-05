@@ -15,7 +15,6 @@ and the preserved TypeScript reference.
 | Model turns and tool execution | [agent/src/lib.rs](../crates/davinci-agent/src/lib.rs), `turn.rs`, `tools.rs`, `permission.rs` |
 | Provider requests/streaming | [ai/src/stream.rs](../crates/davinci-ai/src/stream.rs), `request_shape.rs`, `stream_decoder*.rs`, `codex*.rs` |
 | Native capabilities | [coding-agent/src/native_extensions/](../crates/davinci-coding-agent/src/native_extensions/), [agent/src/runtime/](../crates/davinci-agent/src/runtime/) |
-| Voice subprocess | [voice/src/bin/davinci-voice-worker.rs](../crates/davinci-voice/src/bin/davinci-voice-worker.rs) |
 
 Read the relevant manifest and module declarations first. The CLI and embedding
 library compile some of the same source modules; check both targets when
@@ -23,7 +22,7 @@ changing those modules.
 
 ## Responsibilities
 
-The root [Cargo.toml](../Cargo.toml) declares 14 active crates. Their dependencies
+The root [Cargo.toml](../Cargo.toml) declares 13 active crates. Their dependencies
 form a directed graph with shared contracts and supporting libraries.
 
 | Crate | Owns |
@@ -32,8 +31,7 @@ form a directed graph with shared contracts and supporting libraries.
 | `davinci-agent` | Agent turns, tool dispatch, permissions, scheduler, planning/subagents, cache/context/evidence runtime |
 | `davinci-ai` | Models, authentication/OAuth, request shaping, SSE/WebSocket decoding, retries and usage |
 | `davinci-mcp` | MCP configuration, JSON-RPC, stdio and HTTP transports |
-| `davinci-tui` | Terminal rendering, editor/widgets, themes, command sheets and voice UI state |
-| `davinci-voice` | Audio/state contracts, capture, speech engine bindings and isolated worker |
+| `davinci-tui` | Terminal rendering, editor/widgets, themes and command sheets |
 | `davinci-session` | Session/repository contracts, JSONL codec/discovery, branches and context history |
 | `davinci-session-sqlite` | SQLite repositories, migrations, fact/log persistence and branch caches |
 | `davinci-protocol` | Typed IPC schemas, CBOR codec and length-prefixed framing |
@@ -123,7 +121,7 @@ fixtures and source control.
 Rust 1.88 is the baseline. Keep exact dependency pins and the lockfile consistent.
 Unit tests are usually inline; larger scenarios and deterministic evals live in
 each crate's `tests/` directory. Fixtures may use loopback servers, subprocesses
-or platform APIs. Live provider, browser, voice and benchmark runs are separate.
+or platform APIs. Live provider, browser and benchmark runs are separate.
 
 Run affected crate tests and integration selectors. Workspace static checks and
 the exported viewer gate are:
