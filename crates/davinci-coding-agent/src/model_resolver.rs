@@ -746,7 +746,7 @@ pub fn thinking_level_for_model_switch(
 }
 
 #[cfg(test)]
-fn mock_model(provider: &str, id: &str, name: &str, reasoning: bool) -> Model {
+pub(crate) fn mock_model(provider: &str, id: &str, name: &str, reasoning: bool) -> Model {
     use davinci_ai::ModelCost;
     Model {
         id: id.into(),

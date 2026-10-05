@@ -1427,6 +1427,19 @@ pub(crate) fn resolve_model_and_auth(
     Ok((model, auth))
 }
 
+/// The model that summarizes a session is the session's own model. A model id
+/// missing from the catalog keeps its id, as for an ordinary turn: falling
+/// back to the provider's first record sent `gpt-5.3-codex-spark`, which the
+/// ChatGPT-plan route refuses, so every compaction of a `gpt-6-luna` session
+/// failed.
+fn summarization_model(
+    models: &[davinci_ai::Model],
+    provider: &str,
+    model_id: &str,
+) -> Option<davinci_ai::Model> {
+    model_resolver::model_for_request(models, provider, model_id)
+}
+
 fn complete_simple_summarization(
     parsed: &Args,
     request: &SummarizeRequest,
@@ -1441,15 +1454,7 @@ fn complete_simple_summarization(
         return Err("Summarization failed: offline".into());
     }
     let models = available_models(parsed);
-    let model = find_model(&models, &request.provider, &request.model_id)
-        .cloned()
-        .or_else(|| {
-            models
-                .iter()
-                .find(|item| item.provider == request.provider)
-                .cloned()
-        })
-        .or_else(|| models.first().cloned())
+    let model = summarization_model(&models, &request.provider, &request.model_id)
         .ok_or_else(|| "Summarization failed: no model available".to_string())?;
     let mut storage = AuthStorage::create().ok();
     if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
