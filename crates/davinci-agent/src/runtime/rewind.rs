@@ -602,7 +602,7 @@ fn build_rewind_preview_with(
         };
         let pre_rewind_hash = current_bytes
             .as_ref()
-            .map(|b| format!("{:x}", Sha256::digest(b)));
+            .map(|b| format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(b))));
 
         let mut plan = plan_file_rewind(
             &path,
@@ -629,7 +629,7 @@ fn build_rewind_preview_with(
             hasher.update(content);
         }
     }
-    let preview_digest = format!("{:x}", hasher.finalize());
+    let preview_digest = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
 
     RewindPreview {
         checkpoint_id,
@@ -719,7 +719,7 @@ pub fn apply_rewind_transaction(
         let current_bytes = read_current_rewind_content(&target)?;
         let current_hash = current_bytes
             .as_ref()
-            .map(|b| format!("{:x}", Sha256::digest(b)));
+            .map(|b| format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(b))));
         if current_hash != f.pre_rewind_hash {
             return Err(format!(
                 "Stale preview: {} was modified after preview generation",
@@ -778,7 +778,7 @@ pub fn apply_rewind_transaction(
         // enter rollback instead of redirecting a write to another file.
         let validation = validate_rewind_path(workspace_root, &plan.path).and_then(|_| {
             let current_hash = read_current_rewind_content(&target)?
-                .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+                .map(|bytes| format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes))));
             if current_hash != plan.pre_rewind_hash {
                 return Err(format!(
                     "Stale preview: {} changed before mutation",
@@ -2315,7 +2315,7 @@ impl crate::Agent {
                 .as_bytes(),
         );
         digest.update(ledger.len().to_le_bytes());
-        preview.preview_digest = format!("{:x}", digest.finalize());
+        preview.preview_digest = format!("{:x}", davinci_sys::hex::Lower(&digest.finalize()));
         Ok(preview)
     }
 

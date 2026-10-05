@@ -1678,7 +1678,7 @@ fn parse_candidate(args: &Value) -> Result<SecurityCandidate, ToolError> {
         .and_then(Value::as_str)
         .unwrap_or("recorded by worker");
     Ok(SecurityCandidate {
-        id: format!("{}:{}:{}", rule_id, file, line),
+        id: format!("{rule_id}:{file}:{line}"),
         rule_id: rule_id.into(),
         file: normalize_relative_path(Path::new(file))
             .map_err(ToolError::Failed)?
@@ -1944,7 +1944,7 @@ fn format_scan_id(repo_id: &str, started_at: u64, nonce: u128) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 pub fn render_report(scan: &SecurityScan) -> String {

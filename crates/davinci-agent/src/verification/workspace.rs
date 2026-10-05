@@ -63,7 +63,7 @@ impl Snapshot {
         self.complete
             .then(|| serde_json::to_vec(&self.files).ok())
             .flatten()
-            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .map(|bytes| format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes))))
     }
 
     pub(crate) fn required_paths(&self) -> &[PathBuf] {

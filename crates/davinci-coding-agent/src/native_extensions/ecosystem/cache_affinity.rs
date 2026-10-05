@@ -132,7 +132,7 @@ pub fn derive_worker_cache_key(
         crate::native_extensions::graph::validate::artifact_contract(expect)
     );
     contract_hasher.update(contract_str.as_bytes());
-    let system_contract_hash = format!("{:x}", contract_hasher.finalize());
+    let system_contract_hash = format!("{:x}", davinci_sys::hex::Lower(&contract_hasher.finalize()));
 
     let identity = GraphCacheIdentity {
         repo_id,

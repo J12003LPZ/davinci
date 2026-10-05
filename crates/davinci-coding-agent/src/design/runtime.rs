@@ -51,7 +51,7 @@ pub(crate) fn file_hash(path: &Path) -> DesignResult<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize())))
 }
 pub(crate) fn no_links(path: &Path) -> DesignResult<()> {
     for part in path.ancestors() {
@@ -133,7 +133,7 @@ impl TrustedDesignRuntime {
         }
         let bytes = fs::read(path)?;
         let manifest: RuntimeManifest = serde_json::from_slice(&bytes)?;
-        let fingerprint = format!("{:x}", Sha256::digest(&bytes));
+        let fingerprint = format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(&bytes)));
         let runtime = Self {
             node,
             root,

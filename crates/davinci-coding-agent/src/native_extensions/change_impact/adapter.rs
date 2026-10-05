@@ -105,7 +105,7 @@ impl SemanticLanguageProvider for LanguageIntelligenceAdapter {
                         end_line,
                         end_column: end_col,
                     },
-                    description: format!("LSP {} at {}:{}", tool_name, item_path, start_line),
+                    description: format!("LSP {tool_name} at {item_path}:{start_line}"),
                 });
             }
         }

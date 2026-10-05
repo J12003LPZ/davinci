@@ -301,7 +301,7 @@ mod tests {
 
         // Create 25 finished unreferenced runs to trigger pruning
         for i in 1..=25 {
-            let id = format!("run-prune-{:03}", i);
+            let id = format!("run-prune-{i:03}");
             create_run_dir(dir.path(), &id).unwrap();
             let mut r = sample_run(dir.path(), &id, &format!("prune {i}"));
             r.phase = Phase::Done;

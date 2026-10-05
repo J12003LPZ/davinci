@@ -82,7 +82,7 @@ impl VerificationBundle {
             return false;
         }
 
-        let security_required = contract.map_or(false, |c| {
+        let security_required = contract.is_some_and(|c| {
             c.verification_requirements
                 .iter()
                 .any(|r| r == "security" || r == "security_scan")

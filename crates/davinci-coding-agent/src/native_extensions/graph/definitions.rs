@@ -130,7 +130,7 @@ pub fn compute_definition_digest(def: &SavedGraphDefinitionV1) -> String {
     let mut hasher = Sha256::new();
     let json_bytes = serde_json::to_vec(def).unwrap_or_default();
     hasher.update(&json_bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 pub fn has_case_collision(dir: &Path, name: &str) -> bool {
@@ -1164,13 +1164,13 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     if let Some(budgets) = &def.budgets {
         out.push_str("budgets:\n");
         if let Some(d) = budgets.max_duration_ms {
-            out.push_str(&format!("  max_duration_ms: {}\n", d));
+            out.push_str(&format!("  max_duration_ms: {d}\n"));
         }
         if let Some(c) = budgets.max_cost_usd {
-            out.push_str(&format!("  max_cost_usd: {}\n", c));
+            out.push_str(&format!("  max_cost_usd: {c}\n"));
         }
         if let Some(t) = budgets.max_tokens {
-            out.push_str(&format!("  max_tokens: {}\n", t));
+            out.push_str(&format!("  max_tokens: {t}\n"));
         }
     }
     if let Some(vp) = &def.verification_policy {
@@ -1408,8 +1408,7 @@ pub fn validate_param_value(
     }
     if !allowed_values.is_empty() && !allowed_values.iter().any(|allowed| allowed == val) {
         return Err(format!(
-            "parameter '{name}' value '{val}' is not in allowed values: {:?}",
-            allowed_values
+            "parameter '{name}' value '{val}' is not in allowed values: {allowed_values:?}"
         ));
     }
     match param_type {

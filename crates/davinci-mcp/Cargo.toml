@@ -11,6 +11,7 @@ name = "mcp-fixture"
 path = "src/bin/mcp_fixture.rs"
 
 [dependencies]
+davinci-sys = { path = "../davinci-sys" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

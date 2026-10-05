@@ -173,7 +173,7 @@ fn task_fingerprint(task: &CodexBenchmarkTask) -> String {
     // All fields are strings/arrays/options, so serialization is infallible.
     format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(task).expect("task serialization"))
+        davinci_sys::hex::Lower(&Sha256::digest(serde_json::to_vec(task).expect("task serialization")))
     )
 }
 

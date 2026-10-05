@@ -210,7 +210,7 @@ fn native_confined_capture_and_prototype_actions() {
             directory.join("native-environment.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "platform":std::env::consts::OS, "arch":std::env::consts::ARCH,
-                "binary_sha256":format!("{:x}", hash.finalize()),
+                "binary_sha256":format!("{:x}", davinci_sys::hex::Lower(&hash.finalize())),
                 "runtime_hash":runtime.fingerprint(),
                 "ci_source_commit":std::env::var("GITHUB_SHA").ok(),
                 "ci_run_id":std::env::var("GITHUB_RUN_ID").ok(),

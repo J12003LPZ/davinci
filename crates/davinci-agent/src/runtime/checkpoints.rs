@@ -75,7 +75,7 @@ pub fn may_mutate_with_checkpoint(
 }
 
 pub fn compute_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }
 
 #[derive(Clone, Default)]
@@ -118,19 +118,14 @@ impl BlobStore {
             return Err(CheckpointError::BlobTooLarge { size: bytes.len() });
         }
         let hash = compute_sha256(bytes);
-        let mut blobs = self.blobs.write().map_err(|_| {
-            CheckpointError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Blob store lock poisoned",
-            ))
-        })?;
+        let mut blobs = self
+            .blobs
+            .write()
+            .map_err(|_| CheckpointError::Io(std::io::Error::other("Blob store lock poisoned")))?;
 
         if !blobs.contains_key(&hash) {
             let mut usage = self.task_usage.write().map_err(|_| {
-                CheckpointError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Task usage lock poisoned",
-                ))
+                CheckpointError::Io(std::io::Error::other("Task usage lock poisoned"))
             })?;
             let current = usage.entry(task_id).or_insert(0);
             let next = *current + bytes.len() as u64;

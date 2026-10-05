@@ -54,7 +54,7 @@ impl TransportConnection {
         let now = Instant::now();
         let acct = account_id.into();
         let url = base_url.into();
-        let key = format!("{}:{}", acct, url);
+        let key = format!("{acct}:{url}");
         Self {
             key,
             account_id: acct,
@@ -138,7 +138,7 @@ impl CodexTransportPool {
         account_id: &str,
         base_url: &str,
     ) -> &mut TransportConnection {
-        let key = format!("{}:{}", account_id, base_url);
+        let key = format!("{account_id}:{base_url}");
         self.rotate_expired();
         self.connections
             .entry(key)

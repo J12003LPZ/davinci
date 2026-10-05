@@ -391,7 +391,7 @@ impl ManagedOwner {
             &options,
         ))
         .map_err(|_| "invalid command identity")?;
-        let key = format!("{:x}", Sha256::digest(identity));
+        let key = format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(identity)));
         let (flight, leader) = {
             let mut book = self.0.scope.jobs.lock().unwrap_or_else(|e| e.into_inner());
             self.ensure_open()?;
@@ -533,9 +533,9 @@ impl ManagedOwner {
             scope: self.0.scope.id,
             environment_digest: format!(
                 "{:x}",
-                Sha256::digest(
+                davinci_sys::hex::Lower(&Sha256::digest(
                     serde_json::to_vec(&config.environment).map_err(|_| "invalid environment")?
-                )
+                ))
             ),
             command: config,
             owners: Mutex::new(Owners::default()),

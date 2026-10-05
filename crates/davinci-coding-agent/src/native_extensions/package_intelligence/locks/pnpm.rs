@@ -181,7 +181,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                 // Parse package name and version: handle scoped @scope/pkg@1.0.0 vs pkg@1.0.0
                 let (name, ver) = if let Some(stripped) = clean.strip_prefix('@') {
                     if let Some((scope_pkg, ver)) = stripped.split_once('@') {
-                        (format!("@{}", scope_pkg), ver)
+                        (format!("@{scope_pkg}"), ver)
                     } else {
                         (clean.to_string(), "")
                     }

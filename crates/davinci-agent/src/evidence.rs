@@ -76,7 +76,7 @@ impl EvidenceStore {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
+        let sha256 = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
 
         let rel_path = path
             .strip_prefix(&self.dir)

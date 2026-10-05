@@ -452,7 +452,7 @@ impl Snapshot {
             digest.update((skipped.reason.len() as u64).to_le_bytes());
             digest.update(skipped.reason.as_bytes());
         }
-        snapshot.id = format!("{:x}", digest.finalize());
+        snapshot.id = format!("{:x}", davinci_sys::hex::Lower(&digest.finalize()));
         Ok(snapshot)
     }
 

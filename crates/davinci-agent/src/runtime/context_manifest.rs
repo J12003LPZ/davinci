@@ -78,7 +78,7 @@ impl ContextManifestEntry {
     pub fn hash_content(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 }
 
@@ -196,7 +196,7 @@ impl PreparedContextManifest {
             hasher.update(entry.token_estimate.to_le_bytes());
             hasher.update(if entry.mandatory { b"M" } else { b"O" });
         }
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 
     pub fn selected_entries(&self) -> impl Iterator<Item = &ContextManifestEntry> {

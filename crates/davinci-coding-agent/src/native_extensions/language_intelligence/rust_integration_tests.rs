@@ -40,7 +40,7 @@ fn hash(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    Some(format!("{:x}", hasher.finalize()))
+    Some(format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize())))
 }
 
 #[test]

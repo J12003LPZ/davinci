@@ -285,7 +285,7 @@ impl SandboxSpec {
                                 || matches!(c, '/' | '\\' | '@' | '#')
                         })
                 })
-                || ports.iter().any(|port| *port == 0)
+                || ports.contains(&0)
             {
                 return Err(SandboxFailure::policy_denied("invalid network allowlist"));
             }

@@ -11,7 +11,7 @@ pub struct DesignStore {
     limits: DesignLimits,
 }
 pub fn digest(value: &impl Serialize) -> DesignResult<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+    Ok(format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(serde_json::to_vec(value)?))))
 }
 
 impl DesignStore {
@@ -274,7 +274,7 @@ impl DesignStore {
         let refs = files
             .iter()
             .map(|(path, text)| {
-                let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+                let sha256 = format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(text.as_bytes())));
                 (
                     path.clone(),
                     ArtifactRef {

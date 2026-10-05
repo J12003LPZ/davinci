@@ -52,7 +52,7 @@ pub fn render_symbol_lines(
     ));
 
     if let Some(ref def) = view.definition {
-        rows.extend(section_detail(width, th, &format!("Definition   {}", def)));
+        rows.extend(section_detail(width, th, &format!("Definition   {def}")));
     } else {
         rows.extend(section_detail(width, th, "Definition   [unavailable]"));
     }
@@ -63,7 +63,7 @@ pub fn render_symbol_lines(
         &format!("References   {}", view.references_count),
     ));
     for r in &view.references {
-        rows.extend(section_detail(width, th, &format!("  {}", r)));
+        rows.extend(section_detail(width, th, &format!("  {r}")));
     }
 
     rows.extend(section_detail(
@@ -110,7 +110,7 @@ pub fn render_rename_review_lines(
         rows.extend(section_detail(
             width,
             th,
-            &format!("  {} ({} edit(s))", file, count),
+            &format!("  {file} ({count} edit(s))"),
         ));
     }
 

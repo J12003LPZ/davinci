@@ -576,7 +576,7 @@ fn redacted_scalar(value: &Value) -> Value {
     let digest = Sha256::digest(&bytes);
     json!({
         "redacted": true,
-        "sha256": format!("{digest:x}"),
+        "sha256": format!("{:x}", davinci_sys::hex::Lower(&digest)),
         "length": bytes.len(),
     })
 }

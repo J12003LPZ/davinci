@@ -602,7 +602,7 @@ fn validate_non_empty_refs(value: &serde_json::Value) -> Result<(), String> {
     if refs.is_empty()
         || refs
             .iter()
-            .any(|v| v.as_str().map_or(true, |s| s.trim().is_empty()))
+            .any(|v| v.as_str().is_none_or(|s| s.trim().is_empty()))
     {
         return Err("evidence finding requires at least one non-empty ref".into());
     }

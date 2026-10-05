@@ -8,6 +8,9 @@ pub(super) const MAX_FRAME: usize = 128 * 1024;
 pub(super) const MAX_INPUT: usize = 16 * 1024;
 pub(super) const POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+// One short-lived frame per message; boxing the config would only add an
+// allocation to every decode.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {

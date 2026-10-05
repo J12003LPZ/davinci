@@ -278,7 +278,7 @@ impl SourceManifestBuilder {
 
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let content_hash = format!("{:x}", hasher.finalize());
+        let content_hash = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
 
         let is_executable = is_path_executable(full, &sym_meta);
 
@@ -359,7 +359,7 @@ pub fn compute_manifest_digest(
         hasher.update([0u8]);
     }
 
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 fn normalize_rel_path(path: &str) -> String {

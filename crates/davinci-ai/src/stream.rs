@@ -693,7 +693,7 @@ fn observe_request(model: &Model, body: &Value) {
     use sha2::Digest;
     let schema_hash = format!(
         "{:x}",
-        sha2::Sha256::digest(serde_json::to_vec(&body.get("tools")).unwrap_or_default())
+        davinci_sys::hex::Lower(&sha2::Sha256::digest(serde_json::to_vec(&body.get("tools")).unwrap_or_default()))
     );
     let effort = body.pointer("/reasoning/effort").and_then(Value::as_str);
     crate::provider_observation::begin_request(

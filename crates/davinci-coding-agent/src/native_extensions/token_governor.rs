@@ -378,7 +378,7 @@ pub fn file_content_hash(content: &str) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -764,7 +764,7 @@ fn collapse_repeated_lines(lines: Vec<String>) -> Vec<String> {
         if previous.as_deref() == Some(line.as_str()) {
             repeats += 1;
             if repeats == 3 {
-                output.push(format!("[… repeated line omitted: {}]", line));
+                output.push(format!("[… repeated line omitted: {line}]"));
             }
             continue;
         }

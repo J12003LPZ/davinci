@@ -53,7 +53,7 @@ pub fn compute_request_shape_hash(params: &RequestShapeParams<'_>) -> String {
     hasher.update(b"\ncompaction:");
     hasher.update(params.compaction_lineage.unwrap_or("none").as_bytes());
 
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 /// Computes the stable-prefix hash for prompt caching across turns.
@@ -79,7 +79,7 @@ pub fn compute_stable_prefix_hash(
         hasher.update(tool.to_string().as_bytes());
         hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 #[cfg(test)]

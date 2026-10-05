@@ -38,7 +38,7 @@ impl std::str::FromStr for MemoryScope {
             "project" => Ok(Self::Project),
             "agent_project" | "agent-project" => Ok(Self::AgentProject),
             "agent_global" | "agent-global" => Ok(Self::AgentGlobal),
-            other => Err(format!("Unknown memory scope: '{}'", other)),
+            other => Err(format!("Unknown memory scope: '{other}'")),
         }
     }
 }
@@ -192,7 +192,7 @@ impl AgentProfile {
                     let found = models.iter().any(|m| {
                         m == &self.model
                             || m.ends_with(&format!("/{}", self.model))
-                            || self.model.ends_with(&format!("/{}", m))
+                            || self.model.ends_with(&format!("/{m}"))
                     });
                     if !found {
                         return Err(format!(
@@ -368,7 +368,7 @@ pub fn format_agent_profiles_status_with_plugins(
             p.memory_scope,
         ));
         if let Some(tokens) = p.max_context_tokens {
-            out.push_str(&format!("  Max Context Tokens: {}\n", tokens));
+            out.push_str(&format!("  Max Context Tokens: {tokens}\n"));
         }
         out.push('\n');
     }

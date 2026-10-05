@@ -150,7 +150,7 @@ is newer than this copy."
 
 fn content_tag(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
-    format!("{digest:x}")
+    format!("{:x}", davinci_sys::hex::Lower(&digest))
 }
 
 /// Path-like tokens of `text`, in order and without duplicates: a relative

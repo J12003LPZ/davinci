@@ -31,7 +31,7 @@ pub struct ProfileSelection {
     pub overrides: Vec<String>,
 }
 pub fn byte_hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }
 
 pub fn select_profile(kind: DesignKind, overrides: &[String]) -> DesignResult<ProfileSelection> {

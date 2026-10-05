@@ -158,7 +158,7 @@ impl ManagedBrowserSession {
             BrowserBridgeEvent::Navigated { url, status } => {
                 self.current_url = Some(url.clone());
                 self.event_log
-                    .push(format!("Navigated to {} (status {})", url, status));
+                    .push(format!("Navigated to {url} (status {status})"));
             }
             BrowserBridgeEvent::ActionDone => {
                 self.event_log.push("Action completed".into());
@@ -195,11 +195,11 @@ impl ManagedBrowserSession {
             } => {
                 self.assertions_passed = false;
                 self.network_failures
-                    .push(format!("{} (status {}): {}", url, status, failure_text));
+                    .push(format!("{url} (status {status}): {failure_text}"));
             }
             BrowserBridgeEvent::Error { message } => {
                 self.assertions_passed = false;
-                self.event_log.push(format!("Bridge error: {}", message));
+                self.event_log.push(format!("Bridge error: {message}"));
             }
             BrowserBridgeEvent::Closed => {
                 self.is_running = false;
@@ -237,7 +237,7 @@ impl ManagedBrowserSession {
             }
             Err(e) => {
                 self.assertions_passed = false;
-                let err_msg = format!("Malformed bridge JSON: {}", e);
+                let err_msg = format!("Malformed bridge JSON: {e}");
                 self.handle_bridge_event(BrowserBridgeEvent::Error {
                     message: err_msg.clone(),
                 });

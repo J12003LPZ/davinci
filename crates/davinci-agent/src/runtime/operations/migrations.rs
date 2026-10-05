@@ -149,12 +149,12 @@ impl LegacyObservation {
         hasher.update(self.source_digest.as_bytes());
         hasher.update([0]);
         hasher.update(self.record_identity.as_bytes());
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 }
 
 pub fn digest_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }
 
 const SCHEMA_V1: &str = r#"

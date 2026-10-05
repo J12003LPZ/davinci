@@ -311,7 +311,7 @@ fn redacted_scalar(value: &Value) -> Value {
         _ => serde_json::to_vec(value).unwrap_or_default(),
     };
     let digest = Sha256::digest(&bytes);
-    let hash = format!("{digest:x}");
+    let hash = format!("{:x}", davinci_sys::hex::Lower(&digest));
     json!({"redacted": true, "sha256": hash, "length": bytes.len()})
 }
 

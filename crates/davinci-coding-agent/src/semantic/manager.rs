@@ -175,7 +175,7 @@ pub fn verify_executable(path: &Path, expected_hash: Option<&str>) -> Result<(),
             .map_err(|e| format!("Failed to read executable {}: {}", path.display(), e))?;
         let mut hasher = Sha256::new();
         hasher.update(&content);
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(format!(
                 "Executable hash mismatch for {}: expected {}, got {}",
@@ -561,7 +561,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(b"original-binary-v1");
-        let hash_v1 = format!("{:x}", hasher.finalize());
+        let hash_v1 = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
 
         assert!(verify_executable(&bin_path, Some(&hash_v1)).is_ok());
 

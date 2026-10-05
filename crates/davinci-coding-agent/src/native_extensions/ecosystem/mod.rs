@@ -856,15 +856,14 @@ mod tests {
         let records = (0..25)
             .map(|i| {
                 let rec = MemoryRecord {
-                    id: format!("mem-invariant-{:03}", i),
+                    id: format!("mem-invariant-{i:03}"),
                     repo_id: repo.clone(),
                     kind: MemoryKind::Discovery,
                     text: format!(
-                        "Invariant memory entry {} with lengthy verbose text that consumes plenty of prompt space across multiple sentences to test truncation.",
-                        i
+                        "Invariant memory entry {i} with lengthy verbose text that consumes plenty of prompt space across multiple sentences to test truncation."
                     ),
                     source: "user".into(),
-                    content_hash: format!("hash-{}", i),
+                    content_hash: format!("hash-{i}"),
                     importance: 0.85,
                     created_at: 2000 + i as u64,
                     embedding: None,

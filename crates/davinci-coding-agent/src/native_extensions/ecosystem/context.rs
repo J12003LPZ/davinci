@@ -249,7 +249,7 @@ pub fn compute_context_fingerprint(
         hasher.update(s.content_hash.as_bytes());
         hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 pub fn assemble_packet_text(
@@ -302,7 +302,7 @@ pub fn build_context_packet(
     }
 
     let mut text = assemble_packet_text(&memory_hits, &skill_candidates);
-    let mut est_tokens = (text.chars().count() + 3) / 4;
+    let mut est_tokens = text.chars().count().div_ceil(4);
 
     // Enforce aggregate token_cap: trimming order is lowest-ranked context first
     while est_tokens > request.token_cap
@@ -333,7 +333,7 @@ pub fn build_context_packet(
             (None, None) => break,
         }
         text = assemble_packet_text(&memory_hits, &skill_candidates);
-        est_tokens = (text.chars().count() + 3) / 4;
+        est_tokens = text.chars().count().div_ceil(4);
     }
 
     // Never truncate a skill body. If the packet wrapper makes the selected
@@ -342,7 +342,7 @@ pub fn build_context_packet(
     if est_tokens > request.token_cap && !skill_candidates.is_empty() {
         skill_candidates.clear();
         text = assemble_packet_text(&memory_hits, &skill_candidates);
-        est_tokens = (text.chars().count() + 3) / 4;
+        est_tokens = text.chars().count().div_ceil(4);
     }
 
     // If still over cap with 1 memory item remaining, truncate that item.
@@ -355,9 +355,9 @@ pub fn build_context_packet(
             let inner_cap = char_budget.saturating_sub(60);
             let truncated: String = m.text.chars().take(inner_cap).collect();
             m.text = truncated;
-            m.estimated_tokens = (m.text.chars().count() + 3) / 4;
+            m.estimated_tokens = m.text.chars().count().div_ceil(4);
             text = assemble_packet_text(&memory_hits, &skill_candidates);
-            est_tokens = (text.chars().count() + 3) / 4;
+            est_tokens = text.chars().count().div_ceil(4);
         }
     }
 

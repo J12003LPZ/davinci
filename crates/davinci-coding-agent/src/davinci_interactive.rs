@@ -1905,7 +1905,7 @@ fn run_turn(
     if !interrupted {
         if let Some(preview) = scope_expansion.take() {
             let task_guard = capture_scope_expansion_task_guard(agent, &preview)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+                .map_err(std::io::Error::other)?;
             if let Some(guidance) =
                 resolve_scope_expansion_modal(agent, model, session, &preview, task_guard.as_ref())?
             {
@@ -3400,7 +3400,7 @@ fn resolve_scope_expansion_modal(
                         decision,
                         instructions.as_deref(),
                     )
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
+                    .map_err(std::io::Error::other);
                 }
             }
             crossterm::event::Event::Resize(width, height) => {
@@ -7681,7 +7681,7 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
         tasks
             .iter()
             .filter(|task| task.id == prefix || task.id.starts_with(&format!("{prefix}-")))
-            .last()
+            .next_back()
             .map(node)
             .unwrap_or_else(|| format!("{prefix} ○"))
     };
@@ -9755,7 +9755,7 @@ fn apply_graph_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .execute_native_command("graph-retry", &arg);
-                sheet.control_status = Some(format!("Retry requested for {}", nid));
+                sheet.control_status = Some(format!("Retry requested for {nid}"));
             }
         }
         _ => {}
@@ -9876,7 +9876,7 @@ fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
                 shell.model.transcript.push(Entry::tool(
                     State::Done,
                     "opus",
-                    &format!("workflow {} stopped", wf_id),
+                    &format!("workflow {wf_id} stopped"),
                     None,
                 ));
             }
@@ -9885,7 +9885,7 @@ fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
             }
         },
         None => {
-            shell.note(&format!("no workflow matching '{}'", id_str));
+            shell.note(&format!("no workflow matching '{id_str}'"));
         }
     }
     Next::Go
@@ -9921,7 +9921,7 @@ fn workflow_resume_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
                 shell.model.transcript.push(Entry::tool(
                     State::Done,
                     "opus",
-                    &format!("workflow {} resumed", wf_id),
+                    &format!("workflow {wf_id} resumed"),
                     None,
                 ));
             }
@@ -9930,7 +9930,7 @@ fn workflow_resume_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
             }
         },
         None => {
-            shell.note(&format!("no workflow matching '{}'", id_str));
+            shell.note(&format!("no workflow matching '{id_str}'"));
         }
     }
     Next::Go

@@ -402,7 +402,7 @@ mod tests {
         let marker = root.join("executed");
         std::fs::write(
             root.join("setup.py"),
-            format!("open({:?}, 'w').write('bad')", marker),
+            format!("open({marker:?}, 'w').write('bad')"),
         )
         .unwrap();
         std::fs::write(root.join("app.py"), "x=1").unwrap();

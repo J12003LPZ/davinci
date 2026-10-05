@@ -39,7 +39,7 @@ pub fn estimate_tokens_from_str(s: &str) -> usize {
 pub fn hash_text(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&h.finalize()))
 }
 
 impl PromptManifest {

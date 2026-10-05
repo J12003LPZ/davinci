@@ -127,7 +127,10 @@ struct SessionHeader {
 }
 
 fn checksum(commit: &Commit) -> Result<String, TaskError> {
-    Ok(format!("{:x}", Sha256::digest(encode_bounded(commit)?)))
+    Ok(format!(
+        "{:x}",
+        davinci_sys::hex::Lower(&Sha256::digest(encode_bounded(commit)?))
+    ))
 }
 
 fn decode_frame(bytes: &[u8], run_id: RunId, previous_sequence: u64) -> Result<Frame, TaskError> {
@@ -363,7 +366,10 @@ impl TaskJournal {
             };
             migration_projection(&binding)?;
             let header = SessionHeader {
-                checksum: format!("{:x}", Sha256::digest(encode_bounded(&binding)?)),
+                checksum: format!(
+                    "{:x}",
+                    davinci_sys::hex::Lower(&Sha256::digest(encode_bounded(&binding)?))
+                ),
                 task_journal: binding,
             };
             let mut bytes = encode_bounded(&header)?;
@@ -396,7 +402,9 @@ impl TaskJournal {
                 || header.checksum
                     != format!(
                         "{:x}",
-                        Sha256::digest(encode_bounded(&header.task_journal)?)
+                        davinci_sys::hex::Lower(&Sha256::digest(encode_bounded(
+                            &header.task_journal
+                        )?))
                     )
             {
                 return Err(persistence(
@@ -743,7 +751,10 @@ mod tests {
                 migrated_tasks: Some(vec![dependency, dependent]),
             };
             let header = SessionHeader {
-                checksum: format!("{:x}", Sha256::digest(encode_bounded(&binding).unwrap())),
+                checksum: format!(
+                    "{:x}",
+                    davinci_sys::hex::Lower(&Sha256::digest(encode_bounded(&binding).unwrap()))
+                ),
                 task_journal: binding,
             };
             let mut bytes = encode_bounded(&header).unwrap();
@@ -799,7 +810,9 @@ mod tests {
             if kind != "checksum" {
                 header.checksum = format!(
                     "{:x}",
-                    Sha256::digest(encode_bounded(&header.task_journal).unwrap())
+                    davinci_sys::hex::Lower(&Sha256::digest(
+                        encode_bounded(&header.task_journal).unwrap()
+                    ))
                 );
             }
             let mut damaged = serde_json::to_vec(&header).unwrap();
@@ -955,7 +968,9 @@ mod tests {
                             header.task_journal.schema_version = 2;
                             header.checksum = format!(
                                 "{:x}",
-                                Sha256::digest(encode_bounded(&header.task_journal).unwrap())
+                                davinci_sys::hex::Lower(&Sha256::digest(
+                                    encode_bounded(&header.task_journal).unwrap()
+                                ))
                             );
                         } else {
                             header.checksum = "bad".into();

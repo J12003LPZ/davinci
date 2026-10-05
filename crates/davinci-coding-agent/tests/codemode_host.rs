@@ -13,7 +13,7 @@ fn fixture(root: &Path) -> AssetManifest {
             AssetEntry {
                 path: path.into(),
                 bytes: path.len() as u64,
-                sha256: format!("{:x}", Sha256::digest(path.as_bytes())),
+                sha256: format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(path.as_bytes()))),
             }
         })
         .collect();

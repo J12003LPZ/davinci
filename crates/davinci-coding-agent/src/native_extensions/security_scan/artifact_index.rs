@@ -92,7 +92,7 @@ fn digest(root: &Path, name: String, remaining: u64) -> Result<Entry, String> {
     Ok(Entry {
         path: name,
         bytes,
-        sha256: format!("{:x}", hash.finalize()),
+        sha256: format!("{:x}", davinci_sys::hex::Lower(&hash.finalize())),
     })
 }
 

@@ -1277,7 +1277,7 @@ mod tests {
         save_run(&mut ancestor_run).unwrap();
 
         for i in 1..=25 {
-            let id = format!("run-child-{:03}", i);
+            let id = format!("run-child-{i:03}");
             create_run_dir(dir.path(), &id).unwrap();
             let mut run = sample_run(dir.path(), &id, &format!("run {i}"));
             run.phase = Phase::Done;

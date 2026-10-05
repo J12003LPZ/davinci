@@ -220,18 +220,12 @@ fn real_python_project_venv_executes_only_after_trusted_launch() {
     let sitecustomize_sentinel = root.join("sitecustomize-sentinel-ran");
     std::fs::write(
         site_packages.join("davinci_lsp_fixture.pth"),
-        format!(
-            "import pathlib; pathlib.Path({:?}).write_text('ran')\n",
-            pth_sentinel
-        ),
+        format!("import pathlib; pathlib.Path({pth_sentinel:?}).write_text('ran')\n"),
     )
     .unwrap();
     std::fs::write(
         site_packages.join("sitecustomize.py"),
-        format!(
-            "import pathlib\npathlib.Path({:?}).write_text('ran')\n",
-            sitecustomize_sentinel
-        ),
+        format!("import pathlib\npathlib.Path({sitecustomize_sentinel:?}).write_text('ran')\n"),
     )
     .unwrap();
     assert!(!pth_sentinel.exists());

@@ -537,7 +537,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
             let end = model
                 .settings_query
                 .grapheme_indices(true)
-                .last()
+                .next_back()
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             model.settings_query.truncate(end);

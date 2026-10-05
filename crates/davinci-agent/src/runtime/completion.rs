@@ -271,9 +271,8 @@ pub fn evaluate_task_completion_with_budget(
     }
 
     // 3. Build dimension: Not required by default unless specified
-    let build_required = contract.map_or(false, |c| {
-        c.verification_requirements.contains(&"build".to_string())
-    });
+    let build_required =
+        contract.is_some_and(|c| c.verification_requirements.contains(&"build".to_string()));
     if build_required {
         let mut build_passed = false;
         let mut build_ev = None;
@@ -312,7 +311,7 @@ pub fn evaluate_task_completion_with_budget(
     }
 
     // 4. Installed App dimension
-    let install_required = contract.map_or(false, |c| {
+    let install_required = contract.is_some_and(|c| {
         c.verification_requirements
             .iter()
             .any(|r| r == "install" || r == "installed_app")

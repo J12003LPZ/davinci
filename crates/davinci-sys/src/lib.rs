@@ -3,5 +3,6 @@
 //! This crate depends on no other davinci crate, so any crate can use it.
 
 pub mod fs;
+pub mod hex;
 pub mod lock;
 pub mod process;

@@ -78,7 +78,7 @@ impl ServerInvocation {
             program,
             args,
             canonical_program,
-            executable_fingerprint: format!("{:x}", hasher.finalize()),
+            executable_fingerprint: format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize())),
         })
     }
 }

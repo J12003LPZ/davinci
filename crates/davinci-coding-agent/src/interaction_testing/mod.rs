@@ -176,8 +176,7 @@ pub fn check_browser_runtime(
     if let (Some(expected), Some(actual)) = (expected_version, actual_version) {
         if actual != expected {
             return Err(format!(
-                "Wrong browser binary version: expected {}, found {}",
-                expected, actual
+                "Wrong browser binary version: expected {expected}, found {actual}"
             ));
         }
     }

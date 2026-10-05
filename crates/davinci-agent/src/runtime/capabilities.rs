@@ -459,7 +459,7 @@ pub fn compute_schema_hash(schema: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     let json_bytes = serde_json::to_vec(schema).unwrap_or_default();
     hasher.update(&json_bytes);
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 /// Returns builtin tool capabilities for all builtins in `tool_specs()`.
@@ -810,7 +810,7 @@ impl RuntimeCapabilityRegistry {
             }
             hasher.update(b"\n");
         }
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 }
 

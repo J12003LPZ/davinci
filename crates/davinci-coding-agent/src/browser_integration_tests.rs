@@ -1633,7 +1633,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
             "metrics": normal_metrics.clone()
         })
     );
-    eprintln!("P12_LOGIN_METRICS {}", normal_metrics);
+    eprintln!("P12_LOGIN_METRICS {normal_metrics}");
 
     let required_csv = required.join(",");
     let artifact = root.path().join("graph-artifact.json");

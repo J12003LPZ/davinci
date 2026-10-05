@@ -11,7 +11,7 @@ pub const MAX_PENDING_REQUESTS: usize = 64;
 
 /// Formats a JSON string as an LSP Content-Length framed byte message.
 pub fn lsp_frame(json: &str) -> Vec<u8> {
-    let mut out = format!("Content-Length: {}\r\n\r\n", json.as_bytes().len()).into_bytes();
+    let mut out = format!("Content-Length: {}\r\n\r\n", json.len()).into_bytes();
     out.extend_from_slice(json.as_bytes());
     out
 }
@@ -244,7 +244,7 @@ mod tests {
     fn test_utf8_byte_length() {
         let payload = r#"{"text":"こんにちは"}"#;
         let frame = lsp_frame(payload);
-        let prefix = format!("Content-Length: {}\r\n\r\n", payload.as_bytes().len());
+        let prefix = format!("Content-Length: {}\r\n\r\n", payload.len());
         assert!(frame.starts_with(prefix.as_bytes()));
     }
 

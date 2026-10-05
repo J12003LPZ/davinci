@@ -274,8 +274,7 @@ fn forward_output(
     loop {
         let count = match pipe.read(&mut bytes) {
             Ok(0) if truncated => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "sandbox output limit exceeded; output truncated",
                 ))
             }

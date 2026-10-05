@@ -186,7 +186,7 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
 
     let mut hasher = Sha256::new();
     hasher.update(trimmed.as_bytes());
-    let raw_digest = format!("{:x}", hasher.finalize());
+    let raw_digest = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
 
     let mut i = 1; // skip Begin Patch
     let mut saw_footer = false;

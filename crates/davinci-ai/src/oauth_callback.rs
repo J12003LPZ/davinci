@@ -633,8 +633,7 @@ mod tests {
         client
             .write_all(
                 format!(
-                    "GET /callback?code=pi-fixture-loop&state=state-1 HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                    addr
+                    "GET /callback?code=pi-fixture-loop&state=state-1 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
             )

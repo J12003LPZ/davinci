@@ -445,7 +445,7 @@ pub fn task_board_from_records(tasks: &[davinci_agent::TaskRecord]) -> Vec<TaskB
             row.updated_at_ms = t.updated_at_ms;
             if row.activity.is_none() {
                 row.activity = Some(match &t.contract_digest {
-                    Some(digest) => format!("contract: {:.8}", digest),
+                    Some(digest) => format!("contract: {digest:.8}"),
                     None => "legacy (uncontracted)".to_string(),
                 });
             }
@@ -499,7 +499,7 @@ pub fn agents_from_snapshots(
             let elapsed_secs = s.elapsed_ms / 1000;
             let mins = elapsed_secs / 60;
             let secs = elapsed_secs % 60;
-            let elapsed = format!("{:02}:{:02}", mins, secs);
+            let elapsed = format!("{mins:02}:{secs:02}");
 
             let owned_paths = s
                 .owned_paths
@@ -699,8 +699,8 @@ pub fn context_inspector_sheet_from_manifest(
         .entries
         .iter()
         .map(|entry| {
-            let is_pinned = overlay.map_or(false, |o| o.pinned_ids.contains(&entry.id));
-            let is_excluded = overlay.map_or(false, |o| o.excluded_ids.contains(&entry.id));
+            let is_pinned = overlay.is_some_and(|o| o.pinned_ids.contains(&entry.id));
+            let is_excluded = overlay.is_some_and(|o| o.excluded_ids.contains(&entry.id));
             let selected = if entry.mandatory {
                 true
             } else if is_excluded {
@@ -909,8 +909,7 @@ mod tests {
         ] {
             assert!(
                 ALLOWED.contains(&work_verb(role)),
-                "{:?} uses a verb the design does not list",
-                role
+                "{role:?} uses a verb the design does not list"
             );
         }
     }

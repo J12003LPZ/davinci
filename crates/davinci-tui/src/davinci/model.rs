@@ -28,17 +28,9 @@ pub const SUGGESTION_ROWS: usize = 5;
 /// `Deref<str>` and the string conversions keep the renderer/fixture surface
 /// lightweight while all mutations go through editor semantics rather than an
 /// append-only `String`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Composer {
     editor: Editor,
-}
-
-impl Default for Composer {
-    fn default() -> Self {
-        Self {
-            editor: Editor::new(),
-        }
-    }
 }
 
 impl Composer {

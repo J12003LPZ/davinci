@@ -166,8 +166,7 @@ pub fn append_effect_report(
         .unwrap_or(0);
     if current_len.saturating_add(line.len()) > MAX_EFFECT_REPORT_BYTES {
         return Err(format!(
-            "effect report exceeds the {} byte limit",
-            MAX_EFFECT_REPORT_BYTES
+            "effect report exceeds the {MAX_EFFECT_REPORT_BYTES} byte limit"
         ));
     }
     let parent = path
@@ -204,15 +203,13 @@ pub fn read_effect_report(path: &Path) -> Result<Vec<OwnedFileEffectReport>, Str
     }
     if metadata.len() > MAX_EFFECT_REPORT_BYTES as u64 {
         return Err(format!(
-            "effect report exceeds the {} byte limit",
-            MAX_EFFECT_REPORT_BYTES
+            "effect report exceeds the {MAX_EFFECT_REPORT_BYTES} byte limit"
         ));
     }
     let raw = fs::read(path).map_err(|e| format!("read effect report: {e}"))?;
     if raw.len() > MAX_EFFECT_REPORT_BYTES {
         return Err(format!(
-            "effect report exceeds the {} byte limit",
-            MAX_EFFECT_REPORT_BYTES
+            "effect report exceeds the {MAX_EFFECT_REPORT_BYTES} byte limit"
         ));
     }
     let mut reports = Vec::new();

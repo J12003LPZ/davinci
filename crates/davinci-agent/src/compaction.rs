@@ -886,7 +886,7 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     } else {
         let prefix = safe_prefix(text, max_chars);
         let truncated = text.len().saturating_sub(prefix.len());
-        format!("{}\n\n[... {truncated} more characters truncated]", prefix)
+        format!("{prefix}\n\n[... {truncated} more characters truncated]")
     }
 }
 

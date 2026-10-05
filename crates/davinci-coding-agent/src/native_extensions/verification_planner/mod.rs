@@ -399,5 +399,5 @@ fn validate_request(
 fn digest(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(bytes);
-    format!("sha256:{:x}", digest.finalize())
+    format!("sha256:{:x}", davinci_sys::hex::Lower(&digest.finalize()))
 }

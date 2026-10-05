@@ -162,7 +162,7 @@ fn schema_digest(tools: &[Value]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"davinci.responses-tools.v1\0");
     hasher.update(serde_json::to_vec(tools).unwrap_or_default());
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 pub fn set_wire_kind(extra: &mut Map<String, Value>, call_id: &str, kind: ResponsesToolWireKind) {

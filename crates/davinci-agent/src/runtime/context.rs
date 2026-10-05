@@ -150,7 +150,7 @@ fn item_hash(item: &ContextItem) -> String {
     hasher.update(item.content.as_bytes());
     hasher.update(b":");
     hasher.update(item.provenance.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 /// Computes a cache key from the stable context items.
@@ -162,7 +162,7 @@ fn compute_cache_key(items: &[ContextItem]) -> String {
         hasher.update(item.content.as_bytes());
         hasher.update(b"|");
     }
-    format!("{:x}", hasher.finalize())
+    format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
 /// In-memory context broker that gathers items from registered sources and enforces deterministic ordering and strict token budgets.

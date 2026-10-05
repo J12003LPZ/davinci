@@ -546,7 +546,7 @@ impl ScopeExpansionPreview {
         });
         let mut hasher = Sha256::new();
         hasher.update(serde_json::to_vec(&canonical).unwrap_or_default());
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 
     /// Revalidate an exact submitted preview against the live current contract.
@@ -643,7 +643,7 @@ impl TaskContract {
         let serialized = serde_json::to_string(&canonical).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(serialized.as_bytes());
-        format!("{:x}", hasher.finalize())
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
     }
 
     /// Constructs a new `TaskContract` with canonical digest and validation.

@@ -107,7 +107,7 @@ fn file_sha256(path: &Path) -> Option<String> {
         }
         hash.update(&buffer[..read]);
     }
-    Some(format!("{:x}", hash.finalize()))
+    Some(format!("{:x}", davinci_sys::hex::Lower(&hash.finalize())))
 }
 
 pub fn install_identity(executable: &Path) -> Value {

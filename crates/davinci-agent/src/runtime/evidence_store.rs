@@ -175,7 +175,7 @@ impl VerificationEvidenceStore {
 
         let mut hasher = Sha256::new();
         hasher.update(data);
-        let sha256 = format!("{:x}", hasher.finalize());
+        let sha256 = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
 
         let file_name = format!("{}.bin", &sha256);
         let target_path = self.dir.join(&file_name);
@@ -277,7 +277,7 @@ impl VerificationEvidenceStore {
 
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let calculated = format!("{:x}", hasher.finalize());
+        let calculated = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
         if calculated != artifact_ref.sha256 {
             return Err(format!(
                 "artifact hash mismatch: expected {}, got {}",

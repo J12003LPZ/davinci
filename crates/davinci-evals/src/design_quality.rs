@@ -69,7 +69,7 @@ pub fn load_manifest(root: &Path) -> Result<DesignManifest, String> {
         }
         let content = fs::read(path).map_err(|e| e.to_string())?;
         if content.len() > 256 * 1024
-            || format!("{:x}", Sha256::digest(&content)) != reference.sha256
+            || format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(&content))) != reference.sha256
         {
             return Err("reference content changed".into());
         }

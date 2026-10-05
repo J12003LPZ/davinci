@@ -124,13 +124,13 @@ impl OutputCompletionSummary {
                 if dim.required { "required" } else { "optional" }
             ));
             if let Some(ref p) = dim.proof {
-                out.push_str(&format!("    Proof: {}\n", p));
+                out.push_str(&format!("    Proof: {p}\n"));
             }
         }
         if !self.remaining_gaps.is_empty() {
             out.push_str("Remaining Gaps:\n");
             for gap in &self.remaining_gaps {
-                out.push_str(&format!("  ! {}\n", gap));
+                out.push_str(&format!("  ! {gap}\n"));
             }
         }
         out
@@ -141,7 +141,7 @@ impl OutputCompletionSummary {
 pub fn print_completion_json(summary: &OutputCompletionSummary) -> io::Result<()> {
     let json = summary
         .to_json_string()
-        .map_err(|e| io::Error::new(ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     write_raw_stdout_line(&json)
 }
 
@@ -190,8 +190,8 @@ impl ContextManifestSummary {
             .entries
             .iter()
             .map(|entry| {
-                let is_pinned = overlay.map_or(false, |o| o.pinned_ids.contains(&entry.id));
-                let is_excluded = overlay.map_or(false, |o| o.excluded_ids.contains(&entry.id));
+                let is_pinned = overlay.is_some_and(|o| o.pinned_ids.contains(&entry.id));
+                let is_excluded = overlay.is_some_and(|o| o.excluded_ids.contains(&entry.id));
                 let selected = if entry.mandatory {
                     true
                 } else if is_excluded {
@@ -477,7 +477,7 @@ impl StructuredGraphStatus {
                 out.push_str(&format!("    depends on: {}\n", task.depends_on.join(", ")));
             }
             if let Some(ref err) = task.error {
-                out.push_str(&format!("    error: {}\n", err));
+                out.push_str(&format!("    error: {err}\n"));
             }
         }
         out
@@ -488,7 +488,7 @@ impl StructuredGraphStatus {
 pub fn print_graph_status_json(status: &StructuredGraphStatus) -> io::Result<()> {
     let json = status
         .to_json_string()
-        .map_err(|e| io::Error::new(ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     write_raw_stdout_line(&json)
 }
 
