@@ -471,6 +471,24 @@ pub(crate) fn oauth_credential_usable(provider: &str, credential: &Credential) -
     true
 }
 
+/// Why a stored credential is refused, so callers can say more than "no
+/// credential". `None` when nothing is stored or the credential is usable.
+/// A legacy Codex login is the common case: it predates Sign in with ChatGPT
+/// and stops resolving after an upgrade, which otherwise looks like the
+/// account vanished.
+pub fn stored_credential_problem(provider: &str, storage: &AuthStorage) -> Option<String> {
+    let credential = storage.get(provider)?;
+    match (provider, &credential.kind) {
+        ("openai-codex", CredentialKind::Oauth) => {
+            crate::openai_siwc::validate_credential(credential).err()
+        }
+        ("openai-codex", CredentialKind::ApiKey) => {
+            Some("an API key cannot use the ChatGPT plan; sign in again with ChatGPT".into())
+        }
+        _ => None,
+    }
+}
+
 pub fn resolve_provider_auth(
     provider: &str,
     storage: &AuthStorage,
@@ -984,6 +1002,28 @@ mod tests {
         let resolved = resolve_provider_auth("openai", &storage, &env, true).unwrap();
         assert_eq!(resolved.api_key.as_deref(), Some("sk-stored"));
         assert_eq!(resolved.source, "stored credential");
+    }
+
+    #[test]
+    fn stored_credential_problem_names_a_legacy_codex_login() {
+        let mut storage = AuthStorage::in_memory();
+        assert_eq!(stored_credential_problem("openai-codex", &storage), None);
+        storage
+            .login_oauth(
+                "openai-codex",
+                "legacy-access",
+                Some("legacy-refresh".into()),
+                Some(u64::MAX),
+            )
+            .unwrap();
+        let problem = stored_credential_problem("openai-codex", &storage).unwrap();
+        assert!(problem.contains("legacy Codex login"), "{problem}");
+        assert!(problem.contains("sign in again with ChatGPT"), "{problem}");
+        // Other providers keep their own guidance.
+        storage
+            .login_oauth("github-copilot", "token", None, Some(u64::MAX))
+            .unwrap();
+        assert_eq!(stored_credential_problem("github-copilot", &storage), None);
     }
 
     #[test]

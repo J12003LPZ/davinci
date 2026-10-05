@@ -81,8 +81,8 @@ pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
     copilot_base_url_from_token, credential_expires_by, default_auth_path,
     fetch_github_copilot_available_model_ids, parse_copilot_available_model_ids,
-    resolve_provider_auth, try_default_auth_path, vertex_ambient_auth, AuthStorage,
-    AuthStorageError, Credential, CredentialKind, ResolvedAuth,
+    resolve_provider_auth, stored_credential_problem, try_default_auth_path, vertex_ambient_auth,
+    AuthStorage, AuthStorageError, Credential, CredentialKind, ResolvedAuth,
     ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE,
 };
 pub use catalog::{

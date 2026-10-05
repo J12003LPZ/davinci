@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- A stored openai-codex login that predates Sign in with ChatGPT is now named as the cause, with `/login openai-codex` as the fix. Previously `--list-models` reported no models, a prompt failed with "No model matched", and `/model` said there was no credential.
+
 ### Changed
 - Require Rust 1.88.0 (previously 1.83.0).
 - Upgrade ratatui to 0.30.0, sha2 to 0.11.0, rusqlite to 0.40.2, tempfile to 3.27.0, and crossterm to 0.29.0. The ratatui upgrade removes the unmaintained paste dependency (RUSTSEC-2024-0436).
@@ -9,6 +12,9 @@
 ## 1.1.0
 
 Changes since `v1.0.71`. Not tagged yet.
+
+### Upgrade notes
+- **Sign in again with ChatGPT.** The `openai-codex` provider now uses Sign in with ChatGPT and the public Responses route. Logins created by 1.0.71 or earlier, and API keys, no longer work for it. Run `davinci`, then `/login openai-codex`, once after upgrading.
 
 ### Security
 - Remote model catalogs can no longer redirect requests or credentials. A catalog entry keeps the endpoint, API and headers of the built-in entry for its provider; entries for another provider, or with an endpoint no built-in entry of that provider uses, are dropped. Already-cached `models-store.json` entries are hardened the same way.

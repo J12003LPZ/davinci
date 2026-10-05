@@ -1626,6 +1626,22 @@ fn available_models(parsed: &Args) -> Vec<davinci_ai::Model> {
     load_model_runtime(parsed).available
 }
 
+/// The note for a provider that has no usable credential: the precise reason
+/// when one is stored but refused, the generic login hint otherwise.
+fn missing_credential_note(provider: &str) -> String {
+    let problem = davinci_ai::AuthStorage::create()
+        .ok()
+        .and_then(|storage| davinci_ai::stored_credential_problem(provider, &storage));
+    match problem {
+        Some(problem) => {
+            format!(
+                "the stored {provider} credential cannot be used: {problem} — /login {provider}"
+            )
+        }
+        None => format!("no credential for {provider} — /login {provider} adds one"),
+    }
+}
+
 fn has_configured_auth(snapshot: &ModelRuntimeSnapshot, provider: &str) -> bool {
     snapshot
         .configured_providers
@@ -2067,10 +2083,17 @@ fn list_models(list: &ListModels, takeover: bool) -> Result<i32, String> {
             eprintln!("{NO_MODELS_AVAILABLE}");
             return Ok(1);
         }
-        write_text(
-            takeover,
-            &format_no_models_available_message(&coding_agent_docs_dir()),
-        );
+        let mut message = format_no_models_available_message(&coding_agent_docs_dir());
+        if let Some(problem) = davinci_ai::AuthStorage::create()
+            .ok()
+            .and_then(|storage| davinci_ai::stored_credential_problem("openai-codex", &storage))
+        {
+            message.push_str(&format!(
+                "
+The stored openai-codex credential cannot be used: {problem}. Run /login openai-codex."
+            ));
+        }
+        write_text(takeover, &message);
         return Ok(0);
     }
     let selected = match list {
@@ -2782,6 +2805,12 @@ fn complete_prompt_with_host(
     if expired_oauth {
         auth = None;
     }
+    // A stored credential the provider refuses (a legacy Codex login after
+    // the move to Sign in with ChatGPT) would otherwise surface as "no model
+    // matched", which reads as if the account or model disappeared.
+    let credential_problem = storage
+        .as_ref()
+        .and_then(|storage| davinci_ai::stored_credential_problem(&agent.provider, storage));
     let fresh_host = existing_host.is_none();
     let host = existing_host.unwrap_or_else(|| Arc::new(Mutex::new(loaded_extension_host(parsed))));
     attach_shared_tool_executor(agent, host.clone());
@@ -3322,6 +3351,11 @@ fn complete_prompt_with_host(
                 (true, ..) => Ok(CompleteOutput::from(offline_stub_message(
                     current, last_user,
                 ))),
+                (false, _, None, _) if credential_problem.is_some() => Err(format!(
+                    "The stored {provider} credential cannot be used: {problem}. Run /login {provider}.",
+                    provider = current.provider,
+                    problem = credential_problem.as_deref().unwrap_or_default()
+                )),
                 (false, None, ..) => Err(format!(
                     "No model matched {}/{}. Run /model to choose one, or check ~/.pi/agent/models.json.",
                     current.provider, current.model_id
