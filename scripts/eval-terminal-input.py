@@ -15,6 +15,23 @@ import pyte
 from winpty import PtyProcess
 
 
+OFFLINE_CODEX_LOGIN = {
+    "type": "oauth",
+    "access": "offline-eval-access",
+    "expires": 4102444800000,
+    "env": {
+        "OPENAI_SIWC_CLIENT_ID": "oaiapp_offline_eval",
+        "OPENAI_SIWC_EXT_AGENT_HOST_ID": "urn:uuid:00000000-0000-4000-8000-000000000001",
+        "OPENAI_SIWC_ISSUER": "https://auth.openai.com",
+        "OPENAI_SIWC_SUBJECT": "offline-eval-subject",
+        "OPENAI_SIWC_EMAIL": "offline-eval@example.test",
+        "OPENAI_SIWC_ID_TOKEN": "offline-eval-id-token",
+        "OPENAI_SIWC_SCOPES": "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
+        "OPENAI_SIWC_RESOURCE": "https://api.openai.com/v1",
+    },
+}
+
+
 class Terminal:
     def __init__(self, executable, cwd, fixture, width, height, *, offline=True, extra_args=()):
         args = [executable, "--davinci", "--no-animation",
@@ -31,6 +48,12 @@ class Terminal:
         env.update(PI_CODING_AGENT_DIR=str(config), DAVINCI_CODING_AGENT_DIR=str(config))
         if offline and not fixture:
             env["OPENAI_API_KEY"] = "offline-eval-placeholder"
+            # openai-codex accepts only Sign in with ChatGPT credentials, so an
+            # API key no longer makes its models selectable. Offline runs never
+            # send this synthetic login; it only satisfies the catalog check.
+            auth = config / "auth.json"
+            if not auth.exists():
+                auth.write_text(json.dumps({"openai-codex": OFFLINE_CODEX_LOGIN}), encoding="utf-8")
         self.process = PtyProcess.spawn(
             args, cwd=cwd, dimensions=(height, width), env=env,
         )
