@@ -431,6 +431,17 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             width,
         ))
     };
+    let live = |lead: &str, body: String| {
+        let mut spans = vec![span(lead.to_string(), cc.inactive)];
+        spans.extend(super::opera::shimmer(
+            &clip_ellipsis(&body, width.saturating_sub(run_width(&spans))),
+            model.tick,
+            model.animate,
+            cc.inactive,
+            cc.inactive_shimmer,
+        ));
+        Line::from(truncate_run(spans, width))
+    };
     if let [row] = rows {
         let failed = row.state == SubagentRowState::Failed;
         let running = row.state == SubagentRowState::Running;
@@ -442,7 +453,7 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             } else {
                 format!("Initializing… · {tokens}")
             };
-            return vec![line(format!("{ELBOW}{text}"), false)];
+            return vec![live(ELBOW, text)];
         }
         if !running {
             return vec![line(format!("{ELBOW}{}", subagent_outcome(row)), failed)];
@@ -458,7 +469,11 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             .enumerate()
             .map(|(index, call)| {
                 let lead = if index == 0 { ELBOW } else { ELBOW_GAP };
-                line(format!("{lead}{call}"), false)
+                if index + 1 == shown.len() {
+                    live(lead, call.to_string())
+                } else {
+                    line(format!("{lead}{call}"), false)
+                }
             })
             .collect();
         // The live tally under the calls: `+3 more tool uses · 12.4k tokens`.
@@ -507,13 +522,20 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
         } else {
             format!("{label} · {stats}")
         };
-        let spans = vec![
-            span(format!("   {branch} "), cc.inactive),
-            span(
-                clip_ellipsis(&head, width.saturating_sub(6)),
-                if failed { cc.error } else { th.text },
-            ),
-        ];
+        let running = row.state == SubagentRowState::Running;
+        let mut spans = vec![span(format!("   {branch} "), cc.inactive)];
+        let head = clip_ellipsis(&head, width.saturating_sub(6));
+        if running {
+            spans.extend(super::opera::shimmer(
+                &head,
+                model.tick,
+                model.animate,
+                th.text,
+                cc.claude_shimmer,
+            ));
+        } else {
+            spans.push(span(head, if failed { cc.error } else { th.text }));
+        }
         out.push(Line::from(truncate_run(spans, width)));
         let detail = match row.state {
             SubagentRowState::Running => row
@@ -523,7 +545,20 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
                 .unwrap_or_else(|| "Initializing…".into()),
             _ => subagent_outcome(row),
         };
-        out.push(line(format!("   {rail}⎿  {detail}"), failed));
+        if running {
+            let mut spans = vec![span(format!("   {rail}⎿  "), cc.inactive)];
+            let room = width.saturating_sub(7);
+            spans.extend(super::opera::shimmer(
+                &clip_ellipsis(&detail, room),
+                model.tick,
+                model.animate,
+                cc.inactive,
+                cc.inactive_shimmer,
+            ));
+            out.push(Line::from(truncate_run(spans, width)));
+        } else {
+            out.push(line(format!("   {rail}⎿  {detail}"), failed));
+        }
     }
     out
 }

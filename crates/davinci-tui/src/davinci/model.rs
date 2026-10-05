@@ -382,6 +382,9 @@ pub struct Working {
     pub seconds: u64,
     /// Tokens streamed back so far — output, not context.
     pub tokens: u64,
+    /// The count drawn while animating: it rolls toward `tokens` on each
+    /// tick. `None` draws `tokens` as-is (animation off, or not yet ticked).
+    pub shown_tokens: Option<u64>,
     /// `high`, `medium`, … — `None` when the model is not thinking.
     pub thinking: Option<String>,
     /// Whether an interrupt was requested and the turn is concluding.
@@ -395,6 +398,19 @@ pub struct Working {
 }
 
 impl Working {
+    /// The token count to draw: the rolling value while one is in flight.
+    pub fn displayed_tokens(&self) -> u64 {
+        self.shown_tokens.unwrap_or(self.tokens).min(self.tokens)
+    }
+
+    /// Move the drawn count one step toward the real one. It closes a third
+    /// of the gap (at least four, or the rest) so a big jump rolls up over a
+    /// few ticks and the tail settles quickly. It never overshoots or runs back.
+    pub fn roll_tokens(&mut self) {
+        let shown = self.shown_tokens.unwrap_or(0).min(self.tokens);
+        let gap = self.tokens - shown;
+        self.shown_tokens = Some(shown + (gap / 3).max(gap.min(4)));
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -2810,8 +2826,19 @@ impl Model {
         }
     }
 
-    /// The caret blinks at ~1s, step-end, off the same clock as the spinner.
-    ///
+    /// One step of the shared 250ms clock. Besides bumping `tick`, it rolls
+    /// the working line's token counter toward its real value while
+    /// animation is on, so every event loop animates the number the same way.
+    pub fn advance_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if self.animate {
+            if let Some(working) = self.working.as_mut() {
+                working.roll_tokens();
+            }
+        }
+    }
+
+    /// The caret blinks at ~1s, step-end, off the same clock as the spinner.    ///
     /// The phase is measured from the last caret move, not from zero, so the
     /// caret is solid while it is being typed at or arrowed across and only
     /// resumes blinking a full phase after the composer goes still. A caret
