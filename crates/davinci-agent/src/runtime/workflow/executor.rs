@@ -51,6 +51,9 @@ pub struct PhaseExecutionState {
     pub completed_workers: Vec<AgentId>,
     pub failed_workers: Vec<AgentId>,
     pub retry_counts: HashMap<AgentId, usize>,
+    /// `worker-id: error` for each failed worker, so a failed phase can say why.
+    #[serde(default)]
+    pub failure_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,12 +75,23 @@ pub enum WorkflowExecutionError {
     WorkflowNotFound(WorkflowId),
     #[error("workflow is in invalid state for action: {0:?}")]
     InvalidState(WorkflowStatus),
-    #[error("phase execution failed: phase '{phase}' failed")]
-    PhaseFailed { phase: String },
+    #[error(
+        "phase execution failed: phase '{phase}' failed{}",
+        reason_suffix(reasons)
+    )]
+    PhaseFailed { phase: String, reasons: Vec<String> },
     #[error("workflow was cancelled")]
     Cancelled,
     #[error("execution error: {0}")]
     ExecutionError(String),
+}
+
+fn reason_suffix(reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", reasons.join("; "))
+    }
 }
 
 fn now_ms() -> i64 {
@@ -286,6 +300,7 @@ impl WorkflowExecutor {
                     completed_workers: Vec::new(),
                     failed_workers: Vec::new(),
                     retry_counts: HashMap::new(),
+                    failure_reasons: Vec::new(),
                 },
             );
         }
@@ -457,6 +472,7 @@ impl WorkflowExecutor {
                         completed_workers: Vec::new(),
                         failed_workers: Vec::new(),
                         retry_counts: HashMap::new(),
+                        failure_reasons: Vec::new(),
                     },
                 );
             } else {
@@ -487,6 +503,7 @@ impl WorkflowExecutor {
                         completed_workers: Vec::new(),
                         failed_workers: Vec::new(),
                         retry_counts: HashMap::new(),
+                        failure_reasons: Vec::new(),
                     },
                 );
             }
@@ -620,9 +637,27 @@ impl WorkflowExecutor {
                     return Err(self.cancelled_error(&wf_id, &spec, started));
                 }
                 if !phase_success {
-                    let err_msg = format!("Phase '{}' failed join requirements", phase.id);
+                    let reasons = self
+                        .executions
+                        .read()
+                        .ok()
+                        .and_then(|execs| {
+                            execs
+                                .get(&wf_id)
+                                .and_then(|state| state.phases.get(&phase.id))
+                                .map(|state| state.failure_reasons.clone())
+                        })
+                        .unwrap_or_default();
+                    let err_msg = format!(
+                        "Phase '{}' failed join requirements{}",
+                        phase.id,
+                        reason_suffix(&reasons)
+                    );
                     self.fail_workflow(&wf_id, &err_msg);
-                    return Err(WorkflowExecutionError::PhaseFailed { phase: phase.id });
+                    return Err(WorkflowExecutionError::PhaseFailed {
+                        phase: phase.id,
+                        reasons,
+                    });
                 }
 
                 completed_phase_ids.insert(phase.id.clone());
@@ -1038,6 +1073,7 @@ impl WorkflowExecutor {
         // Execute workers using scheduler or runner
         let mut successful_workers: Vec<AgentId> = Vec::new();
         let mut failed_workers: Vec<AgentId> = Vec::new();
+        let mut failure_reasons: Vec<String> = Vec::new();
         let requested = self
             .specs
             .read()
@@ -1142,6 +1178,7 @@ impl WorkflowExecutor {
                 }
                 Err(error) => {
                     self.runtime.registry.set_failure_reason(aid, &error);
+                    failure_reasons.push(format!("{worker_id}: {error}"));
                     if joined_early || wf_token.is_cancelled() {
                         let _ = self.runtime.registry.transition(aid, AgentState::Cancelled);
                         let _ = self.runtime.task_registry.cancel_task(tid);
@@ -1164,6 +1201,7 @@ impl WorkflowExecutor {
                 if let Some(p_state) = wf_state.phases.get_mut(&phase.id) {
                     p_state.completed_workers = successful_workers.clone();
                     p_state.failed_workers = failed_workers.clone();
+                    p_state.failure_reasons = failure_reasons.clone();
                 }
             }
         }
@@ -1248,6 +1286,49 @@ mod tests {
             .store
             .list_phase_artifacts(final_state.id, "implement");
         assert_eq!(p3_arts.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_phase_names_each_failed_worker_and_its_error() {
+        let runner = SubagentRunner::new(|req| {
+            if req.instance_name.as_deref() == Some("broken-worker") {
+                Err("worktree isolation failed: git lock held".into())
+            } else {
+                Ok("fine".into())
+            }
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let worker = |id: &str| WorkflowWorkerSpec {
+            id: id.into(),
+            prompt: "work".into(),
+            agent_profile: None,
+            model: None,
+            tools: vec!["read".into()],
+            isolation: None,
+            max_turns: None,
+            retry_budget: None,
+        };
+        let spec = WorkflowSpec {
+            schema_version: 1,
+            name: "reason-test".into(),
+            max_parallel_agents: 2,
+            max_total_agents: 2,
+            max_cost_usd: None,
+            deadline_ms: None,
+            phases: vec![WorkflowPhaseSpec {
+                id: "implement".into(),
+                depends_on: vec![],
+                join: WorkflowJoin::All,
+                workers: vec![worker("good-worker"), worker("broken-worker")],
+            }],
+        };
+        let error = executor.execute(spec).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("phase 'implement' failed (broken-worker: worktree isolation failed: git lock held)"),
+            "{message}"
+        );
+        assert!(!message.contains("good-worker"), "{message}");
     }
 
     #[test]
