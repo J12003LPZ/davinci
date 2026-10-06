@@ -2,7 +2,14 @@
 
 ## Unreleased
 
+### Removed
+- `/act`, which duplicated Shift+Tab: Shift+Tab leaves Plan Mode without approving the plan. `/plan` stays for plan review and approval (`show`, `diff`, `edit`, `reject`, `approve`, `accept [mode]`).
+- `/thinking`, which duplicated `/effort`. `/effort <level>` is the one reasoning command.
+- `/fast`. Fast applied only to the OpenAI Codex route; request it with `"serviceTier": "fast"` in user settings (or `DAVINCI_OPENAI_SERVICE_TIER=fast`). The status label and downgrade notice still report the tier.
+
 ### Fixed
+- Enter in the composer no longer swaps a typed command for a different one that merely contains it: `/act` + Enter ran `/compact`. Enter takes a suggestion only when its name begins with what you typed or you chose it with the arrows.
+- A removed command typed with arguments (`/thinking low`, `/fast on`) is answered locally with where its job went, instead of being sent to the model as a prompt.
 - Codemode admission errors name the path they checked (`Codemode Node runtime unavailable: no Node 24.21.0 at <path>`). Without it, a runtime installed in another agent directory (`~/.pi/agent` while DaVinci used `~/.davinci/agent`) failed with no clue where DaVinci looked. The docs' install example now picks the active agent directory.
 
 ## 1.1.2

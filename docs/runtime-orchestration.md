@@ -12,7 +12,7 @@ Davinci provides five distinct execution modes, each tailored to a specific oper
 
 | Mode | Entry Point / Tool | Autonomy & Lifespan | Context Model | Isolation & Mutation Boundary |
 | :--- | :--- | :--- | :--- | :--- |
-| **Normal Agent** | CLI, `/act`, interactive turn | Synchronous foreground turn loop | Monolithic conversation history with Token Governor compression and turn compaction | Shared workspace, synchronous in-turn mutation barriers |
+| **Normal Agent** | CLI, interactive turn | Synchronous foreground turn loop | Monolithic conversation history with Token Governor compression and turn compaction | Shared workspace, synchronous in-turn mutation barriers |
 | **One-Shot Subagent** | `agent` tool (`mode: "oneshot"`) | Bounded ephemeral worker | Isolated throw-away context; returns compact summary string (capped at 50 KB) | Scoped tool allowlist; read-only default; worktree lease optional |
 | **Agent Teams** | `agent` (`mode: "teammate"`), `/agents`, `task_*`, `agent_message` | Multi-agent collaborative session | Per-agent scoped context, peer mailboxes, mailbox condition-variable wakeup and idle interactive lead auto-wake | Shared runtime task board; atomic task claiming; message passing |
 | **Workflows** | `workflow_run`, `workflow_status`, `/workflow`, `/workflows` | Multi-phase repeatable DAG pipeline | Phased execution; intermediate artifacts stored outside model context in Governor-backed store | Worktree isolation required for parallel writers; join policies (All, Any, Quorum); retry budgets |

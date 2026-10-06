@@ -353,9 +353,9 @@ davinci --list-models claude
 davinci --model openai-codex/gpt-6-astra:high
 ~~~
 
-Reasoning levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; support and mapping depend on the model. Use `/thinking <level>` or its alias `/effort <level>` interactively.
+Reasoning levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; support and mapping depend on the model. Use `/effort <level>` interactively.
 
-`/fast` toggles Fast/Standard for OpenAI Codex while keeping the selected model and reasoning level. It requests a service tier, not a guaranteed latency result. Availability depends on the model/backend/account; Fast may consume subscription limits faster. See [configuration](#useful-environment-variables).
+OpenAI Codex can request the Fast service tier with the `serviceTier` setting; there is no command for it. It requests a service tier, not a guaranteed latency result. Availability depends on the model/backend/account; Fast may consume subscription limits faster. See [configuration](#useful-environment-variables).
 
 Use `/status`, `/cost`, and `/context` to inspect session state and usage. USD estimates and cached-token counts do not measure remaining included subscription allowance. Missing usage is unknown, not zero. See [subscription efficiency](docs/openai-efficiency.md).
 
@@ -446,13 +446,12 @@ The [runtime inspector](crates/davinci-coding-agent/src/runtime_inspect.rs) is r
 | `/setup`, `/setup trust` | Apply workspace setup or explicitly trust project resources. Setup can update `.gitignore`, memory/index state, and local service/model setup; review the output first. |
 | `/config` | Open the settings panel, including the Codemode switch. |
 | `/model [provider/model]` | Open model selection or switch directly. |
-| `/thinking <level>`, `/effort <level>` | Select reasoning effort. |
-| `/fast` | Toggle requested Fast/Standard speed for OpenAI Codex. |
+| `/effort <level>` | Select reasoning effort. |
 | `/login [provider]`, `/logout [provider]` | Choose/configure or remove stored provider authentication. |
 | `/permissions [mode]` | Inspect or change the approval policy. |
 | `/plan`, `/plan show`, `/plan diff` | Enter read-only planning or inspect its revisions. |
 | `/plan edit <id> <text>`, `/plan accept <id>`, `/plan reject <id>` | Edit/accept/reject plan decisions; `all` selects all decisions. |
-| `/plan approve`, `/plan accept [mode]`, `/act` | Approve a complete plan, approve and choose execution mode, or leave planning without implicit approval. |
+| `/plan approve`, `/plan accept [mode]` | Approve a complete plan, or approve and choose execution mode. Shift+Tab leaves planning without approving. |
 | `/new`, `/resume`, `/name <name>` | Start, switch, or name sessions. |
 | `/tree`, `/fork`, `/clone` | Navigate branches, fork from an earlier prompt, or duplicate the current position. |
 | `/rewind` | Restore code, conversation, or both from a recent prompt; inspect the proposed restore before accepting. |
@@ -920,10 +919,9 @@ to keep the model reminder instead. The environment switch takes precedence
 and also applies when settings are reloaded.
 
 Fast mode keeps the selected model and reasoning effort on the ChatGPT/Codex
-subscription route; no API key is required. Use `/fast` to toggle Fast and Standard
-for the active session. The choice is saved to user settings for future sessions;
-a failed save is reported as “this run only.” `/status` and the model footer show
-the requested speed. Unknown model capabilities are marked unverified; an explicit
+subscription route; no API key is required. Select it with the `serviceTier`
+setting below (there is no command). `/status` and the model footer show the
+requested speed. Unknown model capabilities are marked unverified; an explicit
 backend downgrade produces a notice without retrying the turn. Fast is available
 only for OpenAI Codex models; other providers receive no service-tier field and
 show no speed indicator.
@@ -931,8 +929,7 @@ show no speed indicator.
 In user-level `settings.json`, set `"serviceTier": "fast"`. `priority` remains an
 accepted alias and `flex` remains supported. `standard`/`default` or an omitted
 setting uses Standard, the default. Project settings cannot select the user's tier.
-`DAVINCI_OPENAI_SERVICE_TIER=fast` overrides user settings at startup; `/fast`
-overrides that input for the current session. Invalid values produce a diagnostic
+`DAVINCI_OPENAI_SERVICE_TIER=fast` overrides user settings at startup. Invalid values produce a diagnostic
 and use Standard. These settings apply to interactive, print, JSON and RPC calls;
 child agents inherit the host selection. Fast may consume subscription limits
 faster, and availability depends on the model, backend and account.

@@ -133,7 +133,7 @@ pub enum Screen {
     Models,
     /// `3b` — settings (`/config`).
     Settings,
-    /// `3c` — thinking levels (`/thinking`).
+    /// `3c` — thinking levels (`/effort`).
     Thinking,
     /// `3d` — provider credentials (`/login`).
     Login,
@@ -2504,6 +2504,10 @@ pub struct Model {
     /// dismissed (design.md §6: the most specific layer wins).
     pub suggestions: Option<AutocompleteSuggestions>,
     pub suggestion_index: usize,
+    /// Whether the user moved to the marked row with the arrows. Enter takes
+    /// a row the user chose, or one that begins with what they typed; it never
+    /// swaps `/act` for `/compact` just because the name contains it.
+    pub suggestion_picked: bool,
     pub sessions: Vec<SessionItem>,
     pub models: Vec<ModelItem>,
     /// Where the model picker says the configuration lives (`1f`).
@@ -2676,6 +2680,7 @@ impl Model {
             extra_autocomplete: Vec::new(),
             suggestions: None,
             suggestion_index: 0,
+            suggestion_picked: false,
             sessions: Vec::new(),
             models: Vec::new(),
             config_path: String::new(),
@@ -3253,6 +3258,7 @@ impl Model {
         if !self.composer_owns_focus() {
             self.suggestions = None;
             self.suggestion_index = 0;
+            self.suggestion_picked = false;
             return;
         }
         let text = self.composer.to_string();
@@ -3263,6 +3269,7 @@ impl Model {
         if awaits_first_argument(&text) && self.command_has_argument_hint(&text) {
             self.suggestions = None;
             self.suggestion_index = 0;
+            self.suggestion_picked = false;
             return;
         }
         let found = suggestions(SuggestionQuery {
@@ -3281,6 +3288,7 @@ impl Model {
         // the cap.
         self.suggestions = found;
         self.suggestion_index = 0;
+        self.suggestion_picked = false;
     }
 
     /// Whether the composer's `/command` draws an argument hint. Commands
@@ -3327,6 +3335,7 @@ impl Model {
         }
         let index = self.suggestion_index.min(len - 1) as isize;
         self.suggestion_index = (index + delta).rem_euclid(len as isize) as usize;
+        self.suggestion_picked = true;
         true
     }
 
@@ -3359,6 +3368,31 @@ impl Model {
         true
     }
 
+    /// Whether enter should take the marked row. Paths, mentions and argument
+    /// values keep fuzzy matching. A command name is only swapped for one the
+    /// user chose with the arrows or one that begins with what was typed, so
+    /// a removed or mistyped command is named rather than replaced by a
+    /// different command that merely contains it.
+    pub fn enter_takes_suggestion(&self) -> bool {
+        let Some(found) = &self.suggestions else {
+            return false;
+        };
+        let Some(item) = found.items.get(self.suggestion_index) else {
+            return false;
+        };
+        let text = self.composer.to_string();
+        let typed = text.trim_start();
+        let naming_a_command = typed.starts_with('/') && !typed.contains(char::is_whitespace);
+        if !naming_a_command || self.suggestion_picked {
+            return true;
+        }
+        let typed = typed.trim_start_matches('/').to_lowercase();
+        item.value
+            .trim_start_matches('/')
+            .to_lowercase()
+            .starts_with(&typed)
+    }
+
     /// esc with a list open closes the list rather than the screen behind it.
     pub fn dismiss_suggestions(&mut self) -> bool {
         if self.suggestions.is_none() {
@@ -3366,6 +3400,7 @@ impl Model {
         }
         self.suggestions = None;
         self.suggestion_index = 0;
+        self.suggestion_picked = false;
         true
     }
 
@@ -3807,6 +3842,29 @@ mod tests {
             .clone();
         assert!(m.accept_suggestion());
         assert_eq!(m.composer, format!("/{taken} "));
+    }
+
+    #[test]
+    fn enter_never_swaps_a_command_for_one_that_merely_contains_it() {
+        let mut m = with_commands();
+        // `/act` was removed; `/compact` contains it. Enter must send `/act`
+        // (named as not a command) rather than compact the session.
+        m.type_char("/act");
+        assert!(m.suggestions.is_some(), "/compact is offered for /act");
+        assert!(!m.enter_takes_suggestion());
+        // A row the typed text begins is still taken by enter.
+        m.composer.set_text(String::new());
+        m.refresh_suggestions();
+        m.type_char("/comp");
+        assert!(m.enter_takes_suggestion());
+        // A row chosen with the arrows is taken even when it does not
+        // begin with what was typed.
+        m.composer.set_text(String::new());
+        m.refresh_suggestions();
+        m.type_char("/act");
+        m.suggestion_move(1);
+        m.suggestion_move(-1);
+        assert!(m.enter_takes_suggestion());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! `/thinking` selector matching TS `ThinkingSelectorComponent`.
+//! `/effort` selector matching TS `ThinkingSelectorComponent`.
 
 use crate::fuzzy::fuzzy_match;
 use crate::render::Component;

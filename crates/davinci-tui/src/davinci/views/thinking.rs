@@ -1,4 +1,4 @@
-//! `/thinking`: supported levels, current state, and runtime-supplied mappings.
+//! `/effort`: supported levels, current state, and runtime-supplied mappings.
 //! Cursor movement previews a level; only the existing confirmation flow applies it.
 
 use ratatui::text::Line;

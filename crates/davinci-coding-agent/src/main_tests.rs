@@ -2698,11 +2698,11 @@ fn help_lists_product_commands() {
         slash::SlashAction::OpenModel
     ));
     assert!(matches!(
-        slash::parse_line("/thinking"),
+        slash::parse_line("/effort"),
         slash::SlashAction::SetThinking(level) if level.is_empty()
     ));
     assert!(matches!(
-        slash::parse_line("/thinking high"),
+        slash::parse_line("/effort high"),
         slash::SlashAction::SetThinking(level) if level == "high"
     ));
     assert_eq!(

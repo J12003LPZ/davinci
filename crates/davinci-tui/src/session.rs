@@ -849,13 +849,13 @@ impl InteractiveSession {
         if trimmed == "/scoped-models" {
             return SessionAction::OpenScopedModels;
         }
-        if trimmed == "/thinking"
-            || (trimmed.starts_with("/thinking ") && trimmed["/thinking ".len()..].is_empty())
+        if trimmed == "/effort"
+            || (trimmed.starts_with("/effort ") && trimmed["/effort ".len()..].is_empty())
         {
             self.open_thinking_selector(None);
             return SessionAction::OpenThinking;
         }
-        if let Some(rest) = trimmed.strip_prefix("/thinking ") {
+        if let Some(rest) = trimmed.strip_prefix("/effort ") {
             if !rest.is_empty() {
                 return SessionAction::SelectThinking(rest.to_string());
             }
@@ -2042,10 +2042,7 @@ mod tests {
         session.last_escape = Some(Instant::now());
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::OpenTree);
         session.aborted = false;
-        assert_eq!(
-            session.handle_line("/thinking"),
-            SessionAction::OpenThinking
-        );
+        assert_eq!(session.handle_line("/effort"), SessionAction::OpenThinking);
         assert!(session.chrome.thinking_selector.is_some());
         let thinking_frame = session
             .chrome
@@ -2065,7 +2062,7 @@ mod tests {
         );
         assert!(session.chrome.thinking_selector.is_none());
         assert_eq!(
-            session.handle_line("/thinking high"),
+            session.handle_line("/effort high"),
             SessionAction::SelectThinking("high".into())
         );
         session.open_trust_selector(crate::TrustSelector::new(

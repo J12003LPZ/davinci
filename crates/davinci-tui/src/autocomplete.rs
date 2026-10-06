@@ -459,7 +459,7 @@ fn argument_suggestions(
     }
     let pool = match command {
         "model" => models,
-        "thinking" | "effort" => thinking_levels,
+        "effort" => thinking_levels,
         "login" => login_providers,
         _ => return None,
     };
@@ -1174,8 +1174,8 @@ mod tests {
                 argument_items: Vec::new(),
             },
             SlashCommandSpec {
-                name: "thinking".into(),
-                description: "Set thinking".into(),
+                name: "effort".into(),
+                description: "Set reasoning effort".into(),
                 argument_hint: Some("<level>".into()),
                 argument_items: Vec::new(),
             },

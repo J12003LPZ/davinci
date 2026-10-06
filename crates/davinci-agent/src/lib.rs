@@ -594,7 +594,7 @@ pub struct Agent {
     pruned_tool_results: std::collections::HashSet<String>,
     pruned_evidence: std::collections::HashMap<String, (PathBuf, String)>,
     base_system_prompt: String,
-    /// Return target for /act, not another active mode.
+    /// The mode leaving Plan Mode returns to, not another active mode.
     previous_execution_mode: Option<PermissionMode>,
     auto_sandbox: Option<davinci_protocol::SandboxSpec>,
     auto_sandbox_resolver: Option<AutoSandboxResolverHandle>,

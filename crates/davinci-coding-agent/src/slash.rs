@@ -9,6 +9,24 @@ pub struct SlashCommand {
     pub source: String,
 }
 
+/// Commands that existed once, with where their job went. Typed with or
+/// without arguments they are answered locally: `/thinking low` reaching the
+/// model as a prompt would spend a turn on a command that no longer exists.
+pub const RETIRED_COMMANDS: &[(&str, &str)] = &[
+    ("thinking", "use /effort"),
+    ("fast", "set \"serviceTier\" in settings"),
+    ("act", "Shift+Tab leaves Plan Mode"),
+    ("settings", "use /config"),
+];
+
+/// Where a retired command's job went, when `name` is one.
+pub fn retired_command_hint(name: &str) -> Option<&'static str> {
+    RETIRED_COMMANDS
+        .iter()
+        .find(|(retired, _)| retired.eq_ignore_ascii_case(name))
+        .map(|(_, hint)| *hint)
+}
+
 pub fn builtin_slash_commands() -> Vec<SlashCommand> {
     [
         (
@@ -16,23 +34,17 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Analyze this project and create or update AGENTS.md",
             Some("[focus]"),
         ),
-        ("fast", "Toggle Fast mode for OpenAI Codex", None),
         ("config", "Open configuration", None),
         (
             "model",
             "Select model (opens selector UI)",
             Some("<provider/model>"),
         ),
-        (
-            "thinking",
-            "Set reasoning level",
-            Some("<off|minimal|low|medium|high|xhigh|max>"),
-        ),
         // The composer rule advertises `/effort` on every screen; it was not a
         // command, so following the hint printed "not a command".
         (
             "effort",
-            "Set reasoning effort (alias for /thinking)",
+            "Set reasoning effort",
             Some("<off|minimal|low|medium|high|xhigh|max>"),
         ),
         ("tree", "Navigate session tree (switch branches)", None),
@@ -103,11 +115,6 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             Some("[show|diff|edit <id> <text>|reject|accept [mode]]"),
         ),
         (
-            "act",
-            "Leave Plan Mode without implicitly approving a plan",
-            None,
-        ),
-        (
             "workflow",
             "Workflow runs: list, status <id>, cancel <id>",
             Some("[status <id>|cancel <id>]"),
@@ -152,7 +159,6 @@ pub enum SlashAction {
     OpenModel,
     SetModel(String),
     SetThinking(String),
-    ToggleFast,
     Export(Option<String>),
     Login {
         provider: String,
@@ -231,8 +237,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         }),
         "model" if args.is_empty() => SlashAction::OpenModel,
         "model" => SlashAction::SetModel(args.to_string()),
-        "thinking" | "effort" => SlashAction::SetThinking(args.to_string()),
-        "fast" if args.is_empty() => SlashAction::ToggleFast,
+        "effort" => SlashAction::SetThinking(args.to_string()),
         "export" => SlashAction::Export(if args.is_empty() {
             None
         } else {
@@ -415,14 +420,24 @@ mod tests {
 
     #[test]
     fn session_stats_and_info_subcommands_route_to_session_info() {
-        assert_eq!(parse_line("/fast"), SlashAction::ToggleFast);
         assert_eq!(parse_line("/session info"), SlashAction::SessionInfo);
         assert_eq!(parse_line("/session stats"), SlashAction::SessionInfo);
     }
 
     #[test]
     fn retired_commands_are_not_registered_or_dispatched() {
-        let retired = ["llama", "trust", "changelog", "scoped-models"];
+        // `/thinking` duplicated `/effort`; `/fast` only ever applied to the
+        // Codex route and the tier now lives in the `serviceTier` setting.
+        let retired = [
+            "llama",
+            "trust",
+            "changelog",
+            "scoped-models",
+            "thinking",
+            "fast",
+            // Shift+Tab leaves Plan Mode; /plan keeps plan review and approval.
+            "act",
+        ];
         let names = builtin_slash_commands()
             .into_iter()
             .map(|command| command.name)
@@ -438,7 +453,7 @@ mod tests {
     #[test]
     fn permission_and_plan_commands_are_advertised_for_host_owned_dispatch() {
         let commands = builtin_slash_commands();
-        for name in ["permissions", "plan", "act"] {
+        for name in ["permissions", "plan"] {
             assert_eq!(
                 commands
                     .iter()
@@ -453,21 +468,17 @@ mod tests {
     }
 
     #[test]
-    fn thinking_command_sets_every_supported_level() {
+    fn effort_command_sets_every_supported_level() {
         let names = builtin_slash_commands()
             .into_iter()
             .map(|command| command.name)
             .collect::<Vec<_>>();
-        assert!(names.iter().any(|name| name == "thinking"));
-
         assert!(names.iter().any(|name| name == "effort"));
         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
-            for command in ["thinking", "effort"] {
-                assert_eq!(
-                    parse_line(&format!("/{command} {level}")),
-                    SlashAction::SetThinking(level.into())
-                );
-            }
+            assert_eq!(
+                parse_line(&format!("/effort {level}")),
+                SlashAction::SetThinking(level.into())
+            );
         }
     }
 

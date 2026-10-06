@@ -2256,9 +2256,9 @@ fn init_starts_a_repository_analysis_prompt() {
 }
 
 #[test]
-fn thinking_command_reaches_the_agent_for_every_supported_level() {
+fn effort_command_reaches_the_agent_for_every_supported_level() {
     for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
-        let command = format!("/thinking {level}");
+        let command = format!("/effort {level}");
         assert!(matches!(
             classify(&command),
             Sent::Command(crate::slash::SlashAction::SetThinking(value)) if value == level
@@ -2266,7 +2266,7 @@ fn thinking_command_reaches_the_agent_for_every_supported_level() {
     }
     assert!(crate::slash::builtin_slash_commands()
         .iter()
-        .any(|command| command.name == "thinking"));
+        .any(|command| command.name == "effort"));
 }
 
 #[test]
@@ -2286,7 +2286,7 @@ fn every_builtin_command_reaches_the_agent_rather_than_the_model() {
         "/import a.jsonl",
         "/share",
         "/session",
-        "/thinking high",
+        "/effort high",
         "/mcp",
         "/cost",
         "/status",
@@ -2613,6 +2613,20 @@ fn a_slash_nobody_owns_is_named_rather_than_sent_to_the_model() {
     // Nothing close: still say what to press.
     let note = unknown_command(&m, "/zzzz").expect("not a command");
     assert!(note.contains("ctrl+p"), "{note}");
+
+    // A retired command is caught with its old arguments too, and names
+    // where its job went, so `/thinking low` never reaches the model.
+    for (line, hint) in [
+        ("/thinking low", "/effort"),
+        ("/thinking", "/effort"),
+        ("/fast on", "serviceTier"),
+        ("/act", "Shift+Tab"),
+        ("/settings", "/config"),
+    ] {
+        let note = unknown_command(&m, line).expect("retired");
+        assert!(note.contains("is not a command"), "{note}");
+        assert!(note.contains(hint), "{line}: {note}");
+    }
 }
 
 #[test]
@@ -2687,7 +2701,10 @@ fn the_palette_lists_every_command_the_composer_completes() {
     assert!(names.contains(&"/jobs"), "{names:?}");
     assert!(names.contains(&"/mcp"), "{names:?}");
     assert!(names.contains(&"/plan"), "{names:?}");
-    assert!(names.contains(&"/act"), "{names:?}");
+    // Shift+Tab leaves Plan Mode; the duplicate commands are gone.
+    for retired in ["/act", "/fast", "/thinking", "/settings"] {
+        assert!(!names.contains(&retired), "{names:?}");
+    }
     assert!(names.contains(&"/cost"), "{names:?}");
     assert!(names.contains(&"/status"), "{names:?}");
     assert!(names.contains(&"/agents"), "{names:?}");

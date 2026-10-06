@@ -894,7 +894,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::Mensura => Some("/mensura policy frugal"),
         Screen::Models => Some("/model anthropic/claude-opus"),
         Screen::Settings => Some("/config"),
-        Screen::Thinking => Some("/thinking high"),
+        Screen::Thinking => Some("/effort high"),
         Screen::Login => Some("/login openai"),
         Screen::Keys => Some("/hotkeys"),
         Screen::Resume => Some("/resume provider-parity"),
@@ -1267,7 +1267,7 @@ mod tests {
         let mut m = model(140);
         m.model_names = vec!["openai-codex / gpt-6-astra".into()];
         m.thinking_levels = vec!["low".into(), "high".into()];
-        m.slash_commands = ["model", "thinking"]
+        m.slash_commands = ["model", "effort"]
             .into_iter()
             .map(|name| crate::autocomplete::SlashCommandSpec {
                 name: name.into(),
@@ -1275,7 +1275,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        for text in ["/model ", "/model   ", "/thinking "] {
+        for text in ["/model ", "/model   ", "/effort "] {
             m.composer.set_text(text);
             m.refresh_suggestions();
             assert!(m.suggestions.is_none(), "{text:?} opened a list");
@@ -1283,7 +1283,7 @@ mod tests {
         }
         // No hint to show: the value list is the only discovery surface.
         m.slash_commands[1].argument_hint = None;
-        m.composer.set_text("/thinking ");
+        m.composer.set_text("/effort ");
         m.refresh_suggestions();
         assert!(m.suggestions.is_some(), "hintless command lost its values");
         // A newline anywhere means it is not a bare command line.
