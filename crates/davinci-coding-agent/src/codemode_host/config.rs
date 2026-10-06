@@ -73,18 +73,29 @@ impl ReadOnlyConfig {
         let workspace = workspace
             .canonicalize()
             .map_err(|_| "Codemode workspace unavailable")?;
-        let node = self
-            .node_path
-            .canonicalize()
-            .map_err(|_| "Codemode Node runtime unavailable")?;
+        let node = self.node_path.canonicalize().map_err(|_| {
+            format!(
+                "Codemode Node runtime unavailable: no Node 24.21.0 at {}",
+                self.node_path.display()
+            )
+        })?;
         if node.starts_with(&workspace) {
             return Err("Workspace-provided Node runtime is not admitted".into());
         }
         let manifest = trusted_manifest()
             .map_err(|error| format!("Codemode manifest unavailable: {error}"))?;
         let assets = HostAssets::validate_installation(&self.host_path, &workspace, &manifest)
-            .map_err(|error| format!("Codemode host admission failed: {error}"))?;
-        NodeCodeModeHost::new(&self.node_path, assets)
-            .map_err(|error| format!("Codemode runtime admission failed: {error}"))
+            .map_err(|error| {
+                format!(
+                    "Codemode host admission failed at {}: {error}",
+                    self.host_path.display()
+                )
+            })?;
+        NodeCodeModeHost::new(&self.node_path, assets).map_err(|error| {
+            format!(
+                "Codemode runtime admission failed at {}: {error}",
+                self.node_path.display()
+            )
+        })
     }
 }

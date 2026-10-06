@@ -35,8 +35,10 @@ When settings name no paths, DaVinci looks in your agent directory:
 | `<agent dir>/codemode/node/node.exe` (Windows) or `<agent dir>/codemode/node/bin/node` | Node.js 24.21.0 |
 | `<agent dir>/codemode/host` | The Codemode host bundle |
 
-The agent directory is `~/.davinci/agent` (or the legacy `~/.pi/agent` when that
-is the one in use, or `DAVINCI_CODING_AGENT_DIR`).
+The agent directory is `DAVINCI_CODING_AGENT_DIR` when set, otherwise
+`~/.davinci/agent` when it exists, otherwise the legacy `~/.pi/agent`. A stored
+login may still be read from `~/.pi/agent`, but settings and the Codemode
+runtime use the agent directory. Every Codemode error names the path it checked.
 
 To use other locations, add absolute paths next to the mode:
 
@@ -52,7 +54,7 @@ Run from a DaVinci source checkout at the same version as your installed binary,
 so the bundle matches its manifest. Replace `AGENT` with your agent directory.
 
 ```bash
-AGENT="$HOME/.pi/agent"            # or ~/.davinci/agent
+AGENT="$HOME/.davinci/agent"; [ -d "$AGENT" ] || AGENT="$HOME/.pi/agent"
 mkdir -p "$AGENT/codemode" && cd "$AGENT/codemode"
 curl -fsSLO https://nodejs.org/dist/v24.21.0/node-v24.21.0-win-x64.zip
 curl -fsSLO https://nodejs.org/dist/v24.21.0/SHASUMS256.txt
@@ -78,8 +80,8 @@ Rebuild the bundle after upgrading DaVinci if its manifest changed.
 | Message | Meaning |
 | --- | --- |
 | `Codemode on: available from the next prompt` | `/config` switched it on and the runtime was admitted. |
-| `Codemode stays off: Codemode Node runtime unavailable` | No Node at the configured or managed path. Install the runtime. |
-| `Codemode stays off: Codemode runtime admission failed: Codemode requires the admitted Node 24.21.0 runtime` | Another Node version is configured. |
-| `Codemode stays off: Codemode host admission failed: ...` | The bundle is missing or does not match this DaVinci's manifest. Rebuild it. |
+| `Codemode stays off: Codemode Node runtime unavailable: no Node 24.21.0 at <path>` | No Node at that path. Install the runtime there, or set `nodePath`. |
+| `Codemode stays off: Codemode runtime admission failed at <path>: Codemode requires the admitted Node 24.21.0 runtime` | Another Node version is at that path. |
+| `Codemode stays off: Codemode host admission failed at <path>: ...` | The bundle there is missing or does not match this DaVinci's manifest. Rebuild it. |
 | `Codemode is on in /config but stays off: ...` | Printed at startup when the switch is on but the runtime or session is unavailable; DaVinci starts without Codemode. |
 | `Codemode records its operations in the session journal; remove --no-session to use it` | Codemode with `--no-session`. With `--codemode` this stops the run. |
