@@ -159,6 +159,17 @@ pub fn resolve(origin: Origin, key: &str) -> Option<ExternalPlugin> {
 }
 
 /// Marketplace directories Claude Code and Codex already keep on disk.
+/// The GitHub `owner/repo` Claude Code records for its marketplace `name`
+/// in `known_marketplaces.json`, when it came from GitHub.
+pub fn claude_marketplace_repo(name: &str) -> Option<String> {
+    let known = claude_dir()
+        .and_then(|dir| read_json(&dir.join("plugins").join("known_marketplaces.json")))?;
+    let source = known.get(name)?.get("source")?;
+    (source.get("source")?.as_str()? == "github")
+        .then(|| source.get("repo")?.as_str().map(str::to_string))
+        .flatten()
+}
+
 pub fn marketplace_dirs() -> Vec<(String, PathBuf, &'static str)> {
     let mut out = Vec::new();
     if let Some(known) =

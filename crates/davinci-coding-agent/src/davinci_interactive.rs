@@ -5954,12 +5954,13 @@ fn marketplace_rows(agent_dir: &std::path::Path) -> Vec<ExtensionRow> {
     use davinci_coding_agent::plugins::{discover, marketplace};
     let registry = marketplace::load_registry(agent_dir).unwrap_or_default();
     let mut catalogs = marketplace::catalogs(agent_dir).unwrap_or_default();
-    catalogs.sort_by_key(|catalog| !discover::is_builtin(&catalog.name));
+    let builtins = discover::genuine_builtins(agent_dir);
+    catalogs.sort_by_key(|catalog| !builtins.contains(&catalog.name));
     catalogs
         .into_iter()
         .map(|catalog| {
             let own = catalog.from == "davinci";
-            let builtin = discover::is_builtin(&catalog.name);
+            let builtin = builtins.contains(&catalog.name);
             let source = registry
                 .get(&catalog.name)
                 .map(|entry| entry.source.describe())

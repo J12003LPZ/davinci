@@ -79,9 +79,94 @@ pub const FEATURED_MCP: &[&str] = &[
     "com.apify/apify-mcp-server",
 ];
 
-/// Whether `name` is one of the built-in marketplaces.
-pub fn is_builtin(name: &str) -> bool {
-    builtin_sources().iter().any(|(builtin, _)| builtin == name)
+/// The fetch URL of a git checkout, from `.git/config` (`[remote "origin"]`).
+fn git_origin(root: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(root.join(".git").join("config")).ok()?;
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_origin = line == r#"[remote "origin"]"#;
+        } else if in_origin {
+            if let Some(url) = line.strip_prefix("url").map(str::trim_start) {
+                if let Some(url) = url.strip_prefix('=') {
+                    return Some(url.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `owner/repo` of a GitHub URL in any of its spellings, lower-cased.
+fn github_repo(url: &str) -> Option<String> {
+    let lower = url.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://github.com/")
+        .or_else(|| lower.strip_prefix("http://github.com/"))
+        .or_else(|| lower.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| lower.strip_prefix("git@github.com:"))?;
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() => {
+            Some(format!("{owner}/{repo}"))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a catalog really comes from `expected`: what DaVinci registered,
+/// or where another tool's checkout fetches from. A marketplace that merely
+/// calls itself `claude-plugins-official` is not the global one.
+fn genuine(
+    catalog: &marketplace::Catalog,
+    expected: &marketplace::MarketplaceSource,
+    registry: &marketplace::Registry,
+) -> bool {
+    use marketplace::MarketplaceSource;
+    if catalog.from == "davinci" {
+        return registry
+            .get(&catalog.name)
+            .is_some_and(|entry| entry.source == *expected);
+    }
+    match expected {
+        MarketplaceSource::Github { repo } => {
+            let wanted = repo.to_ascii_lowercase();
+            // Claude Code downloads its marketplaces without git and records
+            // where each came from; a git checkout says so in its origin.
+            let declared = catalog.from == "claude"
+                && super::external::claude_marketplace_repo(&catalog.name)
+                    .is_some_and(|declared| declared.to_ascii_lowercase() == wanted);
+            declared
+                || git_origin(&catalog.root)
+                    .and_then(|url| github_repo(&url))
+                    .is_some_and(|found| found == wanted)
+        }
+        MarketplaceSource::Git { url } => git_origin(&catalog.root).as_deref() == Some(url),
+        MarketplaceSource::Directory { path } => catalog
+            .root
+            .canonicalize()
+            .ok()
+            .zip(path.canonicalize().ok())
+            .is_some_and(|(root, path)| root == path),
+    }
+}
+
+/// The built-in marketplaces that are present with their genuine source:
+/// only these are labelled "built in" and listed first.
+pub fn genuine_builtins(agent_dir: &Path) -> BTreeSet<String> {
+    let registry = marketplace::load_registry(agent_dir).unwrap_or_default();
+    let catalogs = marketplace::catalogs(agent_dir).unwrap_or_default();
+    builtin_sources()
+        .into_iter()
+        .filter_map(|(name, spec)| {
+            let expected = marketplace::parse_source(&spec, agent_dir).ok()?;
+            let catalog = catalogs.iter().find(|catalog| catalog.name == name)?;
+            genuine(catalog, &expected, &registry).then_some(name)
+        })
+        .collect()
 }
 
 /// The built-in marketplaces, unless `DAVINCI_BUILTIN_MARKETPLACES`
@@ -116,14 +201,27 @@ pub fn ensure_builtin_from(
     now_ms: u64,
 ) -> Result<Vec<String>, String> {
     let registry = marketplace::load_registry(agent_dir)?;
-    let known: BTreeSet<String> = marketplace::catalogs(agent_dir)?
-        .into_iter()
-        .map(|catalog| catalog.name)
-        .collect();
+    let catalogs = marketplace::catalogs(agent_dir)?;
     let mut lines = Vec::new();
     let mut failures = Vec::new();
     for (name, source) in sources {
+        let expected = match marketplace::parse_source(source, cwd) {
+            Ok(expected) => expected,
+            Err(err) => {
+                failures.push(format!("{source}: {err}"));
+                continue;
+            }
+        };
         if let Some(entry) = registry.get(name) {
+            if entry.source != expected {
+                // The user's own marketplace holds the name; never replace it,
+                // and never call it the global one.
+                failures.push(format!(
+                    "a marketplace you added is named {name} but comes from {}, not {source}",
+                    entry.source.describe()
+                ));
+                continue;
+            }
             let pullable = !matches!(
                 entry.source,
                 marketplace::MarketplaceSource::Directory { .. }
@@ -136,7 +234,12 @@ pub fn ensure_builtin_from(
             }
             continue;
         }
-        if known.contains(name) {
+        // Claude Code's or Codex's genuine clone is enough; an impostor with
+        // the same name is not, and DaVinci's own copy takes precedence.
+        if catalogs
+            .iter()
+            .any(|catalog| catalog.name == *name && genuine(catalog, &expected, &registry))
+        {
             continue;
         }
         match marketplace::add(agent_dir, source, cwd) {
@@ -227,8 +330,9 @@ fn plugin_listings(agent_dir: &Path) -> Vec<Listing> {
     let Ok(mut catalogs) = marketplace::catalogs(agent_dir) else {
         return Vec::new();
     };
-    // The global marketplaces lead; private ones follow.
-    catalogs.sort_by_key(|catalog| !is_builtin(&catalog.name));
+    // The genuine global marketplaces lead; private ones follow.
+    let builtins = genuine_builtins(agent_dir);
+    catalogs.sort_by_key(|catalog| !builtins.contains(&catalog.name));
     let mut out = Vec::new();
     for catalog in catalogs {
         for entry in catalog.entries() {
@@ -1368,13 +1472,94 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(is_builtin("claude-plugins-official"));
+        assert_eq!(
+            github_repo("git@github.com:Anthropics/claude-plugins-official.git").as_deref(),
+            Some("anthropics/claude-plugins-official")
+        );
+        assert_eq!(github_repo("https://evil.example/anthropics/x"), None);
         // One that cannot be fetched is reported, the others still apply.
         let broken = vec![(
             "missing".to_string(),
             agent.path().join("nope").display().to_string(),
         )];
         assert!(ensure_builtin_from(agent.path(), agent.path(), &broken, now).is_err());
+    }
+
+    #[test]
+    fn a_marketplace_named_like_a_builtin_is_not_the_builtin() {
+        let agent = tempfile::tempdir().unwrap();
+        let catalog = |dir: &Path, name: &str| {
+            std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+            std::fs::write(
+                dir.join(".claude-plugin").join("marketplace.json"),
+                format!(r#"{{"name": "{name}", "plugins": [{{"name": "p"}}]}}"#),
+            )
+            .unwrap();
+        };
+        let real = tempfile::tempdir().unwrap();
+        let impostor = tempfile::tempdir().unwrap();
+        catalog(real.path(), "global");
+        catalog(impostor.path(), "global");
+        // The user added an impostor under the built-in's name first.
+        crate::plugins::command::run(
+            &[
+                "marketplace".into(),
+                "add".into(),
+                impostor.path().display().to_string(),
+            ],
+            agent.path(),
+            agent.path(),
+        )
+        .unwrap();
+        let sources = vec![("global".to_string(), real.path().display().to_string())];
+        let error =
+            ensure_builtin_from(agent.path(), agent.path(), &sources, store::now_ms()).unwrap_err();
+        assert!(
+            error.contains("a marketplace you added is named global"),
+            "{error}"
+        );
+        // Its source is not the built-in's, so it is never labelled built in.
+        let registry = marketplace::load_registry(agent.path()).unwrap();
+        let expected = marketplace::parse_source(&sources[0].1, agent.path()).unwrap();
+        let catalogs = marketplace::catalogs(agent.path()).unwrap();
+        let found = catalogs.iter().find(|c| c.name == "global").unwrap();
+        assert!(!genuine(found, &expected, &registry));
+        // The genuine one, once registered, is.
+        crate::plugins::command::run(
+            &["marketplace".into(), "remove".into(), "global".into()],
+            agent.path(),
+            agent.path(),
+        )
+        .unwrap();
+        ensure_builtin_from(agent.path(), agent.path(), &sources, store::now_ms()).unwrap();
+        let registry = marketplace::load_registry(agent.path()).unwrap();
+        let catalogs = marketplace::catalogs(agent.path()).unwrap();
+        let found = catalogs.iter().find(|c| c.name == "global").unwrap();
+        assert!(genuine(found, &expected, &registry));
+        // Another tool's checkout counts only when its origin is the repo.
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
+        std::fs::write(
+            checkout.path().join(".git").join("config"),
+            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://github.com/evil/claude-plugins-official.git\n",
+        )
+        .unwrap();
+        let foreign = marketplace::Catalog {
+            name: "claude-plugins-official".into(),
+            root: checkout.path().to_path_buf(),
+            from: "claude",
+            document: json!({}),
+        };
+        let official = marketplace::MarketplaceSource::Github {
+            repo: "anthropics/claude-plugins-official".into(),
+        };
+        assert!(!genuine(&foreign, &official, &registry));
+        std::fs::write(
+            checkout.path().join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:anthropics/claude-plugins-official.git\n",
+        )
+        .unwrap();
+        assert!(genuine(&foreign, &official, &registry));
     }
 
     #[test]
