@@ -112,9 +112,9 @@ class ReleaseIdentityTests(unittest.TestCase):
             sha, ci = self.evidence()
             source = {"source_sha": sha, "source_tree": "b" * 40, "source_clean": True,
                       "dirty_diff_hash": release_identity.CLEAN_DIFF_HASH}
-            identity = release_identity.make_identity(binary, source, ci, "v1.1.2")
+            identity = release_identity.make_identity(binary, source, ci, "v1.1.3")
             self.assertEqual(identity["schema_version"], 3)
-            self.assertEqual(identity["release_tag"], "v1.1.2")
+            self.assertEqual(identity["release_tag"], "v1.1.3")
             self.assertEqual(identity["ci_run"], 12)
             self.assertEqual(identity["binary_sha256"], release_identity.file_hash(binary))
             for bad in (None, "v0.0.0", "1.0.71"):

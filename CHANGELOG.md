@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.1.3
+
+Changes since `v1.1.2`.
 
 ### Added
 - A system prompt for each GPT-6 model. Sol and 6.1 Sol look for the root cause before patching; Luna works one focused job at a time; Astra keeps its lean policy. All three share GPT-6 rules for tools, delegation and answer style, which replace the generic OpenAI adapter. See [docs/prompt-engineering.md](docs/prompt-engineering.md#gpt-6-family-policies).
@@ -25,7 +27,7 @@
 
 ## 1.1.2
 
-Changes since `v1.1.1`.
+Changes since `v1.1.1`. Tagged `v1.1.2` at `5b7ba537`.
 
 ### Added
 - `/config` has a **Codemode** switch. On, the model can run sandboxed read-only JavaScript over your tools from the next prompt; off removes the tool. Without explicit `nodePath`/`hostPath`, the runtime is expected in `<agent dir>/codemode` (Node 24.21.0 in `node/`, the host bundle in `host/`). See [docs/codemode.md](docs/codemode.md).
