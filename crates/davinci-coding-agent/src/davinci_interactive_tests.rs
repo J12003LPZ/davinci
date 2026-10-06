@@ -307,6 +307,46 @@ fn theme_setting_persists_and_recolors_the_current_session() {
 }
 
 #[test]
+fn vox_theme_from_config_recolors_into_the_editorial_palette() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut m = model();
+    let dark = m.theme;
+    let mut row = SettingRow {
+        key: "theme".into(),
+        value: "light".into(),
+        values: vec!["dark".into(), "light".into(), "vox".into()],
+        ..SettingRow::default()
+    };
+    let next = persist_setting_row(&mut row, |assignment| {
+        assert_eq!(assignment, "theme=vox");
+        let stored = crate::settings::Settings {
+            theme: Some("vox".into()),
+            ..Default::default()
+        };
+        crate::settings::save_settings(dir.path(), &stored)
+    })
+    .unwrap();
+    assert_eq!(next, "vox");
+    let stored = crate::settings::load_settings(dir.path());
+    apply_theme_setting(&mut m, &stored);
+    // Regression: "vox" was listed in /config but rendered the dark palette.
+    assert!(m.theme.is_vox());
+    assert_ne!(m.theme, dark);
+    let mut restarted = model();
+    apply_theme_setting(&mut restarted, &stored);
+    assert_eq!(restarted.theme, m.theme);
+    // The ramp wraps back to dark, and dark is exactly the old palette.
+    persist_setting_row(&mut row, |_| Ok(())).unwrap();
+    assert_eq!(row.value, "dark");
+    let back = crate::settings::Settings {
+        theme: Some(row.value.clone()),
+        ..Default::default()
+    };
+    apply_theme_setting(&mut m, &back);
+    assert_eq!(m.theme, dark);
+}
+
+#[test]
 fn failed_setting_persistence_does_not_change_the_displayed_row() {
     let mut row = SettingRow {
         label: "Auto compact".into(),
