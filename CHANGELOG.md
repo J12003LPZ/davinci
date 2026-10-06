@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- `/skills`, `/plugins` and `/mcp`, one manager each, like Claude Code. Installed lists what DaVinci loads with update, enable/disable, hook approval and delete. Discover is a search bar: plugins from your marketplaces, skills from your marketplaces and skills.sh, MCP servers from the official MCP Registry; Enter twice installs. `/plugins` also adds, refreshes and removes marketplaces. `/skills pdf` opens Discover with the search typed in. An MCP server's secrets come from variables named for it (`DAVINCI_MCP_<SERVER>_<NAME>`), so a registry entry cannot ask for a host secret such as `AWS_SECRET_ACCESS_KEY`; the result row shows what it runs or contacts before you confirm.
+- `/skills`, `/plugins` and `/mcp`, one manager each, like Claude Code. Installed lists what DaVinci loads with update, enable/disable, hook approval and delete. Discover is a search bar: plugins from your marketplaces, skills from your marketplaces and skills.sh, MCP servers from the official MCP Registry; Enter twice installs. `/plugins` also adds, refreshes and removes marketplaces. `/skills pdf` opens Discover with the search typed in. An MCP server's secrets come from variables named for it (`DAVINCI_MCP_<SERVER>__<NAME>`), so a registry entry cannot ask for a host secret such as `AWS_SECRET_ACCESS_KEY`; the result row shows what it runs or contacts before you confirm.
 - Escape twice clears a draft in the composer, as in Claude Code; `↑` brings it back. The first Escape says "esc again to clear".
 
 ### Removed

@@ -5935,7 +5935,8 @@ fn open_extension_manager(
         sheet.discover.query = query.to_string();
     }
     if wants_discover {
-        discover::search(model, tab, query, &crate::default_agent_dir());
+        let (_, files) = extension_scope(parsed, agent);
+        discover::search(model, tab, query, &crate::default_agent_dir(), &files.user);
     }
 }
 
@@ -6233,7 +6234,7 @@ fn install_listing(shell: &mut Shell<'_>, tab: ExtensionTab, key: &str) -> Next 
         .as_ref()
         .map(|sheet| sheet.discover.query.clone())
         .unwrap_or_default();
-    discover::search(shell.model, tab, &query, &agent_dir);
+    discover::search(shell.model, tab, &query, &agent_dir, &files.user);
     Next::Go
 }
 
@@ -9131,7 +9132,14 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             apply_extension_action(shell, action, tab, &key)
         }
         Choice::ExtensionSearch { tab, query } => {
-            discover::search(shell.model, tab, &query, &crate::default_agent_dir());
+            let (_, files) = extension_scope(shell.parsed, shell.agent);
+            discover::search(
+                shell.model,
+                tab,
+                &query,
+                &crate::default_agent_dir(),
+                &files.user,
+            );
             Next::Go
         }
         Choice::ExtensionInstall { tab, key } => install_listing(shell, tab, &key),

@@ -7,7 +7,7 @@
 
 use davinci_coding_agent::plugins::discover::{self, Kind, Listing};
 use davinci_tui::davinci::model::{ExtensionRow, ExtensionTab, Model};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
@@ -26,6 +26,8 @@ struct State {
     shown: BTreeMap<String, Listing>,
     /// The local half of the current results, kept while the online half is out.
     pending_local: Vec<Listing>,
+    /// Registry servers already in the user `mcp.json`, by registry name.
+    registry_installed: BTreeSet<String>,
     sender: Sender<Reply>,
     receiver: Receiver<Reply>,
 }
@@ -39,6 +41,7 @@ fn state() -> &'static Mutex<State> {
             local: BTreeMap::new(),
             shown: BTreeMap::new(),
             pending_local: Vec::new(),
+            registry_installed: BTreeSet::new(),
             sender,
             receiver,
         })
@@ -92,7 +95,7 @@ fn thousands(value: u64) -> String {
     out
 }
 
-pub(super) fn row(listing: &Listing) -> ExtensionRow {
+pub(super) fn row(listing: &Listing, configured: &BTreeSet<String>) -> ExtensionRow {
     let mut detail = listing.description.lines().next().unwrap_or("").to_string();
     if detail.chars().count() > 160 {
         detail = format!("{}…", detail.chars().take(160).collect::<String>());
@@ -109,7 +112,7 @@ pub(super) fn row(listing: &Listing) -> ExtensionRow {
         // A registry server says what it runs or contacts and which
         // variables it reads, before the second enter installs it.
         note: match (&listing.payload, listing.key.starts_with("registry:")) {
-            (Some(server), true) => Some(discover::mcp_preview(server)),
+            (Some(server), true) => Some(discover::mcp_preview(server, configured)),
             _ => listing
                 .installs
                 .map(|count| format!("{} installs", thousands(count))),
@@ -132,7 +135,7 @@ fn merge(local: &[Listing], remote: &[Listing]) -> Vec<Listing> {
 
 fn show(model: &mut Model, listings: &[Listing], state: &mut State) {
     // A registry server whose name is already configured is installed.
-    let configured: std::collections::BTreeSet<String> = model
+    let configured: BTreeSet<String> = model
         .extension_manager
         .as_ref()
         .map(|sheet| sheet.mcp.iter().map(|row| row.key.clone()).collect())
@@ -147,7 +150,7 @@ fn show(model: &mut Model, listings: &[Listing], state: &mut State) {
                 .filter(|_| listing.key.starts_with("registry:"))
             {
                 let name = server.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                listing.installed = configured.contains(&discover::server_name(name));
+                listing.installed = state.registry_installed.contains(name);
             }
             listing
         })
@@ -159,7 +162,10 @@ fn show(model: &mut Model, listings: &[Listing], state: &mut State) {
         .collect();
     if let Some(sheet) = model.extension_manager.as_mut() {
         let selected = sheet.discover.current().map(|row| row.key.clone());
-        sheet.discover.results = listings.iter().map(row).collect();
+        sheet.discover.results = listings
+            .iter()
+            .map(|listing| row(listing, &configured))
+            .collect();
         // Keep the selection on the same result when it is still listed.
         sheet.discover.selected = selected
             .and_then(|key| sheet.discover.results.iter().position(|row| row.key == key))
@@ -168,9 +174,16 @@ fn show(model: &mut Model, listings: &[Listing], state: &mut State) {
 }
 
 /// Answer the query now from local catalogs; ask online directories later.
-pub(super) fn search(model: &mut Model, tab: ExtensionTab, query: &str, agent_dir: &Path) {
+pub(super) fn search(
+    model: &mut Model,
+    tab: ExtensionTab,
+    query: &str,
+    agent_dir: &Path,
+    mcp_file: &Path,
+) {
     let kind = kind(tab);
     let mut state = lock();
+    state.registry_installed = discover::registry_installs(mcp_file).into_keys().collect();
     state.generation += 1;
     let generation = state.generation;
     let all = state
@@ -274,14 +287,18 @@ mod tests {
 
     #[test]
     fn rows_show_source_or_installed_and_install_counts() {
-        let shown = row(&listing("pdf", Some(205751)));
+        let none = BTreeSet::new();
+        let shown = row(&listing("pdf", Some(205751)), &none);
         assert_eq!(shown.status, "src");
         assert_eq!(shown.detail, "first line");
         assert_eq!(shown.note.as_deref(), Some("205,751 installs"));
-        let installed = row(&Listing {
-            installed: true,
-            ..listing("pdf", None)
-        });
+        let installed = row(
+            &Listing {
+                installed: true,
+                ..listing("pdf", None)
+            },
+            &none,
+        );
         assert_eq!(installed.status, "installed");
         assert_eq!(installed.note, None);
     }
