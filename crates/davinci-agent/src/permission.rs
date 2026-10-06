@@ -7,7 +7,7 @@
 //! (`turn.rs`) asks the policy before every tool call, after the extension
 //! `tool_call` hook and before the tool runs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -954,6 +954,10 @@ pub struct PermissionPolicy {
     /// decision; settings and tool arguments never do. A worker asking for a
     /// different model needs the user's approval for that model.
     pub session_model: Option<String>,
+    /// Agent profile name to the model it names (`model:` other than
+    /// `inherit`), from host-discovered profiles. A worker launched through
+    /// a profile runs on that model, so the gate checks it too.
+    pub agent_profile_models: BTreeMap<String, String>,
 }
 
 impl Default for PermissionPolicy {
@@ -971,6 +975,7 @@ impl Default for PermissionPolicy {
             filesystem_boundary: FilesystemBoundaryPolicy::default(),
             execution_isolated: false,
             session_model: None,
+            agent_profile_models: BTreeMap::new(),
         }
     }
 }
@@ -1528,11 +1533,19 @@ impl PermissionPolicy {
             return None;
         }
         let current = self.session_model.as_deref()?;
+        // The host's order: an explicit `model`, else the profile's own.
         let requested = args
             .get("model")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|model| !model.is_empty())?;
+            .filter(|model| !model.is_empty())
+            .or_else(|| {
+                let profile = args.get("agent").and_then(Value::as_str)?;
+                self.agent_profile_models
+                    .get(profile.trim())
+                    .map(|model| model.trim())
+                    .filter(|model| !model.is_empty())
+            })?;
         let requested = if requested.contains('/') {
             requested.to_string()
         } else {

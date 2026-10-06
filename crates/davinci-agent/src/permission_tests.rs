@@ -1339,6 +1339,78 @@ fn a_worker_on_another_model_needs_the_users_approval_for_that_model() {
 }
 
 #[test]
+fn a_profile_that_picks_another_model_is_gated_like_an_explicit_model() {
+    // Regression (commit security review): `{"agent":"deep"}` ran a profile
+    // whose `model:` names Sol without asking, because only `args.model`
+    // was compared. Plugin profiles load even in untrusted projects.
+    let mut policy = PermissionPolicy {
+        session_model: Some("openai-codex/gpt-6-luna".into()),
+        ..PermissionPolicy::new(PermissionMode::Auto)
+    };
+    policy
+        .agent_profile_models
+        .insert("deep".into(), "openai-codex/gpt-6-sol".into());
+    policy
+        .agent_profile_models
+        .insert("scout".into(), "gpt-6-luna".into());
+    policy.remember("agent");
+
+    let PermissionVerdict::Ask(request) = policy.decide(
+        "p1",
+        "agent",
+        &json!({"prompt": "x", "agent": "deep"}),
+        &cwd(),
+    ) else {
+        panic!("a Sol profile must ask");
+    };
+    assert_eq!(request.subject, "model:openai-codex/gpt-6-sol");
+    // Plan Mode's read-only workers do not skip it either.
+    let plan = PermissionPolicy {
+        mode: PermissionMode::ReadOnly,
+        ..policy.clone()
+    };
+    assert!(is_ask(&plan.decide(
+        "p2",
+        "agent",
+        &json!({"prompt": "x", "agent": "deep"}),
+        &cwd()
+    )));
+    // A profile on the session's own model, or an explicit `model` that
+    // overrides the profile with the session's, is not an escalation.
+    for args in [
+        json!({"prompt": "x", "agent": "scout"}),
+        json!({"prompt": "x", "agent": "deep", "model": "gpt-6-luna"}),
+        json!({"prompt": "x", "agent": "unknown-profile"}),
+    ] {
+        assert!(
+            matches!(
+                policy.decide("p3", "agent", &args, &cwd()),
+                PermissionVerdict::Allow
+            ),
+            "{args}"
+        );
+    }
+    // A case variant is a different id to the host, so it asks.
+    assert!(is_ask(&policy.decide(
+        "p4",
+        "agent",
+        &json!({"prompt": "x", "model": "openai-codex/GPT-6-Luna"}),
+        &cwd()
+    )));
+    // The session grant for that model covers the profile route too.
+    policy.remember("agent(model:openai-codex/gpt-6-sol)");
+    assert!(matches!(
+        policy.decide(
+            "p5",
+            "agent",
+            &json!({"prompt": "x", "agent": "deep"}),
+            &cwd()
+        ),
+        PermissionVerdict::Allow
+    ));
+}
+
+#[test]
 fn apply_patch_subject_reports_modified_paths_and_detects_outside() {
     let root = cwd();
     let patch = r#"*** Begin Patch

@@ -133,6 +133,7 @@ impl PermissionSources {
             filesystem_boundary: Default::default(),
             execution_isolated: false,
             session_model: None,
+            agent_profile_models: Default::default(),
         }
     }
 }

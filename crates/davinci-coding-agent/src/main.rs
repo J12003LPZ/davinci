@@ -941,6 +941,20 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
         policy.filesystem_boundary.extra_roots = roots;
     }
+    // A profile's `model:` picks the worker's model, so the cross-model
+    // gate must know it. Same discovery the worker build uses: plugin
+    // profiles always, project profiles only in a trusted project.
+    let profiles_trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
+    policy.agent_profile_models = agent_profiles::discover_agent_profiles_with_plugins(
+        cwd,
+        None,
+        profiles_trusted,
+        davinci_coding_agent::plugins::active(&default_agent_dir()).agent_profiles(),
+    )
+    .into_iter()
+    .filter(|profile| !profile.model.is_empty() && profile.model != "inherit")
+    .map(|profile| (profile.name, profile.model))
+    .collect();
     agent.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     agent.tool_context.cache = davinci_agent::runtime::cache::CacheRuntime::shared(
         settings.cache.clone().unwrap_or_default(),

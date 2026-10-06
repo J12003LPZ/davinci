@@ -4,7 +4,7 @@
 
 ### Added
 - A system prompt for each GPT-6 model. Sol and 6.1 Sol look for the root cause before patching; Luna works one focused job at a time; Astra keeps its lean policy. All three share GPT-6 rules for tools, delegation and answer style, which replace the generic OpenAI adapter. See [docs/prompt-engineering.md](docs/prompt-engineering.md#gpt-6-family-policies).
-- Luna can hand hard work to a GPT-6 Sol worker. When a task needs multi-step debugging or a check keeps failing, Luna asks first (Sol worker, continue with Luna, or switch models). DaVinci then asks you to approve any worker on a model other than the session's, in every mode except Always Approve; "allow for this session" covers that model only.
+- Luna can hand hard work to a GPT-6 Sol worker. When a task needs multi-step debugging or a check keeps failing, Luna asks first (Sol worker, continue with Luna, or switch models). DaVinci then asks you to approve any worker on a model other than the session's, in every mode except Always Approve, including a worker whose agent profile names another model; "allow for this session" covers that model only.
 - Leaving Plan Mode tells the model how to carry out the approved plan: steps in order, each step's checks, progress in `update_plan`, and a proposed revision instead of a silent change.
 - `davinci-evals` regression suites and A/B model policies for `gpt6-sol` and `gpt6-luna`.
 
