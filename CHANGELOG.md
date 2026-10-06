@@ -1,13 +1,15 @@
 # Changelog
 
-## Unreleased
+## 1.1.4
+
+Changes since `v1.1.3`.
 
 ### Fixed
 - Codemode turned on in `/config` stayed off with "Workspace-provided Node runtime is not admitted" when DaVinci ran from the home directory: the workspace then contains `~/.davinci/agent/codemode`, and DaVinci's own runtime was refused as project-provided. A runtime under `<agent dir>/codemode` is now admitted wherever the workspace is; a Node binary or host elsewhere in the workspace is still refused, and the error names both paths.
 
 ## 1.1.3
 
-Changes since `v1.1.2`.
+Changes since `v1.1.2`. Tagged `v1.1.3` at `7c554f40`.
 
 ### Added
 - A system prompt for each GPT-6 model. Sol and 6.1 Sol look for the root cause before patching; Luna works one focused job at a time; Astra keeps its lean policy. All three share GPT-6 rules for tools, delegation and answer style, which replace the generic OpenAI adapter. See [docs/prompt-engineering.md](docs/prompt-engineering.md#gpt-6-family-policies).
