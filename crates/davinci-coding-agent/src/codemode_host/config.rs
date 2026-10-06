@@ -86,7 +86,9 @@ impl ReadOnlyConfig {
         let managed_root = agent_dir.join("codemode");
         let trusted = managed_root.canonicalize().ok();
         if node.starts_with(&workspace)
-            && !trusted.as_ref().is_some_and(|trusted| node.starts_with(trusted))
+            && !trusted
+                .as_ref()
+                .is_some_and(|trusted| node.starts_with(trusted))
         {
             return Err(format!(
                 "Workspace-provided Node runtime is not admitted: {} is inside the workspace {}",
@@ -102,12 +104,12 @@ impl ReadOnlyConfig {
             Some(&managed_root),
             &manifest,
         )
-            .map_err(|error| {
-                format!(
-                    "Codemode host admission failed at {}: {error}",
-                    self.host_path.display()
-                )
-            })?;
+        .map_err(|error| {
+            format!(
+                "Codemode host admission failed at {}: {error}",
+                self.host_path.display()
+            )
+        })?;
         NodeCodeModeHost::new(&self.node_path, assets).map_err(|error| {
             format!(
                 "Codemode runtime admission failed at {}: {error}",

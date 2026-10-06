@@ -128,5 +128,8 @@ fn a_home_workspace_admits_the_managed_node_but_not_a_project_node() {
         host_path: managed.host_path.clone(),
     };
     let error = project.admit(home.path(), &agent).err().unwrap();
-    assert!(error.contains("Workspace-provided Node runtime is not admitted"), "{error}");
+    assert!(
+        error.contains("Workspace-provided Node runtime is not admitted"),
+        "{error}"
+    );
 }
