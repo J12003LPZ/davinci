@@ -7,6 +7,7 @@
 - Luna can hand hard work to a GPT-6 Sol worker. When a task needs multi-step debugging or a check keeps failing, Luna asks first (Sol worker, continue with Luna, or switch models). DaVinci then asks you to approve any worker on a model other than the session's, in every mode except Always Approve, including a worker whose agent profile names another model; "allow for this session" covers that model only.
 - Leaving Plan Mode tells the model how to carry out the approved plan: steps in order, each step's checks, progress in `update_plan`, and a proposed revision instead of a silent change.
 - `davinci-evals` regression suites and A/B model policies for `gpt6-sol` and `gpt6-luna`.
+- **Vox** theme: an editorial collage palette (ink ground, oxblood and navy layers, cream text, mustard focus, cyan and magenta accents). Pick it in `/config` → Theme or at first-time setup; it applies at once and is saved as `"theme": "vox"`. Every text color clears 4.5:1 contrast on every surface, in truecolor and 256 colors. Tokens are in [docs/ui/design.md §2](docs/ui/design.md).
 
 ### Removed
 - `/act`, which duplicated Shift+Tab: Shift+Tab leaves Plan Mode without approving the plan. `/plan` stays for plan review and approval (`show`, `diff`, `edit`, `reject`, `approve`, `accept [mode]`).
@@ -19,6 +20,7 @@
 - `ask_user_question` works as advertised. Its schema offered `kind` values (`approach`, `tradeoff`, ...) that the validator rejected, and outside Plan Mode every evidence reference failed as "Unknown plan evidence". The schema now lists the accepted kinds, and a question may cite workspace files it read; they are re-checked when you answer, under the same path rules as plan evidence.
 - Behavior evals no longer fail every run for "unrelated files changed" in `.davinci-transactions/`, the edit journal DaVinci keeps outside git repositories.
 - A worker's `model` override is no longer dropped when the catalog does not list that model: `gpt-6-sol` from a Luna session ran on Luna. Unlisted ids on a known provider now run as asked, a bare id uses the session's provider, and an unknown provider fails the call.
+- Choosing `vox` in `/config` or first-time setup rendered the dark theme. The name had been aliased to dark while still being offered.
 - Codemode admission errors name the path they checked (`Codemode Node runtime unavailable: no Node 24.21.0 at <path>`). Without it, a runtime installed in another agent directory (`~/.pi/agent` while DaVinci used `~/.davinci/agent`) failed with no clue where DaVinci looked. The docs' install example now picks the active agent directory.
 
 ## 1.1.2

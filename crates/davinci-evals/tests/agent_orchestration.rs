@@ -137,8 +137,16 @@ fn background_outcome_matrix_reports_and_terminates_after_lead_cancellation() {
             .unwrap()
             .parse()
             .unwrap();
+        // The worker leaves the roster before it publishes its terminal state
+        // (subagent.rs), so wait for both: leaving alone can still read Running.
+        let terminal = |state: AgentState| {
+            matches!(
+                state,
+                AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+            )
+        };
         let started = Instant::now();
-        while runtime.team.is_member(&id) {
+        while runtime.team.is_member(&id) || !terminal(runtime.registry.get(&id).unwrap().state) {
             assert!(
                 started.elapsed() < Duration::from_secs(5),
                 "{scenario} leaked its worker"

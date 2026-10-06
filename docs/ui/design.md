@@ -71,11 +71,14 @@ token governor.
 
 ### September 2026 interface revision
 
-The optional `vox` theme is selectable beside `dark` and `light` in `/settings`
-and first-time setup. It adds distressed clipping ends, coarse print rules, and
-brighter crimson selection bands while retaining ink, cream, navy, and yellow.
-The existing light and dark palettes are preserved. Color-depth fallbacks and
-`NO_COLOR` remain supported. Preview it with
+The optional `vox` theme is selectable beside `dark` and `light` in `/config`
+(Settings → Theme, Enter cycles `dark → light → vox`) and in first-time setup.
+It applies at once and is saved as `"theme": "vox"`; the older unlisted name
+`vox-classic` loads the same palette. It paints its own ink ground instead of
+the terminal background, so it looks the same on any terminal profile. The
+existing light and dark palettes are unchanged. Color-depth fallbacks and
+`NO_COLOR` remain supported: under `NO_COLOR` vox drops to the greyscale ramp.
+Preview it with
 `cargo run -p davinci-tui --example editorial_preview --offline -- vox`.
 
 The masthead combines a four-row screen-print D with a yellow DAVINCI clipping,
@@ -135,31 +138,44 @@ Three hard rules:
 
 ## 2. Color tokens
 
-Truecolor values. Map to the nearest ANSI-256 when the terminal reports fewer,
-and drop to `NO_COLOR` (§9) below 16.
+The default `dark` theme leaves ground and text to the terminal and is
+authored in `TRUECOLOR` in `crates/davinci-tui/src/davinci/theme.rs`. The table
+below is the `vox` editorial palette, taken from the newspaper collage reference: dirty
+paper browns and a brick red for the layers, mustard for focus, and cyan and
+magenta kept for the "modern" signals. Truecolor values are authored; ANSI-256
+values are chosen by hand because the 256 cube has no dark browns. Below 16
+colors the ramp drops to `NO_COLOR` (§9).
 
-| Token       | Hex       | Role |
-|---|---|---|
-| `background` | `#1D1516` | terminal ground |
-| `surface`    | `#5E1C16` | user messages, selection, panel fill |
-| `surface_alt`| `#182033` | secondary panels, sidebar |
-| `border`     | `#9C6C4F` | panel rules, separators, inert glyphs |
-| `text`       | `#D8A687` | primary copy, code, prompt, caret |
-| `muted`      | `#C59574` | secondary copy, tool arguments, keybind hints |
-| `primary`    | `#F3D90D` | editorial yellow: identity, in-progress, selection, Δ |
-| `secondary`  | `#D8A687` | identifiers, thinking level, memoria |
-| `success`    | `#D8A687` | completed tools, additions, healthy caps |
-| `warning`    | `#F3D90D` | attention, soft-cap breach, governor proposals |
-| `error`      | `#E6A080` | failures, deletions |
+| Token       | Truecolor | 256 | Role |
+|---|---|---|---|
+| `background` | `#0F0910` near-black ink | 233 | terminal ground |
+| `surface`    | `#341413` oxblood        | 52  | user messages, selection, panel fill |
+| `surface_alt`| `#191C2E` charcoal navy  | 17  | secondary panels, user strip, sidebar |
+| `border`     | `#7E5A42` kraft brown    | 95  | panel rules, separators, inert glyphs |
+| `text`       | `#E0B57C` cream          | 223 | primary copy, code, prompt, caret |
+| `muted`      | `#C08D64` tan            | 180 | secondary copy, tool arguments, keybind hints |
+| `primary`    | `#EABC34` mustard        | 179 | identity, in-progress, selection, Δ |
+| `secondary`  | `#C45ADF` magenta        | 176 | identifiers, read/search, code keywords |
+| `success`    | `#20C9D6` cyan           | 44  | completed tools, additions, healthy caps |
+| `warning`    | `#F04A16` orange         | 202 | attention, soft-cap breach, governor proposals |
+| `error`      | `#E8604A` lifted brick   | 203 | failures, deletions |
 
-Dimmed layer (behind a modal, `1d` and `1f`): `text → #80604D`,
-`muted → #70503E`, `primary → #827522`, `border → #4A3028`. Never blur, never
-tint — just drop the ramp.
+Every ink clears 4.5:1 on `background`, `surface` and `surface_alt` at both
+depths; `readable_print_inks_have_contrast_on_every_surface` in
+`crates/davinci-tui/src/davinci/theme.rs` enforces it. The reference brick
+(`#7B2A1A`) does not: orange and red text on it falls under 3:1. So `surface`
+is that brick darkened to `#341413`, the most saturated step on the
+ink-to-brick line where every ink still passes. Full brick stays out of text
+surfaces.
 
-Yellow carries focus and active work. Muted text carries tool arguments;
-success, warning, and error colors reinforce their status glyphs. Muted sepia
-(`#C59574`) and error ink (`#E6A080`) are lifted print tints for readable contrast
-on crimson; the darker reference reds are surface colors rather than small text.
+Dimmed layer (behind a modal): the ground and surfaces stay, every ink drops
+to sepia `#90674B` (256: 137), conversation inks (`Theme::cc`) included.
+Never blur, never tint — just drop the ramp.
+
+The conversation palette (`Theme::cc`) follows the same reference: mustard agent
+mark, navy user strip, cyan permission and additions, magenta bash and
+accept-edits, orange auto mode, strong blue `#1595C5` plan mode, and diff bands
+`#0E2A2E` / `#3A1410`.
 
 ```rust
 pub struct Theme {
@@ -168,7 +184,10 @@ pub struct Theme {
     pub primary: Color, pub secondary: Color,
     pub success: Color, pub warning: Color, pub error: Color,
 }
-impl Theme { pub const DA_VINCI: Self = /* table above */; }
+impl Theme {
+    pub fn da_vinci(depth: ColorDepth, no_color: bool) -> Self; // default dark
+    pub fn with_name(&self, name: &str) -> Self; // "dark" | "light" | "vox"
+}
 ```
 
 No color literal outside `Theme`. Widgets take `&Theme`.

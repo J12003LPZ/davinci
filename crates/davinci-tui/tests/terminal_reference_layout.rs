@@ -62,9 +62,11 @@ fn settings_tabs_switch_without_mutating_a_setting_or_chat_draft() {
     assert_eq!(m.composer.editor().get_text(), "Preserved draft");
 }
 #[test]
-fn shipped_vox_selection_upgrades_without_changing_settings_on_disk() {
+fn shipped_vox_selection_is_the_editorial_palette_not_dark() {
     let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
-    assert_eq!(theme.with_name("vox"), theme.with_name("dark"));
+    assert_ne!(theme.with_name("vox"), theme.with_name("dark"));
+    assert!(theme.with_name("vox").is_vox());
+    assert_eq!(theme.with_name("vox-classic"), theme.with_name("vox"));
 }
 #[test]
 fn startup_keeps_the_reference_identity_geometry_and_model_hint() {

@@ -44,6 +44,22 @@ pub struct Palette {
 
 impl Palette {
     /// Design spec §2 truecolor values.
+    /// Mirrors `davinci::theme::VOX`; `dim` is the sepia used behind modals.
+    pub fn vox() -> Self {
+        Self {
+            surface: "#341413".into(),
+            border: "#7E5A42".into(),
+            text: "#E0B57C".into(),
+            muted: "#C08D64".into(),
+            primary: "#EABC34".into(),
+            secondary: "#C45ADF".into(),
+            success: "#20C9D6".into(),
+            warning: "#F04A16".into(),
+            error: "#E8604A".into(),
+            dim: "#90674B".into(),
+        }
+    }
+
     pub fn da_vinci() -> Self {
         Self {
             surface: "#2B2B2B".into(),
@@ -302,27 +318,19 @@ pub fn builtin_themes() -> Vec<Theme> {
             }),
         },
         Theme {
-            // Existing shipped preset names upgrade without rewriting user files.
             name: "vox".into(),
-            background: "#1F1F1F".into(),
-            foreground: "#E6E6E6".into(),
-            accent: "#B1B9F9".into(),
-            palette: Some(Palette::da_vinci()),
+            background: "#0F0910".into(),
+            foreground: "#E0B57C".into(),
+            accent: "#EABC34".into(),
+            palette: Some(Palette::vox()),
         },
         Theme {
+            // Unlisted earlier preset name; files that saved it keep working.
             name: "vox-classic".into(),
-            background: "#1D1516".into(),
-            foreground: "#E2BE9E".into(),
-            accent: "#F3D90D".into(),
-            palette: Some(Palette {
-                surface: "#8D150F".into(),
-                text: "#E2BE9E".into(),
-                muted: "#E2BE9E".into(),
-                secondary: "#E2BE9E".into(),
-                success: "#E2BE9E".into(),
-                error: "#E2BE9E".into(),
-                ..Palette::da_vinci()
-            }),
+            background: "#0F0910".into(),
+            foreground: "#E0B57C".into(),
+            accent: "#EABC34".into(),
+            palette: Some(Palette::vox()),
         },
         Theme {
             name: "pi".into(),
@@ -367,8 +375,33 @@ mod tests {
         let themes = builtin_themes();
         assert_eq!(themes[0].name, "dark");
         let vox = themes.iter().find(|theme| theme.name == "vox").unwrap();
-        assert_eq!(vox.background, themes[0].background);
-        assert_eq!(vox.palette, themes[0].palette);
+        assert_ne!(vox.palette, themes[0].palette, "vox must not alias dark");
+        let classic = themes.iter().find(|t| t.name == "vox-classic").unwrap();
+        assert_eq!(classic.palette, vox.palette);
+        // The legacy preset and the native ramp must name the same colors.
+        let native = crate::davinci::theme::Theme::da_vinci(
+            crate::davinci::theme::ColorDepth::TrueColor,
+            false,
+        )
+        .with_name("vox");
+        let hex = |color: ratatui::style::Color| match color {
+            ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02X}{g:02X}{b:02X}"),
+            other => panic!("{other:?} is not truecolor"),
+        };
+        let palette = vox.palette.as_ref().unwrap();
+        assert_eq!(vox.background, hex(native.background));
+        assert_eq!(vox.foreground, hex(native.text));
+        assert_eq!(vox.accent, hex(native.primary));
+        assert_eq!(palette.surface, hex(native.surface));
+        assert_eq!(palette.border, hex(native.border));
+        assert_eq!(palette.text, hex(native.text));
+        assert_eq!(palette.muted, hex(native.muted));
+        assert_eq!(palette.primary, hex(native.primary));
+        assert_eq!(palette.secondary, hex(native.secondary));
+        assert_eq!(palette.success, hex(native.success));
+        assert_eq!(palette.warning, hex(native.warning));
+        assert_eq!(palette.error, hex(native.error));
+        assert_eq!(palette.dim, hex(native.dim().text));
         assert!(crate::first_time::THEME_OPTIONS
             .iter()
             .any(|(name, _)| *name == "vox"));

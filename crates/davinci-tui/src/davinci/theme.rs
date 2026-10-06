@@ -93,6 +93,31 @@ pub enum ColorDepth {
     Basic,
 }
 
+/// Which built-in palette a `Theme` was built from. Recorded rather than
+/// sniffed from token values, so a retuned palette cannot silently stop
+/// being recognised by `dim`, `cc` and `label_colors`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Variant {
+    #[default]
+    Dark,
+    Light,
+    /// Editorial collage: ink ground, oxblood and navy layers, mustard focus.
+    Vox,
+}
+
+impl Variant {
+    /// The setting value for a built-in theme name. Legacy and custom names
+    /// fall back to the native dark palette.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "light" => Variant::Light,
+            // `vox-classic` was an unlisted preset name; keep it working.
+            "vox" | "vox-classic" => Variant::Vox,
+            _ => Variant::Dark,
+        }
+    }
+}
+
 /// One row of the §2 table, in whichever encoding the terminal understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
@@ -111,6 +136,7 @@ pub struct Theme {
     pub emphasis: Modifier,
     pub no_color: bool,
     pub dimmed: bool,
+    pub variant: Variant,
 }
 
 /// The eleven tokens, before they are wrapped in a `Theme`.
@@ -193,6 +219,53 @@ const LIGHT_BASIC: Ramp = Ramp {
     secondary: Color::Blue,
     success: Color::Blue,
     warning: Color::Red,
+    error: Color::Red,
+};
+
+/// Vox editorial collage (design.md §2). Inks are the reference palette;
+/// the oxblood surface is the brick band darkened until every ink clears
+/// 4.5:1 on it. Full-strength brick (#7B2A1A) cannot carry orange or red text.
+const VOX: Ramp = Ramp {
+    background: rgb(0x0F0910),
+    surface: rgb(0x341413),
+    surface_alt: rgb(0x191C2E),
+    border: rgb(0x7E5A42),
+    text: rgb(0xE0B57C),
+    muted: rgb(0xC08D64),
+    primary: rgb(0xEABC34),
+    secondary: rgb(0xC45ADF),
+    success: rgb(0x20C9D6),
+    warning: rgb(0xF04A16),
+    error: rgb(0xE8604A),
+};
+
+/// xterm-256 has no dark browns, so the cube's pure oxblood and navy stand in
+/// for the paper layers, and the inks are lifted to keep 4.5:1 on them.
+const VOX_256: Ramp = Ramp {
+    background: Color::Indexed(233),
+    surface: Color::Indexed(52),
+    surface_alt: Color::Indexed(17),
+    border: Color::Indexed(95),
+    text: Color::Indexed(223),
+    muted: Color::Indexed(180),
+    primary: Color::Indexed(179),
+    secondary: Color::Indexed(176),
+    success: Color::Indexed(44),
+    warning: Color::Indexed(202),
+    error: Color::Indexed(203),
+};
+
+const VOX_BASIC: Ramp = Ramp {
+    background: Color::Black,
+    surface: Color::Black,
+    surface_alt: Color::Black,
+    border: Color::DarkGray,
+    text: Color::White,
+    muted: Color::Gray,
+    primary: Color::Yellow,
+    secondary: Color::Magenta,
+    success: Color::Cyan,
+    warning: Color::LightRed,
     error: Color::Red,
 };
 
@@ -481,6 +554,62 @@ const CC_LIGHT_256: Cc = Cc {
     code_macro: Color::Cyan,
 };
 
+/// Vox conversation colors: mustard identity, navy user strip, cyan and
+/// magenta kept for the "modern" signals (permission, bash, edits).
+const CC_VOX: Cc = Cc {
+    claude: rgb(0xEABC34),
+    claude_shimmer: rgb(0xF3D272),
+    permission: rgb(0x20C9D6),
+    inactive: rgb(0xC08D64),
+    inactive_shimmer: rgb(0xD29F62),
+    subtle: rgb(0x542C23),
+    prompt_border: rgb(0x7E5A42),
+    text: rgb(0xE0B57C),
+    user_bg: rgb(0x191C2E),
+    bash: rgb(0xC45ADF),
+    bash_bg: rgb(0x241A2E),
+    success: rgb(0x20C9D6),
+    error: rgb(0xE8604A),
+    auto_mode: rgb(0xF04A16),
+    plan_mode: rgb(0x1595C5),
+    accept_edits: rgb(0xC45ADF),
+    diff_text: rgb(0xE0B57C),
+    diff_add: rgb(0x20C9D6),
+    diff_add_bg: rgb(0x0E2A2E),
+    diff_del: rgb(0xE8604A),
+    diff_del_bg: rgb(0x3A1410),
+    code_keyword: rgb(0xC45ADF),
+    code_string: rgb(0xEABC34),
+    code_macro: rgb(0x20C9D6),
+};
+
+const CC_VOX_256: Cc = Cc {
+    claude: Color::Indexed(179),
+    claude_shimmer: Color::Indexed(221),
+    permission: Color::Indexed(44),
+    inactive: Color::Indexed(180),
+    inactive_shimmer: Color::Indexed(223),
+    subtle: Color::Indexed(95),
+    prompt_border: Color::Indexed(95),
+    text: Color::Indexed(223),
+    user_bg: Color::Indexed(17),
+    bash: Color::Indexed(176),
+    bash_bg: Color::Indexed(235),
+    success: Color::Indexed(44),
+    error: Color::Indexed(203),
+    auto_mode: Color::Indexed(202),
+    plan_mode: Color::Indexed(39),
+    accept_edits: Color::Indexed(176),
+    diff_text: Color::Indexed(223),
+    diff_add: Color::Indexed(44),
+    diff_add_bg: Color::Indexed(23),
+    diff_del: Color::Indexed(203),
+    diff_del_bg: Color::Indexed(52),
+    code_keyword: Color::Indexed(176),
+    code_string: Color::Indexed(179),
+    code_macro: Color::Indexed(44),
+};
+
 const CC_BASIC: Cc = Cc {
     claude: Color::LightRed,
     claude_shimmer: Color::LightRed,
@@ -541,17 +670,25 @@ impl Theme {
         if self.no_color {
             return CC_NONE;
         }
-        let base = match (self.depth_hint(), self.is_light()) {
-            (ColorDepth::TrueColor, false) => CC_DARK,
-            (ColorDepth::TrueColor, true) => CC_LIGHT,
-            (ColorDepth::Ansi256, false) => CC_DARK_256,
-            (ColorDepth::Ansi256, true) => CC_LIGHT_256,
+        let base = match (self.depth_hint(), self.variant) {
+            (ColorDepth::TrueColor, Variant::Dark) => CC_DARK,
+            (ColorDepth::TrueColor, Variant::Light) => CC_LIGHT,
+            (ColorDepth::TrueColor, Variant::Vox) => CC_VOX,
+            (ColorDepth::Ansi256, Variant::Dark) => CC_DARK_256,
+            (ColorDepth::Ansi256, Variant::Light) => CC_LIGHT_256,
+            (ColorDepth::Ansi256, Variant::Vox) => CC_VOX_256,
             (ColorDepth::Basic, _) => CC_BASIC,
         };
         if !self.dimmed {
             return base;
         }
-        let quiet = base.inactive;
+        // Vox's inactive tan is still a reading ink; use the sepia `dim`
+        // already gave this theme's text instead.
+        let quiet = if self.is_vox() {
+            self.text
+        } else {
+            base.inactive
+        };
         Cc {
             claude: quiet,
             claude_shimmer: quiet,
@@ -574,48 +711,45 @@ impl Theme {
         }
     }
 
-    /// Saturated crimson identifies the optional editorial collage palette.
+    /// The editorial collage palette is active.
     pub fn is_vox(&self) -> bool {
-        matches!(
-            self.surface,
-            Color::Rgb(141, 21, 15) | Color::Indexed(88) | Color::Red
-        )
+        self.variant == Variant::Vox
     }
 
     /// Apply the built-in setting while retaining terminal capabilities.
     /// Legacy/custom names retain the native dark palette.
     pub fn with_name(&self, name: &str) -> Self {
-        if name == "vox-classic" && !self.no_color {
-            let ink = match self.depth_hint() {
-                ColorDepth::TrueColor => rgb(0xE2BE9E),
-                ColorDepth::Ansi256 => Color::Indexed(223),
-                ColorDepth::Basic => Color::White,
+        let depth = self.depth_hint();
+        let variant = Variant::from_name(name);
+        if variant == Variant::Vox {
+            // NO_COLOR outranks a palette choice: vox drops to the greyscale ramp.
+            if self.no_color {
+                return Self::da_vinci(depth, true);
+            }
+            let ramp = match depth {
+                ColorDepth::TrueColor => &VOX,
+                ColorDepth::Ansi256 => &VOX_256,
+                ColorDepth::Basic => &VOX_BASIC,
             };
             return Self {
-                text: ink,
-                muted: ink,
-                secondary: ink,
-                success: ink,
-                error: ink,
-                surface: match self.depth_hint() {
-                    ColorDepth::TrueColor => rgb(0x8D150F),
-                    ColorDepth::Ansi256 => Color::Indexed(88),
-                    ColorDepth::Basic => Color::Red,
-                },
-                ..Self::da_vinci(self.depth_hint(), false)
+                variant,
+                ..Self::from_ramp(ramp, false, false)
             };
         }
-        if name != "light" {
-            return Self::da_vinci(self.depth_hint(), self.no_color);
+        if variant == Variant::Dark {
+            return Self::da_vinci(depth, self.no_color);
         }
-        let ramp = match self.depth_hint() {
+        let ramp = match depth {
             ColorDepth::TrueColor => &LIGHT,
             ColorDepth::Ansi256 => &LIGHT_256,
             ColorDepth::Basic => &LIGHT_BASIC,
         };
-        let light = Self::from_ramp(ramp, self.no_color, false);
+        let light = Self {
+            variant: Variant::Light,
+            ..Self::from_ramp(ramp, self.no_color, false)
+        };
         if self.no_color {
-            let (paper, ink, surface) = match self.depth_hint() {
+            let (paper, ink, surface) = match depth {
                 ColorDepth::TrueColor => (rgb(0xE6E6E6), rgb(0x1C1C1C), rgb(0xCFCFCF)),
                 ColorDepth::Ansi256 => (
                     Color::Indexed(254),
@@ -643,18 +777,7 @@ impl Theme {
     }
 
     fn is_light(&self) -> bool {
-        matches!(
-            self.primary,
-            Color::Rgb(70, 87, 217) | Color::Indexed(60) | Color::Blue
-        ) || matches!(
-            self.background,
-            Color::Rgb(250, 250, 250)
-                | Color::Rgb(255, 255, 255)
-                | Color::Rgb(230, 230, 230)
-                | Color::Indexed(231)
-                | Color::Indexed(254)
-                | Color::White
-        )
+        self.variant == Variant::Light
     }
 
     /// Yellow headline scraps retain dark ink in both editorial variants.
@@ -702,13 +825,22 @@ impl Theme {
             return *self;
         }
         if self.is_light() || self.is_vox() {
+            // Paper themes keep their ground and drop every ink to one quiet
+            // tone. Vox's tan muted is still a reading ink, so it goes to sepia.
+            let quiet = match (self.variant, self.depth_hint()) {
+                (Variant::Vox, ColorDepth::TrueColor) => rgb(0x90674B),
+                (Variant::Vox, ColorDepth::Ansi256) => Color::Indexed(137),
+                (Variant::Vox, ColorDepth::Basic) => Color::DarkGray,
+                _ => self.muted,
+            };
             return Self {
-                text: self.muted,
-                primary: self.muted,
-                secondary: self.muted,
-                success: self.muted,
-                warning: self.muted,
-                error: self.muted,
+                text: quiet,
+                muted: quiet,
+                primary: quiet,
+                secondary: quiet,
+                success: quiet,
+                warning: quiet,
+                error: quiet,
                 emphasis: Modifier::empty(),
                 dimmed: true,
                 ..*self
@@ -797,6 +929,7 @@ impl Theme {
             },
             no_color,
             dimmed,
+            variant: Variant::Dark,
         }
     }
 
@@ -826,16 +959,81 @@ mod tests {
             ColorDepth::Basic,
         ] {
             let dark = Theme::da_vinci(depth, false);
-            let vox = dark.with_name("vox-classic");
-            assert_eq!(dark.with_name("vox"), dark);
+            let vox = dark.with_name("vox");
+            // Regression: "vox" was offered in /config but rendered as dark.
+            assert_ne!(vox, dark, "vox at {depth:?} is the dark palette");
             assert!(vox.is_vox());
-            assert_ne!(vox, dark);
+            assert!(!dark.is_vox());
+            assert_eq!(vox.depth_hint(), depth);
+            assert_eq!(dark.with_name("vox-classic"), vox);
+            assert_eq!(vox.with_name("vox"), vox);
+            assert_eq!(vox.with_name("dark"), dark);
+            assert_eq!(vox.with_name("light"), dark.with_name("light"));
             assert_eq!(vox.dim().background, vox.background);
             assert_eq!(vox.dim().surface, vox.surface);
-            assert_eq!(vox.with_name("dark"), dark);
+            assert!(vox.dim().is_vox());
+            assert_eq!(vox.dim().dim(), vox.dim());
             let monochrome = Theme::da_vinci(depth, true);
             assert_eq!(monochrome.with_name("vox"), monochrome);
+            assert!(!monochrome.with_name("vox").is_vox());
         }
+    }
+
+    #[test]
+    fn vox_truecolor_tokens_are_the_editorial_palette() {
+        let vox = Theme::da_vinci(ColorDepth::TrueColor, false).with_name("vox");
+        assert_eq!(vox.background, rgb(0x0F0910));
+        assert_eq!(vox.surface, rgb(0x341413));
+        assert_eq!(vox.surface_alt, rgb(0x191C2E));
+        assert_eq!(vox.border, rgb(0x7E5A42));
+        assert_eq!(vox.text, rgb(0xE0B57C));
+        assert_eq!(vox.muted, rgb(0xC08D64));
+        assert_eq!(vox.primary, rgb(0xEABC34));
+        assert_eq!(vox.secondary, rgb(0xC45ADF));
+        assert_eq!(vox.success, rgb(0x20C9D6));
+        assert_eq!(vox.warning, rgb(0xF04A16));
+        assert_eq!(vox.error, rgb(0xE8604A));
+        // Mustard headline scrap with ink lettering, like the Vox logo box.
+        assert_eq!(vox.label_colors(true), (vox.background, vox.primary));
+    }
+
+    #[test]
+    fn vox_conversation_palette_follows_the_theme_and_depth() {
+        let dark = Theme::da_vinci(ColorDepth::TrueColor, false);
+        let vox = dark.with_name("vox");
+        assert_eq!(vox.cc().claude, rgb(0xEABC34));
+        assert_eq!(vox.cc().user_bg, vox.surface_alt);
+        assert_ne!(vox.cc(), dark.cc());
+        let vox256 = Theme::da_vinci(ColorDepth::Ansi256, false).with_name("vox");
+        assert_eq!(vox256.cc().claude, vox256.primary);
+        let cc = vox256.cc();
+        for color in [
+            cc.claude,
+            cc.text,
+            cc.user_bg,
+            cc.diff_add_bg,
+            cc.code_keyword,
+        ] {
+            assert!(matches!(color, Color::Indexed(_)), "{color:?} is not 256");
+        }
+        // Behind a modal the conversation drops to the same sepia as the
+        // theme tokens, not to the tan reading ink.
+        let quiet = vox.dim().cc();
+        assert_eq!(quiet.claude, rgb(0x90674B));
+        assert_eq!(quiet.text, rgb(0x90674B));
+        assert_eq!(quiet.diff_add, rgb(0x90674B));
+        assert_eq!(vox256.dim().cc().claude, Color::Indexed(137));
+    }
+
+    #[test]
+    fn theme_names_map_to_variants() {
+        assert_eq!(Variant::from_name("dark"), Variant::Dark);
+        assert_eq!(Variant::from_name("light"), Variant::Light);
+        assert_eq!(Variant::from_name("vox"), Variant::Vox);
+        assert_eq!(Variant::from_name("vox-classic"), Variant::Vox);
+        assert_eq!(Variant::from_name("pi"), Variant::Dark);
+        assert_eq!(Variant::from_name(""), Variant::Dark);
+        assert_eq!(Variant::from_name("VOX"), Variant::Dark);
     }
 
     #[test]
