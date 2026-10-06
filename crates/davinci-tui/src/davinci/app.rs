@@ -612,6 +612,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         return Flow::Continue;
     }
     let data = key_event_bytes(&key);
+    if key.kind != KeyEventKind::Release && key.code != KeyCode::Esc {
+        model.clear_armed = None;
+    }
 
     if action_matches(model, data.as_deref(), "davinci.interrupt")
         || (model.running
@@ -696,6 +699,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
             return Flow::Submit(sent);
         }
         if model.keybindings.matches(data, "tui.select.cancel") {
+            if clear_draft_on_double_escape(model) {
+                return Flow::Continue;
+            }
             model.close();
             return Flow::Continue;
         }
@@ -710,6 +716,34 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         }
     }
     Flow::Continue
+}
+
+/// `esc` over a draft arms a clear; a second `esc` within
+/// `DOUBLE_ESCAPE_MS` empties the composer, as in Claude Code. The draft goes
+/// to history first, so `↑` brings it back. Only on the conversation, at rest
+/// and with nothing open: there `esc` has nothing else to close.
+fn clear_draft_on_double_escape(model: &mut Model) -> bool {
+    if model.screen != Screen::Agent
+        || model.overlay.is_some()
+        || model.running
+        || model.composer.trim().is_empty()
+    {
+        model.clear_armed = None;
+        return false;
+    }
+    let now = std::time::Instant::now();
+    let window = std::time::Duration::from_millis(crate::DOUBLE_ESCAPE_MS);
+    if model
+        .clear_armed
+        .is_some_and(|armed| now.duration_since(armed) < window)
+    {
+        model.clear_armed = None;
+        let _ = model.composer.editor_mut().submit();
+        model.refresh_suggestions();
+    } else {
+        model.clear_armed = Some(now);
+    }
+    true
 }
 
 /// Steer the open completion list. `None` hands the key back to the composer,
@@ -910,6 +944,11 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
     if handle_picker_search(model, &key) {
         return Flow::Continue;
     }
+    if model.screen == Screen::Extensions && key.kind == KeyEventKind::Press {
+        if let Some(flow) = handle_extensions_key(model, key) {
+            return flow;
+        }
+    }
 
     let toggle_action = match model.screen {
         Screen::Plan => Some("davinci.plan.toggle"),
@@ -971,12 +1010,6 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         }
         model.section_offset = None;
         return Flow::Continue;
-    }
-
-    if model.screen == Screen::Extensions && key.kind == KeyEventKind::Press {
-        if let Some(flow) = handle_extensions_key(model, key) {
-            return flow;
-        }
     }
 
     // A sheet with a selection owns the arrows and enter.
@@ -1423,29 +1456,47 @@ fn screen_move(model: &mut Model, delta: isize) {
     }
 }
 
-/// The `/plugin` manager's own keys: tabs, and the actions the selected row
+/// The `/plugins`, `/skills` and `/mcp` manager's own keys: tabs, and the actions the selected row
 /// allows. Delete and hook approval arm first and run only on `y`, a key
 /// that auto-repeat of the arming key cannot produce; any other key
 /// disarms. Arming approval also asks the host for the plugin's details, so
 /// the hook commands are on screen before `y`.
 fn handle_extensions_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    use crate::davinci::model::ExtensionView;
+    let sheet = model.extension_manager.as_mut()?;
+    let view_step = match key.code {
+        KeyCode::Left | KeyCode::BackTab => Some(-1),
+        KeyCode::Right | KeyCode::Tab => Some(1),
+        _ => None,
+    };
+    // While a marketplace source is typed, the arrows stay in the field.
+    if let (Some(step), None) = (view_step, sheet.marketplace_input.as_ref()) {
+        sheet.switch_view(step);
+        model.section_offset = None;
+        if sheet.view == ExtensionView::Discover {
+            return Some(Flow::Choose(Choice::ExtensionSearch {
+                tab: sheet.tab,
+                query: sheet.discover.query.clone(),
+            }));
+        }
+        return Some(Flow::Continue);
+    }
+    match sheet.view {
+        ExtensionView::Installed => handle_installed_key(model, key),
+        ExtensionView::Discover => handle_discover_key(model, key),
+        ExtensionView::Marketplaces => handle_marketplaces_key(model, key),
+    }
+}
+
+fn handle_installed_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
     let sheet = model.extension_manager.as_mut()?;
     let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-    match key.code {
-        KeyCode::Left | KeyCode::BackTab => {
-            sheet.switch_tab(-1);
-            model.section_offset = None;
-            return Some(Flow::Continue);
-        }
-        KeyCode::Right | KeyCode::Tab => {
-            sheet.switch_tab(1);
-            model.section_offset = None;
-            return Some(Flow::Continue);
-        }
-        _ => {}
-    }
     let row = sheet.current().cloned()?;
     let armed = sheet.armed_here();
+    if key.code == KeyCode::Esc && armed.is_some() {
+        sheet.armed = None;
+        return Some(Flow::Continue);
+    }
     sheet.armed = None;
     let action = match key.code {
         KeyCode::Char('y') if plain && armed.is_some() => armed.unwrap_or_default(),
@@ -1467,6 +1518,161 @@ fn handle_extensions_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
         tab: sheet.tab,
         key: row.key,
     }))
+}
+
+/// Typing searches; ↑↓ pick; enter arms the pick and a second enter
+/// installs it; esc backs out one step (the armed install, then the query,
+/// then the sheet).
+fn handle_discover_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    let sheet = model.extension_manager.as_mut()?;
+    let tab = sheet.tab;
+    let discover = &mut sheet.discover;
+    let typing = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let search = |discover: &mut crate::davinci::model::DiscoverState| {
+        discover.armed = None;
+        discover.selected = 0;
+        Some(Flow::Choose(Choice::ExtensionSearch {
+            tab,
+            query: discover.query.clone(),
+        }))
+    };
+    match key.code {
+        KeyCode::Esc if discover.armed.is_some() => {
+            discover.armed = None;
+            Some(Flow::Continue)
+        }
+        KeyCode::Esc if !discover.query.is_empty() => {
+            discover.query.clear();
+            search(discover)
+        }
+        KeyCode::Up => {
+            discover.move_selection(-1);
+            Some(Flow::Continue)
+        }
+        KeyCode::Down => {
+            discover.move_selection(1);
+            Some(Flow::Continue)
+        }
+        KeyCode::PageUp | KeyCode::PageDown => {
+            let page = model.height.saturating_sub(8).max(1) as isize / 3;
+            let page = page.max(1);
+            discover.move_selection(if key.code == KeyCode::PageUp {
+                -page
+            } else {
+                page
+            });
+            Some(Flow::Continue)
+        }
+        KeyCode::Enter => {
+            let row = discover.current()?.clone();
+            if row.status == "installed" {
+                return Some(Flow::Continue);
+            }
+            if discover.armed_here() {
+                discover.armed = None;
+                return Some(Flow::Choose(Choice::ExtensionInstall { tab, key: row.key }));
+            }
+            discover.armed = Some(row.key);
+            Some(Flow::Continue)
+        }
+        KeyCode::Backspace if typing => {
+            use unicode_segmentation::UnicodeSegmentation;
+            let cut = discover
+                .query
+                .grapheme_indices(true)
+                .next_back()
+                .map(|(at, _)| at)?;
+            discover.query.truncate(cut);
+            search(discover)
+        }
+        KeyCode::Char(ch) if typing => {
+            discover.query.push(ch);
+            search(discover)
+        }
+        _ => None,
+    }
+}
+
+/// `a` types a new source (owner/repo, git URL or folder), enter adds it;
+/// `u` refreshes the selected marketplace, `d` then `y` removes it.
+fn handle_marketplaces_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    let sheet = model.extension_manager.as_mut()?;
+    let typing = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if let Some(input) = sheet.marketplace_input.as_mut() {
+        return match key.code {
+            KeyCode::Esc => {
+                sheet.marketplace_input = None;
+                Some(Flow::Continue)
+            }
+            KeyCode::Enter => {
+                let value = input.trim().to_string();
+                sheet.marketplace_input = None;
+                if value.is_empty() {
+                    return Some(Flow::Continue);
+                }
+                Some(Flow::Choose(Choice::MarketplaceAction {
+                    action: "add",
+                    value,
+                }))
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                Some(Flow::Continue)
+            }
+            KeyCode::Char(ch) if typing => {
+                input.push(ch);
+                Some(Flow::Continue)
+            }
+            _ => Some(Flow::Continue),
+        };
+    }
+    let selected = sheet.current_marketplace().cloned();
+    let armed = sheet
+        .armed
+        .take()
+        .filter(|(name, _)| selected.as_ref().is_some_and(|row| &row.key == name));
+    let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+    match key.code {
+        KeyCode::Esc if armed.is_some() => Some(Flow::Continue),
+        KeyCode::Up | KeyCode::Down => {
+            let len = sheet.marketplaces.len();
+            if len > 0 {
+                let delta: isize = if key.code == KeyCode::Up { -1 } else { 1 };
+                sheet.marketplace_selected =
+                    (sheet.marketplace_index() as isize + delta).rem_euclid(len as isize) as usize;
+            }
+            Some(Flow::Continue)
+        }
+        KeyCode::Char('a') if plain => {
+            sheet.marketplace_input = Some(String::new());
+            Some(Flow::Continue)
+        }
+        KeyCode::Char('y') if plain && armed.is_some() => {
+            let (name, _) = armed?;
+            Some(Flow::Choose(Choice::MarketplaceAction {
+                action: "remove",
+                value: name,
+            }))
+        }
+        KeyCode::Char('u') if plain => {
+            let row = selected.filter(|row| row.can_update)?;
+            Some(Flow::Choose(Choice::MarketplaceAction {
+                action: "update",
+                value: row.key,
+            }))
+        }
+        KeyCode::Char('d') if plain => {
+            let row = selected.filter(|row| row.can_delete)?;
+            sheet.armed = Some((row.key, "remove"));
+            Some(Flow::Continue)
+        }
+        KeyCode::Enter => Some(Flow::Continue),
+        _ => None,
+    }
 }
 
 fn extension_choice(model: &Model, action: &'static str) -> Option<Choice> {
@@ -2157,6 +2363,46 @@ mod tests {
         assert_eq!(handle_key(&mut m, ctrl('c')), Flow::Interrupt);
         assert!(!m.running);
         assert!(!m.transcript.is_empty());
+    }
+
+    #[test]
+    fn double_esc_clears_the_draft_and_up_brings_it_back() {
+        let mut m = model(100, 24);
+        m.type_char("half a thought");
+        handle_key(&mut m, key(KeyCode::Esc));
+        assert_eq!(m.composer.editor().get_text(), "half a thought");
+        assert!(m.clear_armed.is_some());
+        handle_key(&mut m, key(KeyCode::Esc));
+        assert_eq!(m.composer.editor().get_text(), "");
+        assert!(m.clear_armed.is_none());
+        handle_key(&mut m, key(KeyCode::Up));
+        assert_eq!(m.composer.editor().get_text(), "half a thought");
+    }
+
+    #[test]
+    fn a_key_between_the_escapes_disarms_the_clear() {
+        let mut m = model(100, 24);
+        m.type_char("keep");
+        handle_key(&mut m, key(KeyCode::Esc));
+        handle_key(&mut m, key(KeyCode::Char('!')));
+        assert!(m.clear_armed.is_none());
+        handle_key(&mut m, key(KeyCode::Esc));
+        assert_eq!(m.composer.editor().get_text(), "keep!");
+        // An expired arm counts as a first press again.
+        m.clear_armed = Some(
+            std::time::Instant::now()
+                - std::time::Duration::from_millis(crate::DOUBLE_ESCAPE_MS + 50),
+        );
+        handle_key(&mut m, key(KeyCode::Esc));
+        assert_eq!(m.composer.editor().get_text(), "keep!");
+        assert!(m.clear_armed.is_some());
+    }
+
+    #[test]
+    fn esc_on_an_empty_composer_arms_nothing() {
+        let mut m = model(100, 24);
+        handle_key(&mut m, key(KeyCode::Esc));
+        assert!(m.clear_armed.is_none());
     }
 
     #[test]
@@ -3510,20 +3756,29 @@ mod extension_manager_tests {
     }
 
     #[test]
-    fn arrows_and_tab_move_between_rows_and_tabs() {
+    fn arrows_and_tab_move_between_rows_and_views() {
+        use crate::davinci::model::ExtensionView;
         let mut m = model();
         press(&mut m, KeyCode::Down);
         assert_eq!(
             chosen(press(&mut m, KeyCode::Char('e'))).unwrap().2,
             "two@m"
         );
-        press(&mut m, KeyCode::Right);
+        // Opening Discover asks the host for its first results.
         assert_eq!(
-            m.extension_manager.as_ref().unwrap().tab,
-            ExtensionTab::Skills
+            press(&mut m, KeyCode::Right),
+            Flow::Choose(Choice::ExtensionSearch {
+                tab: ExtensionTab::Plugins,
+                query: String::new()
+            })
         );
+        let view = |m: &Model| m.extension_manager.as_ref().unwrap().view;
+        assert_eq!(view(&m), ExtensionView::Discover);
         press(&mut m, KeyCode::Tab);
+        assert_eq!(view(&m), ExtensionView::Marketplaces);
         press(&mut m, KeyCode::Tab);
+        assert_eq!(view(&m), ExtensionView::Installed);
+        // The kind never changes: each command opens its own manager.
         assert_eq!(
             m.extension_manager.as_ref().unwrap().tab,
             ExtensionTab::Plugins
@@ -3592,6 +3847,148 @@ mod extension_manager_tests {
         press(&mut m, KeyCode::Right);
         assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
         assert!(armed(&m).is_none());
+    }
+
+    fn discover_model() -> Model {
+        use crate::davinci::model::ExtensionView;
+        let mut m = model();
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.tab = ExtensionTab::Skills;
+        sheet.view = ExtensionView::Discover;
+        sheet.discover.results = vec![
+            ExtensionRow {
+                key: "skills.sh:a/b/pdf".into(),
+                title: "pdf".into(),
+                status: "a/b".into(),
+                ..ExtensionRow::default()
+            },
+            ExtensionRow {
+                key: "local:docx".into(),
+                title: "docx".into(),
+                status: "installed".into(),
+                ..ExtensionRow::default()
+            },
+        ];
+        m
+    }
+
+    fn searched(flow: Flow) -> Option<String> {
+        match flow {
+            Flow::Choose(Choice::ExtensionSearch { query, .. }) => Some(query),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn typing_in_discover_searches_and_letters_are_not_shortcuts() {
+        let mut m = discover_model();
+        assert_eq!(
+            searched(press(&mut m, KeyCode::Char('p'))).as_deref(),
+            Some("p")
+        );
+        // `d`, `e`, `u` and `y` are query text here, not actions.
+        assert_eq!(
+            searched(press(&mut m, KeyCode::Char('d'))).as_deref(),
+            Some("pd")
+        );
+        assert_eq!(
+            searched(press(&mut m, KeyCode::Char('y'))).as_deref(),
+            Some("pdy")
+        );
+        assert_eq!(
+            searched(press(&mut m, KeyCode::Backspace)).as_deref(),
+            Some("pd")
+        );
+        // Esc clears the query first, then closes the sheet.
+        assert_eq!(searched(press(&mut m, KeyCode::Esc)).as_deref(), Some(""));
+        assert_eq!(m.screen, Screen::Extensions);
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(m.screen, Screen::Agent);
+    }
+
+    #[test]
+    fn install_needs_a_second_enter_and_installed_results_offer_none() {
+        let mut m = discover_model();
+        assert_eq!(press(&mut m, KeyCode::Enter), Flow::Continue);
+        assert!(m.extension_manager.as_ref().unwrap().discover.armed_here());
+        // Esc cancels the armed install without leaving.
+        press(&mut m, KeyCode::Esc);
+        assert!(m
+            .extension_manager
+            .as_ref()
+            .unwrap()
+            .discover
+            .armed
+            .is_none());
+        assert_eq!(m.screen, Screen::Extensions);
+        press(&mut m, KeyCode::Enter);
+        assert_eq!(
+            press(&mut m, KeyCode::Enter),
+            Flow::Choose(Choice::ExtensionInstall {
+                tab: ExtensionTab::Skills,
+                key: "skills.sh:a/b/pdf".into()
+            })
+        );
+        // Moving away disarms; an installed result never arms.
+        press(&mut m, KeyCode::Enter);
+        press(&mut m, KeyCode::Down);
+        assert!(m
+            .extension_manager
+            .as_ref()
+            .unwrap()
+            .discover
+            .armed
+            .is_none());
+        assert_eq!(press(&mut m, KeyCode::Enter), Flow::Continue);
+        assert_eq!(press(&mut m, KeyCode::Enter), Flow::Continue);
+    }
+
+    #[test]
+    fn marketplaces_add_update_and_remove_with_confirmation() {
+        use crate::davinci::model::ExtensionView;
+        let mut m = model();
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.view = ExtensionView::Marketplaces;
+        sheet.marketplaces = vec![ExtensionRow {
+            key: "official".into(),
+            title: "official".into(),
+            can_update: true,
+            can_delete: true,
+            ..ExtensionRow::default()
+        }];
+        let action = |flow: Flow| match flow {
+            Flow::Choose(Choice::MarketplaceAction { action, value }) => Some((action, value)),
+            _ => None,
+        };
+        assert_eq!(
+            action(press(&mut m, KeyCode::Char('u'))),
+            Some(("update", "official".into()))
+        );
+        press(&mut m, KeyCode::Char('a'));
+        for ch in "a/b".chars() {
+            press(&mut m, KeyCode::Char(ch));
+        }
+        // Arrows stay in the field while typing.
+        press(&mut m, KeyCode::Right);
+        assert_eq!(
+            m.extension_manager.as_ref().unwrap().view,
+            ExtensionView::Marketplaces
+        );
+        assert_eq!(
+            action(press(&mut m, KeyCode::Enter)),
+            Some(("add", "a/b".into()))
+        );
+        assert!(action(press(&mut m, KeyCode::Char('d'))).is_none());
+        assert!(action(press(&mut m, KeyCode::Char('x'))).is_none());
+        assert!(
+            action(press(&mut m, KeyCode::Char('y'))).is_none(),
+            "x disarmed"
+        );
+        press(&mut m, KeyCode::Char('d'));
+        assert_eq!(
+            action(press(&mut m, KeyCode::Char('y'))),
+            Some(("remove", "official".into()))
+        );
     }
 }
 

@@ -30,14 +30,16 @@ davinci plugin install code-review@claude-plugins-official
 Marketplaces that Claude Code or Codex already cloned are browsable without
 adding them. Installs are copied to `~/.davinci/agent/plugins/cache/`.
 
-Every command also works inside a session as `/plugin …`. Changes take effect
+Every command also works inside a session as `/plugins …`. Changes take effect
 in a new session or after `/reload`.
 
 ## Managing what is installed
 
-In a session, `/plugin` with no arguments opens a manager with three tabs:
-Plugins, Skills and MCP servers. `←`/`→` (or Tab) switch tabs, `↑`/`↓`
-select, and the hint row names only the keys the selected row allows:
+In a session, `/plugins`, `/skills` and `/mcp` each open a manager for one
+kind, with an Installed view, a Discover view (search and install) and, for
+plugins, a Marketplaces view. `←`/`→` (or Tab) switch views, `↑`/`↓`
+select, and the hint row names only the keys the selected row allows. In
+Installed:
 
 | Key | Plugins | Skills | MCP servers |
 |---|---|---|---|
@@ -158,7 +160,8 @@ treated as a new, empty registry.
 - DaVinci does not list skills in the system prompt yet (neither plugin nor
   user skills), so the model does not pick one on its own. Invoke a plugin
   skill with `/skill:<name>`.
-- `/plugin` runs in the foreground: `marketplace add` and `install` from git
-  wait for the clone.
+- Installing and marketplace changes run in the foreground: `marketplace add`
+  and `install` from git wait for the clone. Discover searches online
+  directories in the background.
 - Claude Code's `npm` plugin sources and non-command hook types (`prompt`)
   are not supported.

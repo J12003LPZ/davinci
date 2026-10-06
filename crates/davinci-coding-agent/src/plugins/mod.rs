@@ -9,6 +9,7 @@
 //! load resources but never run plugin hooks.
 
 pub mod command;
+pub mod discover;
 pub mod external;
 pub mod hooks;
 pub mod manager;

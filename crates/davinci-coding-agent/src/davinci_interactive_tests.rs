@@ -3830,3 +3830,20 @@ fn prompt_rewind_notices_reach_native_transcript_and_picker() {
         Done::Note(text) if text == failure)
     );
 }
+
+#[test]
+fn plugins_words_search_unless_they_are_a_subcommand_with_its_target() {
+    for search in ["test", "info", "update", "code review", "show", ""] {
+        assert!(!super::is_plugin_subcommand(search), "{search:?} searches");
+    }
+    for command in [
+        "install code-review@claude-plugins-official",
+        "test my-plugin",
+        "marketplace add anthropics/skills",
+        "list",
+        "help",
+        "import",
+    ] {
+        assert!(super::is_plugin_subcommand(command), "{command:?} runs");
+    }
+}

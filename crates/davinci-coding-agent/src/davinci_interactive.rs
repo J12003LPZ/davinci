@@ -14,16 +14,17 @@ use davinci_agent::{
 };
 use davinci_tui::davinci::model::{
     Ask, AskKind, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger,
-    ExtensionRow, ExtensionTab, ExtensionsSheet, FailedRun, Finding, GovernorCounter,
-    GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk, HunkKind, KeymapGroup,
-    McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep,
-    ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity,
-    Step, SubagentRow, SubagentRowState, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
+    ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, FailedRun, Finding,
+    GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk, HunkKind,
+    KeymapGroup, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep, ProviderRow,
+    ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step,
+    SubagentRow, SubagentRowState, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
     WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
 use crate::extension_host::ExtensionHost;
+mod discover;
 mod graph_feedback;
 mod graph_setup;
 
@@ -4247,16 +4248,13 @@ pub fn perform(
                 }
             }
         }
-        SlashAction::Mcp => {
-            if agent.tool_context.mcp.rows().is_empty() {
-                Ok(Done::Said(
-                    "No MCP servers configured. Run davinci doctor if this is unexpected — it lists MCP config files that failed validation. Otherwise, run davinci mcp --help to learn more."
-                        .into(),
-                ))
-            } else {
-                open_mcp_sheet(agent, model);
-                Ok(Done::Opened)
-            }
+        SlashAction::Mcp(args) => {
+            open_extension_manager(parsed, agent, model, ExtensionTab::Mcp, &args);
+            Ok(Done::Opened)
+        }
+        SlashAction::Skills(args) => {
+            open_extension_manager(parsed, agent, model, ExtensionTab::Skills, &args);
+            Ok(Done::Opened)
         }
         SlashAction::ShowDoctor => Ok(Done::Said(crate::format_session_doctor(parsed, agent))),
         SlashAction::ShowCost => Ok(Done::Said(crate::format_session_cost(parsed, agent))),
@@ -4280,12 +4278,15 @@ pub fn perform(
             );
             Ok(Done::Said(team_command_text(agent, profiles, &args)))
         }
-        // Bare `/plugin` opens the manager; `/plugin <command>` stays text.
-        SlashAction::Plugin(args) if args.trim().is_empty() => {
-            open_extensions_sheet(parsed, agent, model, None, false);
+        // `/plugins install x@m` and the other subcommands stay text, so
+        // scripts and muscle memory keep working; anything else searches.
+        SlashAction::Plugins(args) if is_plugin_subcommand(&args) => {
+            Ok(Done::Said(crate::plugin_command_text(&args, &agent.cwd)))
+        }
+        SlashAction::Plugins(args) => {
+            open_extension_manager(parsed, agent, model, ExtensionTab::Plugins, &args);
             Ok(Done::Opened)
         }
-        SlashAction::Plugin(args) => Ok(Done::Said(crate::plugin_command_text(&args, &agent.cwd))),
         SlashAction::Tasks => {
             open_task_board_sheet(agent, model);
             Ok(Done::Opened)
@@ -4806,6 +4807,11 @@ pub fn run(
             model.dirty = true;
             last_tick = Instant::now();
             poll_jobs(&agent.tool_context.jobs, &mut model);
+            if model.screen == davinci_tui::davinci::model::Screen::Extensions {
+                if let Some(tab) = model.extension_manager.as_ref().map(|sheet| sheet.tab) {
+                    discover::poll(&mut model, tab);
+                }
+            }
             let (agents, workflows) = background_counts(agent);
             if (agents, workflows) != (model.agents_running, model.workflows_running) {
                 model.agents_running = agents;
@@ -5867,28 +5873,103 @@ fn sessions_disk(paths: &[std::path::PathBuf]) -> Option<(u64, u64)> {
     Some((used, 0))
 }
 
-fn open_mcp_sheet(agent: &Agent, model: &mut Model) {
-    let servers = agent
-        .tool_context
-        .mcp
-        .rows()
+/// The words `/plugins` treats as a `davinci plugin` subcommand rather
+/// than a search.
+pub(crate) fn is_plugin_subcommand(args: &str) -> bool {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    match words.as_slice() {
+        // Commands that act on a plugin need one: `/plugins test` searches.
+        [verb, _target, ..] => matches!(
+            *verb,
+            "install"
+                | "add"
+                | "uninstall"
+                | "remove"
+                | "enable"
+                | "disable"
+                | "update"
+                | "marketplace"
+                | "import"
+                | "info"
+                | "show"
+                | "approve"
+                | "revoke"
+                | "test"
+        ),
+        [verb] => matches!(*verb, "list" | "ls" | "help" | "import" | "marketplace"),
+        [] => false,
+    }
+}
+
+/// `/plugins`, `/skills`, `/mcp`: open the manager on its kind. With a
+/// search, it opens on Discover with the search typed in.
+fn open_extension_manager(
+    parsed: &crate::args::Args,
+    agent: &Agent,
+    model: &mut Model,
+    tab: ExtensionTab,
+    query: &str,
+) {
+    let typed = query.trim();
+    // `/plugins search` (or `browse`) with nothing after it opens Discover too.
+    let explicit = matches!(typed.split_whitespace().next(), Some("search" | "browse"));
+    let query = if explicit {
+        typed
+            .split_once(char::is_whitespace)
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("")
+    } else {
+        typed
+    };
+    let wants_discover = explicit || !query.is_empty();
+    model.extension_manager = None;
+    discover::invalidate();
+    open_extensions_sheet(parsed, agent, model, None, false);
+    if let Some(sheet) = model.extension_manager.as_mut() {
+        sheet.tab = tab;
+        sheet.view = if wants_discover {
+            ExtensionView::Discover
+        } else {
+            ExtensionView::Installed
+        };
+        sheet.discover.query = query.to_string();
+    }
+    if wants_discover {
+        discover::search(model, tab, query, &crate::default_agent_dir());
+    }
+}
+
+/// Plugin marketplaces as manager rows. Only the ones DaVinci registered can
+/// be refreshed or removed here; Claude Code's and Codex's are read-only.
+fn marketplace_rows(agent_dir: &std::path::Path) -> Vec<ExtensionRow> {
+    use davinci_coding_agent::plugins::marketplace;
+    let registry = marketplace::load_registry(agent_dir).unwrap_or_default();
+    marketplace::catalogs(agent_dir)
+        .unwrap_or_default()
         .into_iter()
-        .map(|row| McpServerRow {
-            name: row.name,
-            transport: row.transport,
-            status: row.status,
-            tools: row.tools,
-            error: row.error,
+        .map(|catalog| {
+            let own = catalog.from == "davinci";
+            let source = registry
+                .get(&catalog.name)
+                .map(|entry| entry.source.describe())
+                .unwrap_or_else(|| catalog.root.display().to_string());
+            ExtensionRow {
+                key: catalog.name.clone(),
+                title: catalog.name.clone(),
+                status: match catalog.from {
+                    "claude" => "from Claude Code".into(),
+                    "codex" => "from Codex".into(),
+                    _ => "davinci".into(),
+                },
+                state: State::Done,
+                detail: format!("{} plugins · {source}", catalog.entries().len()),
+                note: (!own).then(|| "Read from that tool's install; manage it there.".to_string()),
+                can_update: own,
+                can_delete: own,
+                ..ExtensionRow::default()
+            }
         })
-        .collect();
-    model.mcp = Some(McpSheet {
-        servers,
-        config_path: crate::default_agent_dir()
-            .join("mcp.json")
-            .display()
-            .to_string(),
-    });
-    open_sheet(model, Screen::Mcp);
+        .collect()
 }
 
 /// Where `/plugin` may act: the skill directories whose contents it may move
@@ -5993,6 +6074,11 @@ fn open_extensions_sheet(
     let reopening = model.screen == Screen::Extensions;
     model.extension_manager = Some(ExtensionsSheet {
         tab: previous.tab,
+        view: previous.view,
+        discover: previous.discover,
+        marketplaces: marketplace_rows(&agent_dir),
+        marketplace_selected: previous.marketplace_selected,
+        marketplace_input: None,
         plugins: extension_rows(manager::plugin_rows(&agent_dir)),
         skills: extension_rows(manager::skill_rows(&agent.skills, &agent_dir, &skill_roots)),
         mcp: extension_rows(manager::mcp_rows(&agent_dir, &files, &live)),
@@ -6022,6 +6108,9 @@ fn apply_extension_action(
         ExtensionTab::Mcp => manager::mcp_action(&agent_dir, &files, action, key),
     };
     let changed = outcome.is_ok() && action != "info";
+    if changed {
+        discover::invalidate();
+    }
     // Skills, commands, agents and SessionStart context from plugins take
     // effect now; other hooks are read per prompt. MCP servers wait for the
     // next session.
@@ -6065,6 +6154,116 @@ fn apply_extension_action(
         Some(notice),
         action == "info",
     );
+    Next::Go
+}
+
+/// Make what changed on disk live, as an installed-row action does: skills,
+/// commands, agents and SessionStart context now; MCP servers next session.
+fn refresh_after_change(shell: &mut Shell<'_>, tab: ExtensionTab) {
+    if tab == ExtensionTab::Mcp {
+        return;
+    }
+    crate::apply_discovered_resources(shell.parsed, shell.agent);
+    shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+    shell.model.corpus = corpus(
+        shell.agent,
+        &shell.model.slash_commands,
+        &shell.model.sessions,
+    );
+    shell.model.corpus_total = shell.model.corpus.len();
+}
+
+/// Install a Discover result, then show the outcome and the refreshed lists.
+fn install_listing(shell: &mut Shell<'_>, tab: ExtensionTab, key: &str) -> Next {
+    use davinci_coding_agent::plugins::discover as catalog;
+    let agent_dir = crate::default_agent_dir();
+    // A git clone can take a while: say so before the screen waits on it.
+    if let Some(sheet) = shell.model.extension_manager.as_mut() {
+        let title = sheet
+            .discover
+            .current()
+            .map(|row| row.title.clone())
+            .unwrap_or_else(|| key.to_string());
+        sheet.notice = Some(format!("Installing {title}…"));
+    }
+    let _ = shell.terminal.draw(shell.model);
+    let (_, files) = extension_scope(shell.parsed, shell.agent);
+    let outcome = match discover::listing(key) {
+        None => Err("that result is no longer listed; search again".to_string()),
+        Some(listing) => {
+            let names: std::collections::BTreeSet<String> = shell
+                .model
+                .extension_manager
+                .as_ref()
+                .map(|sheet| sheet.mcp.iter().map(|row| row.key.clone()).collect())
+                .unwrap_or_default();
+            catalog::install(
+                discover::kind(tab),
+                &listing,
+                &catalog::InstallContext {
+                    agent_dir: &agent_dir,
+                    cwd: &shell.agent.cwd,
+                    mcp_file: &files.user,
+                    mcp_names: &names,
+                },
+            )
+        }
+    };
+    let notice = match outcome {
+        Ok(text) => {
+            refresh_after_change(shell, tab);
+            let mut text = text
+                .replace("Start a new session or run /reload to load it.", "")
+                .trim()
+                .to_string();
+            if tab == ExtensionTab::Plugins {
+                for warning in davinci_coding_agent::plugins::take_notices() {
+                    text.push_str(&format!("\nWarning: {warning}"));
+                }
+            }
+            text
+        }
+        Err(err) => format!("Could not install: {err}"),
+    };
+    discover::invalidate();
+    open_extensions_sheet(shell.parsed, shell.agent, shell.model, Some(notice), false);
+    let query = shell
+        .model
+        .extension_manager
+        .as_ref()
+        .map(|sheet| sheet.discover.query.clone())
+        .unwrap_or_default();
+    discover::search(shell.model, tab, &query, &agent_dir);
+    Next::Go
+}
+
+/// Add, refresh or remove a plugin marketplace from the Marketplaces view.
+fn apply_marketplace_action(shell: &mut Shell<'_>, action: &'static str, value: &str) -> Next {
+    let agent_dir = crate::default_agent_dir();
+    if let Some(sheet) = shell.model.extension_manager.as_mut() {
+        sheet.notice = Some(match action {
+            "add" => format!("Adding {value}…"),
+            "update" => format!("Updating {value}…"),
+            _ => format!("Removing {value}…"),
+        });
+    }
+    let _ = shell.terminal.draw(shell.model);
+    let args: Vec<String> = ["marketplace", action, value]
+        .iter()
+        .map(|word| word.to_string())
+        .collect();
+    let notice =
+        match davinci_coding_agent::plugins::command::run(&args, &agent_dir, &shell.agent.cwd) {
+            Ok(text) if action == "add" => text.replace(
+                "Browse it with `plugin browse`.",
+                "Its plugins are in Discover (←).",
+            ),
+            Ok(text) if text.trim().is_empty() => format!("Updated {value}."),
+            Ok(text) => text,
+            Err(err) => format!("Could not {action} {value}: {err}"),
+        };
+    discover::invalidate();
+    open_extensions_sheet(shell.parsed, shell.agent, shell.model, Some(notice), false);
     Next::Go
 }
 
@@ -8930,6 +9129,14 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
         Choice::GraphAction { action, index } => apply_graph_action(shell, action, index),
         Choice::ExtensionAction { action, tab, key } => {
             apply_extension_action(shell, action, tab, &key)
+        }
+        Choice::ExtensionSearch { tab, query } => {
+            discover::search(shell.model, tab, &query, &crate::default_agent_dir());
+            Next::Go
+        }
+        Choice::ExtensionInstall { tab, key } => install_listing(shell, tab, &key),
+        Choice::MarketplaceAction { action, value } => {
+            apply_marketplace_action(shell, action, &value)
         }
     }
 }

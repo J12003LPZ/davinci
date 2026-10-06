@@ -71,7 +71,7 @@ something before it works, fixes what it can, and lists the rest:
 | Vector memory | Starts an installed local Ollama (`ollama serve`), pulls `embeddingModel` in the background, and embeds records that have no vector. | Install Ollama when it is missing. Fix `embeddingDimensions` when the model disagrees. |
 | .gitignore | Adds `/.davinci/vector-memory/` and `/.davinci/graph/` to the project's `.gitignore` inside a Git work tree. | Nothing. |
 | Project trust | Reports when project settings, hooks, skills or MCP servers are ignored because the project is not trusted. | Review them, then run `/setup trust`. Restart to load them. |
-| Plugin hooks | Lists enabled plugins whose hooks wait for approval. | `/plugin approve <name>`. |
+| Plugin hooks | Lists enabled plugins whose hooks wait for approval. | `/plugins approve <name>`. |
 | Language servers | Detects Rust, TypeScript/JavaScript and Python projects and looks for their servers on `PATH` or in `node_modules/.bin`. | Install the server it names. Davinci never installs one. |
 | Project instructions | Looks for `AGENTS.md` or `CLAUDE.md`. | `/init`. |
 

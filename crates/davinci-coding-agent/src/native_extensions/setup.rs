@@ -772,7 +772,7 @@ pub fn plugins_step(agent_dir: &Path) -> Step {
     }
     let action = pending
         .iter()
-        .map(|name| format!("/plugin approve {name}"))
+        .map(|name| format!("/plugins approve {name}"))
         .collect::<Vec<_>>()
         .join(", ");
     Step::new(
@@ -781,7 +781,7 @@ pub fn plugins_step(agent_dir: &Path) -> Step {
         StepState::Action,
         format!("hooks of {} wait for approval", pending.join(", ")),
     )
-    .with_action(format!("read them with /plugin, then {action}"))
+    .with_action(format!("read them with /plugins, then {action}"))
 }
 
 struct LanguageCheck {

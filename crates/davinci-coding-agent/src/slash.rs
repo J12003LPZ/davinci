@@ -17,6 +17,9 @@ pub const RETIRED_COMMANDS: &[(&str, &str)] = &[
     ("fast", "set \"serviceTier\" in settings"),
     ("act", "Shift+Tab leaves Plan Mode"),
     ("settings", "use /config"),
+    ("plugin", "use /plugins, /skills or /mcp"),
+    ("skill-list", "use /skills"),
+    ("skill-view", "use /skills"),
 ];
 
 /// Where a retired command's job went, when `name` is one.
@@ -96,7 +99,21 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Reload keybindings, extensions, skills, prompts, themes, and context files",
             None,
         ),
-        ("mcp", "Connected MCP servers, tools and errors", None),
+        (
+            "skills",
+            "Find, install and manage skills",
+            Some("[search]"),
+        ),
+        (
+            "plugins",
+            "Find, install and manage plugins and their marketplaces",
+            Some("[search|install|uninstall|enable|disable|update|marketplace …]"),
+        ),
+        (
+            "mcp",
+            "Find, install and manage MCP servers",
+            Some("[search]"),
+        ),
         ("cost", "Tokens and USD spent this session", None),
         ("status", "Model, permission, jobs, MCP, tokens", None),
         (
@@ -123,11 +140,6 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "agents",
             "Agent profiles and live team",
             Some("[msg <name> <text>|stop <name>]"),
-        ),
-        (
-            "plugin",
-            "Manage plugins, skills and MCP servers; install Claude Code / Codex plugins",
-            Some("[list|browse|install|import|info|approve|enable|disable|marketplace]"),
         ),
         ("tasks", "Execution checklist and live task board", None),
         (
@@ -180,7 +192,8 @@ pub enum SlashAction {
     Settings,
     Hotkeys,
     SessionInfo,
-    Mcp,
+    /// `/mcp [search]`.
+    Mcp(String),
     ShowCost,
     ShowStatus,
     ShowDoctor,
@@ -190,8 +203,10 @@ pub enum SlashAction {
     Context(String),
     Agents(String),
     Workflow(String),
-    /// `/plugin …`: the text after the command name.
-    Plugin(String),
+    /// `/plugins [search | subcommand …]`.
+    Plugins(String),
+    /// `/skills [search]`.
+    Skills(String),
     Tasks,
 }
 
@@ -270,7 +285,8 @@ pub fn parse_line(line: &str) -> SlashAction {
         "hotkeys" => SlashAction::Hotkeys,
         "session" if args == "info" || args == "stats" => SlashAction::SessionInfo,
         "session" => SlashAction::Resume,
-        "mcp" => SlashAction::Mcp,
+        "mcp" => SlashAction::Mcp(args.to_string()),
+        "skills" => SlashAction::Skills(args.to_string()),
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
         "doctor" => SlashAction::ShowDoctor,
@@ -278,7 +294,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "context" => SlashAction::Context(args.to_string()),
         "workflow" | "workflows" => SlashAction::Workflow(args.to_string()),
         "agents" => SlashAction::Agents(args.to_string()),
-        "plugin" | "plugins" => SlashAction::Plugin(args.to_string()),
+        "plugins" => SlashAction::Plugins(args.to_string()),
         "tasks" => SlashAction::Tasks,
         "help" => SlashAction::Status(help_lines().join("\n")),
         // TS sends unknown slashes (skills, templates, extension commands) to prompt().

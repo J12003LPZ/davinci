@@ -102,8 +102,7 @@ Active procedural skills are persisted as standard skill directories containing 
 | `/learning-pending` | Lists candidates staged for approval after an opted-in review. |
 | `/learning-approve <id\|all>` | Approves a staged candidate, activating the skill/memory and updating the ledger. |
 | `/learning-reject <id\|all>` | Rejects a staged candidate, marking it as dismissed. |
-| `/skill-list [query]` | Lists compact descriptors of known skills across project and global scopes with versions and usage counts. |
-| `/skill-view <name> [file]` | Displays the contents and ledger metadata of a specific skill or support file. |
+| `/skills [search]` | Lists installed skills and finds new ones (Discover). The model keeps its `skill_list` and `skill_view` tools. |
 
 ### Progressive Disclosure
 When background reviews stage candidates or activate skills, notifications are buffered and drained into the interactive transcript without corrupting the TUI screen:

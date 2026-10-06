@@ -1267,34 +1267,6 @@ impl LearningController {
             "rejected": rejected_ids
         }))
     }
-
-    pub fn skill_list_command(&self, args: &str) -> Result<Value, String> {
-        let query = args.trim();
-        let tool_args = json!({
-            "query": query,
-            "limit": 20
-        });
-        let result = self
-            .skill_list_tool(Path::new("."), &tool_args)
-            .map_err(|e| e.to_string())?;
-        serde_json::from_str(&result.content).map_err(|e| e.to_string())
-    }
-
-    pub fn skill_view_command(&self, args: &str) -> Result<Value, String> {
-        let mut parts = args.split_whitespace();
-        let name = parts
-            .next()
-            .ok_or_else(|| "usage: /skill-view <name> [file]".to_string())?;
-        let file = parts.next().unwrap_or("SKILL.md");
-        let tool_args = json!({
-            "name": name,
-            "file": file
-        });
-        let result = self
-            .skill_view_tool(Path::new("."), &tool_args)
-            .map_err(|e| e.to_string())?;
-        serde_json::from_str(&result.content).map_err(|e| e.to_string())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1864,7 +1836,10 @@ mod tests {
 
         let controller2 = LearningController::new(dir.path(), Some(agent_dir.path()), None);
         assert!(controller2.project_store.skill("persisted-skill").is_some());
-        let list = controller2.skill_list_command("persisted").unwrap();
+        let result = controller2
+            .skill_list_tool(Path::new("."), &json!({"query": "persisted", "limit": 20}))
+            .unwrap();
+        let list: Value = serde_json::from_str(&result.content).unwrap();
         assert!(list["skills"]
             .as_array()
             .unwrap()

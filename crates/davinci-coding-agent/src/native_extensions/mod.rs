@@ -168,8 +168,6 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "learning-pending",
     "learning-approve",
     "learning-reject",
-    "skill-list",
-    "skill-view",
     "hook-status",
     "setup",
 ];
@@ -289,16 +287,6 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             "learning-reject",
             "Reject a learning candidate.",
             Some("<candidateId|all> [reason]"),
-        ),
-        (
-            "skill-list",
-            "List compact reusable skill descriptors.",
-            Some("[query]"),
-        ),
-        (
-            "skill-view",
-            "Read the full content of a skill.",
-            Some("<name> [file]"),
         ),
         (
             "hook-status",
@@ -1011,8 +999,6 @@ impl NativeExtensionHost {
                 res.map(Some)
             }
             "learning-reject" => self.learning().reject_command(args).map(Some),
-            "skill-list" => self.learning().skill_list_command(args).map(Some),
-            "skill-view" => self.learning().skill_view_command(args).map(Some),
             "hook-status" => {
                 let cwd = if self.cwd.as_os_str().is_empty() {
                     std::env::current_dir().unwrap_or_default()

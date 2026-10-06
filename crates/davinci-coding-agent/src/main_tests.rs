@@ -2721,7 +2721,31 @@ fn help_lists_product_commands() {
         slash::parse_line("/share"),
         slash::SlashAction::Share
     ));
-    assert!(matches!(slash::parse_line("/mcp"), slash::SlashAction::Mcp));
+    assert_eq!(
+        slash::parse_line("/mcp"),
+        slash::SlashAction::Mcp(String::new())
+    );
+    assert_eq!(
+        slash::parse_line("/mcp github"),
+        slash::SlashAction::Mcp("github".into())
+    );
+    assert_eq!(
+        slash::parse_line("/skills pdf forms"),
+        slash::SlashAction::Skills("pdf forms".into())
+    );
+    assert_eq!(
+        slash::parse_line("/plugins install x@m"),
+        slash::SlashAction::Plugins("install x@m".into())
+    );
+    // The retired names are no longer parsed as commands.
+    for retired in ["/plugin", "/skill-list", "/skill-view x"] {
+        assert!(matches!(
+            slash::parse_line(retired),
+            slash::SlashAction::Prompt(_)
+        ));
+        let head = retired.trim_start_matches('/').split(' ').next().unwrap();
+        assert!(slash::retired_command_hint(head).is_some(), "{head}");
+    }
     assert!(matches!(
         slash::parse_line("/cost"),
         slash::SlashAction::ShowCost
