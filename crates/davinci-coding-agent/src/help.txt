@@ -168,7 +168,6 @@ Permission Modes (interactive):
   /plan reject <id>               Reject one plan decision; "all" selects all decisions
   /plan approve                   Approve a fresh, complete plan without changing mode
   /plan accept [mode]             Approve and select an execution mode
-  /act                            Leave Plan Mode without implicitly approving a plan
   Always Approve removes harness approval prompts, not explicit denials, filesystem
   boundaries, OS restrictions, or missing credentials. Auto Mode escalates risk.
 

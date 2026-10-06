@@ -523,7 +523,7 @@ impl LivingPlan {
                 s.verify.join("; ")
             ));
         }
-        lines.push("\n/plan accept <id|all> · /plan reject <id> · /plan edit <id> <change> · /plan approve · /act".into());
+        lines.push("\n/plan accept <id|all> · /plan reject <id> · /plan edit <id> <change> · /plan approve · Shift+Tab leaves planning".into());
         lines.join("\n")
     }
 }

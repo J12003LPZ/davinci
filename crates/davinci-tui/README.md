@@ -30,7 +30,7 @@ The TUI implements the design system documented in [`docs/ui/design.md`](../../d
 | `1a`–`2c` | Main transcript & interaction loop | `src/davinci/views/stream.rs`, `turn.rs` |
 | `3a` | `/model` selection sheet | `src/davinci/views/model.rs` |
 | `3b` | `/config` toggle sheet | `src/davinci/views/settings.rs` |
-| `3c` | `/thinking` budget sheet | `src/davinci/views/thinking.rs` |
+| `3c` | `/effort` budget sheet | `src/davinci/views/thinking.rs` |
 | `3d` | `/login` authentication sheet | `src/davinci/views/login.rs` |
 | `4a` | `/hotkeys` help sheet | `src/davinci/views/keys.rs` |
 | `4b` | `/resume` session picker | `src/davinci/views/resume.rs` |

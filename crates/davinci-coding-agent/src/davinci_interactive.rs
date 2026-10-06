@@ -2217,7 +2217,6 @@ pub fn corpus(
         "freeze mutations · the model may only read",
         "command",
     ));
-    items.push(CorpusItem::new("/act", "leave plan mode", "command"));
     items.push(CorpusItem::new(
         "/cost",
         "tokens and USD this session",
@@ -2565,6 +2564,18 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
 /// prose is a prompt, and is sent as one.
 fn unknown_command(model: &Model, line: &str) -> Option<String> {
     let token = line.trim().strip_prefix('/')?;
+    // A retired command is answered even with arguments: `/thinking low` is
+    // the old command, not prose that happens to start with a slash.
+    let head = token.split_whitespace().next().unwrap_or_default();
+    if let Some(hint) = crate::slash::retired_command_hint(head) {
+        let owned = model
+            .slash_commands
+            .iter()
+            .any(|item| item.name.eq_ignore_ascii_case(head));
+        if !owned {
+            return Some(format!("/{head} is not a command · {hint}"));
+        }
+    }
     if token.is_empty() || token.chars().any(char::is_whitespace) {
         return None;
     }
@@ -3974,13 +3985,8 @@ pub fn perform(
                 ),
             }))
         }
-        // Bare `/thinking` or `/effort`: the model picker opens on the
-        // current model, whose effort row adjusts with ←/→.
-        SlashAction::ToggleFast => {
-            let text = crate::toggle_fast(parsed, agent);
-            model.speed_mode = crate::speed_label(agent);
-            Ok(Done::Said(text))
-        }
+        // Bare `/effort`: the model picker opens on the current model, whose
+        // effort row adjusts with ←/→.
         SlashAction::SetThinking(level) if level.trim().is_empty() => {
             open_models_sheet(parsed, agent, model);
             Ok(Done::Opened)

@@ -147,11 +147,6 @@ pub fn handle_mode_command(
     let args = words.next().unwrap_or_default().trim();
     match name {
         "/plan" => Some(agent.handle_plan_command(args)),
-        "/act" if args.is_empty() => {
-            agent.set_plan_mode(false);
-            Some(Ok(format!("{} · planning ended; no plan was implicitly approved", agent.permission_mode().label())))
-        }
-        "/act" => Some(Err("usage: /act (or /plan accept <mode> to approve a plan)".into())),
         "/permissions" if args.is_empty() => Some(Ok(format!(
             "{} · {}\n{}",
             agent.permission_mode().label(), agent.permission_mode().describe(),

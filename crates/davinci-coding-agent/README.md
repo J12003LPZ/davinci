@@ -12,7 +12,7 @@
   - `run_rpc`: Headless JSON-RPC over stdio (`--mode rpc`).
 - **Interactive Shell (`davinci_interactive.rs`, `davinci_sources.rs`)**:
   - Full-featured terminal interface connecting the user to `davinci_tui`.
-  - Slash command parser (`/help`, `/model`, `/thinking`, `/permissions`, `/diff`, `/graph`, etc.).
+  - Slash command parser (`/help`, `/model`, `/effort`, `/permissions`, `/diff`, `/graph`, etc.).
   - Real-time fact providers dressing command sheets with live git status, token meters, and context windows.
 - **Native Extensions (`src/native_extensions/`)**:
   - **Vector Memory (`vector_memory.rs`)**: Indexes conversation messages using local embeddings (e.g. via Ollama) for semantic recall.

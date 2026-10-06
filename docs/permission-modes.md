@@ -97,7 +97,7 @@ Commands:
 - `/plan accept <id>` or `/plan reject <id>`: accept/reject a decision (`all` is supported).
 - `/plan approve`: approve the complete, fresh plan without changing execution mode.
 - `/plan accept [mode]`: approve and select an execution mode. A blank mode uses the previous safe execution mode, never implicitly Always Approve. Explicit Always Approve remains available.
-- `/act`: leave Plan Mode without treating the plan as approved.
+- Shift+Tab: leave Plan Mode without treating the plan as approved.
 
 Handoff rejects incomplete plans, unresolved questions, rejected decisions and changed/unavailable evidence. Plan acceptance is a user command, not a tool the model can call to approve itself. Mode selection alone does not approve a plan or submit an implementation prompt. Re-entering Plan Mode invalidates blanket approval.
 

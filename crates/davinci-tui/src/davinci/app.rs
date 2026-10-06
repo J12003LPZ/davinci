@@ -729,6 +729,12 @@ fn handle_suggestion_key(model: &mut Model, data: Option<&str>) -> Option<Flow> 
     let tab = bindings.matches(data, "tui.input.tab");
     if tab || bindings.matches(data, "tui.input.submit") {
         let run = !tab && runs_on_enter(model);
+        if !tab && !model.enter_takes_suggestion() {
+            // Enter sends what was typed; the submit path names an unknown
+            // command instead of running whichever command contains it.
+            model.dismiss_suggestions();
+            return None;
+        }
         if model.accept_suggestion() || tab {
             if run {
                 let sent = model

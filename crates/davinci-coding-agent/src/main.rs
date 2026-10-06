@@ -7439,11 +7439,6 @@ fn handle_user_line(
             println!("model={}/{}", agent.provider, agent.model_id);
             Ok(true)
         }
-        SlashAction::ToggleFast => {
-            println!("{}", toggle_fast(parsed, agent));
-            refresh_chrome_footer(session, agent);
-            Ok(true)
-        }
         SlashAction::SetThinking(level) => {
             let result = apply_thinking_level(agent, session, &level, false);
             loaded_extension_host(parsed).emit(ExtensionEvent::ThinkingLevelSelect {
@@ -8841,14 +8836,6 @@ fn speed_label(agent: &Agent) -> String {
         agent,
         davinci_ai::fast_capability_for_model(&default_agent_dir(), &agent.model_id),
     )
-}
-
-fn toggle_fast(parsed: &Args, agent: &mut Agent) -> String {
-    let agent_dir = default_agent_dir();
-    let capability = davinci_ai::fast_capability_for_model(&agent_dir, &agent.model_id);
-    let text = fast::toggle_and_persist(agent, capability, &agent_dir);
-    agent.summarizer = Some(live_compaction_summarizer(parsed, agent));
-    text
 }
 
 pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {

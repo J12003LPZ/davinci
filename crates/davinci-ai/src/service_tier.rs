@@ -21,7 +21,7 @@ impl CodexServiceTier {
     ) -> Result<(), String> {
         if self == Self::Fast && capability == crate::FastCapability::Unsupported {
             return Err(format!(
-                "Fast is not advertised for {model_id}. Select Standard with /fast or change the saved serviceTier setting; no request was sent."
+                "Fast is not advertised for {model_id}. Set serviceTier to standard in your settings; no request was sent."
             ));
         }
         Ok(())
