@@ -11,6 +11,11 @@ pub const TURN_CONTEXT_CUSTOM_TYPE: &str = "davinci.turn_context";
 
 const HEADER: &str = "Harness context for the user request above. It is not a new user request.";
 
+/// What the model is told once when Plan Mode ends: how to carry out an
+/// approved plan. Sent with the transition, never in the system prompt, so
+/// toggling modes leaves the cached prefix alone.
+pub const EXECUTE_MODE_NOTICE: &str = "Plan Mode has ended. If the user approved a plan, implement it: follow its steps in dependency order, run each step's verify checks, and record progress with update_plan. If evidence shows a step is wrong, stop and say so with a proposed revision rather than silently changing the plan. Without an approved plan, work on the user's request directly.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TurnContextPlacement {
@@ -102,7 +107,7 @@ pub fn render_turn_context(
                 sections.push(format!("<plan_mode>\n{}\n</plan_mode>", appendix.trim()))
             }
             None if previous.plan_mode => {
-                sections.push("<plan_mode>\nPlan Mode has ended.\n</plan_mode>".to_string())
+                sections.push(format!("<plan_mode>\n{EXECUTE_MODE_NOTICE}\n</plan_mode>"))
             }
             None => {}
         }
@@ -211,7 +216,12 @@ mod tests {
         let (text, state) =
             render_turn_context(&state, &input("Permission mode: Ask.", None)).unwrap();
         assert!(text.contains("Plan Mode has ended."));
+        // The exit carries how to execute an approved plan, once.
+        assert!(text.contains("dependency order"), "{text}");
+        assert!(text.contains("update_plan"), "{text}");
+        assert!(text.contains("proposed revision"), "{text}");
         assert!(!state.plan_mode);
+        assert!(render_turn_context(&state, &input("Permission mode: Ask.", None)).is_none());
     }
 
     #[test]

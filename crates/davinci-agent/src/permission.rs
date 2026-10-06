@@ -7,7 +7,7 @@
 //! (`turn.rs`) asks the policy before every tool call, after the extension
 //! `tool_call` hook and before the tool runs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -772,6 +772,18 @@ pub enum ToolApprovalDecision {
 
 /// What the host answers an `Ask` with. Blocks the tool thread until the
 /// user has spoken.
+/// Lists each agent profile's model (`name -> provider/model`), read fresh
+/// on every `agent` decision so a profile or plugin added mid-session is
+/// gated with the same view the host has when it spawns the worker.
+#[derive(Clone)]
+pub struct AgentProfileModels(pub Arc<dyn Fn() -> BTreeMap<String, String> + Send + Sync>);
+
+impl std::fmt::Debug for AgentProfileModels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AgentProfileModels")
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolApprover(
     pub Arc<dyn Fn(&ToolApprovalRequest) -> ToolApprovalDecision + Send + Sync>,
@@ -950,6 +962,14 @@ pub struct PermissionPolicy {
     /// agent derives it from its host-resolved sandbox; tool arguments never
     /// set it. Auto runs builds and tests without asking only when this holds.
     pub execution_isolated: bool,
+    /// The session's own `provider/model`. The agent sets it before each
+    /// decision; settings and tool arguments never do. A worker asking for a
+    /// different model needs the user's approval for that model.
+    pub session_model: Option<String>,
+    /// Agent profile name to the model it names (`model:` other than
+    /// `inherit`), from host-discovered profiles. A worker launched through
+    /// a profile runs on that model, so the gate checks it too.
+    pub agent_profile_models: BTreeMap<String, String>,
 }
 
 impl Default for PermissionPolicy {
@@ -966,6 +986,8 @@ impl Default for PermissionPolicy {
             mcp_read_only: BTreeSet::new(),
             filesystem_boundary: FilesystemBoundaryPolicy::default(),
             execution_isolated: false,
+            session_model: None,
+            agent_profile_models: BTreeMap::new(),
         }
     }
 }
@@ -1319,6 +1341,36 @@ impl PermissionPolicy {
             return PermissionVerdict::Ask(request);
         }
 
+        // A worker on another model spends a different budget, so it is the
+        // user's call even where workers otherwise run unasked (Plan Mode's
+        // read-only workers, a broad `agent` grant). Only Always Approve or a
+        // grant naming that model lets it through.
+        if let Some(model) = self.cross_model_subagent(tool, args) {
+            let rule = PermissionRule::parameter("agent", "model", model.as_str());
+            if self
+                .allow
+                .iter()
+                .chain(self.session_allow.iter())
+                .any(|granted| granted == &rule)
+            {
+                return PermissionVerdict::Allow;
+            }
+            let current = self.session_model.clone().unwrap_or_default();
+            return PermissionVerdict::Ask(ToolApprovalRequest {
+                legal_choices: crate::approval::offer_scopes(false, true, self.project_trusted),
+                tool_call_id: tool_call_id.to_string(),
+                tool: tool.to_string(),
+                args: args.clone(),
+                summary: crate::approval::display_text(&format!(
+                    "Subagent on {model} (this session runs {current})"
+                )),
+                session_rule: rule.to_string(),
+                subject: format!("model:{model}"),
+                outside_project: false,
+                mode: self.mode,
+            });
+        }
+
         // Every patch target and every shell segment needs its own grant.
         // A subject pattern cannot authorize hidden command substitutions.
         // A protected file inside an additional directory needs an exact
@@ -1483,6 +1535,38 @@ impl PermissionPolicy {
             }
             None => PermissionVerdict::Allow,
         }
+    }
+
+    /// The full `provider/model` a worker call asks for, when it is not the
+    /// session's own. A bare id means the session's provider, matching how
+    /// the host resolves it.
+    fn cross_model_subagent(&self, tool: &str, args: &Value) -> Option<String> {
+        if tool != "agent" {
+            return None;
+        }
+        let current = self.session_model.as_deref()?;
+        // The host's order: an explicit `model`, else the profile's own.
+        let requested = args
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .or_else(|| {
+                let profile = args.get("agent").and_then(Value::as_str)?;
+                self.agent_profile_models
+                    .get(profile.trim())
+                    .map(|model| model.trim())
+                    .filter(|model| !model.is_empty())
+            })?;
+        let requested = if requested.contains('/') {
+            requested.to_string()
+        } else {
+            let provider = current.split_once('/').map_or("", |(provider, _)| provider);
+            format!("{provider}/{requested}")
+        };
+        // Exact: the host resolves ids exactly, so a case variant is another
+        // model id and must not pass as the session's own.
+        (requested != current).then_some(requested)
     }
 
     fn agent_call_is_read_only(&self, args: &Value) -> bool {

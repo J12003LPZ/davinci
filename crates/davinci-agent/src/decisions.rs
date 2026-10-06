@@ -416,6 +416,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_tool_schema_offers_exactly_the_kinds_the_validator_accepts() {
+        // Regression: the schema offered `approach`, `tradeoff`, ... which the
+        // validator rejected, so a model following the schema always failed.
+        let spec = crate::tools::tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "ask_user_question")
+            .expect("ask_user_question spec");
+        let offered = spec.parameters["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kind| kind.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let accepted = [
+            DecisionKind::Architecture,
+            DecisionKind::Scope,
+            DecisionKind::Behavior,
+            DecisionKind::Permissions,
+            DecisionKind::Cost,
+            DecisionKind::Persistence,
+            DecisionKind::Irreversible,
+        ]
+        .map(|kind| {
+            serde_json::to_value(kind)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        });
+        assert_eq!(offered, accepted);
+        for kind in &offered {
+            assert!(
+                serde_json::from_value::<DecisionKind>(json!(kind)).is_ok(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_outside_a_plan_cites_workspace_files() {
+        // Regression: with no living plan every evidence reference was
+        // "Unknown plan evidence", so the question tool never worked outside
+        // Plan Mode.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn a() {}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "TOKEN=x
+",
+        )
+        .unwrap();
+        let plan = LivingPlan::default();
+        let ask = |refs: Vec<&str>| {
+            validate_question_for_plan(
+                DecisionQuestionInput {
+                    kind: DecisionKind::Cost,
+                    evidence_refs: refs.into_iter().map(String::from).collect(),
+                    ..question()
+                },
+                &plan,
+                dir.path(),
+            )
+        };
+        let asked = ask(vec!["src/lib.rs"]).expect("a read workspace file is evidence");
+        assert_eq!(asked.evidence_fingerprints.len(), 1);
+        // Missing, sensitive or outside-workspace files are not evidence.
+        for bad in ["src/missing.rs", ".env", "../outside.rs"] {
+            let error = ask(vec![bad]).unwrap_err();
+            assert!(error.contains(bad), "{bad}: {error}");
+        }
+        // A changed file makes the issued question stale.
+        let issued = &asked.evidence_fingerprints["src/lib.rs"];
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn b() {}
+",
+        )
+        .unwrap();
+        let now = plan
+            .decision_evidence_fingerprint("src/lib.rs", dir.path())
+            .unwrap();
+        assert_ne!(&now, issued);
+    }
+
     fn fixture() -> (tempfile::TempDir, LivingPlan) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("src.rs"), "fn existing() {}\n").unwrap();

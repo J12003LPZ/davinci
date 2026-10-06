@@ -417,7 +417,16 @@ fn generated_workspace_entry(entry: &fs::DirEntry) -> bool {
     }
     matches!(
         entry.file_name().to_string_lossy().as_ref(),
-        ".git" | ".davinci" | ".pi" | "target" | "node_modules" | "__pycache__"
+        ".git"
+            | ".davinci"
+            // Edit transactions keep their journal here outside a git repo;
+            // eval workspaces are not repos, so every edit wrote it and every
+            // run failed "unrelated files changed".
+            | ".davinci-transactions"
+            | ".pi"
+            | "target"
+            | "node_modules"
+            | "__pycache__"
     )
 }
 
@@ -527,6 +536,12 @@ mod tests {
         )
         .unwrap();
         fs::write(directory.path().join("Cargo.lock"), b"tracked").unwrap();
+        fs::create_dir_all(directory.path().join(".davinci-transactions")).unwrap();
+        fs::write(
+            directory.path().join(".davinci-transactions/active.lock"),
+            b"journal",
+        )
+        .unwrap();
 
         let files = snapshot(directory.path()).unwrap();
 

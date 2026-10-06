@@ -514,11 +514,11 @@ pub fn tool_specs() -> Vec<AgentTool> {
                 "additionalProperties": false,
                 "properties":{
                     "id":{"type":"string"},
-                    "kind":{"type":"string","enum":["scope","approach","tradeoff","compatibility","persistence","behavior","verification","other"]},
+                    "kind":{"type":"string","enum":["architecture","scope","behavior","permissions","cost","persistence","irreversible"]},
                     "title":{"type":"string"},
                     "question":{"type":"string"},
                     "materiality":{"type":"string"},
-                    "evidence_refs":{"type":"array","items":{"type":"string"}},
+                    "evidence_refs":{"type":"array","items":{"type":"string"},"description":"1-16 workspace-relative paths of files you read (or plan evidence paths) that make the decision material"},
                     "options":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
                         "id":{"type":"string"},"label":{"type":"string"},"explanation":{"type":"string"},"recommended":{"type":"boolean"}
                     },"required":["id","label","explanation"]}},

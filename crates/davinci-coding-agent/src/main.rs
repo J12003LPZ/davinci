@@ -941,6 +941,29 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
         policy.filesystem_boundary.extra_roots = roots;
     }
+    // A profile's `model:` picks the worker's model, so the cross-model gate
+    // must know it. Same discovery the worker build uses (plugin profiles
+    // always, project profiles only in a trusted project), re-read before
+    // each `agent` decision so a profile added mid-session is covered too.
+    let profile_cwd = cwd.to_path_buf();
+    let trust_override = parsed.project_trust_override;
+    let source = davinci_agent::AgentProfileModels(Arc::new(move || {
+        let agent_dir = default_agent_dir();
+        let settings = load_merged_settings(&agent_dir, &profile_cwd);
+        let trusted = is_trusted(&settings, &profile_cwd, trust_override);
+        agent_profiles::discover_agent_profiles_with_plugins(
+            &profile_cwd,
+            None,
+            trusted,
+            davinci_coding_agent::plugins::active(&agent_dir).agent_profiles(),
+        )
+        .into_iter()
+        .filter(|profile| !profile.model.is_empty() && profile.model != "inherit")
+        .map(|profile| (profile.name, profile.model))
+        .collect()
+    }));
+    policy.agent_profile_models = (source.0)();
+    agent.agent_profile_models = Some(source);
     agent.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     agent.tool_context.cache = davinci_agent::runtime::cache::CacheRuntime::shared(
         settings.cache.clone().unwrap_or_default(),
@@ -2345,6 +2368,39 @@ impl Drop for ProviderTransportSession {
     }
 }
 
+/// The model a worker's `model` override names. A bare id means the parent's
+/// provider, so `gpt-6-sol` from a Luna session stays on `openai-codex`. A
+/// provider the catalog knows can run an id it has not listed yet: Codex
+/// offers models before discovery lists them, as the main session already
+/// allows (`model_for_request`). Anything else is an error rather than a
+/// worker that silently runs on the parent's model under the asked-for name.
+fn resolve_subagent_model(
+    models: &[davinci_ai::Model],
+    target: &str,
+    parent_provider: &str,
+) -> Result<davinci_ai::Model, String> {
+    let (provider, model_id) = match target.trim().split_once('/') {
+        Some((provider, model_id)) => (provider.trim(), model_id.trim()),
+        None => (parent_provider, target.trim()),
+    };
+    if model_id.is_empty() {
+        return Err(format!("subagent model `{target}` names no model"));
+    }
+    if let Some(model) = davinci_ai::find_model(models, provider, model_id) {
+        return Ok(model.clone());
+    }
+    if models.iter().any(|model| model.provider == provider) {
+        if let Some(model) = model_resolver::model_for_request(models, provider, model_id) {
+            if model.id == model_id {
+                return Ok(model);
+            }
+        }
+    }
+    Err(format!(
+        "subagent model `{target}` is not available: provider `{provider}` has no such model"
+    ))
+}
+
 fn build_worker_agent(
     parsed: &Args,
     cwd: &Path,
@@ -2526,18 +2582,18 @@ fn build_worker_agent(
         })
     });
     if let Some(target) = model_req {
-        let parts: Vec<&str> = target.splitn(2, '/').collect();
-        let (prov, mid) = if parts.len() == 2 {
-            (parts[0], parts[1])
-        } else {
-            ("", parts[0])
-        };
         let snapshot = load_model_runtime(parsed);
-        if let Some(model) = davinci_ai::find_model(&snapshot.all, prov, mid) {
-            child.provider = model.provider.clone();
-            child.model_id = model.id.clone();
-            child.context_window = model.context_window;
-        }
+        // A bare id means the parent's current provider, the same one the
+        // permission gate compared against, not the launch flags'.
+        let parent_provider = req
+            .provider
+            .clone()
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or_else(|| child.provider.clone());
+        let model = resolve_subagent_model(&snapshot.all, target, &parent_provider)?;
+        child.provider = model.provider;
+        child.model_id = model.id;
+        child.context_window = model.context_window;
     } else if let (Some(provider), Some(model_id)) = (&req.provider, &req.model_id) {
         if !model_id.is_empty() && (provider != &child.provider || model_id != &child.model_id) {
             let snapshot = load_model_runtime(parsed);

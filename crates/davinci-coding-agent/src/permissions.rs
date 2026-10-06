@@ -132,6 +132,8 @@ impl PermissionSources {
             mcp_read_only: Default::default(),
             filesystem_boundary: Default::default(),
             execution_isolated: false,
+            session_model: None,
+            agent_profile_models: Default::default(),
         }
     }
 }

@@ -1,0 +1,121 @@
+[
+  {
+    "id": "sol-root-cause-before-patch",
+    "owner": "model_family",
+    "issue": "Sol must inspect the implementation before editing and verify the fix it makes.",
+    "scenario": {
+      "id": "sol-root-cause-before-patch",
+      "category": "collaboration",
+      "request": "The slug test fails. Find the root cause and fix it.",
+      "repo_fixture": "astra-policy-rust",
+      "requirements": [
+        {
+          "type": "read_before_edit",
+          "target": "src/lib.rs"
+        },
+        {
+          "type": "file_changed",
+          "path": "src/lib.rs"
+        },
+        {
+          "type": "verification_passed",
+          "kind": "test"
+        },
+        {
+          "type": "no_unverified_success_claim"
+        }
+      ],
+      "limits": {
+        "max_unrelated_files_changed": 0,
+        "max_tool_calls": 12,
+        "max_model_turns": 9
+      },
+      "setup_commands": [],
+      "verification_commands": [
+        {
+          "command": "cargo test --quiet",
+          "timeout_seconds": 30,
+          "expected_exit": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "sol-proportional-verification",
+    "owner": "model_family",
+    "issue": "Sol runs the smallest meaningful check for a local change and does not delegate it.",
+    "scenario": {
+      "id": "sol-proportional-verification",
+      "category": "collaboration",
+      "request": "Fix the slug normalization bug and run the smallest meaningful check.",
+      "repo_fixture": "astra-policy-rust",
+      "requirements": [
+        {
+          "type": "file_changed",
+          "path": "src/lib.rs"
+        },
+        {
+          "type": "verification_passed",
+          "kind": "test"
+        },
+        {
+          "type": "no_unverified_success_claim"
+        },
+        {
+          "type": "tool_not_used",
+          "tool": "agent"
+        }
+      ],
+      "limits": {
+        "max_unrelated_files_changed": 0,
+        "max_tool_calls": 12,
+        "max_model_turns": 9
+      },
+      "setup_commands": [],
+      "verification_commands": [
+        {
+          "command": "cargo test --quiet",
+          "timeout_seconds": 30,
+          "expected_exit": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "sol-minimum-coherent-change",
+    "owner": "model_family",
+    "issue": "Sol keeps a local fix local and the public API unchanged.",
+    "scenario": {
+      "id": "sol-minimum-coherent-change",
+      "category": "collaboration",
+      "request": "Fix normalize_slug so the existing test passes. Do not change public API shape.",
+      "repo_fixture": "astra-policy-rust",
+      "requirements": [
+        {
+          "type": "file_changed",
+          "path": "src/lib.rs"
+        },
+        {
+          "type": "no_unverified_success_claim"
+        },
+        {
+          "type": "model_turns_at_most",
+          "count": 9
+        }
+      ],
+      "limits": {
+        "max_unrelated_files_changed": 0,
+        "max_tool_calls": 12,
+        "max_model_turns": 9
+      },
+      "setup_commands": [],
+      "verification_commands": [
+        {
+          "command": "cargo test --quiet",
+          "timeout_seconds": 30,
+          "expected_exit": 0
+        }
+      ]
+    }
+  }
+]

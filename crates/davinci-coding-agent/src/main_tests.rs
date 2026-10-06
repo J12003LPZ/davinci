@@ -4638,6 +4638,37 @@ fn compaction_summarizes_with_the_session_model_even_when_uncataloged() {
 }
 
 #[test]
+fn a_subagent_model_override_runs_that_model_or_fails_loudly() {
+    // Regression: a Luna session asking for a `gpt-6-sol` worker got a Luna
+    // worker, because an id missing from the catalog was dropped in silence.
+    use crate::model_resolver::mock_model;
+    let models = vec![
+        mock_model("openai-codex", "gpt-5.3-codex-spark", "Spark", true),
+        mock_model("openai-codex", "gpt-6-astra", "GPT-6 Astra", true),
+        mock_model("anthropic", "claude-opus-4-8", "Opus", true),
+    ];
+    let sol = super::resolve_subagent_model(&models, "openai-codex/gpt-6-sol", "openai-codex")
+        .expect("an unlisted Codex id still runs");
+    assert_eq!(
+        (sol.provider.as_str(), sol.id.as_str()),
+        ("openai-codex", "gpt-6-sol")
+    );
+    // A bare id stays on the parent's provider.
+    let bare = super::resolve_subagent_model(&models, "gpt-6.1-sol", "openai-codex").unwrap();
+    assert_eq!(
+        (bare.provider.as_str(), bare.id.as_str()),
+        ("openai-codex", "gpt-6.1-sol")
+    );
+    let exact = super::resolve_subagent_model(&models, "anthropic/claude-opus-4-8", "openai-codex")
+        .unwrap();
+    assert_eq!(exact.id, "claude-opus-4-8");
+    // An unknown provider or an empty id is an error, never the parent model.
+    let err = super::resolve_subagent_model(&models, "nobody/x", "openai-codex").unwrap_err();
+    assert!(err.contains("not available"), "{err}");
+    assert!(super::resolve_subagent_model(&models, "openai-codex/", "openai-codex").is_err());
+}
+
+#[test]
 fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()

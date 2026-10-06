@@ -1240,6 +1240,177 @@ fn plan_mode_freezes_mutations_and_keeps_reads() {
 }
 
 #[test]
+fn a_worker_on_another_model_needs_the_users_approval_for_that_model() {
+    let luna = |mode| PermissionPolicy {
+        session_model: Some("openai-codex/gpt-6-luna".into()),
+        ..policy(mode)
+    };
+    let sol = json!({"prompt": "find the root cause", "model": "gpt-6-sol"});
+
+    // Asked in every gated mode, naming the model, with a session grant.
+    for mode in [
+        PermissionMode::Ask,
+        PermissionMode::Edits,
+        PermissionMode::Auto,
+    ] {
+        let PermissionVerdict::Ask(request) = luna(mode).decide("c1", "agent", &sol, &cwd()) else {
+            panic!("{mode:?} must ask before a Sol worker");
+        };
+        assert_eq!(request.subject, "model:openai-codex/gpt-6-sol");
+        assert!(request.summary.contains("gpt-6-sol"), "{}", request.summary);
+        assert!(
+            request.summary.contains("gpt-6-luna"),
+            "{}",
+            request.summary
+        );
+        assert_eq!(request.session_rule, "agent(model:openai-codex/gpt-6-sol)");
+        assert!(request
+            .legal_choices
+            .iter()
+            .any(|choice| choice.scope == crate::approval::GrantScope::Session));
+    }
+
+    // Plan Mode lets read-only workers run unasked, but not on another model.
+    let plan = luna(PermissionMode::ReadOnly);
+    assert!(matches!(
+        plan.decide("c2", "agent", &json!({"prompt": "research"}), &cwd()),
+        PermissionVerdict::Allow
+    ));
+    assert!(is_ask(&plan.decide("c3", "agent", &sol, &cwd())));
+
+    // The grant covers that model only; a broad `agent` grant covers none.
+    let mut auto = luna(PermissionMode::Auto);
+    auto.remember("agent");
+    assert!(is_ask(&auto.decide("c4", "agent", &sol, &cwd())));
+    auto.remember("agent(model:openai-codex/gpt-6-sol)");
+    assert!(matches!(
+        auto.decide("c5", "agent", &sol, &cwd()),
+        PermissionVerdict::Allow
+    ));
+    let full_name = json!({"prompt": "x", "model": "openai-codex/gpt-6-sol"});
+    assert!(matches!(
+        auto.decide("c6", "agent", &full_name, &cwd()),
+        PermissionVerdict::Allow
+    ));
+    let astra = json!({"prompt": "x", "model": "gpt-6-astra"});
+    assert!(is_ask(&auto.decide("c7", "agent", &astra, &cwd())));
+
+    // A batch is decided task by task, so one cross-model task asks for
+    // the whole call even under a broad grant.
+    let batch = json!({"tasks": [
+        {"prompt": "a"},
+        {"prompt": "b", "model": "openai-codex/gpt-6-sol"},
+    ]});
+    let mut broad = luna(PermissionMode::Auto);
+    broad.remember("agent");
+    assert!(is_ask(&broad.decide("c11", "agent", &batch, &cwd())));
+    assert!(is_ask(&luna(PermissionMode::ReadOnly).decide(
+        "c12",
+        "agent",
+        &batch,
+        &cwd()
+    )));
+
+    // The session's own model is not an escalation; Always Approve is the
+    // user's standing yes; with no session model there is nothing to compare.
+    let mut same = luna(PermissionMode::Auto);
+    same.remember("agent");
+    for model in ["gpt-6-luna", "openai-codex/gpt-6-luna"] {
+        assert!(matches!(
+            same.decide(
+                "c8",
+                "agent",
+                &json!({"prompt": "x", "model": model}),
+                &cwd()
+            ),
+            PermissionVerdict::Allow
+        ));
+    }
+    assert!(matches!(
+        luna(PermissionMode::AlwaysApprove).decide("c9", "agent", &sol, &cwd()),
+        PermissionVerdict::Allow
+    ));
+    let mut unknown = policy(PermissionMode::Auto);
+    unknown.remember("agent");
+    assert!(matches!(
+        unknown.decide("c10", "agent", &sol, &cwd()),
+        PermissionVerdict::Allow
+    ));
+}
+
+#[test]
+fn a_profile_that_picks_another_model_is_gated_like_an_explicit_model() {
+    // Regression (commit security review): `{"agent":"deep"}` ran a profile
+    // whose `model:` names Sol without asking, because only `args.model`
+    // was compared. Plugin profiles load even in untrusted projects.
+    let mut policy = PermissionPolicy {
+        session_model: Some("openai-codex/gpt-6-luna".into()),
+        ..PermissionPolicy::new(PermissionMode::Auto)
+    };
+    policy
+        .agent_profile_models
+        .insert("deep".into(), "openai-codex/gpt-6-sol".into());
+    policy
+        .agent_profile_models
+        .insert("scout".into(), "gpt-6-luna".into());
+    policy.remember("agent");
+
+    let PermissionVerdict::Ask(request) = policy.decide(
+        "p1",
+        "agent",
+        &json!({"prompt": "x", "agent": "deep"}),
+        &cwd(),
+    ) else {
+        panic!("a Sol profile must ask");
+    };
+    assert_eq!(request.subject, "model:openai-codex/gpt-6-sol");
+    // Plan Mode's read-only workers do not skip it either.
+    let plan = PermissionPolicy {
+        mode: PermissionMode::ReadOnly,
+        ..policy.clone()
+    };
+    assert!(is_ask(&plan.decide(
+        "p2",
+        "agent",
+        &json!({"prompt": "x", "agent": "deep"}),
+        &cwd()
+    )));
+    // A profile on the session's own model, or an explicit `model` that
+    // overrides the profile with the session's, is not an escalation.
+    for args in [
+        json!({"prompt": "x", "agent": "scout"}),
+        json!({"prompt": "x", "agent": "deep", "model": "gpt-6-luna"}),
+        json!({"prompt": "x", "agent": "unknown-profile"}),
+    ] {
+        assert!(
+            matches!(
+                policy.decide("p3", "agent", &args, &cwd()),
+                PermissionVerdict::Allow
+            ),
+            "{args}"
+        );
+    }
+    // A case variant is a different id to the host, so it asks.
+    assert!(is_ask(&policy.decide(
+        "p4",
+        "agent",
+        &json!({"prompt": "x", "model": "openai-codex/GPT-6-Luna"}),
+        &cwd()
+    )));
+    // The session grant for that model covers the profile route too.
+    policy.remember("agent(model:openai-codex/gpt-6-sol)");
+    assert!(matches!(
+        policy.decide(
+            "p5",
+            "agent",
+            &json!({"prompt": "x", "agent": "deep"}),
+            &cwd()
+        ),
+        PermissionVerdict::Allow
+    ));
+}
+
+#[test]
 fn apply_patch_subject_reports_modified_paths_and_detects_outside() {
     let root = cwd();
     let patch = r#"*** Begin Patch

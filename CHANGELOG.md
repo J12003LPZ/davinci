@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+- A system prompt for each GPT-6 model. Sol and 6.1 Sol look for the root cause before patching; Luna works one focused job at a time; Astra keeps its lean policy. All three share GPT-6 rules for tools, delegation and answer style, which replace the generic OpenAI adapter. See [docs/prompt-engineering.md](docs/prompt-engineering.md#gpt-6-family-policies).
+- Luna can hand hard work to a GPT-6 Sol worker. When a task needs multi-step debugging or a check keeps failing, Luna asks first (Sol worker, continue with Luna, or switch models). DaVinci then asks you to approve any worker on a model other than the session's, in every mode except Always Approve, including a worker whose agent profile names another model; "allow for this session" covers that model only.
+- Leaving Plan Mode tells the model how to carry out the approved plan: steps in order, each step's checks, progress in `update_plan`, and a proposed revision instead of a silent change.
+- `davinci-evals` regression suites and A/B model policies for `gpt6-sol` and `gpt6-luna`.
+
 ### Removed
 - `/act`, which duplicated Shift+Tab: Shift+Tab leaves Plan Mode without approving the plan. `/plan` stays for plan review and approval (`show`, `diff`, `edit`, `reject`, `approve`, `accept [mode]`).
 - `/thinking`, which duplicated `/effort`. `/effort <level>` is the one reasoning command.
@@ -10,6 +16,9 @@
 ### Fixed
 - Enter in the composer no longer swaps a typed command for a different one that merely contains it: `/act` + Enter ran `/compact`. Enter takes a suggestion only when its name begins with what you typed or you chose it with the arrows.
 - A removed command typed with arguments (`/thinking low`, `/fast on`) is answered locally with where its job went, instead of being sent to the model as a prompt.
+- `ask_user_question` works as advertised. Its schema offered `kind` values (`approach`, `tradeoff`, ...) that the validator rejected, and outside Plan Mode every evidence reference failed as "Unknown plan evidence". The schema now lists the accepted kinds, and a question may cite workspace files it read; they are re-checked when you answer, under the same path rules as plan evidence.
+- Behavior evals no longer fail every run for "unrelated files changed" in `.davinci-transactions/`, the edit journal DaVinci keeps outside git repositories.
+- A worker's `model` override is no longer dropped when the catalog does not list that model: `gpt-6-sol` from a Luna session ran on Luna. Unlisted ids on a known provider now run as asked, a bare id uses the session's provider, and an unknown provider fails the call.
 - Codemode admission errors name the path they checked (`Codemode Node runtime unavailable: no Node 24.21.0 at <path>`). Without it, a runtime installed in another agent directory (`~/.pi/agent` while DaVinci used `~/.davinci/agent`) failed with no clue where DaVinci looked. The docs' install example now picks the active agent directory.
 
 ## 1.1.2

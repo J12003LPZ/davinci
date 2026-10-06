@@ -331,11 +331,21 @@ impl LivingPlan {
         evidence_ref: &str,
         cwd: &Path,
     ) -> Result<String, String> {
-        let evidence = self
+        let Some(evidence) = self
             .evidence
             .iter()
             .find(|evidence| evidence.path == evidence_ref)
-            .ok_or_else(|| format!("Unknown plan evidence reference: {evidence_ref}"))?;
+        else {
+            // Outside a plan a question still needs evidence: a workspace file
+            // the model read, fingerprinted now and compared again when the
+            // user answers. The same path rules as plan evidence apply, so
+            // sensitive files and paths outside the workspace are refused.
+            return fingerprint(cwd, evidence_ref).map_err(|error| {
+                format!(
+                    "Evidence reference {evidence_ref} is neither plan evidence nor a readable workspace file: {error}"
+                )
+            });
+        };
         match fingerprint(cwd, &evidence.path) {
             Ok(current) if current == evidence.fingerprint => Ok(current),
             _ => Err(format!("Plan evidence is stale: {}", evidence.path)),

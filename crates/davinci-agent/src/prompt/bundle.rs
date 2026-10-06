@@ -45,9 +45,12 @@ impl PromptBundle {
             crate::prompt::model_policy::apply_model_policy(policy, profile, self.modules.clone());
         let mut modules =
             crate::prompt::tool_strategy::apply_subscription_strategy(ctx.provider, modules);
-        let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
-        if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
-            modules.push(adapter);
+        // A GPT-6 policy carries its own tool and reporting rules.
+        if !policy.replaces_provider_adapter(profile) {
+            let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
+            if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
+                modules.push(adapter);
+            }
         }
         modules.push(crate::prompt::runtime_state::runtime_state_module(
             &crate::prompt::runtime_state::RuntimePromptState {
