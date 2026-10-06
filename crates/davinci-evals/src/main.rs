@@ -270,14 +270,14 @@ fn load_behavior_suite(name: &str) -> Result<Vec<BehaviorScenario>, String> {
     match name {
         "core-200" => davinci_evals::behavior::load_core_200_corpus(),
         "debugging-hard" => davinci_evals::behavior::load_debugging_hard_corpus(),
-        "gpt6-astra" => Ok(
-            davinci_evals::behavior::load_regression_suite("gpt6-astra")?
+        "gpt6-astra" | "gpt6-sol" | "gpt6-luna" => Ok(
+            davinci_evals::behavior::load_regression_suite(name)?
                 .into_iter()
                 .map(|case| case.scenario)
                 .collect(),
         ),
         _ => Err(format!(
-            "unknown behavior suite '{name}'; valid suites: core-200, debugging-hard, gpt6-astra"
+            "unknown behavior suite '{name}'; valid suites: core-200, debugging-hard, gpt6-astra, gpt6-sol, gpt6-luna"
         )),
     }
 }
@@ -301,11 +301,11 @@ fn parse_comparison_mode(value: &str) -> Result<ComparisonMode, String> {
 fn parse_model_policy(name: Option<&str>) -> Result<Option<PromptModelPolicy>, String> {
     match name.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok(None),
-        Some("default") => Ok(Some(PromptModelPolicy::Default)),
-        Some("gpt6-astra") => Ok(Some(PromptModelPolicy::Gpt6Astra)),
-        Some(other) => Err(format!(
-            "invalid model policy '{other}'; valid policies: default, gpt6-astra"
-        )),
+        Some(id) => PromptModelPolicy::parse(id).map(Some).ok_or_else(|| {
+            format!(
+                "invalid model policy '{id}'; valid policies: default, gpt6-astra, gpt6-sol, gpt6-luna"
+            )
+        }),
     }
 }
 
@@ -1789,6 +1789,31 @@ mod tests {
         assert!(scenarios
             .iter()
             .all(|scenario| scenario.id.starts_with("astra-")));
+    }
+
+    #[test]
+    fn every_gpt6_variant_has_a_suite_and_a_policy_for_ab_runs() {
+        for (suite, prefix) in [("gpt6-sol", "sol-"), ("gpt6-luna", "luna-")] {
+            let scenarios = load_behavior_suite(suite).expect(suite);
+            assert_eq!(scenarios.len(), 3, "{suite}");
+            assert!(
+                scenarios.iter().all(|s| s.id.starts_with(prefix)),
+                "{suite}"
+            );
+            assert_eq!(
+                parse_model_policy(Some(suite))
+                    .unwrap()
+                    .map(|policy| policy.id()),
+                Some(suite)
+            );
+        }
+        // Luna is measured on not escalating focused work.
+        let luna = load_behavior_suite("gpt6-luna").unwrap();
+        assert!(luna[0].requirements.iter().any(|requirement| matches!(
+            requirement,
+            davinci_evals::behavior::scenario::BehaviorRequirement::ToolNotUsed { tool } if tool == "ask_user_question"
+        )));
+        assert!(parse_model_policy(Some("gpt6-terra")).is_err());
     }
     #[test]
     fn promotion_repeat_default_is_three() {

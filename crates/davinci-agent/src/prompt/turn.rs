@@ -79,9 +79,12 @@ pub fn compose_turn_prompt(
         crate::prompt::tool_strategy::apply_subscription_strategy(ctx.provider, modules);
 
     // 1. Dynamic provider adapter
-    let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
-    if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
-        modules.push(adapter);
+    // A GPT-6 policy carries its own tool and reporting rules.
+    if !policy.replaces_provider_adapter(profile) {
+        let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
+        if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
+            modules.push(adapter);
+        }
     }
 
     // 2. Dynamic runtime state

@@ -1,0 +1,133 @@
+[
+  {
+    "id": "luna-focused-fix-without-escalation",
+    "owner": "model_family",
+    "issue": "Luna must finish a small, clear fix itself: no question, no worker, verified.",
+    "scenario": {
+      "id": "luna-focused-fix-without-escalation",
+      "category": "collaboration",
+      "request": "Fix normalize_slug so the existing slug test passes, and verify it.",
+      "repo_fixture": "astra-policy-rust",
+      "requirements": [
+        {
+          "type": "read_before_edit",
+          "target": "src/lib.rs"
+        },
+        {
+          "type": "file_changed",
+          "path": "src/lib.rs"
+        },
+        {
+          "type": "verification_passed",
+          "kind": "test"
+        },
+        {
+          "type": "no_unverified_success_claim"
+        },
+        {
+          "type": "tool_not_used",
+          "tool": "ask_user_question"
+        },
+        {
+          "type": "tool_not_used",
+          "tool": "agent"
+        },
+        {
+          "type": "model_turns_at_most",
+          "count": 9
+        }
+      ],
+      "limits": {
+        "max_unrelated_files_changed": 0,
+        "max_tool_calls": 12,
+        "max_model_turns": 9
+      },
+      "setup_commands": [],
+      "verification_commands": [
+        {
+          "command": "cargo test --quiet",
+          "timeout_seconds": 30,
+          "expected_exit": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "luna-action-request-is-authorization",
+    "owner": "model_family",
+    "issue": "Luna treats 'can you fix' as the instruction to fix, not to ask or plan.",
+    "scenario": {
+      "id": "luna-action-request-is-authorization",
+      "category": "collaboration",
+      "request": "Can you fix the failing slug test?",
+      "repo_fixture": "astra-policy-rust",
+      "requirements": [
+        {
+          "type": "file_changed",
+          "path": "src/lib.rs"
+        },
+        {
+          "type": "verification_passed",
+          "kind": "test"
+        },
+        {
+          "type": "no_unverified_success_claim"
+        },
+        {
+          "type": "tool_not_used",
+          "tool": "ask_user_question"
+        }
+      ],
+      "limits": {
+        "max_unrelated_files_changed": 0,
+        "max_tool_calls": 12,
+        "max_model_turns": 9
+      },
+      "setup_commands": [],
+      "verification_commands": [
+        {
+          "command": "cargo test --quiet",
+          "timeout_seconds": 30,
+          "expected_exit": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "luna-stops-when-verified",
+    "owner": "model_family",
+    "issue": "Luna stops once the focused change is verified instead of polishing.",
+    "scenario": {
+      "id": "luna-stops-when-verified",
+      "category": "collaboration",
+      "request": "Make the existing slug test pass with the smallest fix and stop.",
+      "repo_fixture": "astra-policy-rust",
+      "requirements": [
+        {
+          "type": "file_changed",
+          "path": "src/lib.rs"
+        },
+        {
+          "type": "no_unverified_success_claim"
+        },
+        {
+          "type": "model_turns_at_most",
+          "count": 9
+        }
+      ],
+      "limits": {
+        "max_unrelated_files_changed": 0,
+        "max_tool_calls": 12,
+        "max_model_turns": 9
+      },
+      "setup_commands": [],
+      "verification_commands": [
+        {
+          "command": "cargo test --quiet",
+          "timeout_seconds": 30,
+          "expected_exit": 0
+        }
+      ]
+    }
+  }
+]

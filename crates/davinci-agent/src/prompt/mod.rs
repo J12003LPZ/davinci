@@ -8,6 +8,7 @@ pub mod collaboration;
 pub mod composer;
 pub mod core;
 pub mod environment;
+pub mod gpt6;
 pub mod manifest;
 pub mod model_policy;
 pub mod named_files;

@@ -3896,6 +3896,13 @@ impl Agent {
             if state.execution_isolated != isolated {
                 state.execution_isolated = isolated;
             }
+            // A worker's model is compared with the session's current one, so
+            // a `/model` switch counts. Written only on a real change, which
+            // is also when approvals issued under the old model should lapse.
+            let model = format!("{}/{}", self.provider, self.model_id);
+            if state.session_model.as_deref() != Some(model.as_str()) {
+                state.session_model = Some(model);
+            }
             (state.clone(), state.revision())
         };
         let verdict = issued_policy.decide(id, name, args, cwd);

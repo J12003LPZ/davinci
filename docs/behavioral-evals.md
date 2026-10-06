@@ -25,7 +25,7 @@ A model-specific prompt policy may graduate only when:
 4. stable prompt token count decreases or remains within the approved budget; and
 5. cache/session identity remains stable across ordinary turns.
 
-For GPT-6 Astra, the eval-only runner can compare the same profile with different policies using `--baseline-model-policy default --candidate-model-policy gpt6-astra`. These flags exist only on `davinci-evals`; the production DaVinci CLI does not expose a policy override. Promotion is blocked if verified success regresses, median model turns increase, unrelated-file-change rate increases, verification-failure claims increase, or the candidate fails to reduce the Astra stable prompt footprint as required by the rollout plan.
+For GPT-6 models, the eval-only runner can compare the same profile with different policies, for example `--baseline-model-policy default --candidate-model-policy gpt6-luna`. Each variant has a regression suite: `gpt6-astra`, `gpt6-sol` and `gpt6-luna` (`crates/davinci-evals/fixtures/behavior/regressions/`). Keep reasoning effort fixed across an A/B run so the prompt is the only variable. These flags exist only on `davinci-evals`; the production DaVinci CLI does not expose a policy override. Promotion is blocked if verified success regresses, median model turns increase, unrelated-file-change rate increases, verification-failure claims increase, or the candidate fails to reduce the Astra stable prompt footprint as required by the rollout plan.
 
 This specification defines DaVinci's behavioral reliability scorecard, competitive benchmarking protocol against external harnesses (such as Claude Code), and PR evaluation examples.
 
