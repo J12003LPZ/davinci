@@ -9,7 +9,7 @@ on:
       version:
         description: Product version from Cargo.toml (initial release 1.0.71)
         required: true
-        default: '1.1.2'
+        default: '1.1.3'
 
 permissions:
   contents: write
