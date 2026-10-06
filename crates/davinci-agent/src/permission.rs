@@ -1539,7 +1539,9 @@ impl PermissionPolicy {
             let provider = current.split_once('/').map_or("", |(provider, _)| provider);
             format!("{provider}/{requested}")
         };
-        (!requested.eq_ignore_ascii_case(current)).then_some(requested)
+        // Exact: the host resolves ids exactly, so a case variant is another
+        // model id and must not pass as the session's own.
+        (requested != current).then_some(requested)
     }
 
     fn agent_call_is_read_only(&self, args: &Value) -> bool {

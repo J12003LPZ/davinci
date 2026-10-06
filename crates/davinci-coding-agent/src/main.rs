@@ -2560,7 +2560,14 @@ fn build_worker_agent(
     });
     if let Some(target) = model_req {
         let snapshot = load_model_runtime(parsed);
-        let model = resolve_subagent_model(&snapshot.all, target, &child.provider)?;
+        // A bare id means the parent's current provider, the same one the
+        // permission gate compared against, not the launch flags'.
+        let parent_provider = req
+            .provider
+            .clone()
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or_else(|| child.provider.clone());
+        let model = resolve_subagent_model(&snapshot.all, target, &parent_provider)?;
         child.provider = model.provider;
         child.model_id = model.id;
         child.context_window = model.context_window;
