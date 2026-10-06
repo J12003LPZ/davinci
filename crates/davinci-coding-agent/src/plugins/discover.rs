@@ -845,13 +845,23 @@ pub fn mcp_preview(server: &Value, taken: &BTreeSet<String>) -> String {
 /// install both use this, so the variables a preview names are the ones the
 /// install writes.
 pub fn install_name(registry_name: &str, taken: &BTreeSet<String>) -> Result<String, String> {
+    // Names that differ only in case or punctuation (`github-mcp`,
+    // `github_mcp`) are different `mcp.json` keys but share one variable
+    // namespace, so they clash too.
+    let clashes = |name: &str| {
+        taken
+            .iter()
+            .any(|other| other == name || upper_ident(other) == upper_ident(name))
+    };
     let short = server_name(registry_name);
-    if !taken.contains(&short) {
+    if !clashes(&short) {
         return Ok(short);
     }
     let full = server_name(&registry_name.replace(['/', '.'], "-"));
-    if taken.contains(&full) {
-        return Err(format!("an MCP server named {short} is already configured"));
+    if clashes(&full) {
+        return Err(format!(
+            "an MCP server named {short} (or one sharing its variables) is already configured"
+        ));
     }
     Ok(full)
 }
@@ -1211,6 +1221,18 @@ mod tests {
         assert!(install_name("io.github.other/github-mcp", &both)
             .unwrap_err()
             .contains("already configured"));
+        // A spelling that shares another server's variables clashes too.
+        let spelled: BTreeSet<String> = ["GitHub_MCP".to_string()].into();
+        assert_eq!(
+            install_name("io.github.x/github-mcp", &spelled).unwrap(),
+            "io-github-x-github-mcp"
+        );
+        let both_spelled: BTreeSet<String> = [
+            "GitHub_MCP".to_string(),
+            "io_github_x_github_mcp".to_string(),
+        ]
+        .into();
+        assert!(install_name("io.github.x/github-mcp", &both_spelled).is_err());
         for identifier in ["--privileged", "a b", ""] {
             let server = json!({"packages": [{"registryType": "oci", "identifier": identifier}]});
             assert!(mcp_config(&server, "x").is_err(), "{identifier:?}");
