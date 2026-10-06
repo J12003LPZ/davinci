@@ -180,13 +180,21 @@ impl HostAssets {
         })
     }
 
+    /// `trusted_root` is DaVinci's own runtime directory (`<agent dir>/codemode`).
+    /// A host under it is admitted even when the workspace contains it, as when
+    /// DaVinci runs from the home directory; any other host in the workspace is
+    /// project-provided and refused.
     pub fn validate_installation(
         root: &Path,
         workspace: &Path,
+        trusted_root: Option<&Path>,
         manifest: &AssetManifest,
     ) -> std::io::Result<Self> {
         let assets = Self::validate(root, manifest)?;
-        if assets.root.starts_with(workspace.canonicalize()?) {
+        let trusted = trusted_root.and_then(|path| path.canonicalize().ok());
+        if assets.root.starts_with(workspace.canonicalize()?)
+            && !trusted.is_some_and(|trusted| assets.root.starts_with(trusted))
+        {
             return Err(invalid("workspace-provided hosts are not admitted"));
         }
         Ok(assets)

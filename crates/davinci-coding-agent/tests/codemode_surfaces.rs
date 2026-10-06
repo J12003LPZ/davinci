@@ -107,3 +107,29 @@ fn read_only_project_configuration_cannot_enable_or_replace_host() {
     let settings = load_merged_settings_with_override(user.path(), project.path(), Some(true));
     assert_eq!(settings.codemode, Some(global));
 }
+
+#[test]
+fn a_home_workspace_admits_the_managed_node_but_not_a_project_node() {
+    // `davinci` started from the home directory: the managed runtime under
+    // `~/.davinci/agent/codemode` lies inside the workspace yet is DaVinci's.
+    let home = tempfile::tempdir().unwrap();
+    let agent = home.path().join(".davinci").join("agent");
+    let managed = managed_paths(&agent);
+    std::fs::create_dir_all(managed.node_path.parent().unwrap()).unwrap();
+    std::fs::write(&managed.node_path, b"not node").unwrap();
+    let error = managed.admit(home.path(), &agent).err().unwrap();
+    assert!(!error.contains("Workspace-provided"), "{error}");
+
+    let project_node = home.path().join("repo").join("node.exe");
+    std::fs::create_dir_all(project_node.parent().unwrap()).unwrap();
+    std::fs::write(&project_node, b"not node").unwrap();
+    let project = ReadOnlyConfig {
+        node_path: project_node,
+        host_path: managed.host_path.clone(),
+    };
+    let error = project.admit(home.path(), &agent).err().unwrap();
+    assert!(
+        error.contains("Workspace-provided Node runtime is not admitted"),
+        "{error}"
+    );
+}

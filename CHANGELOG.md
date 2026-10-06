@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Codemode turned on in `/config` stayed off with "Workspace-provided Node runtime is not admitted" when DaVinci ran from the home directory: the workspace then contains `~/.davinci/agent/codemode`, and DaVinci's own runtime was refused as project-provided. A runtime under `<agent dir>/codemode` is now admitted wherever the workspace is; a Node binary or host elsewhere in the workspace is still refused, and the error names both paths.
+
 ## 1.1.3
 
 Changes since `v1.1.2`.
