@@ -4674,6 +4674,8 @@ fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
         .unwrap();
     let missing = super::sync_codemode_from_settings(&mut agent).unwrap_err();
     assert!(missing.contains("Node runtime unavailable"), "{missing}");
+    // The message names where it looked, so a wrong agent dir is visible.
+    assert!(missing.contains(&node), "{missing}");
     assert!(!agent.has_staged_codemode());
 
     super::persist_interactive_setting("codemode=false").unwrap();

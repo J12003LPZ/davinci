@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Codemode admission errors name the path they checked (`Codemode Node runtime unavailable: no Node 24.21.0 at <path>`). Without it, a runtime installed in another agent directory (`~/.pi/agent` while DaVinci used `~/.davinci/agent`) failed with no clue where DaVinci looked. The docs' install example now picks the active agent directory.
+
 ## 1.1.2
 
 Changes since `v1.1.1`.
