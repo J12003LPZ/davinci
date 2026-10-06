@@ -443,6 +443,20 @@ mod tests {
     }
 
     #[test]
+    fn each_manager_is_titled_by_its_kind() {
+        let mut m = model(100);
+        m.screen = crate::davinci::model::Screen::Extensions;
+        for (tab, title) in [
+            (ExtensionTab::Plugins, "Plugins"),
+            (ExtensionTab::Skills, "Skills"),
+            (ExtensionTab::Mcp, "MCP servers"),
+        ] {
+            m.extension_manager.as_mut().unwrap().tab = tab;
+            assert_eq!(super::super::sheet::sheet_title(&m), title);
+        }
+    }
+
+    #[test]
     fn skills_and_mcp_have_no_marketplaces_view() {
         let mut m = model(100);
         let sheet = m.extension_manager.as_mut().unwrap();

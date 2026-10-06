@@ -245,7 +245,7 @@ fn command_panel_frame(
     rows.push(Line::from(ui::truncate_run(
         vec![
             ui::span("   ", cc.inactive),
-            ui::span_strong(sheet::title(model.screen), cc.permission, th),
+            ui::span_strong(sheet::sheet_title(model), cc.permission, th),
         ],
         model.width,
     )));

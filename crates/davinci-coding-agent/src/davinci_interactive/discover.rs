@@ -4,6 +4,10 @@
 //! sheet. Online directories (skills.sh, the MCP Registry) are asked on a
 //! background thread after a short pause in typing; the answer is merged on
 //! the next tick, and only if it still belongs to the current query.
+//!
+//! The first Discover of a process also makes the global marketplaces
+//! available (`discover::ensure_builtin`) on a background thread, and the
+//! open search is run again when they arrive.
 
 use davinci_coding_agent::plugins::discover::{self, Kind, Listing};
 use davinci_tui::davinci::model::{ExtensionRow, ExtensionTab, Model};
@@ -18,6 +22,15 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 
 type Reply = (u64, Result<Vec<Listing>, String>);
 
+/// Where the global marketplaces stand in this process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Builtins {
+    Unchecked,
+    Fetching,
+    Ready,
+    Failed(String),
+}
+
 struct State {
     generation: u64,
     /// Offline listings per kind, read once per sheet.
@@ -30,13 +43,23 @@ struct State {
     registry_installed: BTreeSet<String>,
     sender: Sender<Reply>,
     receiver: Receiver<Reply>,
+    builtins: Builtins,
+    builtin_sender: Sender<Result<Vec<String>, String>>,
+    builtin_receiver: Receiver<Result<Vec<String>, String>>,
+    /// The last search, to run again when the global marketplaces arrive.
+    last: Option<(ExtensionTab, String, PathBuf, PathBuf)>,
 }
 
 fn state() -> &'static Mutex<State> {
     static STATE: std::sync::OnceLock<Mutex<State>> = std::sync::OnceLock::new();
     STATE.get_or_init(|| {
         let (sender, receiver) = channel();
+        let (builtin_sender, builtin_receiver) = channel();
         Mutex::new(State {
+            builtins: Builtins::Unchecked,
+            builtin_sender,
+            builtin_receiver,
+            last: None,
             generation: 0,
             local: BTreeMap::new(),
             shown: BTreeMap::new(),
@@ -183,6 +206,20 @@ pub(super) fn search(
 ) {
     let kind = kind(tab);
     let mut state = lock();
+    state.last = Some((
+        tab,
+        query.to_string(),
+        agent_dir.to_path_buf(),
+        mcp_file.to_path_buf(),
+    ));
+    if kind != Kind::Mcp && state.builtins == Builtins::Unchecked {
+        state.builtins = Builtins::Fetching;
+        let sender = state.builtin_sender.clone();
+        let dir = agent_dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = sender.send(discover::ensure_builtin(&dir, &dir));
+        });
+    }
     state.registry_installed = discover::registry_installs(mcp_file).into_keys().collect();
     state.generation += 1;
     let generation = state.generation;
@@ -199,18 +236,39 @@ pub(super) fn search(
         Kind::Mcp => true,
         Kind::Plugin => false,
     };
+    let fetching = kind != Kind::Mcp && state.builtins == Builtins::Fetching;
+    let failed = match (&state.builtins, kind) {
+        (Builtins::Failed(error), Kind::Plugin | Kind::Skill) => Some(error.clone()),
+        _ => None,
+    };
     if let Some(sheet) = model.extension_manager.as_mut() {
-        sheet.discover.searching = asks_online;
-        sheet.discover.message = match (kind, asks_online) {
-            (Kind::Skill, false) => Some(format!(
-                "{} skills in your marketplaces. Type 2+ letters to also search skills.sh.",
+        sheet.discover.searching = asks_online || fetching;
+        let count = match kind {
+            Kind::Skill if query.trim().chars().count() < 2 => Some(format!(
+                "{} skills from the marketplaces. Type 2+ letters to also search skills.sh.",
                 all.len()
             )),
-            (Kind::Plugin, _) if all.is_empty() => {
-                Some("No marketplaces yet: add one in the Marketplaces view (→).".to_string())
-            }
-            (Kind::Plugin, _) => Some(format!("{} plugins in your marketplaces.", all.len())),
+            Kind::Plugin => Some(format!("{} plugins from the marketplaces.", all.len())),
             _ => None,
+        }
+        .map(|text| {
+            if local.len() >= discover::MAX_LOCAL {
+                format!(
+                    "{text} Showing the first {}; type to narrow.",
+                    discover::MAX_LOCAL
+                )
+            } else {
+                text
+            }
+        });
+        sheet.discover.message = if fetching {
+            Some("Fetching the global marketplaces (first time only)…".to_string())
+        } else if let Some(error) = failed {
+            Some(format!(
+                "Could not fetch the global marketplaces ({error}). Showing what is on this machine."
+            ))
+        } else {
+            count
         };
     }
     if !asks_online {
@@ -230,9 +288,41 @@ pub(super) fn search(
     });
 }
 
-/// Merge an online answer that arrived since the last tick. True when the
-/// sheet changed.
-pub(super) fn poll(model: &mut Model, tab: ExtensionTab) -> bool {
+/// What a tick found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct Polled {
+    /// The Discover list changed.
+    pub changed: bool,
+    /// Marketplaces were added or refreshed: the caller rebuilds the sheet.
+    pub catalogs_changed: bool,
+}
+
+/// Merge an online answer that arrived since the last tick.
+pub(super) fn poll(model: &mut Model, tab: ExtensionTab) -> Polled {
+    // The global marketplaces arrived: re-read catalogs and search again.
+    let arrived = {
+        let mut state = lock();
+        match state.builtin_receiver.try_recv() {
+            Ok(result) => {
+                state.builtins = match result {
+                    Ok(_) => Builtins::Ready,
+                    Err(error) => Builtins::Failed(error),
+                };
+                state.local.clear();
+                state.last.clone()
+            }
+            Err(_) => None,
+        }
+    };
+    if let Some((last_tab, query, agent_dir, mcp_file)) = arrived {
+        if last_tab == tab {
+            search(model, tab, &query, &agent_dir, &mcp_file);
+        }
+        return Polled {
+            changed: true,
+            catalogs_changed: true,
+        };
+    }
     let mut state = lock();
     let mut changed = false;
     while let Ok((generation, result)) = state.receiver.try_recv() {
@@ -261,7 +351,10 @@ pub(super) fn poll(model: &mut Model, tab: ExtensionTab) -> bool {
         }
         changed = true;
     }
-    changed
+    Polled {
+        changed,
+        catalogs_changed: false,
+    }
 }
 
 /// The listing behind a result key on screen.

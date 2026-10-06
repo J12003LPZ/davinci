@@ -40,9 +40,121 @@ pub struct Listing {
     pub payload: Option<Value>,
 }
 
+/// Global catalogs every user gets without adding anything, as Claude Code
+/// ships its official marketplace: Anthropic's plugin directory and its
+/// Agent Skills repository. `(catalog name, source)`.
+pub const BUILTIN_MARKETPLACES: &[(&str, &str)] = &[
+    (
+        "claude-plugins-official",
+        "anthropics/claude-plugins-official",
+    ),
+    ("anthropic-agent-skills", "anthropics/skills"),
+];
+
+/// How often DaVinci pulls a built-in marketplace it cloned itself.
+const BUILTIN_REFRESH_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Well-known MCP servers shown before any search, by MCP Registry name.
+/// Each was checked against the registry; one that disappears is skipped.
+pub const FEATURED_MCP: &[&str] = &[
+    "io.github.upstash/context7",
+    "io.github.github/github-mcp-server",
+    "io.github.microsoft/playwright-mcp",
+    "io.github.ChromeDevTools/chrome-devtools-mcp",
+    "com.notion/mcp",
+    "app.linear/linear",
+    "com.atlassian/atlassian-mcp-server",
+    "com.figma.mcp/mcp",
+    "com.stripe/mcp",
+    "com.supabase/mcp",
+    "io.github.getsentry/sentry-mcp",
+    "com.vercel/vercel-mcp",
+    "io.github.firecrawl/firecrawl-mcp-server",
+    "io.github.brave/brave-search-mcp-server",
+    "ai.exa/exa",
+    "com.microsoft/microsoft-learn-mcp",
+    "io.github.hashicorp/terraform-mcp-server",
+    "io.github.mongodb-js/mongodb-mcp-server",
+    "com.postman/postman-mcp-server",
+    "com.apify/apify-mcp-server",
+];
+
+/// Whether `name` is one of the built-in marketplaces.
+pub fn is_builtin(name: &str) -> bool {
+    builtin_sources().iter().any(|(builtin, _)| builtin == name)
+}
+
+/// The built-in marketplaces, unless `DAVINCI_BUILTIN_MARKETPLACES`
+/// replaces them (`name=source,…`) or turns them `off`.
+pub fn builtin_sources() -> Vec<(String, String)> {
+    match std::env::var("DAVINCI_BUILTIN_MARKETPLACES") {
+        Ok(value) if value.trim() == "off" => Vec::new(),
+        Ok(value) => value
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, source)| (name.trim().to_string(), source.trim().to_string()))
+            .collect(),
+        Err(_) => BUILTIN_MARKETPLACES
+            .iter()
+            .map(|(name, source)| (name.to_string(), source.to_string()))
+            .collect(),
+    }
+}
+
+/// Make the built-in marketplaces available: add one no known marketplace
+/// already provides (Claude Code's clone counts), and pull one DaVinci
+/// cloned more than a day ago. Returns one line per change; a failure on one
+/// marketplace does not stop the others.
+pub fn ensure_builtin(agent_dir: &Path, cwd: &Path) -> Result<Vec<String>, String> {
+    ensure_builtin_from(agent_dir, cwd, &builtin_sources(), store::now_ms())
+}
+
+pub fn ensure_builtin_from(
+    agent_dir: &Path,
+    cwd: &Path,
+    sources: &[(String, String)],
+    now_ms: u64,
+) -> Result<Vec<String>, String> {
+    let registry = marketplace::load_registry(agent_dir)?;
+    let known: BTreeSet<String> = marketplace::catalogs(agent_dir)?
+        .into_iter()
+        .map(|catalog| catalog.name)
+        .collect();
+    let mut lines = Vec::new();
+    let mut failures = Vec::new();
+    for (name, source) in sources {
+        if let Some(entry) = registry.get(name) {
+            let pullable = !matches!(
+                entry.source,
+                marketplace::MarketplaceSource::Directory { .. }
+            );
+            if pullable && now_ms.saturating_sub(entry.last_updated) > BUILTIN_REFRESH_MS {
+                match marketplace::update(agent_dir, Some(name)) {
+                    Ok(_) => lines.push(format!("Refreshed {name}.")),
+                    Err(err) => failures.push(err),
+                }
+            }
+            continue;
+        }
+        if known.contains(name) {
+            continue;
+        }
+        match marketplace::add(agent_dir, source, cwd) {
+            Ok(added) => lines.push(format!("Added the {added} marketplace.")),
+            Err(err) => failures.push(format!("{source}: {err}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(lines)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 const SKILLS_SEARCH_URL: &str = "https://skills.sh/api/search";
 const MCP_REGISTRY_URL: &str = "https://registry.modelcontextprotocol.io/v0/servers";
-const MAX_LOCAL: usize = 200;
+/// The most offline listings shown at once; typing narrows the rest.
+pub const MAX_LOCAL: usize = 500;
 const MAX_REMOTE: usize = 40;
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -112,9 +224,11 @@ pub fn local(kind: Kind, agent_dir: &Path, query: &str) -> Vec<Listing> {
 
 fn plugin_listings(agent_dir: &Path) -> Vec<Listing> {
     let installed = store::load(agent_dir).unwrap_or_default();
-    let Ok(catalogs) = marketplace::catalogs(agent_dir) else {
+    let Ok(mut catalogs) = marketplace::catalogs(agent_dir) else {
         return Vec::new();
     };
+    // The global marketplaces lead; private ones follow.
+    catalogs.sort_by_key(|catalog| !is_builtin(&catalog.name));
     let mut out = Vec::new();
     for catalog in catalogs {
         for entry in catalog.entries() {
@@ -260,14 +374,96 @@ pub fn remote(kind: Kind, agent_dir: &Path, query: &str) -> Result<Vec<Listing>,
             let url = format!("{}?q={}", skills_search_url(), encode(query));
             Ok(parse_skills_search(&http_get_json(&url)?, agent_dir))
         }
+        Kind::Mcp if query.is_empty() => browse_registry(),
         Kind::Mcp => {
-            let mut url = format!("{}?limit={MAX_REMOTE}", mcp_registry_url());
-            if !query.is_empty() {
-                url.push_str(&format!("&search={}", encode(query)));
-            }
+            let url = format!(
+                "{}?limit={MAX_REMOTE}&search={}",
+                mcp_registry_url(),
+                encode(query)
+            );
             Ok(parse_registry(&http_get_json(&url)?))
         }
     }
+}
+
+/// What `/mcp` shows before a search: the featured servers, then the ones
+/// updated in the last two weeks. The registry has no popularity ranking,
+/// so "featured" is DaVinci's list and "recent" is the registry's own.
+fn browse_registry() -> Result<Vec<Listing>, String> {
+    let featured = featured_mcp();
+    let since = rfc3339_date(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(14 * 24 * 60 * 60),
+    );
+    let recent = http_get_json(&format!(
+        "{}?limit={MAX_REMOTE}&updated_since={since}",
+        mcp_registry_url()
+    ))
+    .map(|doc| parse_registry(&doc));
+    if featured.is_empty() {
+        return recent;
+    }
+    let mut out = featured;
+    for mut listing in recent.unwrap_or_default() {
+        if out.iter().all(|known| known.key != listing.key) {
+            listing.source = format!("recently updated · {}", listing.source);
+            out.push(listing);
+        }
+    }
+    Ok(out)
+}
+
+/// The featured servers, fetched by name in parallel and kept for an hour.
+fn featured_mcp() -> Vec<Listing> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Listing>)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some((at, listings)) = cache.as_ref() {
+        if at.elapsed() < Duration::from_secs(3600) && !listings.is_empty() {
+            return listings.clone();
+        }
+    }
+    let base = mcp_registry_url();
+    let docs: Vec<Option<Value>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = FEATURED_MCP
+            .iter()
+            .map(|name| {
+                let url = format!("{base}/{}/versions/latest", encode(name));
+                scope.spawn(move || http_get_json(&url).ok())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect()
+    });
+    let mut listings: Vec<Listing> = Vec::new();
+    for doc in docs.into_iter().flatten() {
+        for mut listing in parse_registry(&json!({ "servers": [doc] })) {
+            listing.source = format!("featured · {}", listing.source);
+            listings.push(listing);
+        }
+    }
+    *cache = Some((std::time::Instant::now(), listings.clone()));
+    listings
+}
+
+/// `YYYY-MM-DDT00:00:00Z` for a Unix time (days from the civil calendar).
+fn rfc3339_date(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T00:00:00Z")
 }
 
 pub fn parse_skills_search(doc: &Value, agent_dir: &Path) -> Vec<Listing> {
@@ -1130,6 +1326,58 @@ mod tests {
     }
 
     #[test]
+    fn dates_for_the_registry_filter_are_civil_dates() {
+        assert_eq!(rfc3339_date(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_date(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_date(1_791_244_800), "2026-10-06T00:00:00Z");
+    }
+
+    #[test]
+    fn builtin_marketplaces_are_added_once_and_refreshed_daily() {
+        let agent = tempfile::tempdir().unwrap();
+        let market = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(market.path().join(".claude-plugin")).unwrap();
+        std::fs::write(
+            market
+                .path()
+                .join(".claude-plugin")
+                .join("marketplace.json"),
+            r#"{"name": "global", "plugins": [{"name": "context7", "description": "docs"}]}"#,
+        )
+        .unwrap();
+        let sources = vec![("global".to_string(), market.path().display().to_string())];
+        let now = store::now_ms();
+        let lines = ensure_builtin_from(agent.path(), agent.path(), &sources, now).unwrap();
+        assert_eq!(lines, ["Added the global marketplace."]);
+        // Discover lists it without the user adding anything.
+        let listed = local(Kind::Plugin, agent.path(), "context7");
+        assert!(
+            listed.iter().any(|l| l.key == "context7@global"),
+            "{listed:?}"
+        );
+        // Present and fresh: nothing to do.
+        assert!(
+            ensure_builtin_from(agent.path(), agent.path(), &sources, now)
+                .unwrap()
+                .is_empty()
+        );
+        // A git clone is pulled after a day; a folder has nothing to pull.
+        let later = now + BUILTIN_REFRESH_MS + 1;
+        assert!(
+            ensure_builtin_from(agent.path(), agent.path(), &sources, later)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(is_builtin("claude-plugins-official"));
+        // One that cannot be fetched is reported, the others still apply.
+        let broken = vec![(
+            "missing".to_string(),
+            agent.path().join("nope").display().to_string(),
+        )];
+        assert!(ensure_builtin_from(agent.path(), agent.path(), &broken, now).is_err());
+    }
+
+    #[test]
     fn server_names_are_safe_mcp_json_keys() {
         assert_eq!(server_name("io.github.example/github-mcp"), "github-mcp");
         assert_eq!(server_name("ai.smithery/Hint Services"), "Hint-Services");
@@ -1325,6 +1573,21 @@ mod tests {
             .iter()
             .filter(|s| mcp_config(s.payload.as_ref().unwrap(), "live").is_ok())
             .count();
+        // Nothing typed: the featured servers lead, Context7 among them.
+        let browse = remote(Kind::Mcp, agent.path(), "").unwrap();
+        assert!(
+            browse
+                .iter()
+                .any(|s| s.key == "registry:io.github.upstash/context7"),
+            "{:?}",
+            browse.iter().map(|s| &s.key).collect::<Vec<_>>()
+        );
+        assert!(browse[0].source.starts_with("featured"));
+        let featured = browse
+            .iter()
+            .filter(|s| s.source.starts_with("featured"))
+            .count();
+        assert!(featured >= FEATURED_MCP.len() - 2, "{featured} featured");
         eprintln!(
             "{runnable}/{} registry servers map to configs",
             servers.len()

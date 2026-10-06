@@ -43,7 +43,7 @@ pub fn header(model: &Model) -> Line<'static> {
     if let Some(section) = sheet::chrome(model) {
         return spread(
             model.width,
-            vec![paper_label(sheet::title(model.screen), th, false)],
+            vec![paper_label(sheet::sheet_title(model), th, false)],
             section.header_right,
         );
     }
@@ -290,7 +290,7 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
         run.extend(
             chrome
                 .status_third
-                .unwrap_or_else(|| vec![span(sheet::title(model.screen), th.muted)]),
+                .unwrap_or_else(|| vec![span(sheet::sheet_title(model), th.muted)]),
         );
         return run;
     }

@@ -4809,7 +4809,15 @@ pub fn run(
             poll_jobs(&agent.tool_context.jobs, &mut model);
             if model.screen == davinci_tui::davinci::model::Screen::Extensions {
                 if let Some(tab) = model.extension_manager.as_ref().map(|sheet| sheet.tab) {
-                    discover::poll(&mut model, tab);
+                    if discover::poll(&mut model, tab).catalogs_changed {
+                        // New marketplaces: the Marketplaces view and the
+                        // installed lists are read again; Discover keeps its state.
+                        let notice = model
+                            .extension_manager
+                            .as_ref()
+                            .and_then(|sheet| sheet.notice.clone());
+                        open_extensions_sheet(parsed, agent, &mut model, notice, false);
+                    }
                 }
             }
             let (agents, workflows) = background_counts(agent);
@@ -5943,13 +5951,15 @@ fn open_extension_manager(
 /// Plugin marketplaces as manager rows. Only the ones DaVinci registered can
 /// be refreshed or removed here; Claude Code's and Codex's are read-only.
 fn marketplace_rows(agent_dir: &std::path::Path) -> Vec<ExtensionRow> {
-    use davinci_coding_agent::plugins::marketplace;
+    use davinci_coding_agent::plugins::{discover, marketplace};
     let registry = marketplace::load_registry(agent_dir).unwrap_or_default();
-    marketplace::catalogs(agent_dir)
-        .unwrap_or_default()
+    let mut catalogs = marketplace::catalogs(agent_dir).unwrap_or_default();
+    catalogs.sort_by_key(|catalog| !discover::is_builtin(&catalog.name));
+    catalogs
         .into_iter()
         .map(|catalog| {
             let own = catalog.from == "davinci";
+            let builtin = discover::is_builtin(&catalog.name);
             let source = registry
                 .get(&catalog.name)
                 .map(|entry| entry.source.describe())
@@ -5958,15 +5968,23 @@ fn marketplace_rows(agent_dir: &std::path::Path) -> Vec<ExtensionRow> {
                 key: catalog.name.clone(),
                 title: catalog.name.clone(),
                 status: match catalog.from {
+                    _ if builtin => "built in".into(),
                     "claude" => "from Claude Code".into(),
                     "codex" => "from Codex".into(),
-                    _ => "davinci".into(),
+                    _ => "added".into(),
                 },
                 state: State::Done,
                 detail: format!("{} plugins · {source}", catalog.entries().len()),
-                note: (!own).then(|| "Read from that tool's install; manage it there.".to_string()),
+                note: if builtin {
+                    Some("Global marketplace: DaVinci keeps it and refreshes it daily.".into())
+                } else if !own {
+                    Some("Read from that tool's install; manage it there.".into())
+                } else {
+                    None
+                },
                 can_update: own,
-                can_delete: own,
+                // The global marketplaces come back on the next Discover.
+                can_delete: own && !builtin,
                 ..ExtensionRow::default()
             }
         })

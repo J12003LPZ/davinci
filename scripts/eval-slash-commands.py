@@ -69,6 +69,7 @@ def main():
         DAVINCI_EXPERIMENTAL_WORKFLOWS="1",
         DAVINCI_MCP_REGISTRY_URL="http://127.0.0.1:9/v0/servers",
         DAVINCI_SKILLS_SEARCH_URL="http://127.0.0.1:9/api/search",
+        DAVINCI_BUILTIN_MARKETPLACES="off",
     )
     with tempfile.TemporaryDirectory(prefix="davinci-slash-eval-") as cwd:
         config = Path(cwd) / "eval-config"
