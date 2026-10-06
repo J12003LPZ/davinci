@@ -3885,6 +3885,14 @@ impl Agent {
             return None;
         }
         use crate::PermissionVerdict;
+        // Read outside the lock: profile discovery touches the disk.
+        let fresh_profile_models = (name == "agent")
+            .then(|| {
+                self.agent_profile_models
+                    .as_ref()
+                    .map(|source| (source.0)())
+            })
+            .flatten();
         let (issued_policy, issued_revision) = {
             let mut state = self
                 .permissions
@@ -3902,6 +3910,11 @@ impl Agent {
             let model = format!("{}/{}", self.provider, self.model_id);
             if state.session_model.as_deref() != Some(model.as_str()) {
                 state.session_model = Some(model);
+            }
+            if let Some(fresh) = fresh_profile_models {
+                if state.agent_profile_models != fresh {
+                    state.agent_profile_models = fresh;
+                }
             }
             (state.clone(), state.revision())
         };
@@ -6651,6 +6664,47 @@ mod tests {
                 lane: crate::scheduler::ToolLane::Parallel
             }
         ));
+    }
+
+    #[test]
+    fn a_profile_added_mid_session_is_gated_on_the_next_agent_call() {
+        // Regression (security review): profile models were read once at
+        // startup, while the host rediscovers profiles when it spawns a
+        // worker, so a profile or plugin added later picked a model unasked.
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("profile gate fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent.provider = "openai-codex".into();
+        agent.model_id = "gpt-6-luna".into();
+        agent.tools = vec!["agent".into()];
+        agent.set_permission_mode(crate::PermissionMode::Auto);
+        agent.permissions.lock().unwrap().remember("agent");
+        let profiles = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let source = profiles.clone();
+        agent.agent_profile_models = Some(crate::AgentProfileModels(Arc::new(move || {
+            source.lock().unwrap().clone()
+        })));
+        let call = serde_json::json!({"prompt": "x", "agent": "deep"});
+
+        // Unknown profile: the host refuses it; the gate has nothing to add.
+        assert!(matches!(
+            agent.prepare_tool_call(dir.path(), "a-1", "agent", &call, 0),
+            Preparation::Ready { .. }
+        ));
+        profiles
+            .lock()
+            .unwrap()
+            .insert("deep".to_string(), "openai-codex/gpt-6-sol".to_string());
+        // No approver in this run, so an Ask becomes a refusal: the point is
+        // that the call is no longer Ready.
+        assert!(!matches!(
+            agent.prepare_tool_call(dir.path(), "a-2", "agent", &call, 0),
+            Preparation::Ready { .. }
+        ));
+        assert_eq!(
+            agent.permissions.lock().unwrap().agent_profile_models["deep"],
+            "openai-codex/gpt-6-sol"
+        );
     }
 
     fn f02_turn_question_fixture() -> (tempfile::TempDir, Agent, serde_json::Value) {

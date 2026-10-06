@@ -941,20 +941,29 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
         policy.filesystem_boundary.extra_roots = roots;
     }
-    // A profile's `model:` picks the worker's model, so the cross-model
-    // gate must know it. Same discovery the worker build uses: plugin
-    // profiles always, project profiles only in a trusted project.
-    let profiles_trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
-    policy.agent_profile_models = agent_profiles::discover_agent_profiles_with_plugins(
-        cwd,
-        None,
-        profiles_trusted,
-        davinci_coding_agent::plugins::active(&default_agent_dir()).agent_profiles(),
-    )
-    .into_iter()
-    .filter(|profile| !profile.model.is_empty() && profile.model != "inherit")
-    .map(|profile| (profile.name, profile.model))
-    .collect();
+    // A profile's `model:` picks the worker's model, so the cross-model gate
+    // must know it. Same discovery the worker build uses (plugin profiles
+    // always, project profiles only in a trusted project), re-read before
+    // each `agent` decision so a profile added mid-session is covered too.
+    let profile_cwd = cwd.to_path_buf();
+    let trust_override = parsed.project_trust_override;
+    let source = davinci_agent::AgentProfileModels(Arc::new(move || {
+        let agent_dir = default_agent_dir();
+        let settings = load_merged_settings(&agent_dir, &profile_cwd);
+        let trusted = is_trusted(&settings, &profile_cwd, trust_override);
+        agent_profiles::discover_agent_profiles_with_plugins(
+            &profile_cwd,
+            None,
+            trusted,
+            davinci_coding_agent::plugins::active(&agent_dir).agent_profiles(),
+        )
+        .into_iter()
+        .filter(|profile| !profile.model.is_empty() && profile.model != "inherit")
+        .map(|profile| (profile.name, profile.model))
+        .collect()
+    }));
+    policy.agent_profile_models = (source.0)();
+    agent.agent_profile_models = Some(source);
     agent.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     agent.tool_context.cache = davinci_agent::runtime::cache::CacheRuntime::shared(
         settings.cache.clone().unwrap_or_default(),

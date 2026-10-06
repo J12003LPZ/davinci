@@ -95,8 +95,8 @@ pub use permission::{
     check_path_boundary, glob_matches, is_git_metadata_path, is_outside_or_symlink_escape,
     is_sensitive_file_path, is_symlink_escape, project_relative, session_rule_for,
     strip_verbatim_prefix, subject_of, summary_of, tool_class, validate_extra_root,
-    FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
-    ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
+    AgentProfileModels, FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy, PermissionRule,
+    PermissionVerdict, ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
     ToolApprovalRequest, ToolApprover, ToolClass,
 };
 pub use prompt::{
@@ -539,6 +539,9 @@ pub struct Agent {
     /// Who answers when the policy says ask. `None` means the run cannot
     /// ask, and the call is refused with a message that says so.
     pub approver: Option<ToolApprover>,
+    /// Host view of agent profile models, refreshed before each `agent`
+    /// permission decision. `None` keeps whatever the policy was built with.
+    pub agent_profile_models: Option<AgentProfileModels>,
     /// Typed trusted-host responder; takes precedence over the legacy approver.
     pub approval_responder: Option<approval::ApprovalResponder>,
     /// The responder is an unattended policy, not a person. A denial it
@@ -730,6 +733,7 @@ impl Agent {
             // TS `runtimeOptions.toolExecution ?? "parallel"`.
             tool_execution_mode: ToolExecutionMode::Parallel,
             custom_tool_executor: None,
+            agent_profile_models: None,
             codemode: None,
             staged_codemode: None,
             pre_tool: None,

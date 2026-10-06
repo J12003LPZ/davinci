@@ -772,6 +772,18 @@ pub enum ToolApprovalDecision {
 
 /// What the host answers an `Ask` with. Blocks the tool thread until the
 /// user has spoken.
+/// Lists each agent profile's model (`name -> provider/model`), read fresh
+/// on every `agent` decision so a profile or plugin added mid-session is
+/// gated with the same view the host has when it spawns the worker.
+#[derive(Clone)]
+pub struct AgentProfileModels(pub Arc<dyn Fn() -> BTreeMap<String, String> + Send + Sync>);
+
+impl std::fmt::Debug for AgentProfileModels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AgentProfileModels")
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolApprover(
     pub Arc<dyn Fn(&ToolApprovalRequest) -> ToolApprovalDecision + Send + Sync>,
