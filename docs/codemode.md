@@ -46,7 +46,7 @@ To use other locations, add absolute paths next to the mode:
 { "codemode": { "mode": "read-only", "nodePath": "D:/runtimes/node-24.21.0/node.exe", "hostPath": "D:/runtimes/codemode-host" } }
 ```
 
-The runtime must live outside the workspace you work in.
+A runtime given with `nodePath`/`hostPath` must live outside the workspace you work in. The managed runtime in `<agent dir>/codemode` is DaVinci's own and is admitted even when the workspace contains it, as when you start DaVinci from your home directory.
 
 ## Install the runtime (Windows, Git Bash)
 

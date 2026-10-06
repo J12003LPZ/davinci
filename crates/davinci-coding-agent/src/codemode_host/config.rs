@@ -69,7 +69,11 @@ pub fn resolve_config(
 }
 
 impl ReadOnlyConfig {
-    pub fn admit(&self, workspace: &Path) -> Result<NodeCodeModeHost, String> {
+    /// A runtime inside the workspace is refused as project-provided, unless it
+    /// sits in DaVinci's own `<agent_dir>/codemode`. Running from the home
+    /// directory puts the agent dir inside the workspace; the write tools
+    /// already treat it as protected.
+    pub fn admit(&self, workspace: &Path, agent_dir: &Path) -> Result<NodeCodeModeHost, String> {
         let workspace = workspace
             .canonicalize()
             .map_err(|_| "Codemode workspace unavailable")?;
@@ -79,12 +83,25 @@ impl ReadOnlyConfig {
                 self.node_path.display()
             )
         })?;
-        if node.starts_with(&workspace) {
-            return Err("Workspace-provided Node runtime is not admitted".into());
+        let managed_root = agent_dir.join("codemode");
+        let trusted = managed_root.canonicalize().ok();
+        if node.starts_with(&workspace)
+            && !trusted.as_ref().is_some_and(|trusted| node.starts_with(trusted))
+        {
+            return Err(format!(
+                "Workspace-provided Node runtime is not admitted: {} is inside the workspace {}",
+                node.display(),
+                workspace.display()
+            ));
         }
         let manifest = trusted_manifest()
             .map_err(|error| format!("Codemode manifest unavailable: {error}"))?;
-        let assets = HostAssets::validate_installation(&self.host_path, &workspace, &manifest)
+        let assets = HostAssets::validate_installation(
+            &self.host_path,
+            &workspace,
+            Some(&managed_root),
+            &manifest,
+        )
             .map_err(|error| {
                 format!(
                     "Codemode host admission failed at {}: {error}",

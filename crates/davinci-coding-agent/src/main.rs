@@ -1340,10 +1340,11 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         // switch is a preference: a missing runtime or a sessionless run
         // starts without Codemode and says why, rather than refusing to start.
         let explicit = parsed.codemode.is_some();
+        let agent_dir = default_agent_dir();
         let staged = davinci_coding_agent::codemode_host::config::resolve_config(
             parsed.codemode.as_deref(),
             settings.codemode.as_ref(),
-            &default_agent_dir(),
+            &agent_dir,
         )
         .and_then(|config| match config {
             None => Ok(None),
@@ -1351,7 +1352,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
                 "Codemode records its operations in the session journal; remove --no-session to use it"
                     .to_string(),
             ),
-            Some(config) => config.admit(cwd).map(Some),
+            Some(config) => config.admit(cwd, &agent_dir).map(Some),
         });
         match staged {
             Ok(Some(codemode)) => agent.stage_read_only_codemode(Arc::new(codemode)),
@@ -8269,7 +8270,7 @@ pub(crate) fn sync_codemode_from_settings(agent: &mut Agent) -> Result<(), Strin
             Err("Codemode needs a session journal; this run has no session".into())
         }
         Some(config) => {
-            let host = config.admit(&agent.cwd)?;
+            let host = config.admit(&agent.cwd, &agent_dir)?;
             agent.stage_read_only_codemode(Arc::new(host));
             Ok(())
         }

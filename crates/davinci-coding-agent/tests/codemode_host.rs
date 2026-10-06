@@ -58,7 +58,29 @@ fn rejects_project_host_override() {
     let root = workspace.path().join("host");
     fs::create_dir(&root).unwrap();
     let manifest = fixture(&root);
-    assert!(HostAssets::validate_installation(&root, workspace.path(), &manifest).is_err());
+    assert!(HostAssets::validate_installation(&root, workspace.path(), None, &manifest).is_err());
+}
+
+#[test]
+fn admits_davinci_owned_host_when_the_workspace_is_home() {
+    // Running from the home directory puts `<agent dir>/codemode` inside the
+    // workspace. That runtime is DaVinci's own, not the project's.
+    let home = tempfile::tempdir().unwrap();
+    let trusted = home.path().join(".davinci").join("agent").join("codemode");
+    let root = trusted.join("host");
+    fs::create_dir_all(&root).unwrap();
+    let manifest = fixture(&root);
+    assert!(
+        HostAssets::validate_installation(&root, home.path(), Some(&trusted), &manifest).is_ok()
+    );
+    // A host elsewhere in that workspace is still project-provided.
+    let project = home.path().join("repo").join("host");
+    fs::create_dir_all(&project).unwrap();
+    let manifest = fixture(&project);
+    assert!(
+        HostAssets::validate_installation(&project, home.path(), Some(&trusted), &manifest)
+            .is_err()
+    );
 }
 
 #[test]
