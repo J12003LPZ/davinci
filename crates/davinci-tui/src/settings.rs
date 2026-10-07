@@ -134,6 +134,8 @@ pub struct InteractiveSettingsConfig {
     pub auto_compact_threshold: String,
     /// `off`, `compact` or `full`: the context bar above the input.
     pub context_bar: String,
+    /// ChatGPT plan usage (5-hour and weekly) under it, for openai-codex.
+    pub plan_usage: bool,
     pub steering_mode: String,
     pub follow_up_mode: String,
     pub transport: String,
@@ -204,6 +206,7 @@ impl Default for InteractiveSettingsConfig {
             block_images: false,
             skill_commands: true,
             context_bar: "compact".into(),
+            plan_usage: true,
             show_hardware_cursor: false,
             editor_padding: 0,
             output_padding: 1,
@@ -312,6 +315,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 current_value: config.context_bar.clone(),
                 values: vec!["off".into(), "compact".into(), "full".into()],
             },
+            bool_item(
+                "plan-usage",
+                "Plan usage",
+                "For openai-codex models: the ChatGPT plan's 5-hour and weekly usage under the context bar, read through the Codex CLI's login",
+                config.plan_usage,
+            ),
             bool_item(
                 "skill-commands",
                 "Skill commands",

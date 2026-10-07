@@ -2283,6 +2283,27 @@ pub struct ContextSection {
     pub items: Vec<(String, u64)>,
 }
 
+/// One ChatGPT plan usage window, as the plan usage row draws it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanWindow {
+    /// `5h`, `week`.
+    pub label: String,
+    pub minutes: u64,
+    pub used_percent: f64,
+    /// Seconds until it resets, when known.
+    pub resets_in: Option<u64>,
+}
+
+/// ChatGPT plan usage for `openai-codex` models (`/config` → Plan usage).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlanUsageView {
+    /// `plus`, `pro`, `free`, …
+    pub plan: Option<String>,
+    pub windows: Vec<PlanWindow>,
+    /// Why nothing is shown, when nothing could be read.
+    pub note: Option<String>,
+}
+
 /// `/config` → Context bar: the meter above the input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContextBarMode {
@@ -2675,6 +2696,10 @@ pub struct Model {
     pub context_meter: Option<ContextUsageView>,
     /// What the meter was measured from, so the shell measures only on change.
     pub context_meter_key: u64,
+    /// ChatGPT plan usage under the context bar; `None` hides the row.
+    pub plan_usage: Option<PlanUsageView>,
+    /// `/config` → Plan usage.
+    pub plan_usage_enabled: bool,
     /// `1e` — the workspace tree and the git changes beside it.
     pub tree: Vec<TreeRow>,
     pub changes_list: Vec<ChangeRow>,
@@ -2850,6 +2875,8 @@ impl Model {
             context_bar: ContextBarMode::default(),
             context_meter: None,
             context_meter_key: 0,
+            plan_usage: None,
+            plan_usage_enabled: true,
             tree: Vec::new(),
             changes_list: Vec::new(),
             graph: Vec::new(),

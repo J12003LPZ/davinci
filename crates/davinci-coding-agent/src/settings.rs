@@ -396,6 +396,9 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub context_bar: Option<String>,
+    /// The ChatGPT plan usage row for openai-codex models (default on).
+    #[serde(default, rename = "planUsage", skip_serializing_if = "Option::is_none")]
+    pub plan_usage: Option<bool>,
     #[serde(default, rename = "showHardwareCursor")]
     pub show_hardware_cursor: Option<bool>,
     #[serde(default, rename = "editorPaddingX")]
@@ -1761,6 +1764,7 @@ pub fn to_interactive_config(
             .context_bar
             .clone()
             .unwrap_or_else(|| "compact".into()),
+        plan_usage: settings.plan_usage.unwrap_or(true),
         show_hardware_cursor: settings.show_hardware_cursor.unwrap_or(false),
         editor_padding: settings.editor_padding_x.unwrap_or(0),
         output_padding: settings.output_pad.unwrap_or(1),

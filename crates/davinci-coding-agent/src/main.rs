@@ -7,6 +7,7 @@ mod cache_stats;
 mod catalog_refresh;
 mod changelog;
 mod codex_probe;
+mod codex_quota;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
@@ -8238,6 +8239,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "auto-resize-images" => stored.auto_resize_images = Some(value == "true"),
         "block-images" => stored.block_images = Some(value == "true"),
         "skill-commands" => stored.enable_skill_commands = Some(value == "true"),
+        "plan-usage" => stored.plan_usage = Some(value == "true"),
         "context-bar" => {
             stored.context_bar = Some(
                 match value {

@@ -19,8 +19,8 @@ use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_bar, context_inspector, decision_modal, diff,
     disegno, export, extensions, goal_path, governor, grafo, graph_run, instrumenta, keys, login,
-    mcp, memoria, mensura, officina, opera, permissions, recovery, resume, rewind, securitas,
-    settings, startup, task_board, transcript, tree, trust, vectors, workflows,
+    mcp, memoria, mensura, officina, opera, permissions, plan_usage, recovery, resume, rewind,
+    securitas, settings, startup, task_board, transcript, tree, trust, vectors, workflows,
 };
 
 /// What the runtime should do after a key.
@@ -119,7 +119,9 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     // The context bar sits right above what the composer offers, as the
     // last thing read before typing.
     let meter = if conversation {
-        context_bar::lines(chrome_model, height)
+        let mut meter = context_bar::lines(chrome_model, height);
+        meter.extend(plan_usage::lines(chrome_model, height));
+        meter
     } else {
         Vec::new()
     };

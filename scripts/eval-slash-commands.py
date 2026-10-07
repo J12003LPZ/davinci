@@ -119,6 +119,13 @@ def main():
         clip = Path(cwd) / "clip.png"
         clip.write_bytes(tiny_png())
         os.environ["PI_CLIPBOARD_IMAGE"] = str(clip)
+        # Plan usage reads this fake `codex app-server` (a Plus plan).
+        fake_codex = Path(cwd) / "fake-codex.cmd"
+        fake_codex.write_text(
+            f'@"{sys.executable}" "{Path(__file__).with_name("fake-codex-app-server.py")}" %*\r\n',
+            encoding="utf-8",
+        )
+        os.environ["DAVINCI_CODEX_BIN"] = str(fake_codex)
         terminal = module.Terminal(executable, cwd, None, 180, 55, skills=True)
 
         def check(command, expected, overlay=False, *, reset=False):
@@ -144,6 +151,17 @@ def main():
             # The context bar is on by default, with the auto-compact point.
             assert "◆ context" in text and "compacts at" in text, text
             rows.append({"command": "context bar", "passed": True})
+            # Plan usage under it: both windows of a Plus plan, the 5-hour one
+            # first, after the fake's sparse update moved only that window.
+            for _ in range(10):
+                if "69% left" in text:
+                    break
+                text = terminal.pump(0.5)
+            usage = next((row for row in text.splitlines() if "◇ plus" in row), "")
+            assert "5h" in usage and "69% left" in usage, text
+            assert "week" in usage and "41% left" in usage, text
+            assert usage.index("5h") < usage.index("week"), usage
+            rows.append({"command": "plan usage", "passed": True})
             for item in checks:
                 check(*item, reset=True)
             # Discover: → opens it, typing searches, esc clears then closes.
