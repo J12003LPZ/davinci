@@ -210,6 +210,14 @@ pub fn hint_row(model: &Model, chrome: &SheetChrome) -> Option<Line<'static>> {
         .map(|esc| ui::hint_row(model.width, &chrome.hints, Some(esc), &model.theme))
 }
 
+/// The title of the open sheet: the manager names its own kind.
+pub fn sheet_title(model: &Model) -> &'static str {
+    match (model.screen, model.extension_manager.as_ref()) {
+        (Screen::Extensions, Some(sheet)) => sheet.tab.label(),
+        (screen, _) => title(screen),
+    }
+}
+
 /// Human-readable section names; domain-specific content keeps its own structure.
 pub fn title(screen: Screen) -> &'static str {
     match screen {

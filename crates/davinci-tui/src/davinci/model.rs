@@ -175,7 +175,7 @@ pub enum Screen {
     Agents,
     /// Context memory inspector (`/context`).
     ContextInspector,
-    /// Installed plugins, skills and MCP servers (`/plugin`).
+    /// Installed plugins, skills and MCP servers (`/plugins`, `/skills`, `/mcp`).
     Extensions,
 }
 
@@ -272,13 +272,19 @@ pub enum Choice {
     ContextInspectorAction { action: &'static str, index: usize },
     /// An action on the `/graph` run sheet (`5a`).
     GraphAction { action: &'static str, index: usize },
-    /// An action on the `/plugin` manager: `update`, `toggle`, `approve`,
-    /// `revoke`, `delete` or `info`, on the row `key` of `tab`.
+    /// An action on an installed row of the manager: `update`, `toggle`,
+    /// `approve`, `revoke`, `delete` or `info`, on the row `key` of `tab`.
     ExtensionAction {
         action: &'static str,
         tab: ExtensionTab,
         key: String,
     },
+    /// The Discover query of `tab` changed (or the view opened): search.
+    ExtensionSearch { tab: ExtensionTab, query: String },
+    /// Install the Discover result `key` of `tab`.
+    ExtensionInstall { tab: ExtensionTab, key: String },
+    /// `add` (a source), `update` or `remove` (a marketplace name).
+    MarketplaceAction { action: &'static str, value: String },
 }
 
 /// A block of rows an extension owns. Extensions get rows, not colours and
@@ -1710,7 +1716,8 @@ pub struct McpSheet {
     pub config_path: String,
 }
 
-/// Which list the `/plugin` manager shows.
+/// What the `/plugins`, `/skills` or `/mcp` manager manages. Each command
+/// opens the manager on its own kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExtensionTab {
     #[default]
@@ -1730,6 +1737,28 @@ impl ExtensionTab {
         }
     }
 
+    /// The slash command that opens this manager.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Plugins => "/plugins",
+            Self::Skills => "/skills",
+            Self::Mcp => "/mcp",
+        }
+    }
+
+    /// The views this manager has: only plugins come from marketplaces the
+    /// user adds and removes.
+    pub fn views(self) -> &'static [ExtensionView] {
+        match self {
+            Self::Plugins => &[
+                ExtensionView::Installed,
+                ExtensionView::Discover,
+                ExtensionView::Marketplaces,
+            ],
+            Self::Skills | Self::Mcp => &[ExtensionView::Installed, ExtensionView::Discover],
+        }
+    }
+
     fn position(self) -> usize {
         Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
     }
@@ -1741,7 +1770,78 @@ impl ExtensionTab {
     }
 }
 
-/// One installed plugin, skill or MCP server in the `/plugin` manager. The
+/// A view of the manager: what is installed, what can be installed, and (for
+/// plugins) the marketplaces it comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExtensionView {
+    #[default]
+    Installed,
+    Discover,
+    Marketplaces,
+}
+
+impl ExtensionView {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Installed => "Installed",
+            Self::Discover => "Discover",
+            Self::Marketplaces => "Marketplaces",
+        }
+    }
+}
+
+/// The Discover view: a search box and what the host found for it. Typing
+/// edits the query; the host answers with `results`, local catalogs at once
+/// and online directories when they reply.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoverState {
+    pub query: String,
+    /// `title`, `status` (`installed` or the source), `detail` (the
+    /// description) and an optional `note`; `key` is what install names.
+    pub results: Vec<ExtensionRow>,
+    pub selected: usize,
+    /// An online search is still out.
+    pub searching: bool,
+    /// What the list cannot say itself: a prompt to type, an offline source.
+    pub message: Option<String>,
+    /// The result key waiting for a second enter to install.
+    pub armed: Option<String>,
+}
+
+impl DiscoverState {
+    pub fn index(&self) -> usize {
+        if self.results.is_empty() {
+            0
+        } else {
+            self.selected.min(self.results.len() - 1)
+        }
+    }
+
+    pub fn current(&self) -> Option<&ExtensionRow> {
+        self.results.get(self.index())
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.results.len();
+        if len == 0 {
+            return;
+        }
+        let target = self.index() as isize + delta;
+        self.selected = if delta.abs() == 1 {
+            target.rem_euclid(len as isize) as usize
+        } else {
+            target.clamp(0, len as isize - 1) as usize
+        };
+        self.armed = None;
+    }
+
+    /// Whether the selected result is the one armed for install.
+    pub fn armed_here(&self) -> bool {
+        self.armed.is_some() && self.current().map(|row| &row.key) == self.armed.as_ref()
+    }
+}
+
+/// One installed plugin, skill or MCP server in the manager. The
 /// `can_*` flags say which keys apply: the host decides, the view only shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionRow {
@@ -1761,10 +1861,17 @@ pub struct ExtensionRow {
     pub can_delete: bool,
 }
 
-/// `/plugin` — installed plugins, skills and MCP servers, one tab each.
+/// `/plugins`, `/skills` and `/mcp`: one kind each (`tab`), with its views.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionsSheet {
     pub tab: ExtensionTab,
+    pub view: ExtensionView,
+    pub discover: DiscoverState,
+    /// Known plugin marketplaces; `key` is the marketplace name.
+    pub marketplaces: Vec<ExtensionRow>,
+    pub marketplace_selected: usize,
+    /// The source being typed after `a` in the Marketplaces view.
+    pub marketplace_input: Option<String>,
     pub plugins: Vec<ExtensionRow>,
     pub skills: Vec<ExtensionRow>,
     pub mcp: Vec<ExtensionRow>,
@@ -1823,6 +1930,28 @@ impl ExtensionsSheet {
     pub fn switch_tab(&mut self, step: isize) {
         self.tab = self.tab.step(step);
         self.armed = None;
+    }
+
+    /// The view `step` places away among this kind's views, wrapping.
+    pub fn switch_view(&mut self, step: isize) {
+        let views = self.tab.views();
+        let at = views
+            .iter()
+            .position(|view| *view == self.view)
+            .unwrap_or(0) as isize;
+        self.view = views[(at + step).rem_euclid(views.len() as isize) as usize];
+        self.armed = None;
+        self.discover.armed = None;
+        self.marketplace_input = None;
+    }
+
+    pub fn marketplace_index(&self) -> usize {
+        self.marketplace_selected
+            .min(self.marketplaces.len().saturating_sub(1))
+    }
+
+    pub fn current_marketplace(&self) -> Option<&ExtensionRow> {
+        self.marketplaces.get(self.marketplace_index())
     }
 
     /// The action armed on the selected row, if any.
@@ -2435,6 +2564,10 @@ pub struct Model {
     /// A `ctrl+c` at rest was pressed once; the next one within the window
     /// leaves. The hint row says so while it is up.
     pub exit_armed: bool,
+    /// When `esc` was pressed once over a draft; a second `esc` within
+    /// `DOUBLE_ESCAPE_MS` clears the composer. The hint row says so while it
+    /// is up.
+    pub clear_armed: Option<std::time::Instant>,
     /// The working line's numbers while a turn is under way. `None` between
     /// turns, which is what takes the row off the window.
     pub working: Option<Working>,
@@ -2588,7 +2721,7 @@ pub struct Model {
     pub diff_index: usize,
     /// `/mcp` — connected MCP servers.
     pub mcp: Option<McpSheet>,
-    /// `/plugin` — the plugin, skill and MCP manager.
+    /// `/plugins`, `/skills`, `/mcp`: the plugin, skill and MCP manager.
     pub extension_manager: Option<ExtensionsSheet>,
     /// `/permissions` — mode and rules.
     pub permission_rows: Vec<PermissionRow>,
@@ -2646,6 +2779,7 @@ impl Model {
             transcript: Vec::new(),
             running: false,
             exit_armed: false,
+            clear_armed: None,
             working: None,
             palette_index: 0,
             session_index: 0,
@@ -3578,6 +3712,13 @@ impl Model {
         self.section_notice = None;
         self.screen = Screen::Agent;
         self.overlay = None;
+    }
+
+    /// Whether a first `esc` over a draft is still waiting for its second.
+    pub fn clear_pending(&self) -> bool {
+        self.clear_armed.is_some_and(|armed| {
+            armed.elapsed() < std::time::Duration::from_millis(crate::DOUBLE_ESCAPE_MS)
+        })
     }
 
     pub fn toggle_overlay(&mut self, overlay: Overlay) {

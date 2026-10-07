@@ -43,7 +43,7 @@ pub fn header(model: &Model) -> Line<'static> {
     if let Some(section) = sheet::chrome(model) {
         return spread(
             model.width,
-            vec![paper_label(sheet::title(model.screen), th, false)],
+            vec![paper_label(sheet::sheet_title(model), th, false)],
             section.header_right,
         );
     }
@@ -131,6 +131,9 @@ fn conversation_status(model: &Model) -> Line<'static> {
     }
     if model.exit_armed {
         return Line::from(span("  Press Ctrl-C again to exit", cc.inactive));
+    }
+    if model.clear_pending() {
+        return Line::from(span("  Esc again to clear", cc.inactive));
     }
     if model.screen == Screen::Agent && model.composer.starts_with('!') {
         return Line::from(vec![
@@ -287,7 +290,7 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
         run.extend(
             chrome
                 .status_third
-                .unwrap_or_else(|| vec![span(sheet::title(model.screen), th.muted)]),
+                .unwrap_or_else(|| vec![span(sheet::sheet_title(model), th.muted)]),
         );
         return run;
     }
@@ -913,7 +916,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::TaskBoard => Some("/tasks"),
         Screen::Agents => Some("/agents"),
         Screen::ContextInspector => Some("/context inspect"),
-        Screen::Extensions => Some("/plugin"),
+        Screen::Extensions => Some("/plugins"),
         Screen::Recovery | Screen::Diff | Screen::Agent | Screen::Plan | Screen::Memoria => None,
     }
 }
@@ -1052,6 +1055,9 @@ fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
     let th = &model.theme;
     if model.exit_armed {
         return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
+    }
+    if model.clear_pending() {
+        return Line::from(vec![span("esc again to clear", th.primary)]);
     }
     if model.screen == Screen::Agent && hint == Hint::Default && !model.running {
         let cycle = model.keybindings.keys_for("app.permissions.cycle").first();

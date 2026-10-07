@@ -41,7 +41,10 @@ def main():
         ("/context", "Context Usage", True),
         ("/context inspect", "Context & Memory Inspector", True),
         ("/reload", "Native extensions", True),
-        ("/mcp", "No MCP servers configured", False),
+        ("/mcp", "No MCP servers configured", True),
+        ("/skills", "No skills installed", True),
+        ("/skill-list", "is not a command", False),
+        ("/skill-view pdf", "is not a command", False),
         ("/cost", "input 0", False),
         ("/status", "restores", False),
         ("/doctor", "securityConfiguration", False),
@@ -50,7 +53,8 @@ def main():
         ("/act", "is not a command", False),
         ("/permissions manual", "Manual", False),
         ("/agents", "No workers active", True),
-        ("/plugin list", "No plugins installed", False),
+        ("/plugin list", "is not a command", False),
+        ("/plugins list", "No plugins installed", False),
         ("/tasks", "No tasks currently running", True),
         ("/setup check", "vector memory", False),
         ("/workflow list", "workflows are not available in this session", False),
@@ -58,7 +62,15 @@ def main():
     ]
     rows = []
     # These settings affect only the child started by this standalone eval.
-    os.environ.update(PI_SHARE_DRY_RUN="1", DAVINCI_EXPERIMENTAL_WORKFLOWS="1")
+    # Discover's online directories point at a closed port: the eval stays
+    # offline and checks that an unreachable directory is reported.
+    os.environ.update(
+        PI_SHARE_DRY_RUN="1",
+        DAVINCI_EXPERIMENTAL_WORKFLOWS="1",
+        DAVINCI_MCP_REGISTRY_URL="http://127.0.0.1:9/v0/servers",
+        DAVINCI_SKILLS_SEARCH_URL="http://127.0.0.1:9/api/search",
+        DAVINCI_BUILTIN_MARKETPLACES="off",
+    )
     with tempfile.TemporaryDirectory(prefix="davinci-slash-eval-") as cwd:
         config = Path(cwd) / "eval-config"
         config.mkdir()
@@ -87,6 +99,30 @@ def main():
             terminal.pump(8)
             for item in checks:
                 check(*item, reset=True)
+            # Discover: → opens it, typing searches, esc clears then closes.
+            text = terminal.command("/mcp")
+            assert "No MCP servers configured" in text, text
+            text = terminal.send("\x1b[C", 1.0)
+            assert "Search the MCP Registry" in text, text
+            for ch in "git":
+                text = terminal.send(ch, 0.3)
+            text = terminal.pump(2.5)
+            assert "\u2315 git" in text, text
+            assert "Could not reach the MCP Registry" in text, text
+            text = terminal.send("\x1b", 0.8)
+            assert "Search the MCP Registry" in text, text
+            terminal.send("\x1b", 0.8)
+            rows.append({"command": "/mcp discover", "passed": True})
+            # A double esc clears a draft; one esc only arms it.
+            for ch in "half a draft":
+                terminal.send(ch, 0.05)
+            text = terminal.pump(1.0)
+            assert "half a draft" in text, text
+            text = terminal.send("\x1b", 0.3)
+            assert "esc again to clear" in text.lower(), text
+            text = terminal.send("\x1b", 1.0)
+            assert "half a draft" not in text, text
+            rows.append({"command": "esc esc", "passed": True})
             check("/new", "started a new session")
             check("Session audit sentinel", "offline")
             check("/name Audit", "named this session Audit")

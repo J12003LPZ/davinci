@@ -145,6 +145,11 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
     command.args(args);
     // Also covers submodules and redirects git itself might follow.
     command.env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git");
+    // A private or deleted repository must fail, not wait on a credential
+    // prompt the user cannot see behind the TUI.
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GCM_INTERACTIVE", "never");
+    command.stdin(std::process::Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -190,7 +195,7 @@ pub fn validate_git_url(url: &str) -> Result<(), String> {
     }
 }
 
-fn clone(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String> {
+pub(crate) fn clone(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String> {
     validate_git_url(url)?;
     let dest_text = dest.display().to_string();
     if git_ref.is_some() {

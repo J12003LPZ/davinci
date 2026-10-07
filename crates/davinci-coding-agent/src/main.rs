@@ -7683,7 +7683,35 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
-        SlashAction::Mcp => {
+        SlashAction::Mcp(query) if !query.trim().is_empty() => {
+            let text = discover_text(davinci_coding_agent::plugins::discover::Kind::Mcp, &query);
+            session.chrome.transcript.push("mcp", &text);
+            session.chrome.status = "mcp".into();
+            println!("{text}");
+            Ok(true)
+        }
+        SlashAction::Skills(query) => {
+            let text = if query.trim().is_empty() {
+                let mut names: Vec<String> = agent
+                    .skills
+                    .iter()
+                    .map(|skill| format!("{}  {}", skill.name, skill.description))
+                    .collect();
+                names.sort();
+                if names.is_empty() {
+                    "No skills installed. Search with /skills <words>.".to_string()
+                } else {
+                    names.join("\n")
+                }
+            } else {
+                discover_text(davinci_coding_agent::plugins::discover::Kind::Skill, &query)
+            };
+            session.chrome.transcript.push("skills", &text);
+            session.chrome.status = "skills".into();
+            println!("{text}");
+            Ok(true)
+        }
+        SlashAction::Mcp(_) => {
             let rows = agent.tool_context.mcp.rows();
             let text = if rows.is_empty() {
                 format!(
@@ -7729,8 +7757,18 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
-        SlashAction::Plugin(args) => {
-            let text = plugin_command_text(&args, &agent.cwd);
+        SlashAction::Plugins(args) => {
+            let words = args.trim();
+            let text = if words.is_empty() {
+                plugin_command_text("list", &agent.cwd)
+            } else if davinci_interactive::is_plugin_subcommand(words)
+                || words.starts_with("browse")
+                || words.starts_with("search")
+            {
+                plugin_command_text(words, &agent.cwd)
+            } else {
+                plugin_command_text(&format!("browse {words}"), &agent.cwd)
+            };
             session.chrome.transcript.push("plugin", &text);
             session.chrome.status = "plugin".into();
             println!("{text}");
@@ -9534,6 +9572,39 @@ fn handle_custom_overlay_input(
 }
 
 /// `/plugin …` in a session: the same commands as `davinci plugin …`.
+/// `/skills <words>` and `/mcp <words>` outside the interactive shell: the
+/// same results Discover shows, as text.
+fn discover_text(kind: davinci_coding_agent::plugins::discover::Kind, query: &str) -> String {
+    use davinci_coding_agent::plugins::discover;
+    let agent_dir = default_agent_dir();
+    let mut listings = discover::local(kind, &agent_dir, query);
+    let mut out = Vec::new();
+    match discover::remote(kind, &agent_dir, query) {
+        Ok(remote) => {
+            for listing in remote {
+                if !listings.iter().any(|known| known.title == listing.title) {
+                    listings.push(listing);
+                }
+            }
+        }
+        Err(err) => out.push(format!("(online search failed: {err})")),
+    }
+    if listings.is_empty() {
+        out.insert(0, format!("Nothing matches {query:?}."));
+        return out.join("\n");
+    }
+    for listing in listings.iter().take(30) {
+        let mark = if listing.installed { "*" } else { " " };
+        let description = listing.description.lines().next().unwrap_or("");
+        out.push(format!(
+            "{mark} {}  ({})  {description}",
+            listing.title, listing.source
+        ));
+    }
+    out.push("* installed. Install from the interactive /skills or /mcp Discover view.".into());
+    out.join("\n")
+}
+
 fn plugin_command_text(args: &str, cwd: &Path) -> String {
     let words: Vec<String> = args.split_whitespace().map(str::to_string).collect();
     match davinci_coding_agent::plugins::command::run(&words, &default_agent_dir(), cwd) {

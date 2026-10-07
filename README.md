@@ -461,7 +461,8 @@ The [runtime inspector](crates/davinci-coding-agent/src/runtime_inspect.rs) is r
 | `/share` | Upload a session as a secret GitHub gist. Review/redact first: a secret gist is accessible to anyone with its URL. |
 | `/copy` | Copy the latest assistant reply. |
 | `/reload` | Reload keybindings, extensions, skills, prompts, themes, and context files. |
-| `/mcp`, `/status`, `/doctor`, `/cost` | Inspect connected services, session state, setup/install identity, and usage. |
+| `/skills [search]`, `/plugins [search]`, `/mcp [search]` | Find, install and manage skills, plugins and MCP servers. Each opens a manager with Installed and Discover views (a search bar over marketplaces, skills.sh and the MCP Registry); `/plugins` also manages marketplaces. See [Skills, plugins and MCP servers](#skills-plugins-and-mcp-servers). |
+| `/status`, `/doctor`, `/cost` | Inspect session state, setup/install identity, and usage. |
 | `/sandbox-status` | Inspect execution-isolation policy and evidence. |
 | `/agents [msg <name> <text>\|stop <name>]`, `/tasks` | Inspect profiles/live teams, message/stop a worker, or inspect task state. |
 | `/workflow [status <id>\|cancel <id>]` | Inspect workflow runs; available when dynamic workflows are enabled. |
@@ -471,18 +472,26 @@ The [runtime inspector](crates/davinci-coding-agent/src/runtime_inspect.rs) is r
 | `/memory-reindex`, `/memory-clear` | Rebuild memory indexing/embeddings or clear local records; the latter is destructive. |
 | `/governor-reset` | Reset the session's Token Governor state. |
 | `/learning-pending`, `/learning-approve <id\|all>`, `/learning-reject <id\|all> [reason]` | Review and accept/reject learned skill candidates. |
-| `/skill-list [query]`, `/skill-view <name> [file]` | Find or read reusable skills. |
-| `/plugin ...` | The plugin operations below, inside the TUI. |
 | `/design ...`, `/design-sync ...` | Feature-gated [design artifact operations](docs/design-artifacts.md#commands-and-controls). |
 | `/quit` | Exit; `/exit` and `/q` are aliases. |
 
-`/sessions` and `/session` are compatibility aliases for `/resume`; `/session info` and `/session stats` inspect the session. `/workflows` and `/plugins` are also accepted aliases. Native service diagnostics are consolidated in `/status`; older commands such as `/cache-status`, `/lsp-status`, `/repo-index-status`, `/memory-status`, and `/governor-status` remain internal/compatibility entry points rather than the public command-menu inventory.
+`/sessions` and `/session` are compatibility aliases for `/resume`; `/session info` and `/session stats` inspect the session. `/workflows` is an accepted alias. Native service diagnostics are consolidated in `/status`; older commands such as `/cache-status`, `/lsp-status`, `/repo-index-status`, `/memory-status`, and `/governor-status` remain internal/compatibility entry points rather than the public command-menu inventory.
 
 Keyboard bindings can be customized. In the default model picker, Enter persists the default and `s` selects for the current session only. Shift+Tab cycles permission modes at the idle composer. Use `/hotkeys` rather than assuming shortcuts are identical across the default and legacy TUIs.
 
+### Skills, plugins and MCP servers
+
+`/skills`, `/plugins` and `/mcp` each open a manager for one kind:
+
+- **Installed**: what DaVinci loads, with the actions the selected row allows (`u` update, `e` enable/disable, `a` approve hooks, `r` revoke hooks, `d` delete, each named in the hint row).
+- **Discover**: a global marketplace you can browse without typing anything, as in Claude Code. Plugins come from Anthropic's official directory (`anthropics/claude-plugins-official`: superpowers, context7, github, playwright and 300 more); skills from Anthropic's Agent Skills (`anthropics/skills`), skills inside those plugins and, once you type, [skills.sh](https://skills.sh); MCP servers from the official [MCP Registry](https://registry.modelcontextprotocol.io), with featured servers (Context7, GitHub, Playwright, Notion, Linear, Stripe, Supabase, Sentry …) first and recently updated ones after. DaVinci adds the two global marketplaces itself the first time you open Discover and refreshes them daily; you never add them by hand. Type to search; `↑`/`↓` pick; Enter, then Enter again, installs. Esc clears the search, then closes. Skills install into `~/.davinci/agent/skills/` and are available at once; MCP servers are added to `~/.davinci/agent/mcp.json` and start with the next session. A server that needs a secret reads it from an environment variable named for that server, such as `DAVINCI_MCP_GITHUB_MCP__GITHUB_TOKEN`: a registry entry can never read a host variable it was not given. The result row shows what the server runs or contacts and which variables it reads before you confirm; the install message names the variables to set.
+- **Marketplaces** (`/plugins` only): the two global ones (marked "built in") plus any you add for private or extra catalogs: `a` adds one (owner/repo, git URL or folder), `u` refreshes it, `d` then `y` removes it. `DAVINCI_BUILTIN_MARKETPLACES=off` turns the global ones off.
+
+`←`/`→` switch views. `/skills pdf` (any words after the command) opens Discover with that search typed in.
+
 ### Plugin commands
 
-These work as `davinci plugin ...` in the shell or `/plugin ...` in the TUI:
+These work as `davinci plugin ...` in the shell or `/plugins ...` in the TUI:
 
 ~~~text
 list
@@ -838,7 +847,7 @@ Session history is JSONL-compatible. An optional SQLite layer provides derived i
 
 ### Rewind code and conversation
 
-`/rewind` opens recent user prompts. Select the prompt whose work you want to undo, inspect the file preview, then restore **code**, **conversation**, or **both** to immediately before that prompt. Double-Escape with an empty composer opens the same flow unless you customize `doubleEscapeAction`.
+`/rewind` opens recent user prompts. Select the prompt whose work you want to undo, inspect the file preview, then restore **code**, **conversation**, or **both** to immediately before that prompt. Double-Escape with an empty composer opens the same flow unless you customize `doubleEscapeAction`. With a draft in the composer, Escape twice clears it; `↑` brings it back.
 
 Rewind tracks file-tool `write`, `edit`, and `apply_patch` changes. **Shell commands and external processes are not tracked**, so this is not a Git reset or a whole-workspace backup. Stop background jobs/workers first. Overlapping later edits become conflicts rather than being overwritten; conversation-only restore remains available. Abandoned conversation messages remain in the session tree. Saved sessions retain checkpoint/effect evidence; unsaved conversations retain only the last ten conversation snapshots. See [rewind safety, persistence, and RPC commands](docs/rewind.md).
 

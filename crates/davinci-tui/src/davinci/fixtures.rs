@@ -2200,7 +2200,7 @@ pub fn dress_screen(model: &mut Model, id: &str) {
     }
 }
 
-/// `/plugin` with sample rows: one plugin of each kind of state.
+/// `/plugins` with sample rows: one plugin of each kind of state.
 pub fn extension_manager() -> crate::davinci::model::ExtensionsSheet {
     use crate::davinci::model::{ExtensionRow, ExtensionsSheet};
     use crate::davinci::theme::State;

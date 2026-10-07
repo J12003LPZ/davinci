@@ -1,24 +1,37 @@
-//! `/plugin` — manage installed plugins, skills and MCP servers.
+//! `/plugins`, `/skills` and `/mcp`: install, find and manage extensions.
 //!
-//! One tab per kind. The host fills the rows and decides which actions each
-//! row allows (`ExtensionRow::can_*`); this view draws them and names only
-//! the keys that apply to the selected row. No TypeScript counterpart.
+//! Each command opens the manager on one kind. Its views: Installed (what
+//! the host found, with the actions each row allows), Discover (a search box
+//! over marketplaces and online directories) and, for plugins, Marketplaces.
+//! The host fills every list and decides every action; this view only draws.
+//! No TypeScript counterpart.
 
 use super::sheet::{hint, Composer, SheetChrome};
-use crate::davinci::model::{ExtensionRow, ExtensionTab, ExtensionsSheet, Model};
+use crate::davinci::model::{ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, Model};
 use crate::davinci::theme::State;
 use crate::davinci::ui::{section_detail, section_row, span};
 use ratatui::text::{Line, Span};
 
-fn tab_bar(model: &Model, sheet: &ExtensionsSheet) -> Line<'static> {
+fn view_count(sheet: &ExtensionsSheet, view: ExtensionView) -> Option<usize> {
+    match view {
+        ExtensionView::Installed => Some(sheet.current_rows().len()),
+        ExtensionView::Discover => None,
+        ExtensionView::Marketplaces => Some(sheet.marketplaces.len()),
+    }
+}
+
+fn view_bar(model: &Model, sheet: &ExtensionsSheet) -> Line<'static> {
     let th = &model.theme;
     let mut spans: Vec<Span<'static>> = vec![span("   ", th.muted)];
-    for (i, tab) in ExtensionTab::ALL.iter().enumerate() {
+    for (i, view) in sheet.tab.views().iter().enumerate() {
         if i > 0 {
             spans.push(span("   ", th.muted));
         }
-        let label = format!("{} ({})", tab.label(), sheet.rows(*tab).len());
-        if *tab == sheet.tab {
+        let label = match view_count(sheet, *view) {
+            Some(count) => format!("{} ({count})", view.label()),
+            None => view.label().to_string(),
+        };
+        if *view == sheet.view {
             spans.push(span(format!("[{label}]"), model.theme.cc().permission));
         } else {
             spans.push(span(label, th.muted));
@@ -41,11 +54,20 @@ fn colored(rows: Vec<Line<'static>>, color: ratatui::style::Color) -> Vec<Line<'
 fn empty_text(tab: ExtensionTab) -> &'static str {
     match tab {
         ExtensionTab::Plugins => {
-            "No plugins installed. Run /plugin import to adopt Claude Code or Codex plugins, \
-             or /plugin browse to see marketplaces."
+            "No plugins installed. Press → for Discover to find one, or adopt your \
+             Claude Code / Codex plugins with `davinci plugin import`."
         }
-        ExtensionTab::Skills => "No skills found.",
-        ExtensionTab::Mcp => "No MCP servers configured.",
+        ExtensionTab::Skills => "No skills installed. Press → for Discover to find one.",
+        ExtensionTab::Mcp => "No MCP servers configured. Press → for Discover to find one.",
+    }
+}
+
+/// What the Discover search covers, said in the empty search box.
+fn search_placeholder(tab: ExtensionTab) -> &'static str {
+    match tab {
+        ExtensionTab::Plugins => "Search plugins in your marketplaces",
+        ExtensionTab::Skills => "Search skills in your marketplaces and on skills.sh",
+        ExtensionTab::Mcp => "Search the MCP Registry",
     }
 }
 
@@ -55,48 +77,170 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let Some(sheet) = &model.extension_manager else {
         return section_detail(width, th, "Nothing to manage.");
     };
-    let mut rows = vec![tab_bar(model, sheet), Line::default()];
+    let mut rows = vec![view_bar(model, sheet), Line::default()];
     if let Some(notice) = sheet.notice.as_deref().filter(|text| !text.is_empty()) {
         for line in notice.lines() {
             rows.extend(colored(section_detail(width, th, line), th.muted));
         }
         rows.push(Line::default());
     }
+    match sheet.view {
+        ExtensionView::Installed => installed_lines(model, sheet, &mut rows),
+        ExtensionView::Discover => discover_lines(model, sheet, &mut rows),
+        ExtensionView::Marketplaces => marketplace_lines(model, sheet, &mut rows),
+    }
+    rows
+}
+
+fn push_row(model: &Model, rows: &mut Vec<Line<'static>>, item: &ExtensionRow, selected: bool) {
+    let th = &model.theme;
+    let width = model.width;
+    rows.push(section_row(width, th, selected, &item.title, &item.status));
+    if !item.detail.is_empty() {
+        rows.extend(section_detail(width, th, &item.detail));
+    }
+    if let Some(note) = &item.note {
+        let color = match item.state {
+            State::Failed => th.error,
+            State::Attention => th.warning,
+            _ => th.muted,
+        };
+        for line in note.lines() {
+            rows.extend(colored(section_detail(width, th, line), color));
+        }
+    }
+}
+
+fn installed_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'static>>) {
+    let th = &model.theme;
     let items = sheet.current_rows();
     if items.is_empty() {
-        rows.extend(section_detail(width, th, empty_text(sheet.tab)));
-        return rows;
+        rows.extend(section_detail(model.width, th, empty_text(sheet.tab)));
+        return;
     }
     let selected = sheet.index();
     for (i, item) in items.iter().enumerate() {
-        rows.push(section_row(
-            width,
-            th,
-            i == selected,
-            &item.title,
-            &item.status,
-        ));
-        rows.extend(section_detail(width, th, &item.detail));
-        if let Some(note) = &item.note {
-            let color = match item.state {
-                State::Failed => th.error,
-                State::Attention => th.warning,
-                _ => th.muted,
-            };
-            for line in note.lines() {
-                rows.extend(colored(section_detail(width, th, line), color));
-            }
-        }
+        push_row(model, rows, item, i == selected);
         if i == selected {
             if let Some(action) = sheet.armed_here() {
                 rows.extend(colored(
-                    section_detail(width, th, &confirm_warning(sheet.tab, action, item)),
+                    section_detail(model.width, th, &confirm_warning(sheet.tab, action, item)),
                     th.warning,
                 ));
             }
         }
     }
-    rows
+}
+
+fn discover_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'static>>) {
+    let th = &model.theme;
+    let width = model.width;
+    let discover = &sheet.discover;
+    let search = if discover.query.is_empty() {
+        vec![
+            span("   ⌕ ", th.primary),
+            span(search_placeholder(sheet.tab), th.muted),
+        ]
+    } else {
+        vec![
+            span("   ⌕ ", th.primary),
+            span(discover.query.clone(), th.text),
+            span("▏", th.primary),
+        ]
+    };
+    rows.push(Line::from(crate::davinci::ui::truncate_run(search, width)));
+    let status = if discover.searching {
+        Some("Searching…".to_string())
+    } else {
+        discover.message.clone()
+    };
+    if let Some(status) = status {
+        rows.extend(colored(section_detail(width, th, &status), th.muted));
+    }
+    rows.push(Line::default());
+    if discover.results.is_empty() {
+        if !discover.searching {
+            let text = if discover.query.is_empty() {
+                "Type to search."
+            } else {
+                "Nothing matches."
+            };
+            rows.extend(section_detail(width, th, text));
+        }
+        return;
+    }
+    let selected = discover.index();
+    for (i, item) in discover.results.iter().enumerate() {
+        push_row(model, rows, item, i == selected);
+        if i == selected && discover.armed_here() {
+            rows.extend(colored(
+                section_detail(
+                    width,
+                    th,
+                    &format!(
+                        "Press enter again to install {} ({}). Esc cancels.",
+                        item.title, item.status
+                    ),
+                ),
+                th.warning,
+            ));
+        }
+    }
+}
+
+fn marketplace_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'static>>) {
+    let th = &model.theme;
+    let width = model.width;
+    if let Some(input) = &sheet.marketplace_input {
+        rows.push(Line::from(crate::davinci::ui::truncate_run(
+            vec![
+                span("   Add marketplace: ", th.primary),
+                span(input.clone(), th.text),
+                span("▏", th.primary),
+            ],
+            width,
+        )));
+        rows.extend(colored(
+            section_detail(
+                width,
+                th,
+                "owner/repo on GitHub, a git URL, or a local folder. Enter adds it.",
+            ),
+            th.muted,
+        ));
+        rows.push(Line::default());
+    }
+    if sheet.marketplaces.is_empty() {
+        rows.extend(section_detail(
+            width,
+            th,
+            "No marketplaces yet. Press a to add one, for example \
+             anthropics/claude-plugins-official.",
+        ));
+        return;
+    }
+    let selected = sheet.marketplace_index();
+    for (i, item) in sheet.marketplaces.iter().enumerate() {
+        push_row(model, rows, item, i == selected);
+        let armed = sheet
+            .armed
+            .as_ref()
+            .is_some_and(|(name, _)| i == selected && *name == item.key);
+        if armed {
+            rows.extend(colored(
+                section_detail(
+                    width,
+                    th,
+                    &format!(
+                        "Press y to remove the marketplace {}. Installed plugins stay. \
+                         Any other key cancels.",
+                        item.title
+                    ),
+                ),
+                th.warning,
+            ));
+        }
+    }
 }
 
 fn confirm_warning(tab: ExtensionTab, action: &str, item: &ExtensionRow) -> String {
@@ -115,8 +259,8 @@ fn confirm_warning(tab: ExtensionTab, action: &str, item: &ExtensionRow) -> Stri
     format!("Press y to {what} ({}). Any other key cancels.", item.title)
 }
 
-/// The keys the selected row allows, in the order the hint row shows them.
-/// While an action waits for confirmation only `y` does anything.
+/// The keys the selected installed row allows, in the order the hint row
+/// shows them. While an action waits for confirmation only `y` does anything.
 pub fn row_hints(item: Option<&ExtensionRow>, armed: Option<&str>) -> Vec<&'static str> {
     if let Some(action) = armed {
         return vec![if action == "approve" {
@@ -125,7 +269,7 @@ pub fn row_hints(item: Option<&ExtensionRow>, armed: Option<&str>) -> Vec<&'stat
             "y confirm delete"
         }];
     }
-    let mut out = vec!["←→ tab", "↑↓ move"];
+    let mut out = vec!["←→ view", "↑↓ move"];
     let Some(item) = item else {
         return out;
     };
@@ -152,21 +296,51 @@ pub fn row_hints(item: Option<&ExtensionRow>, armed: Option<&str>) -> Vec<&'stat
     out
 }
 
+fn discover_hints(sheet: &ExtensionsSheet) -> Vec<&'static str> {
+    if sheet.discover.armed_here() {
+        return vec!["enter install", "esc cancel"];
+    }
+    let mut out = vec!["type to search", "↑↓ move"];
+    if sheet
+        .discover
+        .current()
+        .is_some_and(|row| row.status != "installed")
+    {
+        out.push("enter install");
+    }
+    out.push("←→ view");
+    out
+}
+
+fn marketplace_hints(sheet: &ExtensionsSheet) -> Vec<&'static str> {
+    if sheet.marketplace_input.is_some() {
+        return vec!["enter add", "esc cancel"];
+    }
+    if sheet.armed.is_some() {
+        return vec!["y confirm remove"];
+    }
+    let mut out = vec!["←→ view", "↑↓ move", "a add"];
+    if let Some(row) = sheet.current_marketplace() {
+        if row.can_update {
+            out.push("u update");
+        }
+        if row.can_delete {
+            out.push("d remove");
+        }
+    }
+    out
+}
+
 pub fn chrome(model: &Model) -> SheetChrome {
     let th = &model.theme;
     let (header, hints) = match &model.extension_manager {
         Some(sheet) => {
-            let item = sheet.current();
-            let armed = sheet.armed_here();
-            (
-                format!(
-                    "{} plugins · {} skills · {} MCP",
-                    sheet.plugins.len(),
-                    sheet.skills.len(),
-                    sheet.mcp.len()
-                ),
-                row_hints(item, armed),
-            )
+            let hints = match sheet.view {
+                ExtensionView::Installed => row_hints(sheet.current(), sheet.armed_here()),
+                ExtensionView::Discover => discover_hints(sheet),
+                ExtensionView::Marketplaces => marketplace_hints(sheet),
+            };
+            (sheet.tab.label().to_string(), hints)
         }
         None => (String::new(), row_hints(None, None)),
     };
@@ -183,7 +357,7 @@ pub fn chrome(model: &Model) -> SheetChrome {
 mod tests {
     use super::*;
     use crate::davinci::{
-        model::ExtensionsSheet,
+        model::{DiscoverState, ExtensionsSheet},
         theme::{ColorDepth, Theme},
         ui,
     };
@@ -219,6 +393,11 @@ mod tests {
                 },
             ],
             skills: vec![row("pelican-facts", "user")],
+            marketplaces: vec![ExtensionRow {
+                can_update: true,
+                can_delete: true,
+                ..row("superpowers-marketplace", "davinci")
+            }],
             ..ExtensionsSheet::default()
         });
         m
@@ -232,14 +411,22 @@ mod tests {
             .join("\n")
     }
 
+    fn hints(m: &Model) -> Vec<String> {
+        chrome(m)
+            .hints
+            .iter()
+            .flat_map(|h| h.iter().map(|s| s.content.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn tabs_counts_rows_and_notes_are_drawn() {
+    fn installed_view_draws_its_rows_and_the_views_of_its_kind() {
         let m = model(100);
         let drawn = text(&lines(&m));
         for value in [
-            "[Plugins (2)]",
-            "Skills (1)",
-            "MCP servers (0)",
+            "[Installed (2)]",
+            "Discover",
+            "Marketplaces (1)",
             "superpowers@superpowers-marketplace",
             "detail of caveman@caveman",
             "hooks changed, approval needed",
@@ -247,34 +434,46 @@ mod tests {
             assert!(drawn.contains(value), "missing {value}:\n{drawn}");
         }
         assert_eq!(ui::focused_row(&lines(&m)), Some(2));
+        let header: String = chrome(&m)
+            .header_right
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(header, "Plugins");
     }
 
     #[test]
-    fn switching_tabs_keeps_each_selection_and_empty_tabs_explain() {
+    fn each_manager_is_titled_by_its_kind() {
+        let mut m = model(100);
+        m.screen = crate::davinci::model::Screen::Extensions;
+        for (tab, title) in [
+            (ExtensionTab::Plugins, "Plugins"),
+            (ExtensionTab::Skills, "Skills"),
+            (ExtensionTab::Mcp, "MCP servers"),
+        ] {
+            m.extension_manager.as_mut().unwrap().tab = tab;
+            assert_eq!(super::super::sheet::sheet_title(&m), title);
+        }
+    }
+
+    #[test]
+    fn skills_and_mcp_have_no_marketplaces_view() {
         let mut m = model(100);
         let sheet = m.extension_manager.as_mut().unwrap();
-        sheet.move_selection(1);
-        sheet.switch_tab(1);
-        assert_eq!(sheet.tab, ExtensionTab::Skills);
-        assert_eq!(sheet.index(), 0);
-        sheet.switch_tab(1);
-        assert!(text(&lines(&m)).contains("No MCP servers configured."));
+        sheet.tab = ExtensionTab::Skills;
+        let drawn = text(&lines(&m));
+        assert!(drawn.contains("[Installed (1)]"), "{drawn}");
+        assert!(!drawn.contains("Marketplaces"), "{drawn}");
         let sheet = m.extension_manager.as_mut().unwrap();
-        sheet.switch_tab(1);
-        assert_eq!(sheet.tab, ExtensionTab::Plugins);
-        assert_eq!(sheet.current().unwrap().key, "caveman@caveman");
+        sheet.switch_view(1);
+        assert_eq!(sheet.view, ExtensionView::Discover);
+        sheet.switch_view(1);
+        assert_eq!(sheet.view, ExtensionView::Installed);
     }
 
     #[test]
     fn hints_name_only_the_actions_the_row_allows() {
         let mut m = model(100);
-        let hints = |m: &Model| {
-            chrome(m)
-                .hints
-                .iter()
-                .flat_map(|h| h.iter().map(|s| s.content.to_string()))
-                .collect::<Vec<_>>()
-        };
         let first = hints(&m);
         assert!(first.contains(&"e disable".to_string()));
         assert!(!first.iter().any(|h| h.starts_with("a ")));
@@ -286,23 +485,106 @@ mod tests {
     }
 
     #[test]
+    fn discover_shows_the_search_box_results_and_the_armed_install() {
+        let mut m = model(100);
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.tab = ExtensionTab::Skills;
+        sheet.view = ExtensionView::Discover;
+        let drawn = text(&lines(&m));
+        assert!(
+            drawn.contains("Search skills in your marketplaces and on skills.sh"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("Type to search."), "{drawn}");
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.discover = DiscoverState {
+            query: "pdf".into(),
+            results: vec![
+                ExtensionRow {
+                    key: "skills.sh:anthropics/skills/pdf".into(),
+                    title: "pdf".into(),
+                    status: "anthropics/skills".into(),
+                    detail: "Read and fill PDF forms".into(),
+                    note: Some("205,751 installs".into()),
+                    ..ExtensionRow::default()
+                },
+                ExtensionRow {
+                    key: "local:x".into(),
+                    title: "docx".into(),
+                    status: "installed".into(),
+                    ..ExtensionRow::default()
+                },
+            ],
+            message: Some("skills.sh: offline".into()),
+            ..DiscoverState::default()
+        };
+        let drawn = text(&lines(&m));
+        for value in [
+            "⌕ pdf",
+            "Read and fill PDF forms",
+            "205,751 installs",
+            "skills.sh: offline",
+        ] {
+            assert!(drawn.contains(value), "missing {value}:\n{drawn}");
+        }
+        assert!(hints(&m).contains(&"enter install".to_string()));
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.discover.armed = Some("skills.sh:anthropics/skills/pdf".into());
+        assert!(text(&lines(&m)).contains("Press enter again to install pdf (anthropics/skills)"));
+        assert_eq!(hints(&m), ["enter install", "esc cancel"]);
+        // An installed result offers no install.
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.discover.armed = None;
+        sheet.discover.move_selection(1);
+        assert!(!hints(&m).contains(&"enter install".to_string()));
+    }
+
+    #[test]
+    fn marketplaces_view_adds_updates_and_confirms_removal() {
+        let mut m = model(100);
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.view = ExtensionView::Marketplaces;
+        assert_eq!(
+            hints(&m),
+            ["←→ view", "↑↓ move", "a add", "u update", "d remove"]
+        );
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.marketplace_input = Some("anthropics/skills".into());
+        let drawn = text(&lines(&m));
+        assert!(
+            drawn.contains("Add marketplace: anthropics/skills"),
+            "{drawn}"
+        );
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.marketplace_input = None;
+        sheet.armed = Some(("superpowers-marketplace".into(), "remove"));
+        assert!(text(&lines(&m)).contains("Press y to remove the marketplace"));
+    }
+
+    #[test]
     fn armed_delete_warns_and_narrow_widths_stay_bounded() {
         let mut m = model(100);
         m.extension_manager.as_mut().unwrap().armed =
             Some(("superpowers@superpowers-marketplace".into(), "delete"));
         assert!(text(&lines(&m)).contains("Press y to uninstall this plugin"));
-        let hints: Vec<String> = chrome(&m)
-            .hints
-            .iter()
-            .flat_map(|h| h.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert_eq!(hints, vec!["y confirm delete".to_string()]);
+        assert_eq!(hints(&m), vec!["y confirm delete".to_string()]);
         // Armed on a row that is not selected: nothing is shown.
         m.extension_manager.as_mut().unwrap().armed = Some(("caveman@caveman".into(), "delete"));
         assert!(!text(&lines(&m)).contains("Press y"));
-        for width in [0, 1, 20, 40, 80, 120] {
-            for row in lines(&model(width)) {
-                assert!(ui::run_width(&row.spans) <= width);
+        for view in [
+            ExtensionView::Installed,
+            ExtensionView::Discover,
+            ExtensionView::Marketplaces,
+        ] {
+            for width in [0, 1, 20, 40, 80, 120] {
+                let mut m = model(width);
+                let sheet = m.extension_manager.as_mut().unwrap();
+                sheet.view = view;
+                sheet.discover.query = "a long query that will not fit".into();
+                sheet.marketplace_input = Some("owner/repository-name".into());
+                for row in lines(&m) {
+                    assert!(ui::run_width(&row.spans) <= width, "{view:?} {width}");
+                }
             }
         }
     }

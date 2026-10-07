@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `/skills`, `/plugins` and `/mcp`, one manager each, like Claude Code. Discover is a global marketplace you browse without adding anything: Anthropic's official plugin directory (superpowers, context7, github, playwright and 300 more) and Agent Skills repository are added automatically the first time and refreshed daily, and `/mcp` opens on featured MCP Registry servers (Context7, GitHub, Playwright, Notion, …) followed by recently updated ones. Private marketplaces can still be added. Installed lists what DaVinci loads with update, enable/disable, hook approval and delete. Discover is a search bar: plugins from your marketplaces, skills from your marketplaces and skills.sh, MCP servers from the official MCP Registry; Enter twice installs. `/plugins` also adds, refreshes and removes marketplaces. `/skills pdf` opens Discover with the search typed in. An MCP server's secrets come from variables named for it (`DAVINCI_MCP_<SERVER>__<NAME>`), so a registry entry cannot ask for a host secret such as `AWS_SECRET_ACCESS_KEY`; the result row shows what it runs or contacts before you confirm.
+- Escape twice clears a draft in the composer, as in Claude Code; `↑` brings it back. The first Escape says "esc again to clear".
+
+### Removed
+- `/plugin`, `/skill-list` and `/skill-view`. Typing one says where its job went: `/plugins`, `/skills` or `/mcp`. `/plugins install …` and the other `davinci plugin` subcommands still work as text.
+
 ## 1.1.4
 
 Changes since `v1.1.3`.
