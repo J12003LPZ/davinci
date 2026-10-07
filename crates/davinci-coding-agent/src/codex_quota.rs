@@ -1,18 +1,24 @@
 //! ChatGPT plan usage for `openai-codex` models, read the way Codex's own
 //! usage screen reads it: one `codex app-server` child over stdio JSON-RPC,
-//! `account/rateLimits/read` at start, after each turn (debounced) and every
+//! `account/rateLimits/read` at start, after each turn (at most one read per
+//! [`MIN_GAP`], a refresh inside the gap is deferred, not dropped) and every
 //! minute, with `account/rateLimits/updated` notifications merged between
 //! reads. The child uses the Codex CLI's own ChatGPT login; DaVinci passes it
 //! no token. Results land in [`davinci_ai::codex_usage`], which the shell
 //! draws.
 //!
-//! The child exits when DaVinci does: its stdin closes. `DAVINCI_CODEX_BIN`
+//! The child runs only while the row is shown ([`set_active`]): hiding the
+//! row (another provider, `/config` → Plan usage off) stops it. A child that
+//! leaves a read unanswered for [`ANSWER_TIMEOUT`] is killed and restarted.
+//! It also exits when DaVinci does: its stdin closes. `DAVINCI_CODEX_BIN`
 //! names another executable (tests use a fixture); `off` disables the meter.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use davinci_ai::codex_usage;
@@ -22,46 +28,114 @@ use serde_json::{json, Value};
 const PERIOD: Duration = Duration::from_secs(60);
 /// No two reads closer than this, however many turns end.
 const MIN_GAP: Duration = Duration::from_secs(10);
+/// A read with no answer for this long means the child is stuck.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// After the child dies, wait this long before starting another.
 const RESTART_AFTER: Duration = Duration::from_secs(60);
 
-static MONITOR: OnceLock<Mutex<Sender<()>>> = OnceLock::new();
+struct Monitor {
+    wake: SyncSender<()>,
+    active: AtomicBool,
+}
 
-/// Start the monitor once per process. Later calls do nothing.
-pub fn start() {
-    MONITOR.get_or_init(|| {
-        let (tx, rx) = channel::<()>();
+static MONITOR: OnceLock<Monitor> = OnceLock::new();
+
+/// Show or hide the row. The first `true` starts the monitor thread; `false`
+/// stops the child until the row is shown again.
+pub fn set_active(active: bool) {
+    if !active && MONITOR.get().is_none() {
+        return;
+    }
+    let monitor = MONITOR.get_or_init(|| {
+        // One slot is enough: a wake-up only says "look again".
+        let (wake, requests) = sync_channel::<()>(1);
         std::thread::Builder::new()
             .name("codex-usage".into())
-            .spawn(move || run(rx))
+            .spawn(move || run(requests))
             .ok();
-        Mutex::new(tx)
+        Monitor {
+            wake,
+            active: AtomicBool::new(false),
+        }
     });
-}
-
-/// Ask for a fresh read soon (after a turn). Does nothing before [`start`].
-pub fn refresh() {
-    if let Some(sender) = MONITOR.get() {
-        let _ = sender
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .send(());
+    if monitor.active.swap(active, Ordering::SeqCst) != active {
+        let _ = monitor.wake.try_send(());
     }
 }
 
-fn binary() -> Option<String> {
+fn active() -> bool {
+    MONITOR
+        .get()
+        .is_some_and(|monitor| monitor.active.load(Ordering::SeqCst))
+}
+
+/// Ask for a fresh read soon (after a turn). Does nothing while the row is
+/// hidden.
+pub fn refresh() {
+    if let Some(monitor) = MONITOR.get() {
+        let _ = monitor.wake.try_send(());
+    }
+}
+
+fn binary() -> Option<PathBuf> {
     match std::env::var("DAVINCI_CODEX_BIN") {
         Ok(value) if value.trim().eq_ignore_ascii_case("off") => None,
-        Ok(value) if !value.trim().is_empty() => Some(value),
-        _ => Some("codex".into()),
+        Ok(value) if !value.trim().is_empty() => Some(PathBuf::from(value.trim())),
+        _ => Some(resolve_codex()),
     }
 }
 
-fn run(requests: std::sync::mpsc::Receiver<()>) {
+/// `codex` on PATH, else where the Codex installers put it. On Windows a bare
+/// `codex` only finds `codex.exe`, so an npm install's `codex.cmd` shim is
+/// looked up by name.
+fn resolve_codex() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let names: &[&str] = if cfg!(windows) {
+        &["codex.exe", "codex.cmd"]
+    } else {
+        &["codex"]
+    };
+    for name in names {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let mut installed: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        installed.push(
+            PathBuf::from(home)
+                .join(".codex/packages/standalone/current/bin")
+                .join(names[0]),
+        );
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        installed.push(
+            PathBuf::from(local)
+                .join("Programs/OpenAI/Codex/bin")
+                .join(names[0]),
+        );
+    }
+    installed
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("codex"))
+}
+
+fn run(requests: Receiver<()>) {
     let Some(binary) = binary() else {
         return;
     };
     loop {
+        // Hidden: no child, wait to be shown.
+        while !active() {
+            if requests.recv().is_err() {
+                return;
+            }
+        }
         let session = match Session::spawn(&binary) {
             Ok(session) => session,
             Err(reason) => {
@@ -70,18 +144,38 @@ fn run(requests: std::sync::mpsc::Receiver<()>) {
                 continue;
             }
         };
-        session.drive(&requests);
-        // The child went away: say so, then try again later.
-        codex_usage::set_unavailable("Codex app-server stopped · retrying");
-        std::thread::sleep(RESTART_AFTER);
+        match session.drive(&requests) {
+            Ended::Hidden => continue,
+            Ended::Disconnected => return,
+            Ended::Stopped(reason) => {
+                codex_usage::set_unavailable(reason);
+                std::thread::sleep(RESTART_AFTER);
+            }
+        }
     }
+}
+
+enum Ended {
+    /// The row was hidden: the child was stopped on purpose.
+    Hidden,
+    /// DaVinci is shutting down.
+    Disconnected,
+    /// The child died or stopped answering.
+    Stopped(&'static str),
+}
+
+/// What the reader thread tells the driver.
+struct Shared {
+    alive: AtomicBool,
+    /// The highest read id answered (result or error).
+    answered: AtomicU64,
 }
 
 struct Session {
     child: Child,
     stdin: ChildStdin,
     next_id: u64,
-    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shared: Arc<Shared>,
 }
 
 impl Drop for Session {
@@ -92,7 +186,7 @@ impl Drop for Session {
 }
 
 impl Session {
-    fn spawn(binary: &str) -> Result<Self, String> {
+    fn spawn(binary: &std::path::Path) -> Result<Self, String> {
         let mut command = Command::new(binary);
         command
             .arg("app-server")
@@ -113,29 +207,39 @@ impl Session {
                 format!("could not start Codex app-server: {error}")
             }
         })?;
-        let stdin = child.stdin.take().ok_or("no stdin for Codex app-server")?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("no stdout for Codex app-server")?;
-        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let reader_alive = alive.clone();
+        let stdout = child.stdout.take();
+        let stdin = child.stdin.take();
+        let shared = Arc::new(Shared {
+            alive: AtomicBool::new(true),
+            answered: AtomicU64::new(0),
+        });
+        // Own the child before anything else can fail, so Drop kills it.
+        let mut session = match stdin {
+            Some(stdin) => Self {
+                child,
+                stdin,
+                next_id: 1,
+                shared: shared.clone(),
+            },
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("no stdin for Codex app-server".into());
+            }
+        };
+        let stdout = stdout.ok_or("no stdout for Codex app-server")?;
         std::thread::Builder::new()
             .name("codex-usage-reader".into())
             .spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
-                    handle_line(&line);
+                    if let Some(id) = handle_line(&line) {
+                        shared.answered.fetch_max(id, Ordering::SeqCst);
+                    }
                 }
-                reader_alive.store(false, std::sync::atomic::Ordering::SeqCst);
+                shared.alive.store(false, Ordering::SeqCst);
             })
             .map_err(|error| error.to_string())?;
-        let mut session = Self {
-            child,
-            stdin,
-            next_id: 1,
-            alive,
-        };
         session.send(&json!({
             "id": 0,
             "method": "initialize",
@@ -161,60 +265,81 @@ impl Session {
             .map_err(|error| format!("Codex app-server closed: {error}"))
     }
 
-    fn read(&mut self) -> Result<(), String> {
+    fn read(&mut self) -> Result<u64, String> {
         self.next_id += 1;
         let id = self.next_id;
-        self.send(&json!({ "id": id, "method": "account/rateLimits/read" }))
+        self.send(&json!({ "id": id, "method": "account/rateLimits/read" }))?;
+        Ok(id)
     }
 
-    fn drive(mut self, requests: &std::sync::mpsc::Receiver<()>) {
+    fn drive(mut self, requests: &Receiver<()>) -> Ended {
+        const STOPPED: Ended = Ended::Stopped("Codex app-server stopped · retrying");
+        let Ok(mut sent) = self.read() else {
+            return STOPPED;
+        };
         let mut last = Instant::now();
-        if self.read().is_err() {
-            return;
-        }
+        let mut pending = false;
         loop {
-            if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
+            if !active() {
+                return Ended::Hidden;
             }
-            let wait = PERIOD.saturating_sub(last.elapsed());
-            match requests.recv_timeout(wait.max(Duration::from_millis(100))) {
-                Ok(()) if last.elapsed() < MIN_GAP => continue,
-                Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+            if !self.shared.alive.load(Ordering::SeqCst) {
+                return STOPPED;
             }
-            if last.elapsed() < MIN_GAP {
+            let unanswered = self.shared.answered.load(Ordering::SeqCst) < sent;
+            if unanswered && last.elapsed() >= ANSWER_TIMEOUT {
+                return Ended::Stopped("Codex app-server is not answering · retrying");
+            }
+            let due = if pending { MIN_GAP } else { PERIOD };
+            if last.elapsed() >= due && !unanswered {
+                match self.read() {
+                    Ok(id) => sent = id,
+                    Err(_) => return STOPPED,
+                }
+                last = Instant::now();
+                pending = false;
                 continue;
             }
-            last = Instant::now();
-            if self.read().is_err() {
-                return;
+            // Wake for the next read or a request; while a read is out, look
+            // for its answer once a second (it usually takes under one).
+            let wait = if unanswered {
+                Duration::from_secs(1)
+            } else {
+                due.saturating_sub(last.elapsed())
+            };
+            match requests.recv_timeout(wait.clamp(Duration::from_millis(100), PERIOD)) {
+                Ok(()) => pending = true,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ended::Disconnected,
             }
         }
     }
 }
 
 /// One line from the app-server: a read's result or error, or a rate-limit
-/// notification. Everything else (the initialize reply, other
-/// notifications) is ignored.
-pub(crate) fn handle_line(line: &str) {
-    let Ok(message) = serde_json::from_str::<Value>(line) else {
-        return;
-    };
+/// notification. Returns the id of the read it answers. Everything else (the
+/// initialize reply, other notifications, other limits) is ignored.
+pub(crate) fn handle_line(line: &str) -> Option<u64> {
+    let message = serde_json::from_str::<Value>(line).ok()?;
     if message.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated") {
-        if let Some(update) = message
-            .pointer("/params/rateLimits")
-            .and_then(codex_usage::parse_app_server_rate_limits)
-        {
-            codex_usage::record_update(update);
+        let limits = message.pointer("/params/rateLimits")?;
+        // Only the main `codex` limit is the plan's; other ids are other
+        // buckets with windows of their own.
+        let limit_id = limits.get("limitId").and_then(Value::as_str);
+        if limit_id.is_none_or(|id| id == "codex") {
+            if let Some(update) = codex_usage::parse_app_server_rate_limits(limits) {
+                codex_usage::record_update(update);
+            }
         }
-        return;
+        return None;
     }
+    let id = message.get("id").and_then(Value::as_u64)?;
     // id 0 is `initialize`; reads start at 2.
-    if message.get("id").and_then(Value::as_u64).unwrap_or(0) < 2 {
+    if id < 2 {
         if let Some(error) = message.get("error") {
             codex_usage::set_unavailable(describe_error(error));
         }
-        return;
+        return None;
     }
     if let Some(snapshot) = message
         .pointer("/result/rateLimits")
@@ -224,6 +349,7 @@ pub(crate) fn handle_line(line: &str) {
     } else if let Some(error) = message.get("error") {
         codex_usage::set_unavailable(describe_error(error));
     }
+    Some(id)
 }
 
 /// A read's error as the one line the usage row shows.
@@ -233,13 +359,18 @@ pub(crate) fn describe_error(error: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let lower = message.to_ascii_lowercase();
-    if lower.contains("token_expired")
-        || lower.contains("401")
-        || lower.contains("not logged in")
-        || lower.contains("no auth")
-        || lower.contains("login")
-    {
+    if lower.contains("token_expired") || lower.contains("401 unauthorized") {
         "Codex login expired · run `codex login` to see plan usage".into()
+    } else if [
+        "not logged in",
+        "not signed in",
+        "login required",
+        "no auth",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+    {
+        "Codex is not signed in · run `codex login` to see plan usage".into()
     } else {
         let first = message.lines().next().unwrap_or("unknown error");
         let short: String = first.chars().take(80).collect();
@@ -275,11 +406,35 @@ mod tests {
         assert_eq!(snapshot.five_hour().unwrap().used_percent, 31.0);
         assert_eq!(snapshot.weekly().unwrap().used_percent, 59.0);
         assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
-        // A failed read says why; the initialize reply and noise are ignored.
-        handle_line(r#"{"id": 0, "result": {"userAgent": "codex"}}"#);
-        handle_line("not json");
+        // Another limit's update (its own bucket) leaves the plan alone.
         handle_line(
-            &json!({"id": 3, "error": {"message": "401 Unauthorized token_expired"}}).to_string(),
+            &json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex_other",
+                "primary": {"usedPercent": 99, "windowDurationMins": 300}
+            }}})
+            .to_string(),
+        );
+        assert_eq!(
+            codex_usage::latest()
+                .unwrap()
+                .five_hour()
+                .unwrap()
+                .used_percent,
+            31.0
+        );
+        // A failed read says why; the initialize reply and noise are ignored,
+        // and only replies to reads count as answers.
+        assert_eq!(
+            handle_line(r#"{"id": 0, "result": {"userAgent": "codex"}}"#),
+            None
+        );
+        assert_eq!(handle_line("not json"), None);
+        assert_eq!(
+            handle_line(
+                &json!({"id": 3, "error": {"message": "401 Unauthorized token_expired"}})
+                    .to_string(),
+            ),
+            Some(3)
         );
         assert_eq!(
             codex_usage::unavailable().as_deref(),
@@ -296,6 +451,15 @@ mod tests {
         assert_eq!(
             describe_error(&expired),
             "Codex login expired · run `codex login` to see plan usage"
+        );
+        assert_eq!(
+            describe_error(&json!({"message": "Not logged in"})),
+            "Codex is not signed in · run `codex login` to see plan usage"
+        );
+        // A 401 elsewhere in an unrelated message is not a login problem.
+        assert_eq!(
+            describe_error(&json!({"message": "quota 401 tokens over"})),
+            "plan usage unavailable: quota 401 tokens over"
         );
         let other = json!({"message": "backend unavailable\nsecond line"});
         assert_eq!(

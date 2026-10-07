@@ -52,9 +52,26 @@ pub struct CodexUsageSnapshot {
 pub const FIVE_HOURS_MINUTES: u64 = 300;
 /// A weekly window.
 pub const WEEK_MINUTES: u64 = 7 * 24 * 60;
+/// A 30-day window (what a free plan reported in October 2026).
+pub const MONTH_MINUTES: u64 = 30 * 24 * 60;
+
+/// A window's short name by its length: `5h`, `week`, `month`, else `3d`,
+/// `2h`, `45m`, or `limit` when the length is unknown.
+pub fn window_label(minutes: Option<u64>) -> String {
+    match minutes {
+        Some(FIVE_HOURS_MINUTES) => "5h".into(),
+        Some(WEEK_MINUTES) => "week".into(),
+        Some(MONTH_MINUTES) => "month".into(),
+        Some(minutes) if minutes > 0 && minutes % 1440 == 0 => format!("{}d", minutes / 1440),
+        Some(minutes) if minutes > 0 && minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) if minutes > 0 => format!("{minutes}m"),
+        _ => "limit".into(),
+    }
+}
 
 impl CodexUsageSnapshot {
-    fn windows(&self) -> impl Iterator<Item = &UsageWindow> {
+    /// Every reported window, in slot order.
+    pub fn windows(&self) -> impl Iterator<Item = &UsageWindow> {
         self.primary.iter().chain(self.secondary.iter())
     }
 
@@ -173,7 +190,12 @@ pub fn merge(base: Option<CodexUsageSnapshot>, update: CodexUsageSnapshot) -> Co
         };
         if let Some(previous) = slot.as_ref() {
             if previous.window_minutes == window.window_minutes {
-                window.resets_at = window.resets_at.or(previous.resets_at);
+                // A reset time already past means the window rolled over:
+                // better no time than "now" forever.
+                let now = now_seconds();
+                window.resets_at = window
+                    .resets_at
+                    .or(previous.resets_at.filter(|at| *at > now));
                 window.resets_in_seconds = window.resets_in_seconds.or(previous.resets_in_seconds);
             }
         }
@@ -183,8 +205,27 @@ pub fn merge(base: Option<CodexUsageSnapshot>, update: CodexUsageSnapshot) -> Co
     merged
 }
 
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
 pub fn record(snapshot: CodexUsageSnapshot) {
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    record_locked(&mut state, snapshot);
+}
+
+fn record_locked(state: &mut State, mut snapshot: CodexUsageSnapshot) {
+    // A relative reset (from headers) is pinned to the clock now, so it
+    // counts down instead of staying "in 20 minutes" forever.
+    let now = now_seconds();
+    for window in [&mut snapshot.primary, &mut snapshot.secondary]
+        .into_iter()
+        .flatten()
+    {
+        window.resets_at = window.reset_time(now);
+    }
     if let Some(leading) = snapshot.leading() {
         let used = leading.used_percent;
         let crossed = WARN_AT
@@ -194,8 +235,13 @@ pub fn record(snapshot: CodexUsageSnapshot) {
         if let Some(threshold) = crossed {
             state.warned_primary = *threshold;
             let reset = leading
-                .resets_in_seconds
-                .map(|seconds| format!(" · resets in {} min", seconds.div_ceil(60)))
+                .reset_time(now)
+                .map(|at| {
+                    format!(
+                        " · resets in {} min",
+                        (at.saturating_sub(now).max(0) as u64).div_ceil(60)
+                    )
+                })
                 .unwrap_or_default();
             state.pending = Some(format!(
                 "ChatGPT plan usage at {used:.0}% of the current window{reset}"
@@ -209,10 +255,12 @@ pub fn record(snapshot: CodexUsageSnapshot) {
     state.unavailable = None;
 }
 
-/// Lay a sparse update over the latest snapshot and record the result.
+/// Lay a sparse update over the latest snapshot and record the result, under
+/// one lock so a read landing in between is not lost.
 pub fn record_update(update: CodexUsageSnapshot) {
-    let base = latest();
-    record(merge(base, update));
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    let merged = merge(state.latest.clone(), update);
+    record_locked(&mut state, merged);
 }
 
 /// Why no usage can be shown (the Codex CLI is missing, its login expired),
@@ -316,6 +364,39 @@ mod tests {
     }
 
     #[test]
+    fn a_free_plan_with_one_thirty_day_window_is_read() {
+        // The shape a free account returned live (October 2026), with the
+        // account id left out.
+        let free = parse_app_server_rate_limits(&json!({
+            "limitId": "codex", "limitName": null, "normalModelSlug": null,
+            "primary": {"usedPercent": 0, "windowDurationMins": 43200, "resetsAt": 1793936153},
+            "secondary": null,
+            "credits": {"hasCredits": false, "unlimited": false, "balance": null},
+            "individualLimit": null, "spendControlReached": false,
+            "planType": "free", "rateLimitReachedType": null
+        }))
+        .unwrap();
+        assert!(free.five_hour().is_none() && free.weekly().is_none());
+        let windows: Vec<_> = free.windows().collect();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(window_label(windows[0].window_minutes), "month");
+        assert_eq!(windows[0].remaining_percent(), 100.0);
+        assert_eq!(free.leading().unwrap().used_percent, 0.0);
+    }
+
+    #[test]
+    fn windows_are_named_by_length() {
+        assert_eq!(window_label(Some(300)), "5h");
+        assert_eq!(window_label(Some(10_080)), "week");
+        assert_eq!(window_label(Some(43_200)), "month");
+        assert_eq!(window_label(Some(4_320)), "3d");
+        assert_eq!(window_label(Some(120)), "2h");
+        assert_eq!(window_label(Some(45)), "45m");
+        assert_eq!(window_label(Some(0)), "limit");
+        assert_eq!(window_label(None), "limit");
+    }
+
+    #[test]
     fn a_sparse_update_keeps_what_it_does_not_carry() {
         let base = parse_app_server_rate_limits(&json!({
             "primary": {"usedPercent": 10, "windowDurationMins": 300},
@@ -337,8 +418,8 @@ mod tests {
         // The read put the weekly window first; the update sends the 5-hour
         // one in the primary slot, without a reset time.
         let base = parse_app_server_rate_limits(&json!({
-            "primary": {"usedPercent": 59, "windowDurationMins": 10080, "resetsAt": 2000},
-            "secondary": {"usedPercent": 27, "windowDurationMins": 300, "resetsAt": 1000},
+            "primary": {"usedPercent": 59, "windowDurationMins": 10080, "resetsAt": 4_000_002_000_i64},
+            "secondary": {"usedPercent": 27, "windowDurationMins": 300, "resetsAt": 4_000_001_000_i64},
         }));
         let update = parse_app_server_rate_limits(&json!({
             "primary": {"usedPercent": 31, "windowDurationMins": 300}
@@ -348,7 +429,19 @@ mod tests {
         assert_eq!(merged.weekly().unwrap().used_percent, 59.0);
         let five = merged.five_hour().unwrap();
         assert_eq!(five.used_percent, 31.0);
-        assert_eq!(five.resets_at, Some(1000));
+        assert_eq!(five.resets_at, Some(4_000_001_000));
+        // A kept reset time already past is dropped: the window rolled over.
+        let past = parse_app_server_rate_limits(&json!({
+            "primary": {"usedPercent": 90, "windowDurationMins": 300, "resetsAt": 1000}
+        }));
+        let rolled = merge(
+            past,
+            parse_app_server_rate_limits(&json!({
+                "primary": {"usedPercent": 2, "windowDurationMins": 300}
+            }))
+            .unwrap(),
+        );
+        assert_eq!(rolled.five_hour().unwrap().resets_at, None);
         // An update with no length falls back to its slot.
         let merged = merge(
             Some(merged),

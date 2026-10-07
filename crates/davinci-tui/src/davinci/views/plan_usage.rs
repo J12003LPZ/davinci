@@ -103,18 +103,40 @@ pub fn lines(model: &Model, height: usize) -> Vec<Line<'static>> {
     }
     let label = view.plan.clone().unwrap_or_else(|| "plan".into());
     let gap = "   ";
-    for rule in [true, false] {
+    let indent = " ".repeat(width_of(&head(label.clone())));
+    // The last read failed: the numbers are old, and this says why.
+    let note = view
+        .note
+        .as_ref()
+        .map(|note| span(format!("{gap}⚠ {note}"), th.warning));
+    let clip = |spans: Vec<Span<'static>>| {
+        Line::from(crate::davinci::ui::truncate_run(spans, width as u16))
+    };
+    let row = |rule: bool| {
         let mut spans = head(label.clone());
         for window in &view.windows {
             spans.push(Span::raw(gap));
             spans.extend(window_spans(model, window, rule));
         }
+        spans
+    };
+    // Everything on one row, with rules if they fit, else without.
+    for rule in [true, false] {
+        let mut spans = row(rule);
+        spans.extend(note.clone());
         if width_of(&spans) <= width {
             return vec![Line::from(spans)];
         }
     }
-    // One window per row, without rules.
-    let indent = " ".repeat(width_of(&head(label.clone())));
+    // The windows on one row, the note under them.
+    let note_row = note.map(|note| clip(vec![Span::raw(indent.clone()), note]));
+    for rule in [true, false] {
+        let spans = row(rule);
+        if width_of(&spans) <= width {
+            return std::iter::once(Line::from(spans)).chain(note_row).collect();
+        }
+    }
+    // One window per row, without rules, then the note.
     view.windows
         .iter()
         .enumerate()
@@ -126,8 +148,9 @@ pub fn lines(model: &Model, height: usize) -> Vec<Line<'static>> {
             };
             spans.push(Span::raw(gap));
             spans.extend(window_spans(model, window, false));
-            Line::from(crate::davinci::ui::truncate_run(spans, width as u16))
+            clip(spans)
         })
+        .chain(note_row)
         .collect()
 }
 
@@ -256,6 +279,63 @@ mod tests {
             let all: String = rows.iter().map(text).collect();
             assert!(all.contains("73% left") || width < 50, "{width}: {all}");
         }
+    }
+
+    #[test]
+    fn old_numbers_carry_the_reason_they_are_old() {
+        let note = "Codex login expired · run `codex login` to see plan usage";
+        let usage = view(
+            Some("plus".into()),
+            vec![
+                window("5h", 300, 27.0, None),
+                window("week", 10_080, 59.0, None),
+            ],
+            Some(note.into()),
+        );
+        let rows: Vec<String> = lines(&model(200, usage.clone()), 40)
+            .iter()
+            .map(text)
+            .collect();
+        // Too long for one row at the content measure: the note goes under.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows[0].contains("73% left") && rows[0].contains('━'),
+            "{rows:?}"
+        );
+        assert!(rows[1].trim_start() == format!("⚠ {note}"), "{rows:?}");
+        // A short note fits on the row.
+        let short = view(
+            None,
+            vec![window("week", 10_080, 59.0, None)],
+            Some("retrying".into()),
+        );
+        let rows: Vec<String> = lines(&model(200, short), 40).iter().map(text).collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].ends_with("41% left   ⚠ retrying"), "{rows:?}");
+        // Stacked on a narrow screen: the note gets its own row, clipped.
+        let rows = lines(&model(44, usage), 40);
+        let last = text(rows.last().unwrap());
+        assert!(last.contains("⚠ Codex login"), "{last}");
+        for row in &rows {
+            assert!(row.width() <= 44, "{}", text(row));
+        }
+    }
+
+    #[test]
+    fn a_free_plan_month_window_reads_as_a_month() {
+        let usage = view(
+            Some("free".into()),
+            vec![window("month", 43_200, 0.0, Some(29 * 86_400))],
+            None,
+        );
+        let rows: Vec<String> = lines(&model(100, usage), 40).iter().map(text).collect();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].starts_with("  ◇ free")
+                && rows[0].contains("month")
+                && rows[0].contains("100% left · 29d"),
+            "{rows:?}"
+        );
     }
 
     #[test]

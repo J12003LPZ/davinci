@@ -1105,42 +1105,42 @@ fn estimate_tokens(text: &str) -> u64 {
     text.chars().count() as u64 / 4
 }
 
-/// The plan usage row: on for openai-codex models (starting the Codex
-/// app-server monitor the first time), hidden for every other provider or
-/// when `/config` → Plan usage is off.
+/// The plan usage row: on for openai-codex models, hidden for every other
+/// provider or when `/config` → Plan usage is off. The Codex app-server
+/// child runs only while the row is shown.
 fn sync_plan_usage(agent: &Agent, model: &mut Model) {
     use davinci_ai::codex_usage;
     use davinci_tui::davinci::model::PlanWindow;
-    if !model.plan_usage_enabled || agent.provider != "openai-codex" {
+    let shown = model.plan_usage_enabled && agent.provider == "openai-codex";
+    crate::codex_quota::set_active(shown);
+    if !shown {
         if model.plan_usage.take().is_some() {
             model.dirty = true;
         }
         return;
     }
-    crate::codex_quota::start();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64);
     let snapshot = codex_usage::latest();
+    // Every window the plan reports, named by its length: Plus has 5h and
+    // week, a free plan reported a single 30-day one.
     let windows = snapshot
         .as_ref()
         .map(|snapshot| {
-            [
-                ("5h", codex_usage::FIVE_HOURS_MINUTES),
-                ("week", codex_usage::WEEK_MINUTES),
-            ]
-            .into_iter()
-            .filter_map(|(label, minutes)| {
-                snapshot.window_of(minutes).map(|window| PlanWindow {
-                    label: label.into(),
-                    minutes,
+            snapshot
+                .windows()
+                .map(|window| PlanWindow {
+                    label: codex_usage::window_label(window.window_minutes),
+                    minutes: window.window_minutes.unwrap_or(u64::MAX),
                     used_percent: window.used_percent,
+                    // Whole minutes, as drawn: the row redraws once a minute,
+                    // not every tick.
                     resets_in: window
                         .reset_time(now)
-                        .map(|at| at.saturating_sub(now).max(0) as u64),
+                        .map(|at| (at.saturating_sub(now).max(0) as u64).div_ceil(60) * 60),
                 })
-            })
-            .collect()
+                .collect()
         })
         .unwrap_or_default();
     let view = davinci_tui::davinci::views::plan_usage::view(
