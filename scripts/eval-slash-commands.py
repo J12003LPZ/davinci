@@ -8,7 +8,23 @@ import json
 import os
 from pathlib import Path
 import sys
+import struct
 import tempfile
+import zlib
+
+
+def tiny_png():
+    """A valid 2x1 RGB PNG, built here so no binary lives in the repo."""
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+    raw = b"\x00" + b"\xff\x00\x00" + b"\x00\x00\xff"
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
 
 
 def main():
@@ -42,7 +58,7 @@ def main():
         ("/context inspect", "Context & Memory Inspector", True),
         ("/reload", "Native extensions", True),
         ("/mcp", "No MCP servers configured", True),
-        ("/skills", "No skills installed", True),
+        ("/skills", "eval-own-skill", True),
         ("/skill-list", "is not a command", False),
         ("/skill-view pdf", "is not a command", False),
         ("/cost", "input 0", False),
@@ -75,7 +91,35 @@ def main():
         config = Path(cwd) / "eval-config"
         config.mkdir()
         (config / "vector-memory.json").write_text(json.dumps({"enabled": False}), encoding="utf-8")
-        terminal = module.Terminal(executable, cwd, None, 180, 55)
+        # A skill of the user's own, and a local marketplace with a plugin
+        # that ships a skill and a command, for the slash menu checks.
+        own = config / "skills" / "eval-own-skill"
+        own.mkdir(parents=True)
+        (own / "SKILL.md").write_text(
+            "---\nname: eval-own-skill\ndescription: The user's own eval skill\n---\nOwn body.\n",
+            encoding="utf-8",
+        )
+        market = Path(cwd) / "eval-market"
+        plugin = market / "plugins" / "evalkit"
+        (market / ".claude-plugin").mkdir(parents=True)
+        (market / ".claude-plugin" / "marketplace.json").write_text(json.dumps({
+            "name": "eval-market",
+            "plugins": [{"name": "evalkit", "source": "./plugins/evalkit", "description": "eval"}],
+        }), encoding="utf-8")
+        (plugin / ".claude-plugin").mkdir(parents=True)
+        (plugin / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "evalkit"}), encoding="utf-8")
+        (plugin / "skills" / "plan-it").mkdir(parents=True)
+        (plugin / "skills" / "plan-it" / "SKILL.md").write_text(
+            "---\nname: plan-it\ndescription: Plan before touching code\n---\nPlan body.\n",
+            encoding="utf-8",
+        )
+        (plugin / "commands").mkdir()
+        (plugin / "commands" / "ship.md").write_text("Ship it: $ARGUMENTS\n", encoding="utf-8")
+        # alt+v reads this instead of the system clipboard (2x1 PNG).
+        clip = Path(cwd) / "clip.png"
+        clip.write_bytes(tiny_png())
+        os.environ["PI_CLIPBOARD_IMAGE"] = str(clip)
+        terminal = module.Terminal(executable, cwd, None, 180, 55, skills=True)
 
         def check(command, expected, overlay=False, *, reset=False):
             text = terminal.command(command)
@@ -123,6 +167,36 @@ def main():
             text = terminal.send("\x1b", 1.0)
             assert "half a draft" not in text, text
             rows.append({"command": "esc esc", "passed": True})
+            # Skills and plugin commands are slash commands, named as Claude
+            # Code names them: `/name`, `/plugin:name`.
+            check("/plugins marketplace add " + str(market), "eval-market")
+            check("/plugins install evalkit@eval-market", "Loaded now")
+            for typed, listed in [
+                ("/eval-own", "/eval-own-skill"),
+                ("/evalkit:", "/evalkit:plan-it"),
+                ("/evalkit:sh", "/evalkit:ship"),
+            ]:
+                for ch in typed:
+                    terminal.send(ch, 0.05)
+                text = terminal.pump(1.0)
+                assert listed in text, (typed, text)
+                assert "/skill:" not in text, text
+                terminal.send("", 0.3)
+                rows.append({"command": f"menu {typed}", "passed": True})
+            text = terminal.pump(0.5)
+            # alt+v pastes the clipboard image as an [Image #1] chip; clearing
+            # the draft drops it.
+            def composer(screen):
+                return [line for line in screen.splitlines() if line.lstrip().startswith("❯")][-1]
+            text = terminal.send("v", 2.0)
+            assert "[Image #1]" in composer(text), text
+            assert "1 image attached" in text, text
+            assert "Pasted [Image #1]" in text, text
+            terminal.send("", 0.3)
+            text = terminal.send("", 1.0)
+            assert "[Image #1]" not in composer(text), text
+            assert "image attached" not in text, text
+            rows.append({"command": "alt+v image chip", "passed": True})
             check("/new", "started a new session")
             check("Session audit sentinel", "offline")
             check("/name Audit", "named this session Audit")

@@ -33,10 +33,13 @@ OFFLINE_CODEX_LOGIN = {
 
 
 class Terminal:
-    def __init__(self, executable, cwd, fixture, width, height, *, offline=True, extra_args=()):
+    def __init__(self, executable, cwd, fixture, width, height, *, offline=True, extra_args=(), skills=False):
         args = [executable, "--davinci", "--no-animation",
-                "--no-session", "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files",
+                "--no-session", "--no-extensions", "--no-mcp", "--no-context-files",
                 "--provider", "openai-codex", "--model", "gpt-6-luna", "--thinking", "low"]
+        # Skills stay off unless a check is about them (the slash menu).
+        if not skills:
+            args.insert(6, "--no-skills")
         if offline:
             args.append("--offline")
         args.extend(extra_args)

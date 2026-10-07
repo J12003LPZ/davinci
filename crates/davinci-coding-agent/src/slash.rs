@@ -343,16 +343,21 @@ pub fn invocable_commands(
             .unwrap_or("")
             .to_string();
         commands.push(serde_json::json!({
-            "name": template.name,
+            "name": template.command_name(),
             "description": description,
             "source": "prompt",
             "sourceInfo": { "path": template.path.display().to_string() }
         }));
     }
     for skill in skills {
+        // As Claude Code lists them: `/my-skill`, `/superpowers:writing-plans`.
+        // `/skill:<name>` still runs one but is no longer listed.
         commands.push(serde_json::json!({
-            "name": format!("skill:{}", skill.name),
-            "description": skill.description,
+            "name": skill.command_name(),
+            "description": match &skill.namespace {
+                Some(plugin) => format!("({plugin}) {}", skill.description),
+                None => skill.description.clone(),
+            },
             "source": "skill",
             "sourceInfo": { "path": skill.path.display().to_string() }
         }));
@@ -363,6 +368,58 @@ pub fn invocable_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skills_and_plugin_commands_are_listed_by_their_slash_names() {
+        let skill = |name: &str, namespace: Option<&str>| davinci_agent::Skill {
+            name: name.into(),
+            path: format!("/virtual/{name}/SKILL.md").into(),
+            description: "does things".into(),
+            body: String::new(),
+            base_dir: Default::default(),
+            namespace: namespace.map(str::to_string),
+        };
+        let template = davinci_agent::PromptTemplate {
+            name: "commit".into(),
+            path: "/virtual/commit.md".into(),
+            body: "Commit it".into(),
+            description: String::new(),
+            argument_hint: None,
+            namespace: Some("git-tools".into()),
+        };
+        let listed = invocable_commands(
+            &[],
+            &[template],
+            &[
+                skill("mine", None),
+                skill("writing-plans", Some("superpowers")),
+            ],
+        );
+        let rows: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|row| {
+                (
+                    row["name"].as_str().unwrap(),
+                    row["description"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("git-tools:commit", "Commit it"),
+                ("mine", "does things"),
+                ("superpowers:writing-plans", "(superpowers) does things"),
+            ]
+        );
+        // What the menu inserts is not a built-in, so it reaches expansion.
+        for (name, _) in rows {
+            assert_eq!(
+                parse_line(&format!("/{name} go")),
+                SlashAction::Prompt(format!("/{name} go"))
+            );
+        }
+    }
 
     #[test]
     fn rewind_is_discoverable_and_host_owned() {

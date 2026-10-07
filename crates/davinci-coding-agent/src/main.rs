@@ -8750,6 +8750,10 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
     } else {
         &[]
     };
+    let native: std::collections::HashSet<&str> = command_specs()
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
     for spec in slash::invocable_commands(
         &host
             .js
@@ -8766,7 +8770,7 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
         let Some(name) = spec.get("name").and_then(|value| value.as_str()) else {
             continue;
         };
-        if commands.iter().any(|command| command.name == name) {
+        if native.contains(name) || commands.iter().any(|command| command.name == name) {
             continue;
         }
         commands.push(SlashCommandSpec {
@@ -9796,6 +9800,11 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         // skill with the same name wins.
         roots.extend(plugins.skill_files());
         agent.skills = discover_skills(&roots);
+        davinci_agent::set_skill_commands_enabled(settings.enable_skill_commands.unwrap_or(true));
+        // A plugin's skills answer to `/plugin:skill`, as in Claude Code.
+        for skill in &mut agent.skills {
+            skill.namespace = plugins.owner_of(&skill.path).map(str::to_string);
+        }
     }
     if !parsed.no_prompt_templates {
         let mut roots: Vec<PathBuf> = parsed.prompt_templates.iter().map(PathBuf::from).collect();
@@ -9816,6 +9825,9 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         }
         roots.extend(plugins.command_files());
         agent.templates = discover_prompt_templates(&roots);
+        for template in &mut agent.templates {
+            template.namespace = plugins.owner_of(&template.path).map(str::to_string);
+        }
     }
     agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
     apply_plugin_session_start(agent, &plugins);

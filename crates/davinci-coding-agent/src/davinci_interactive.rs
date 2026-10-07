@@ -24,6 +24,7 @@ use davinci_tui::davinci::model::{
 use davinci_tui::davinci::theme::State;
 
 use crate::extension_host::ExtensionHost;
+mod attachments;
 mod discover;
 mod graph_feedback;
 mod graph_setup;
@@ -682,6 +683,7 @@ impl Turn {
     fn take_ledger(&mut self, model: &mut Model, list: &davinci_agent::TodoList) {
         model.plan = plan_from_todos(list);
         let steps = steps_from_todos(list);
+        model.goal_path = steps.clone();
         self.ledger = !steps.is_empty();
         self.ledger_target = None;
         match self
@@ -1101,6 +1103,25 @@ impl Turn {
 /// the same approximation `estimate_context_tokens` uses.
 fn estimate_tokens(text: &str) -> u64 {
     text.chars().count() as u64 / 4
+}
+
+/// After a session switch, the goal path is that session's own task list:
+/// its last recorded ledger, or none, never the previous session's.
+fn reload_goal_path(agent: &mut Agent, model: &mut Model) {
+    if !agent.restore_todos() {
+        *agent
+            .tool_context
+            .todos
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = davinci_agent::TodoList::default();
+    }
+    let list = agent
+        .tool_context
+        .todos
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    model.goal_path = steps_from_todos(&list);
 }
 
 /// The model's ledger as STUDIO steps: `✓` done, `◉` active, `○` pending.
@@ -3742,6 +3763,7 @@ pub fn perform(
             let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(store)?;
+            reload_goal_path(agent, model);
             model.transcript.clear();
             Ok(Done::Said("started a new session".into()))
         }
@@ -3913,6 +3935,7 @@ pub fn perform(
                 )
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
+            reload_goal_path(agent, model);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("forked to {}", session_id(agent))))
         }
@@ -3925,6 +3948,7 @@ pub fn perform(
                 .clone_session(&session_dir)
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
+            reload_goal_path(agent, model);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("cloned to {}", session_id(agent))))
         }
@@ -3935,6 +3959,7 @@ pub fn perform(
             let expanded = davinci_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
+            reload_goal_path(agent, model);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("imported {}", session_id(agent))))
         }
@@ -4281,7 +4306,22 @@ pub fn perform(
         // `/plugins install x@m` and the other subcommands stay text, so
         // scripts and muscle memory keep working; anything else searches.
         SlashAction::Plugins(args) if is_plugin_subcommand(&args) => {
-            Ok(Done::Said(crate::plugin_command_text(&args, &agent.cwd)))
+            let text = crate::plugin_command_text(&args, &agent.cwd);
+            // A change to what is installed applies now, as the /plugins
+            // manager's own installs do: its skills and commands join the
+            // `/` menu without a /reload.
+            let hint = davinci_coding_agent::plugins::command::RELOAD_HINT;
+            if !text.contains(hint) {
+                return Ok(Done::Said(text));
+            }
+            crate::apply_discovered_resources(parsed, agent);
+            model.slash_commands = crate::interactive_slash_commands(agent, parsed);
+            model.corpus = corpus(agent, &model.slash_commands, &model.sessions);
+            model.corpus_total = model.corpus.len();
+            Ok(Done::Said(text.replace(
+                hint,
+                "Loaded now: its skills and commands are in the / menu.",
+            )))
         }
         SlashAction::Plugins(args) => {
             open_extension_manager(parsed, agent, model, ExtensionTab::Plugins, &args);
@@ -4559,6 +4599,7 @@ pub fn run(
             .unwrap_or_else(|err| err.into_inner())
             .clone();
         model.plan = plan_from_todos(&list);
+        model.goal_path = steps_from_todos(&list);
     }
     model.model_index = model
         .models
@@ -4661,6 +4702,7 @@ pub fn run(
     // Images pasted with ctrl+v, sent with the next prompt so a vision model
     // is reachable from this interface.
     let mut attached_images: Vec<davinci_ai::MessageContent> = Vec::new();
+    let mut image_status: Option<String> = None;
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
     crate::startup_mark("shell: terminal open");
@@ -4948,6 +4990,15 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        // The attachment line follows the chips left in the draft.
+        if !attached_images.is_empty() || image_status.is_some() {
+            let line = attachments::status(&model.composer.to_string(), &attached_images);
+            if line != image_status {
+                model.extensions.set_status("§images", line.as_deref());
+                image_status = line;
+                model.dirty = true;
+            }
+        }
         // A reply still being written after its turn ended finishes at the
         // typewriter's own pace, not the 250ms clock's.
         model.advance_reveal();
@@ -5034,15 +5085,15 @@ pub fn run(
                                 continue;
                             }
                         }
-                        // ctrl+v reads the clipboard the way the legacy chrome's
-                        // `PasteClipboard` does: an image is attached to the next
-                        // prompt — the only way a vision model is reachable from
-                        // this interface — and text goes into the composer.
-                        if key.code == crossterm::event::KeyCode::Char('v')
-                            && key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL)
-                        {
+                        // ctrl+v / alt+v (`app.clipboard.pasteImage`) read the
+                        // clipboard the way the legacy chrome's `PasteClipboard`
+                        // does: an image is attached to the next prompt, with an
+                        // `[Image #N]` chip in the draft, and text goes into the
+                        // composer. alt+v is the one Windows Terminal lets
+                        // through, since it keeps ctrl+v for its own paste.
+                        if davinci_tui::key_event_bytes(&key).is_some_and(|data| {
+                            model.keybindings.matches(&data, "app.clipboard.pasteImage")
+                        }) {
                             if let Some(png) = crate::external_editor::clipboard_image_png() {
                                 let (bytes, note) =
                                     match crate::image_convert::resize_image_in_process(
@@ -5067,18 +5118,27 @@ pub fn run(
                                     &base64::engine::general_purpose::STANDARD,
                                     bytes,
                                 );
+                                let chip = attachments::next_chip(&attached_images);
                                 attached_images.push(davinci_ai::MessageContent::Image {
                                     data,
                                     mime_type: "image/png".into(),
                                 });
-                                let count = attached_images.len();
-                                model.extensions.set_status(
-                                    "§images",
-                                    Some(&format!(
-                                    "{count} image{} attached ({note}) · sent with the next prompt",
-                                    if count == 1 { "" } else { "s" },
-                                )),
-                                );
+                                let draft = model.composer.to_string();
+                                let cursor = model.composer.cursor().min(draft.len());
+                                let before = draft
+                                    .get(..cursor)
+                                    .and_then(|head| head.chars().next_back());
+                                let spaced = attachments::spaced_chip(&chip, before);
+                                model.paste(&spaced);
+                                if model.composer.to_string().contains(&chip) {
+                                    model
+                                        .transcript
+                                        .push(Entry::Detail(format!("Pasted {chip} ({note})")));
+                                } else {
+                                    // The composer is not taking input (a sheet or
+                                    // selector has focus): no chip, no image.
+                                    attached_images.pop();
+                                }
                                 continue;
                             }
                             if let Some(text) = crate::external_editor::clipboard_text() {
@@ -8635,6 +8695,7 @@ impl Shell<'_> {
                     self.note(&error);
                     return Next::Go;
                 }
+                reload_goal_path(self.agent, self.model);
                 self.model.transcript = transcript_from(&self.agent.messages);
                 self.model.running = false;
                 self.redress();
@@ -8858,10 +8919,17 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
 /// see it first and may swallow or transform it, then skills and templates
 /// expand it, then the turn runs, then whatever was queued behind it.
 fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::MessageContent]) -> Next {
-    // Whatever ctrl+v attached goes with this prompt.
+    // Whatever ctrl+v / alt+v attached goes with this prompt, as long as its
+    // `[Image #N]` chip is still in the text.
     let mut images = images.to_vec();
-    images.append(shell.images);
-    shell.model.extensions.set_status("§images", None);
+    images.extend(attachments::retained(text, shell.images));
+    // A prompt that is not the draft (an extension's, `/init`) leaves the
+    // images the draft still shows, and their status line, for the draft's
+    // own send.
+    if !attachments::any_chip(&shell.model.composer.to_string(), shell.images) {
+        shell.images.clear();
+        shell.model.extensions.set_status("§images", None);
+    }
     let images = images.as_slice();
     // Extensions with an input handler get the line before the model does.
     let input = {
@@ -9388,6 +9456,7 @@ fn todo_command(shell: &mut Shell<'_>, arg: &str) -> Next {
             .unwrap_or_else(|err| err.into_inner()) = davinci_agent::TodoList::default();
         shell.agent.persist_todos();
         shell.model.plan.clear();
+        shell.model.goal_path.clear();
         shell.model.running = false;
         shell.model.transcript.push(Entry::Gap);
         shell
@@ -9417,6 +9486,7 @@ fn todo_command(shell: &mut Shell<'_>, arg: &str) -> Next {
         return Next::Go;
     }
     shell.model.plan = plan_from_todos(&list);
+    shell.model.goal_path = steps_from_todos(&list);
     shell
         .model
         .transcript

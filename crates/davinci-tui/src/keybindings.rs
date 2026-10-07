@@ -112,7 +112,7 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("app.message.copy", &["ctrl+x"]),
         ("app.message.followUp", &["alt+enter"]),
         ("app.message.dequeue", &["alt+up"]),
-        ("app.clipboard.pasteImage", &["ctrl+v"]),
+        ("app.clipboard.pasteImage", &["ctrl+v", "alt+v"]),
         ("davinci.interrupt", &["ctrl+c"]),
         ("davinci.quit", &["ctrl+d"]),
         ("davinci.instrumenta.toggle", &["ctrl+alt+p"]),
@@ -396,6 +396,8 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x07", "app.editor.external"));
         assert!(Keybindings::defaults().matches("\x1b\r", "app.message.followUp"));
         assert!(Keybindings::defaults().matches("\x16", "app.clipboard.pasteImage"));
+        // Windows Terminal keeps ctrl+v for its own paste; alt+v reaches us.
+        assert!(Keybindings::defaults().matches("\x1bv", "app.clipboard.pasteImage"));
         assert!(Keybindings::defaults().matches("\x1bp", "app.model.select"));
         assert!(Keybindings::defaults().matches("\x0f", "app.tools.expand"));
         assert_eq!(

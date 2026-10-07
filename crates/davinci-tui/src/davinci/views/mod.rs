@@ -17,6 +17,7 @@ pub mod diff;
 pub mod disegno;
 pub mod export;
 pub mod extensions;
+pub mod goal_path;
 pub mod governor;
 pub mod grafo;
 pub mod graph_canvas;

@@ -431,7 +431,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "todo".into(),
-            description: "Keep a task list for long work only: four or more distinct steps across several files or commands. Skip it for a one-file fix, a small feature, or read-edit-test work. Send the whole list every time (it replaces the previous one): each item has text and a status of pending, active or done. Update it only when a step changes status, and send the update in the same response as your next real tool call.".into(),
+            description: "Keep the task list the user watches (the goal path under the working line) for any request of three or more distinct steps: write the whole plan as the first call, keep exactly one task active, and mark each done as soon as it is finished. Skip it for a single edit, a question, or read-edit-test work. Send the whole list every time (it replaces the previous one): each item has text and a status of pending, active or done. Update it only when a step changes status, and send the update in the same response as your next real tool call.".into(),
             parameters: crate::todo::tool_parameters(),
         },
         AgentTool {
@@ -4414,18 +4414,15 @@ mod tests {
     #[test]
     fn planning_tools_are_reserved_for_long_tasks() {
         let specs = tool_specs();
-        for name in ["todo", "update_plan"] {
+        // The todo list is what the user sees as the goal path, so it starts
+        // at three steps, as Claude Code's does; update_plan stays reserved.
+        for (name, threshold) in [("todo", "three or more"), ("update_plan", "four or more")] {
             let spec = specs
                 .iter()
                 .find(|spec| spec.name == name)
                 .unwrap_or_else(|| panic!("{name} spec"));
             assert!(
-                spec.description.contains("four or more"),
-                "{name}: {}",
-                spec.description
-            );
-            assert!(
-                !spec.description.contains("three or more"),
+                spec.description.contains(threshold),
                 "{name}: {}",
                 spec.description
             );

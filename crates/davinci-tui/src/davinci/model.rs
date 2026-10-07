@@ -1213,7 +1213,7 @@ pub struct SettingRow {
     pub description: String,
     /// The stored key behind the row, so a change knows where to land.
     pub key: String,
-    /// What follows the ramp in border ink: `cells`, `registers /skill:name`.
+    /// What follows the ramp in border ink: `cells`, `registers /name`.
     pub note: String,
 }
 
@@ -2648,6 +2648,8 @@ pub struct Model {
 
     /// `1c` — the plan in hand.
     pub plan: Vec<PlanStep>,
+    /// The model's task list (`todo` tool), pinned under the working line.
+    pub goal_path: Vec<Step>,
     /// `1e` — the workspace tree and the git changes beside it.
     pub tree: Vec<TreeRow>,
     pub changes_list: Vec<ChangeRow>,
@@ -2819,6 +2821,7 @@ impl Model {
             models: Vec::new(),
             config_path: String::new(),
             plan: Vec::new(),
+            goal_path: Vec::new(),
             tree: Vec::new(),
             changes_list: Vec::new(),
             graph: Vec::new(),

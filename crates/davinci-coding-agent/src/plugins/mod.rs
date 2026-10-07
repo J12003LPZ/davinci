@@ -166,6 +166,17 @@ impl ActivePlugins {
             .collect()
     }
 
+    /// The plugin that ships `path` (one of its skill or command files).
+    pub fn owner_of(&self, path: &Path) -> Option<&str> {
+        self.plugins
+            .iter()
+            .find(|active| {
+                active.plugin.skill_files.iter().any(|file| file == path)
+                    || active.plugin.command_files.iter().any(|file| file == path)
+            })
+            .map(|active| active.plugin.name.as_str())
+    }
+
     pub fn command_files(&self) -> Vec<PathBuf> {
         self.plugins
             .iter()
@@ -1127,6 +1138,16 @@ mod tests {
         assert_eq!(plugins.plugins.len(), 1);
         assert_eq!(plugins.skill_files().len(), 1);
         assert_eq!(plugins.command_files().len(), 1);
+        // Its skills and commands are invoked as `/demo:<name>`.
+        for file in plugins.skill_files().iter().chain(&plugins.command_files()) {
+            assert_eq!(plugins.owner_of(file), Some("demo"));
+        }
+        assert_eq!(plugins.owner_of(&root.join("README.md")), None);
+        let skills = davinci_agent::discover_skills(&plugins.skill_files());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(plugins.owner_of(&skills[0].path), Some("demo"));
+        let templates = davinci_agent::discover_prompt_templates(&plugins.command_files());
+        assert_eq!(plugins.owner_of(&templates[0].path), Some("demo"));
         let profiles = plugins.agent_profiles();
         assert_eq!(profiles[0].tools, vec!["read", "find", "edit"]);
         assert_eq!(profiles[0].model, "inherit");

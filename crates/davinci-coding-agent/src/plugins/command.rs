@@ -31,7 +31,7 @@ plugin marketplace list | update [name] | remove <name>
 
 Changes apply to new sessions, or after /reload.";
 
-const RELOAD_HINT: &str = "Start a new session or run /reload to load it.";
+pub const RELOAD_HINT: &str = "Start a new session or run /reload to load it.";
 
 /// Run one `plugin` subcommand and return the text to show.
 pub fn run(args: &[String], agent_dir: &Path, cwd: &Path) -> Result<String, String> {
