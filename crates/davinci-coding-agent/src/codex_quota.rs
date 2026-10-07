@@ -77,57 +77,71 @@ pub fn refresh() {
     }
 }
 
-fn binary() -> Option<PathBuf> {
+/// Where to find Codex: `DAVINCI_CODEX_BIN`, or the installed CLI.
+enum Binary {
+    Off,
+    Named(PathBuf),
+    Installed,
+}
+
+fn binary() -> Binary {
     match std::env::var("DAVINCI_CODEX_BIN") {
-        Ok(value) if value.trim().eq_ignore_ascii_case("off") => None,
-        Ok(value) if !value.trim().is_empty() => Some(PathBuf::from(value.trim())),
-        _ => Some(resolve_codex()),
+        Ok(value) if value.trim().eq_ignore_ascii_case("off") => Binary::Off,
+        Ok(value) if !value.trim().is_empty() => Binary::Named(PathBuf::from(value.trim())),
+        _ => Binary::Installed,
     }
 }
 
-/// `codex` on PATH, else where the Codex installers put it. On Windows a bare
-/// `codex` only finds `codex.exe`, so an npm install's `codex.cmd` shim is
-/// looked up by name.
-fn resolve_codex() -> PathBuf {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let names: &[&str] = if cfg!(windows) {
+fn executable_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        // A bare `codex` only finds `codex.exe`; an npm install is `codex.cmd`.
         &["codex.exe", "codex.cmd"]
     } else {
         &["codex"]
-    };
-    for name in names {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
+    }
+}
+
+/// The first `names` file in `path`'s absolute entries. A relative entry
+/// (`.`, an empty one) resolves against the working directory, and a
+/// `codex.exe` in a project being opened must not run just because the row
+/// is shown.
+fn find_on_path(path: &std::ffi::OsStr, names: &[&str]) -> Option<PathBuf> {
+    names.iter().find_map(|name| {
+        std::env::split_paths(path)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// `codex` on PATH, else where the Codex installers put it. Never a bare
+/// name: that would let the OS search relative PATH entries after all.
+fn resolve_codex() -> Option<PathBuf> {
+    let names = executable_names();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(found) = find_on_path(&path, names) {
+        return Some(found);
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
-    let mut installed: Vec<PathBuf> = Vec::new();
-    if let Some(home) = home {
-        installed.push(
-            PathBuf::from(home)
-                .join(".codex/packages/standalone/current/bin")
-                .join(names[0]),
-        );
-    }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        installed.push(
-            PathBuf::from(local)
-                .join("Programs/OpenAI/Codex/bin")
-                .join(names[0]),
-        );
-    }
+    let installed = [
+        home.map(|home| PathBuf::from(home).join(".codex/packages/standalone/current/bin")),
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|_| cfg!(windows))
+            .map(|local| PathBuf::from(local).join("Programs/OpenAI/Codex/bin")),
+    ];
     installed
         .into_iter()
+        .flatten()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(names[0]))
         .find(|candidate| candidate.is_file())
-        .unwrap_or_else(|| PathBuf::from("codex"))
 }
 
 fn run(requests: Receiver<()>) {
-    let Some(binary) = binary() else {
-        return;
+    let named = match binary() {
+        Binary::Off => return,
+        Binary::Named(path) => Some(path),
+        Binary::Installed => None,
     };
     loop {
         // Hidden: no child, wait to be shown.
@@ -136,6 +150,14 @@ fn run(requests: Receiver<()>) {
                 return;
             }
         }
+        // Looked up each time, so installing Codex mid-session is picked up.
+        let Some(binary) = named.clone().or_else(resolve_codex) else {
+            codex_usage::set_unavailable(
+                "Codex CLI not found · install it and run `codex login` to see plan usage",
+            );
+            std::thread::sleep(RESTART_AFTER);
+            continue;
+        };
         let session = match Session::spawn(&binary) {
             Ok(session) => session,
             Err(reason) => {
@@ -440,6 +462,43 @@ mod tests {
             codex_usage::unavailable().as_deref(),
             Some("Codex login expired · run `codex login` to see plan usage")
         );
+    }
+
+    #[test]
+    fn codex_is_found_only_in_absolute_path_entries() {
+        let root = std::env::temp_dir().join(format!("davinci-codex-path-{}", std::process::id()));
+        let trusted = root.join("bin");
+        let project = root.join("project");
+        std::fs::create_dir_all(&trusted).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let name = executable_names()[0];
+        std::fs::write(project.join(name), b"planted").unwrap();
+        // A relative entry naming the planted copy is skipped, even when it
+        // comes first and resolves from the current directory.
+        let relative = pathdiff_relative(&project);
+        assert!(relative.is_relative() && relative.join(name).is_file());
+        let path = std::env::join_paths([relative.clone(), trusted.clone()]).unwrap();
+        assert_eq!(find_on_path(&path, &[name]), None);
+        std::fs::write(trusted.join(name), b"real").unwrap();
+        assert_eq!(find_on_path(&path, &[name]), Some(trusted.join(name)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `dir` as a path relative to the current directory (same drive).
+    fn pathdiff_relative(dir: &std::path::Path) -> PathBuf {
+        use std::path::Component;
+        let below_root = |path: &std::path::Path| -> Vec<std::ffi::OsString> {
+            path.components()
+                .filter_map(|part| match part {
+                    Component::Normal(name) => Some(name.to_os_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative: PathBuf = below_root(&cwd).iter().map(|_| "..").collect();
+        relative.extend(below_root(dir));
+        relative
     }
 
     #[test]
