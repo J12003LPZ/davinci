@@ -466,39 +466,25 @@ mod tests {
 
     #[test]
     fn codex_is_found_only_in_absolute_path_entries() {
-        let root = std::env::temp_dir().join(format!("davinci-codex-path-{}", std::process::id()));
-        let trusted = root.join("bin");
-        let project = root.join("project");
+        let id = std::process::id();
+        let trusted = std::env::temp_dir().join(format!("davinci-codex-path-{id}"));
+        // A project directory under the working directory, named relatively:
+        // what `.` in PATH means when DaVinci is opened inside a project.
+        let project = PathBuf::from(format!("davinci-codex-planted-{id}"));
         std::fs::create_dir_all(&trusted).unwrap();
         std::fs::create_dir_all(&project).unwrap();
         let name = executable_names()[0];
         std::fs::write(project.join(name), b"planted").unwrap();
-        // A relative entry naming the planted copy is skipped, even when it
-        // comes first and resolves from the current directory.
-        let relative = pathdiff_relative(&project);
-        assert!(relative.is_relative() && relative.join(name).is_file());
-        let path = std::env::join_paths([relative.clone(), trusted.clone()]).unwrap();
-        assert_eq!(find_on_path(&path, &[name]), None);
+        assert!(project.is_relative() && project.join(name).is_file());
+        // The relative entry comes first and names a real file; it is skipped.
+        let path = std::env::join_paths([project.clone(), trusted.clone()]).unwrap();
+        let before = find_on_path(&path, &[name]);
         std::fs::write(trusted.join(name), b"real").unwrap();
-        assert_eq!(find_on_path(&path, &[name]), Some(trusted.join(name)));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `dir` as a path relative to the current directory (same drive).
-    fn pathdiff_relative(dir: &std::path::Path) -> PathBuf {
-        use std::path::Component;
-        let below_root = |path: &std::path::Path| -> Vec<std::ffi::OsString> {
-            path.components()
-                .filter_map(|part| match part {
-                    Component::Normal(name) => Some(name.to_os_string()),
-                    _ => None,
-                })
-                .collect()
-        };
-        let cwd = std::env::current_dir().unwrap();
-        let mut relative: PathBuf = below_root(&cwd).iter().map(|_| "..").collect();
-        relative.extend(below_root(dir));
-        relative
+        let after = find_on_path(&path, &[name]);
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&trusted);
+        assert_eq!(before, None);
+        assert_eq!(after, Some(trusted.join(name)));
     }
 
     #[test]
