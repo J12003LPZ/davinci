@@ -45,6 +45,13 @@ def body(text, offset):
     raise ValueError("Unbalanced declaration")
 
 
+def strip_comments(text):
+    """Drop whole-line `//` and `///` comments; they document a field and are
+    not part of it. A comment may hold commas or brackets, which would split
+    or nest fields. `//` inside a string on a code line is left alone."""
+    return re.sub(r"(?m)^[ \t]*//.*$", "", text)
+
+
 def generate():
     declarations = []
     names = {"RevisionId", "SchemaVersion"}
@@ -52,7 +59,7 @@ def generate():
     ids = [name.strip() for name in re.search(r"opaque_id!\(([^)]+)\)", types_source)[1].split(",") if name.strip()]
     names.update(ids)
     for filename in ["types.rs", "blob.rs", "records.rs", "controller.rs", "commands.rs", "export.rs", "acceptance.rs", "sync.rs", "generation.rs", "handoff.rs", "handoff_draft.rs", "handoff_verification.rs", "interaction.rs"]:
-        source = (SOURCE / filename).read_text()
+        source = strip_comments((SOURCE / filename).read_text())
         for match in re.finditer(r"pub (struct|enum) (\w+)\s*\{", source):
             kind, name = match.groups()
             if name in {"DesignLimits", "DesignController", "ConfinedRenderer"}:
