@@ -10,6 +10,7 @@ pub mod codex;
 pub mod cogitator;
 pub mod compact;
 pub mod completion;
+pub mod context_bar;
 pub mod context_inspector;
 pub mod context_usage;
 pub mod decision_modal;

@@ -132,6 +132,8 @@ pub struct InteractiveSettingsConfig {
     pub enable_analytics: bool,
     pub auto_compact: bool,
     pub auto_compact_threshold: String,
+    /// `off`, `compact` or `full`: the context bar above the input.
+    pub context_bar: String,
     pub steering_mode: String,
     pub follow_up_mode: String,
     pub transport: String,
@@ -201,6 +203,7 @@ impl Default for InteractiveSettingsConfig {
             auto_resize_images: true,
             block_images: false,
             skill_commands: true,
+            context_bar: "compact".into(),
             show_hardware_cursor: false,
             editor_padding: 0,
             output_padding: 1,
@@ -299,6 +302,16 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Prevent images from being sent to LLM providers",
                 config.block_images,
             ),
+            SettingItem {
+                id: "context-bar".into(),
+                label: "Context bar".into(),
+                description: Some(
+                    "The context meter above the input, with a tick where auto-compact fires: off, compact (one bar), or full (with each category)"
+                        .into(),
+                ),
+                current_value: config.context_bar.clone(),
+                values: vec!["off".into(), "compact".into(), "full".into()],
+            },
             bool_item(
                 "skill-commands",
                 "Skill commands",

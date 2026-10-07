@@ -8238,6 +8238,15 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "auto-resize-images" => stored.auto_resize_images = Some(value == "true"),
         "block-images" => stored.block_images = Some(value == "true"),
         "skill-commands" => stored.enable_skill_commands = Some(value == "true"),
+        "context-bar" => {
+            stored.context_bar = Some(
+                match value {
+                    "off" | "compact" | "full" => value,
+                    _ => return Err(format!("context-bar is off, compact or full, not {value}")),
+                }
+                .to_string(),
+            )
+        }
         "show-hardware-cursor" => stored.show_hardware_cursor = Some(value == "true"),
         "editor-padding" => stored.editor_padding_x = value.parse().ok(),
         "output-padding" => stored.output_pad = value.parse().ok(),

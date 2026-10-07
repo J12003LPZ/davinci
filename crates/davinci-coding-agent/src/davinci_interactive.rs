@@ -1105,6 +1105,32 @@ fn estimate_tokens(text: &str) -> u64 {
     text.chars().count() as u64 / 4
 }
 
+/// Measure the context for the bar when what it depends on changed (the
+/// messages, the model and its window, the compaction settings), or always
+/// with `force`. Measuring builds the system prompt and tool schemas, so it
+/// runs between turns, not every frame.
+fn refresh_context_meter(agent: &Agent, model: &mut Model, force: bool) {
+    use std::hash::{Hash, Hasher};
+    if model.context_bar == davinci_tui::davinci::model::ContextBarMode::Off {
+        return;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    agent.messages.len().hash(&mut hasher);
+    agent.model_id.hash(&mut hasher);
+    agent.context_window.hash(&mut hasher);
+    agent.auto_compaction.hash(&mut hasher);
+    format!("{:?}", agent.compaction).hash(&mut hasher);
+    let key = hasher.finish();
+    if !force && model.context_meter.is_some() && model.context_meter_key == key {
+        return;
+    }
+    model.context_meter_key = key;
+    model.context_meter = Some(crate::davinci_surfaces::context_usage_view(
+        &agent.context_usage(),
+    ));
+    model.dirty = true;
+}
+
 /// After a session switch, the goal path is that session's own task list:
 /// its last recorded ledger, or none, never the previous session's.
 fn reload_goal_path(agent: &mut Agent, model: &mut Model) {
@@ -4586,10 +4612,12 @@ pub fn run(
     model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
     sync_thinking_state(agent, &mut model);
     sync_permission_state(agent, &mut model);
-    model.show_tool_output =
-        crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd)
-            .show_tool_output
-            .unwrap_or(false);
+    let startup_settings =
+        crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    model.show_tool_output = startup_settings.show_tool_output.unwrap_or(false);
+    model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(
+        startup_settings.context_bar.as_deref().unwrap_or("compact"),
+    );
     // A resumed session opens on the ledger it closed on (phase 3).
     if agent.restore_todos() {
         let list = agent
@@ -4989,6 +5017,10 @@ pub fn run(
         }
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
+        }
+        // Between turns the context bar follows what the next request holds.
+        if !model.running {
+            refresh_context_meter(agent, &mut model, false);
         }
         // The attachment line follows the chips left in the draft.
         if !attached_images.is_empty() || image_status.is_some() {
@@ -9371,8 +9403,13 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
         "terminal-progress" => shell.model.terminal_progress = effective == "true",
         "double-escape-action" => shell.model.double_escape_action = effective,
         "show-tool-output" => shell.model.show_tool_output = effective == "true",
+        "context-bar" => {
+            shell.model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(&effective)
+        }
         _ => {}
     }
+    // A threshold or model change moves the compaction tick: measure again.
+    refresh_context_meter(shell.agent, shell.model, true);
     Next::Go
 }
 

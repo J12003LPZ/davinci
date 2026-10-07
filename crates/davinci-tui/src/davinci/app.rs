@@ -17,10 +17,10 @@ use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::sheet::{self, Composer};
 use super::views::{
-    agents, ask, codex, cogitator, compact, context_inspector, decision_modal, diff, disegno,
-    export, extensions, goal_path, governor, grafo, graph_run, instrumenta, keys, login, mcp,
-    memoria, mensura, officina, opera, permissions, recovery, resume, rewind, securitas, settings,
-    startup, task_board, transcript, tree, trust, vectors, workflows,
+    agents, ask, codex, cogitator, compact, context_bar, context_inspector, decision_modal, diff,
+    disegno, export, extensions, goal_path, governor, grafo, graph_run, instrumenta, keys, login,
+    mcp, memoria, mensura, officina, opera, permissions, recovery, resume, rewind, securitas,
+    settings, startup, task_board, transcript, tree, trust, vectors, workflows,
 };
 
 /// What the runtime should do after a key.
@@ -116,6 +116,13 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let above = extension_rows(model, &model.extensions.above());
     let below = extension_rows(model, &model.extensions.below());
     let notice = chrome::governor_notice(chrome_model);
+    // The context bar sits right above what the composer offers, as the
+    // last thing read before typing.
+    let meter = if conversation {
+        context_bar::lines(chrome_model, height)
+    } else {
+        Vec::new()
+    };
     // The working line is a block of its own, so it never runs into the last
     // transcript row (design.md §3). It is pinned here rather than pushed into
     // the transcript so what a running turn has cost stays put while the
@@ -137,6 +144,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             + above.len()
             + working.len()
             + notice.len()
+            + meter.len()
             + offered.len()
             + composer_rows.len()
             + below.len()
@@ -154,6 +162,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         + above.len()
         + working.len()
         + notice.len()
+        + meter.len()
         + offered.len()
         + composer_rows.len()
         + below.len()
@@ -180,6 +189,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     rows.extend(above);
     rows.extend(working);
     rows.extend(notice);
+    rows.extend(meter);
     rows.extend(offered);
     rows.extend(composer_rows);
     rows.extend(below);

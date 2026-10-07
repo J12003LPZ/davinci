@@ -84,7 +84,7 @@ pub fn cells(view: &ContextUsageView) -> Vec<Cell> {
     grid
 }
 
-fn kind_color(cc: &Cc, kind: ContextKind) -> Color {
+pub(crate) fn kind_color(cc: &Cc, kind: ContextKind) -> Color {
     match kind {
         ContextKind::SystemPrompt => cc.prompt_border,
         ContextKind::SystemTools => cc.inactive,
