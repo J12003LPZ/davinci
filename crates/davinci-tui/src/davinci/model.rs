@@ -2283,6 +2283,25 @@ pub struct ContextSection {
     pub items: Vec<(String, u64)>,
 }
 
+/// `/config` → Context bar: the meter above the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextBarMode {
+    Off,
+    #[default]
+    Compact,
+    Full,
+}
+
+impl ContextBarMode {
+    pub fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "hidden" => Self::Off,
+            "full" | "detailed" => Self::Full,
+            _ => Self::Compact,
+        }
+    }
+}
+
 /// Everything `/context` draws, already measured.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContextUsageView {
@@ -2650,6 +2669,12 @@ pub struct Model {
     pub plan: Vec<PlanStep>,
     /// The model's task list (`todo` tool), pinned under the working line.
     pub goal_path: Vec<Step>,
+    /// `/config` → Context bar, and the window it draws (refreshed by the
+    /// shell between turns).
+    pub context_bar: ContextBarMode,
+    pub context_meter: Option<ContextUsageView>,
+    /// What the meter was measured from, so the shell measures only on change.
+    pub context_meter_key: u64,
     /// `1e` — the workspace tree and the git changes beside it.
     pub tree: Vec<TreeRow>,
     pub changes_list: Vec<ChangeRow>,
@@ -2822,6 +2847,9 @@ impl Model {
             config_path: String::new(),
             plan: Vec::new(),
             goal_path: Vec::new(),
+            context_bar: ContextBarMode::default(),
+            context_meter: None,
+            context_meter_key: 0,
             tree: Vec::new(),
             changes_list: Vec::new(),
             graph: Vec::new(),

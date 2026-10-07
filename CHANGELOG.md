@@ -5,6 +5,7 @@
 ### Added
 - Installed skills and plugin commands are slash commands, named as in Claude Code: `/<skill>` for your own, `/<plugin>:<name>` for a plugin's (`/superpowers:writing-plans`), listed with their descriptions when you type `/`. An install from `/plugins` (manager or typed `/plugins install …`) loads them at once; no `/reload`. Built-in and native commands keep their names; `/skill:<name>` still works.
 - `alt+v` pastes a clipboard image as an `[Image #N]` chip in the draft, with a count under the input; deleting the chip or clearing the draft drops the image. On native Windows the clipboard is now read at all (screenshots and image files copied in Explorer); before, only WSL, Wayland, X11 and macOS were.
+- The context bar above the input: used of the window, split by category, with a tick at the configured auto-compact point and a warning as it nears. `/config` → Context bar: off, compact (default) or full.
 - The goal path: the model's task list pinned under the working line while it works, numbered, with the active task spinning and finished ones checked and struck through. The `todo` tool now asks for a list on work of three or more steps, as Claude Code's does.
 
 ### Fixed

@@ -495,6 +495,10 @@ Every installed skill and plugin command is a slash command, named as Claude Cod
 
 `alt+v` (or `ctrl+v` where the terminal passes it through) pastes the image on the clipboard: a screenshot, or an image file copied in Explorer or Finder. It lands in the draft as an `[Image #1]` chip, the line under the input counts what is attached, and the image goes with the next prompt to a model that reads images. Delete the chip, or clear the draft with `esc esc`, to drop it. On Windows use `alt+v`: Windows Terminal keeps `ctrl+v` for its own text paste. Rebind with `app.clipboard.pasteImage` in `keybindings.json`.
 
+### Context bar
+
+Above the input, a bar shows how full the context window is: `◆ context  15k of 272k · compacts at 136k  6%`. The rule is split by category in the `/context` colours, and a tick marks where auto-compact fires, at whatever threshold you set (`/config` → Auto-compact threshold, a percentage or a token count); past the tick the window is drawn as reserve. The limit turns amber from 80% of the threshold and the header says "compacting next turn" once it is reached; with auto-compact off it says so and draws no tick. `/config` → Context bar: `off`, `compact` (the default: header and bar) or `full` (adds each category with its tokens and share). It updates between turns and gives its rows back on short terminals.
+
 ### Goal path
 
 On work of three or more steps the model writes its task list first, and DaVinci pins it under the working line while the turn runs: tasks numbered in order, the one in progress spinning in full ink, finished ones checked and struck through, the rest waiting in grey (`Goal path · 2/5 done`). A long list folds around the active task. It stays up while any task is open and steps aside once all are done, leaving the record in the transcript. `/todo` shows the current list; `/todo clear` drops it.

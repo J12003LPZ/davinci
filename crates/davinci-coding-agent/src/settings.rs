@@ -389,6 +389,13 @@ pub struct Settings {
     pub images: Option<ImageBlockSettings>,
     #[serde(default, rename = "enableSkillCommands")]
     pub enable_skill_commands: Option<bool>,
+    /// `off`, `compact` (default) or `full`: the context bar above the input.
+    #[serde(
+        default,
+        rename = "contextBar",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_bar: Option<String>,
     #[serde(default, rename = "showHardwareCursor")]
     pub show_hardware_cursor: Option<bool>,
     #[serde(default, rename = "editorPaddingX")]
@@ -1750,6 +1757,10 @@ pub fn to_interactive_config(
         auto_resize_images: settings.image_auto_resize(),
         block_images: settings.block_images(),
         skill_commands: settings.enable_skill_commands.unwrap_or(true),
+        context_bar: settings
+            .context_bar
+            .clone()
+            .unwrap_or_else(|| "compact".into()),
         show_hardware_cursor: settings.show_hardware_cursor.unwrap_or(false),
         editor_padding: settings.editor_padding_x.unwrap_or(0),
         output_padding: settings.output_pad.unwrap_or(1),

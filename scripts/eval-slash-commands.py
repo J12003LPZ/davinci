@@ -140,7 +140,10 @@ def main():
                 terminal.send("\x15")
 
         try:
-            terminal.pump(8)
+            text = terminal.pump(8)
+            # The context bar is on by default, with the auto-compact point.
+            assert "◆ context" in text and "compacts at" in text, text
+            rows.append({"command": "context bar", "passed": True})
             for item in checks:
                 check(*item, reset=True)
             # Discover: → opens it, typing searches, esc clears then closes.
