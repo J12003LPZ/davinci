@@ -38,6 +38,7 @@ pub mod officina;
 pub mod opera;
 pub mod permissions;
 pub mod picker;
+pub mod plan_usage;
 pub mod recovery;
 pub mod resume;
 pub mod rewind;

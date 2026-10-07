@@ -499,6 +499,12 @@ Every installed skill and plugin command is a slash command, named as Claude Cod
 
 Above the input, a bar shows how full the context window is: `◆ context  15k of 272k · compacts at 136k  6%`. The rule is split by category in the `/context` colours, and a tick marks where auto-compact fires, at whatever threshold you set (`/config` → Auto-compact threshold, a percentage or a token count); past the tick the window is drawn as reserve. The limit turns amber from 80% of the threshold and the header says "compacting next turn" once it is reached; with auto-compact off it says so and draws no tick. `/config` → Context bar: `off`, `compact` (the default: header and bar) or `full` (adds each category with its tokens and share). It updates between turns and gives its rows back on short terminals.
 
+### Plan usage (openai-codex)
+
+With an `openai-codex` model, a row under the context bar shows how much of your ChatGPT plan is left: `◇ plus   5h ━━━━━━━━━─── 73% left · 2h 14m   week ━━━━━─────── 41% left · 3d 4h`. Plus and Pro plans have a 5-hour window and a weekly one; plans without the 5-hour window show only the week. Windows are told apart by their length, never by the order the backend sends them. Green above 30% left, amber at 30% or less, red at 10% or less.
+
+DaVinci reads it the way Codex's own usage screen does: one `codex app-server` child per session, `account/rateLimits/read` at start, after each turn and every minute, with `account/rateLimits/updated` notifications merged in between. The child uses the Codex CLI's own login, so install the Codex CLI and run `codex login`; DaVinci passes it no token. When it cannot read usage the row says why in one line (for example ``Codex login expired · run `codex login` to see plan usage``). `/config` → Plan usage turns the row off (`planUsage` in settings.json). `DAVINCI_CODEX_BIN` names another executable, or `off` disables the monitor.
+
 ### Goal path
 
 On work of three or more steps the model writes its task list first, and DaVinci pins it under the working line while the turn runs: tasks numbered in order, the one in progress spinning in full ink, finished ones checked and struck through, the rest waiting in grey (`Goal path · 2/5 done`). A long list folds around the active task. It stays up while any task is open and steps aside once all are done, leaving the record in the transcript. `/todo` shows the current list; `/todo clear` drops it.

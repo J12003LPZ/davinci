@@ -1105,6 +1105,55 @@ fn estimate_tokens(text: &str) -> u64 {
     text.chars().count() as u64 / 4
 }
 
+/// The plan usage row: on for openai-codex models (starting the Codex
+/// app-server monitor the first time), hidden for every other provider or
+/// when `/config` → Plan usage is off.
+fn sync_plan_usage(agent: &Agent, model: &mut Model) {
+    use davinci_ai::codex_usage;
+    use davinci_tui::davinci::model::PlanWindow;
+    if !model.plan_usage_enabled || agent.provider != "openai-codex" {
+        if model.plan_usage.take().is_some() {
+            model.dirty = true;
+        }
+        return;
+    }
+    crate::codex_quota::start();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let snapshot = codex_usage::latest();
+    let windows = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            [
+                ("5h", codex_usage::FIVE_HOURS_MINUTES),
+                ("week", codex_usage::WEEK_MINUTES),
+            ]
+            .into_iter()
+            .filter_map(|(label, minutes)| {
+                snapshot.window_of(minutes).map(|window| PlanWindow {
+                    label: label.into(),
+                    minutes,
+                    used_percent: window.used_percent,
+                    resets_in: window
+                        .reset_time(now)
+                        .map(|at| at.saturating_sub(now).max(0) as u64),
+                })
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    let view = davinci_tui::davinci::views::plan_usage::view(
+        snapshot.and_then(|snapshot| snapshot.plan_type),
+        windows,
+        codex_usage::unavailable(),
+    );
+    if model.plan_usage.as_ref() != Some(&view) {
+        model.plan_usage = Some(view);
+        model.dirty = true;
+    }
+}
+
 /// Measure the context for the bar when what it depends on changed (the
 /// messages, the model and its window, the compaction settings), or always
 /// with `force`. Measuring builds the system prompt and tool schemas, so it
@@ -1866,6 +1915,8 @@ fn run_turn(
     // The turn is over: the working line goes with it.
     let finished_working = model.working.take();
     turn.close(model, interrupted);
+    // A turn used some of the plan: read the windows again.
+    crate::codex_quota::refresh();
 
     for entry in turn_outcome(
         crashed.load(Ordering::Relaxed),
@@ -4618,6 +4669,7 @@ pub fn run(
     model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(
         startup_settings.context_bar.as_deref().unwrap_or("compact"),
     );
+    model.plan_usage_enabled = startup_settings.plan_usage.unwrap_or(true);
     // A resumed session opens on the ledger it closed on (phase 3).
     if agent.restore_todos() {
         let list = agent
@@ -5022,6 +5074,7 @@ pub fn run(
         if !model.running {
             refresh_context_meter(agent, &mut model, false);
         }
+        sync_plan_usage(agent, &mut model);
         // The attachment line follows the chips left in the draft.
         if !attached_images.is_empty() || image_status.is_some() {
             let line = attachments::status(&model.composer.to_string(), &attached_images);
@@ -9406,6 +9459,7 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
         "context-bar" => {
             shell.model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(&effective)
         }
+        "plan-usage" => shell.model.plan_usage_enabled = effective == "true",
         _ => {}
     }
     // A threshold or model change moves the compaction tick: measure again.

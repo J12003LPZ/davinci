@@ -49,6 +49,9 @@ class Terminal:
         config = Path(cwd) / "eval-config"
         config.mkdir(exist_ok=True)
         env.update(PI_CODING_AGENT_DIR=str(config), DAVINCI_CODING_AGENT_DIR=str(config))
+        # Never start the real Codex app-server for plan usage; an eval that
+        # checks the usage row names its fake one.
+        env.setdefault("DAVINCI_CODEX_BIN", "off")
         if offline and not fixture:
             env["OPENAI_API_KEY"] = "offline-eval-placeholder"
             # openai-codex accepts only Sign in with ChatGPT credentials, so an

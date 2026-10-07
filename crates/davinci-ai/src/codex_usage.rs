@@ -1,8 +1,16 @@
-//! ChatGPT plan usage windows reported by the Codex backend.
-//! Header names are conservative defaults until the explicit backend probe
-//! records the names returned by the authenticated route.
+//! ChatGPT plan usage windows for `openai-codex` models: how much of the
+//! 5-hour and weekly allowance is used, and when each resets.
+//!
+//! Two sources feed one snapshot. The Codex app-server's
+//! `account/rateLimits/read` (and its `account/rateLimits/updated`
+//! notifications) is the one Codex's own usage screen reads; the
+//! `x-codex-*` response headers are kept for backends that send them.
+//! Windows are told apart by their length (300 minutes, 10 080 minutes),
+//! never by position: a plan may report only one, in either slot.
 
 use std::sync::Mutex;
+
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -10,6 +18,24 @@ pub struct UsageWindow {
     pub used_percent: f64,
     pub window_minutes: Option<u64>,
     pub resets_in_seconds: Option<u64>,
+    /// Unix seconds, when the source gives an absolute time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+}
+
+impl UsageWindow {
+    /// When it resets, as Unix seconds, measured from `now` for a relative
+    /// reset.
+    pub fn reset_time(&self, now: i64) -> Option<i64> {
+        self.resets_at.or_else(|| {
+            self.resets_in_seconds
+                .map(|seconds| now.saturating_add(seconds as i64))
+        })
+    }
+
+    pub fn remaining_percent(&self) -> f64 {
+        (100.0 - self.used_percent).clamp(0.0, 100.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
@@ -17,6 +43,40 @@ pub struct UsageWindow {
 pub struct CodexUsageSnapshot {
     pub primary: Option<UsageWindow>,
     pub secondary: Option<UsageWindow>,
+    /// `plus`, `pro`, `free`, … as the backend names the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+}
+
+/// A 5-hour window.
+pub const FIVE_HOURS_MINUTES: u64 = 300;
+/// A weekly window.
+pub const WEEK_MINUTES: u64 = 7 * 24 * 60;
+
+impl CodexUsageSnapshot {
+    fn windows(&self) -> impl Iterator<Item = &UsageWindow> {
+        self.primary.iter().chain(self.secondary.iter())
+    }
+
+    /// The window of `minutes` length, whichever slot carries it.
+    pub fn window_of(&self, minutes: u64) -> Option<&UsageWindow> {
+        self.windows()
+            .find(|window| window.window_minutes == Some(minutes))
+    }
+
+    pub fn five_hour(&self) -> Option<&UsageWindow> {
+        self.window_of(FIVE_HOURS_MINUTES)
+    }
+
+    pub fn weekly(&self) -> Option<&UsageWindow> {
+        self.window_of(WEEK_MINUTES)
+    }
+
+    /// The window to warn about: the 5-hour one when there is one, else the
+    /// first reported.
+    fn leading(&self) -> Option<&UsageWindow> {
+        self.five_hour().or_else(|| self.windows().next())
+    }
 }
 
 const WARN_AT: [f64; 2] = [80.0, 95.0];
@@ -25,12 +85,14 @@ struct State {
     latest: Option<CodexUsageSnapshot>,
     warned_primary: f64,
     pending: Option<String>,
+    unavailable: Option<String>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     latest: None,
     warned_primary: 0.0,
     pending: None,
+    unavailable: None,
 });
 
 fn header(headers: &[(String, String)], name: &str) -> Option<String> {
@@ -50,6 +112,7 @@ fn window(headers: &[(String, String)], prefix: &str) -> Option<UsageWindow> {
             .and_then(|value| value.parse().ok()),
         resets_in_seconds: header(headers, &format!("x-codex-{prefix}-reset-after-seconds"))
             .and_then(|value| value.parse().ok()),
+        resets_at: None,
     })
 }
 
@@ -57,32 +120,116 @@ pub fn parse_usage_headers(headers: &[(String, String)]) -> Option<CodexUsageSna
     let snapshot = CodexUsageSnapshot {
         primary: window(headers, "primary"),
         secondary: window(headers, "secondary"),
+        plan_type: header(headers, "x-codex-plan-type"),
     };
     (snapshot.primary.is_some() || snapshot.secondary.is_some()).then_some(snapshot)
 }
 
+fn app_server_window(value: &Value) -> Option<UsageWindow> {
+    Some(UsageWindow {
+        used_percent: value.get("usedPercent")?.as_f64()?,
+        window_minutes: value.get("windowDurationMins").and_then(Value::as_u64),
+        resets_in_seconds: None,
+        resets_at: value.get("resetsAt").and_then(Value::as_i64),
+    })
+}
+
+/// The `rateLimits` object of `account/rateLimits/read` or of an
+/// `account/rateLimits/updated` notification. A field it leaves out stays
+/// `None`, so [`merge`] can tell "not sent" from "gone".
+pub fn parse_app_server_rate_limits(rate_limits: &Value) -> Option<CodexUsageSnapshot> {
+    let snapshot = CodexUsageSnapshot {
+        primary: rate_limits.get("primary").and_then(app_server_window),
+        secondary: rate_limits.get("secondary").and_then(app_server_window),
+        plan_type: rate_limits
+            .get("planType")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    (snapshot.primary.is_some() || snapshot.secondary.is_some() || snapshot.plan_type.is_some())
+        .then_some(snapshot)
+}
+
+/// A sparse update laid over the last snapshot: what it carries replaces,
+/// what it leaves out stays. An updated window replaces the window of the
+/// same length wherever it sat (slots carry no meaning), and keeps that
+/// window's reset time when the update leaves it out.
+pub fn merge(base: Option<CodexUsageSnapshot>, update: CodexUsageSnapshot) -> CodexUsageSnapshot {
+    let mut merged = base.unwrap_or_default();
+    for (is_primary, window) in [(true, update.primary), (false, update.secondary)] {
+        let Some(mut window) = window else {
+            continue;
+        };
+        let length = |slot: &Option<UsageWindow>| slot.as_ref().and_then(|w| w.window_minutes);
+        let into_primary = match window.window_minutes {
+            Some(minutes) if length(&merged.primary) == Some(minutes) => true,
+            Some(minutes) if length(&merged.secondary) == Some(minutes) => false,
+            _ => is_primary,
+        };
+        let slot = if into_primary {
+            &mut merged.primary
+        } else {
+            &mut merged.secondary
+        };
+        if let Some(previous) = slot.as_ref() {
+            if previous.window_minutes == window.window_minutes {
+                window.resets_at = window.resets_at.or(previous.resets_at);
+                window.resets_in_seconds = window.resets_in_seconds.or(previous.resets_in_seconds);
+            }
+        }
+        *slot = Some(window);
+    }
+    merged.plan_type = update.plan_type.or(merged.plan_type);
+    merged
+}
+
 pub fn record(snapshot: CodexUsageSnapshot) {
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(primary) = &snapshot.primary {
-        let crossed = WARN_AT.iter().rev().find(|threshold| {
-            primary.used_percent >= **threshold && state.warned_primary < **threshold
-        });
+    if let Some(leading) = snapshot.leading() {
+        let used = leading.used_percent;
+        let crossed = WARN_AT
+            .iter()
+            .rev()
+            .find(|threshold| used >= **threshold && state.warned_primary < **threshold);
         if let Some(threshold) = crossed {
             state.warned_primary = *threshold;
-            let reset = primary
+            let reset = leading
                 .resets_in_seconds
                 .map(|seconds| format!(" · resets in {} min", seconds.div_ceil(60)))
                 .unwrap_or_default();
             state.pending = Some(format!(
-                "ChatGPT plan usage at {:.0}% of the current window{reset}",
-                primary.used_percent
+                "ChatGPT plan usage at {used:.0}% of the current window{reset}"
             ));
         }
-        if primary.used_percent < 50.0 {
+        if used < 50.0 {
             state.warned_primary = 0.0;
         }
     }
     state.latest = Some(snapshot);
+    state.unavailable = None;
+}
+
+/// Lay a sparse update over the latest snapshot and record the result.
+pub fn record_update(update: CodexUsageSnapshot) {
+    let base = latest();
+    record(merge(base, update));
+}
+
+/// Why no usage can be shown (the Codex CLI is missing, its login expired),
+/// until the next successful read clears it.
+pub fn set_unavailable(reason: impl Into<String>) {
+    STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .unavailable = Some(reason.into());
+}
+
+pub fn unavailable() -> Option<String> {
+    STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .unavailable
+        .clone()
 }
 
 pub fn latest() -> Option<CodexUsageSnapshot> {
@@ -108,6 +255,7 @@ pub fn is_usage_limit_error(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn h(name: &str, value: &str) -> (String, String) {
         (name.into(), value.into())
@@ -122,11 +270,12 @@ mod tests {
             h("x-codex-secondary-used-percent", "40"),
         ])
         .unwrap();
-        let primary = snapshot.primary.unwrap();
+        let primary = snapshot.primary.clone().unwrap();
         assert_eq!(primary.used_percent, 82.5);
         assert_eq!(primary.window_minutes, Some(300));
         assert_eq!(primary.resets_in_seconds, Some(1200));
         assert_eq!(snapshot.secondary.unwrap().used_percent, 40.0);
+        assert_eq!(primary.reset_time(1_000), Some(2_200));
     }
 
     #[test]
@@ -135,6 +284,88 @@ mod tests {
             parse_usage_headers(&[h("content-type", "text/event-stream")]),
             None
         );
+    }
+
+    #[test]
+    fn app_server_windows_are_told_apart_by_length_not_slot() {
+        // A Plus account: 5-hour and weekly, in either order.
+        let plus = parse_app_server_rate_limits(&json!({
+            "limitId": "codex",
+            "primary": {"usedPercent": 59, "windowDurationMins": 10080, "resetsAt": 1791741600},
+            "secondary": {"usedPercent": 27, "windowDurationMins": 300, "resetsAt": 1791349200},
+            "planType": "plus"
+        }))
+        .unwrap();
+        let five = plus.five_hour().unwrap();
+        assert_eq!(five.used_percent, 27.0);
+        assert_eq!(five.remaining_percent(), 73.0);
+        assert_eq!(five.reset_time(0), Some(1791349200));
+        assert_eq!(plus.weekly().unwrap().remaining_percent(), 41.0);
+        assert_eq!(plus.plan_type.as_deref(), Some("plus"));
+        // A free account: weekly only.
+        let free = parse_app_server_rate_limits(&json!({
+            "primary": {"usedPercent": 12, "windowDurationMins": 10080, "resetsAt": null},
+            "secondary": null,
+            "planType": "free"
+        }))
+        .unwrap();
+        assert!(free.five_hour().is_none());
+        assert_eq!(free.weekly().unwrap().used_percent, 12.0);
+        assert_eq!(free.leading().unwrap().used_percent, 12.0);
+        assert!(parse_app_server_rate_limits(&json!({})).is_none());
+    }
+
+    #[test]
+    fn a_sparse_update_keeps_what_it_does_not_carry() {
+        let base = parse_app_server_rate_limits(&json!({
+            "primary": {"usedPercent": 10, "windowDurationMins": 300},
+            "secondary": {"usedPercent": 40, "windowDurationMins": 10080},
+            "planType": "plus"
+        }));
+        let update = parse_app_server_rate_limits(&json!({
+            "primary": {"usedPercent": 35, "windowDurationMins": 300}
+        }))
+        .unwrap();
+        let merged = merge(base, update);
+        assert_eq!(merged.five_hour().unwrap().used_percent, 35.0);
+        assert_eq!(merged.weekly().unwrap().used_percent, 40.0);
+        assert_eq!(merged.plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn an_update_in_the_other_slot_replaces_the_window_of_its_length() {
+        // The read put the weekly window first; the update sends the 5-hour
+        // one in the primary slot, without a reset time.
+        let base = parse_app_server_rate_limits(&json!({
+            "primary": {"usedPercent": 59, "windowDurationMins": 10080, "resetsAt": 2000},
+            "secondary": {"usedPercent": 27, "windowDurationMins": 300, "resetsAt": 1000},
+        }));
+        let update = parse_app_server_rate_limits(&json!({
+            "primary": {"usedPercent": 31, "windowDurationMins": 300}
+        }))
+        .unwrap();
+        let merged = merge(base, update);
+        assert_eq!(merged.weekly().unwrap().used_percent, 59.0);
+        let five = merged.five_hour().unwrap();
+        assert_eq!(five.used_percent, 31.0);
+        assert_eq!(five.resets_at, Some(1000));
+        // An update with no length falls back to its slot.
+        let merged = merge(
+            Some(merged),
+            parse_app_server_rate_limits(&json!({"secondary": {"usedPercent": 40}})).unwrap(),
+        );
+        assert_eq!(merged.secondary.unwrap().window_minutes, None);
+    }
+
+    #[test]
+    fn used_past_a_hundred_leaves_nothing_not_less_than_nothing() {
+        let window = UsageWindow {
+            used_percent: 104.0,
+            window_minutes: Some(300),
+            resets_in_seconds: None,
+            resets_at: None,
+        };
+        assert_eq!(window.remaining_percent(), 0.0);
     }
 
     #[test]
