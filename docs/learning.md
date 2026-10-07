@@ -9,7 +9,7 @@ The Davinci Self-Improving Learning System turns settled Davinci agent turns int
 Davinci maintains a strict distinction between declarative facts and procedural workflows:
 
 - **Memory**: Durable declarative facts (repository architecture, conventions, constraints, bug causes). Stored and retrieved via the repo-aware `VectorMemory` system with dense embedding and lexical fallbacks.
-- **Skills**: Reusable procedural workflows (`SKILL.md` files). Stored in standard skill directories and invocable via `/skill:name` or model-selected via progressive disclosure tools.
+- **Skills**: Reusable procedural workflows (`SKILL.md` files). Stored in standard skill directories and invocable as `/name` (a plugin's as `/plugin:name`; `/skill:name` still works) or model-selected via progressive disclosure tools.
 - **Candidates**: Proposed learning items extracted from completed turns that have not yet met the policy threshold for autonomous activation.
 - **Verification**: Deterministic ground truth from real command executions (`bash`, `powershell`, or graph worker verification) required to auto-promote candidates.
 

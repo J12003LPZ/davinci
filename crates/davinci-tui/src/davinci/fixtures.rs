@@ -636,14 +636,14 @@ pub fn settings_rows() -> Vec<SettingRow> {
         row("Autocomplete max items", "7", false, &["3", "5", "7", "10", "15", "20"],
             "How many rows the composer's completion list may show."),
         row("Skill commands", "on", false, &["on", "off"],
-            "Register every discovered skill as a /skill:name command."),
+            "Register every discovered skill as a /name command (/plugin:name for a plugin's)."),
         row("Quiet startup", "on", false, &["on", "off"],
             "Skip the verbose banner when a session opens."),
     ];
     for setting in &mut rows {
         setting.note = match setting.label.as_str() {
             "Image width" => "cells".into(),
-            "Skill commands" => "registers /skill:name".into(),
+            "Skill commands" => "registers /name".into(),
             _ => String::new(),
         };
     }

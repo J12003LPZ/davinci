@@ -553,6 +553,7 @@ mod tests {
 
     fn skill(path: &Path, name: &str) -> davinci_agent::Skill {
         davinci_agent::Skill {
+            namespace: None,
             name: name.into(),
             path: path.to_path_buf(),
             description: format!("{name} description"),

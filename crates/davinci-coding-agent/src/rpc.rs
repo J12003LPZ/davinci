@@ -1661,6 +1661,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         runtime.agent.templates.push(davinci_agent::PromptTemplate {
+            namespace: None,
             name: "review".into(),
             path: PathBuf::from("/virtual/review.md"),
             body: "Review this code: $1".into(),

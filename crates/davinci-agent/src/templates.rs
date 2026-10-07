@@ -15,6 +15,18 @@ pub struct PromptTemplate {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
+    /// The plugin that ships it, as Claude Code namespaces plugin
+    /// commands: invoked as `/<namespace>:<name>`. `None` for the user's and
+    /// the project's own, invoked as `/<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+impl PromptTemplate {
+    /// What follows `/` to run it: `plugin:command` for a plugin's command.
+    pub fn command_name(&self) -> String {
+        crate::skills::command_name(self.namespace.as_deref(), &self.name)
+    }
 }
 
 pub fn discover_prompt_templates(roots: &[PathBuf]) -> Vec<PromptTemplate> {
@@ -68,6 +80,7 @@ fn load_template(path: &Path) -> Option<PromptTemplate> {
         body,
         description,
         argument_hint: frontmatter.get("argument-hint").cloned(),
+        namespace: None,
     })
 }
 
@@ -216,7 +229,23 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
         Some((name, args)) => (name, args.to_string()),
         None => (rest, String::new()),
     };
-    let Some(template) = templates.iter().find(|item| item.name == name) else {
+    // A plugin's command answers to `/plugin:command`, and to its bare name
+    // when nothing of the user's or the project's is called that.
+    // Exact first; then without case, as the `/` menu matches.
+    let template = templates
+        .iter()
+        .find(|item| item.command_name() == name)
+        .or_else(|| {
+            templates
+                .iter()
+                .find(|item| item.command_name().eq_ignore_ascii_case(name))
+        })
+        .or_else(|| {
+            templates
+                .iter()
+                .find(|item| item.namespace.is_some() && item.name.eq_ignore_ascii_case(name))
+        });
+    let Some(template) = template else {
         return text.to_string();
     };
     let args = parse_command_args(&args_string);
@@ -390,6 +419,7 @@ mod tests {
     #[test]
     fn multibyte_whitespace_after_the_command_does_not_panic() {
         let templates = vec![PromptTemplate {
+            namespace: None,
             name: "review".into(),
             path: PathBuf::from("/virtual/review.md"),
             body: "Review: $ARGUMENTS".into(),
@@ -412,6 +442,7 @@ mod tests {
     #[test]
     fn expand_prompt_template_splits_on_newlines() {
         let templates = vec![PromptTemplate {
+            namespace: None,
             name: "arg-test".into(),
             path: PathBuf::from("/tmp/arg-test.md"),
             body: "- arg1: $1\n- rest: ${@:2}".into(),
@@ -429,6 +460,7 @@ mod tests {
             expand_prompt_template(
                 "/arg-test\nlabel-2",
                 &[PromptTemplate {
+                    namespace: None,
                     name: "arg-test".into(),
                     path: PathBuf::from("/tmp/arg-test.md"),
                     body: "arg1: $1".into(),
@@ -439,6 +471,7 @@ mod tests {
             "arg1: label-2"
         );
         let review = vec![PromptTemplate {
+            namespace: None,
             name: "review".into(),
             path: PathBuf::from("/virtual/review.md"),
             body: "Review this code: $1".into(),

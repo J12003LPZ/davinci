@@ -426,6 +426,7 @@ mod tests {
 
     fn fixture_skill(name: &str, description: &str, path: &str) -> Skill {
         Skill {
+            namespace: None,
             name: name.to_string(),
             description: description.to_string(),
             path: PathBuf::from(path),
@@ -439,6 +440,7 @@ mod tests {
 
     fn fixture_skill_with_body(name: &str, description: &str, path: &str, body: String) -> Skill {
         Skill {
+            namespace: None,
             name: name.to_string(),
             description: description.to_string(),
             path: PathBuf::from(path),
@@ -728,6 +730,7 @@ mod tests {
                 "procedure detail step text ".repeat(60)
             );
             skills.push(Skill {
+                namespace: None,
                 name: format!("procedure-{i}"),
                 description: "Procedure for test verification".into(),
                 path: PathBuf::from(format!("/skills/p{i}/SKILL.md")),
@@ -901,6 +904,7 @@ mod persisted_applicability_regressions {
 
     fn skill(name: &str) -> Skill {
         Skill {
+            namespace: None,
             name: name.into(),
             description: "shared workflow rust debugging".into(),
             path: PathBuf::from(format!("/skills/{name}/SKILL.md")),

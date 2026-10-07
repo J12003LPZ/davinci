@@ -18,9 +18,9 @@ use super::views::chrome::{self, Hint};
 use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_inspector, decision_modal, diff, disegno,
-    export, extensions, governor, grafo, graph_run, instrumenta, keys, login, mcp, memoria,
-    mensura, officina, opera, permissions, recovery, resume, rewind, securitas, settings, startup,
-    task_board, transcript, tree, trust, vectors, workflows,
+    export, extensions, goal_path, governor, grafo, graph_run, instrumenta, keys, login, mcp,
+    memoria, mensura, officina, opera, permissions, recovery, resume, rewind, securitas, settings,
+    startup, task_board, transcript, tree, trust, vectors, workflows,
 };
 
 /// What the runtime should do after a key.
@@ -127,6 +127,23 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     };
     if model.screen == Screen::Agent && model.overlay.is_none() && height >= 10 {
         working.extend(graph_run::background_lines(chrome_model));
+    }
+    // The goal path rides under the working line, as Claude Code's todos
+    // ride under its spinner, and never takes more than a quarter of the
+    // screen from the transcript.
+    if conversation {
+        let others = top.len()
+            + bottom.len()
+            + above.len()
+            + working.len()
+            + notice.len()
+            + offered.len()
+            + composer_rows.len()
+            + below.len()
+            + chrome::footer(chrome_model).len()
+            + 1;
+        let room = height.saturating_sub(others).min(height / 4);
+        working.extend(goal_path::lines(chrome_model, room));
     }
     if !working.is_empty() {
         working.insert(0, blank());

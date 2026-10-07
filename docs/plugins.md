@@ -159,7 +159,7 @@ treated as a new, empty registry.
   created after resource discovery. Later events carry the real id.
 - DaVinci does not list skills in the system prompt yet (neither plugin nor
   user skills), so the model does not pick one on its own. Invoke a plugin
-  skill with `/skill:<name>`.
+  skill or command as `/<plugin>:<name>` (`/skill:<name>` also works).
 - Installing and marketplace changes run in the foreground: `marketplace add`
   and `install` from git wait for the clone. Discover searches online
   directories in the background.

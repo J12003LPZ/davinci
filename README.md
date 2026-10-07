@@ -489,6 +489,16 @@ Keyboard bindings can be customized. In the default model picker, Enter persists
 
 `←`/`→` switch views. `/skills pdf` (any words after the command) opens Discover with that search typed in.
 
+Every installed skill and plugin command is a slash command, named as Claude Code names them: your own skills as `/<skill>` (`/pdf`), a plugin's skills and commands as `/<plugin>:<name>` (`/superpowers:writing-plans`). Type `/` to see them with their descriptions; arguments after the name go to the skill. They are available as soon as an install finishes, from the manager or from `/plugins install …`, with no `/reload`. Built-in commands keep their names: a skill called `plan` is still reachable as `/skill:plan`. MCP servers are not slash commands; their tools go to the model.
+
+### Images
+
+`alt+v` (or `ctrl+v` where the terminal passes it through) pastes the image on the clipboard: a screenshot, or an image file copied in Explorer or Finder. It lands in the draft as an `[Image #1]` chip, the line under the input counts what is attached, and the image goes with the next prompt to a model that reads images. Delete the chip, or clear the draft with `esc esc`, to drop it. On Windows use `alt+v`: Windows Terminal keeps `ctrl+v` for its own text paste. Rebind with `app.clipboard.pasteImage` in `keybindings.json`.
+
+### Goal path
+
+On work of three or more steps the model writes its task list first, and DaVinci pins it under the working line while the turn runs: tasks numbered in order, the one in progress spinning in full ink, finished ones checked and struck through, the rest waiting in grey (`Goal path · 2/5 done`). A long list folds around the active task. It stays up while any task is open and steps aside once all are done, leaving the record in the transcript. `/todo` shows the current list; `/todo clear` drops it.
+
 ### Plugin commands
 
 These work as `davinci plugin ...` in the shell or `/plugins ...` in the TUI:

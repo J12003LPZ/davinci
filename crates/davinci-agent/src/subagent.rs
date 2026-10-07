@@ -1984,8 +1984,17 @@ mod tests {
         let record = handle.registry.get(&aid).expect("record exists");
         assert_eq!(record.name, "bg-worker");
 
-        // Wait for thread to finish
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        // Wait for the worker to finish: bounded, not a fixed sleep, so a
+        // loaded machine running the whole suite cannot fail it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline
+            && handle
+                .registry
+                .get(&aid)
+                .is_some_and(|record| record.state != AgentState::Completed)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(executed.load(std::sync::atomic::Ordering::SeqCst));
         let record_after = handle.registry.get(&aid).expect("record exists");
         assert_eq!(record_after.state, AgentState::Completed);

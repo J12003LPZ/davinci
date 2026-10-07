@@ -54,14 +54,18 @@ mod tests {
         let path = dir.path().join("same.txt");
         let first_order = order.clone();
         let first_path = path.clone();
+        // The second operation starts only once the first holds the queue,
+        // so the order is fixed by the queue, not by scheduler timing.
+        let (entered, holding) = std::sync::mpsc::channel();
         let first = thread::spawn(move || {
             with_file_mutation_queue(&first_path, || {
                 first_order.lock().unwrap().push("first:start");
+                entered.send(()).unwrap();
                 thread::sleep(Duration::from_millis(30));
                 first_order.lock().unwrap().push("first:end");
             });
         });
-        thread::sleep(Duration::from_millis(5));
+        holding.recv().unwrap();
         let second_order = order.clone();
         let second = thread::spawn(move || {
             with_file_mutation_queue(&path, || {

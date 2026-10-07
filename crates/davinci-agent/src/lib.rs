@@ -108,8 +108,9 @@ pub use pruning::PruneSettings;
 pub use queues::{QueueKind, QueueMode, QueuedMessage, RemoteQueue, SteerFollowUpQueues};
 pub use scheduler::{lane_for, lane_for_capability, ToolLane, MAX_TOOL_PARALLELISM};
 pub use skills::{
-    describe_skill, discover_skills, expand_skill_command, expand_user_text,
-    expand_user_text_with_metadata, ExpandedUserText, Skill, SkillDescriptor,
+    command_name, describe_skill, discover_skills, expand_skill_command, expand_user_text,
+    expand_user_text_with_metadata, find_skill_command, set_skill_commands_enabled,
+    skill_commands_enabled, ExpandedUserText, Skill, SkillDescriptor,
 };
 pub use stats::{RunStats, SharedCounters};
 pub use subagent::{

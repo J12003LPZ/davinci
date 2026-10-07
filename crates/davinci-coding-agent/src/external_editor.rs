@@ -149,6 +149,9 @@ pub fn clipboard_text() -> Option<String> {
     if std::env::var("PI_CLIPBOARD_DRY_RUN").is_ok() {
         return None;
     }
+    if cfg!(windows) {
+        return windows_clipboard_text();
+    }
     if is_wayland() {
         if let Some(text) = command_stdout("wl-paste", &["--no-newline", "--type", "text"], 1000) {
             let text = String::from_utf8_lossy(&text).into_owned();
@@ -200,6 +203,9 @@ pub fn clipboard_image_png() -> Option<Vec<u8>> {
         if let Some(image) = powershell_image() {
             return Some(normalize_clipboard_image(image));
         }
+    }
+    if cfg!(windows) {
+        return windows_clipboard_image().map(normalize_clipboard_image);
     }
     if !is_wayland() {
         if let Some(image) = xclip_image() {
@@ -393,20 +399,171 @@ fn xclip_image() -> Option<Vec<u8>> {
 }
 
 fn powershell_image() -> Option<Vec<u8>> {
-    let tmp = std::env::temp_dir().join(format!("pi-wsl-clip-{}.png", std::process::id()));
-    let win = command_stdout("wslpath", &["-w", &tmp.display().to_string()], 1000)?;
-    let win = String::from_utf8_lossy(&win).trim().replace('\'', "''");
-    if win.is_empty() {
+    let out = command_stdout(
+        "powershell.exe",
+        &["-NoProfile", "-STA", "-Command", CLIPBOARD_IMAGE_SCRIPT],
+        5000,
+    )?;
+    decode_clipboard_script_output(&out)
+}
+
+/// Windows PowerShell, from WSL: the clipboard image as base64 PNG on stdout
+/// (a bitmap, or else the first image file in a copied file list), or
+/// nothing. No path goes into the script, so nothing needs quoting.
+const CLIPBOARD_IMAGE_SCRIPT: &str = concat!(
+    "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; ",
+    "$img = [System.Windows.Forms.Clipboard]::GetImage(); ",
+    "if (-not $img) { foreach ($f in [System.Windows.Forms.Clipboard]::GetFileDropList()) { ",
+    r"if ($f -match '\.(png|jpe?g|gif|bmp|webp|tiff?)$') { ",
+    "try { $img = [System.Drawing.Image]::FromFile($f) } catch { }; break } } }; ",
+    "if ($img) { $ms = New-Object System.IO.MemoryStream; ",
+    "$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); ",
+    "[Convert]::ToBase64String($ms.ToArray()) }",
+);
+
+fn decode_clipboard_script_output(out: &[u8]) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(out);
+    let encoded = text.trim();
+    if encoded.is_empty() {
         return None;
     }
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $path = '{win}'; $img = [System.Windows.Forms.Clipboard]::GetImage(); if ($img) {{ $img.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok' }} else {{ Write-Output 'empty' }}"
-    );
-    let out = command_stdout("powershell.exe", &["-NoProfile", "-Command", &script], 5000)?;
-    let ok = String::from_utf8_lossy(&out).trim() == "ok";
-    let bytes = if ok { fs::read(&tmp).ok() } else { None };
-    let _ = fs::remove_file(&tmp);
-    bytes.filter(|data| !data.is_empty())
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .ok()
+        .filter(|data| !data.is_empty())
+}
+
+/// Native Windows: the clipboard read in-process, as Claude Code does — a
+/// bitmap (a screenshot), or else the first image file in a copied file list
+/// (an image copied in Explorer). No helper process, so alt+v is instant.
+#[cfg(windows)]
+fn windows_clipboard_image() -> Option<Vec<u8>> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    if let Ok(image) = clipboard.get_image() {
+        return rgba_png(
+            image.width as u32,
+            image.height as u32,
+            image.bytes.into_owned(),
+        );
+    }
+    let files = clipboard.get().file_list().ok()?;
+    let path = files.iter().find(|path| is_image_file(path))?;
+    copied_image_png(path)
+}
+
+/// A copied image file, decoded and re-encoded as PNG so what is sent is
+/// what it is labelled; one that will not decode, or is past the size an
+/// upload can take, is not attached.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copied_image_png(path: &std::path::Path) -> Option<Vec<u8>> {
+    const MAX_BYTES: u64 = 50 * 1024 * 1024;
+    if fs::metadata(path).ok()?.len() > MAX_BYTES {
+        return None;
+    }
+    let image = image::open(path).ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    rgba_png(width, height, image.into_raw())
+}
+
+#[cfg(not(windows))]
+fn windows_clipboard_image() -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(windows)]
+fn windows_clipboard_text() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()?
+        .get_text()
+        .ok()
+        .filter(|text| !text.is_empty())
+}
+
+#[cfg(not(windows))]
+fn windows_clipboard_text() -> Option<String> {
+    None
+}
+
+/// Raw RGBA pixels, as the clipboard hands them over, encoded as PNG.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rgba_png(width: u32, height: u32, rgba: Vec<u8>) -> Option<Vec<u8>> {
+    let image = image::RgbaImage::from_raw(width, height, rgba)?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some(png.into_inner())
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_image_file(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .is_some_and(|ext| {
+            matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff"
+            )
+        })
+}
+
+#[cfg(test)]
+mod clipboard_script_tests {
+    use super::*;
+
+    #[test]
+    fn the_wsl_script_takes_no_path_and_accepts_copied_image_files() {
+        // Nothing interpolated: no quoting to get wrong, whatever TEMP holds.
+        assert!(!CLIPBOARD_IMAGE_SCRIPT.contains("$path"));
+        assert!(CLIPBOARD_IMAGE_SCRIPT.contains("GetImage()"));
+        assert!(CLIPBOARD_IMAGE_SCRIPT.contains("GetFileDropList()"));
+        assert!(CLIPBOARD_IMAGE_SCRIPT.contains("ToBase64String"));
+        assert!(CLIPBOARD_IMAGE_SCRIPT.contains(r"'\.(png|jpe?g|gif|bmp|webp|tiff?)$'"));
+    }
+
+    #[test]
+    fn script_output_decodes_to_the_image_or_nothing() {
+        assert_eq!(
+            decode_clipboard_script_output(b"iVBORw0K\r\n"),
+            Some(vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a])
+        );
+        assert_eq!(decode_clipboard_script_output(b"  \r\n"), None);
+        assert_eq!(decode_clipboard_script_output(b"not base64!"), None);
+    }
+
+    #[test]
+    fn clipboard_pixels_become_a_png() {
+        let png = rgba_png(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoded = image::load_from_memory(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+        // A buffer that does not match the size is refused, not misread.
+        assert!(rgba_png(2, 2, vec![0; 8]).is_none());
+    }
+
+    #[test]
+    fn a_copied_image_file_is_sent_as_png_and_a_broken_one_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let bmp = dir.path().join("shot.bmp");
+        image::RgbaImage::from_raw(1, 1, vec![1, 2, 3, 255])
+            .unwrap()
+            .save(&bmp)
+            .unwrap();
+        let png = copied_image_png(&bmp).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let fake = dir.path().join("fake.png");
+        fs::write(&fake, b"not an image").unwrap();
+        assert!(copied_image_png(&fake).is_none());
+        assert!(copied_image_png(&dir.path().join("missing.png")).is_none());
+    }
+
+    #[test]
+    fn copied_files_count_only_when_they_are_images() {
+        assert!(is_image_file(std::path::Path::new(
+            r"C:\shots\Screen Shot.PNG"
+        )));
+        assert!(is_image_file(std::path::Path::new("a/b.jpeg")));
+        assert!(!is_image_file(std::path::Path::new("notes.txt")));
+        assert!(!is_image_file(std::path::Path::new("png")));
+    }
 }
 
 fn select_image_mime<'a>(types: impl Iterator<Item = &'a str>) -> Option<String> {

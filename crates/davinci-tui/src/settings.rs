@@ -302,7 +302,7 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
             bool_item(
                 "skill-commands",
                 "Skill commands",
-                "Register skills as /skill:name commands",
+                "Register skills as /name and /plugin:name commands",
                 config.skill_commands,
             ),
             bool_item(
