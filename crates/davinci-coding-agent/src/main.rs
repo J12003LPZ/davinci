@@ -316,6 +316,14 @@ fn main() {
     {
         davinci_agent::jobs::supervisor::run();
     }
+    // The sandbox launcher: only ever started by the supervisor helper with
+    // a plan it built, and it confines what it starts, never widens it.
+    if raw.len() == 2 && raw[0] == davinci_agent::sandbox::appcontainer::LAUNCHER_ARG {
+        std::process::exit(davinci_agent::sandbox::appcontainer::run_launcher(&raw[1]));
+    }
+    if std::env::var_os(davinci_agent::sandbox::appcontainer::PLAN_ENV).is_some() {
+        std::process::exit(davinci_agent::sandbox::appcontainer::run_env_launcher(&raw));
+    }
     match run(raw) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
@@ -412,6 +420,32 @@ fn apply_cd(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `/config` -> Design artifacts and the runtime paths the setup script
+/// stored (in the user's global settings) become the `DAVINCI_DESIGN_*` variables `/design` reads, unless the
+/// launching environment already set them. Runs before any thread starts.
+fn apply_design_settings() {
+    // Global settings only: a project's own settings must not choose the
+    // executables `/design` trusts, nor switch the feature on.
+    let settings = settings::load_settings(&default_agent_dir());
+    let pairs = [
+        (
+            "DAVINCI_DESIGN_ENABLED",
+            settings
+                .design_enabled
+                .map(|enabled| if enabled { "1" } else { "0" }.to_string()),
+        ),
+        ("DAVINCI_DESIGN_RUNTIME", settings.design_runtime.clone()),
+        ("DAVINCI_DESIGN_NODE", settings.design_node.clone()),
+    ];
+    for (name, value) in pairs {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            if std::env::var_os(name).is_none() {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+}
+
 fn run(raw: Vec<String>) -> Result<i32, String> {
     startup_mark("start");
     // `-o` resolves against the directory davinci was started in, as in Codex;
@@ -422,6 +456,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         apply_cd(dir)?;
     }
     apply_offline_mode(&raw);
+    apply_design_settings();
     if let Some(result) = davinci_coding_agent::runtime_inspect::try_run(&raw) {
         return result;
     }
@@ -8240,6 +8275,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "block-images" => stored.block_images = Some(value == "true"),
         "skill-commands" => stored.enable_skill_commands = Some(value == "true"),
         "plan-usage" => stored.plan_usage = Some(value == "true"),
+        "design" => stored.design_enabled = Some(value == "true"),
         "context-bar" => {
             stored.context_bar = Some(
                 match value {

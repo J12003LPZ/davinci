@@ -188,6 +188,41 @@ struct GeneratedSource {
     variants: Vec<Variant>,
     bindings: Vec<EditableBinding>,
 }
+/// A single planned direction sometimes arrives as one Variant object instead
+/// of a one-element array. Canonicalize only that exact shape. All other
+/// malformed structures still reach the ordinary repair path.
+fn parse_generated_source(
+    mut arguments: serde_json::Value,
+    directions: usize,
+) -> DesignResult<GeneratedSource> {
+    let variants = arguments
+        .get_mut("variants")
+        .ok_or_else(|| DesignError::InvalidInput("variants must be an array".into()))?;
+    if variants.is_object() && directions == 1 {
+        let object = variants.as_object().expect("checked object");
+        if object.len() == 3
+            && ["id", "title", "artboards"]
+                .iter()
+                .all(|key| object.contains_key(*key))
+        {
+            let single = variants.take();
+            *variants = serde_json::Value::Array(vec![single]);
+        }
+    }
+    if !variants.is_array() {
+        return Err(DesignError::InvalidInput(
+            "variants must be an array, even for one concept".into(),
+        ));
+    }
+    let source: GeneratedSource = serde_json::from_value(arguments)?;
+    if source.variants.len() != directions {
+        return Err(DesignError::InvalidInput(
+            "source must include every planned concept".into(),
+        ));
+    }
+    Ok(source)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Critique {
@@ -261,8 +296,37 @@ fn tools(phase: RunPhase, initial: bool) -> Vec<ToolSpec> {
             "files":{"type":"object","additionalProperties":{"type":"string"}},
             "entry_points":{"type":"array","items":{"type":"string"}},
             "variants":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"artboards":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"entry_point":{"type":"string"}},"required":["id","title","entry_point"],"additionalProperties":false}}},"required":["id","title","artboards"],"additionalProperties":false}},
-            "bindings":{"type":"array","items":{"type":"object"}}
+            "bindings":{"type":"array","items":binding_schema()}
         },"required":["files","entry_points","variants","bindings"]}), constrained_sampling:None }]
+}
+
+/// One editable binding, as `EditableBinding` parses it. `source_hash` is
+/// optional: the host computes it from the file's bytes.
+fn binding_schema() -> serde_json::Value {
+    let constraint = |kind: &str, fields: serde_json::Value, required: &[&str]| {
+        let mut properties = json!({"type":{"const":kind}});
+        for (name, schema) in fields.as_object().unwrap() {
+            properties[name] = schema.clone();
+        }
+        let mut required: Vec<&str> = required.to_vec();
+        required.insert(0, "type");
+        json!({"type":"object","additionalProperties":false,"properties":properties,"required":required})
+    };
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "node_id":{"type":"string","description":"UUID of the bound node"},
+        "artboard_id":{"type":"string","description":"UUID of an artboard in variants"},
+        "source_file":{"type":"string","description":"the JSON file in files holding the value"},
+        "source_hash":{"type":"string","description":"optional; the host computes it"},
+        "pointer":{"type":"string","description":"JSON Pointer to the value, e.g. /hero/title"},
+        "constraint":{"oneOf":[
+            constraint("text", json!({"max_bytes":{"type":"integer","minimum":1}}), &["max_bytes"]),
+            constraint("enum", json!({"values":{"type":"array","items":{"type":"string"}}}), &["values"]),
+            constraint("number", json!({"min":{"type":"integer"},"max":{"type":"integer"}}), &["min","max"]),
+            constraint("color", json!({}), &[]),
+            constraint("local_asset", json!({"paths":{"type":"array","items":{"type":"string"}}}), &["paths"]),
+        ]},
+        "affected_nodes":{"type":"array","items":{"type":"string"},"description":"node_id of every binding with this same source_file and pointer, this one included"}
+    },"required":["node_id","artboard_id","source_file","pointer","constraint","affected_nodes"]})
 }
 fn phase_messages(
     store: &DesignStore,
@@ -284,7 +348,7 @@ fn phase_messages(
             let assets = if state.last_revision.0 == 0 { vec![] } else { store.read_revision(ctx, session(agent)?, manifest.id, state.last_revision)?.assets };
             messages.push(ChatMessage::text("user", serde_json::to_string(&json!({"directions":state.directions,"current_source":files,"retained_assets":assets,"findings":state.findings,"quality":state.quality}))?));
             if state.progress.phase == RunPhase::Generate {
-                messages.push(ChatMessage::text("user", "Call the single active source tool exactly once with every variant and complete source. Preserve factual content, responsive behavior, accessible names and keyboard interactions. Keep all node bindings backed by JSON source; the host computes source_hash from supplied JSON bytes. Never invent real backend integrations. Repairs must address the supplied findings without changing the selected directions."));
+                messages.push(ChatMessage::text("user", "Call the single active source tool exactly once with every variant and complete source. The variants field MUST be an array of variant objects, including when there is only one concept; never send a bare object. Preserve factual content, responsive behavior, accessible names and keyboard interactions. Keep all node bindings backed by JSON source; the host computes source_hash from supplied JSON bytes. Never invent real backend integrations. Repairs must address the supplied findings without changing the selected directions."));
             } else {
                 if images {
                     if let Some(report) = &state.quality {
@@ -296,7 +360,7 @@ fn phase_messages(
                         }
                     }
                 }
-                messages.push(ChatMessage::text("user", "Critique the actual supplied source and evidence against the brief and both concepts. Return only JSON {\"findings\":[\"concrete actionable defect\"]}. Empty means no defect found in supplied evidence, not acceptance or verified implementation. Do not infer visual quality without images, interaction without action evidence, or production integration from mocks."));
+                messages.push(ChatMessage::text("user", "Critique the actual supplied source and evidence against the brief and every planned concept. Return only JSON {\"findings\":[\"concrete actionable defect\"]}. Empty means no defect found in supplied evidence, not acceptance or verified implementation. Do not infer visual quality without images, interaction without action evidence, or production integration from mocks."));
             }
         }
         _ => return Err(DesignError::Conflict("no provider dispatch for this phase".into())),
@@ -314,6 +378,32 @@ pub fn run(
     renderer: &mut dyn DesignRenderer,
     cancel: Option<Arc<AtomicBool>>,
 ) -> DesignResult<DesignRunState> {
+    if agent.root_budget().is_some() {
+        return run_accounted(store, agent, workspace, request, model, renderer, cancel);
+    }
+    // No host budget: this operation's own, attached for its length only.
+    model.validate(agent)?;
+    let budget = super::budget::for_operation(
+        agent,
+        &request.operation_id.to_string(),
+        super::budget::GENERATION,
+    )?;
+    agent
+        .with_operation_budget(budget, |agent| {
+            run_accounted(store, agent, workspace, request, model, renderer, cancel)
+        })
+        .map_err(DesignError::MissingCapability)?
+}
+
+fn run_accounted(
+    store: &DesignStore,
+    agent: &mut Agent,
+    workspace: &Path,
+    request: GenerationRequest,
+    model: &mut dyn DesignModel,
+    renderer: &mut dyn DesignRenderer,
+    cancel: Option<Arc<AtomicBool>>,
+) -> DesignResult<DesignRunState> {
     model.validate(agent)?;
     validate_text(&request.brief, 64 * 1024, "revision brief")?;
     let args = serde_json::to_value(&request)?;
@@ -323,10 +413,11 @@ pub fn run(
     } else {
         ctx
     };
-    let budget = agent
-        .root_budget()
-        .ok_or_else(|| DesignError::MissingCapability("root admission unavailable".into()))?
-        .clone();
+    let budget = super::budget::for_operation(
+        agent,
+        &request.operation_id.to_string(),
+        super::budget::GENERATION,
+    )?;
     let request_hash = digest(&request)?;
     let effort = format!("{:?}", agent.request_thinking_level());
     let mut state = if let Some(state) =
@@ -540,25 +631,51 @@ fn run_phases(
                         "generation must call the active artifact source tool exactly once".into(),
                     ));
                 }
-                let mut source: GeneratedSource = serde_json::from_value(calls[0].1.clone())?;
-                if source.variants.len() != state.directions.len() {
-                    return Err(DesignError::InvalidInput(
-                        "source must include every planned concept".into(),
-                    ));
-                }
-                // Hashing is deterministic host work, never a model arithmetic obligation.
-                for binding in &mut source.bindings {
-                    let file = source.files.get(&binding.source_file).ok_or_else(|| {
-                        DesignError::InvalidInput("binding source missing".into())
-                    })?;
-                    binding.source_hash = super::skills::byte_hash(file.as_bytes());
-                }
-                let sources = store.store_sources(
+                let source = (|| -> DesignResult<GeneratedSource> {
+                    let mut source =
+                        parse_generated_source(calls[0].1.clone(), state.directions.len())?;
+                    // Hashing is deterministic host work, never a model arithmetic obligation.
+                    for binding in &mut source.bindings {
+                        let file = source.files.get(&binding.source_file).ok_or_else(|| {
+                            DesignError::InvalidInput(format!(
+                                "binding source {} is not one of the files",
+                                binding.source_file
+                            ))
+                        })?;
+                        binding.source_hash = super::skills::byte_hash(file.as_bytes());
+                    }
+                    Ok(source)
+                })();
+                // A malformed call is the model's to fix, inside the repair
+                // allowance, like a compile or render failure.
+                let source = match source {
+                    Ok(source) => source,
+                    Err(DesignError::InvalidInput(message)) => {
+                        state.findings =
+                            vec![format!("the source tool call was rejected: {message}")];
+                        state.progress.begin_repair()?;
+                        state.reply = None;
+                        checkpoint(store, ctx, agent, state)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let sources = match store.store_sources(
                     ctx,
                     session(agent)?,
                     &source.files,
                     source.entry_points,
-                )?;
+                ) {
+                    Ok(sources) => sources,
+                    Err(DesignError::InvalidInput(message)) => {
+                        state.findings = vec![format!("the source files were rejected: {message}")];
+                        state.progress.begin_repair()?;
+                        state.reply = None;
+                        checkpoint(store, ctx, agent, state)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let assets = if state.last_revision.0 == 0 {
                     vec![]
                 } else {
@@ -566,7 +683,7 @@ fn run_phases(
                         .read_revision(ctx, session(agent)?, head.id, state.last_revision)?
                         .assets
                 };
-                let revision = store.commit_revision(
+                let revision = match store.commit_revision(
                     ctx,
                     session(agent)?,
                     RevisionWrite {
@@ -580,7 +697,20 @@ fn run_phases(
                         profile_refs: vec![state.profile.clone()],
                         system_snapshot: state.system_snapshot.clone(),
                     },
-                )?;
+                ) {
+                    Ok(revision) => revision,
+                    // Bindings and sources the store refuses are the model's
+                    // to fix, like a malformed call.
+                    Err(DesignError::InvalidInput(message)) => {
+                        state.findings =
+                            vec![format!("the source revision was rejected: {message}")];
+                        state.progress.begin_repair()?;
+                        state.reply = None;
+                        checkpoint(store, ctx, agent, state)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 state.last_revision = revision.revision;
                 state.progress.phase = RunPhase::Render;
             }
@@ -615,6 +745,58 @@ fn run_phases(
         checkpoint(store, ctx, agent, state)?;
         if state.progress.phase == RunPhase::Complete {
             return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_shape_evals {
+    use super::*;
+
+    #[test]
+    fn recorded_single_concept_shape_and_neighboring_malformed_shapes() {
+        let corpus: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../../docs/evals/design/fixtures/source-shapes.json"
+        ))
+        .unwrap();
+        assert_eq!(corpus.len(), 8);
+        for case in corpus {
+            let variant = json!({
+                "id":"00000000-0000-4000-8000-000000000001",
+                "title":"Concept",
+                "artboards":[{"id":"00000000-0000-4000-8000-000000000002","title":"Desktop","entry_point":"index.html"}]
+            });
+            let shape = case["shape"].as_str().unwrap();
+            let variants = match shape {
+                "single" => variant,
+                "array" => json!([variant]),
+                "keyed" => json!({"concept":variant}),
+                "extra" => {
+                    let mut value = variant;
+                    value["unrecognized"] = json!(true);
+                    value
+                }
+                "missing" => {
+                    let mut value = variant;
+                    value.as_object_mut().unwrap().remove("artboards");
+                    value
+                }
+                "bad-id" => {
+                    let mut value = variant;
+                    value["id"] = json!("not-a-uuid");
+                    value
+                }
+                _ => panic!("unknown eval shape"),
+            };
+            let source = json!({"files":{"index.html":"<h1>Hello</h1>"},"entry_points":["index.html"],"variants":variants,"bindings":[]});
+            let parsed =
+                parse_generated_source(source, case["directions"].as_u64().unwrap() as usize);
+            assert_eq!(
+                parsed.is_ok(),
+                case["accepted"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
         }
     }
 }

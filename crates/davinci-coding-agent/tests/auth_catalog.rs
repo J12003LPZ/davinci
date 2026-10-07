@@ -102,6 +102,9 @@ fn legacy_codex_login_is_named_with_its_fix() {
             .env_remove("PI_OFFLINE")
             .env_remove("DAVINCI_OFFLINE")
             .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_API_KEY")
             .args(args)
             .output()
             .unwrap();

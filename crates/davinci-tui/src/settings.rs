@@ -136,6 +136,8 @@ pub struct InteractiveSettingsConfig {
     pub context_bar: String,
     /// ChatGPT plan usage (5-hour and weekly) under it, for openai-codex.
     pub plan_usage: bool,
+    /// `/design`: UI concepts rendered in a sandboxed browser.
+    pub design: bool,
     pub steering_mode: String,
     pub follow_up_mode: String,
     pub transport: String,
@@ -207,6 +209,7 @@ impl Default for InteractiveSettingsConfig {
             skill_commands: true,
             context_bar: "compact".into(),
             plan_usage: true,
+            design: false,
             show_hardware_cursor: false,
             editor_padding: 0,
             output_padding: 1,
@@ -320,6 +323,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Plan usage",
                 "For openai-codex models: the ChatGPT plan's 5-hour and weekly usage under the context bar, read through the Codex CLI's login",
                 config.plan_usage,
+            ),
+            bool_item(
+                "design",
+                "Design artifacts",
+                "/design: UI concepts generated with your openai-codex model and rendered in a sandboxed browser; needs the design runtime (scripts/setup-design-runtime.ps1)",
+                config.design,
             ),
             bool_item(
                 "skill-commands",

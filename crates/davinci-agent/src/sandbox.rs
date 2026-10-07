@@ -17,7 +17,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod appcontainer;
 mod seatbelt;
+pub use appcontainer::WindowsAppContainerBackend;
 pub use seatbelt::MacosSeatbeltBackend;
 
 const BASELINE_ENVIRONMENT: &[&str] = &[
@@ -494,6 +496,22 @@ impl SandboxBroker {
                 }
                 MacosSeatbeltBackend::new(private_temp).prepare(spec, request, environment)
             }
+            SandboxBackendKind::WindowsAppContainer => {
+                if !cfg!(windows) {
+                    return Err(SandboxFailure::new(
+                        SandboxErrorCode::SandboxUnavailable,
+                        "AppContainer requires native Windows",
+                    ));
+                }
+                WindowsAppContainerBackend::current()
+                    .ok_or_else(|| {
+                        SandboxFailure::new(
+                            SandboxErrorCode::SandboxUnavailable,
+                            "the sandbox launcher executable is unavailable",
+                        )
+                    })?
+                    .prepare(spec, request, environment)
+            }
             SandboxBackendKind::Container => {
                 let container = spec.container.as_ref().ok_or_else(|| {
                     SandboxFailure::new(
@@ -535,6 +553,10 @@ impl SandboxBroker {
                         );
                     }
                 }
+                // Windows AppContainer is not chosen automatically: a child
+                // that starts processes over named pipes (Node, Rust, most
+                // build tools) cannot create them inside it. Request
+                // `windows_app_container` explicitly.
                 if let Some(container) = spec.container.as_ref() {
                     if let Some(runtime) =
                         resolve_container_runtime(container.runtime, Path::new(&spec.workspace))

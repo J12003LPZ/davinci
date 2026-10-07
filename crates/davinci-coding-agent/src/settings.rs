@@ -399,6 +399,27 @@ pub struct Settings {
     /// The ChatGPT plan usage row for openai-codex models (default on).
     #[serde(default, rename = "planUsage", skip_serializing_if = "Option::is_none")]
     pub plan_usage: Option<bool>,
+    /// `/design` (off by default). `DAVINCI_DESIGN_ENABLED` still wins.
+    #[serde(
+        default,
+        rename = "designEnabled",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub design_enabled: Option<bool>,
+    /// The pinned design runtime, written by `scripts/setup-design-runtime.ps1`.
+    #[serde(
+        default,
+        rename = "designRuntime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub design_runtime: Option<String>,
+    /// The exact Node executable the runtime was pinned with.
+    #[serde(
+        default,
+        rename = "designNode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub design_node: Option<String>,
     #[serde(default, rename = "showHardwareCursor")]
     pub show_hardware_cursor: Option<bool>,
     #[serde(default, rename = "editorPaddingX")]
@@ -1765,6 +1786,7 @@ pub fn to_interactive_config(
             .clone()
             .unwrap_or_else(|| "compact".into()),
         plan_usage: settings.plan_usage.unwrap_or(true),
+        design: settings.design_enabled.unwrap_or(false),
         show_hardware_cursor: settings.show_hardware_cursor.unwrap_or(false),
         editor_padding: settings.editor_padding_x.unwrap_or(0),
         output_padding: settings.output_pad.unwrap_or(1),

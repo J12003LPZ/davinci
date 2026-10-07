@@ -31,23 +31,48 @@ impl CodexSubscriptionPolicy {
         self.validate()?;
         // SSE is selected explicitly: auto transport may silently retry or
         // downgrade after a websocket failure. No fixture or URL override is used.
-        if model.provider != "openai-codex"
-            || model.api != "openai-codex-responses"
-            || model.id != self.model
-            || body.get("model").and_then(Value::as_str) != Some(&self.model)
-            || body.pointer("/reasoning/effort").and_then(Value::as_str) != Some(&self.effort)
-            || !auth.source.eq_ignore_ascii_case("oauth")
-            || auth.api_key.as_deref().is_none_or(str::is_empty)
-            || url != "https://api.openai.com/v1/responses"
-            || body.get("store").and_then(Value::as_bool) != Some(false)
-            || body.get("stream").and_then(Value::as_bool) != Some(true)
-            || options.transport.as_deref() != Some("sse")
-            || options.max_retries.unwrap_or(0) != 0
-            || ["max_output_tokens", "max_completion_tokens", "max_tokens"]
-                .iter()
-                .any(|key| body.get(key).is_some())
-        {
-            return Err("subscription-only admission denied: verified ChatGPT-plan OAuth, public /v1/responses, pinned model/effort and SSE transport required; API-key billing and fallback are forbidden".into());
+        let checks = [
+            (
+                model.provider == "openai-codex" && model.api == "openai-codex-responses",
+                "the openai-codex Responses route",
+            ),
+            (
+                model.id == self.model
+                    && body.get("model").and_then(Value::as_str) == Some(&self.model),
+                "the pinned model",
+            ),
+            (
+                body.pointer("/reasoning/effort").and_then(Value::as_str) == Some(&self.effort),
+                "the pinned effort",
+            ),
+            (
+                auth.source.eq_ignore_ascii_case("oauth")
+                    && auth.api_key.as_deref().is_some_and(|key| !key.is_empty()),
+                "ChatGPT-plan OAuth",
+            ),
+            (
+                url == "https://api.openai.com/v1/responses",
+                "the public /v1/responses endpoint",
+            ),
+            (
+                body.get("store").and_then(Value::as_bool) == Some(false)
+                    && body.get("stream").and_then(Value::as_bool) == Some(true),
+                "an unstored streaming request",
+            ),
+            (
+                options.transport.as_deref() == Some("sse")
+                    && options.max_retries.unwrap_or(0) == 0,
+                "SSE transport without retries",
+            ),
+            (
+                !["max_output_tokens", "max_completion_tokens", "max_tokens"]
+                    .iter()
+                    .any(|key| body.get(key).is_some()),
+                "no output token cap",
+            ),
+        ];
+        if let Some((_, missing)) = checks.iter().find(|(ok, _)| !ok) {
+            return Err(format!("subscription-only admission denied: {missing} is required; verified ChatGPT-plan OAuth, public /v1/responses, pinned model/effort and SSE transport required; API-key billing and fallback are forbidden"));
         }
         Ok(())
     }

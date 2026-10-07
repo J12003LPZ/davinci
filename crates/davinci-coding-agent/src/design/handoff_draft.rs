@@ -113,6 +113,30 @@ pub fn draft_handoff(
     model: &mut dyn DesignModel,
     cancel: Option<Arc<AtomicBool>>,
 ) -> DesignResult<PreparedHandoff> {
+    if agent.root_budget().is_some() {
+        return draft_accounted(store, agent, workspace, request, model, cancel);
+    }
+    model.validate(agent)?;
+    let budget = super::budget::for_operation(
+        agent,
+        &request.operation_id.to_string(),
+        super::budget::HANDOFF_DRAFT,
+    )?;
+    agent
+        .with_operation_budget(budget, |agent| {
+            draft_accounted(store, agent, workspace, request, model, cancel)
+        })
+        .map_err(DesignError::MissingCapability)?
+}
+
+fn draft_accounted(
+    store: &DesignStore,
+    agent: &mut Agent,
+    workspace: &Path,
+    request: DraftHandoff,
+    model: &mut dyn DesignModel,
+    cancel: Option<Arc<AtomicBool>>,
+) -> DesignResult<PreparedHandoff> {
     model.validate(agent)?;
     if request.target_files.is_empty() || request.target_files.len() > 16 {
         return Err(DesignError::InvalidInput(
@@ -156,10 +180,11 @@ pub fn draft_handoff(
     davinci_agent::runtime::worktree::handoff_snapshot(ctx.workspace(), &request.target_files)
         .map_err(|error| DesignError::Conflict(error.to_string()))?;
     let request_hash = digest(&request)?;
-    let budget = agent
-        .root_budget()
-        .ok_or_else(|| DesignError::MissingCapability("root admission unavailable".into()))?
-        .clone();
+    let budget = super::budget::for_operation(
+        agent,
+        &request.operation_id.to_string(),
+        super::budget::HANDOFF_DRAFT,
+    )?;
     let effort = format!("{:?}", agent.request_thinking_level());
     let previous = store
         .events(&ctx, session(agent)?)?

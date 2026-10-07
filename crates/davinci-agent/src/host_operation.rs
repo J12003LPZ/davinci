@@ -105,9 +105,14 @@ impl Agent {
             || after.unknown > 0
             || after.halted
         {
-            return Err(
-                "host model request did not produce settled root admission evidence".into(),
-            );
+            // A request that failed before it was sent leaves no evidence;
+            // its own error says why, not the missing evidence.
+            return Err(match result {
+                Err(error) => error,
+                Ok(_) => {
+                    "host model request did not produce settled root admission evidence".into()
+                }
+            });
         }
         grant.check()?;
         let output = result?;

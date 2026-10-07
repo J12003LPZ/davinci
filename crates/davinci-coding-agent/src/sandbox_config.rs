@@ -316,6 +316,9 @@ fn parse_backend(value: &str) -> Result<SandboxBackendKind, String> {
         "auto" => Ok(SandboxBackendKind::Auto),
         "linux_bubblewrap" | "bubblewrap" | "bwrap" => Ok(SandboxBackendKind::LinuxBubblewrap),
         "macos_seatbelt" | "seatbelt" => Ok(SandboxBackendKind::MacosSeatbelt),
+        "windows_app_container" | "appcontainer" | "app_container" => {
+            Ok(SandboxBackendKind::WindowsAppContainer)
+        }
         "container" | "docker" | "podman" => Ok(SandboxBackendKind::Container),
         "host" => Ok(SandboxBackendKind::Host),
         other => Err(format!("unknown sandbox backend: {other}")),
@@ -794,6 +797,7 @@ pub fn format_sandbox_status(spec: Option<&SandboxSpec>) -> String {
         SandboxBackendKind::Auto => "auto",
         SandboxBackendKind::LinuxBubblewrap => "linux_bubblewrap",
         SandboxBackendKind::MacosSeatbelt => "macos_seatbelt",
+        SandboxBackendKind::WindowsAppContainer => "windows_app_container",
         SandboxBackendKind::Container => "container",
         SandboxBackendKind::Host => "host",
     };

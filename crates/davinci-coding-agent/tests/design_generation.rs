@@ -173,6 +173,11 @@ impl DesignRenderer for RecordedRenderer {
     }
 }
 fn setup() -> (tempfile::TempDir, Agent, DesignStore, GenerationRequest) {
+    setup_with_variants(2)
+}
+fn setup_with_variants(
+    variants: u32,
+) -> (tempfile::TempDir, Agent, DesignStore, GenerationRequest) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let mut agent = Agent::new("fixture");
@@ -208,7 +213,7 @@ fn setup() -> (tempfile::TempDir, Agent, DesignStore, GenerationRequest) {
                 title: "Fixture".into(),
                 brief: "Two honest offline concepts".into(),
                 kind: DesignKind::Product,
-                variants: 2,
+                variants,
                 operation_id: OperationId::new(),
             },
         )
@@ -242,6 +247,93 @@ fn review() -> ContentBlock {
         text: "{\"findings\":[]}".into(),
     }
 }
+#[test]
+fn rejected_source_bundle_spends_a_bounded_repair_instead_of_blocking() {
+    let (dir, mut agent, store, request) = setup();
+    let mut malformed = source("design_create");
+    if let ContentBlock::ToolCall { arguments, .. } = &mut malformed {
+        arguments["entry_points"] = json!(["missing.html"]);
+    }
+    let mut model = RecordedModel {
+        replies: VecDeque::from([concepts(), malformed, source("design_create"), review()]),
+        calls: 0,
+        unknown: false,
+        cancel: None,
+    };
+    let mut renderer = RecordedRenderer {
+        calls: 0,
+        failures: 0,
+    };
+    let state = run(
+        &store,
+        &mut agent,
+        dir.path(),
+        request,
+        &mut model,
+        &mut renderer,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        state.progress.phase,
+        RunPhase::Complete,
+        "{:?}",
+        state.findings
+    );
+    assert_eq!(state.last_revision, RevisionId(1));
+    assert_eq!(state.progress.repairs, 1);
+    assert_eq!(model.calls, 4);
+}
+
+#[test]
+fn single_concept_patch_object_advances_retained_revision_without_extra_request() {
+    let (dir, mut agent, store, request) = setup_with_variants(1);
+    let variant = json!({"id":VariantId::new(),"title":"Editorial","artboards":[{"id":ArtboardId::new(),"title":"Desktop","entry_point":"a.html"}]});
+    let source_call = |name: &str, variants: serde_json::Value| ContentBlock::ToolCall {
+        id: OperationId::new().to_string(),
+        name: name.into(),
+        arguments: json!({"files":{"a.html":"<!doctype html><html lang='en'><title>A</title><h1>Editorial fixture</h1></html>"},"entry_points":["a.html"],"variants":variants,"bindings":[]}),
+    };
+    let mut model = RecordedModel {
+        replies: VecDeque::from([
+            ContentBlock::Text {
+                text: serde_json::to_string(&vec![direction("editorial", "serif")]).unwrap(),
+            },
+            source_call("design_create", json!([variant.clone()])),
+            review(),
+            source_call("design_patch", variant),
+            review(),
+        ]),
+        calls: 0,
+        unknown: false,
+        cancel: None,
+    };
+    let mut renderer = RecordedRenderer {
+        calls: 0,
+        failures: 1,
+    };
+    let state = run(
+        &store,
+        &mut agent,
+        dir.path(),
+        request,
+        &mut model,
+        &mut renderer,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        state.progress.phase,
+        RunPhase::Complete,
+        "{:?}",
+        state.findings
+    );
+    assert_eq!(state.last_revision, RevisionId(2));
+    assert_eq!(state.progress.repairs, 1);
+    assert_eq!(model.calls, 5);
+    assert_eq!(agent.root_budget().unwrap().snapshot().unwrap().requests, 5);
+}
+
 #[test]
 fn recorded_generation_repairs_real_finding_and_reopen_does_not_repeat_requests() {
     let (dir, mut agent, store, request) = setup();

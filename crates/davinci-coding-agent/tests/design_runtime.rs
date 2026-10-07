@@ -353,15 +353,15 @@ fn verify_native_exports(
 }
 
 #[test]
-#[ignore = "requires the pinned native Linux sandbox and browser; run native tests serially"]
+#[ignore = "requires the pinned native sandbox and browser; run native tests serially"]
 fn native_hostile_page_and_process_cleanup() {
     use davinci_coding_agent::interaction_testing::browser_process::{
         BrowserProcess, BrowserProcessConfig,
     };
     use serde_json::json;
     assert!(
-        cfg!(target_os = "linux"),
-        "native process inspection requires Linux"
+        cfg!(any(target_os = "linux", windows)),
+        "native process inspection requires Linux or Windows"
     );
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().canonicalize().unwrap();
@@ -399,19 +399,22 @@ fn native_hostile_page_and_process_cleanup() {
     )
     .unwrap();
     let package = runtime_directory.join("node_modules/playwright-core");
-    let environment = BTreeMap::from([
-        (
-            "PLAYWRIGHT_BROWSERS_PATH".into(),
-            manifest["browser"]["cache"].as_str().unwrap().into(),
-        ),
-        (
+    let mut environment = BTreeMap::from([(
+        "PLAYWRIGHT_BROWSERS_PATH".into(),
+        manifest["browser"]["cache"].as_str().unwrap().into(),
+    )]);
+    if cfg!(target_os = "linux") {
+        environment.insert(
             "FONTCONFIG_FILE".into(),
             runtime_directory
                 .join("fonts.conf")
                 .to_string_lossy()
                 .into_owned(),
-        ),
-    ]);
+        );
+    }
+    // Only processes this fixture starts count: an earlier test's children
+    // may still be exiting when this one looks.
+    let baseline = native_processes();
     let browser = BrowserProcess::start_design(
         &SupervisorCommand {
             executable: env!("CARGO_BIN_EXE_davinci").into(),
@@ -452,11 +455,11 @@ fn native_hostile_page_and_process_cleanup() {
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
 
-    let processes = linux_processes();
+    let processes = native_processes();
     let mut descendants = std::collections::BTreeSet::from([std::process::id()]);
     loop {
         let before = descendants.len();
-        for (&pid, (parent, _, _)) in &processes {
+        for (&pid, (parent, _, _, _)) in &processes {
             if descendants.contains(parent) {
                 descendants.insert(pid);
             }
@@ -466,21 +469,57 @@ fn native_hostile_page_and_process_cleanup() {
         }
     }
     descendants.remove(&std::process::id());
+    descendants.retain(|pid| {
+        baseline
+            .get(pid)
+            .is_none_or(|old| old.2 != processes[pid].2)
+    });
     assert!(
-        descendants.iter().any(|pid| {
-            std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                .is_ok_and(|name| name.contains("chrome"))
-        }),
+        descendants
+            .iter()
+            .any(|pid| processes[pid].3.contains("chrome")),
         "must observe real Chromium descendants before testing cleanup"
     );
+    // Windows: the page-level checks above can also pass on application
+    // routing alone. The OS confinement is in the browser's token: every
+    // browser process is an AppContainer with no network capability.
+    #[cfg(windows)]
+    {
+        let browsers: Vec<_> = descendants
+            .iter()
+            .filter(|pid| processes[pid].3.contains("chrome"))
+            .collect();
+        for pid in &browsers {
+            let confinement = davinci_agent::sandbox::appcontainer::process_confinement(**pid)
+                .unwrap_or_else(|| panic!("browser process {pid} token unreadable"));
+            assert!(
+                confinement.app_container,
+                "browser process {pid} is not in an AppContainer"
+            );
+            assert!(
+                !confinement.network_capability,
+                "browser process {pid} holds a network capability"
+            );
+        }
+        // The host, by contrast, is not: the boundary is around the browser.
+        let host = descendants
+            .iter()
+            .find(|pid| processes[pid].3 == "node.exe")
+            .expect("browser host process");
+        assert!(
+            !davinci_agent::sandbox::appcontainer::process_confinement(*host)
+                .unwrap()
+                .app_container
+        );
+    }
     drop(browser);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let current = linux_processes();
+        let current = native_processes();
         let alive: Vec<_> = descendants
             .iter()
             .filter(|pid| {
-                current.get(pid).is_some_and(|(_, state, started)| {
+                current.get(pid).is_some_and(|(_, state, started, _)| {
                     *state != 'Z' && *started == processes[pid].2
                 })
             })
@@ -490,7 +529,11 @@ fn native_hostile_page_and_process_cleanup() {
         }
         assert!(
             Instant::now() < deadline,
-            "browser descendants survived close: {alive:?}"
+            "browser descendants survived close: {:?}",
+            alive
+                .iter()
+                .map(|pid| (**pid, &processes[*pid].3))
+                .collect::<Vec<_>>()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -507,6 +550,43 @@ fn native_hostile_page_and_process_cleanup() {
     }
 }
 
+/// pid -> (parent, state, start time, name). Start times tell a reused pid
+/// from the process that had it.
+#[cfg(windows)]
+fn native_processes() -> BTreeMap<u32, (u32, char, u64, String)> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CreationDate.Ticks)`t$($_.Name)\" }",
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().split('\t');
+            let pid = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            let started = fields.next()?.parse().ok()?;
+            let name = fields.next()?.to_ascii_lowercase();
+            Some((pid, (parent, 'R', started, name)))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn native_processes() -> BTreeMap<u32, (u32, char, u64, String)> {
+    linux_processes()
+        .into_iter()
+        .map(|(pid, (parent, state, started))| {
+            let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            (pid, (parent, state, started, name))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
 fn linux_processes() -> BTreeMap<u32, (u32, char, u64)> {
     std::fs::read_dir("/proc")
         .unwrap()

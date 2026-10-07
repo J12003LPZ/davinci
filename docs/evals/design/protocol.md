@@ -1,6 +1,6 @@
 # Design quality evaluation protocol
 
-This protocol is for a separately authorized live campaign. CI validates the frozen manifest and result schema offline; it never starts a provider request or manufactures a human preference score.
+This protocol is for a separately authorized live campaign. CI validates the frozen manifest and result schema offline; it never starts a provider request or manufactures a human preference score. `fixtures/source-shapes.json` is a separate offline malformed-tool-call corpus: it checks that a recorded single-direction Variant object is normalized without spending another request, while keyed maps, extra/missing fields, malformed IDs and mismatched direction counts remain rejected. It is not a quality score.
 
 ## Frozen inputs
 

@@ -9460,6 +9460,11 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
             shell.model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(&effective)
         }
         "plan-usage" => shell.model.plan_usage_enabled = effective == "true",
+        // `/design` reads this on each command, so the switch is immediate.
+        "design" => std::env::set_var(
+            "DAVINCI_DESIGN_ENABLED",
+            if effective == "true" { "1" } else { "0" },
+        ),
         _ => {}
     }
     // A threshold or model change moves the compaction tick: measure again.
