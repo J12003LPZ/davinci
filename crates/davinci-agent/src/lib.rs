@@ -2265,6 +2265,9 @@ impl Agent {
         let mut image = runtime
             .context_vm
             .compile(&events, &broker_packet, max_tokens)?;
+        if self.block_images {
+            image.messages = apply_block_images(&image.messages);
+        }
         // The most recent, complete tool exchange remains protocol data. Older
         // exchanges are evidence only. Reserve this suffix before compilation.
         for (index, message) in live.iter().enumerate() {

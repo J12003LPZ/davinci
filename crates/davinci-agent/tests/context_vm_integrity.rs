@@ -24,6 +24,7 @@ fn event(source_ref: &str, seq: u64, kind: ContextEventKind, text: &str) -> Cont
         content_hash: format!("hash-{source_ref}"),
         visible_text: text.into(),
         artifact_refs: Vec::new(),
+        images: Vec::new(),
     }
 }
 
@@ -473,4 +474,112 @@ fn wor72_recent_turns_are_admitted_before_optional_broker_context() {
     let broker_at = categories.iter().position(|c| *c == "broker_context");
     let first_hot = categories.iter().position(|c| c.starts_with("hot_"));
     assert!(broker_at < first_hot, "{categories:?}");
+}
+
+fn user_with_image(text: Option<&str>, data: &str) -> ChatMessage {
+    let mut content = Vec::new();
+    if let Some(text) = text {
+        content.push(davinci_ai::MessageContent::Text { text: text.into() });
+    }
+    content.push(davinci_ai::MessageContent::Image {
+        data: data.into(),
+        mime_type: "image/png".into(),
+    });
+    ChatMessage {
+        role: "user".into(),
+        content,
+        ..Default::default()
+    }
+}
+
+fn wire_for(mode: ContextVmMode, messages: Vec<ChatMessage>) -> String {
+    let mut agent = Agent::new("system");
+    agent.set_context_vm_mode(mode);
+    agent.set_runtime(runtime());
+    agent.messages = messages;
+    // The provider list every adapter encodes; the Responses test helper
+    // has no image encoding, in any mode.
+    serde_json::to_string(&agent.messages_for_provider()).unwrap()
+}
+
+/// WOR-58: the active VM projected only text, so an image-only message
+/// vanished and a mixed message lost its image.
+#[test]
+fn wor58_user_images_reach_the_provider_in_active_mode() {
+    let image_only = vec![user_with_image(None, "UE5HLWltYWdlLW9ubHk=")];
+    let mixed = vec![user_with_image(
+        Some("what is wrong in this screenshot?"),
+        "UE5HLW1peGVkLWltYWdl",
+    )];
+    for (messages, data) in [
+        (image_only, "UE5HLWltYWdlLW9ubHk="),
+        (mixed, "UE5HLW1peGVkLWltYWdl"),
+    ] {
+        let off = wire_for(ContextVmMode::Off, messages.clone());
+        let active = wire_for(ContextVmMode::Active, messages);
+        assert_eq!(off.matches(data).count(), 1, "{off}");
+        assert_eq!(active.matches(data).count(), 1, "{active}");
+    }
+    let active = wire_for(
+        ContextVmMode::Active,
+        vec![user_with_image(
+            Some("what is wrong in this screenshot?"),
+            "UE5HLW1peGVkLWltYWdl",
+        )],
+    );
+    assert!(active.contains("what is wrong in this screenshot?"));
+}
+
+#[test]
+fn wor58_a_different_image_changes_the_event_identity() {
+    use davinci_agent::runtime::context_vm::events_from_messages;
+    let a = events_from_messages(&[user_with_image(Some("compare"), "QUFBQQ==")]);
+    let b = events_from_messages(&[user_with_image(Some("compare"), "QkJCQg==")]);
+    let text = events_from_messages(&[ChatMessage::text("user", "compare")]);
+    assert_ne!(a[0].content_hash, b[0].content_hash);
+    assert_ne!(a[0].source_ref, b[0].source_ref);
+    assert_ne!(a[0].content_hash, text[0].content_hash);
+    // Text-only identities are unchanged, so persisted roots stay valid.
+    assert_eq!(
+        text[0].content_hash,
+        davinci_agent::runtime::cache::digest(b"compare")
+    );
+}
+
+#[test]
+fn wor58_blocked_images_stay_blocked_in_active_mode() {
+    let mut agent = Agent::new("system");
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.set_runtime(runtime());
+    agent.block_images = true;
+    agent.messages = vec![user_with_image(Some("look"), "UE5HLWJsb2NrZWQ=")];
+    let wire = serde_json::to_string(&agent.messages_for_provider()).unwrap();
+    assert!(!wire.contains("UE5HLWJsb2NrZWQ="), "{wire}");
+    assert!(wire.contains("look"));
+}
+
+#[test]
+fn wor58_session_images_survive_replay_into_the_image() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session =
+        davinci_session::JsonlSession::create(directory.path(), "fixture", None).unwrap();
+    let message = user_with_image(None, "UE5HLXNlc3Npb24=");
+    session
+        .append_entry(davinci_session::SessionEntry {
+            id: "event-1".into(),
+            entry_type: "message".into(),
+            parent_id: None,
+            seq: 1,
+            timestamp: 0,
+            message: Some(serde_json::to_value(&message).unwrap()),
+            custom_type: None,
+            extra: Default::default(),
+        })
+        .unwrap();
+    let path = session.path.clone();
+    drop(session);
+    let mut agent = active_agent_on(&path);
+    agent.messages = vec![message];
+    let wire = serde_json::to_string(&agent.messages_for_provider()).unwrap();
+    assert_eq!(wire.matches("UE5HLXNlc3Npb24=").count(), 1, "{wire}");
 }

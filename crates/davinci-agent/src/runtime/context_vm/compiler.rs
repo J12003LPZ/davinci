@@ -278,6 +278,12 @@ fn event_message(event: &ContextEvent) -> ChatMessage {
             role,
             wrap_untrusted_data(&event.source_ref, &event.visible_text),
         )
+    } else if !event.images.is_empty() {
+        ChatMessage {
+            role: role.into(),
+            content: event.user_content(),
+            ..Default::default()
+        }
     } else {
         ChatMessage::text(role, &event.visible_text)
     }

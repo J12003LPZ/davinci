@@ -16,7 +16,7 @@ pub(crate) const CONTEXT_BUDGET_EXCEEDED: &str =
 pub use compiler::{ContextCompileRequest, ContextCompiler};
 pub use diagnostics::ContextVmFailure;
 pub use events::{
-    events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind,
+    events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind, EventImage,
 };
 pub(crate) use fold::fold_request;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
@@ -624,6 +624,7 @@ impl ContextVmRuntime {
                 provenance_kind: event.provenance_kind,
                 visible_text: String::new(),
                 artifact_refs: event.artifact_refs.clone(),
+                images: Vec::new(),
             })
             .collect();
         drop(old);

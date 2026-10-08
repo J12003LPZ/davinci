@@ -153,6 +153,8 @@ impl ContextStateReducer {
             match event.kind {
                 // The exact user text is authoritative. Keeping it as a goal preserves the
                 // prompt reference without asking the deterministic path to infer intent.
+                // An image-only message has no words to keep as a goal.
+                ContextEventKind::User if event.visible_text.trim().is_empty() => {}
                 ContextEventKind::User => push_unique(
                     &mut state.goals,
                     StateValue {
