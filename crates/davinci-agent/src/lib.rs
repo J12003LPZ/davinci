@@ -879,10 +879,18 @@ impl Agent {
         // One Context VM per conversation. Hosts build a fresh handle for each
         // prompt; the derived state, metrics and diagnostics of the handle it
         // replaces carry over while the bound session is unchanged.
+        // Without a session there is no id to compare (None == None), so the
+        // transcript decides: a VM carries over only while the messages still
+        // extend what it recorded. Otherwise a new, unrelated run on this
+        // Agent would inherit the old checkpoint, sources and notices (WOR-60).
         if let Some(previous) = &self.runtime {
             let session_id = self.session.as_ref().map(|session| &session.header.id);
             if !runtime.context_vm.shares_state_with(&previous.context_vm)
                 && previous.context_vm.bound_session_id().as_ref() == session_id
+                && (session_id.is_some()
+                    || previous
+                        .context_vm
+                        .continues(&runtime::context_vm::events_from_messages(&self.messages)))
             {
                 runtime.context_vm = previous.context_vm.clone();
             }
@@ -3695,10 +3703,16 @@ impl Agent {
             return Err("context VM runtime is unavailable".into());
         };
         let events = self.context_vm_events_for_runtime();
-        let parent = runtime
-            .context_vm
-            .load_state_from_root()
-            .unwrap_or_default();
+        // A VM whose recorded events this history no longer extends holds
+        // another history's state; the summarizer must not see it.
+        let parent = if runtime.context_vm.continues(&events) {
+            runtime
+                .context_vm
+                .load_state_from_root()
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let observations = self.provider_observation_scope("compaction");
         let proposal = self.summarizer.as_ref().and_then(|summarizer| {
             let request = runtime::context_vm::fold_request(

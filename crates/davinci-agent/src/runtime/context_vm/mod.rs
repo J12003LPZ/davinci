@@ -142,6 +142,17 @@ impl ContextVmRuntime {
         state.last_source_seq = last_source_seq;
     }
 
+    /// True when `events` extend what this VM last recorded: the same
+    /// conversation, possibly with newer events. A VM that has recorded
+    /// nothing continues anything.
+    pub fn continues(&self, events: &[ContextEvent]) -> bool {
+        let recorded = self.events.read().unwrap_or_else(|e| e.into_inner());
+        recorded.len() <= events.len()
+            && recorded.iter().zip(events).all(|(a, b)| {
+                a.source_ref == b.source_ref && a.content_hash == b.content_hash && a.seq == b.seq
+            })
+    }
+
     pub fn events(&self) -> Vec<ContextEvent> {
         self.events
             .read()

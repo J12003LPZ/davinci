@@ -231,3 +231,88 @@ fn wor61_failed_checkpoint_persistence_rolls_the_fold_back() {
         reloaded.prepared_context_image().unwrap().prefix_digest
     );
 }
+
+fn sessionless_active_agent() -> Agent {
+    let mut agent = Agent::new("system");
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.set_runtime(runtime());
+    agent
+}
+
+/// WOR-60: with no session, both bound ids are None and used to compare
+/// equal, so an unrelated run on the same Agent inherited the old VM.
+#[test]
+fn wor60_unrelated_sessionless_run_starts_a_fresh_vm() {
+    let mut agent = sessionless_active_agent();
+    agent.messages = vec![ChatMessage::text("user", "private marker alpha-7731")];
+    assert!(agent.compact(None).compacted);
+    let first = agent.runtime.as_ref().unwrap().context_vm.clone();
+    let episode = first.root().episodes[0].id.clone();
+    first.record_failure("compile", "run A failure");
+
+    agent.messages = vec![ChatMessage::text("user", "an unrelated task")];
+    agent.set_runtime(runtime());
+    let second = agent.runtime.as_ref().unwrap().context_vm.clone();
+    assert!(!second.shares_state_with(&first));
+    assert_eq!(second.failure_count(), 0);
+    assert!(second.root().episodes.is_empty());
+    assert!(!agent.context_vm_offers_retrieval());
+    let image = agent.prepared_context_image().unwrap();
+    let text = serde_json::to_string(&image.messages).unwrap();
+    assert!(!text.contains("alpha-7731"), "{text}");
+    assert!(second
+        .retrieve(
+            &davinci_agent::runtime::context_vm::RetrieveContextRequest {
+                page: Some(episode),
+                ..Default::default()
+            }
+        )
+        .is_err());
+    assert_ne!(second.cache_affinity(), first.cache_affinity());
+}
+
+/// The same conversation continuing on a new prompt handle keeps its VM.
+#[test]
+fn wor60_sessionless_continuation_keeps_its_vm() {
+    let mut agent = sessionless_active_agent();
+    agent.messages = vec![ChatMessage::text("user", "first step")];
+    assert!(agent.compact(None).compacted);
+    let first = agent.runtime.as_ref().unwrap().context_vm.clone();
+    agent
+        .messages
+        .push(ChatMessage::text("user", "second step"));
+    agent.set_runtime(runtime());
+    let second = &agent.runtime.as_ref().unwrap().context_vm;
+    assert!(second.shares_state_with(&first));
+    assert_eq!(second.metrics().folds, 1);
+}
+
+/// A fold on a history the VM no longer matches must not hand the old
+/// history's checkpoint to the summarizer as the parent state.
+#[test]
+fn wor60_fold_never_shows_another_historys_state_to_the_summarizer() {
+    let mut agent = sessionless_active_agent();
+    agent.messages = vec![ChatMessage::text("user", "private marker alpha-7731")];
+    assert!(agent.compact(None).compacted);
+    agent.messages = vec![ChatMessage::text("user", "an unrelated task")];
+    let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = prompts.clone();
+    agent.summarizer = Some(davinci_agent::Summarizer::new(move |request| {
+        seen.lock().unwrap().push(request.prompt.clone());
+        Err("no proposal".into())
+    }));
+    agent.fold_context(FoldReason::Manual, None).unwrap();
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(!prompts[0].contains("alpha-7731"), "{}", prompts[0]);
+    let state = agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .context_vm
+        .load_state_from_root()
+        .unwrap();
+    assert!(!serde_json::to_string(&state)
+        .unwrap()
+        .contains("alpha-7731"));
+}
