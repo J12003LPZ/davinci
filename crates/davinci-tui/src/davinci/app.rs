@@ -15,6 +15,7 @@ use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOw
 use super::model::{Choice, Model, Overlay, Screen};
 use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
+use super::views::scrollbar::{self, Scrollbar};
 use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_bar, context_inspector, decision_modal, diff,
@@ -55,6 +56,8 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
 pub struct ComposedFrame {
     pub lines: Vec<Line<'static>>,
     pub graph: Option<super::views::graph_nav::GraphFrame>,
+    /// The conversation's scrollbar, when it has more rows than fit.
+    pub scrollbar: Option<Scrollbar>,
 }
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
@@ -63,6 +66,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         return ComposedFrame {
             lines: Vec::new(),
             graph: None,
+            scrollbar: None,
         };
     }
     if matches!(model.screen, Screen::Models | Screen::Settings) && model.overlay.is_none() {
@@ -84,6 +88,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         return ComposedFrame {
             lines: pad_to(lines, height),
             graph: None,
+            scrollbar: None,
         };
     }
     // Command surfaces use the same bottom-anchored, unboxed language as the
@@ -94,6 +99,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             return ComposedFrame {
                 lines: command_panel_frame(model, content, height),
                 graph: None,
+                scrollbar: None,
             };
         }
     }
@@ -178,7 +184,17 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     rows.extend(top);
     let body_start = rows.len() as u16;
     let mut graph = None;
-    let content = body_with_graph(model, body_height, &mut graph);
+    let mut scrollbar = None;
+    let content = if conversation {
+        let (rows, bar) = conversation_body(model, body_height);
+        scrollbar = bar.map(|bar| Scrollbar {
+            top: body_start,
+            ..bar
+        });
+        rows
+    } else {
+        body_with_graph(model, body_height, &mut graph)
+    };
     rows.extend(if conversation {
         pad_to(content, body_height)
     } else {
@@ -206,7 +222,139 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     ComposedFrame {
         lines: pad_to(rows, height),
         graph,
+        scrollbar,
     }
+}
+
+/// The conversation, scrolled to `model.transcript_scroll`, with its
+/// scrollbar in the last column once it outgrows `height`. The banner leads
+/// the conversation, so scrolling to the top reaches it, as in a terminal's
+/// own scrollback. A window under `scrollbar::MIN_WIDTH` scrolls the same
+/// way with the bar left undrawn.
+fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Option<Scrollbar>) {
+    if height == 0 || model.transcript.is_empty() {
+        return (body(model, height), None);
+    }
+    let drawn = model.width >= scrollbar::MIN_WIDTH;
+    // The text always leaves the bar's column, so a conversation that starts
+    // to overflow does not reflow under the reader.
+    let width = if drawn { model.width - 1 } else { model.width };
+    let mut head = vec![blank()];
+    head.extend(startup::banner(model, &model.startup));
+    head.push(blank());
+    let conversation = transcript::conversation_rows(model, width);
+    let total = head.len() + conversation.len();
+    // Rows `range` of banner-then-conversation, copying only those rows.
+    let rows_of = |range: std::ops::Range<usize>| {
+        let split = head.len();
+        let mut out: Vec<Line<'static>> = Vec::with_capacity(range.len());
+        if range.start < split {
+            out.extend_from_slice(&head[range.start..range.end.min(split)]);
+        }
+        if range.end > split {
+            out.extend(conversation.slice(range.start.max(split) - split..range.end - split));
+        }
+        out
+    };
+    let scroll = model.transcript_scroll.get();
+    let top = scroll.top_for(model.width, &model.transcript);
+    if scroll.top.is_some() && top.is_none() {
+        // Cleared, replaced or resized: back to the newest.
+        model.transcript_scroll.take();
+    }
+    if total <= height {
+        let mut content = rows_of(0..total);
+        if content.len() < height {
+            content.push(blank());
+        }
+        return (content, None);
+    }
+    let max_top = total - height;
+    let top = top.map_or(max_top, |top| top.min(max_top));
+    let offset = max_top - top;
+    let bar = Scrollbar {
+        column: model.width.saturating_sub(1),
+        top: 0,
+        height: height as u16,
+        total,
+        offset,
+        drawn,
+    };
+    let mut rows = rows_of(top..top + height);
+    if offset > 0 {
+        let cc = model.theme.cc();
+        let below = format!(
+            "  ↓ {offset} {} below · scroll down or pgdn to return",
+            if offset == 1 { "line" } else { "lines" }
+        );
+        if let Some(last) = rows.last_mut() {
+            *last = Line::from(ui::span(ui::clip_ellipsis(&below, width), cc.permission));
+        }
+    }
+    if !drawn {
+        return (rows, Some(bar));
+    }
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut spans = ui::truncate_run(row.spans, width);
+            let used = ui::run_width(&spans);
+            if used < width {
+                spans.push(ratatui::text::Span::raw(
+                    " ".repeat(usize::from(width - used)),
+                ));
+            }
+            spans.push(bar.cell(&model.theme, index as u16));
+            Line::from(spans)
+        })
+        .collect();
+    (rows, Some(bar))
+}
+
+/// Scroll the conversation by `rows` (up is positive). `false` when there is
+/// nothing to scroll: another surface is open or everything already fits.
+pub fn scroll_transcript(model: &mut Model, rows: isize) -> bool {
+    let Some(bar) = transcript_scrollbar(model) else {
+        return false;
+    };
+    let offset = bar.offset.saturating_add_signed(rows).min(bar.max_offset());
+    set_transcript_offset(model, &bar, offset);
+    true
+}
+
+/// Scroll by whole screens of conversation. A page is two rows short of the
+/// view: one row of overlap, and one for the `↓ … below` line that covers
+/// the last row while scrolled back.
+pub fn scroll_transcript_pages(model: &mut Model, pages: isize) -> bool {
+    let Some(bar) = transcript_scrollbar(model) else {
+        return false;
+    };
+    let page = bar.height.saturating_sub(2).max(1) as isize;
+    scroll_transcript(model, pages * page)
+}
+
+/// The conversation's scrollbar as the next frame will lay it out.
+pub fn transcript_scrollbar(model: &Model) -> Option<Scrollbar> {
+    if model.screen != Screen::Agent || model.overlay.is_some() || model.codex_open() {
+        return None;
+    }
+    compose_frame(model, model.height).scrollbar
+}
+
+/// Scroll to `offset` rows up from the newest, as measured by `bar`. Back at
+/// the newest the view follows new output again.
+pub fn set_transcript_offset(model: &mut Model, bar: &Scrollbar, offset: usize) {
+    let offset = offset.min(bar.max_offset());
+    model.transcript_scroll.set(if offset == 0 {
+        super::model::TranscriptScroll::default()
+    } else {
+        super::model::TranscriptScroll::at(
+            bar.max_offset() - offset,
+            model.width,
+            &model.transcript,
+        )
+    });
 }
 
 /// A shared command panel for authentication, history, help, policies and
@@ -702,6 +850,21 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         // keys to the instruments, so the editor never sees them.
         if let Some(flow) = handle_global_key(model, data) {
             return flow;
+        }
+        // A draft that fits on one row has no pages to move through, so the
+        // page keys scroll the conversation; a longer draft keeps them.
+        let pages = if model.keybindings.matches(data, "tui.altScreen.pageUp") {
+            1
+        } else if model.keybindings.matches(data, "tui.altScreen.pageDown") {
+            -1
+        } else {
+            0
+        };
+        let one_row = !model.composer.contains('\n')
+            && unicode_width::UnicodeWidthStr::width(&*model.composer) + 4
+                < usize::from(model.width);
+        if pages != 0 && one_row && scroll_transcript_pages(model, pages) {
+            return Flow::Continue;
         }
         if apply_editor_key(model.composer.editor_mut(), &model.keybindings, data) {
             // Deleting a word or moving the caret changes what is on offer.

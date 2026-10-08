@@ -27,6 +27,22 @@ hint and no list (Claude Code `shell/54-tab-mod`); argument values are offered
 once the first character of the argument is typed, in the ordinary completion
 list. Host notices render as a wrapped `●` line, never as `● Tool(…)`.
 
+The conversation scrolls. DaVinci draws on the alternate screen, where the
+terminal keeps no scrollback and shows no scrollbar (Windows Terminal hides
+it there), so the conversation carries both itself. The banner leads it; the
+mouse wheel moves three rows a notch; the page keys (`tui.altScreen.pageUp`
+and `pageDown`, PgUp/PgDn by default) move a screen less two rows while the
+draft fits on one row, and a longer draft keeps them for the editor. Once
+the conversation outgrows the window a scrollbar (`│` track, `┃` thumb)
+fills the last column: pressing the track jumps there, dragging the thumb
+follows the pointer, and copied text leaves the bar out. Below 20 columns it
+scrolls the same way with no bar drawn. Scrolled back, the last row reads
+`↓ N lines below · scroll down or pgdn to return`. The view is anchored from
+the top, so output streaming in, or calls collapsing as they finish, never
+move it; sending a turn returns to the newest, and so does a resize or a
+conversation that is cleared, rewound or replaced. Over a list or a command
+sheet the wheel steps the selection like the arrows.
+
 `/context` follows Claude Code's command of the same name: under the echoed
 `❯ /context` it hangs `⎿  Context Usage`, a ten-by-ten grid of the window (`■`
 full, `▪` partial, `□` free, `▒` the autocompact buffer filling from the end)
