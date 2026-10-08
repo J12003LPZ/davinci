@@ -306,8 +306,8 @@ fn parent_provenance(parent: &CheckpointState) -> ParentSources {
     result
 }
 
-/// Words that carry no claim of their own. Negations are deliberately absent:
-/// "do not delete" and "delete" must never ground each other.
+/// Words that carry no claim of their own; they may be dropped from a quote.
+/// Negations are deliberately absent: "do not delete" never grounds "delete".
 const UNGROUNDED_WORDS: &[&str] = &[
     "a",
     "an",
@@ -349,22 +349,75 @@ const UNGROUNDED_WORDS: &[&str] = &[
     "please",
 ];
 
-fn words(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
+/// Words that reverse what follows them in a clause, besides any "n't"
+/// contraction ("don't", "can't", "isn't").
+const NEGATIONS: &[&str] = &[
+    "not", "no", "never", "nor", "without", "avoid", "dont", "cannot", "stop",
+];
+
+fn is_negation(word: &str) -> bool {
+    NEGATIONS.contains(&word) || word.ends_with("n't") || word.ends_with("n\u{2019}t")
 }
 
-/// True when every content word of `value` appears in the text it cites:
-/// the summarizer may shorten or reorder the user's words but not add new
-/// ones. Quoting out of context (dropping a qualifier) is not detectable here.
+/// Whitespace-separated words, lowercased, with surrounding punctuation
+/// trimmed. Inner punctuation stays, so `src/main.rs` and `.env` remain
+/// distinct from `main` and `env`.
+fn content_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let word = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+            let start = word.find(|c: char| c.is_alphanumeric())?;
+            // Keep the dot of a dotfile name: ".env" is not "env".
+            let start = if start > 0 && word[..start].ends_with('.') {
+                start - 1
+            } else {
+                start
+            };
+            Some(word[start..].to_lowercase())
+        })
+        .filter(|word| !UNGROUNDED_WORDS.contains(&word.as_str()))
+        .collect()
+}
+
+/// Clauses end at `;`, `!`, `?`, a line break, or a period that ends a
+/// sentence (followed by whitespace or the end), never at the dot in a name.
+fn clauses(text: &str) -> Vec<&str> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        let ends = match c {
+            ';' | '!' | '?' | '\n' => true,
+            '.' => chars.peek().is_none_or(|(_, next)| next.is_whitespace()),
+            _ => false,
+        };
+        if ends {
+            clauses.push(&text[start..index]);
+            start = index + c.len_utf8();
+        }
+    }
+    clauses.push(&text[start..]);
+    clauses
+}
+
+/// True when `value` quotes one cited source: its content words appear as one
+/// contiguous run inside a single clause of that source, and no negation
+/// precedes the run in that clause. The summarizer may drop function words
+/// but cannot reorder ("tabs, not spaces" never grounds "spaces, not tabs"),
+/// stitch words from different messages, or drop a negation that scopes the
+/// quote ("don't delete the tests" never grounds "delete the tests"). A
+/// negation earlier in the clause rejects even an unrelated quote; that only
+/// costs the summarizer's copy, as the checkpoint keeps the user's own text.
 fn grounded_in_sources(
     value: &ProposedStateValue,
     events: &HashMap<&str, &ContextEvent>,
     parent: &ParentSources,
 ) -> bool {
-    let mut cited = HashSet::new();
-    for source_ref in &value.source_refs {
+    let quote = content_words(&value.value);
+    if quote.is_empty() {
+        return false;
+    }
+    value.source_refs.iter().any(|source_ref| {
         let text = match events.get(source_ref.as_str()) {
             Some(event) => event.visible_text.as_str(),
             None => match parent.get(source_ref) {
@@ -372,19 +425,17 @@ fn grounded_in_sources(
                 None => return false,
             },
         };
-        cited.extend(words(text));
-    }
-    let all = words(&value.value).collect::<Vec<_>>();
-    let content = all
-        .iter()
-        .filter(|word| !UNGROUNDED_WORDS.contains(&word.as_str()))
-        .collect::<Vec<_>>();
-    let required = if content.is_empty() {
-        all.iter().collect()
-    } else {
-        content
-    };
-    !required.is_empty() && required.iter().all(|word| cited.contains(*word))
+        clauses(text).into_iter().any(|clause| {
+            let clause = content_words(clause);
+            clause
+                .windows(quote.len())
+                .enumerate()
+                .any(|(start, window)| {
+                    window == quote.as_slice()
+                        && !clause[..start].iter().any(|word| is_negation(word))
+                })
+        })
+    })
 }
 
 fn state_provenance_refs(state: &CheckpointState) -> HashSet<String> {

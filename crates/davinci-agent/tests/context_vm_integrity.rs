@@ -62,7 +62,7 @@ fn wor62_forged_user_constraint_citing_unrelated_text_is_rejected() {
 }
 
 #[test]
-fn wor62_grounded_user_values_may_be_shortened_and_reordered() {
+fn wor62_grounded_user_values_may_drop_function_words() {
     let events = vec![event(
         "user:1",
         1,
@@ -81,6 +81,93 @@ fn wor62_grounded_user_values_may_be_shortened_and_reordered() {
     // A negation is a content word: it cannot be added to a quote either.
     let proposal = CheckpointProposal {
         constraints: vec![user_value("do not keep the public API stable", "user:1")],
+        ..CheckpointProposal::default()
+    };
+    let state = ContextStateReducer::validate_proposal(&Default::default(), &events, proposal);
+    assert!(state.constraints.is_empty());
+}
+
+/// Each value below uses only the user's words but says something the user
+/// did not: reordered, stitched across clauses, or stripped of a negation.
+#[test]
+fn wor62_quotes_cannot_invert_or_restitch_the_users_meaning() {
+    let cases = [
+        ("Use tabs, not spaces.", "use spaces, not tabs"),
+        ("Use tabs, not spaces.", "spaces"),
+        (
+            "Don't delete the tests; clean the build dir.",
+            "delete the tests",
+        ),
+        (
+            "Don't delete the tests; clean the build dir.",
+            "don't clean the build dir",
+        ),
+        ("Remove the env section from the docs.", "remove .env"),
+        (
+            "Never push to main without review. Push the branch.",
+            "push to main without review",
+        ),
+        (
+            "Do not, under any circumstances, drop the table.",
+            "drop the table",
+        ),
+    ];
+    for (said, forged) in cases {
+        let events = vec![event("user:1", 1, ContextEventKind::User, said)];
+        let proposal = CheckpointProposal {
+            constraints: vec![user_value(forged, "user:1")],
+            ..CheckpointProposal::default()
+        };
+        let state = ContextStateReducer::validate_proposal(&Default::default(), &events, proposal);
+        assert!(
+            state.constraints.is_empty(),
+            "{forged:?} accepted from {said:?}"
+        );
+    }
+    // The faithful quotes from the same messages still pass.
+    let faithful = [
+        ("Use tabs, not spaces.", "use tabs"),
+        (
+            "Don't delete the tests; clean the build dir.",
+            "clean the build dir",
+        ),
+        (
+            "Don't delete the tests; clean the build dir.",
+            "don't delete the tests",
+        ),
+        (
+            "Never push to main without review. Push the branch.",
+            "never push to main without review",
+        ),
+    ];
+    for (said, quote) in faithful {
+        let events = vec![event("user:1", 1, ContextEventKind::User, said)];
+        let proposal = CheckpointProposal {
+            constraints: vec![user_value(quote, "user:1")],
+            ..CheckpointProposal::default()
+        };
+        let state = ContextStateReducer::validate_proposal(&Default::default(), &events, proposal);
+        assert_eq!(
+            state.constraints.len(),
+            1,
+            "{quote:?} rejected from {said:?}"
+        );
+    }
+}
+
+/// Words from two different messages cannot be stitched into one claim.
+#[test]
+fn wor62_a_quote_comes_from_one_cited_source() {
+    let events = vec![
+        event("user:1", 1, ContextEventKind::User, "delete"),
+        event("user:2", 2, ContextEventKind::User, "all the files"),
+    ];
+    let proposal = CheckpointProposal {
+        constraints: vec![ProposedStateValue {
+            value: "delete all files".into(),
+            source_refs: vec!["user:1".into(), "user:2".into()],
+            provenance_kind: ProvenanceKind::UserDecision,
+        }],
         ..CheckpointProposal::default()
     };
     let state = ContextStateReducer::validate_proposal(&Default::default(), &events, proposal);
@@ -604,9 +691,9 @@ fn wor59_tool_rounds_do_not_rebuild_the_vm() {
             ..Default::default()
         });
         agent.messages.push(ChatMessage::tool_result(
-            &format!("call-{round}"),
+            format!("call-{round}"),
             "read",
-            &format!("contents {round}"),
+            format!("contents {round}"),
             false,
         ));
         agent.invalidate_context_image();
