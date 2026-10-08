@@ -99,12 +99,40 @@ impl ContextCompiler {
             entries.push(entry);
         }
 
-        // Admission order is not message order. Recent conversation is
-        // admitted first, newest first: the hot set is already capped by the
-        // hot window, so it is the recency reserve, and optional episode
-        // descriptors and broker items share what it leaves (WOR-72). The
-        // messages keep their cache-friendly order: pages, broker, then hot.
+        // Admission order is not message order (WOR-72). After the required
+        // entries come optional broker items at or above
+        // PRIORITY_OVER_RECENT_TURNS (the living plan), then recent turns,
+        // newest first: the hot set is already capped by the hot window, so
+        // it is the recency reserve. Episode descriptors and the remaining
+        // broker items share what is left. The messages keep their
+        // cache-friendly order: pages, broker, then hot.
         let mut optional_remaining = optional_limit.saturating_sub(used_tokens);
+        let mut broker = request
+            .broker_packet
+            .items
+            .iter()
+            .map(|item| {
+                let entry = broker_entry(item);
+                (!entry.mandatory).then_some((item.priority, entry))
+            })
+            .collect::<Vec<_>>();
+        let mut admitted = vec![false; broker.len()];
+        let mut admit_broker = |high: bool, remaining: &mut u64| {
+            for (slot, candidate) in broker.iter().enumerate() {
+                let Some((priority, entry)) = candidate else {
+                    continue;
+                };
+                if admitted[slot]
+                    || (*priority >= PRIORITY_OVER_RECENT_TURNS) != high
+                    || entry.estimated_tokens > *remaining
+                {
+                    continue;
+                }
+                *remaining -= entry.estimated_tokens;
+                admitted[slot] = true;
+            }
+        };
+        admit_broker(true, &mut optional_remaining);
         let mut selected_from_tail = Vec::new();
         let mut hot_tokens = 0u64;
         while let Some(event) = selected_hot.pop() {
@@ -137,12 +165,11 @@ impl ContextCompiler {
             entries.push(entry);
         }
 
-        for item in &request.broker_packet.items {
-            let entry = broker_entry(item);
-            if entry.mandatory || entry.estimated_tokens > optional_remaining {
+        admit_broker(false, &mut optional_remaining);
+        for (slot, candidate) in broker.iter_mut().enumerate() {
+            let Some((_, entry)) = candidate.take().filter(|_| admitted[slot]) else {
                 continue;
-            }
-            optional_remaining -= entry.estimated_tokens;
+            };
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
             messages.push(ChatMessage::text("custom", entry.content.clone()));
             entries.push(entry);
@@ -398,6 +425,10 @@ fn broker_provenance(item: &ContextItem) -> ProvenanceKind {
         })
         .unwrap_or(ProvenanceKind::RepositoryFact)
 }
+
+/// Optional broker items at or above this priority are admitted before
+/// recent conversation. The living plan uses 500; repository files 100.
+const PRIORITY_OVER_RECENT_TURNS: i32 = 500;
 
 fn estimate_tokens(bytes: usize) -> u64 {
     // Includes custom-message envelope and provider framing.
