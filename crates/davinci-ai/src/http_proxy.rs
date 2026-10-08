@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use url::Url;
@@ -155,6 +155,32 @@ pub fn connect_response_ok(response: &str) -> bool {
 /// with well under 1 KiB; the cap stops a hostile one from growing memory.
 const MAX_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
 
+/// Tries each address in turn, giving every attempt only what is left of the
+/// shared `deadline`, so N unreachable addresses cost one timeout, not N.
+fn connect_within_deadline<I, F>(
+    addrs: I,
+    deadline: Instant,
+    mut connect: F,
+) -> Result<TcpStream, String>
+where
+    I: IntoIterator<Item = SocketAddr>,
+    F: FnMut(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+{
+    let mut last_error = "WebSocket connect failed".to_string();
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            last_error = "WebSocket connect failed: timed out".to_string();
+            break;
+        }
+        match connect(&addr, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = format!("WebSocket connect failed: {err}"),
+        }
+    }
+    Err(last_error)
+}
+
 pub fn tcp_connect_via_http_proxy(
     proxy: &Url,
     target_host: &str,
@@ -170,18 +196,11 @@ pub fn tcp_connect_via_http_proxy(
     let addrs = (proxy_host, proxy_port)
         .to_socket_addrs()
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
-    let mut last_error = "WebSocket connect failed".to_string();
-    let mut tcp = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                tcp = Some(stream);
-                break;
-            }
-            Err(err) => last_error = format!("WebSocket connect failed: {err}"),
-        }
-    }
-    let mut tcp = tcp.ok_or(last_error)?;
+    // One deadline covers address attempts and the header read.
+    let deadline = Instant::now() + timeout;
+    let mut tcp = connect_within_deadline(addrs, deadline, |addr, remaining| {
+        TcpStream::connect_timeout(addr, remaining)
+    })?;
     tcp.set_nodelay(true)
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
     tcp.set_read_timeout(Some(timeout))
@@ -196,9 +215,8 @@ pub fn tcp_connect_via_http_proxy(
     // tunnel, so nothing past the header terminator may be consumed here.
     let mut byte = [0u8; 1];
     let mut collected = Vec::new();
-    // One deadline for the whole header read: the per-read timeout alone
-    // never fires on a proxy that keeps trickling bytes.
-    let deadline = Instant::now() + timeout;
+    // The per-read timeout alone never fires on a proxy that keeps
+    // trickling bytes, so every read is bounded by the shared deadline.
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -466,5 +484,25 @@ mod tests {
         let mut payload = [0u8; 14];
         tcp.read_exact(&mut payload).unwrap();
         assert_eq!(&payload, b"tunnel-payload");
+    }
+
+    #[test]
+    fn wor80_connect_deadline_is_shared_across_resolved_addresses() {
+        let addrs: Vec<SocketAddr> = (1..=4)
+            .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
+            .collect();
+        let timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let mut attempts = 0;
+        let result = connect_within_deadline(addrs, started + timeout, |_, remaining| {
+            attempts += 1;
+            // An unreachable address burns whatever time it is granted.
+            thread::sleep(remaining);
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        });
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert!(elapsed < Duration::from_millis(600), "took {elapsed:?}");
     }
 }
