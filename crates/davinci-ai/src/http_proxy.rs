@@ -146,7 +146,9 @@ pub fn http_connect_request(target_host: &str, target_port: u16, proxy: &Url) ->
 }
 
 pub fn connect_response_ok(response: &str) -> bool {
-    response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
+    let status_line = response.lines().next().unwrap_or_default();
+    let mut fields = status_line.splitn(3, ' ');
+    matches!(fields.next(), Some("HTTP/1.1" | "HTTP/1.0")) && fields.next() == Some("200")
 }
 
 pub fn tcp_connect_via_http_proxy(
@@ -358,5 +360,19 @@ mod tests {
         assert!(!proxied("*,localhost", "https://example.org"));
         assert!(!proxied("localhost *", "https://example.org"));
         assert!(proxied("localhost,internal.test", "https://example.org"));
+    }
+
+    #[test]
+    fn wor75_connect_response_requires_exact_200_status_field() {
+        assert!(connect_response_ok(
+            "HTTP/1.1 200 Connection established\r\n\r\n"
+        ));
+        assert!(connect_response_ok("HTTP/1.0 200 OK\r\n\r\n"));
+        assert!(connect_response_ok("HTTP/1.1 200\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/1.1 2000 Bad\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/1.1 200X\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/1.1  200 OK\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/2 200\r\n\r\n"));
+        assert!(!connect_response_ok(""));
     }
 }
