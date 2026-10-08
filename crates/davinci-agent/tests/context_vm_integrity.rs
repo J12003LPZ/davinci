@@ -583,3 +583,82 @@ fn wor58_session_images_survive_replay_into_the_image() {
     let wire = serde_json::to_string(&agent.messages_for_provider()).unwrap();
     assert_eq!(wire.matches("UE5HLXNlc3Npb24=").count(), 1, "{wire}");
 }
+
+/// The per-round delta and the compile must agree on the event list, or
+/// every tool round reads as a diverged history and rebuilds the VM.
+#[test]
+fn wor59_tool_rounds_do_not_rebuild_the_vm() {
+    let mut agent = sessionless_active_agent();
+    agent.messages = vec![ChatMessage::text("user", "fix the build")];
+    agent.prepared_context_image().unwrap();
+    let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
+    let baseline = vm.metrics().rebuilds;
+    for round in 0..3 {
+        agent.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: vec![davinci_ai::MessageContent::ToolCall {
+                id: format!("call-{round}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": format!("f{round}")}),
+            }],
+            ..Default::default()
+        });
+        agent.messages.push(ChatMessage::tool_result(
+            &format!("call-{round}"),
+            "read",
+            &format!("contents {round}"),
+            false,
+        ));
+        agent.invalidate_context_image();
+        vm.append_delta(&agent.context_vm_events_for_test())
+            .unwrap();
+        agent.prepared_context_image().unwrap();
+    }
+    assert_eq!(
+        vm.metrics().rebuilds,
+        baseline,
+        "a tool round rebuilt the VM"
+    );
+}
+
+/// A fold made while a tool exchange is live must survive the compile that
+/// follows it, and match what the session persisted.
+#[test]
+fn wor59_fold_with_a_live_tool_exchange_is_kept() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session =
+        davinci_session::JsonlSession::create(directory.path(), "fixture", None).unwrap();
+    let messages = tool_exchange("live output marker-5524");
+    for (index, message) in messages.iter().enumerate() {
+        let seq = index as u64 + 1;
+        session
+            .append_entry(davinci_session::SessionEntry {
+                id: format!("event-{seq}"),
+                entry_type: "message".into(),
+                parent_id: session.leaf_id.clone(),
+                seq,
+                timestamp: 0,
+                message: Some(serde_json::to_value(message).unwrap()),
+                custom_type: None,
+                extra: Default::default(),
+            })
+            .unwrap();
+    }
+    let mut agent = Agent::new("system");
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.session = Some(session);
+    agent.messages = messages;
+    agent.set_runtime(runtime());
+    let folded = agent.fold_context(FoldReason::Manual, None).unwrap();
+    agent.prepared_context_image().unwrap();
+    let vm = &agent.runtime.as_ref().unwrap().context_vm;
+    assert_eq!(vm.root().epoch, folded.epoch);
+    assert_eq!(vm.root().checkpoint, folded.checkpoint);
+    assert_eq!(vm.root().episodes, folded.episodes);
+    let (persisted, _) = davinci_agent::runtime::context_vm::latest_persisted_root(
+        &agent.session.as_ref().unwrap().entries,
+        agent.session.as_ref().unwrap().leaf_id.as_deref(),
+    )
+    .unwrap();
+    assert_eq!(persisted.checkpoint, folded.checkpoint);
+}

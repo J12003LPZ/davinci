@@ -482,7 +482,7 @@ impl Agent {
             // folds its derived state instead.
             let tokens = if active_context_vm {
                 self.invalidate_context_image();
-                let events = self.context_vm_events_for_runtime();
+                let events = self.context_vm_events_for_vm();
                 if let Some(runtime) = &self.runtime {
                     if let Err(error) = runtime.context_vm.append_delta(&events) {
                         runtime.context_vm.record_failure("append_delta", error);

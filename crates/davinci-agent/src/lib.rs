@@ -2163,6 +2163,12 @@ impl Agent {
         ))
     }
 
+    /// The event list the run loop hands to `append_delta` each round.
+    #[doc(hidden)]
+    pub fn context_vm_events_for_test(&self) -> Vec<runtime::context_vm::ContextEvent> {
+        self.context_vm_events_for_vm()
+    }
+
     #[doc(hidden)]
     pub fn legacy_messages_for_provider_for_test(&self) -> Vec<ChatMessage> {
         self.legacy_messages_for_provider()
@@ -2172,10 +2178,7 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
-        let mut events = self.context_vm_events_for_runtime();
-        if let Some(start) = self.live_tool_exchange_start() {
-            drop_live_exchange_events(&mut events, &self.messages[start..]);
-        }
+        let events = self.context_vm_events_for_vm();
         let selected = self.select_root_context(self.context_window);
         let mut items = Vec::new();
         for file in selected.repository_files {
@@ -2361,6 +2364,18 @@ impl Agent {
     pub fn context_vm_provider_output_limit(&self) -> Option<u64> {
         (self.context_vm_mode() == ContextVmMode::Active)
             .then(|| self.provider_context_budget().output_limit())
+    }
+
+    /// The events every VM recorder (compile, delta, fold) works from. The
+    /// live tool exchange is excluded: it goes to the provider as native
+    /// messages, and recorders that disagreed on it would read the shorter
+    /// list as a diverged history and rebuild (WOR-59).
+    pub(crate) fn context_vm_events_for_vm(&self) -> Vec<runtime::context_vm::ContextEvent> {
+        let mut events = self.context_vm_events_for_runtime();
+        if let Some(start) = self.live_tool_exchange_start() {
+            drop_live_exchange_events(&mut events, &self.messages[start..]);
+        }
+        events
     }
 
     pub(crate) fn context_vm_events_for_runtime(&self) -> Vec<runtime::context_vm::ContextEvent> {
@@ -3714,7 +3729,7 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
-        let events = self.context_vm_events_for_runtime();
+        let events = self.context_vm_events_for_vm();
         // A VM whose recorded events this history no longer extends holds
         // another history's state; the summarizer must not see it.
         let parent = if runtime.context_vm.continues(&events) {
