@@ -1,4 +1,6 @@
-//! HTTP(S) proxy resolution matching TS `utils/node-http-proxy.ts`.
+//! HTTP(S) proxy resolution, based on TS `utils/node-http-proxy.ts`. One
+//! deliberate difference: a bare `NO_PROXY` domain also covers its subdomains
+//! (WOR-77), as curl and most proxy clients do.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

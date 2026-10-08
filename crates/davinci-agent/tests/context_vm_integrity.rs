@@ -914,3 +914,39 @@ fn wor81_retrieval_query_matches_case_insensitively() {
         "Error: build failed\nERROR in linker\nan error here"
     );
 }
+
+/// The same property through the real run loop: tool rounds driven by
+/// `run_loop` (which records a delta each round) never rebuild the VM.
+#[test]
+fn wor59_run_loop_tool_rounds_do_not_rebuild_the_vm() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "alpha").unwrap();
+    let mut agent = sessionless_active_agent();
+    agent.cwd = root.path().to_path_buf();
+    agent.set_permission_mode(davinci_agent::PermissionMode::AlwaysApprove);
+    agent.prompt_user_with("read a.txt three times", &[]);
+    let mut requests = 0;
+    agent
+        .run_loop(|_| {
+            requests += 1;
+            let message = if requests <= 3 {
+                serde_json::json!({
+                    "id": format!("r{requests}"), "role": "assistant", "model": "fixture",
+                    "stopReason": "toolUse",
+                    "content": [{"type": "toolCall", "id": format!("call-{requests}"),
+                        "name": "read", "arguments": {"path": "a.txt"}}]
+                })
+            } else {
+                serde_json::json!({
+                    "id": "done", "role": "assistant", "model": "fixture",
+                    "stopReason": "stop", "content": [{"type": "text", "text": "done"}]
+                })
+            };
+            Ok(serde_json::from_value::<davinci_ai::AssistantMessage>(message).unwrap())
+        })
+        .unwrap();
+    assert_eq!(requests, 4);
+    let vm = &agent.runtime.as_ref().unwrap().context_vm;
+    // One rebuild creates the first checkpoint; none after that.
+    assert_eq!(vm.metrics().rebuilds, 1, "{:?}", vm.metrics());
+}

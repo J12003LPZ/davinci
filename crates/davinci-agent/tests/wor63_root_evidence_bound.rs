@@ -1,6 +1,7 @@
 use davinci_agent::runtime::cache::CacheRuntime;
 use davinci_agent::runtime::context_vm::{
-    events_from_messages, ContextVmConfig, ContextVmRuntime, MAX_ROOT_EVIDENCE_REFS,
+    events_from_messages, ContextEventKind, ContextVmConfig, ContextVmRuntime,
+    MAX_ROOT_EVIDENCE_REFS,
 };
 use davinci_agent::ContextPacket;
 use davinci_ai::ChatMessage;
@@ -25,16 +26,16 @@ fn wor63_root_evidence_refs_stay_bounded_in_tool_heavy_sessions() {
 
     let root = runtime.root();
     assert_eq!(root.evidence_refs.len(), MAX_ROOT_EVIDENCE_REFS);
-    // Newest refs are the ones kept, in order.
-    let newest = events
+    // The newest tool-result refs are the ones kept, oldest first.
+    let tool_refs = events
         .iter()
-        .rev()
-        .filter(|event| event.source_ref.contains("call-"))
+        .filter(|event| event.kind == ContextEventKind::ToolResult)
         .map(|event| event.source_ref.clone())
-        .next();
-    if let Some(newest) = newest {
-        assert_eq!(root.evidence_refs.last(), Some(&newest));
-    }
+        .collect::<Vec<_>>();
+    assert_eq!(
+        root.evidence_refs,
+        tool_refs[tool_refs.len() - MAX_ROOT_EVIDENCE_REFS..]
+    );
     let bytes = serde_json::to_vec(&root.evidence_refs).unwrap().len();
     assert!(
         bytes < 4 * 1024,
