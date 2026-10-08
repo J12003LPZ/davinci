@@ -13,13 +13,12 @@ use davinci_agent::{
     ToolApprovalDecision, ToolApprovalRequest,
 };
 use davinci_tui::davinci::model::{
-    Ask, AskKind, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger,
-    ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, FailedRun, Finding,
-    GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk, HunkKind,
-    KeymapGroup, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep, ProviderRow,
-    ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step,
-    SubagentRow, SubagentRowState, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
-    WorkflowsSheet, Working, WorkshopSheet,
+    Ask, AskKind, CatalogRow, Choice, CorpusItem, Credential, Entry, ExportLedger, ExtensionRow,
+    ExtensionTab, ExtensionView, ExtensionsSheet, FailedRun, Finding, GovernorCounter,
+    GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk, HunkKind, KeymapGroup, Model,
+    ModelItem, Overlay, PermissionRow, PickerItem, PlanStep, ProviderRow, ResumeRow, ReviewFile,
+    ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step, SubagentRow, SubagentRowState,
+    ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow, WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -1537,6 +1536,23 @@ fn mid_turn_key(
     false
 }
 
+/// A key while `/compact` runs. It edits the composer as mid-turn, but
+/// there is nothing to interrupt and nothing to queue behind: Esc, ctrl+c
+/// and a plain Enter do nothing.
+fn compacting_key(model: &mut Model, key: crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let plain_enter = key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+    if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) || plain_enter {
+        return;
+    }
+    // The flag is never read: the keys that would raise it are gone above.
+    let _ = mid_turn_key(model, key, &Arc::new(AtomicBool::new(false)));
+}
+
 /// A turn and everything queued behind it, in the order it was typed.
 ///
 /// Each queued line goes back through `on_line`, exactly as if it had been
@@ -1647,6 +1663,7 @@ fn run_turn(
         verb_seed,
         reasoning: false,
         thought_for: None,
+        label: None,
     });
     if model.terminal_progress {
         let _ = session.set_progress(true);
@@ -2071,6 +2088,24 @@ pub fn transcript_from(messages: &[davinci_ai::ChatMessage]) -> Vec<Entry> {
         let text = davinci_ai::content_text(&message.content);
         let text = text.trim();
         match message.role.as_str() {
+            // A compaction or branch summary is the model's memory, not
+            // something anyone said: one quiet row marks where it sits.
+            "user" if text.starts_with(davinci_agent::COMPACTION_SUMMARY_PREFIX.trim_end()) => {
+                if !entries.is_empty() {
+                    entries.push(Entry::Gap);
+                }
+                entries.push(Entry::Detail(format!(
+                    "{COMPACTED} · earlier messages summarized"
+                )));
+            }
+            "user" if text.starts_with(davinci_agent::BRANCH_SUMMARY_PREFIX.trim_end()) => {
+                if !entries.is_empty() {
+                    entries.push(Entry::Gap);
+                }
+                entries.push(Entry::Detail(
+                    "back from a branch · its summary is in context".into(),
+                ));
+            }
             "user" if !text.is_empty() => {
                 if !entries.is_empty() {
                     entries.push(Entry::Gap);
@@ -3801,6 +3836,56 @@ pub enum Detached {
 /// Carry out a command that needs the live agent. Everything here mirrors the
 /// arm of `handle_user_line` in `main.rs` that the old chrome ran, minus the
 /// chrome: the same stores, the same extension events, the same order.
+/// The extensions' say before `/compact`: `None` when one cancelled it.
+fn before_compaction(parsed: &crate::args::Args) -> Option<ExtensionHost> {
+    let mut host = crate::loaded_extension_host(parsed);
+    host.runtime_flag_values = crate::flag_values_json(parsed);
+    host.emit(crate::extension_host::ExtensionEvent::SessionBeforeCompact);
+    (!host.last_result_cancelled()).then_some(host)
+}
+
+/// Tell the extensions how `/compact` went and leave one quiet row in the
+/// transcript. The conversation above it stays on screen: compaction changes
+/// what the next request carries, not what was said. The summary itself is
+/// for the model and is never printed.
+fn after_compaction(
+    mut host: ExtensionHost,
+    agent: &Agent,
+    model: &mut Model,
+    result: davinci_agent::CompactionResult,
+    messages_before: usize,
+) -> Done {
+    use crate::extension_host::ExtensionEvent;
+    if !result.compacted {
+        host.emit(ExtensionEvent::SessionCompactFailed {
+            error: result.summary.clone(),
+        });
+        return Done::Note(result.summary);
+    }
+    host.emit(ExtensionEvent::SessionCompact);
+    // Measured the way `tokens_before` was, so the drop is the real one.
+    let after = agent.estimated_context_tokens();
+    let folded = messages_before.saturating_sub(agent.messages.len());
+    let format = davinci_tui::davinci::views::context_usage::format_tokens;
+    let mut row = format!(
+        "{COMPACTED} · {} → {} tokens",
+        format(result.tokens_before),
+        format(after),
+    );
+    // A Context VM fold checkpoints without dropping messages.
+    if folded > 0 {
+        row.push_str(&format!(" · {folded} messages summarized"));
+    }
+    model.transcript.push(Entry::Gap);
+    model.transcript.push(Entry::Detail(row));
+    model.running = false;
+    model.dirty = true;
+    Done::Opened
+}
+
+/// The row that stands where a compaction summary sits in the history.
+const COMPACTED: &str = "context compacted";
+
 pub fn perform(
     parsed: &crate::args::Args,
     agent: &mut Agent,
@@ -3845,71 +3930,18 @@ pub fn perform(
             Ok(Done::Said("started a new session".into()))
         }
         SlashAction::Compact(instructions) => {
-            let mut host = crate::loaded_extension_host(parsed);
-            host.runtime_flag_values = crate::flag_values_json(parsed);
-            host.emit(ExtensionEvent::SessionBeforeCompact);
-            if host.last_result_cancelled() {
+            let Some(host) = before_compaction(parsed) else {
                 return Ok(Done::Note("compaction cancelled".into()));
-            }
+            };
             let messages_before = agent.messages.len();
             let result = agent.compact(instructions.as_deref());
-            if result.compacted {
-                host.emit(ExtensionEvent::SessionCompact);
-            } else {
-                host.emit(ExtensionEvent::SessionCompactFailed {
-                    error: result.summary.clone(),
-                });
-            }
-            model.transcript = transcript_from(&agent.messages);
-            if !result.compacted {
-                return Ok(Done::Said(result.summary));
-            }
-            // The `4c` sheet, as the receipt of what just happened: both
-            // sides measured, what was kept named, what was folded counted.
-            let window = agent.context_window.max(1);
-            let before = result.tokens_before;
-            let after = davinci_agent::estimate_context_tokens(&agent.messages);
-            let folded_messages = messages_before.saturating_sub(agent.messages.len());
-            let thousands = davinci_tui::davinci::views::chrome::thousands;
-            let mut kept = vec![
-                format!("the last {} messages, whole", agent.messages.len()),
-                "the summary of everything folded".into(),
-            ];
-            if let Some(instructions) = instructions.as_deref().filter(|text| !text.is_empty()) {
-                kept.push(format!("your instruction: {}", clip(instructions, 48)));
-            }
-            if !result.details.modified_files.is_empty() {
-                kept.push(format!(
-                    "the {} files the turn modified, named",
-                    result.details.modified_files.len()
-                ));
-            }
-            model.compaction = Some(Compaction {
-                before_tokens: thousands(before),
-                before_fraction: (before as f64 / window as f64).clamp(0.0, 1.0),
-                before_note: format!(
-                    "{:.0}% of {}",
-                    before as f64 / window as f64 * 100.0,
-                    thousands(window)
-                ),
-                after_tokens: thousands(after),
-                after_fraction: (after as f64 / window as f64).clamp(0.0, 1.0),
-                after_note: format!(
-                    "{:.0}% of {}",
-                    after as f64 / window as f64 * 100.0,
-                    thousands(window)
-                ),
-                kept,
-                folded: vec![format!(
-                    "{folded_messages} messages folded into the summary"
-                )],
-                recovers: thousands(before.saturating_sub(after)),
-                call_cost: "in the next /session stats".into(),
-                cache_cost: "the cache re-primes on the next turn".into(),
-                ..Default::default()
-            });
-            open_sheet(model, Screen::Compact);
-            Ok(Done::Opened)
+            Ok(after_compaction(
+                host,
+                agent,
+                model,
+                result,
+                messages_before,
+            ))
         }
         SlashAction::Export(path) => {
             let Some(store) = agent.session.as_ref() else {
@@ -8714,6 +8746,92 @@ impl Shell<'_> {
         apply_host_effects(self)
     }
 
+    /// `/compact` with the shell alive: the summarizing call runs on a
+    /// worker while this loop draws the working line, so the screen moves
+    /// instead of freezing for as long as the provider takes. Typing goes
+    /// into the composer; nothing can interrupt the call, so `running` stays
+    /// off (no "esc to interrupt") and Esc, ctrl+c and Enter are dropped
+    /// rather than replayed as a double-Esc or a quit once it ends.
+    fn compact(&mut self, instructions: Option<String>) -> Next {
+        let Some(host) = before_compaction(self.parsed) else {
+            self.note("compaction cancelled");
+            return Next::Go;
+        };
+        let messages_before = self.agent.messages.len();
+        self.model.working = Some(Working {
+            label: Some("Compacting conversation"),
+            ..Working::default()
+        });
+        if self.model.terminal_progress {
+            let _ = self.terminal.set_progress(true);
+        }
+        let started = Instant::now();
+        let (agent, model, terminal) = (&mut *self.agent, &mut *self.model, &mut *self.terminal);
+        let outcome = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| agent.compact(instructions.as_deref()));
+            let mut last_tick = Instant::now();
+            model.dirty = true;
+            loop {
+                if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
+                    model.advance_tick();
+                    last_tick = Instant::now();
+                    model.dirty = true;
+                }
+                if let Some(working) = model.working.as_mut() {
+                    working.seconds = started.elapsed().as_secs();
+                    // One long call with no events is the whole job, not a
+                    // stall: the worker being alive is the sign of life.
+                    working.idle_ticks = 0;
+                }
+                if model.dirty {
+                    let _ = terminal.draw(model);
+                    model.dirty = false;
+                }
+                if worker.is_finished() {
+                    break;
+                }
+                match terminal.poll_event(Duration::from_millis(40)) {
+                    Ok(Some(crossterm::event::Event::Key(key)))
+                        if key.kind != crossterm::event::KeyEventKind::Release =>
+                    {
+                        compacting_key(model, key);
+                        model.dirty = true;
+                    }
+                    Ok(Some(crossterm::event::Event::Resize(width, height))) => {
+                        model.width = width.max(20);
+                        model.height = height.max(4);
+                        model.dirty = true;
+                    }
+                    Ok(Some(crossterm::event::Event::Paste(text))) => {
+                        model.paste(&text);
+                        model.dirty = true;
+                    }
+                    Ok(_) => {}
+                    // No input to read: still wait, never spin.
+                    Err(_) => std::thread::sleep(Duration::from_millis(40)),
+                }
+            }
+            worker.join()
+        });
+        self.model.working = None;
+        if self.model.terminal_progress {
+            let _ = self.terminal.set_progress(false);
+        }
+        let done = match outcome {
+            Ok(result) => after_compaction(host, self.agent, self.model, result, messages_before),
+            Err(_) => {
+                // The panic skipped the agent's own cleanup, and its message
+                // went to the screen behind the renderer.
+                self.agent.is_compacting = false;
+                let _ = self.terminal.clear();
+                Done::Note("compaction failed: the summarizer stopped unexpectedly".into())
+            }
+        };
+        let next = self.finish(done);
+        self.redress();
+        next
+    }
+
     fn finish(&mut self, done: Done) -> Next {
         match done {
             Done::Said(text) => self.say(&text),
@@ -8983,6 +9101,9 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
         Sent::Say(text) => {
             shell.say(&text);
             Next::Go
+        }
+        Sent::Command(crate::slash::SlashAction::Compact(instructions)) => {
+            shell.compact(instructions)
         }
         Sent::Command(action) => match perform(shell.parsed, shell.agent, shell.model, action) {
             Ok(done) => {

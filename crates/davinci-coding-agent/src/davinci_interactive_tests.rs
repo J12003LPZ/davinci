@@ -3847,3 +3847,109 @@ fn plugins_words_search_unless_they_are_a_subcommand_with_its_target() {
         assert!(super::is_plugin_subcommand(command), "{command:?} runs");
     }
 }
+
+#[test]
+fn a_compaction_summary_reads_as_one_quiet_row_not_its_text() {
+    let summary = "## Progress\n### Done\n- [x] User said hello.";
+    let messages = vec![
+        davinci_agent::compaction_context_message(summary),
+        davinci_ai::ChatMessage::text("user", "keep going"),
+        davinci_agent::branch_summary_context_message("tried the other parser"),
+    ];
+    let entries = transcript_from(&messages);
+    let shown = format!("{entries:?}");
+    assert!(shown.contains("context compacted · earlier messages summarized"));
+    assert!(shown.contains("back from a branch · its summary is in context"));
+    assert!(shown.contains("keep going"));
+    for leaked in [
+        "<summary>",
+        "</summary>",
+        "User said hello",
+        "## Progress",
+        "other parser",
+    ] {
+        assert!(
+            !shown.contains(leaked),
+            "{leaked} leaked into the transcript"
+        );
+    }
+}
+
+#[test]
+fn a_finished_compaction_keeps_the_chat_and_opens_no_sheet() {
+    let mut m = model();
+    m.transcript.push(Entry::user("hello"));
+    m.transcript.push(Entry::prose("hi there"));
+    m.running = true;
+    let mut agent = Agent::new("system");
+    agent.messages = vec![
+        davinci_agent::compaction_context_message("the summary"),
+        davinci_ai::ChatMessage::text("user", "hello"),
+    ];
+    let result = davinci_agent::CompactionResult {
+        summary: "the summary".into(),
+        messages: agent.messages.clone(),
+        compacted: true,
+        details: Default::default(),
+        first_kept_entry_id: String::new(),
+        tokens_before: 24_600,
+        tokens_after: 0,
+        usage: None,
+    };
+    let done = after_compaction(ExtensionHost::default(), &agent, &mut m, result, 5);
+    assert!(matches!(done, Done::Opened));
+    assert!(!m.running);
+    assert!(m.compaction.is_none() && m.overlay.is_none());
+    let shown = format!("{:?}", m.transcript);
+    assert!(
+        shown.contains("hello") && shown.contains("hi there"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("context compacted · 24.6k → ") && shown.contains("3 messages summarized"),
+        "{shown}"
+    );
+    assert!(!shown.contains("the summary"));
+}
+
+#[test]
+fn a_failed_compaction_says_why() {
+    let mut m = model();
+    let agent = Agent::new("system");
+    let result = davinci_agent::CompactionResult {
+        summary: "nothing to compact".into(),
+        messages: Vec::new(),
+        compacted: false,
+        details: Default::default(),
+        first_kept_entry_id: String::new(),
+        tokens_before: 0,
+        tokens_after: 0,
+        usage: None,
+    };
+    let done = after_compaction(ExtensionHost::default(), &agent, &mut m, result, 0);
+    assert!(matches!(done, Done::Note(text) if text == "nothing to compact"));
+    assert!(m.transcript.is_empty());
+}
+
+#[test]
+fn keys_during_compaction_type_but_never_interrupt_or_submit() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut m = model();
+    m.working = Some(Working {
+        label: Some("Compacting conversation"),
+        ..Working::default()
+    });
+    let press = |code, modifiers| KeyEvent::new(code, modifiers);
+    for ch in "next".chars() {
+        compacting_key(&mut m, press(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    compacting_key(&mut m, press(KeyCode::Esc, KeyModifiers::NONE));
+    compacting_key(&mut m, press(KeyCode::Esc, KeyModifiers::NONE));
+    compacting_key(&mut m, press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    compacting_key(&mut m, press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(m.composer.to_string(), "next");
+    let working = m.working.as_ref().unwrap();
+    assert!(!working.interrupting);
+    assert_eq!(working.verb(), "Compacting conversation");
+    assert!(m.transcript.is_empty(), "nothing was submitted or queued");
+}
