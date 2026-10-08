@@ -7,6 +7,12 @@
 //! no token. Results land in [`davinci_ai::codex_usage`], which the shell
 //! draws.
 //!
+//! That login can be a different ChatGPT account from the one DaVinci signed
+//! in with (DaVinci's Sign in with ChatGPT token cannot read usage itself).
+//! Each read asks the child whose account it is (`account/read`); when its
+//! email is not DaVinci's, the numbers are withdrawn and the row says which
+//! account to sign the Codex CLI into instead.
+//!
 //! The child runs only while the row is shown ([`set_active`]): hiding the
 //! row (another provider, `/config` → Plan usage off) stops it. A child that
 //! leaves a read unanswered for [`ANSWER_TIMEOUT`] is killed and restarted.
@@ -18,7 +24,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use davinci_ai::codex_usage;
@@ -32,6 +38,61 @@ const MIN_GAP: Duration = Duration::from_secs(10);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// After the child dies, wait this long before starting another.
 const RESTART_AFTER: Duration = Duration::from_secs(60);
+
+/// The two ChatGPT accounts in play, by email: DaVinci's own sign-in, and
+/// the one the Codex CLI (so the child) is logged into. `None` is unknown.
+/// Replies may come in any order, so a usage answer that lands before its
+/// cycle's account answer is held until that answer says whose it is.
+struct Accounts {
+    davinci: Option<String>,
+    codex: Option<String>,
+    /// The `account/read` this cycle still waits for.
+    awaiting: Option<u64>,
+    /// A usage read answered while `awaiting`.
+    held: Option<davinci_ai::codex_usage::CodexUsageSnapshot>,
+}
+
+const NO_ACCOUNTS: Accounts = Accounts {
+    davinci: None,
+    codex: None,
+    awaiting: None,
+    held: None,
+};
+
+static ACCOUNTS: Mutex<Accounts> = Mutex::new(NO_ACCOUNTS);
+
+fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
+    ACCOUNTS.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// The email DaVinci's `openai-codex` sign-in carries, read from its
+/// credential file each time (a `/login` mid-session switches accounts).
+fn davinci_account() -> Option<String> {
+    let storage = davinci_ai::AuthStorage::create().ok()?;
+    storage
+        .get("openai-codex")?
+        .env
+        .get(davinci_ai::openai_siwc::META_EMAIL)
+        .cloned()
+}
+
+/// Why the child's numbers are not DaVinci's, when both accounts are known
+/// and differ. Emails compare without case or surrounding space. The fix
+/// comes first: the row clips at 80 columns.
+pub(crate) fn account_mismatch(davinci: Option<&str>, codex: Option<&str>) -> Option<String> {
+    let (davinci, codex) = (davinci?.trim(), codex?.trim());
+    if davinci.is_empty() || codex.is_empty() || davinci.eq_ignore_ascii_case(codex) {
+        return None;
+    }
+    Some(format!(
+        "run `codex login` as {davinci} · the Codex CLI is on {codex}"
+    ))
+}
+
+fn current_mismatch() -> Option<String> {
+    let accounts = accounts();
+    account_mismatch(accounts.davinci.as_deref(), accounts.codex.as_deref())
+}
 
 struct Monitor {
     wake: SyncSender<()>,
@@ -209,6 +270,12 @@ impl Drop for Session {
 
 impl Session {
     fn spawn(binary: &std::path::Path) -> Result<Self, String> {
+        // A new child may run under another login (`codex login` in between):
+        // whose account it reads is asked again, not carried over.
+        *accounts() = Accounts {
+            davinci: davinci_account(),
+            ..NO_ACCOUNTS
+        };
         let mut command = Command::new(binary);
         command
             .arg("app-server")
@@ -287,7 +354,19 @@ impl Session {
             .map_err(|error| format!("Codex app-server closed: {error}"))
     }
 
+    /// Ask whose account the child reads, then its usage. The account read
+    /// is local (the CLI's auth file) and goes first, so its answer is in
+    /// before the usage that depends on it.
     fn read(&mut self) -> Result<u64, String> {
+        self.next_id += 1;
+        let account_id = self.next_id;
+        {
+            let mut accounts = accounts();
+            accounts.davinci = davinci_account();
+            accounts.awaiting = Some(account_id);
+            accounts.held = None;
+        }
+        self.send(&json!({ "id": account_id, "method": "account/read", "params": {} }))?;
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({ "id": id, "method": "account/rateLimits/read" }))?;
@@ -338,9 +417,22 @@ impl Session {
     }
 }
 
-/// One line from the app-server: a read's result or error, or a rate-limit
-/// notification. Returns the id of the read it answers. Everything else (the
-/// initialize reply, other notifications, other limits) is ignored.
+/// Record `snapshot` (a full read, or a sparse update), unless it belongs to
+/// an account DaVinci is not using: then whatever is shown is withdrawn.
+fn accept(snapshot: davinci_ai::codex_usage::CodexUsageSnapshot, full: bool) {
+    if let Some(reason) = current_mismatch() {
+        codex_usage::withdraw(reason);
+    } else if full {
+        codex_usage::record(snapshot);
+    } else {
+        codex_usage::record_update(snapshot);
+    }
+}
+
+/// One line from the app-server: an account or usage read's result or
+/// error, or a rate-limit notification. Returns the id of the usage read it
+/// answers. Everything else (the initialize reply, other notifications,
+/// other limits) is ignored.
 pub(crate) fn handle_line(line: &str) -> Option<u64> {
     let message = serde_json::from_str::<Value>(line).ok()?;
     if message.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated") {
@@ -349,8 +441,12 @@ pub(crate) fn handle_line(line: &str) -> Option<u64> {
         // buckets with windows of their own.
         let limit_id = limits.get("limitId").and_then(Value::as_str);
         if limit_id.is_none_or(|id| id == "codex") {
-            if let Some(update) = codex_usage::parse_app_server_rate_limits(limits) {
-                codex_usage::record_update(update);
+            // While whose account it is is being asked, an update waits for
+            // the full read that follows.
+            if accounts().awaiting.is_none() {
+                if let Some(update) = codex_usage::parse_app_server_rate_limits(limits) {
+                    accept(update, false);
+                }
             }
         }
         return None;
@@ -363,11 +459,46 @@ pub(crate) fn handle_line(line: &str) -> Option<u64> {
         }
         return None;
     }
+    // This cycle's `account/read`. No account, or one with no email (an API
+    // key), leaves nothing to compare; an error (a CLI without the method)
+    // keeps what was known and says nothing on the row.
+    let held = {
+        let mut accounts = accounts();
+        if accounts.awaiting == Some(id) {
+            accounts.awaiting = None;
+            if let Some(account) = message.pointer("/result/account") {
+                accounts.codex = account
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            Some(accounts.held.take())
+        } else {
+            None
+        }
+    };
+    if let Some(held) = held {
+        match held {
+            Some(snapshot) => accept(snapshot, true),
+            None => {
+                if let Some(reason) = current_mismatch() {
+                    codex_usage::withdraw(reason);
+                }
+            }
+        }
+        return None;
+    }
     if let Some(snapshot) = message
         .pointer("/result/rateLimits")
         .and_then(codex_usage::parse_app_server_rate_limits)
     {
-        codex_usage::record(snapshot);
+        let mut accounts = accounts();
+        if accounts.awaiting.is_some() {
+            accounts.held = Some(snapshot);
+        } else {
+            drop(accounts);
+            accept(snapshot, true);
+        }
     } else if let Some(error) = message.get("error") {
         codex_usage::set_unavailable(describe_error(error));
     }
@@ -461,6 +592,91 @@ mod tests {
         assert_eq!(
             codex_usage::unavailable().as_deref(),
             Some("Codex login expired · run `codex login` to see plan usage")
+        );
+
+        // The Codex CLI is logged into another account (a free one, while
+        // DaVinci runs on Plus): its numbers are not DaVinci's, so they go.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                *accounts() = NO_ACCOUNTS;
+            }
+        }
+        let _reset = Reset;
+        let cycle = |account_id: u64| {
+            let mut accounts = accounts();
+            accounts.davinci = Some("me@example.com".into());
+            accounts.awaiting = Some(account_id);
+            accounts.held = None;
+        };
+        let account = |id: u64, email: &str| {
+            json!({"id": id, "result": {"account": {"type": "chatgpt", "email": email}}})
+                .to_string()
+        };
+        let usage = |id: u64, used: f64, minutes: u64| {
+            json!({"id": id, "result": {"rateLimits": {
+                "primary": {"usedPercent": used, "windowDurationMins": minutes}
+            }}})
+            .to_string()
+        };
+        let note = "run `codex login` as me@example.com · the Codex CLI is on other@example.com";
+        assert!(codex_usage::latest().is_some());
+        // The usage answer comes first: held, then withdrawn once the
+        // account answer says it is another account's.
+        cycle(4);
+        assert_eq!(handle_line(&usage(5, 53.0, 43200)), Some(5));
+        assert!(codex_usage::latest().unwrap().five_hour().is_some());
+        assert_eq!(handle_line(&account(4, "other@example.com")), None);
+        assert_eq!(codex_usage::latest(), None);
+        assert_eq!(codex_usage::unavailable().as_deref(), Some(note));
+        // In order, and notifications between reads, stay out too.
+        cycle(6);
+        handle_line(&account(6, "other@example.com"));
+        handle_line(&usage(7, 53.0, 43200));
+        handle_line(
+            &json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "primary": {"usedPercent": 60, "windowDurationMins": 43200}
+            }}})
+            .to_string(),
+        );
+        assert_eq!(codex_usage::latest(), None);
+        assert_eq!(codex_usage::unavailable().as_deref(), Some(note));
+        // `codex login` as DaVinci's account, the usage answer first again:
+        // the stale mismatch does not hide it, the account answer lets it in.
+        cycle(8);
+        handle_line(&usage(9, 16.0, 10080));
+        assert_eq!(codex_usage::latest(), None);
+        handle_line(&account(8, "Me@Example.com"));
+        let snapshot = codex_usage::latest().unwrap();
+        assert_eq!(snapshot.weekly().unwrap().remaining_percent(), 84.0);
+        assert_eq!(codex_usage::unavailable(), None);
+        // A CLI without `account/read`: its error is not the row's business.
+        cycle(10);
+        assert_eq!(
+            handle_line(&json!({"id": 10, "error": {"message": "Method not found"}}).to_string()),
+            None
+        );
+        handle_line(&usage(11, 20.0, 10080));
+        assert_eq!(codex_usage::unavailable(), None);
+        assert_eq!(
+            codex_usage::latest()
+                .unwrap()
+                .weekly()
+                .unwrap()
+                .used_percent,
+            20.0
+        );
+    }
+
+    #[test]
+    fn accounts_differ_only_when_both_are_known() {
+        assert_eq!(account_mismatch(None, Some("a@x.com")), None);
+        assert_eq!(account_mismatch(Some("a@x.com"), None), None);
+        assert_eq!(account_mismatch(Some(" A@X.com "), Some("a@x.com")), None);
+        assert_eq!(account_mismatch(Some(""), Some("a@x.com")), None);
+        assert_eq!(
+            account_mismatch(Some("me@x.com"), Some("me2003@x.com")).as_deref(),
+            Some("run `codex login` as me@x.com · the Codex CLI is on me2003@x.com")
         );
     }
 

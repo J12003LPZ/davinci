@@ -272,6 +272,20 @@ pub fn set_unavailable(reason: impl Into<String>) {
         .unavailable = Some(reason.into());
 }
 
+/// Drop the last snapshot and any pending warning, and say why: the numbers
+/// on hand belong to an account DaVinci is not using.
+pub fn withdraw(reason: impl Into<String>) {
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    withdraw_locked(&mut state, reason.into());
+}
+
+fn withdraw_locked(state: &mut State, reason: String) {
+    state.latest = None;
+    state.pending = None;
+    state.warned_primary = 0.0;
+    state.unavailable = Some(reason);
+}
+
 pub fn unavailable() -> Option<String> {
     STATE
         .lock()
@@ -459,6 +473,28 @@ mod tests {
             resets_at: None,
         };
         assert_eq!(window.remaining_percent(), 0.0);
+    }
+
+    #[test]
+    fn withdrawing_drops_the_snapshot_and_the_warning() {
+        let mut state = State {
+            latest: None,
+            warned_primary: 0.0,
+            pending: None,
+            unavailable: None,
+        };
+        record_locked(
+            &mut state,
+            parse_app_server_rate_limits(&json!({
+                "primary": {"usedPercent": 90, "windowDurationMins": 300}
+            }))
+            .unwrap(),
+        );
+        assert!(state.latest.is_some() && state.pending.is_some());
+        withdraw_locked(&mut state, "other account".into());
+        assert!(state.latest.is_none() && state.pending.is_none());
+        assert_eq!(state.warned_primary, 0.0);
+        assert_eq!(state.unavailable.as_deref(), Some("other account"));
     }
 
     #[test]
