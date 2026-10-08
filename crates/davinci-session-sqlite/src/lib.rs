@@ -508,11 +508,11 @@ impl SqliteSessionStore {
     pub fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionSummary>, SessionError> {
         let mut stmt = if cwd.is_some() {
             self.conn.prepare(
-                "SELECT id, created_at, cwd, parent_session_id, metadata FROM sessions WHERE cwd = ?1 ORDER BY created_at DESC",
+                "SELECT id, created_at, cwd, parent_session_id, metadata, MAX(created_at, COALESCE((SELECT timestamp FROM entries WHERE entries.session_id = sessions.id ORDER BY seq DESC LIMIT 1), 0)) AS modified_at FROM sessions WHERE cwd = ?1 ORDER BY modified_at DESC, created_at DESC",
             )
         } else {
             self.conn.prepare(
-                "SELECT id, created_at, cwd, parent_session_id, metadata FROM sessions ORDER BY created_at DESC",
+                "SELECT id, created_at, cwd, parent_session_id, metadata, MAX(created_at, COALESCE((SELECT timestamp FROM entries WHERE entries.session_id = sessions.id ORDER BY seq DESC LIMIT 1), 0)) AS modified_at FROM sessions ORDER BY modified_at DESC, created_at DESC",
             )
         }
         .map_err(|err| SessionError::storage(format!("Unable to list sessions: {err}")))?;
@@ -974,7 +974,9 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> 
         path: std::path::PathBuf::new(),
         cwd: row.get(2)?,
         created_at: row.get::<_, i64>(1)? as u64,
-        modified_at: row.get::<_, i64>(1)? as u64,
+        // The newest entry's timestamp, so a session that was appended to
+        // sorts above one that was merely created later.
+        modified_at: row.get::<_, i64>(5)?.max(0) as u64,
         name,
         parent_session_id: row.get(3)?,
         source_format: 4,
@@ -1462,6 +1464,62 @@ mod tests {
         assert_eq!(
             tip_changed.message,
             format!("Branch tip {child_id} changed during append")
+        );
+    }
+
+    /// WOR-55: listings order by the newest activity, not by creation.
+    #[test]
+    fn listing_orders_by_latest_append_and_reports_modified_at() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut old = JsonlSession::create(dir.path(), "/tmp/w", Some("old")).unwrap();
+        let mut new = JsonlSession::create(dir.path(), "/tmp/w", Some("new")).unwrap();
+        old.header.created_at = 1_000;
+        new.header.created_at = 2_000;
+        store.upsert_session(&old).unwrap();
+        store.upsert_session(&new).unwrap();
+        let ids = |store: &SqliteSessionStore| -> Vec<String> {
+            store
+                .list_sessions(None)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert_eq!(
+            ids(&store),
+            vec![new.header.id.clone(), old.header.id.clone()]
+        );
+        let listed = store.list_sessions(None).unwrap();
+        assert_eq!(
+            listed[0].modified_at, 2_000,
+            "no entries: modified = created"
+        );
+
+        // A later append to the older session moves it to the top.
+        let mut entry = SessionEntry::message("user", serde_json::json!("hello"));
+        entry.id = "e1".into();
+        entry.seq = 1;
+        entry.timestamp = 5_000;
+        store.insert_entry(&old.header.id, &entry).unwrap();
+        assert_eq!(
+            ids(&store),
+            vec![old.header.id.clone(), new.header.id.clone()]
+        );
+        let listed = store.list_sessions(Some("/tmp/w")).unwrap();
+        assert_eq!(listed[0].id, old.header.id);
+        assert_eq!(listed[0].modified_at, 5_000);
+        assert_eq!(listed[0].created_at, 1_000);
+
+        // And another append to the newer one moves it back.
+        let mut entry = SessionEntry::message("user", serde_json::json!("again"));
+        entry.id = "e2".into();
+        entry.seq = 1;
+        entry.timestamp = 9_000;
+        store.insert_entry(&new.header.id, &entry).unwrap();
+        assert_eq!(
+            ids(&store),
+            vec![new.header.id.clone(), old.header.id.clone()]
         );
     }
 }
