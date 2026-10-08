@@ -192,7 +192,9 @@ pub fn tcp_connect_via_http_proxy(
     tcp.write_all(request.as_bytes())
         .and_then(|_| tcp.flush())
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
-    let mut buf = vec![0u8; 4096];
+    // Read one byte at a time: the stream is returned to the caller as the
+    // tunnel, so nothing past the header terminator may be consumed here.
+    let mut byte = [0u8; 1];
     let mut collected = Vec::new();
     // One deadline for the whole header read: the per-read timeout alone
     // never fires on a proxy that keeps trickling bytes.
@@ -205,13 +207,13 @@ pub fn tcp_connect_via_http_proxy(
         tcp.set_read_timeout(Some(remaining))
             .map_err(|err| format!("WebSocket connect failed: {err}"))?;
         let n = tcp
-            .read(&mut buf)
+            .read(&mut byte)
             .map_err(|err| format!("WebSocket connect failed: {err}"))?;
         if n == 0 {
             break;
         }
-        collected.extend_from_slice(&buf[..n]);
-        if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+        collected.push(byte[0]);
+        if collected.ends_with(b"\r\n\r\n") {
             break;
         }
         if collected.len() > MAX_CONNECT_RESPONSE_BYTES {
@@ -415,12 +417,9 @@ mod tests {
         let started = Instant::now();
         let result = tcp_connect_via_http_proxy(&proxy, "chatgpt.com", 443, timeout);
         let elapsed = started.elapsed();
-        drop(
-            result
-                .as_ref()
-                .map(|tcp| tcp.shutdown(std::net::Shutdown::Both)),
-        );
-        server.join().unwrap();
+        if result.is_err() {
+            server.join().unwrap();
+        }
         (result, elapsed)
     }
 
@@ -452,5 +451,20 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn wor70_connect_keeps_tunneled_bytes_that_arrive_with_headers() {
+        let (result, _) = connect_to_fake_proxy(Duration::from_secs(5), |mut stream| {
+            // Headers and the first tunneled bytes in a single write.
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\ntunnel-payload")
+                .unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut tcp = result.unwrap();
+        let mut payload = [0u8; 14];
+        tcp.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"tunnel-payload");
     }
 }
