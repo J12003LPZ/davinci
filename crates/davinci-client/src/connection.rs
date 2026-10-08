@@ -1,6 +1,7 @@
 //! Framed `Connection` + `ByteTransport` matching TypeScript `connection.ts` / `transport.ts`.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use davinci_protocol::{
@@ -75,6 +76,27 @@ struct ConnectionInner {
     on_handshake: Option<HandshakeListener>,
     on_message: Option<MessageListener>,
     on_state_change: Option<StateChangeListener>,
+    /// Notifications waiting for delivery. Listeners run with no borrow of
+    /// `ConnectionInner` held, so they may call back into the connection;
+    /// anything they trigger is queued here and delivered after they return.
+    notices: VecDeque<Notice>,
+    notifying: bool,
+}
+
+enum Notice {
+    State(ConnectionStateChange),
+    Message(Box<ServerMessage>),
+}
+
+/// Clears `notifying` even if a listener panics.
+struct NotifyingGuard<'a>(&'a RefCell<ConnectionInner>);
+
+impl Drop for NotifyingGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.borrow_mut();
+        inner.notifying = false;
+        inner.notices.clear();
+    }
 }
 
 pub struct Connection {
@@ -104,6 +126,8 @@ impl Connection {
                 on_handshake: None,
                 on_message: None,
                 on_state_change: None,
+                notices: VecDeque::new(),
+                notifying: false,
             })),
         })
     }
@@ -301,15 +325,7 @@ impl Connection {
                         let mut inner = self.inner.borrow_mut();
                         inner.state = ConnectionState::Connected;
                     }
-                    let handshake_err = {
-                        let mut inner = self.inner.borrow_mut();
-                        if let Some(listener) = inner.on_handshake.as_mut() {
-                            listener(&snapshot).err()
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(error) = handshake_err {
+                    if let Err(error) = self.run_handshake_listener(&snapshot) {
                         self.fail_and_close(error);
                         return;
                     }
@@ -341,13 +357,8 @@ impl Connection {
             self.fail_and_close(ClientError::Protocol("Unexpected handshake message".into()));
             return;
         }
-        {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(listener) = inner.on_message.as_mut() {
-                listener(&message);
-            }
-            inner.inbound.push(message);
-        }
+        self.inner.borrow_mut().inbound.push(message.clone());
+        self.notify(Notice::Message(Box::new(message)));
     }
 
     fn handle_close(&self) {
@@ -410,9 +421,62 @@ impl Connection {
     }
 
     fn emit_state(&self, state: ConnectionState, error: Option<String>) {
-        let change = ConnectionStateChange { state, error };
-        if let Some(listener) = self.inner.borrow_mut().on_state_change.as_mut() {
-            listener(&change);
+        self.notify(Notice::State(ConnectionStateChange { state, error }));
+    }
+
+    /// Run the handshake listener with no borrow held (WOR-49). A listener
+    /// that installs a replacement for itself keeps the replacement.
+    fn run_handshake_listener(&self, snapshot: &ServerSnapshot) -> Result<(), ClientError> {
+        let Some(mut listener) = self.inner.borrow_mut().on_handshake.take() else {
+            return Ok(());
+        };
+        let result = listener(snapshot);
+        let mut inner = self.inner.borrow_mut();
+        if inner.on_handshake.is_none() {
+            inner.on_handshake = Some(listener);
+        }
+        result
+    }
+
+    /// Deliver a notification to its listener with no borrow held (WOR-49).
+    /// Notifications raised while a listener runs are queued and delivered in
+    /// order once it returns, so no listener is ever re-entered.
+    fn notify(&self, notice: Notice) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.notices.push_back(notice);
+            if inner.notifying {
+                return;
+            }
+            inner.notifying = true;
+        }
+        let _guard = NotifyingGuard(&self.inner);
+        loop {
+            let Some(notice) = self.inner.borrow_mut().notices.pop_front() else {
+                break;
+            };
+            match notice {
+                Notice::State(change) => {
+                    let Some(mut listener) = self.inner.borrow_mut().on_state_change.take() else {
+                        continue;
+                    };
+                    listener(&change);
+                    let mut inner = self.inner.borrow_mut();
+                    if inner.on_state_change.is_none() {
+                        inner.on_state_change = Some(listener);
+                    }
+                }
+                Notice::Message(message) => {
+                    let Some(mut listener) = self.inner.borrow_mut().on_message.take() else {
+                        continue;
+                    };
+                    listener(&message);
+                    let mut inner = self.inner.borrow_mut();
+                    if inner.on_message.is_none() {
+                        inner.on_message = Some(listener);
+                    }
+                }
+            }
         }
     }
 

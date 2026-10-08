@@ -1,7 +1,7 @@
 //! SessionHandle + reconnecting client matching TypeScript `session-handle.ts` / `client.ts`.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use davinci_protocol::{
@@ -31,6 +31,12 @@ struct SessionClientInner {
     factory: Option<TransportFactory>,
     connection: Option<Connection>,
     last_response: Option<ServerMessage>,
+    /// Id of the framed request awaiting its response. Responses carrying any
+    /// other id are late replies to abandoned requests and are dropped.
+    pending_request: Option<String>,
+    /// Events received on the framed transport, applied once the transport
+    /// call returns so client listeners never run inside a borrow.
+    inbox: VecDeque<ServerEvent>,
     state: ClientState,
     connected: bool,
     disposed: bool,
@@ -50,6 +56,8 @@ impl SessionClient {
                 factory: None,
                 connection: None,
                 last_response: None,
+                pending_request: None,
+                inbox: VecDeque::new(),
                 state: ClientState::new(),
                 connected: false,
                 disposed: false,
@@ -82,6 +90,8 @@ impl SessionClient {
                 factory: Some(factory),
                 connection: Some(Connection::new(None)?),
                 last_response: None,
+                pending_request: None,
+                inbox: VecDeque::new(),
                 state: ClientState::new(),
                 connected: false,
                 disposed: false,
@@ -138,13 +148,16 @@ impl SessionClient {
         if self.inner.borrow().factory.is_some() {
             return self.connect_framed();
         }
-        let mut inner = self.inner.borrow_mut();
-        if !inner.connected {
-            inner.state.reset();
-        }
-        let (message, events) = (inner.dispatch)(ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-        });
+        let (message, events, state) = {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.connected {
+                inner.state.reset();
+            }
+            let (message, events) = (inner.dispatch)(ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+            });
+            (message, events, inner.state.clone())
+        };
         match message {
             ServerMessage::Hello {
                 version, snapshot, ..
@@ -162,15 +175,16 @@ impl SessionClient {
                     None
                 };
                 if let Some(message) = mismatch {
-                    inner.connected = false;
-                    inner.state.reset();
+                    self.inner.borrow_mut().connected = false;
+                    state.reset();
                     return Err(ClientError::Protocol(message));
                 }
-                inner.state.apply_server_snapshot(snapshot.clone());
+                self.inner.borrow_mut().connected = true;
+                // Listeners run with no client borrow held (WOR-49).
+                state.apply_server_snapshot(snapshot.clone());
                 for event in events {
-                    inner.state.apply_event(&event);
+                    state.apply_event(&event);
                 }
-                inner.connected = true;
                 Ok(snapshot)
             }
             ServerMessage::HelloError { error } => Err(protocol_error(&error)),
@@ -202,39 +216,63 @@ impl SessionClient {
         };
         let client = self.clone();
         connection.on_handshake(move |snapshot| {
-            client
-                .inner
-                .borrow_mut()
-                .state
-                .apply_server_snapshot(snapshot.clone());
+            let state = client.inner.borrow().state.clone();
+            state.apply_server_snapshot(snapshot.clone());
             Ok(())
         });
         let client = self.clone();
-        connection.on_message(move |message| match message {
-            ServerMessage::Event { event } => {
-                let mut inner = client.inner.borrow_mut();
-                if let ServerEvent::SessionRemoved { session_id } = event {
-                    invalidate_one(&mut inner, session_id);
+        connection.on_message(move |message| {
+            let mut inner = client.inner.borrow_mut();
+            match message {
+                ServerMessage::Event { event } => inner.inbox.push_back(event.clone()),
+                // Only the reply to the request in flight is accepted. A late
+                // reply to an earlier, abandoned request must not answer a
+                // newer one that happens to share its command (WOR-48).
+                ServerMessage::Response { id, .. }
+                    if inner.pending_request.as_deref() == Some(id.as_str()) =>
+                {
+                    inner.last_response = Some(message.clone());
                 }
-                inner.state.apply_event(event);
+                _ => {}
             }
-            ServerMessage::Response { .. } => {
-                client.inner.borrow_mut().last_response = Some(message.clone());
-            }
-            _ => {}
         });
         let result = connection.connect(&mut factory);
         self.inner.borrow_mut().factory = Some(factory);
         match result {
             Ok(snapshot) => {
                 self.inner.borrow_mut().connected = true;
+                self.drain_inbox();
                 Ok(snapshot)
             }
             Err(error) => {
-                self.inner.borrow_mut().connected = false;
+                let mut inner = self.inner.borrow_mut();
+                inner.connected = false;
+                inner.inbox.clear();
                 Err(error)
             }
         }
+    }
+
+    /// Apply events queued by the framed transport. Runs with no borrow held,
+    /// so event listeners may call back into the client (WOR-49).
+    fn drain_inbox(&self) {
+        loop {
+            let Some(event) = self.inner.borrow_mut().inbox.pop_front() else {
+                break;
+            };
+            self.apply_inbound_event(event);
+        }
+    }
+
+    fn apply_inbound_event(&self, event: ServerEvent) {
+        let state = {
+            let mut inner = self.inner.borrow_mut();
+            if let ServerEvent::SessionRemoved { session_id } = &event {
+                invalidate_one(&mut inner, session_id);
+            }
+            inner.state.clone()
+        };
+        state.apply_event(&event);
     }
 
     pub fn reconnect(&self) -> Result<ServerSnapshot, ClientError> {
@@ -345,21 +383,29 @@ impl SessionClient {
         if self.inner.borrow().factory.is_some() {
             return self.request_framed(command);
         }
-        let mut inner = self.inner.borrow_mut();
-        inner.request_seq += 1;
-        let id = format!("request-{}", inner.request_seq);
-        let expected = command.name().to_string();
-        let (message, events) = (inner.dispatch)(ClientMessage::Request {
-            id: id.clone(),
-            request: command,
-        });
+        let (id, expected, message, events) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.request_seq += 1;
+            let id = format!("request-{}", inner.request_seq);
+            let expected = command.name().to_string();
+            let (message, events) = (inner.dispatch)(ClientMessage::Request {
+                id: id.clone(),
+                request: command,
+            });
+            (id, expected, message, events)
+        };
         for event in events {
-            if let ServerEvent::SessionRemoved { session_id } = &event {
-                invalidate_one(&mut inner, session_id);
-            }
-            inner.state.apply_event(&event);
+            self.apply_inbound_event(event);
         }
-        apply_response(&mut inner, expected, message)
+        if let ServerMessage::Response { id: got, .. } = &message {
+            if *got != id {
+                return Err(ClientError::Protocol(format!(
+                    "Response id {got} does not match {id}"
+                )));
+            }
+        }
+        let state = self.inner.borrow().state.clone();
+        apply_response(&state, expected, message)
     }
 
     fn request_framed(&self, command: Command) -> Result<CommandResult, ClientError> {
@@ -375,7 +421,7 @@ impl SessionClient {
                 .unwrap_or(davinci_protocol::DEFAULT_MAX_FRAME_LENGTH);
             let frame = encode_client_message(
                 &ClientMessage::Request {
-                    id,
+                    id: id.clone(),
                     request: command,
                 },
                 Some(FrameDecoderOptions {
@@ -383,22 +429,26 @@ impl SessionClient {
                 }),
             )
             .map_err(|err| ClientError::Protocol(err.to_string()))?;
-            inner.last_response = None;
             let connection = inner
                 .connection
                 .clone()
                 .ok_or_else(|| ClientError::Protocol(DISCONNECTED.into()))?;
+            inner.last_response = None;
+            inner.pending_request = Some(id);
             (expected, frame, connection)
         };
-        connection.send(&frame)?;
-        let message = self
-            .inner
-            .borrow_mut()
-            .last_response
-            .take()
-            .ok_or_else(|| ClientError::Protocol("Unexpected response: missing".into()))?;
-        let mut inner = self.inner.borrow_mut();
-        apply_response(&mut inner, expected, message)
+        let sent = connection.send(&frame);
+        let message = {
+            let mut inner = self.inner.borrow_mut();
+            inner.pending_request = None;
+            inner.last_response.take()
+        };
+        self.drain_inbox();
+        sent?;
+        let message =
+            message.ok_or_else(|| ClientError::Protocol("Unexpected response: missing".into()))?;
+        let state = self.inner.borrow().state.clone();
+        apply_response(&state, expected, message)
     }
 
     fn reserve_lease(&self, session_id: &str, mode: SessionLeaseMode) -> Result<(), ClientError> {
@@ -447,6 +497,7 @@ impl SessionClient {
             client: self.clone(),
             generation,
             mode,
+            released: Cell::new(false),
         }
     }
 }
@@ -456,6 +507,10 @@ pub struct SessionHandle {
     client: SessionClient,
     generation: u64,
     mode: SessionLeaseMode,
+    /// Set once this handle has given its lease back. A released handle stays
+    /// dead: it cannot release another handle's lease or be revived when the
+    /// session is attached again under a new lease (WOR-50).
+    released: Cell<bool>,
 }
 
 impl SessionHandle {
@@ -464,6 +519,9 @@ impl SessionHandle {
     }
 
     pub fn active(&self) -> bool {
+        if self.released.get() {
+            return false;
+        }
         let inner = self.client.inner.borrow();
         let current = inner.generations.get(&self.id).copied().unwrap_or(0);
         current == self.generation
@@ -590,31 +648,44 @@ impl SessionHandle {
     }
 
     fn release(&self, relinquish_on_failure: bool) -> Result<(), ClientError> {
-        if !self.active() {
+        if self.released.get() {
             return Ok(());
         }
-        let count = self
-            .client
-            .inner
-            .borrow()
-            .lease_counts
-            .get(&self.id)
-            .copied()
-            .unwrap_or(0);
+        let (current_generation, count) = {
+            let inner = self.client.inner.borrow();
+            (
+                inner.generations.get(&self.id).copied().unwrap_or(0),
+                inner.lease_counts.get(&self.id).copied().unwrap_or(0),
+            )
+        };
+        if current_generation != self.generation {
+            // Disconnect or session removal already dropped every lease of
+            // this generation; there is nothing left to give back.
+            self.released.set(true);
+            return Ok(());
+        }
+        if !self.active() {
+            // Still holding a lease, but the session is no longer attached:
+            // give the lease back without a remote detach.
+            self.client.release_lease(&self.id, self.mode);
+            self.released.set(true);
+            return Ok(());
+        }
         if count <= 1 {
             match self.client.request(Command::Detach {
                 session_id: self.id.clone(),
             }) {
-                Ok(_) => self.client.release_lease(&self.id, self.mode),
+                Ok(_) => {}
                 Err(err) if relinquish_on_failure => {
                     self.client.release_lease(&self.id, self.mode);
+                    self.released.set(true);
                     return Err(err);
                 }
                 Err(err) => return Err(err),
             }
-        } else {
-            self.client.release_lease(&self.id, self.mode);
         }
+        self.client.release_lease(&self.id, self.mode);
+        self.released.set(true);
         Ok(())
     }
 }
@@ -638,7 +709,7 @@ fn protocol_error(error: &ProtocolError) -> ClientError {
 }
 
 fn apply_response(
-    inner: &mut SessionClientInner,
+    state: &ClientState,
     expected: String,
     message: ServerMessage,
 ) -> Result<CommandResult, ClientError> {
@@ -654,7 +725,7 @@ fn apply_response(
                     result.command_name()
                 )));
             }
-            inner.state.apply_result(&result);
+            state.apply_result(&result);
             Ok(result)
         }
         ServerMessage::Response {
