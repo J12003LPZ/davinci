@@ -205,13 +205,19 @@ fn is_user_authority(value: &ProposedStateValue) -> bool {
 fn validate_value(
     value: ProposedStateValue,
     events: &HashMap<&str, &ContextEvent>,
-    parent: &HashMap<String, ProvenanceKind>,
+    parent: &ParentSources,
 ) -> Option<StateValue<String>> {
     if value.value.trim().is_empty()
         || value.value.len() > 1024
         || value.source_refs.is_empty()
         || value.source_refs.len() > 16
     {
+        return None;
+    }
+    // A matching source type is not enough for authority: the summarizer
+    // could pin any claim to a real user message. User and policy values
+    // must be grounded in the text they cite (WOR-62).
+    if is_user_authority(&value) && !grounded_in_sources(&value, events, parent) {
         return None;
     }
     let mut sources = Vec::new();
@@ -222,7 +228,7 @@ fn validate_value(
         } else {
             parent
                 .get(&source_ref)
-                .is_some_and(|kind| provenance_matches_parent(value.provenance_kind, *kind))
+                .is_some_and(|(kind, _)| provenance_matches_parent(value.provenance_kind, *kind))
         };
         if !valid {
             return None;
@@ -276,16 +282,107 @@ fn provenance_matches_parent(requested: ProvenanceKind, existing: ProvenanceKind
     }
 }
 
-fn parent_provenance(parent: &CheckpointState) -> HashMap<String, ProvenanceKind> {
-    let mut result = HashMap::new();
+/// Source refs already accepted into the parent checkpoint: their provenance
+/// kind and the accepted values citing them. Folded events are no longer in
+/// the event list, so a new value citing one is grounded in those values.
+type ParentSources = HashMap<String, (ProvenanceKind, String)>;
+
+fn parent_provenance(parent: &CheckpointState) -> ParentSources {
+    let mut result: ParentSources = HashMap::new();
     for value in all_values(parent) {
         for provenance in &value.provenance {
             for source_ref in &provenance.source_refs {
-                result.insert(source_ref.clone(), provenance.kind);
+                let (kind, text) = result
+                    .entry(source_ref.clone())
+                    .or_insert_with(|| (provenance.kind, String::new()));
+                *kind = provenance.kind;
+                text.push('\n');
+                text.push_str(&value.value);
             }
         }
     }
     result
+}
+
+/// Words that carry no claim of their own. Negations are deliberately absent:
+/// "do not delete" and "delete" must never ground each other.
+const UNGROUNDED_WORDS: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "for",
+    "from",
+    "with",
+    "as",
+    "is",
+    "are",
+    "be",
+    "was",
+    "were",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "user",
+    "users",
+    "wants",
+    "want",
+    "asked",
+    "asks",
+    "requires",
+    "require",
+    "requested",
+    "should",
+    "must",
+    "please",
+];
+
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// True when every content word of `value` appears in the text it cites:
+/// the summarizer may shorten or reorder the user's words but not add new
+/// ones. Quoting out of context (dropping a qualifier) is not detectable here.
+fn grounded_in_sources(
+    value: &ProposedStateValue,
+    events: &HashMap<&str, &ContextEvent>,
+    parent: &ParentSources,
+) -> bool {
+    let mut cited = HashSet::new();
+    for source_ref in &value.source_refs {
+        let text = match events.get(source_ref.as_str()) {
+            Some(event) => event.visible_text.as_str(),
+            None => match parent.get(source_ref) {
+                Some((_, text)) => text.as_str(),
+                None => return false,
+            },
+        };
+        cited.extend(words(text));
+    }
+    let all = words(&value.value).collect::<Vec<_>>();
+    let content = all
+        .iter()
+        .filter(|word| !UNGROUNDED_WORDS.contains(&word.as_str()))
+        .collect::<Vec<_>>();
+    let required = if content.is_empty() {
+        all.iter().collect()
+    } else {
+        content
+    };
+    !required.is_empty() && required.iter().all(|word| cited.contains(*word))
 }
 
 fn state_provenance_refs(state: &CheckpointState) -> HashSet<String> {
@@ -336,7 +433,7 @@ fn apply_transition(
     state: &mut CheckpointState,
     transition: StateTransition,
     events: &HashMap<&str, &ContextEvent>,
-    parent: &HashMap<String, ProvenanceKind>,
+    parent: &ParentSources,
 ) {
     let Some(previous) = slot_values(state, transition.slot)
         .iter()

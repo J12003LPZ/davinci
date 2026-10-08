@@ -56,7 +56,7 @@ fn manual_fold_invokes_structured_summarizer_and_applies_a_user_correction() {
         assert!(request.system.contains("JSON"));
         Ok(davinci_agent::SummarizeResponse {
             text: serde_json::json!({"transitions":[{"slot":"goal","kind":"supersede",
-                "previous":"use old API","evidence":{"value":"user corrected API",
+                "previous":"use old API","evidence":{"value":"use new API",
                 "source_refs":[new_ref],"provenance_kind":"user_decision"},
                 "replacement":{"value":"use new API","source_refs":[new_ref],"provenance_kind":"user_decision"}}]}).to_string(),
             usage: Default::default(), stop_reason: None, error_message: None, has_tool_call: false,
