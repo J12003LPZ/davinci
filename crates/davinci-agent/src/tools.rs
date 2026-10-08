@@ -374,7 +374,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "retrieve_context".into(),
-            description: "Retrieve an exact Context VM page or authoritative source by reference. Use query and offset/limit to page large evidence without exposing hidden reasoning.".into(),
+            description: "Retrieve an exact Context VM page or authoritative source by reference. Use query (case-insensitive line filter) and offset/limit to page large evidence without exposing hidden reasoning.".into(),
             parameters: serde_json::json!({
                 "type":"object",
                 "properties":{

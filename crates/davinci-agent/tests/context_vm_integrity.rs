@@ -854,3 +854,30 @@ fn wor58_image_only_turn_keeps_a_textual_goal() {
         .unwrap()
         .contains("UE5HLWdvYWw="));
 }
+
+/// WOR-81: a retrieval query filtered lines case-sensitively, so "error"
+/// missed "Error:" and "ERROR".
+#[test]
+fn wor81_retrieval_query_matches_case_insensitively() {
+    use davinci_agent::runtime::context_vm::{
+        events_from_messages, ContextVmConfig, ContextVmRuntime, RetrieveContextRequest,
+    };
+    let vm = ContextVmRuntime::new(ContextVmConfig::default(), Default::default());
+    let events = events_from_messages(&[ChatMessage::text(
+        "user",
+        "Error: build failed\nall good\nERROR in linker\nan error here",
+    )]);
+    vm.compile(&events, &davinci_agent::ContextPacket::empty(), 1_000_000)
+        .unwrap();
+    let result = vm
+        .retrieve(&RetrieveContextRequest {
+            source_ref: Some(events[0].source_ref.clone()),
+            query: Some("error".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        result.content,
+        "Error: build failed\nERROR in linker\nan error here"
+    );
+}

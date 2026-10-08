@@ -54,11 +54,15 @@ fn retrieve_inner(
     } else {
         request.limit
     };
-    let query = request.query.as_deref();
+    // A query matches case-insensitively: the model searching for "error"
+    // must find "Error" (WOR-81). The returned lines are exact.
+    let query = request.query.as_deref().map(str::to_lowercase);
     let (content, next_offset) = page_lines(
-        content
-            .lines()
-            .filter(|line| query.is_none_or(|query| line.contains(query))),
+        content.lines().filter(|line| {
+            query
+                .as_deref()
+                .is_none_or(|query| line.to_lowercase().contains(query))
+        }),
         request.offset,
         limit,
     );
