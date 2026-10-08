@@ -8,7 +8,6 @@ const READ_AHEAD_LINES: usize = 8;
 
 pub(crate) struct ResponseLines {
     receiver: Option<Receiver<io::Result<String>>>,
-    worker: Option<std::thread::JoinHandle<()>>,
     cancellation: Cancellation,
 }
 
@@ -22,11 +21,10 @@ impl std::ops::Deref for ResponseLines {
 impl Drop for ResponseLines {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        // Release a sender waiting on backpressure before joining it.
+        // Release a sender waiting on backpressure. The worker is detached,
+        // not joined: a reader blocked in a non-interruptible read would hang
+        // this drop, and the worker exits on its own once that read returns.
         self.receiver.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
@@ -35,7 +33,7 @@ pub(crate) fn response_lines(
     cancellation: Cancellation,
 ) -> ResponseLines {
     let (sender, receiver) = mpsc::sync_channel(READ_AHEAD_LINES);
-    let worker = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut frame_bytes = 0;
         loop {
@@ -83,7 +81,6 @@ pub(crate) fn response_lines(
     });
     ResponseLines {
         receiver: Some(receiver),
-        worker: Some(worker),
         cancellation,
     }
 }
@@ -143,6 +140,38 @@ mod tests {
         );
         drop(receiver);
         finished.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    struct BlockedReader {
+        release: mpsc::Receiver<()>,
+        started: Sender<()>,
+    }
+    impl Read for BlockedReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn wor78_drop_does_not_wait_for_a_blocked_reader() {
+        let (release, blocked) = mpsc::channel();
+        let (started, reading) = mpsc::channel();
+        let lines = response_lines(BlockedReader {
+            release: blocked,
+            started,
+        });
+        reading.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (dropped, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(lines);
+            let _ = dropped.send(());
+        });
+        let returned = done.recv_timeout(Duration::from_secs(2));
+        // Unblock the reader before asserting so a failure does not leak it.
+        let _ = release.send(());
+        assert!(returned.is_ok(), "drop hung on a blocked reader");
     }
 
     #[test]
