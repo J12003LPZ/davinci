@@ -42,6 +42,7 @@ pub mod plan_usage;
 pub mod recovery;
 pub mod resume;
 pub mod rewind;
+pub mod scrollbar;
 pub mod securitas;
 pub mod semantic;
 pub mod settings;

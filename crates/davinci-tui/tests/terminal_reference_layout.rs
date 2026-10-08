@@ -173,7 +173,7 @@ fn task_checklist_is_readable_at_normal_terminal_widths() {
         Step::new(State::Done, "Inspect files", None),
         Step::new(State::Active, "Run tests", None),
     ];
-    let rows = views::studio::lines(&m, &steps);
+    let rows = views::studio::lines(&m, &steps, m.width);
     let text = rows
         .iter()
         .map(ToString::to_string)

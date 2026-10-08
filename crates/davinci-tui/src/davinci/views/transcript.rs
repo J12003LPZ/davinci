@@ -91,6 +91,155 @@ pub fn tail_lines(
     out
 }
 
+/// The whole conversation as rows, for a view that scrolls through it.
+///
+/// Drawing every row each frame costs time in proportion to the session, so
+/// the settled part is drawn once and kept: everything before the first
+/// entry that can still change on screen (a call in flight, live reasoning,
+/// a finished turn still cooling, a running worker, text the typewriter has
+/// not reached). Only what follows is drawn fresh. The kept rows are reused
+/// while the settled entries, the width and every setting they are drawn
+/// with are unchanged.
+pub struct ConversationRows {
+    settled: std::rc::Rc<Vec<Line<'static>>>,
+    live: Vec<Line<'static>>,
+}
+
+impl ConversationRows {
+    pub fn len(&self) -> usize {
+        self.settled.len() + self.live.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Rows `range`, cloned; nothing outside it is copied.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Vec<Line<'static>> {
+        let split = self.settled.len();
+        let mut out = Vec::with_capacity(range.len());
+        if range.start < split {
+            out.extend_from_slice(&self.settled[range.start..range.end.min(split)]);
+        }
+        if range.end > split {
+            out.extend_from_slice(&self.live[range.start.max(split) - split..range.end - split]);
+        }
+        out
+    }
+}
+
+struct SettledCache {
+    key: u64,
+    rows: std::rc::Rc<Vec<Line<'static>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Cache hits, so tests can tell a reuse from a fresh draw.
+    static HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    static SETTLED: std::cell::RefCell<Option<SettledCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn conversation_rows(model: &Model, width: u16) -> ConversationRows {
+    let entries = &model.transcript;
+    let split = settled_len(model);
+    let key = settled_key(model, &entries[..split], width);
+    let settled = SETTLED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(hit) = cache.as_ref().filter(|hit| hit.key == key) {
+            #[cfg(test)]
+            HITS.with(|hits| hits.set(hits.get() + 1));
+            return hit.rows.clone();
+        }
+        let rows = std::rc::Rc::new(
+            rendered_blocks(model, &entries[..split], width, Some(0))
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        );
+        *cache = Some(SettledCache {
+            key,
+            rows: rows.clone(),
+        });
+        rows
+    });
+    let live = rendered_blocks(model, &entries[split..], width, Some(split))
+        .into_iter()
+        .flatten()
+        .collect();
+    ConversationRows { settled, live }
+}
+
+/// How many leading entries are settled. The split lands where a block
+/// starts, so a group of calls is never cut in two, and at least the newest
+/// 64 entries stay live, as the tail render always drew them.
+fn settled_len(model: &Model) -> usize {
+    let entries = &model.transcript;
+    let first_live = entries
+        .iter()
+        .enumerate()
+        .position(|(index, entry)| {
+            model.revealed(index).is_some()
+                || match entry {
+                    // In flight: the only calls that animate. A notice, or a
+                    // call that ended without a duration, never changes again.
+                    Entry::Tool {
+                        duration,
+                        instrument,
+                        ..
+                    } => model.running && duration.is_none() && instrument != NOTICE_INSTRUMENT,
+                    // A task list spins its active step.
+                    Entry::Studio(steps) => steps.iter().any(|step| step.state == State::Active),
+                    Entry::Thinking { live, .. } => *live,
+                    Entry::Done { landed, .. } => model.tick.wrapping_sub(*landed) < DONE_SETTLE,
+                    Entry::Subagents(rows) => rows.iter().any(|row| {
+                        matches!(
+                            row.state,
+                            SubagentRowState::Running | SubagentRowState::Background
+                        )
+                    }),
+                    _ => false,
+                }
+        })
+        .unwrap_or(entries.len());
+    // The boundary moves in whole steps of 64, so a turn streaming in does
+    // not move it, and miss the cache, on every entry it adds.
+    let step = entries.len().saturating_sub(64) / 64 * 64;
+    let mut split = first_live.min(step);
+    while split > 0 && matches!(entries[split], Entry::Tool { .. } | Entry::Gap) {
+        split -= 1;
+    }
+    split
+}
+
+/// Everything the settled rows are drawn from. `Entry` has no `Hash`, so its
+/// debug form stands in; that costs a small fraction of drawing it.
+fn settled_key(model: &Model, settled: &[Entry], width: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    struct Feed<'a, H: Hasher>(&'a mut H);
+    impl<H: Hasher> std::fmt::Write for Feed<'_, H> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.write(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let _ = std::fmt::write(
+        &mut Feed(&mut hasher),
+        format_args!(
+            "{settled:?}{:?}{}{}{}",
+            model.theme, model.show_tool_output, model.animate, model.running
+        ),
+    );
+    settled.len().hash(&mut hasher);
+    width.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Explore {
     Read,
@@ -427,7 +576,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             }
         }
 
-        Entry::Studio(steps) => studio::lines(model, steps),
+        Entry::Studio(steps) => studio::lines(model, steps, width),
 
         Entry::Delta {
             path,
@@ -2050,5 +2199,146 @@ mod tests {
             boxed.is_empty(),
             "task checklists must not box the conversation: {boxed:?}"
         );
+    }
+
+    /// Cached rows must always equal a fresh draw of the whole transcript.
+    fn assert_fresh(m: &Model, width: u16) {
+        let cached: Vec<String> = {
+            let rows = conversation_rows(m, width);
+            rows.slice(0..rows.len()).iter().map(text).collect()
+        };
+        let fresh: Vec<String> = lines(m, &m.transcript, width).iter().map(text).collect();
+        assert_eq!(cached, fresh);
+    }
+
+    fn long(m: &mut Model, turns: usize) {
+        for turn in 0..turns {
+            m.transcript.push(Entry::user(&format!("turn {turn}")));
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::tool(
+                State::Done,
+                "instrumenta",
+                "read src/lib.rs",
+                Some("1s"),
+            ));
+            m.transcript.push(Entry::tool(
+                State::Done,
+                "instrumenta",
+                "read src/main.rs",
+                Some("1s"),
+            ));
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::Prose(format!(
+                "answer **{turn}** with enough words to wrap at sixty columns but not eighty"
+            )));
+            m.transcript.push(Entry::Gap);
+        }
+    }
+
+    #[test]
+    fn cached_conversation_rows_match_a_fresh_draw() {
+        let mut m = model(80);
+        long(&mut m, 40);
+        assert!(settled_len(&m) > 0);
+        assert_fresh(&m, 80);
+        // A hit.
+        let hits = HITS.with(std::cell::Cell::get);
+        assert_fresh(&m, 80);
+        assert_eq!(HITS.with(std::cell::Cell::get), hits + 1);
+        // A settled entry edited in place, against a warm cache.
+        m.transcript[5] = Entry::Prose("rewritten **answer**".into());
+        assert_fresh(&m, 80);
+        // Another width.
+        assert_fresh(&m, 60);
+        assert_fresh(&m, 80);
+        // A setting the rows are drawn with.
+        m.show_tool_output = !m.show_tool_output;
+        assert_fresh(&m, 80);
+        m.running = true;
+        assert_fresh(&m, 80);
+    }
+
+    #[test]
+    fn the_settled_part_stops_before_anything_still_moving() {
+        let mut m = model(80);
+        long(&mut m, 40);
+        let len = m.transcript.len();
+        assert!(settled_len(&m) <= len - 64);
+        // A call still in flight far back keeps everything from it live.
+        m.transcript[9] = Entry::tool(State::Read, "instrumenta", "read src/x.rs", None);
+        m.running = true;
+        assert!(settled_len(&m) <= 9);
+        for tick in 0..4 {
+            m.tick = tick;
+            assert_fresh(&m, 80);
+        }
+    }
+
+    #[test]
+    fn the_split_never_cuts_a_group_of_calls() {
+        let mut m = model(80);
+        m.show_tool_output = false;
+        long(&mut m, 40);
+        // Each pushed entry moves the 64-entry boundary by one, so it lands
+        // on every kind of entry in a turn, calls and gaps included.
+        for turn in 0..7 {
+            let split = settled_len(&m);
+            assert!(split > 0);
+            assert!(!matches!(
+                m.transcript[split],
+                Entry::Tool { .. } | Entry::Gap
+            ));
+            assert_fresh(&m, 80);
+            m.transcript.push(if turn % 2 == 0 {
+                Entry::tool(State::Done, "instrumenta", "read src/y.rs", Some("1s"))
+            } else {
+                Entry::Gap
+            });
+        }
+    }
+
+    #[test]
+    fn notices_and_ended_calls_do_not_hold_the_cache_open() {
+        let mut m = model(80);
+        long(&mut m, 40);
+        let settled = settled_len(&m);
+        m.transcript[2] = Entry::notice(State::Done, "context compacted");
+        m.transcript[3] = Entry::tool(State::Failed, "manus", "cargo test", None);
+        assert_eq!(settled_len(&m), settled);
+        // Between turns no call is in flight, whatever its duration says.
+        m.transcript[4] = Entry::tool(State::Read, "instrumenta", "read a.rs", None);
+        assert_eq!(settled_len(&m), settled);
+    }
+
+    #[test]
+    fn an_active_task_list_keeps_spinning() {
+        let mut m = model(80);
+        long(&mut m, 40);
+        m.transcript[7] = Entry::Studio(vec![
+            Step::new(State::Done, "surveyed", None),
+            Step::new(State::Active, "examining", Some("store.rs")),
+        ]);
+        assert!(settled_len(&m) <= 7);
+        for tick in 0..6 {
+            m.tick = tick;
+            assert_fresh(&m, 80);
+        }
+    }
+
+    #[test]
+    fn streaming_entries_reuse_the_settled_rows() {
+        let mut m = model(80);
+        long(&mut m, 40);
+        let settled = settled_len(&m);
+        let _ = conversation_rows(&m, 80);
+        let hits = HITS.with(std::cell::Cell::get);
+        // A turn streams in: the split stays put and every frame is a hit.
+        for turn in 0..20 {
+            m.transcript.push(Entry::Prose(format!("streamed {turn}")));
+            assert_eq!(settled_len(&m), settled);
+            let _ = conversation_rows(&m, 80);
+        }
+        assert_eq!(HITS.with(std::cell::Cell::get), hits + 20);
+        assert_fresh(&m, 80);
     }
 }

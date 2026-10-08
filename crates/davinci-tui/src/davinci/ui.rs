@@ -1,9 +1,9 @@
 //! Char-grid primitives.
 //!
 //! Everything here returns either a *run* (`Vec<Span>`) or a *row* (`Line`), so
-//! callers can count rows exactly: the transcript tail-truncates like a
-//! scrollback and the composer anchors to the bottom of the window at any
-//! height. Surfaces are composed as rows rather than as ratatui `Block`s for
+//! callers can count rows exactly: the transcript scrolls through its rows
+//! (newest at the bottom unless scrolled back) and the composer anchors to the
+//! bottom of the window at any height. Surfaces are composed as rows rather than as ratatui `Block`s for
 //! the same reason — a Studio box has to sit *inside* the transcript's row
 //! list and still report its own height (design.md §6).
 //!

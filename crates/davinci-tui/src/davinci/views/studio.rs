@@ -5,12 +5,14 @@ use crate::davinci::theme::State;
 use crate::davinci::ui::{self, clip_ellipsis, span, span_strong, MEASURE};
 use ratatui::text::Line;
 
-pub fn lines(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
+/// `width` is the room the transcript gives the box, which leaves the
+/// scrollbar's column free.
+pub fn lines(model: &Model, steps: &[Step], width: u16) -> Vec<Line<'static>> {
     if steps.is_empty() {
         return Vec::new();
     }
     let th = &model.theme;
-    if model.width < 60 {
+    if width < 60 {
         let task = steps
             .iter()
             .find(|step| step.state == State::Active)
@@ -24,7 +26,7 @@ pub fn lines(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
                 .map(|target| format!(" · {target}"))
                 .unwrap_or_default()
         );
-        return vec![Line::from(span(clip_ellipsis(&text, model.width), th.text))];
+        return vec![Line::from(span(clip_ellipsis(&text, width), th.text))];
     }
     let complete = steps
         .iter()
@@ -55,10 +57,7 @@ pub fn lines(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
         if let Some(target) = &step.target {
             spans.push(span(format!(" · {target}"), th.muted));
         }
-        rows.push(Line::from(ui::truncate_run(
-            spans,
-            model.width.min(MEASURE + 6),
-        )));
+        rows.push(Line::from(ui::truncate_run(spans, width.min(MEASURE + 6))));
     }
     rows
 }
@@ -110,7 +109,7 @@ mod tests {
     #[test]
     fn at_a_hundred_columns_it_is_a_box_with_one_row_per_step() {
         let m = model(100);
-        let rows = lines(&m, &steps());
+        let rows = lines(&m, &steps(), m.width);
         assert_eq!(rows.len(), 5);
         assert_eq!(rows.len(), height(&m, &steps()));
         assert!(text(&rows[0]).starts_with("  Tasks · 2/4 complete"));
@@ -124,10 +123,10 @@ mod tests {
         let steps = steps();
         for (tick, frame) in [(0u64, '◜'), (1, '◝'), (2, '◞'), (3, '◟')] {
             m.tick = tick;
-            let drawn = text(&lines(&m, &steps)[3]);
+            let drawn = text(&lines(&m, &steps, m.width)[3]);
             assert!(drawn.starts_with(&format!("  {frame} ")), "{drawn}");
         }
-        let drawn = text(&lines(&m, &steps)[3]);
+        let drawn = text(&lines(&m, &steps, m.width)[3]);
         assert!(drawn.contains("examining session persistence"));
         assert!(drawn.contains("store.rs"), "{drawn}");
     }
@@ -137,14 +136,14 @@ mod tests {
         let mut m = model(100);
         m.animate = false;
         m.tick = 3;
-        let drawn = text(&lines(&m, &steps())[3]);
+        let drawn = text(&lines(&m, &steps(), m.width)[3]);
         assert!(drawn.starts_with("  ◉ "), "{drawn}");
     }
 
     #[test]
     fn below_a_hundred_columns_it_collapses_to_one_line() {
         let m = model(50);
-        let rows = lines(&m, &steps());
+        let rows = lines(&m, &steps(), m.width);
         assert_eq!(rows.len(), 1);
         assert_eq!(height(&m, &steps()), 1);
         let drawn = text(&rows[0]);
@@ -157,19 +156,19 @@ mod tests {
     fn a_collapsed_ledger_with_no_active_step_falls_back_to_the_first() {
         let m = model(50);
         let steps = vec![Step::new(State::Done, "surveyed workspace", None)];
-        let drawn = text(&lines(&m, &steps)[0]);
+        let drawn = text(&lines(&m, &steps, m.width)[0]);
         assert!(drawn.contains("surveyed workspace"), "{drawn}");
     }
 
     #[test]
     fn an_empty_ledger_draws_nothing_when_collapsed() {
-        assert!(lines(&model(80), &[]).is_empty());
+        assert!(lines(&model(80), &[], 80).is_empty());
     }
 
     #[test]
     fn the_box_never_grows_past_the_measure() {
         let m = model(200);
-        let rows = lines(&m, &steps());
+        let rows = lines(&m, &steps(), m.width);
         let width = crate::davinci::ui::run_width(&rows[0].spans);
         assert!(width <= MEASURE + 6);
         assert!(rows

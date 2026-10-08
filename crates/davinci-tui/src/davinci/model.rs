@@ -2796,8 +2796,58 @@ pub struct Model {
     /// Context memory inspector (`/context`).
     pub context_inspector: Option<ContextInspectorSheet>,
     pub context_inspector_index: usize,
+    /// How far the conversation is scrolled back. A cell, so drawing can
+    /// drop a scroll the conversation no longer supports (see
+    /// [`TranscriptScroll`]) without every caller having to.
+    pub transcript_scroll: std::cell::Cell<TranscriptScroll>,
     /// What the command sheets state about the session (design.md §11).
     pub facts: Facts,
+}
+
+/// Where the conversation is scrolled to, anchored from the top: `top` is
+/// the first row drawn, and `None` follows the newest. Rows that arrive or
+/// settle below the view (a turn streaming in, a group of calls collapsing
+/// to one line once they finish) leave it where it is.
+///
+/// The scroll belongs to one conversation at one width. A resize reflows
+/// every row, and a conversation that lost entries, or whose first entry
+/// changed, was cleared, rewound or replaced; any of those drops the scroll
+/// and the view follows the newest again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptScroll {
+    pub top: Option<usize>,
+    pub width: u16,
+    pub entries: usize,
+    pub first: u64,
+}
+
+impl TranscriptScroll {
+    pub fn at(top: usize, width: u16, transcript: &[Entry]) -> Self {
+        Self {
+            top: Some(top),
+            width,
+            entries: transcript.len(),
+            first: first_entry_print(transcript),
+        }
+    }
+
+    /// The first row to draw, while this scroll still applies.
+    pub fn top_for(self, width: u16, transcript: &[Entry]) -> Option<usize> {
+        let top = self.top?;
+        let same = self.width == width
+            && transcript.len() >= self.entries
+            && first_entry_print(transcript) == self.first;
+        same.then_some(top)
+    }
+}
+
+/// A fingerprint of the conversation's first entry, which a new or resumed
+/// conversation replaces.
+fn first_entry_print(transcript: &[Entry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", transcript.first()).hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Model {
@@ -2942,6 +2992,7 @@ impl Model {
             agents_index: 0,
             context_inspector: None,
             context_inspector_index: 0,
+            transcript_scroll: std::cell::Cell::default(),
             facts: Facts::default(),
         }
     }
@@ -3709,6 +3760,8 @@ impl Model {
         self.mark_caret_moved();
         let text = self.composer.editor_mut().submit();
         self.dismiss_suggestions();
+        // Sending a turn returns to the newest, where its answer lands.
+        self.transcript_scroll.take();
         if !self.transcript.is_empty() {
             self.transcript.push(Entry::Gap);
         }

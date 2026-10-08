@@ -29,6 +29,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::app::{self, Flow};
 use super::model::Model;
+use super::views::scrollbar::Scrollbar;
 
 /// One frame of the clock. Both animations are derived from it.
 pub const TICK: Duration = Duration::from_millis(250);
@@ -359,6 +360,11 @@ pub struct Session {
     rendered_lines: Vec<String>,
     selection_anchor: Option<(u16, u16)>,
     selection_focus: Option<(u16, u16)>,
+    /// While the conversation's scrollbar is held: the thumb row grabbed.
+    scrollbar_grab: Option<u16>,
+    /// The conversation's scrollbar as last drawn, for hit-testing the
+    /// pointer against what is actually on screen.
+    scrollbar: Option<Scrollbar>,
 }
 
 impl Session {
@@ -404,6 +410,8 @@ impl Session {
             rendered_lines: Vec::new(),
             selection_anchor: None,
             selection_focus: None,
+            scrollbar_grab: None,
+            scrollbar: None,
         })
     }
 
@@ -547,11 +555,16 @@ impl Session {
         }
         let background = Style::default().bg(model.theme.background);
         let mut rendered_lines = Vec::new();
+        let mut scrollbar = None;
         let selection = self.selection_range();
         self.terminal.draw(|frame| {
             let area: Rect = frame.area();
             let composed = app::compose_frame(model, area.height);
             rendered_lines = composed.lines.iter().map(ToString::to_string).collect();
+            scrollbar = composed.scrollbar;
+            if let Some(bar) = &scrollbar {
+                strip_scrollbar(&mut rendered_lines, bar);
+            }
             frame.render_widget(Paragraph::new(composed.lines).style(background), area);
             if let Some((start, end)) = selection {
                 for row in start.1..=end.1.min(area.height.saturating_sub(1)) {
@@ -571,6 +584,7 @@ impl Session {
             }
         })?;
         self.rendered_lines = rendered_lines;
+        self.scrollbar = scrollbar;
         Ok(())
     }
 
@@ -612,7 +626,9 @@ impl Session {
 
     /// Graph interaction shares the composed geometry while other surfaces retain native text selection.
     pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
-        if route_graph_mouse(model, mouse) {
+        if route_graph_mouse(model, mouse)
+            || route_scroll_mouse(model, &mut self.scrollbar_grab, self.scrollbar, mouse)
+        {
             self.selection_anchor = None;
             self.selection_focus = None;
             return false;
@@ -677,6 +693,72 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+/// The wheel scrolls the conversation, or steps a list like the arrow
+/// keys; a press on the scrollbar jumps there and a drag carries the
+/// thumb. `false` leaves the event to text selection.
+pub fn route_scroll_mouse(
+    model: &mut Model,
+    grab_state: &mut Option<u16>,
+    drawn: Option<Scrollbar>,
+    mouse: event::MouseEvent,
+) -> bool {
+    use super::views::scrollbar::WHEEL_ROWS;
+    use event::{MouseButton::Left, MouseEventKind};
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = mouse.kind == MouseEventKind::ScrollUp;
+            if app::scroll_transcript(model, if up { WHEEL_ROWS } else { -WHEEL_ROWS }) {
+                return true;
+            }
+            if model.screen != super::model::Screen::Agent || model.overlay.is_some() {
+                let code = if up { KeyCode::Up } else { KeyCode::Down };
+                let _ = app::handle_key(model, KeyEvent::new(code, KeyModifiers::NONE));
+            }
+            true
+        }
+        MouseEventKind::Down(Left) => {
+            // A release outside the window is often never reported; a new
+            // press always starts clean.
+            *grab_state = None;
+            let Some(bar) = drawn.filter(|bar| bar.contains(mouse.column, mouse.row)) else {
+                return false;
+            };
+            let (thumb, len) = bar.thumb();
+            let at = mouse.row - bar.top;
+            let grab = bar.grab(mouse.row);
+            if at < thumb || at >= thumb + len {
+                app::set_transcript_offset(model, &bar, bar.offset_at(mouse.row, grab));
+            }
+            *grab_state = Some(grab);
+            true
+        }
+        MouseEventKind::Drag(Left) => {
+            let Some(grab) = *grab_state else {
+                return false;
+            };
+            if let Some(bar) = drawn {
+                app::set_transcript_offset(model, &bar, bar.offset_at(mouse.row, grab));
+            }
+            true
+        }
+        MouseEventKind::Up(Left) => grab_state.take().is_some(),
+        _ => false,
+    }
+}
+
+/// Copied text is the conversation's, not the scrollbar's: drop the bar's
+/// column from the rows it was drawn in.
+pub fn strip_scrollbar(rows: &mut [String], bar: &Scrollbar) {
+    if !bar.drawn {
+        return;
+    }
+    let first = usize::from(bar.top);
+    let last = first + usize::from(bar.height);
+    for row in rows.iter_mut().take(last).skip(first) {
+        *row = display_column_slice(row, 0, usize::from(bar.column)).to_string();
     }
 }
 
