@@ -45,6 +45,7 @@ fn segment(
     cwd: &Path,
     calls: &Arc<Mutex<Vec<Dispatch>>>,
     cut: Option<Cut>,
+    fail_at: Option<usize>,
     stop_after: Option<String>,
     resume: Option<GraphRun>,
 ) -> GraphRun {
@@ -80,6 +81,14 @@ fn segment(
                 // classifier would read as an environment problem.
                 failure_reason: Some("worker aborted".into()),
                 final_text: "checking the environment first".into(),
+                ..Default::default()
+            };
+        }
+        if fail_at == Some(number) {
+            // A real failure: the worker exits without submitting.
+            return WorkerResult {
+                ok: false,
+                failure_reason: Some("graph_submit was never called".into()),
                 ..Default::default()
             };
         }
@@ -206,7 +215,11 @@ fn segment(
 /// Drives the loop to completion, stopping once at `cut` and resuming from
 /// the durable checkpoint each time. Returns every dispatch, the final run,
 /// and how many times the loop was reopened.
-fn drive(cut: Option<Cut>, baseline: &[Dispatch]) -> (Vec<Dispatch>, GraphRun, String, usize) {
+fn drive(
+    cut: Option<Cut>,
+    fail_at: Option<usize>,
+    baseline: &[Dispatch],
+) -> (Vec<Dispatch>, GraphRun, String, usize) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("owned.txt"), "original\n").unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -214,7 +227,7 @@ fn drive(cut: Option<Cut>, baseline: &[Dispatch]) -> (Vec<Dispatch>, GraphRun, S
         Some(Cut::After(at)) => Some(baseline[at - 1].task_id.clone()),
         _ => None,
     };
-    let mut run = segment(dir.path(), &calls, cut, stop_after, None);
+    let mut run = segment(dir.path(), &calls, cut, fail_at, stop_after, None);
     let mut resumes = 0;
     while run.phase != Phase::Done {
         assert_eq!(
@@ -228,7 +241,7 @@ fn drive(cut: Option<Cut>, baseline: &[Dispatch]) -> (Vec<Dispatch>, GraphRun, S
         let saved = super::super::store::load_run_checked(dir.path(), &run.run_id).unwrap();
         super::super::continuation::validate_resume(&saved, dir.path())
             .unwrap_or_else(|error| panic!("{cut:?}: checkpoint is not resumable: {error}"));
-        run = segment(dir.path(), &calls, None, None, Some(saved));
+        run = segment(dir.path(), &calls, None, None, None, Some(saved));
     }
     let owned = std::fs::read_to_string(dir.path().join("owned.txt")).unwrap();
     let calls = calls.lock().unwrap().clone();
@@ -236,7 +249,7 @@ fn drive(cut: Option<Cut>, baseline: &[Dispatch]) -> (Vec<Dispatch>, GraphRun, S
 }
 
 fn baseline() -> (Vec<Dispatch>, GraphRun, String) {
-    let (calls, run, owned, resumes) = drive(None, &[]);
+    let (calls, run, owned, resumes) = drive(None, None, &[]);
     assert_eq!(resumes, 0);
     (calls, run, owned)
 }
@@ -270,7 +283,7 @@ fn a_loop_stopped_after_any_dispatch_resumes_without_repeating_or_skipping_work(
     let (expected, reference, expected_owned) = baseline();
     for at in 1..=expected.len() {
         let cut = Cut::After(at);
-        let (calls, run, owned, resumes) = drive(Some(cut), &expected);
+        let (calls, run, owned, resumes) = drive(Some(cut), None, &expected);
         if at < expected.len() {
             assert_eq!(resumes, 1, "{cut:?} never stopped the loop");
         }
@@ -300,7 +313,7 @@ fn a_loop_stopped_inside_a_worker_reruns_only_that_worker() {
     let (expected, reference, expected_owned) = baseline();
     for at in 1..=expected.len() {
         let cut = Cut::During(at);
-        let (calls, run, owned, resumes) = drive(Some(cut), &expected);
+        let (calls, run, owned, resumes) = drive(Some(cut), None, &expected);
         assert_eq!(resumes, 1, "{cut:?} never stopped the loop");
         // The stopped attempt is the only extra dispatch, and it is retried
         // as the same node with the same briefing: a stop is not a failure,
@@ -321,4 +334,104 @@ fn a_loop_stopped_inside_a_worker_reruns_only_that_worker() {
             "{cut:?}: node cursor drifted"
         );
     }
+}
+
+#[test]
+fn a_stopped_retry_reopens_with_the_failure_it_was_retrying() {
+    let (expected, _, expected_owned) = baseline();
+    for at in 1..=expected.len() {
+        // Dispatch `at` really fails, its automatic retry is stopped, and the
+        // replacement must carry the same retry notice the stopped retry had.
+        let cut = Cut::During(at + 1);
+        let (calls, run, owned, resumes) = drive(Some(cut), Some(at), &expected);
+        assert_eq!(resumes, 1, "{cut:?} never stopped the loop");
+        assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
+        let failed = &calls[at - 1];
+        let stopped = &calls[at];
+        let replacement = &calls[at + 1];
+        assert_eq!(failed, &expected[at - 1], "{cut:?}: first attempt differs");
+        assert_eq!(stopped.task_id, failed.task_id, "{cut:?}: no retry");
+        assert!(
+            stopped.briefing.starts_with(&failed.briefing)
+                && stopped.briefing.contains("RETRY NOTICE"),
+            "{cut:?}: the retry was not told about the failure"
+        );
+        assert_eq!(
+            replacement, stopped,
+            "{cut:?}: the replacement lost the retry instructions"
+        );
+        let mut rest = calls.clone();
+        rest.drain(at..at + 2);
+        assert_eq!(rest, expected, "{cut:?}: dispatches differ");
+        assert_eq!(owned, expected_owned, "{cut:?}: workspace differs");
+    }
+}
+
+#[test]
+fn a_stopped_worker_with_unreconciled_effects_is_not_replaced() {
+    let (expected, _, _) = baseline();
+    let target = expected
+        .iter()
+        .position(|call| call.task_id == "implement-1")
+        .unwrap()
+        + 1;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("owned.txt"),
+        "original
+",
+    )
+    .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let run = segment(
+        dir.path(),
+        &calls,
+        Some(Cut::During(target)),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(run.phase, Phase::Cancelled, "{:?}", run.blocked_reason);
+    let saved = super::super::store::load_run_checked(dir.path(), &run.run_id).unwrap();
+    let stopped = saved.continuation.as_ref().unwrap().attempt_history["implement-1"]
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(stopped.status, TaskStatus::Cancelled);
+    // The killed writer left a tool ledger nobody can reconcile.
+    let ledger = stopped
+        .worker_session
+        .as_ref()
+        .unwrap()
+        .session_path
+        .with_extension("tool-ledger.json");
+    std::fs::write(&ledger, "not a ledger").unwrap();
+
+    let dispatched = calls.lock().unwrap().len();
+    let reopened = segment(dir.path(), &calls, None, None, None, Some(saved));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        dispatched,
+        "a replacement was launched over unreconciled effects"
+    );
+    assert_ne!(reopened.phase, Phase::Done);
+    let task = reopened.task("implement-1").unwrap();
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert!(
+        task.error
+            .as_deref()
+            .is_some_and(|error| error.contains("reconciliation required")),
+        "{:?}",
+        task.error
+    );
+    let saved = super::super::store::load_run_checked(dir.path(), &run.run_id).unwrap();
+    let decision = saved.continuation.as_ref().unwrap().attempt_history["implement-1"]
+        .last()
+        .unwrap()
+        .retry_recovery
+        .clone()
+        .unwrap();
+    assert!(!decision.allowed, "{decision:?}");
+    let refused = super::super::continuation::validate_resume(&saved, dir.path()).unwrap_err();
+    assert!(refused.contains("reconcile"), "{refused}");
 }

@@ -505,6 +505,10 @@ pub struct TaskAttemptRecord {
     /// reclassifying diagnostic text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_recovery: Option<super::recovery::RetryRecoveryRecord>,
+    /// The retry notice and recovery context this attempt carried after its
+    /// node briefing. A stopped retry reopens with the same instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_instructions: Option<String>,
 }
 
 pub fn write_task_attempt(
@@ -1180,6 +1184,12 @@ mod tests {
             worker_session: None,
             operation_binding: None,
             retry_recovery: None,
+            retry_instructions: Some(
+                "
+
+RETRY NOTICE: fixture."
+                    .into(),
+            ),
         };
 
         write_task_attempt(dir.path(), &run_id, "research-1", 1, &record).unwrap();
