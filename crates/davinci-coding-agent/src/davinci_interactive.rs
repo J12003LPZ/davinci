@@ -2505,6 +2505,9 @@ fn graph_command_opens_view(name: &str, args: &str) -> bool {
 
 fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -> Option<Next> {
     if davinci_coding_agent::design::is_command(line) {
+        if let Some(next) = ask_design_setup(shell, line) {
+            return Some(next);
+        }
         // The ordinary worker path keeps the UI alive while approval is pending.
         return Some(submit_prompt(shell, line, &[]));
     }
@@ -2940,6 +2943,13 @@ pub enum Question {
     Logout {
         providers: Vec<String>,
     },
+    /// `/design` is not ready: install its runtime, or turn it on. `line` is
+    /// the command that asked, run once the answer makes it possible.
+    DesignSetup {
+        line: String,
+        needed: davinci_coding_agent::design::setup::SetupNeeded,
+        installer: Option<davinci_coding_agent::design::setup::Installer>,
+    },
     /// The one thing first-run has to ask. The old setup also asked for a
     /// theme; davinci has one palette, negotiated from the terminal rather
     /// than chosen (design.md §2), so only the analytics question remains.
@@ -2999,6 +3009,9 @@ impl Question {
                 ],
                 ..Default::default()
             },
+            Question::DesignSetup {
+                needed, installer, ..
+            } => design_setup_ask(needed, installer.as_ref()),
             Question::Logout { providers } => Ask {
                 title: "Credentials".into(),
                 name: "CREDENTIALS".into(),
@@ -3830,6 +3843,12 @@ pub enum Detached {
     Login {
         provider: String,
         key: Option<String>,
+    },
+    /// The design runtime setup prints npm, build and browser download
+    /// progress, and may fail with something worth reading.
+    DesignInstall {
+        installer: davinci_coding_agent::design::setup::Installer,
+        line: String,
     },
 }
 
@@ -8873,6 +8892,7 @@ impl Shell<'_> {
                         .and_then(|stored| detached_login_message(provider, !stored))
                 }
             }
+            Detached::DesignInstall { installer, .. } => run_design_installer(installer),
         };
         if let Err(err) = self.terminal.reacquire() {
             return Next::Fail(err.to_string());
@@ -8883,7 +8903,13 @@ impl Shell<'_> {
             self.model.height = height;
         }
         match outcome {
-            Ok(text) => self.say(&text),
+            Ok(text) => {
+                self.say(&text);
+                // Carry out the `/design` command that asked for the setup.
+                if let Detached::DesignInstall { line, .. } = &detached {
+                    return submit_prompt(self, line, &[]);
+                }
+            }
             Err(err) => self.note(&err),
         }
         Next::Go
@@ -9249,6 +9275,14 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             if let Question::GraphSetup(setup) = question {
                 return graph_setup::choose(shell, setup, index);
             }
+            if let Question::DesignSetup {
+                line,
+                needed,
+                installer,
+            } = question
+            {
+                return choose_design_setup(shell, line, needed, installer, index);
+            }
             if let Question::Rewind { checkpoints } = &question {
                 if let Some((id, prompt)) = checkpoints.get(index) {
                     match shell.agent.preview_prompt_rewind(id) {
@@ -9596,11 +9630,218 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     Next::Go
 }
 
+/// `/design` asks before it fails: `Some` when the runtime is missing or the
+/// feature is off, with either the setup question or, where nothing can be
+/// installed from here, what to do instead.
+fn ask_design_setup(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
+    use davinci_coding_agent::design::{commands, setup};
+
+    // A malformed command reports its own usage error on the ordinary path.
+    let command = commands::parse_design_command(line).ok()?;
+    // Installing would not help: the runtime is refused from here anyway.
+    if setup::needs_runtime(&command) && setup::workspace_holds_home(&shell.agent.cwd) {
+        shell.note(&format!("/design: {}", setup::HOME_WORKSPACE));
+        return Some(Next::Go);
+    }
+    let needed = setup::setup_needed(&command)?;
+    // A generation the route would refuse anyway (offline, an API key, a
+    // non-subscription model) fails now, not after a few-minute install.
+    if matches!(
+        command,
+        commands::DesignCommand::Create { .. } | commands::DesignCommand::Revise { .. }
+    ) && (shell.parsed.offline
+        || shell.parsed.api_key.is_some()
+        || davinci_coding_agent::design::model::SubscriptionModel::configured(shell.agent).is_err())
+    {
+        return None;
+    }
+    // The launch environment wins over settings.json at every start, so an
+    // install or the switch would be undone by the next launch.
+    if let Some(name) = design_launch_override(
+        &crate::settings::load_settings(&crate::default_agent_dir()),
+        |name| std::env::var(name).ok(),
+    ) {
+        shell.note(&format!(
+            "/design: {}. {name} is set in the environment DaVinci was started with and overrides settings.json; unset it",
+            needed.reason()
+        ));
+        return Some(Next::Go);
+    }
+    let installer = match (&needed, setup::installer()) {
+        (setup::SetupNeeded::Disabled, _) => None,
+        (setup::SetupNeeded::Runtime(_), Ok(installer)) => Some(installer),
+        (setup::SetupNeeded::Runtime(reason), Err(why)) => {
+            shell.note(&format!("/design: {reason}. {why}"));
+            return Some(Next::Go);
+        }
+    };
+    Some(shell.finish(Done::Ask(Question::DesignSetup {
+        line: line.to_string(),
+        needed,
+        installer,
+    })))
+}
+
+/// The setup question: install when there is no runtime, otherwise only the
+/// `/config` switch is missing.
+pub fn design_setup_ask(
+    needed: &davinci_coding_agent::design::setup::SetupNeeded,
+    installer: Option<&davinci_coding_agent::design::setup::Installer>,
+) -> Ask {
+    let (first, detail) = match installer {
+        Some(installer) => (
+            PickerItem::new(
+                "Install now",
+                "npm packages, the companion build and Chromium; a few minutes",
+            ),
+            format!("runs {}", installer.display()),
+        ),
+        None => (
+            PickerItem::new("Turn on design artifacts", "saved to /config"),
+            "the installed runtime is kept".into(),
+        ),
+    };
+    Ask {
+        title: "Design".into(),
+        name: "DESIGN".into(),
+        key: "/design".into(),
+        note: format!("{} · {detail}", needed.reason()),
+        items: vec![
+            first,
+            PickerItem::new("Not now", "/design asks again next time"),
+        ],
+        ..Default::default()
+    }
+}
+
+fn choose_design_setup(
+    shell: &mut Shell<'_>,
+    line: String,
+    needed: davinci_coding_agent::design::setup::SetupNeeded,
+    installer: Option<davinci_coding_agent::design::setup::Installer>,
+    index: usize,
+) -> Next {
+    if index != 0 {
+        shell.say(&format!("/design not set up: {}", needed.reason()));
+        return Next::Go;
+    }
+    match installer {
+        Some(installer) => shell.detach(Detached::DesignInstall { installer, line }),
+        None => match enable_design() {
+            Ok(()) => {
+                shell.say("design artifacts turned on");
+                submit_prompt(shell, &line, &[])
+            }
+            Err(err) => {
+                shell.note(&format!("could not turn on design artifacts: {err}"));
+                Next::Go
+            }
+        },
+    }
+}
+
+/// The `DAVINCI_DESIGN_*` variable the launching process set to something
+/// other than what settings.json holds, when one did. Startup copies settings
+/// into unset variables, so a difference can only come from the launcher.
+pub fn design_launch_override(
+    stored: &crate::settings::Settings,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    let enabled = stored
+        .design_enabled
+        .map(|enabled| if enabled { "1" } else { "0" }.to_string());
+    [
+        ("DAVINCI_DESIGN_ENABLED", enabled),
+        ("DAVINCI_DESIGN_RUNTIME", stored.design_runtime.clone()),
+        ("DAVINCI_DESIGN_NODE", stored.design_node.clone()),
+    ]
+    .into_iter()
+    .find_map(|(name, stored)| {
+        let live = env(name).filter(|value| !value.is_empty())?;
+        (stored.filter(|value| !value.is_empty()).as_deref() != Some(live.as_str())).then_some(name)
+    })
+}
+
+/// The `/config` switch, saved and live for this run.
+fn enable_design() -> Result<(), String> {
+    let dir = crate::default_agent_dir();
+    let mut stored = crate::settings::load_settings(&dir);
+    stored.design_enabled = Some(true);
+    crate::settings::save_settings(&dir, &stored)?;
+    std::env::set_var("DAVINCI_DESIGN_ENABLED", "1");
+    Ok(())
+}
+
+/// Run the setup script on the user's console. It records the new runtime in
+/// the global settings; this run adopts it without a restart.
+fn run_design_installer(
+    installer: &davinci_coding_agent::design::setup::Installer,
+) -> Result<String, String> {
+    println!(
+        "\nInstalling the DaVinci design runtime: npm packages, the companion build and Chromium.\nThis takes a few minutes; DaVinci returns when it is done.\n"
+    );
+    // Ctrl+C reaches every process on the console: it should stop the
+    // setup, not end this session. The guard only swallows it for DaVinci.
+    let interrupt =
+        davinci_coding_agent::native_extensions::security_scan::interrupt::Interrupt::install();
+    let status = std::process::Command::new(&installer.program)
+        .args(installer.args())
+        .status();
+    drop(interrupt);
+    let outcome = match status {
+        Err(err) => Err(format!("could not start {}: {err}", installer.display())),
+        Ok(status) if !status.success() => Err(format!(
+            "design setup failed ({status}); fix the error above and run: {}",
+            installer.display()
+        )),
+        Ok(_) => adopt_design_settings(),
+    };
+    if let Err(err) = &outcome {
+        // The alternate screen hides this output once DaVinci returns.
+        eprintln!("\n{err}\nPress Enter to return to DaVinci.");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+    outcome.map(|()| "design runtime installed and turned on".into())
+}
+
+/// The startup step (`apply_design_settings`) again, except the values the
+/// setup just wrote replace whatever this process started with.
+fn adopt_design_settings() -> Result<(), String> {
+    let dir = crate::default_agent_dir();
+    let stored = crate::settings::load_settings(&dir);
+    let missing = |key: &str| {
+        format!(
+            "the setup finished but {} has no {key}",
+            dir.join("settings.json").display()
+        )
+    };
+    let runtime = stored
+        .design_runtime
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| missing("designRuntime"))?;
+    let node = stored
+        .design_node
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| missing("designNode"))?;
+    std::env::set_var("DAVINCI_DESIGN_RUNTIME", runtime);
+    std::env::set_var("DAVINCI_DESIGN_NODE", node);
+    std::env::set_var(
+        "DAVINCI_DESIGN_ENABLED",
+        if stored.design_enabled == Some(false) {
+            "0"
+        } else {
+            "1"
+        },
+    );
+    Ok(())
+}
+
 /// Carry out the row chosen from a question.
 fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<String, String> {
     match question {
         Question::GraphSetup(_) => Err("Graph setup must be handled by the launch flow".into()),
         Question::Rewind { .. } => Err("Rewind must be handled by the preview flow".into()),
+        Question::DesignSetup { .. } => Err("Design setup must be handled by its own flow".into()),
         Question::Trust { options, .. } => {
             let Some(option) = options.get(index) else {
                 return Err("that trust option is gone".into());
