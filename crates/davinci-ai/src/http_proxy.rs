@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use url::Url;
 
@@ -151,6 +151,10 @@ pub fn connect_response_ok(response: &str) -> bool {
     matches!(fields.next(), Some("HTTP/1.1" | "HTTP/1.0")) && fields.next() == Some("200")
 }
 
+/// Upper bound on the proxy's CONNECT response headers. Real proxies answer
+/// with well under 1 KiB; the cap stops a hostile one from growing memory.
+const MAX_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
+
 pub fn tcp_connect_via_http_proxy(
     proxy: &Url,
     target_host: &str,
@@ -190,7 +194,16 @@ pub fn tcp_connect_via_http_proxy(
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
     let mut buf = vec![0u8; 4096];
     let mut collected = Vec::new();
+    // One deadline for the whole header read: the per-read timeout alone
+    // never fires on a proxy that keeps trickling bytes.
+    let deadline = Instant::now() + timeout;
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("WebSocket connect failed: proxy CONNECT response timed out".to_string());
+        }
+        tcp.set_read_timeout(Some(remaining))
+            .map_err(|err| format!("WebSocket connect failed: {err}"))?;
         let n = tcp
             .read(&mut buf)
             .map_err(|err| format!("WebSocket connect failed: {err}"))?;
@@ -200,6 +213,11 @@ pub fn tcp_connect_via_http_proxy(
         collected.extend_from_slice(&buf[..n]);
         if collected.windows(4).any(|window| window == b"\r\n\r\n") {
             break;
+        }
+        if collected.len() > MAX_CONNECT_RESPONSE_BYTES {
+            return Err(
+                "WebSocket connect failed: proxy CONNECT response headers too large".to_string(),
+            );
         }
     }
     let response = String::from_utf8_lossy(&collected);
@@ -374,5 +392,65 @@ mod tests {
         assert!(!connect_response_ok("HTTP/1.1  200 OK\r\n\r\n"));
         assert!(!connect_response_ok("HTTP/2 200\r\n\r\n"));
         assert!(!connect_response_ok(""));
+    }
+
+    /// Runs `serve` against the first connection and returns the client result
+    /// plus how long the client call took.
+    fn connect_to_fake_proxy<F>(
+        timeout: Duration,
+        serve: F,
+    ) -> (Result<TcpStream, String>, Duration)
+    where
+        F: FnOnce(TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            serve(stream);
+        });
+        let proxy = Url::parse(&format!("http://{addr}")).unwrap();
+        let started = Instant::now();
+        let result = tcp_connect_via_http_proxy(&proxy, "chatgpt.com", 443, timeout);
+        let elapsed = started.elapsed();
+        drop(
+            result
+                .as_ref()
+                .map(|tcp| tcp.shutdown(std::net::Shutdown::Both)),
+        );
+        server.join().unwrap();
+        (result, elapsed)
+    }
+
+    #[test]
+    fn wor69_connect_response_headers_are_size_capped() {
+        let (result, _) = connect_to_fake_proxy(Duration::from_secs(10), |mut stream| {
+            // Endless header bytes with no CRLFCRLF terminator, then close.
+            let chunk = [b'a'; 4096];
+            for _ in 0..64 {
+                if stream.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+        });
+        let error = result.unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn wor69_connect_response_has_total_deadline_against_slow_drip() {
+        let (result, elapsed) = connect_to_fake_proxy(Duration::from_millis(400), |mut stream| {
+            // One byte every 100ms keeps every individual read under the read timeout.
+            for _ in 0..60 {
+                if stream.write_all(b"a").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 }
