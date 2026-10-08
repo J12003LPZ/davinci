@@ -8758,6 +8758,9 @@ impl Shell<'_> {
             return Next::Go;
         };
         let messages_before = self.agent.messages.len();
+        // Enter on `/compact` went through `Model::submit`, which marks a turn
+        // running; this is not one, and nothing here can interrupt it.
+        self.model.running = false;
         self.model.working = Some(Working {
             label: Some("Compacting conversation"),
             ..Working::default()
