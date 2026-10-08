@@ -274,6 +274,11 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         model.transcript_scroll.take();
     }
     if total <= height {
+        // Nothing to scroll through, so no scroll may linger to reappear
+        // when the conversation grows past the window again.
+        if top.is_some() {
+            model.transcript_scroll.take();
+        }
         let mut content = rows_of(0..total);
         if content.len() < height {
             content.push(blank());
@@ -281,6 +286,12 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         return (content, None);
     }
     let max_top = total - height;
+    // A stored row past the last possible top is stale (the rows below it
+    // were replaced or shrank). Drawing it clamped would leave it stored, to
+    // jump back when the conversation grows; it means the newest instead.
+    if top.is_some_and(|top| top >= max_top) {
+        model.transcript_scroll.take();
+    }
     let top = top.map_or(max_top, |top| top.min(max_top));
     let offset = max_top - top;
     let bar = Scrollbar {

@@ -470,3 +470,43 @@ fn a_resize_while_scrolled_through_folded_output_drops_the_anchor() {
     assert!(shows(&m, "turn 059"));
 }
 
+/// WOR-43: a replacement the fingerprint cannot see (same first entry, same
+/// length) that leaves fewer rows must not strand a stored row past the end
+/// of history, to reappear once the conversation grows again.
+#[test]
+fn a_replaced_conversation_with_fewer_rows_does_not_resurrect_a_stale_offset() {
+    let mut m = model(60);
+    app::scroll_transcript(&mut m, 30);
+    assert_eq!(offset(&m), 30);
+    let keep = m.transcript[0].clone();
+    let len = m.transcript.len();
+    // Same first entry, same length, almost no rows (an agent mark draws none).
+    let mut replaced = vec![Entry::agent("davinci"); len];
+    replaced[0] = keep;
+    m.transcript = replaced;
+    let _ = frame(&m);
+    assert_eq!(offset(&m), 0);
+    // The conversation grows past the window again: still following newest.
+    m.transcript.clear();
+    m.transcript.push(Entry::user("turn 000"));
+    push_turns(&mut m, 1, 120);
+    assert_eq!(offset(&m), 0);
+    assert!(shows(&m, "turn 119"));
+}
+
+#[test]
+fn the_stored_scroll_never_exceeds_the_last_possible_top() {
+    let mut m = model(60);
+    app::scroll_transcript(&mut m, 5);
+    let stored = m.transcript_scroll.get().top.expect("scrolled");
+    let bar = bar(&m);
+    assert!(stored < bar.total - usize::from(bar.height));
+    // Drop rows below the anchor without changing the entry count.
+    let len = m.transcript.len();
+    for entry in m.transcript.iter_mut().skip(1).take(len - 1) {
+        *entry = Entry::agent("davinci");
+    }
+    let _ = frame(&m);
+    assert!(m.transcript_scroll.get().top.is_none());
+    assert_eq!(offset(&m), 0);
+}
