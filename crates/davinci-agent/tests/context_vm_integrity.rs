@@ -413,3 +413,64 @@ fn wor59_large_live_output_is_budgeted_once() {
         image.estimated_tokens
     );
 }
+
+/// WOR-72: optional broker context was admitted before recent turns, so one
+/// large optional item could push every hot event but the newest out.
+#[test]
+fn wor72_recent_turns_are_admitted_before_optional_broker_context() {
+    use davinci_agent::runtime::context_vm::{
+        events_from_messages, ContextVmConfig, ContextVmRuntime,
+    };
+    use davinci_agent::{ContextItem, ContextPacket};
+    let vm = ContextVmRuntime::new(ContextVmConfig::default(), Default::default());
+    let messages = (0..10)
+        .map(|n| {
+            let role = if n % 2 == 0 { "user" } else { "assistant" };
+            ChatMessage::text(role, format!("turn-{n} {}", "detail ".repeat(40)))
+        })
+        .collect::<Vec<_>>();
+    let events = events_from_messages(&messages);
+    let broker = ContextPacket {
+        items: vec![ContextItem {
+            source: "file::docs/big.md".into(),
+            content: "background ".repeat(2_000),
+            estimated_tokens: 5_500,
+            priority: 100,
+            stable_for_cache: true,
+            provenance: serde_json::json!({"provenance_kind": "repository_fact"}),
+        }],
+        estimated_tokens: 5_500,
+        cache_key: "fixture".into(),
+    };
+    let everything = vm.compile(&events, &broker, 1_000_000).unwrap();
+    let hot_tokens = everything
+        .entries
+        .iter()
+        .filter(|entry| entry.category.starts_with("hot_"))
+        .map(|entry| entry.estimated_tokens)
+        .sum::<u64>();
+    // The optional file alone fits, but only by evicting half the turns.
+    let budget = everything.estimated_tokens - hot_tokens / 2;
+    let image = vm.compile(&events, &broker, budget).unwrap();
+    let hot = image
+        .entries
+        .iter()
+        .filter(|entry| entry.category.starts_with("hot_"))
+        .count();
+    assert_eq!(hot, events.len(), "recent turns were evicted");
+    assert!(image
+        .entries
+        .iter()
+        .all(|entry| entry.category != "broker_context"));
+    assert!(image.estimated_tokens <= budget);
+
+    // With room for both, order on the wire is unchanged: broker, then hot.
+    let categories = everything
+        .entries
+        .iter()
+        .map(|entry| entry.category.as_str())
+        .collect::<Vec<_>>();
+    let broker_at = categories.iter().position(|c| *c == "broker_context");
+    let first_hot = categories.iter().position(|c| c.starts_with("hot_"));
+    assert!(broker_at < first_hot, "{categories:?}");
+}

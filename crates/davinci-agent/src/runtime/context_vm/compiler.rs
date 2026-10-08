@@ -99,18 +99,39 @@ impl ContextCompiler {
             entries.push(entry);
         }
 
+        // Admission order is not message order. Recent conversation is
+        // admitted first, newest first: the hot set is already capped by the
+        // hot window, so it is the recency reserve, and optional episode
+        // descriptors and broker items share what it leaves (WOR-72). The
+        // messages keep their cache-friendly order: pages, broker, then hot.
+        let mut optional_remaining = optional_limit.saturating_sub(used_tokens);
+        let mut selected_from_tail = Vec::new();
+        let mut hot_tokens = 0u64;
+        while let Some(event) = selected_hot.pop() {
+            let estimate = event_entry(event).estimated_tokens;
+            if required(event) || estimate <= optional_remaining {
+                if !required(event) {
+                    optional_remaining -= estimate;
+                }
+                hot_tokens = hot_tokens.saturating_add(estimate);
+                selected_from_tail.push(event);
+            }
+        }
+        selected_from_tail.reverse();
+
         for page in &request.root.episodes {
             // Episodes are optional: a descriptor is never smaller than its empty skeleton,
             // so when even that cannot fit, skip without touching the object store.
-            if used_tokens.saturating_add(episode_descriptor_floor_tokens(page)) > optional_limit {
+            if episode_descriptor_floor_tokens(page) > optional_remaining {
                 continue;
             }
             let object = self.load_page(page)?;
             let content = episode_descriptor(&page.id, &object)?;
             let entry = page_entry(page, "episode", content, false);
-            if used_tokens.saturating_add(entry.estimated_tokens) > optional_limit {
+            if entry.estimated_tokens > optional_remaining {
                 continue;
             }
+            optional_remaining -= entry.estimated_tokens;
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
             messages.push(ChatMessage::text("custom", entry.content.clone()));
             entries.push(entry);
@@ -118,30 +139,16 @@ impl ContextCompiler {
 
         for item in &request.broker_packet.items {
             let entry = broker_entry(item);
-            if entry.mandatory {
+            if entry.mandatory || entry.estimated_tokens > optional_remaining {
                 continue;
             }
-            if used_tokens.saturating_add(entry.estimated_tokens) > optional_limit {
-                continue;
-            }
+            optional_remaining -= entry.estimated_tokens;
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
             messages.push(ChatMessage::text("custom", entry.content.clone()));
             entries.push(entry);
         }
 
-        let mut selected_from_tail = Vec::new();
-        let mut optional_remaining = optional_limit.saturating_sub(used_tokens);
-        while let Some(event) = selected_hot.pop() {
-            let estimate = event_entry(event).estimated_tokens;
-            if required(event) || estimate <= optional_remaining {
-                if !required(event) {
-                    optional_remaining -= estimate;
-                }
-                used_tokens = used_tokens.saturating_add(estimate);
-                selected_from_tail.push(event);
-            }
-        }
-        selected_from_tail.reverse();
+        used_tokens = used_tokens.saturating_add(hot_tokens);
         for event in selected_from_tail {
             let mut entry = event_entry(event);
             entry.mandatory |= required(event);
