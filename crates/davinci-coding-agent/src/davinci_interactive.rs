@@ -4041,7 +4041,7 @@ pub fn perform(
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
             reload_goal_path(agent, model);
-            model.transcript = transcript_from(&agent.messages);
+            model.transcript = transcript_from(&agent.messages).into();
             Ok(Done::Said(format!("forked to {}", session_id(agent))))
         }
         SlashAction::Clone => {
@@ -4054,7 +4054,7 @@ pub fn perform(
                 .map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
             reload_goal_path(agent, model);
-            model.transcript = transcript_from(&agent.messages);
+            model.transcript = transcript_from(&agent.messages).into();
             Ok(Done::Said(format!("cloned to {}", session_id(agent))))
         }
         SlashAction::Import(path) => {
@@ -4065,7 +4065,7 @@ pub fn perform(
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
             agent.load_from_session(next)?;
             reload_goal_path(agent, model);
-            model.transcript = transcript_from(&agent.messages);
+            model.transcript = transcript_from(&agent.messages).into();
             Ok(Done::Said(format!("imported {}", session_id(agent))))
         }
         SlashAction::Copy => match agent.last_assistant_text() {
@@ -4666,7 +4666,7 @@ pub fn run(
         .join("config.json")
         .display()
         .to_string();
-    model.transcript = transcript_from(&agent.messages);
+    model.transcript = transcript_from(&agent.messages).into();
     model.models = crate::available_models(parsed)
         .iter()
         .map(|entry| {
@@ -4938,7 +4938,7 @@ pub fn run(
                 match agent.apply_prompt_rewind(&checkpoint_id, &preview_digest, &selection) {
                     Ok(_) => {
                         if selection.transcript {
-                            model.transcript = transcript_from(&agent.messages);
+                            model.transcript = transcript_from(&agent.messages).into();
                         }
                         model.transcript.push(Entry::notice(
                             State::Attention,
@@ -5728,7 +5728,7 @@ fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
         // The session in hand changed, so the transcript is rebuilt from it —
         // which wipes the status lines `apply_session_calls` just pushed.
         // State the change again on the fresh transcript.
-        shell.model.transcript = transcript_from(&shell.agent.messages);
+        shell.model.transcript = transcript_from(&shell.agent.messages).into();
         for (_, error) in &failures {
             shell.note(error);
         }
@@ -8969,7 +8969,7 @@ impl Shell<'_> {
                     return Next::Go;
                 }
                 reload_goal_path(self.agent, self.model);
-                self.model.transcript = transcript_from(&self.agent.messages);
+                self.model.transcript = transcript_from(&self.agent.messages).into();
                 self.model.running = false;
                 self.redress();
                 Next::Go
@@ -9472,7 +9472,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             {
                 Ok(_) => {
                     shell.model.close();
-                    shell.model.transcript = transcript_from(&shell.agent.messages);
+                    shell.model.transcript = transcript_from(&shell.agent.messages).into();
                     shell.say(&format!(
                         "moved to turn {}",
                         node.id.unwrap_or_else(|| target.clone())

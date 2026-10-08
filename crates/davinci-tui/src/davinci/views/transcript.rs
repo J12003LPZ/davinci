@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 
 use super::{markdown, studio};
 use crate::davinci::model::{
-    Entry, HunkKind, Model, SubagentRow, SubagentRowState, NOTICE_INSTRUMENT,
+    Entry, HunkKind, Model, StampSlot, SubagentRow, SubagentRowState, NOTICE_INSTRUMENT,
 };
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
@@ -147,7 +147,7 @@ thread_local! {
 pub fn conversation_rows(model: &Model, width: u16) -> ConversationRows {
     let entries = &model.transcript;
     let split = settled_len(model);
-    let key = settled_key(model, &entries[..split], width);
+    let key = settled_key(model, split, width);
     let settled = SETTLED.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(hit) = cache.as_ref().filter(|hit| hit.key == key) {
@@ -174,15 +174,61 @@ pub fn conversation_rows(model: &Model, width: u16) -> ConversationRows {
     ConversationRows { settled, live }
 }
 
+/// Where the last scan for the first live entry ended, and what it assumed.
+/// Entries before `floor` were all settled then; they stay settled while
+/// nothing before `floor` is touched (`stamp`) and the global conditions the
+/// scan read (a run in flight, the typewriter) are as they were.
+struct ScanMemo {
+    stamp: u64,
+    floor: usize,
+    running: bool,
+    animate: bool,
+}
+
+thread_local! {
+    static SCAN: std::cell::RefCell<Option<ScanMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entries examined by the first-live scan, so tests can bound the work
+    /// a redraw does per entry of history.
+    static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// How many leading entries are settled. The split lands where a block
 /// starts, so a group of calls is never cut in two, and at least the newest
 /// 64 entries stay live, as the tail render always drew them.
+///
+/// The scan for the first entry that can still change resumes from where the
+/// previous one ended while nothing before that point was touched, so a
+/// redraw examines the live tail rather than the whole session.
 fn settled_len(model: &Model) -> usize {
     let entries = &model.transcript;
-    let first_live = entries
+    let start = SCAN.with(|memo| {
+        let memo = memo.borrow();
+        let Some(memo) = memo.as_ref() else {
+            return 0;
+        };
+        let reusable = memo.floor <= entries.len()
+            && memo.running == model.running
+            && memo.animate == model.animate
+            && model.reveal.is_none_or(|reveal| reveal.index >= memo.floor)
+            && model.reveal_floor.is_none_or(|floor| floor >= memo.floor)
+            && entries.prefix_stamp(StampSlot::LiveScan, memo.floor) == memo.stamp;
+        if reusable {
+            memo.floor
+        } else {
+            0
+        }
+    });
+    let first_live = entries[start..]
         .iter()
         .enumerate()
-        .position(|(index, entry)| {
+        .position(|(offset, entry)| {
+            let index = start + offset;
+            #[cfg(test)]
+            SCANNED.with(|n| n.set(n.get() + 1));
             model.revealed(index).is_some()
                 || match entry {
                     // In flight: the only calls that animate. A notice, or a
@@ -205,7 +251,15 @@ fn settled_len(model: &Model) -> usize {
                     _ => false,
                 }
         })
-        .unwrap_or(entries.len());
+        .map_or(entries.len(), |offset| start + offset);
+    SCAN.with(|memo| {
+        *memo.borrow_mut() = Some(ScanMemo {
+            stamp: entries.prefix_stamp(StampSlot::LiveScan, first_live),
+            floor: first_live,
+            running: model.running,
+            animate: model.animate,
+        });
+    });
     // The boundary moves in whole steps of 64, so a turn streaming in does
     // not move it, and miss the cache, on every entry it adds.
     let step = entries.len().saturating_sub(64) / 64 * 64;
@@ -216,9 +270,11 @@ fn settled_len(model: &Model) -> usize {
     split
 }
 
-/// Everything the settled rows are drawn from. `Entry` has no `Hash`, so its
-/// debug form stands in; that costs a small fraction of drawing it.
-fn settled_key(model: &Model, settled: &[Entry], width: u16) -> u64 {
+/// Everything the settled rows are drawn from. The entries themselves are
+/// represented by the log's prefix stamp, which changes exactly when one of
+/// them was touched; hashing their debug forms here cost time in proportion
+/// to the session on every frame.
+fn settled_key(model: &Model, split: usize, width: u16) -> u64 {
     use std::hash::{Hash, Hasher};
     struct Feed<'a, H: Hasher>(&'a mut H);
     impl<H: Hasher> std::fmt::Write for Feed<'_, H> {
@@ -231,11 +287,15 @@ fn settled_key(model: &Model, settled: &[Entry], width: u16) -> u64 {
     let _ = std::fmt::write(
         &mut Feed(&mut hasher),
         format_args!(
-            "{settled:?}{:?}{}{}{}",
+            "{:?}{}{}{}",
             model.theme, model.show_tool_output, model.animate, model.running
         ),
     );
-    settled.len().hash(&mut hasher);
+    model
+        .transcript
+        .prefix_stamp(StampSlot::SettledRows, split)
+        .hash(&mut hasher);
+    split.hash(&mut hasher);
     width.hash(&mut hasher);
     hasher.finish()
 }
@@ -2340,5 +2400,127 @@ mod tests {
         }
         assert_eq!(HITS.with(std::cell::Cell::get), hits + 20);
         assert_fresh(&m, 80);
+    }
+
+    // ---- WOR-44: a redraw does not pay for old, unchanged history ----------
+
+    fn long_model(turns: usize) -> Model {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            44,
+            false,
+        );
+        for turn in 0..turns {
+            m.transcript.push(Entry::User(format!("question {turn}")));
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::Prose(format!("answer {turn}")));
+            m.transcript.push(Entry::Gap);
+        }
+        m
+    }
+
+    fn all_text(rows: &ConversationRows) -> String {
+        rows.slice(0..rows.len())
+            .iter()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Entries the first-live scan examined, and settled-cache hits, for one
+    /// more redraw of an already drawn conversation.
+    fn steady_redraw_work(turns: usize) -> (usize, usize) {
+        let m = long_model(turns);
+        let _ = conversation_rows(&m, 100);
+        let _ = conversation_rows(&m, 100);
+        let (scanned, hits) = (
+            SCANNED.with(std::cell::Cell::get),
+            HITS.with(std::cell::Cell::get),
+        );
+        let _ = conversation_rows(&m, 100);
+        (
+            SCANNED.with(std::cell::Cell::get) - scanned,
+            HITS.with(std::cell::Cell::get) - hits,
+        )
+    }
+
+    #[test]
+    fn redraw_work_does_not_grow_with_unchanged_history() {
+        let (small_scan, small_hits) = steady_redraw_work(100);
+        let (large_scan, large_hits) = steady_redraw_work(3_000);
+        assert_eq!(small_hits, 1, "the settled rows are reused");
+        assert_eq!(large_hits, 1, "the settled rows are reused");
+        // 12,000 entries of history: the scan resumes at the end of the
+        // settled part instead of walking all of it again.
+        assert!(large_scan <= 64, "scanned {large_scan} entries");
+        assert!(
+            large_scan <= small_scan.max(64),
+            "scan grew with history: {small_scan} vs {large_scan}"
+        );
+    }
+
+    #[test]
+    fn a_streaming_tail_keeps_reusing_the_settled_rows() {
+        let mut m = long_model(500);
+        let _ = conversation_rows(&m, 100);
+        let hits = HITS.with(std::cell::Cell::get);
+        for n in 0..10 {
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::Prose(format!("streamed {n}")));
+            let rows = conversation_rows(&m, 100);
+            assert!(all_text(&rows).contains(&format!("streamed {n}")));
+        }
+        assert_eq!(HITS.with(std::cell::Cell::get), hits + 10);
+    }
+
+    #[test]
+    fn touching_an_old_entry_redraws_it_whichever_way_it_was_touched() {
+        let mut m = long_model(500);
+        assert!(all_text(&conversation_rows(&m, 100)).contains("answer 3"));
+        // Through the indexed accessor.
+        let at = 4 * 3 + 2;
+        *m.transcript.get_mut(at).unwrap() = Entry::Prose("edited via get_mut".into());
+        let drawn = all_text(&conversation_rows(&m, 100));
+        assert!(drawn.contains("edited via get_mut") && !drawn.contains("answer 3\n"));
+        // Through the vector itself (iter_mut reaches it by DerefMut).
+        for entry in m.transcript.iter_mut() {
+            if matches!(entry, Entry::Prose(text) if text == "answer 5") {
+                *entry = Entry::Prose("edited via iter_mut".into());
+            }
+        }
+        assert!(all_text(&conversation_rows(&m, 100)).contains("edited via iter_mut"));
+        // Whole-log replacement.
+        m.transcript = vec![Entry::Prose("a different conversation".into())].into();
+        let drawn = all_text(&conversation_rows(&m, 100));
+        assert!(drawn.contains("a different conversation") && !drawn.contains("question 7"));
+    }
+
+    #[test]
+    fn a_clone_edited_after_the_original_was_drawn_does_not_leak_stale_rows() {
+        let mut original = long_model(500);
+        let _ = conversation_rows(&original, 100);
+        let mut copy = original.clone();
+        *copy.transcript.get_mut(2).unwrap() = Entry::Prose("only in the copy".into());
+        assert!(all_text(&conversation_rows(&copy, 100)).contains("only in the copy"));
+        let drawn = all_text(&conversation_rows(&original, 100));
+        assert!(!drawn.contains("only in the copy") && drawn.contains("answer 0"));
+        // The original, edited too, still reflects its own edit.
+        *original.transcript.get_mut(2).unwrap() = Entry::Prose("only in the original".into());
+        let drawn = all_text(&conversation_rows(&original, 100));
+        assert!(drawn.contains("only in the original") && !drawn.contains("only in the copy"));
+    }
+
+    #[test]
+    fn an_old_call_that_starts_running_again_is_drawn_live() {
+        let mut m = long_model(300);
+        let _ = conversation_rows(&m, 100);
+        m.transcript
+            .insert(10, Entry::tool(State::Active, "manus", "cargo build", None));
+        m.running = true;
+        let split_with_tool = settled_len(&m);
+        assert!(split_with_tool <= 10, "the call in flight is not settled");
+        m.running = false;
+        assert!(settled_len(&m) > 10, "once the run ends it settles again");
     }
 }

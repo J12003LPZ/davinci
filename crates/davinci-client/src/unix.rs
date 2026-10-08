@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use davinci_protocol::DEFAULT_MAX_FRAME_LENGTH;
 
 use crate::connection::{ByteTransport, ByteTransportHandlers, TransportFactory};
+use crate::inbound::{pump_finished, FrameWatch};
 use crate::ClientError;
 
 pub fn max_unix_socket_path_bytes() -> usize {
@@ -37,6 +38,8 @@ pub struct UnixByteTransport {
     closed: bool,
     queue: VecDeque<QueuedWrite>,
     handlers: ByteTransportHandlers,
+    /// Where in a frame the inbound bytes stand, across pumps.
+    inbound: FrameWatch,
 }
 
 impl UnixByteTransport {
@@ -49,6 +52,7 @@ impl UnixByteTransport {
             closed: false,
             queue: VecDeque::new(),
             handlers,
+            inbound: FrameWatch::default(),
         }
     }
 
@@ -143,6 +147,7 @@ impl UnixByteTransport {
                 }
                 Ok(n) => {
                     got = true;
+                    self.inbound.observe(&buf[..n]);
                     (self.handlers.on_data)(&buf[..n]);
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(got),
@@ -168,10 +173,16 @@ impl UnixByteTransport {
             if self.closed {
                 return Ok(());
             }
-            if started.elapsed() > timeout {
-                return Ok(());
-            }
-            if got_any && last_data.elapsed() > Duration::from_millis(20) {
+            // A frame split across chunks is a message in flight: the 20ms
+            // quiet window only applies between frames.
+            if pump_finished(
+                Instant::now(),
+                started,
+                last_data,
+                got_any,
+                self.inbound.mid_frame(),
+                timeout,
+            ) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -409,6 +420,78 @@ mod tests {
         assert_eq!(*inbound.lock().unwrap(), vec![9]);
         assert_eq!(*close_count.lock().unwrap(), 1);
         transport.close();
+    }
+
+    /// WOR-47: a valid hello delivered in chunks more than 20ms apart is a
+    /// message in flight, not an idle peer.
+    #[test]
+    fn a_hello_trickled_across_gaps_longer_than_the_quiet_window_still_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("slow.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let snapshot = server_snapshot();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut decoder = ClientMessageDecoder::new(None).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let messages = decoder.push(&buf[..n]).unwrap();
+            assert!(matches!(messages[0], ClientMessage::Hello { .. }));
+            let hello = encode_server_message(
+                &ServerMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    connection_id: "slow-connection".into(),
+                    snapshot,
+                },
+                None,
+            )
+            .unwrap();
+            // Three pieces, 60ms apart: each gap is three quiet windows.
+            let third = hello.len() / 3;
+            for piece in [
+                &hello[..third],
+                &hello[third..2 * third],
+                &hello[2 * third..],
+            ] {
+                stream.write_all(piece).unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let mut factory = create_unix_transport_factory(UnixTransportOptions {
+            path: socket_path.to_string_lossy().into_owned(),
+            max_pending_bytes: None,
+        })
+        .unwrap();
+        let connection = Connection::new(None).unwrap();
+        let snapshot = connection
+            .connect(&mut factory)
+            .expect("a slow but valid hello is accepted");
+        assert_eq!(snapshot.server_id, "unix-server");
+        connection.disconnect("done");
+        let _ = server.join();
+    }
+
+    #[test]
+    fn a_peer_that_never_answers_leaves_the_client_disconnected_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mute.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let _ = stream.read(&mut buf);
+            // Hang up without a hello.
+        });
+        let mut factory = create_unix_transport_factory(UnixTransportOptions {
+            path: socket_path.to_string_lossy().into_owned(),
+            max_pending_bytes: None,
+        })
+        .unwrap();
+        let connection = Connection::new(None).unwrap();
+        assert!(connection.connect(&mut factory).is_err());
+        assert_eq!(connection.state(), crate::ConnectionState::Disconnected);
+        let _ = server.join();
     }
 
     #[test]

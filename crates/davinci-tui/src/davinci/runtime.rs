@@ -710,6 +710,13 @@ pub fn route_scroll_mouse(
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = mouse.kind == MouseEventKind::ScrollUp;
+            // The completion list floats over the screen, so the pointer
+            // decides which surface the wheel belongs to: over the list it
+            // steps the selection, anywhere else it scrolls the conversation.
+            if over_suggestions(model, mouse.row) {
+                model.suggestion_move(if up { -1 } else { 1 });
+                return true;
+            }
             if app::scroll_transcript(model, if up { WHEEL_ROWS } else { -WHEEL_ROWS }) {
                 return true;
             }
@@ -747,6 +754,16 @@ pub fn route_scroll_mouse(
         MouseEventKind::Up(Left) => grab_state.take().is_some(),
         _ => false,
     }
+}
+
+/// Whether `row` falls on the open completion list. Nothing is composed
+/// unless a list is open.
+fn over_suggestions(model: &Model, row: u16) -> bool {
+    model.overlay.is_none()
+        && model.suggestions.is_some()
+        && app::compose_frame(model, model.height)
+            .suggestion_rows
+            .is_some_and(|rows| rows.contains(&row))
 }
 
 /// Copied text is the conversation's, not the scrollbar's: drop the bar's

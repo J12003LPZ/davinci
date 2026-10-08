@@ -373,3 +373,140 @@ fn over_a_list_the_wheel_moves_the_selection() {
     assert_ne!(selected(&m), before);
     assert_eq!(m.screen, Screen::Agent);
 }
+
+/// WOR-41: the pointer decides which surface owns the wheel while a
+/// completion list floats over the conversation.
+#[test]
+fn the_wheel_over_the_completion_list_steps_it_and_elsewhere_scrolls_the_conversation() {
+    let mut m = model(60);
+    davinci_tui::davinci::fixtures::dress(&mut m);
+    m.transcript.clear();
+    push_turns(&mut m, 0, 60);
+    m.slash_commands = ["settings", "sessions", "model", "compact"]
+        .into_iter()
+        .map(|name| davinci_tui::SlashCommandSpec {
+            name: name.into(),
+            ..Default::default()
+        })
+        .collect();
+    m.type_char("/");
+    assert!(m.suggestions.is_some(), "a bare slash opens the list");
+    app::scroll_transcript(&mut m, 12);
+    let scrolled = offset(&m);
+    assert_eq!(scrolled, 12);
+
+    let list = app::compose_frame(&m, m.height)
+        .suggestion_rows
+        .expect("the open list reports the rows it covers");
+    assert!(!list.is_empty());
+    let mut grab = None;
+
+    // Over the list: the selection moves, the conversation stays put.
+    let picked = m.suggestion_index;
+    assert!(point(
+        &mut m,
+        &mut grab,
+        mouse(MouseEventKind::ScrollDown, 10, list.start)
+    ));
+    assert_ne!(m.suggestion_index, picked, "the wheel steps the list");
+    assert_eq!(offset(&m), scrolled, "the conversation did not scroll");
+    let after_down = m.suggestion_index;
+    point(
+        &mut m,
+        &mut grab,
+        mouse(MouseEventKind::ScrollUp, 10, list.end - 1),
+    );
+    assert_ne!(m.suggestion_index, after_down);
+    assert_eq!(offset(&m), scrolled);
+
+    // Over the conversation: it scrolls and the list keeps its selection.
+    let kept = m.suggestion_index;
+    point(&mut m, &mut grab, mouse(MouseEventKind::ScrollUp, 10, 2));
+    assert_eq!(offset(&m), scrolled + WHEEL_ROWS as usize);
+    assert_eq!(m.suggestion_index, kept);
+    assert!(m.suggestions.is_some());
+}
+
+#[test]
+fn without_a_completion_list_no_row_is_a_list_row() {
+    let m = model(60);
+    assert!(app::compose_frame(&m, m.height).suggestion_rows.is_none());
+}
+
+/// WOR-42: folding or unfolding tool output changes how many rows every call
+/// takes, so a stored row number no longer points at what the reader was on.
+#[test]
+fn folding_tool_output_while_scrolled_does_not_keep_a_stale_row_anchor() {
+    let mut m = model(60);
+    for n in 0..20 {
+        m.transcript.insert(
+            4 + n,
+            Entry::tool(State::Done, "manus", &format!("ls dir{n}"), Some("0.1s")),
+        );
+    }
+    app::scroll_transcript(&mut m, 30);
+    assert!(offset(&m) > 0);
+    m.show_tool_output = !m.show_tool_output;
+    assert_eq!(offset(&m), 0, "re-folded: back to the newest");
+    assert!(shows(&m, "turn 059"));
+    // Scrolling again anchors against the new fold, and survives frames.
+    app::scroll_transcript(&mut m, 10);
+    assert_eq!(offset(&m), 10);
+    let _ = frame(&m);
+    assert_eq!(offset(&m), 10);
+    // And back the other way.
+    m.show_tool_output = !m.show_tool_output;
+    assert_eq!(offset(&m), 0);
+}
+
+#[test]
+fn a_resize_while_scrolled_through_folded_output_drops_the_anchor() {
+    let mut m = model(60);
+    app::scroll_transcript(&mut m, 25);
+    m.height = 30;
+    assert!(offset(&m) > 0, "a height change keeps the anchor");
+    m.width = 70;
+    assert_eq!(offset(&m), 0);
+    assert!(shows(&m, "turn 059"));
+}
+
+/// WOR-43: a replacement the fingerprint cannot see (same first entry, same
+/// length) that leaves fewer rows must not strand a stored row past the end
+/// of history, to reappear once the conversation grows again.
+#[test]
+fn a_replaced_conversation_with_fewer_rows_does_not_resurrect_a_stale_offset() {
+    let mut m = model(60);
+    app::scroll_transcript(&mut m, 30);
+    assert_eq!(offset(&m), 30);
+    let keep = m.transcript[0].clone();
+    let len = m.transcript.len();
+    // Same first entry, same length, almost no rows (an agent mark draws none).
+    let mut replaced = vec![Entry::agent("davinci"); len];
+    replaced[0] = keep;
+    m.transcript = replaced.into();
+    let _ = frame(&m);
+    assert_eq!(offset(&m), 0);
+    // The conversation grows past the window again: still following newest.
+    m.transcript.clear();
+    m.transcript.push(Entry::user("turn 000"));
+    push_turns(&mut m, 1, 120);
+    assert_eq!(offset(&m), 0);
+    assert!(shows(&m, "turn 119"));
+}
+
+#[test]
+fn the_stored_scroll_never_exceeds_the_last_possible_top() {
+    let mut m = model(60);
+    app::scroll_transcript(&mut m, 5);
+    let stored = m.transcript_scroll.get().top.expect("scrolled");
+    let bar = bar(&m);
+    assert!(stored < bar.total - usize::from(bar.height));
+    // Drop rows below the anchor without changing the entry count.
+    let len = m.transcript.len();
+    for entry in m.transcript.iter_mut().skip(1).take(len - 1) {
+        *entry = Entry::agent("davinci");
+    }
+    let _ = frame(&m);
+    assert!(m.transcript_scroll.get().top.is_none());
+    assert_eq!(offset(&m), 0);
+}

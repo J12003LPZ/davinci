@@ -58,6 +58,9 @@ pub struct ComposedFrame {
     pub graph: Option<super::views::graph_nav::GraphFrame>,
     /// The conversation's scrollbar, when it has more rows than fit.
     pub scrollbar: Option<Scrollbar>,
+    /// The screen rows the completion list occupies, when one is open. The
+    /// wheel steers the list only while the pointer is over these rows.
+    pub suggestion_rows: Option<std::ops::Range<u16>>,
 }
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
@@ -67,6 +70,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             lines: Vec::new(),
             graph: None,
             scrollbar: None,
+            suggestion_rows: None,
         };
     }
     if matches!(model.screen, Screen::Models | Screen::Settings) && model.overlay.is_none() {
@@ -89,6 +93,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             lines: pad_to(lines, height),
             graph: None,
             scrollbar: None,
+            suggestion_rows: None,
         };
     }
     // Command surfaces use the same bottom-anchored, unboxed language as the
@@ -100,6 +105,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
                 lines: command_panel_frame(model, content, height),
                 graph: None,
                 scrollbar: None,
+                suggestion_rows: None,
             };
         }
     }
@@ -208,6 +214,10 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     rows.extend(working);
     rows.extend(notice);
     rows.extend(meter);
+    let suggestion_rows = (!offered.is_empty()).then(|| {
+        let start = rows.len().min(height) as u16;
+        start..(rows.len() + offered.len()).min(height) as u16
+    });
     rows.extend(offered);
     rows.extend(composer_rows);
     rows.extend(below);
@@ -223,6 +233,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         lines: pad_to(rows, height),
         graph,
         scrollbar,
+        suggestion_rows,
     }
 }
 
@@ -257,12 +268,17 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         out
     };
     let scroll = model.transcript_scroll.get();
-    let top = scroll.top_for(model.width, &model.transcript);
+    let top = scroll.top_for(model.width, model.show_tool_output, &model.transcript);
     if scroll.top.is_some() && top.is_none() {
-        // Cleared, replaced or resized: back to the newest.
+        // Cleared, replaced, resized or re-folded: back to the newest.
         model.transcript_scroll.take();
     }
     if total <= height {
+        // Nothing to scroll through, so no scroll may linger to reappear
+        // when the conversation grows past the window again.
+        if top.is_some() {
+            model.transcript_scroll.take();
+        }
         let mut content = rows_of(0..total);
         if content.len() < height {
             content.push(blank());
@@ -270,6 +286,12 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         return (content, None);
     }
     let max_top = total - height;
+    // A stored row past the last possible top is stale (the rows below it
+    // were replaced or shrank). Drawing it clamped would leave it stored, to
+    // jump back when the conversation grows; it means the newest instead.
+    if top.is_some_and(|top| top >= max_top) {
+        model.transcript_scroll.take();
+    }
     let top = top.map_or(max_top, |top| top.min(max_top));
     let offset = max_top - top;
     let bar = Scrollbar {
@@ -352,6 +374,7 @@ pub fn set_transcript_offset(model: &mut Model, bar: &Scrollbar, offset: usize) 
         super::model::TranscriptScroll::at(
             bar.max_offset() - offset,
             model.width,
+            model.show_tool_output,
             &model.transcript,
         )
     });
@@ -2105,7 +2128,7 @@ mod tests {
     fn a_sheet_starts_under_the_header_and_ends_with_its_hint_row() {
         let mut m = model(100, 44);
         crate::davinci::fixtures::dress_screen(&mut m, "3b");
-        m.transcript = vec![Entry::user("keep this conversation visible")];
+        m.transcript = vec![Entry::user("keep this conversation visible")].into();
         let rows = compose(&m, 44);
         assert_eq!(rows.len(), 44);
         let title = rows
@@ -2129,7 +2152,7 @@ mod tests {
     fn model_picker_is_content_sized_and_keeps_the_conversation_visible_above_it() {
         let mut m = model(108, 30);
         crate::davinci::fixtures::dress_screen(&mut m, "3a");
-        m.transcript = vec![Entry::user("keep this conversation visible")];
+        m.transcript = vec![Entry::user("keep this conversation visible")].into();
         let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
         let conversation = rows
             .iter()
@@ -2257,7 +2280,7 @@ mod tests {
     #[test]
     fn a_short_conversation_follows_the_banner_and_keeps_spare_space_below() {
         let mut m = model(100, 20);
-        m.transcript = vec![Entry::user("run the tests")];
+        m.transcript = vec![Entry::user("run the tests")].into();
         let rows = compose(&m, 20);
         assert!(text(&rows[1]).contains("DaVinci"));
         let turn = rows
@@ -2998,7 +3021,8 @@ mod tests {
             Entry::user("run the tests"),
             Entry::Gap,
             Entry::agent("davinci"),
-        ];
+        ]
+        .into();
         let rows = compose(&m, 18);
         assert_eq!(rows.len(), 18);
         for row in &rows {
