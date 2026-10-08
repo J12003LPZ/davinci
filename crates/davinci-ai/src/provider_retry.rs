@@ -106,18 +106,17 @@ pub fn retry_delay_from_headers(
     now_ms: i64,
 ) -> Result<u64, ProviderError> {
     if let Some(retry_after_ms) = error.header("retry-after-ms") {
-        if let Ok(value) = retry_after_ms.parse::<f64>() {
-            if !value.is_nan() {
-                return validate_server_retry_delay_ms(value, max_retry_delay_ms, &error.message);
-            }
+        if let Some(value) = retry_after_number(retry_after_ms) {
+            return validate_server_retry_delay_ms(value, max_retry_delay_ms, &error.message);
         }
     }
     if let Some(retry_after) = error.header("retry-after") {
-        let delay_ms = match retry_after.parse::<f64>() {
-            Ok(seconds) if !seconds.is_nan() => Some(seconds * 1000.0),
-            _ => http_date_delay_ms(retry_after, now_ms),
+        let delay_ms = match retry_after_number(retry_after) {
+            Some(seconds) => Some(seconds * 1000.0),
+            None => http_date_delay_ms(retry_after, now_ms),
         };
-        // An unparseable header falls through to exponential backoff.
+        // An unparseable or negative header falls through to exponential
+        // backoff. A date in the past is valid and means "retry now".
         if let Some(delay_ms) = delay_ms {
             return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
         }
@@ -129,6 +128,16 @@ pub fn retry_delay_from_headers(
         1.0 - fastrand(0.25)
     };
     Ok((exponential * jitter) as u64)
+}
+
+/// A numeric Retry-After value: finite and not negative. A negative delay is
+/// not a valid header value, and honoring it as zero would retry in a burst.
+fn retry_after_number(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn http_date_delay_ms(value: &str, now_ms: i64) -> Option<f64> {
@@ -448,6 +457,25 @@ mod tests {
                 assert_eq!(delay, expected, "retry-after {value:?}");
             }
         }
+    }
+
+    /// A negative delay is not a valid header value; honoring it as zero
+    /// retried in a burst against a provider that was already throttling.
+    #[test]
+    fn wor79_negative_or_infinite_retry_after_falls_back_to_backoff() {
+        for header in ["retry-after", "retry-after-ms"] {
+            for value in ["-5", "-0.5", "-1", "inf", "-inf"] {
+                let error = ProviderError::new(Some(429), "wait").with_header(header, value);
+                let delay = retry_delay_from_headers(&error, 1, Some(60_000), 0).unwrap();
+                assert_eq!(delay, 1000, "{header}: {value:?}");
+            }
+        }
+        // Zero is valid and still means retry now.
+        let error = ProviderError::new(Some(429), "wait").with_header("retry-after", "0");
+        assert_eq!(
+            retry_delay_from_headers(&error, 1, Some(60_000), 0).unwrap(),
+            0
+        );
     }
 
     #[test]
