@@ -268,9 +268,9 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         out
     };
     let scroll = model.transcript_scroll.get();
-    let top = scroll.top_for(model.width, &model.transcript);
+    let top = scroll.top_for(model.width, model.show_tool_output, &model.transcript);
     if scroll.top.is_some() && top.is_none() {
-        // Cleared, replaced, resized or back to the newest.
+        // Cleared, replaced, resized or re-folded: back to the newest.
         model.transcript_scroll.take();
     }
     if total <= height {
@@ -363,6 +363,7 @@ pub fn set_transcript_offset(model: &mut Model, bar: &Scrollbar, offset: usize) 
         super::model::TranscriptScroll::at(
             bar.max_offset() - offset,
             model.width,
+            model.show_tool_output,
             &model.transcript,
         )
     });

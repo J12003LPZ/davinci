@@ -2809,32 +2809,39 @@ pub struct Model {
 /// settle below the view (a turn streaming in, a group of calls collapsing
 /// to one line once they finish) leave it where it is.
 ///
-/// The scroll belongs to one conversation at one width. A resize reflows
-/// every row, and a conversation that lost entries, or whose first entry
-/// changed, was cleared, rewound or replaced; any of those drops the scroll
-/// and the view follows the newest again.
+/// The scroll belongs to one conversation at one width and one tool-output
+/// mode. A resize reflows every row, expanding or collapsing tool output
+/// changes how many rows each call takes (including calls above the view),
+/// and a conversation that lost entries, or whose first entry changed, was
+/// cleared, rewound or replaced; any of those drops the scroll and the view
+/// follows the newest again, rather than keeping a row number that now
+/// points at other content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptScroll {
     pub top: Option<usize>,
     pub width: u16,
+    /// `Model::show_tool_output` when the scroll was taken.
+    pub tools_shown: bool,
     pub entries: usize,
     pub first: u64,
 }
 
 impl TranscriptScroll {
-    pub fn at(top: usize, width: u16, transcript: &[Entry]) -> Self {
+    pub fn at(top: usize, width: u16, tools_shown: bool, transcript: &[Entry]) -> Self {
         Self {
             top: Some(top),
             width,
+            tools_shown,
             entries: transcript.len(),
             first: first_entry_print(transcript),
         }
     }
 
     /// The first row to draw, while this scroll still applies.
-    pub fn top_for(self, width: u16, transcript: &[Entry]) -> Option<usize> {
+    pub fn top_for(self, width: u16, tools_shown: bool, transcript: &[Entry]) -> Option<usize> {
         let top = self.top?;
         let same = self.width == width
+            && self.tools_shown == tools_shown
             && transcript.len() >= self.entries
             && first_entry_print(transcript) == self.first;
         same.then_some(top)

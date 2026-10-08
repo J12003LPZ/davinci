@@ -433,3 +433,40 @@ fn without_a_completion_list_no_row_is_a_list_row() {
     assert!(app::compose_frame(&m, m.height).suggestion_rows.is_none());
 }
 
+/// WOR-42: folding or unfolding tool output changes how many rows every call
+/// takes, so a stored row number no longer points at what the reader was on.
+#[test]
+fn folding_tool_output_while_scrolled_does_not_keep_a_stale_row_anchor() {
+    let mut m = model(60);
+    for n in 0..20 {
+        m.transcript.insert(
+            4 + n,
+            Entry::tool(State::Done, "manus", &format!("ls dir{n}"), Some("0.1s")),
+        );
+    }
+    app::scroll_transcript(&mut m, 30);
+    assert!(offset(&m) > 0);
+    m.show_tool_output = !m.show_tool_output;
+    assert_eq!(offset(&m), 0, "re-folded: back to the newest");
+    assert!(shows(&m, "turn 059"));
+    // Scrolling again anchors against the new fold, and survives frames.
+    app::scroll_transcript(&mut m, 10);
+    assert_eq!(offset(&m), 10);
+    let _ = frame(&m);
+    assert_eq!(offset(&m), 10);
+    // And back the other way.
+    m.show_tool_output = !m.show_tool_output;
+    assert_eq!(offset(&m), 0);
+}
+
+#[test]
+fn a_resize_while_scrolled_through_folded_output_drops_the_anchor() {
+    let mut m = model(60);
+    app::scroll_transcript(&mut m, 25);
+    m.height = 30;
+    assert!(offset(&m) > 0, "a height change keeps the anchor");
+    m.width = 70;
+    assert_eq!(offset(&m), 0);
+    assert!(shows(&m, "turn 059"));
+}
+
