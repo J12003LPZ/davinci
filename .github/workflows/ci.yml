@@ -341,6 +341,9 @@ jobs:
           - davinci-telemetry
           - davinci-tui
     runs-on: ${{ matrix.os }}
+    # The slowest shard (Windows davinci-coding-agent) takes ~15 minutes. A
+    # hung test otherwise holds the runner for GitHub's 6-hour default.
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
     steps:
