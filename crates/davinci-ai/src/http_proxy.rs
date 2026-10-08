@@ -245,6 +245,10 @@ pub fn tcp_connect_via_http_proxy(
         let status = response.lines().next().unwrap_or("proxy CONNECT failed");
         return Err(format!("WebSocket connect failed: {status}"));
     }
+    // The header read shrank the read timeout to what was left of the
+    // deadline; the tunnel gets the full timeout back.
+    tcp.set_read_timeout(Some(timeout))
+        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
     Ok(tcp)
 }
 
@@ -474,6 +478,9 @@ mod tests {
     #[test]
     fn wor70_connect_keeps_tunneled_bytes_that_arrive_with_headers() {
         let (result, _) = connect_to_fake_proxy(Duration::from_secs(5), |mut stream| {
+            // A slow answer uses up part of the deadline; the tunnel must
+            // still get the full read timeout back.
+            thread::sleep(Duration::from_millis(300));
             // Headers and the first tunneled bytes in a single write.
             stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\ntunnel-payload")
@@ -481,6 +488,7 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
         });
         let mut tcp = result.unwrap();
+        assert_eq!(tcp.read_timeout().unwrap(), Some(Duration::from_secs(5)));
         let mut payload = [0u8; 14];
         tcp.read_exact(&mut payload).unwrap();
         assert_eq!(&payload, b"tunnel-payload");
