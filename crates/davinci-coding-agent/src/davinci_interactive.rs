@@ -1726,7 +1726,7 @@ fn run_turn(
                     if !pending.is_live() {
                         continue;
                     }
-                    open_decision_modal(model, &pending.request.question);
+                    open_decision_modal(model, &pending.request.questions);
                     decision = Some(pending);
                 }
             }
@@ -1772,33 +1772,8 @@ fn run_turn(
                                 let outcome = state.outcome.clone();
                                 model.decision_modal = None;
                                 model.overlay = None;
-                                let response = match outcome {
-                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Choice(choice_id)) => {
-                                        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
-                                            action: davinci_agent::decisions::HostDecisionAction::AnswerChoice(choice_id),
-                                            host_event_id: format!("tui_{}", davinci_session::now_ms()),
-                                            answered_at_ms: davinci_session::now_ms(),
-                                        })
-                                    }
-                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Custom(custom_text)) => {
-                                        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
-                                            action: davinci_agent::decisions::HostDecisionAction::AnswerCustom(custom_text),
-                                            host_event_id: format!("tui_{}", davinci_session::now_ms()),
-                                            answered_at_ms: davinci_session::now_ms(),
-                                        })
-                                    }
-                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Defer) => {
-                                        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
-                                            action: davinci_agent::decisions::HostDecisionAction::Defer,
-                                            host_event_id: format!("tui_{}", davinci_session::now_ms()),
-                                            answered_at_ms: davinci_session::now_ms(),
-                                        })
-                                    }
-                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Cancel) => {
-                                        davinci_agent::DecisionHostResponse::Cancelled
-                                    }
-                                    None => davinci_agent::DecisionHostResponse::Cancelled,
-                                };
+                                let response =
+                                    decision_response(&pending.request.questions, outcome);
                                 let _ = pending.reply.send(response);
                             }
                         }
@@ -1874,9 +1849,11 @@ fn run_turn(
                         model.width = width.max(20);
                         model.height = height.max(4);
                     }
-                    crossterm::event::Event::Paste(text) => {
-                        model.paste(&text);
-                    }
+                    crossterm::event::Event::Paste(text) => match model.decision_modal.as_mut() {
+                        // An open question owns input; a paste fills its answer.
+                        Some(dialog) if decision.is_some() => dialog.paste(&text),
+                        _ => model.paste(&text),
+                    },
                     crossterm::event::Event::Mouse(mouse) => {
                         session.handle_model_mouse(model, mouse);
                     }
@@ -5900,34 +5877,98 @@ fn open_ask_overlay(model: &mut Model) {
 
 pub(crate) fn open_decision_modal(
     model: &mut Model,
-    question: &davinci_agent::decisions::DecisionQuestion,
+    questions: &[davinci_agent::decisions::DecisionQuestion],
 ) {
-    let options = question
-        .options
+    use davinci_tui::davinci::views::decision_modal::{
+        DecisionModalOption, DecisionModalQuestion, DecisionModalState,
+    };
+    let pages = questions
         .iter()
-        .map(
-            |opt| davinci_tui::davinci::views::decision_modal::DecisionModalOption {
-                id: opt.id.clone(),
-                label: opt.label.clone(),
-                explanation: opt.explanation.clone(),
-                recommended: opt.recommended,
-            },
-        )
-        .collect();
-    let state = davinci_tui::davinci::views::decision_modal::DecisionModalState::new(
-        question.id.clone(),
-        question.id.clone(),
-        question.plan_revision,
-        question.title.clone(),
-        question.question.clone(),
-        question.materiality.clone(),
-        question.evidence_refs.clone(),
-        options,
-        question.allow_custom,
-        question.custom_only,
-    );
-    model.decision_modal = Some(state);
+        .map(|question| {
+            let options = question
+                .options
+                .iter()
+                .map(|opt| DecisionModalOption {
+                    id: opt.id.clone(),
+                    label: opt.label.clone(),
+                    explanation: opt.explanation.clone(),
+                    recommended: opt.recommended,
+                })
+                .collect();
+            let page = DecisionModalQuestion::new(
+                question.id.clone(),
+                question.title.clone(),
+                question.question.clone(),
+                question.materiality.clone(),
+                question.evidence_refs.clone(),
+                options,
+                question.allow_custom,
+                question.custom_only,
+            );
+            if question.multi_select {
+                let (min, max) = question.selection_bounds();
+                page.multi(min, max)
+            } else {
+                page
+            }
+        })
+        .collect::<Vec<_>>();
+    let request_id = pages
+        .iter()
+        .map(|page| page.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let revision = questions.first().map_or(0, |q| q.plan_revision);
+    model.decision_modal = Some(DecisionModalState::new(request_id, revision, pages));
     model.overlay = Some(Overlay::Ask);
+}
+
+/// What the closed dialog tells the agent. One idempotency key covers the
+/// whole submission; a dialog closed without an outcome is a cancel.
+pub(crate) fn decision_response(
+    questions: &[davinci_agent::decisions::DecisionQuestion],
+    outcome: Option<davinci_tui::davinci::views::decision_modal::DecisionResult>,
+) -> davinci_agent::DecisionHostResponse {
+    use davinci_agent::decisions::HostDecisionAction;
+    use davinci_tui::davinci::views::decision_modal::{DecisionResult, QuestionAnswer};
+    let now = davinci_session::now_ms();
+    let reply = |answers| {
+        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
+            answers,
+            host_event_id: format!("tui_{now}"),
+            answered_at_ms: now,
+        })
+    };
+    match outcome {
+        Some(DecisionResult::Answers(answers)) => reply(
+            answers
+                .into_iter()
+                .map(|(id, answer)| {
+                    let action = match answer {
+                        QuestionAnswer::Choice(choice) => HostDecisionAction::AnswerChoice(choice),
+                        QuestionAnswer::Custom(text) => HostDecisionAction::AnswerCustom(text),
+                        QuestionAnswer::Choices {
+                            choice_ids,
+                            custom_text,
+                        } => HostDecisionAction::AnswerChoices {
+                            choice_ids,
+                            custom_text,
+                        },
+                    };
+                    (id, action)
+                })
+                .collect(),
+        ),
+        Some(DecisionResult::Defer) => {
+            davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply::uniform(
+                questions,
+                HostDecisionAction::Defer,
+                format!("tui_{now}"),
+                now,
+            ))
+        }
+        Some(DecisionResult::Cancel) | None => davinci_agent::DecisionHostResponse::Cancelled,
+    }
 }
 
 #[allow(dead_code)]

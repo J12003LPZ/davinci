@@ -30,11 +30,32 @@ pub fn decision_wait(interactive: bool, deferred: bool, cancelled: bool) -> &'st
     }
 }
 
+/// One submission of the whole dialog: an action for every question asked,
+/// keyed by question id, under a single idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionHostReply {
-    pub action: crate::decisions::HostDecisionAction,
+    pub answers: std::collections::BTreeMap<String, crate::decisions::HostDecisionAction>,
     pub host_event_id: String,
     pub answered_at_ms: u64,
+}
+
+impl DecisionHostReply {
+    /// The same action for every question, as a dialog-wide defer is.
+    pub fn uniform(
+        questions: &[crate::decisions::DecisionQuestion],
+        action: crate::decisions::HostDecisionAction,
+        host_event_id: String,
+        answered_at_ms: u64,
+    ) -> Self {
+        Self {
+            answers: questions
+                .iter()
+                .map(|question| (question.id.clone(), action.clone()))
+                .collect(),
+            host_event_id,
+            answered_at_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,9 +66,10 @@ pub enum DecisionHostResponse {
     Unavailable,
 }
 
+/// The 1-4 questions of one dialog, validated against one plan revision.
 #[derive(Debug, Clone)]
 pub struct DecisionHostRequest {
-    pub question: crate::decisions::DecisionQuestion,
+    pub questions: Vec<crate::decisions::DecisionQuestion>,
 }
 
 #[derive(Clone)]
@@ -508,24 +530,34 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "ask_user_question".into(),
-            description: "Ask one material, evidence-backed structured question of the controlling user. The tool carries question content only; answers and host authority are never accepted from model JSON.".into(),
+            description: "Ask the user 1-4 related, material questions in one dialog and wait for the answers. Ask only what reading the repository cannot settle; skip it for straightforward tasks. Put related decisions in one call instead of asking one at a time. multi_select false (default) is for mutually exclusive alternatives; true lets several options apply, bounded by min_selections/max_selections. The result lists each question's outcome with the selected option ids. Answers come only from the host, never from model JSON.".into(),
             parameters: serde_json::json!({
                 "type":"object",
                 "additionalProperties": false,
                 "properties":{
-                    "id":{"type":"string"},
-                    "kind":{"type":"string","enum":["architecture","scope","behavior","permissions","cost","persistence","irreversible"]},
-                    "title":{"type":"string"},
-                    "question":{"type":"string"},
-                    "materiality":{"type":"string"},
-                    "evidence_refs":{"type":"array","items":{"type":"string"},"description":"1-16 workspace-relative paths of files you read (or plan evidence paths) that make the decision material"},
-                    "options":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
-                        "id":{"type":"string"},"label":{"type":"string"},"explanation":{"type":"string"},"recommended":{"type":"boolean"}
-                    },"required":["id","label","explanation"]}},
-                    "allow_custom":{"type":"boolean"},
-                    "custom_only":{"type":"boolean"}
+                    "questions":{"type":"array","minItems":1,"maxItems":4,"description":"Shown together in one dialog and answered in one submission","items":{
+                        "type":"object",
+                        "additionalProperties": false,
+                        "properties":{
+                            "id":{"type":"string","description":"Unique within the call"},
+                            "kind":{"type":"string","enum":["architecture","scope","behavior","permissions","cost","persistence","irreversible"]},
+                            "title":{"type":"string","description":"A few words, shown as the question's tab"},
+                            "question":{"type":"string"},
+                            "materiality":{"type":"string"},
+                            "evidence_refs":{"type":"array","items":{"type":"string"},"description":"1-16 workspace-relative paths of files you read (or plan evidence paths) that make the decision material"},
+                            "options":{"type":"array","description":"2-4 options","items":{"type":"object","additionalProperties":false,"properties":{
+                                "id":{"type":"string"},"label":{"type":"string"},"explanation":{"type":"string"},"recommended":{"type":"boolean"}
+                            },"required":["id","label","explanation"]}},
+                            "multi_select":{"type":"boolean","description":"Let the user check several options"},
+                            "min_selections":{"type":"integer","minimum":0,"description":"multi_select only; default 1"},
+                            "max_selections":{"type":"integer","minimum":1,"description":"multi_select only; default all"},
+                            "allow_custom":{"type":"boolean","description":"Offer a free-text answer; with multi_select it is one more answer next to the checked options"},
+                            "custom_only":{"type":"boolean"}
+                        },
+                        "required":["id","kind","title","question","materiality","evidence_refs","options"]
+                    }}
                 },
-                "required":["id","kind","title","question","materiality","evidence_refs","options"]
+                "required":["questions"]
             }),
         },
         AgentTool {
@@ -878,15 +910,15 @@ fn ask_user_question_tool(
     input: &serde_json::Value,
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
-    let raw: crate::decisions::DecisionQuestionInput = serde_json::from_value(input.clone())
-        .map_err(|error| ToolError::Failed(format!("Invalid structured question: {error}")))?;
+    let raw = crate::decisions::parse_question_batch(input).map_err(ToolError::Failed)?;
     let snapshot = context
         .living_plan
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let question = crate::decisions::validate_question_for_plan(raw, &snapshot, cwd)
+    let questions = crate::decisions::validate_question_batch(raw, &snapshot, cwd)
         .map_err(ToolError::Failed)?;
+    let question_ids: Vec<String> = questions.iter().map(|q| q.id.clone()).collect();
 
     let Some(responder) = &context.decision_responder else {
         return Ok(ToolResult {
@@ -894,7 +926,7 @@ fn ask_user_question_tool(
             is_error: true,
             details: Some(serde_json::json!({
                 "status": decision_wait(false, false, false),
-                "question": question,
+                "questions": questions,
                 "interactive": false
             })),
         });
@@ -922,11 +954,11 @@ fn ask_user_question_tool(
                 details: Some(serde_json::json!({
                     "status": decision_wait(false, false, false),
                     "pending_decision_id":active,
-                    "question":question
+                    "questions":questions
                 })),
             });
         }
-        *slot = Some(question.id.clone());
+        *slot = Some(question_ids.join(","));
     }
 
     struct SlotGuard<'a>(&'a Arc<Mutex<Option<String>>>);
@@ -940,7 +972,7 @@ fn ask_user_question_tool(
     let response = wait_for_decision_host(
         responder.clone(),
         DecisionHostRequest {
-            question: question.clone(),
+            questions: questions.clone(),
         },
         context,
     );
@@ -952,7 +984,7 @@ fn ask_user_question_tool(
             is_error: true,
             details: Some(serde_json::json!({
                 "status": decision_wait(true, false, true),
-                "question":question,
+                "questions":questions,
                 "elapsed_ms":elapsed_ms
             })),
         }),
@@ -961,7 +993,7 @@ fn ask_user_question_tool(
             is_error: true,
             details: Some(serde_json::json!({
                 "status": decision_wait(false, false, false),
-                "question":question,
+                "questions":questions,
                 "interactive":false,
                 "elapsed_ms":elapsed_ms
             })),
@@ -975,46 +1007,123 @@ fn ask_user_question_tool(
             details: Some(serde_json::json!({
                 "status": decision_wait(false, false, false),
                 "reason":"timeout",
-                "question":question,
+                "questions":questions,
                 "elapsed_ms":elapsed_ms
             })),
         }),
         DecisionHostResponse::Reply(reply) => {
+            // One reply answers the whole dialog: a host that drops or adds a
+            // question is refused rather than half-applied.
+            let asked: std::collections::BTreeSet<&String> = question_ids.iter().collect();
+            let answered: std::collections::BTreeSet<&String> = reply.answers.keys().collect();
+            if asked != answered {
+                return Err(ToolError::Failed(format!(
+                    "Decision reply must answer exactly the asked questions ({})",
+                    question_ids.join(", ")
+                )));
+            }
             let mut pending = snapshot.clone();
-            pending
-                .structured_decisions
-                .insert(question.id.clone(), question.clone());
-            let host_reply = crate::decisions::HostDecisionReply {
-                decision_id: question.id.clone(),
+            for question in &questions {
+                pending
+                    .structured_decisions
+                    .insert(question.id.clone(), question.clone());
+            }
+            let host_reply = crate::decisions::HostDecisionBatchReply {
+                answers: reply.answers,
                 expected_plan_revision: snapshot.revision,
-                expected_question_revision: question.plan_revision,
+                expected_question_revision: snapshot.revision,
                 host_event_id: reply.host_event_id,
                 answered_at_ms: reply.answered_at_ms,
-                action: reply.action,
             };
-            let (next, _) = crate::decisions::apply_host_decision(&pending, &host_reply, cwd)
+            let (next, _) = crate::decisions::apply_host_decision_batch(&pending, &host_reply, cwd)
                 .map_err(ToolError::Failed)?;
-            let state = next
-                .structured_decisions
-                .get(&question.id)
-                .map(|decision| format!("{:?}", decision.state).to_ascii_lowercase())
-                .unwrap_or_else(|| "unknown".into());
-            *context
-                .living_plan
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = next.clone();
+            {
+                // The plan may have moved while the user was reading; a reply
+                // built on the old revision must not overwrite that change.
+                let mut plan = context
+                    .living_plan
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if plan.revision != snapshot.revision {
+                    return Err(ToolError::Failed(format!(
+                        "Decision reply is stale: the plan moved from revision {} to {} while waiting; ask again",
+                        snapshot.revision, plan.revision
+                    )));
+                }
+                *plan = next.clone();
+            }
+            let summary = decision_answer_summary(&questions, &next);
             Ok(ToolResult {
-                content: state.clone(),
+                content: summary.to_string(),
                 is_error: false,
                 details: Some(serde_json::json!({
-                    "status":state,
-                    "decision_id":question.id,
+                    "status":summary["status"],
+                    "decision_ids":question_ids,
+                    "answers":summary["answers"],
                     "revision":next.revision,
                     "elapsed_ms":elapsed_ms
                 })),
             })
         }
     }
+}
+
+/// What the model reads back: every question with its outcome and the
+/// option ids and labels the user picked. Custom text is quoted user data.
+fn decision_answer_summary(
+    asked: &[crate::decisions::DecisionQuestion],
+    plan: &crate::LivingPlan,
+) -> serde_json::Value {
+    use crate::decisions::DecisionState;
+    let mut states = Vec::with_capacity(asked.len());
+    let answers: Vec<serde_json::Value> = asked
+        .iter()
+        .map(|question| {
+            let stored = plan.structured_decisions.get(&question.id);
+            let state = match stored.map(|d| d.state) {
+                Some(DecisionState::AnsweredByUser) => "answered",
+                Some(DecisionState::Deferred) => "deferred",
+                Some(DecisionState::Cancelled) => "cancelled",
+                Some(DecisionState::Open) | None => "open",
+            };
+            states.push(state);
+            let answer = stored.and_then(|d| d.answer.as_ref());
+            let selected: Vec<serde_json::Value> = answer
+                .map(|answer| answer.selected_ids())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| {
+                    let label = question
+                        .options
+                        .iter()
+                        .find(|option| option.id == id)
+                        .map(|option| option.label.as_str())
+                        .unwrap_or(id);
+                    serde_json::json!({"id": id, "label": label})
+                })
+                .collect();
+            let mut entry = serde_json::json!({
+                "id": question.id,
+                "title": question.title,
+                "multi_select": question.multi_select,
+                "state": state,
+                "selected": selected,
+            });
+            if let Some(text) = answer.and_then(|a| a.custom_text.as_deref()) {
+                entry["custom_text"] = serde_json::json!(text);
+            }
+            entry
+        })
+        .collect();
+    let status = match states.first() {
+        Some(first) if states.iter().all(|state| state == first) => *first,
+        _ => "mixed",
+    };
+    serde_json::json!({
+        "status": status,
+        "revision": plan.revision,
+        "answers": answers,
+    })
 }
 
 const TOOL_SEARCH_DEFAULT_LIMIT: usize = 5;
@@ -4662,6 +4771,267 @@ mod tests {
         (dir, context, question)
     }
 
+    /// The legacy single question plus a multi-select one, as one dialog.
+    fn f02_batch_input(single: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"questions": [single, {
+            "id":"features",
+            "kind":"scope",
+            "title":"Features",
+            "question":"Which features should ship?",
+            "materiality":"Each adds a module",
+            "evidence_refs":["src.rs"],
+            "multi_select":true,
+            "max_selections":2,
+            "allow_custom":true,
+            "options":[
+                {"id":"auth","label":"Authentication","explanation":"Login"},
+                {"id":"cache","label":"Caching","explanation":"Speed"},
+                {"id":"logs","label":"Logging","explanation":"Audit"}
+            ]
+        }]})
+    }
+
+    fn f02_batch_responder(
+        answers: Vec<(&'static str, crate::decisions::HostDecisionAction)>,
+    ) -> DecisionResponder {
+        DecisionResponder::new(move |request| {
+            assert_eq!(
+                request
+                    .questions
+                    .iter()
+                    .map(|q| q.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["cache-scope", "features"],
+                "the host sees every question of the call in one request"
+            );
+            DecisionHostResponse::Reply(DecisionHostReply {
+                answers: answers
+                    .iter()
+                    .map(|(id, action)| (id.to_string(), action.clone()))
+                    .collect(),
+                host_event_id: "ui-batch-1".into(),
+                answered_at_ms: 9,
+            })
+        })
+    }
+
+    #[test]
+    fn f02_one_dialog_returns_every_answer_to_the_model() {
+        let (dir, context, single) = f02_question_fixture();
+        let revision_before = context.living_plan.lock().unwrap().revision;
+        let answer_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(f02_batch_responder(vec![
+                (
+                    "cache-scope",
+                    crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                ),
+                (
+                    "features",
+                    crate::decisions::HostDecisionAction::AnswerChoices {
+                        choice_ids: vec!["logs".into()],
+                        custom_text: Some("export \"metrics\"".into()),
+                    },
+                ),
+            ])),
+            ..ToolContext::default()
+        };
+        let result = execute_tool_with(
+            dir.path(),
+            "ask_user_question",
+            &f02_batch_input(&single),
+            &answer_context,
+        )
+        .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        // The model reads structured answers, not just a status word.
+        let content: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(content["status"], "answered");
+        assert_eq!(content["answers"][0]["id"], "cache-scope");
+        assert_eq!(
+            content["answers"][0]["selected"],
+            serde_json::json!([{"id":"sqlite","label":"SQLite"}])
+        );
+        assert_eq!(content["answers"][1]["multi_select"], true);
+        assert_eq!(
+            content["answers"][1]["selected"],
+            serde_json::json!([{"id":"logs","label":"Logging"}])
+        );
+        assert_eq!(content["answers"][1]["custom_text"], "export \"metrics\"");
+        assert_eq!(
+            result.details.as_ref().unwrap()["answers"],
+            content["answers"]
+        );
+
+        let plan = answer_context.living_plan.lock().unwrap().clone();
+        assert_eq!(plan.revision, revision_before + 1, "one atomic commit");
+        let features = &plan.structured_decisions["features"];
+        assert_eq!(
+            features.answer.as_ref().unwrap().choice_ids,
+            vec!["logs".to_string()]
+        );
+        assert_eq!(
+            features.answer.as_ref().unwrap().host_event_id,
+            "ui-batch-1"
+        );
+    }
+
+    #[test]
+    fn f02_a_reply_that_skips_or_invents_a_question_commits_nothing() {
+        let (dir, context, single) = f02_question_fixture();
+        let before = context.living_plan.lock().unwrap().clone();
+        for answers in [
+            vec![(
+                "cache-scope",
+                crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+            )],
+            vec![
+                (
+                    "cache-scope",
+                    crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                ),
+                (
+                    "features",
+                    crate::decisions::HostDecisionAction::AnswerChoice("auth".into()),
+                ),
+                ("ghost", crate::decisions::HostDecisionAction::Defer),
+            ],
+            // Valid first answer, invalid second: nothing lands.
+            vec![
+                (
+                    "cache-scope",
+                    crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                ),
+                (
+                    "features",
+                    crate::decisions::HostDecisionAction::AnswerChoices {
+                        choice_ids: vec!["auth".into(), "cache".into(), "logs".into()],
+                        custom_text: None,
+                    },
+                ),
+            ],
+        ] {
+            let ctx = ToolContext {
+                living_plan: context.living_plan.clone(),
+                decision_responder: Some(f02_batch_responder(answers)),
+                ..ToolContext::default()
+            };
+            let error = execute_tool_with(
+                dir.path(),
+                "ask_user_question",
+                &f02_batch_input(&single),
+                &ctx,
+            );
+            assert!(error.is_err());
+            assert_eq!(*context.living_plan.lock().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn f02_a_plan_changed_while_the_dialog_was_open_is_not_overwritten() {
+        let (dir, context, single) = f02_question_fixture();
+        let shared = context.living_plan.clone();
+        let ctx = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(move |request| {
+                // Something else revises the plan while the user reads.
+                shared.lock().unwrap().revision += 1;
+                DecisionHostResponse::Reply(DecisionHostReply::uniform(
+                    &request.questions,
+                    crate::decisions::HostDecisionAction::Defer,
+                    "ui-late".into(),
+                    1,
+                ))
+            })),
+            ..ToolContext::default()
+        };
+        let moved = context.living_plan.lock().unwrap().revision + 1;
+        let error = execute_tool_with(
+            dir.path(),
+            "ask_user_question",
+            &f02_batch_input(&single),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("stale"), "{error:?}");
+        let plan = context.living_plan.lock().unwrap();
+        assert_eq!(plan.revision, moved);
+        assert!(plan.structured_decisions.is_empty());
+    }
+
+    #[test]
+    fn f02_deferring_the_dialog_defers_every_question_and_says_so() {
+        let (dir, context, single) = f02_question_fixture();
+        let ctx = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(|request| {
+                DecisionHostResponse::Reply(DecisionHostReply::uniform(
+                    &request.questions,
+                    crate::decisions::HostDecisionAction::Defer,
+                    "ui-defer".into(),
+                    1,
+                ))
+            })),
+            ..ToolContext::default()
+        };
+        let result = execute_tool_with(
+            dir.path(),
+            "ask_user_question",
+            &f02_batch_input(&single),
+            &ctx,
+        )
+        .unwrap();
+        let content: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(content["status"], "deferred");
+        let plan = context.living_plan.lock().unwrap();
+        for id in ["cache-scope", "features"] {
+            assert_eq!(
+                plan.structured_decisions[id].state,
+                crate::decisions::DecisionState::Deferred
+            );
+        }
+    }
+
+    #[test]
+    fn f02_without_a_host_the_whole_batch_is_reported_pending() {
+        let (dir, context, single) = f02_question_fixture();
+        let result = execute_tool_with(
+            dir.path(),
+            "ask_user_question",
+            &f02_batch_input(&single),
+            &context,
+        )
+        .unwrap();
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["status"], "decision_required");
+        assert_eq!(details["questions"].as_array().unwrap().len(), 2);
+        assert_eq!(details["questions"][1]["multi_select"], true);
+    }
+
+    #[test]
+    fn f02_question_schema_items_expose_selection_fields_but_no_authority() {
+        let spec = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "ask_user_question")
+            .unwrap();
+        let questions = &spec.parameters["properties"]["questions"];
+        assert_eq!(questions["maxItems"], crate::decisions::MAX_BATCH_QUESTIONS);
+        let item = questions["items"]["properties"].as_object().unwrap();
+        for field in [
+            "multi_select",
+            "min_selections",
+            "max_selections",
+            "allow_custom",
+        ] {
+            assert!(item.contains_key(field), "{field}");
+        }
+        for forbidden in ["answer", "state", "choice_ids", "host_event_id"] {
+            assert!(!item.contains_key(forbidden), "{forbidden}");
+        }
+        assert_eq!(questions["items"]["additionalProperties"], false);
+    }
+
     #[test]
     fn f02_question_schema_has_content_but_no_authority_fields() {
         let spec = tool_specs()
@@ -4730,7 +5100,10 @@ mod tests {
             living_plan: context.living_plan.clone(),
             decision_responder: Some(DecisionResponder::new(|_| {
                 DecisionHostResponse::Reply(DecisionHostReply {
-                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    answers: std::collections::BTreeMap::from([(
+                        "cache-scope".to_string(),
+                        crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    )]),
                     host_event_id: "ui-event-1".into(),
                     answered_at_ms: 42,
                 })
@@ -4814,7 +5187,10 @@ mod tests {
             decision_responder: Some(DecisionResponder::new(|_| {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 DecisionHostResponse::Reply(DecisionHostReply {
-                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    answers: std::collections::BTreeMap::from([(
+                        "cache-scope".to_string(),
+                        crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    )]),
                     host_event_id: "late-event".into(),
                     answered_at_ms: 100,
                 })
@@ -4844,7 +5220,10 @@ mod tests {
             decision_responder: Some(DecisionResponder::new(|_| {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 DecisionHostResponse::Reply(DecisionHostReply {
-                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    answers: std::collections::BTreeMap::from([(
+                        "cache-scope".to_string(),
+                        crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    )]),
                     host_event_id: "late-event".into(),
                     answered_at_ms: 100,
                 })

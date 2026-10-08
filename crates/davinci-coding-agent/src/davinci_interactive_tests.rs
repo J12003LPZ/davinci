@@ -3391,11 +3391,14 @@ fn f02_wait_native_decision_timeout() {
         options: vec![],
         allow_custom: true,
         custom_only: true,
+        multi_select: false,
+        min_selections: None,
+        max_selections: None,
         plan_revision: 1,
         state: davinci_agent::decisions::DecisionState::Open,
         answer: None,
     };
-    let req = davinci_agent::DecisionHostRequest { question: q };
+    let req = davinci_agent::DecisionHostRequest { questions: vec![q] };
     // Expired deadline
     let expired_ms = davinci_session::now_ms().saturating_sub(10);
     let resp = wait_native_decision(req, expired_ms, &tx, &abort);
@@ -3418,48 +3421,155 @@ fn f02_wait_native_decision_abort_cancelled() {
         options: vec![],
         allow_custom: true,
         custom_only: true,
+        multi_select: false,
+        min_selections: None,
+        max_selections: None,
         plan_revision: 1,
         state: davinci_agent::decisions::DecisionState::Open,
         answer: None,
     };
-    let req = davinci_agent::DecisionHostRequest { question: q };
+    let req = davinci_agent::DecisionHostRequest { questions: vec![q] };
     let resp = wait_native_decision(req, davinci_session::now_ms() + 10_000, &tx, &abort);
     assert_eq!(resp, davinci_agent::DecisionHostResponse::Cancelled);
+}
+
+fn f02_question(
+    id: &str,
+    options: &[&str],
+    multi: Option<(usize, usize)>,
+) -> davinci_agent::decisions::DecisionQuestion {
+    davinci_agent::decisions::DecisionQuestion {
+        id: id.into(),
+        kind: davinci_agent::decisions::DecisionKind::Behavior,
+        title: format!("{id} title"),
+        question: format!("{id}?"),
+        materiality: "Medium".into(),
+        evidence_refs: vec!["ref1".into()],
+        evidence_fingerprints: std::collections::BTreeMap::new(),
+        options: options
+            .iter()
+            .enumerate()
+            .map(
+                |(n, option)| davinci_agent::decisions::DecisionOptionInput {
+                    id: option.to_string(),
+                    label: option.to_uppercase(),
+                    explanation: format!("About {option}"),
+                    recommended: n == 0,
+                },
+            )
+            .collect(),
+        allow_custom: true,
+        custom_only: false,
+        multi_select: multi.is_some(),
+        min_selections: multi.map(|(min, _)| min),
+        max_selections: multi.map(|(_, max)| max),
+        plan_revision: 3,
+        state: davinci_agent::decisions::DecisionState::Open,
+        answer: None,
+    }
 }
 
 #[test]
 fn f02_open_decision_modal_mapping() {
     let mut m = model();
-    let q = davinci_agent::decisions::DecisionQuestion {
-        id: "q-map".into(),
-        kind: davinci_agent::decisions::DecisionKind::Behavior,
-        title: "Map Test".into(),
-        question: "Map Question?".into(),
-        materiality: "Medium".into(),
-        evidence_refs: vec!["ref1".into()],
-        evidence_fingerprints: std::collections::BTreeMap::new(),
-        options: vec![davinci_agent::decisions::DecisionOptionInput {
-            id: "opt1".into(),
-            label: "Option 1".into(),
-            explanation: "Expl 1".into(),
-            recommended: true,
-        }],
-        allow_custom: true,
-        custom_only: false,
-        plan_revision: 3,
-        state: davinci_agent::decisions::DecisionState::Open,
-        answer: None,
-    };
-    open_decision_modal(&mut m, &q);
+    let questions = vec![
+        f02_question("q-map", &["opt1", "opt2"], None),
+        f02_question("q-multi", &["a", "b", "c"], Some((2, 3))),
+    ];
+    open_decision_modal(&mut m, &questions);
     assert_eq!(m.overlay, Some(Overlay::Ask));
-    assert!(m.decision_modal.is_some());
     let modal = m.decision_modal.as_ref().unwrap();
-    assert_eq!(modal.question_id, "q-map");
-    assert_eq!(modal.title, "Map Test");
-    assert_eq!(modal.options.len(), 1);
-    assert_eq!(modal.options[0].id, "opt1");
-    assert!(modal.options[0].recommended);
     assert_eq!(modal.plan_revision, 3);
+    assert_eq!(modal.questions.len(), 2, "one dialog, not two popups");
+    let first = &modal.questions[0];
+    assert_eq!(first.id, "q-map");
+    assert_eq!(first.title, "q-map title");
+    assert_eq!(first.options.len(), 2);
+    assert_eq!(first.options[0].id, "opt1");
+    assert!(first.options[0].recommended);
+    assert!(!first.multi_select);
+    let second = &modal.questions[1];
+    assert!(second.multi_select);
+    assert_eq!((second.min_selections, second.max_selections), (2, 3));
+}
+
+/// The native host end to end: keys go through the app's router into the
+/// dialog, and the closed dialog becomes one batch reply for the agent.
+#[test]
+fn f02_native_dialog_keys_produce_one_batch_reply() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use davinci_agent::decisions::HostDecisionAction;
+    let questions = vec![
+        f02_question("db", &["postgres", "sqlite"], None),
+        f02_question("features", &["auth", "cache", "logs"], Some((1, 2))),
+    ];
+    let mut m = model();
+    open_decision_modal(&mut m, &questions);
+    fn press(m: &mut Model, code: KeyCode) {
+        let _ = davinci_tui::davinci::app::handle_key(m, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    // sqlite, next; check auth and logs; enter to review; enter to submit.
+    for code in [
+        KeyCode::Down,
+        KeyCode::Enter,
+        KeyCode::Char(' '),
+        KeyCode::Down,
+        KeyCode::Down,
+        KeyCode::Char(' '),
+        KeyCode::Enter,
+    ] {
+        press(&mut m, code);
+    }
+    assert!(m.decision_modal.as_ref().unwrap().on_review());
+    assert!(!m.decision_modal.as_ref().unwrap().submitted);
+    press(&mut m, KeyCode::Enter);
+    let state = m.decision_modal.as_ref().unwrap();
+    assert!(state.submitted);
+    assert_eq!(m.overlay, None);
+    match decision_response(&questions, state.outcome.clone()) {
+        davinci_agent::DecisionHostResponse::Reply(reply) => {
+            assert_eq!(reply.answers.len(), 2);
+            assert_eq!(
+                reply.answers["db"],
+                HostDecisionAction::AnswerChoice("sqlite".into())
+            );
+            assert_eq!(
+                reply.answers["features"],
+                HostDecisionAction::AnswerChoices {
+                    choice_ids: vec!["auth".into(), "logs".into()],
+                    custom_text: None
+                }
+            );
+            assert!(reply.host_event_id.starts_with("tui_"));
+        }
+        other => panic!("expected a reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn f02_native_dialog_defer_and_cancel_cover_the_whole_batch() {
+    use davinci_agent::decisions::HostDecisionAction;
+    use davinci_tui::davinci::views::decision_modal::DecisionResult;
+    let questions = vec![
+        f02_question("db", &["postgres", "sqlite"], None),
+        f02_question("features", &["auth", "cache"], Some((1, 2))),
+    ];
+    match decision_response(&questions, Some(DecisionResult::Defer)) {
+        davinci_agent::DecisionHostResponse::Reply(reply) => {
+            assert_eq!(reply.answers.len(), 2);
+            assert!(reply
+                .answers
+                .values()
+                .all(|action| *action == HostDecisionAction::Defer));
+        }
+        other => panic!("expected deferral, got {other:?}"),
+    }
+    for outcome in [Some(DecisionResult::Cancel), None] {
+        assert_eq!(
+            decision_response(&questions, outcome),
+            davinci_agent::DecisionHostResponse::Cancelled
+        );
+    }
 }
 
 #[test]

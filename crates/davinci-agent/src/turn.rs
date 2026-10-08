@@ -6762,7 +6762,10 @@ mod tests {
         let (dir, mut agent, question) = f02_turn_question_fixture();
         agent.tool_context.decision_responder = Some(crate::tools::DecisionResponder::new(|_| {
             crate::tools::DecisionHostResponse::Reply(crate::tools::DecisionHostReply {
-                action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                answers: std::collections::BTreeMap::from([(
+                    "cache-scope".to_string(),
+                    crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                )]),
                 host_event_id: "ui-event-1".into(),
                 answered_at_ms: 42,
             })
@@ -6791,6 +6794,97 @@ mod tests {
         )));
         assert_eq!(*agent.tool_context.living_plan.lock().unwrap(), before);
         assert_eq!(agent.permission_mode(), crate::PermissionMode::ReadOnly);
+    }
+
+    #[test]
+    fn f02_batch_answers_reach_the_next_model_turn_and_survive_a_restart() {
+        let (dir, mut agent, single) = f02_turn_question_fixture();
+        let batch = serde_json::json!({"questions": [single, {
+            "id":"features",
+            "kind":"scope",
+            "title":"Features",
+            "question":"Which features should ship?",
+            "materiality":"Each adds a module",
+            "evidence_refs":["src.rs"],
+            "multi_select":true,
+            "options":[
+                {"id":"auth","label":"Authentication","explanation":"Login"},
+                {"id":"cache","label":"Caching","explanation":"Speed"},
+                {"id":"logs","label":"Logging","explanation":"Audit"}
+            ]
+        }]});
+        agent.tool_context.decision_responder = Some(crate::tools::DecisionResponder::new(|_| {
+            crate::tools::DecisionHostResponse::Reply(crate::tools::DecisionHostReply {
+                answers: std::collections::BTreeMap::from([
+                    (
+                        "cache-scope".to_string(),
+                        crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    ),
+                    (
+                        "features".to_string(),
+                        crate::decisions::HostDecisionAction::AnswerChoices {
+                            choice_ids: vec!["auth".into(), "logs".into()],
+                            custom_text: None,
+                        },
+                    ),
+                ]),
+                host_event_id: "ui-batch".into(),
+                answered_at_ms: 42,
+            })
+        }));
+        let session =
+            davinci_session::JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None)
+                .unwrap();
+        let session_path = session.path.clone();
+        agent.session = Some(session);
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(
+            dir.path(),
+            vec![("ask-1".into(), "ask_user_question".into(), batch)],
+            &mut events,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_ne!(messages[0].is_error, Some(true));
+        // The tool result the model reads next names every answer.
+        let text: String = messages[0]
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                davinci_ai::MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["answers"][0]["selected"][0]["id"], "sqlite");
+        assert_eq!(
+            result["answers"][1]["selected"][0]["label"],
+            "Authentication"
+        );
+        assert_eq!(result["answers"][1]["selected"][1]["label"], "Logging");
+        // And the plan context injected on every later turn shows them too.
+        let rendered = agent.tool_context.living_plan.lock().unwrap().render();
+        assert!(rendered.contains("[selected: auth, logs]"), "{rendered}");
+        assert_eq!(agent.permission_mode(), crate::PermissionMode::ReadOnly);
+
+        // A new process restoring the session sees the same answers.
+        let mut restored = Agent::new("restored");
+        restored.cwd = dir.path().to_path_buf();
+        restored
+            .load_from_session(davinci_session::JsonlSession::open(&session_path).unwrap())
+            .unwrap();
+        let plan = restored.tool_context.living_plan.lock().unwrap().clone();
+        assert_eq!(
+            plan.structured_decisions["features"]
+                .answer
+                .as_ref()
+                .unwrap()
+                .choice_ids,
+            vec!["auth".to_string(), "logs".to_string()]
+        );
+        assert_eq!(
+            plan.structured_decisions["cache-scope"].state,
+            crate::decisions::DecisionState::AnsweredByUser
+        );
     }
 
     #[test]

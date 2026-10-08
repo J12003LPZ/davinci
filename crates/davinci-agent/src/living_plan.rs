@@ -221,6 +221,9 @@ impl LivingPlan {
                         options: Vec::new(),
                         allow_custom: true,
                         custom_only: true,
+                        multi_select: false,
+                        min_selections: None,
+                        max_selections: None,
                         plan_revision: self.revision,
                         state: crate::decisions::DecisionState::Open,
                         answer: None,
@@ -499,12 +502,18 @@ impl LivingPlan {
                     crate::decisions::DecisionState::Cancelled => "cancelled",
                 };
                 let ans = if let Some(a) = &d.answer {
-                    if let Some(c) = &a.choice_id {
-                        format!(" [selected: {c}]")
-                    } else if let Some(txt) = &a.custom_text {
-                        format!(" [custom: {txt}]")
-                    } else {
+                    let mut parts = Vec::new();
+                    let selected = a.selected_ids();
+                    if !selected.is_empty() {
+                        parts.push(format!("selected: {}", selected.join(", ")));
+                    }
+                    if let Some(txt) = &a.custom_text {
+                        parts.push(format!("custom: {txt}"));
+                    }
+                    if parts.is_empty() {
                         String::new()
+                    } else {
+                        format!(" [{}]", parts.join("; "))
                     }
                 } else {
                     String::new()

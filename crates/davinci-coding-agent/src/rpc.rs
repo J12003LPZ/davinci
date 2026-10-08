@@ -1322,13 +1322,13 @@ pub fn rpc_resolve_decision(
     request: &davinci_agent::DecisionHostRequest,
     mut ask: impl FnMut(&serde_json::Value) -> serde_json::Value,
 ) -> davinci_agent::DecisionHostResponse {
+    use crate::decision_prompts::{DecisionPrompt, DecisionStep, SequentialDecision};
     let issued_request_id = format!("dec-req-{}", davinci_session::now_ms());
-    let question = &request.question;
-
-    let payload = serde_json::json!({
-        "op": "decision",
-        "id": issued_request_id,
-        "question": {
+    let Some(first) = request.questions.first() else {
+        return davinci_agent::DecisionHostResponse::Unavailable;
+    };
+    let wire = |question: &davinci_agent::decisions::DecisionQuestion| {
+        serde_json::json!({
             "id": question.id,
             "kind": question.kind,
             "title": question.title,
@@ -1338,140 +1338,146 @@ pub fn rpc_resolve_decision(
             "options": question.options,
             "allow_custom": question.allow_custom,
             "custom_only": question.custom_only,
+            "multi_select": question.multi_select,
+            "min_selections": question.selection_bounds().0,
+            "max_selections": question.selection_bounds().1,
             "plan_revision": question.plan_revision,
-        }
+        })
+    };
+
+    // `question` stays for clients that only know one question per dialog;
+    // they can answer it only when it is the whole batch.
+    let payload = serde_json::json!({
+        "op": "decision",
+        "id": issued_request_id,
+        "question": wire(first),
+        "questions": request.questions.iter().map(wire).collect::<Vec<_>>(),
     });
 
     let answer = ask(&payload);
     if answer.is_null() {
-        // Older clients may use sequential select/input but must preserve question/revision/request identity
-        let mut options: Vec<String> = question.options.iter().map(|o| o.label.clone()).collect();
-        if question.allow_custom {
-            options.push("Custom response".into());
-        }
-        options.push("Defer decision".into());
-        options.push("Cancel".into());
-
-        let select_call = serde_json::json!({
-            "op": "select",
-            "id": issued_request_id,
-            "title": format!("{}: {}", question.title, question.question),
-            "options": options,
-            "decision_id": question.id,
-            "plan_revision": question.plan_revision,
-        });
-        let sel_ans = ask(&select_call);
-        if let Some(choice_str) = sel_ans.as_str() {
-            if choice_str == "Cancel" {
-                return davinci_agent::DecisionHostResponse::Cancelled;
-            }
-            if choice_str == "Defer decision" {
-                return davinci_agent::DecisionHostResponse::Reply(
-                    davinci_agent::DecisionHostReply {
-                        action: davinci_agent::decisions::HostDecisionAction::Defer,
-                        host_event_id: format!("rpc-evt-{}", davinci_session::now_ms()),
-                        answered_at_ms: davinci_session::now_ms(),
-                    },
-                );
-            }
-            if choice_str == "Custom response" && question.allow_custom {
-                let input_call = serde_json::json!({
-                    "op": "input",
-                    "id": issued_request_id,
-                    "title": "Enter custom response",
-                    "placeholder": "Custom answer...",
-                    "decision_id": question.id,
-                    "plan_revision": question.plan_revision,
-                });
-                let input_ans = ask(&input_call);
-                if let Some(custom_text) = input_ans.as_str() {
-                    let trimmed = custom_text.trim();
-                    if !trimmed.is_empty() {
-                        return davinci_agent::DecisionHostResponse::Reply(
-                            davinci_agent::DecisionHostReply {
-                                action: davinci_agent::decisions::HostDecisionAction::AnswerCustom(
-                                    trimmed.to_string(),
-                                ),
-                                host_event_id: format!("rpc-evt-{}", davinci_session::now_ms()),
-                                answered_at_ms: davinci_session::now_ms(),
-                            },
-                        );
-                    }
-                }
-                return davinci_agent::DecisionHostResponse::Cancelled;
-            }
-            if let Some(opt) = question
-                .options
-                .iter()
-                .find(|o| o.label == choice_str || o.id == choice_str)
-            {
-                return davinci_agent::DecisionHostResponse::Reply(
-                    davinci_agent::DecisionHostReply {
-                        action: davinci_agent::decisions::HostDecisionAction::AnswerChoice(
-                            opt.id.clone(),
-                        ),
-                        host_event_id: format!("rpc-evt-{}", davinci_session::now_ms()),
-                        answered_at_ms: davinci_session::now_ms(),
-                    },
-                );
+        // Older clients render one select or input at a time. Each call
+        // carries the question and revision it belongs to.
+        let mut flow = SequentialDecision::new(request, "rpc-evt-");
+        let mut prompt = flow.prompt();
+        loop {
+            let question = flow.question();
+            let (call, is_select) = match &prompt {
+                DecisionPrompt::Select { title, options } => (
+                    serde_json::json!({
+                        "op": "select",
+                        "id": issued_request_id,
+                        "title": title,
+                        "options": options,
+                        "decision_id": question.id,
+                        "plan_revision": question.plan_revision,
+                    }),
+                    true,
+                ),
+                DecisionPrompt::Input { title, placeholder } => (
+                    serde_json::json!({
+                        "op": "input",
+                        "id": issued_request_id,
+                        "title": title,
+                        "placeholder": placeholder,
+                        "decision_id": question.id,
+                        "plan_revision": question.plan_revision,
+                    }),
+                    false,
+                ),
+            };
+            let reply = ask(&call);
+            let Some(text) = reply.as_str() else {
+                // No select answer means no dialog; a dismissed input is a no.
+                return if is_select {
+                    davinci_agent::DecisionHostResponse::Unavailable
+                } else {
+                    davinci_agent::DecisionHostResponse::Cancelled
+                };
+            };
+            match flow.answer(Some(text)) {
+                DecisionStep::Prompt(next) => prompt = next,
+                DecisionStep::Done(response) => return response,
             }
         }
-        return davinci_agent::DecisionHostResponse::Unavailable;
     }
 
-    if let Some(action_str) = answer.get("action").and_then(|a| a.as_str()) {
-        let host_event_id = answer
-            .get("host_event_id")
-            .and_then(|h| h.as_str())
-            .unwrap_or(&issued_request_id)
-            .to_string();
-        let answered_at_ms = answer
-            .get("answered_at_ms")
-            .and_then(|t| t.as_u64())
-            .unwrap_or_else(davinci_session::now_ms);
-        match action_str {
-            "answer_choice" => {
-                if let Some(choice) = answer.get("choice_id").and_then(|c| c.as_str()) {
-                    return davinci_agent::DecisionHostResponse::Reply(
-                        davinci_agent::DecisionHostReply {
-                            action: davinci_agent::decisions::HostDecisionAction::AnswerChoice(
-                                choice.to_string(),
-                            ),
-                            host_event_id,
-                            answered_at_ms,
-                        },
-                    );
-                }
-            }
-            "answer_custom" => {
-                if let Some(custom) = answer.get("custom_text").and_then(|c| c.as_str()) {
-                    return davinci_agent::DecisionHostResponse::Reply(
-                        davinci_agent::DecisionHostReply {
-                            action: davinci_agent::decisions::HostDecisionAction::AnswerCustom(
-                                custom.to_string(),
-                            ),
-                            host_event_id,
-                            answered_at_ms,
-                        },
-                    );
-                }
-            }
-            "defer" => {
-                return davinci_agent::DecisionHostResponse::Reply(
-                    davinci_agent::DecisionHostReply {
-                        action: davinci_agent::decisions::HostDecisionAction::Defer,
-                        host_event_id,
-                        answered_at_ms,
-                    },
-                );
-            }
-            "cancel" => {
-                return davinci_agent::DecisionHostResponse::Cancelled;
-            }
-            _ => {}
+    let host_event_id = answer
+        .get("host_event_id")
+        .and_then(|h| h.as_str())
+        .unwrap_or(&issued_request_id)
+        .to_string();
+    let answered_at_ms = answer
+        .get("answered_at_ms")
+        .and_then(|t| t.as_u64())
+        .unwrap_or_else(davinci_session::now_ms);
+    let reply = |answers| {
+        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
+            answers,
+            host_event_id: host_event_id.clone(),
+            answered_at_ms,
+        })
+    };
+    match answer.get("action").and_then(|a| a.as_str()) {
+        Some("cancel") => return davinci_agent::DecisionHostResponse::Cancelled,
+        Some("defer") => {
+            return reply(
+                request
+                    .questions
+                    .iter()
+                    .map(|q| {
+                        (
+                            q.id.clone(),
+                            davinci_agent::decisions::HostDecisionAction::Defer,
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        _ => {}
+    }
+    // Batch form: {"answers": {"<question id>": {"action": ...}, ...}}.
+    if let Some(answers) = answer.get("answers").and_then(|a| a.as_object()) {
+        let mut parsed = std::collections::BTreeMap::new();
+        for (id, value) in answers {
+            let Some(action) = rpc_decision_action(value) else {
+                return davinci_agent::DecisionHostResponse::Unavailable;
+            };
+            parsed.insert(id.clone(), action);
+        }
+        return reply(parsed);
+    }
+    // Single-question form, valid only when it answers the whole dialog.
+    if request.questions.len() == 1 {
+        if let Some(action) = rpc_decision_action(&answer) {
+            return reply(std::collections::BTreeMap::from([(
+                first.id.clone(),
+                action,
+            )]));
         }
     }
     davinci_agent::DecisionHostResponse::Unavailable
+}
+
+/// One question's action as an RPC client spells it.
+fn rpc_decision_action(value: &Value) -> Option<davinci_agent::decisions::HostDecisionAction> {
+    use davinci_agent::decisions::HostDecisionAction;
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    match value.get("action").and_then(Value::as_str)? {
+        "answer_choice" => text("choice_id").map(HostDecisionAction::AnswerChoice),
+        "answer_custom" => text("custom_text").map(HostDecisionAction::AnswerCustom),
+        "answer_choices" => Some(HostDecisionAction::AnswerChoices {
+            choice_ids: value
+                .get("choice_ids")?
+                .as_array()?
+                .iter()
+                .map(|id| id.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?,
+            custom_text: text("custom_text"),
+        }),
+        "defer" => Some(HostDecisionAction::Defer),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2168,11 +2174,16 @@ mod tests {
             }],
             allow_custom: false,
             custom_only: false,
+            multi_select: false,
+            min_selections: None,
+            max_selections: None,
             state: davinci_agent::decisions::DecisionState::Open,
             answer: None,
             plan_revision: 1,
         };
-        let request = davinci_agent::DecisionHostRequest { question };
+        let request = davinci_agent::DecisionHostRequest {
+            questions: vec![question],
+        };
         let response = rpc_resolve_decision(&request, |call| {
             assert_eq!(call["op"], "decision");
             assert_eq!(call["question"]["id"], "db-choice");
@@ -2186,7 +2197,7 @@ mod tests {
         match response {
             davinci_agent::DecisionHostResponse::Reply(reply) => {
                 assert_eq!(
-                    reply.action,
+                    reply.answers["db-choice"],
                     davinci_agent::decisions::HostDecisionAction::AnswerChoice("sqlite".into())
                 );
                 assert_eq!(reply.host_event_id, "evt-123");
@@ -2213,11 +2224,16 @@ mod tests {
             }],
             allow_custom: true,
             custom_only: false,
+            multi_select: false,
+            min_selections: None,
+            max_selections: None,
             state: davinci_agent::decisions::DecisionState::Open,
             answer: None,
             plan_revision: 2,
         };
-        let request = davinci_agent::DecisionHostRequest { question };
+        let request = davinci_agent::DecisionHostRequest {
+            questions: vec![question],
+        };
         let mut call_count = 0;
         let response = rpc_resolve_decision(&request, |call| {
             call_count += 1;
@@ -2241,7 +2257,7 @@ mod tests {
         match response {
             davinci_agent::DecisionHostResponse::Reply(reply) => {
                 assert_eq!(
-                    reply.action,
+                    reply.answers["db-choice"],
                     davinci_agent::decisions::HostDecisionAction::AnswerCustom(
                         "postgres://localhost:5432".into()
                     )
@@ -2264,13 +2280,148 @@ mod tests {
             options: vec![],
             allow_custom: false,
             custom_only: false,
+            multi_select: false,
+            min_selections: None,
+            max_selections: None,
             state: davinci_agent::decisions::DecisionState::Open,
             answer: None,
             plan_revision: 1,
         };
-        let request = davinci_agent::DecisionHostRequest { question };
+        let request = davinci_agent::DecisionHostRequest {
+            questions: vec![question],
+        };
         let response = rpc_resolve_decision(&request, |_| serde_json::Value::Null);
         assert_eq!(response, davinci_agent::DecisionHostResponse::Unavailable);
+    }
+
+    fn f02_rpc_batch() -> davinci_agent::DecisionHostRequest {
+        use crate::decision_prompts::tests::question;
+        davinci_agent::DecisionHostRequest {
+            questions: vec![
+                question("db", &["postgres", "sqlite"], None),
+                question("features", &["auth", "cache", "logs"], Some((1, 3))),
+            ],
+        }
+    }
+
+    #[test]
+    fn f02_rpc_decision_batch_typed_reply_carries_every_answer() {
+        use davinci_agent::decisions::HostDecisionAction;
+        let request = f02_rpc_batch();
+        let response = rpc_resolve_decision(&request, |call| {
+            assert_eq!(call["op"], "decision");
+            // Old clients still find the first question where they look.
+            assert_eq!(call["question"]["id"], "db");
+            assert_eq!(call["questions"][1]["multi_select"], true);
+            assert_eq!(call["questions"][1]["max_selections"], 3);
+            serde_json::json!({
+                "action": "submit",
+                "host_event_id": "evt-batch",
+                "answers": {
+                    "db": {"action": "answer_custom", "custom_text": "CockroachDB"},
+                    "features": {
+                        "action": "answer_choices",
+                        "choice_ids": ["logs", "auth"],
+                        "custom_text": "metrics"
+                    }
+                }
+            })
+        });
+        let davinci_agent::DecisionHostResponse::Reply(reply) = response else {
+            panic!("expected a reply, got {response:?}");
+        };
+        assert_eq!(reply.host_event_id, "evt-batch");
+        assert_eq!(
+            reply.answers["db"],
+            HostDecisionAction::AnswerCustom("CockroachDB".into())
+        );
+        assert_eq!(
+            reply.answers["features"],
+            HostDecisionAction::AnswerChoices {
+                choice_ids: vec!["logs".into(), "auth".into()],
+                custom_text: Some("metrics".into())
+            }
+        );
+    }
+
+    #[test]
+    fn f02_rpc_decision_batch_rejects_malformed_or_single_form_replies() {
+        let request = f02_rpc_batch();
+        // A one-question reply cannot answer a two-question dialog.
+        let single = rpc_resolve_decision(
+            &request,
+            |_| serde_json::json!({"action": "answer_choice", "choice_id": "sqlite"}),
+        );
+        assert_eq!(single, davinci_agent::DecisionHostResponse::Unavailable);
+        // A malformed entry fails the whole reply, never part of it.
+        let malformed = rpc_resolve_decision(&request, |_| {
+            serde_json::json!({"answers": {
+                "db": {"action": "answer_choice", "choice_id": "sqlite"},
+                "features": {"action": "answer_choices", "choice_ids": [1, 2]}
+            }})
+        });
+        assert_eq!(malformed, davinci_agent::DecisionHostResponse::Unavailable);
+        assert_eq!(
+            rpc_resolve_decision(&request, |_| serde_json::json!({"action": "cancel"})),
+            davinci_agent::DecisionHostResponse::Cancelled
+        );
+        let davinci_agent::DecisionHostResponse::Reply(deferred) =
+            rpc_resolve_decision(&request, |_| serde_json::json!({"action": "defer"}))
+        else {
+            panic!("defer is a reply");
+        };
+        assert_eq!(deferred.answers.len(), 2);
+    }
+
+    #[test]
+    fn f02_rpc_decision_batch_falls_back_to_one_select_at_a_time() {
+        use davinci_agent::decisions::HostDecisionAction;
+        let request = f02_rpc_batch();
+        let mut seen = Vec::new();
+        let mut script = vec![
+            serde_json::json!("SQLITE"),
+            serde_json::json!("LOGS"),
+            serde_json::json!(crate::decision_prompts::CUSTOM),
+            serde_json::json!("audit"),
+            serde_json::json!(crate::decision_prompts::DONE),
+        ]
+        .into_iter();
+        let response = rpc_resolve_decision(&request, |call| {
+            if call["op"] == "decision" {
+                return serde_json::Value::Null;
+            }
+            seen.push((
+                call["op"].as_str().unwrap().to_string(),
+                call["decision_id"].as_str().unwrap().to_string(),
+            ));
+            assert_eq!(call["plan_revision"], 1);
+            script.next().unwrap()
+        });
+        assert_eq!(
+            seen,
+            [
+                ("select", "db"),
+                ("select", "features"),
+                ("select", "features"),
+                ("input", "features"),
+                ("select", "features"),
+            ]
+            .map(|(op, id)| (op.to_string(), id.to_string()))
+        );
+        let davinci_agent::DecisionHostResponse::Reply(reply) = response else {
+            panic!("expected a reply, got {response:?}");
+        };
+        assert_eq!(
+            reply.answers["db"],
+            HostDecisionAction::AnswerChoice("sqlite".into())
+        );
+        assert_eq!(
+            reply.answers["features"],
+            HostDecisionAction::AnswerChoices {
+                choice_ids: vec!["logs".into()],
+                custom_text: Some("audit".into())
+            }
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod codex_quota;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
+mod decision_prompts;
 #[cfg(all(unix, feature = "experimental-ipc"))]
 mod experimental;
 mod fast;
@@ -5875,17 +5876,26 @@ fn run_streaming_turn(
                 .recv()
                 .unwrap_or(davinci_agent::DecisionHostResponse::Cancelled)
         }));
-    #[allow(clippy::large_enum_variant)] // built once per CLI run / prompt
-    enum LegacyDecisionState {
-        Selecting {
-            request: davinci_agent::DecisionHostRequest,
-            reply: std::sync::mpsc::Sender<davinci_agent::DecisionHostResponse>,
-        },
-        Inputting {
-            reply: std::sync::mpsc::Sender<davinci_agent::DecisionHostResponse>,
-        },
+    // One question at a time through the hosted selector and input; the
+    // shared driver turns the answers into one batch reply.
+    struct LegacyDecision {
+        flow: crate::decision_prompts::SequentialDecision,
+        reply: std::sync::mpsc::Sender<davinci_agent::DecisionHostResponse>,
     }
-    let mut legacy_decision: Option<LegacyDecisionState> = None;
+    fn show_decision_prompt(
+        session: &mut InteractiveSession,
+        prompt: crate::decision_prompts::DecisionPrompt,
+    ) {
+        match prompt {
+            crate::decision_prompts::DecisionPrompt::Select { title, options } => {
+                session.open_extension_selector(title, options)
+            }
+            crate::decision_prompts::DecisionPrompt::Input { title, placeholder } => {
+                session.open_extension_input(title, placeholder)
+            }
+        }
+    }
+    let mut legacy_decision: Option<LegacyDecision> = None;
     session.running = true;
     let outcome = std::thread::scope(|scope| {
         let worker = scope.spawn(|| complete_prompt_with_host(parsed, agent, Some(host), false));
@@ -5918,22 +5928,10 @@ fn run_streaming_turn(
                     approval = Some(reply);
                     dirty = true;
                 } else if let Ok((request, reply)) = decision_rx.try_recv() {
-                    let mut options: Vec<String> = request
-                        .question
-                        .options
-                        .iter()
-                        .map(|o| o.label.clone())
-                        .collect();
-                    if request.question.allow_custom {
-                        options.push("Custom response".into());
-                    }
-                    options.push("Defer decision".into());
-                    options.push("Cancel".into());
-                    session.open_extension_selector(
-                        format!("{}: {}", request.question.title, request.question.question),
-                        options,
-                    );
-                    legacy_decision = Some(LegacyDecisionState::Selecting { request, reply });
+                    let flow =
+                        crate::decision_prompts::SequentialDecision::new(&request, "legacy_");
+                    show_decision_prompt(session, flow.prompt());
+                    legacy_decision = Some(LegacyDecision { flow, reply });
                     dirty = true;
                 }
             }
@@ -5977,14 +5975,10 @@ fn run_streaming_turn(
                                 let _ = reply.send(davinci_agent::ToolApprovalDecision::Deny);
                                 session.close_overlays();
                             }
-                            if let Some(state) = legacy_decision.take() {
-                                match state {
-                                    LegacyDecisionState::Selecting { reply, .. }
-                                    | LegacyDecisionState::Inputting { reply } => {
-                                        let _ = reply
-                                            .send(davinci_agent::DecisionHostResponse::Cancelled);
-                                    }
-                                }
+                            if let Some(pending) = legacy_decision.take() {
+                                let _ = pending
+                                    .reply
+                                    .send(davinci_agent::DecisionHostResponse::Cancelled);
                                 session.close_overlays();
                             }
                             session.chrome.status =
@@ -6004,110 +5998,22 @@ fn run_streaming_turn(
                                 });
                                 session.chrome.status.clear();
                             }
-                            davinci_tui::SessionAction::ExtensionSelect(selected)
+                            davinci_tui::SessionAction::ExtensionSelect(answer)
+                            | davinci_tui::SessionAction::ExtensionInput(answer)
                                 if legacy_decision.is_some() =>
                             {
-                                if let Some(LegacyDecisionState::Selecting { request, reply }) =
-                                    legacy_decision.take()
-                                {
-                                    match selected.as_deref() {
-                                        Some("Cancel") | None => {
-                                            let _ = reply.send(
-                                                davinci_agent::DecisionHostResponse::Cancelled,
-                                            );
-                                            session.close_overlays();
-                                            session.chrome.status.clear();
-                                        }
-                                        Some("Defer decision") => {
-                                            let _ = reply.send(
-                                                davinci_agent::DecisionHostResponse::Reply(
-                                                    davinci_agent::DecisionHostReply {
-                                                        action:
-                                                            davinci_agent::decisions::HostDecisionAction::Defer,
-                                                        host_event_id: format!(
-                                                            "legacy_{}",
-                                                            davinci_session::now_ms()
-                                                        ),
-                                                        answered_at_ms: davinci_session::now_ms(),
-                                                    },
-                                                ),
-                                            );
-                                            session.close_overlays();
-                                            session.chrome.status.clear();
-                                        }
-                                        Some("Custom response")
-                                            if request.question.allow_custom =>
-                                        {
-                                            session.open_extension_input(
-                                                "Enter custom response",
-                                                "Custom answer...",
-                                            );
-                                            legacy_decision =
-                                                Some(LegacyDecisionState::Inputting { reply });
-                                        }
-                                        Some(choice_str) => {
-                                            if let Some(opt) =
-                                                request.question.options.iter().find(|o| {
-                                                    o.label == choice_str || o.id == choice_str
-                                                })
-                                            {
-                                                let _ = reply.send(
-                                                    davinci_agent::DecisionHostResponse::Reply(
-                                                        davinci_agent::DecisionHostReply {
-                                                            action:
-                                                                davinci_agent::decisions::HostDecisionAction::AnswerChoice(
-                                                                    opt.id.clone(),
-                                                                ),
-                                                            host_event_id: format!(
-                                                                "legacy_{}",
-                                                                davinci_session::now_ms()
-                                                            ),
-                                                            answered_at_ms: davinci_session::now_ms(
-                                                            ),
-                                                        },
-                                                    ),
-                                                );
-                                            } else {
-                                                let _ = reply.send(
-                                                    davinci_agent::DecisionHostResponse::Cancelled,
-                                                );
-                                            }
-                                            session.close_overlays();
-                                            session.chrome.status.clear();
-                                        }
+                                let pending = legacy_decision.as_mut().expect("checked above");
+                                match pending.flow.answer(answer.as_deref()) {
+                                    crate::decision_prompts::DecisionStep::Prompt(prompt) => {
+                                        show_decision_prompt(session, prompt);
                                     }
-                                }
-                            }
-                            davinci_tui::SessionAction::ExtensionInput(text)
-                                if legacy_decision.is_some() =>
-                            {
-                                if let Some(LegacyDecisionState::Inputting { reply }) =
-                                    legacy_decision.take()
-                                {
-                                    if let Some(custom) =
-                                        text.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-                                    {
-                                        let _ = reply.send(
-                                            davinci_agent::DecisionHostResponse::Reply(
-                                                davinci_agent::DecisionHostReply {
-                                                    action:
-                                                        davinci_agent::decisions::HostDecisionAction::AnswerCustom(
-                                                            custom,
-                                                        ),
-                                                    host_event_id: format!(
-                                                        "legacy_{}",
-                                                        davinci_session::now_ms()
-                                                    ),
-                                                    answered_at_ms: davinci_session::now_ms(),
-                                                },
-                                            ),
-                                        );
-                                    } else {
-                                        let _ = reply
-                                            .send(davinci_agent::DecisionHostResponse::Cancelled);
+                                    crate::decision_prompts::DecisionStep::Done(response) => {
+                                        let pending =
+                                            legacy_decision.take().expect("checked above");
+                                        let _ = pending.reply.send(response);
+                                        session.close_overlays();
+                                        session.chrome.status.clear();
                                     }
-                                    session.close_overlays();
-                                    session.chrome.status.clear();
                                 }
                             }
                             davinci_tui::SessionAction::Submit(text) => {

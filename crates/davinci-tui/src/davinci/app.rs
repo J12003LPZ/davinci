@@ -1979,69 +1979,10 @@ fn handle_overlay_key(
         return Flow::Continue;
     }
     if overlay == Overlay::Ask && model.decision_modal.is_some() {
+        // The dialog owns every key while open; the host reads `outcome`.
         let decision = model.decision_modal.as_mut().unwrap();
-        if key.code == KeyCode::BackTab
-            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
-        {
-            return Flow::Continue;
-        }
-        if key.code == KeyCode::Esc {
-            let _ = decision.cancel();
+        if decision.handle_key(key) == decision_modal::ModalFlow::Closed {
             model.overlay = None;
-            return Flow::Continue;
-        }
-        if key.code == KeyCode::Tab && key.modifiers.is_empty() {
-            decision.toggle_custom();
-            return Flow::Continue;
-        }
-        if key.code == KeyCode::Up {
-            decision.move_selection(-1);
-            return Flow::Continue;
-        }
-        if key.code == KeyCode::Down {
-            decision.move_selection(1);
-            return Flow::Continue;
-        }
-        if (key.code == KeyCode::Char('i') && !decision.custom_focused)
-            || (key.code == KeyCode::Char('i') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
-            decision.toggle_inspect();
-            return Flow::Continue;
-        }
-        if (key.code == KeyCode::Char('d') && !decision.custom_focused)
-            || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
-            let _ = decision.defer();
-            model.overlay = None;
-            return Flow::Continue;
-        }
-        if !decision.custom_focused && key.modifiers.is_empty() {
-            if let KeyCode::Char(num @ '1'..='9') = key.code {
-                let digit = (num as u8 - b'0') as usize;
-                decision.select_number(digit);
-                return Flow::Continue;
-            }
-        }
-        if decision.custom_focused {
-            match key.code {
-                KeyCode::Backspace => {
-                    decision.backspace();
-                    return Flow::Continue;
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    decision.insert_char(c);
-                    return Flow::Continue;
-                }
-                _ => {}
-            }
-        }
-        if key.code == KeyCode::Enter && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
-        {
-            if decision_modal::commits_decision("enter", decision.is_valid()) {
-                let _ = decision.commit();
-                model.overlay = None;
-            }
-            return Flow::Continue;
         }
         return Flow::Continue;
     }
