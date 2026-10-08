@@ -373,3 +373,63 @@ fn over_a_list_the_wheel_moves_the_selection() {
     assert_ne!(selected(&m), before);
     assert_eq!(m.screen, Screen::Agent);
 }
+
+/// WOR-41: the pointer decides which surface owns the wheel while a
+/// completion list floats over the conversation.
+#[test]
+fn the_wheel_over_the_completion_list_steps_it_and_elsewhere_scrolls_the_conversation() {
+    let mut m = model(60);
+    davinci_tui::davinci::fixtures::dress(&mut m);
+    m.transcript.clear();
+    push_turns(&mut m, 0, 60);
+    m.slash_commands = ["settings", "sessions", "model", "compact"]
+        .into_iter()
+        .map(|name| davinci_tui::SlashCommandSpec {
+            name: name.into(),
+            ..Default::default()
+        })
+        .collect();
+    m.type_char("/");
+    assert!(m.suggestions.is_some(), "a bare slash opens the list");
+    app::scroll_transcript(&mut m, 12);
+    let scrolled = offset(&m);
+    assert_eq!(scrolled, 12);
+
+    let list = app::compose_frame(&m, m.height)
+        .suggestion_rows
+        .expect("the open list reports the rows it covers");
+    assert!(!list.is_empty());
+    let mut grab = None;
+
+    // Over the list: the selection moves, the conversation stays put.
+    let picked = m.suggestion_index;
+    assert!(point(
+        &mut m,
+        &mut grab,
+        mouse(MouseEventKind::ScrollDown, 10, list.start)
+    ));
+    assert_ne!(m.suggestion_index, picked, "the wheel steps the list");
+    assert_eq!(offset(&m), scrolled, "the conversation did not scroll");
+    let after_down = m.suggestion_index;
+    point(
+        &mut m,
+        &mut grab,
+        mouse(MouseEventKind::ScrollUp, 10, list.end - 1),
+    );
+    assert_ne!(m.suggestion_index, after_down);
+    assert_eq!(offset(&m), scrolled);
+
+    // Over the conversation: it scrolls and the list keeps its selection.
+    let kept = m.suggestion_index;
+    point(&mut m, &mut grab, mouse(MouseEventKind::ScrollUp, 10, 2));
+    assert_eq!(offset(&m), scrolled + WHEEL_ROWS as usize);
+    assert_eq!(m.suggestion_index, kept);
+    assert!(m.suggestions.is_some());
+}
+
+#[test]
+fn without_a_completion_list_no_row_is_a_list_row() {
+    let m = model(60);
+    assert!(app::compose_frame(&m, m.height).suggestion_rows.is_none());
+}
+
