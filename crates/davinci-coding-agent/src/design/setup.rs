@@ -136,7 +136,13 @@ pub fn setup_script() -> Option<PathBuf> {
 }
 
 /// `Err` says why there is no automatic install here and what to do instead.
-pub fn installer() -> Result<Installer, String> {
+///
+/// The script builds and pins what every later runtime check trusts, so it
+/// must not come from where this session can write: a checkout inside
+/// `workspace` (DaVinci started in its own repository) could have had the
+/// script, the companion or its lockfile edited first. That case is left to
+/// the person, from a terminal of their own.
+pub fn installer(workspace: &Path) -> Result<Installer, String> {
     if !cfg!(windows) {
         return Err(
             "automatic setup is Windows-only for now; follow the Setup steps in docs/design-artifacts.md"
@@ -146,6 +152,16 @@ pub fn installer() -> Result<Installer, String> {
     let script = setup_script().ok_or_else(|| {
         "this DaVinci build has no checkout with scripts/setup-design-runtime.ps1; run it from a DaVinci checkout (see docs/design-artifacts.md)".to_string()
     })?;
+    if checkout_in_workspace(&script, workspace) {
+        return Err(format!(
+            "the setup script is inside this workspace, where the session can edit it, so DaVinci will not run it for you; review the checkout, then run it yourself in a separate terminal: {}",
+            Installer {
+                program: PathBuf::new(),
+                script: script.clone(),
+            }
+            .display()
+        ));
+    }
     // The script needs PowerShell 7 (`ConvertFrom-Json -AsHashtable`).
     let program = find_on_path("pwsh").ok_or_else(|| {
         format!(
@@ -164,6 +180,19 @@ pub fn installer() -> Result<Installer, String> {
 /// workspace, which must not choose the program that builds trusted tooling.
 /// `symlink_metadata` rather than `is_file`: a Microsoft Store `pwsh.exe` is
 /// an app execution alias whose target `metadata` cannot open.
+/// The whole checkout counts, not only the script: it builds `design-ui`
+/// from the same tree.
+fn checkout_in_workspace(script: &Path, workspace: &Path) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let checkout = script
+        .parent()
+        .and_then(Path::parent)
+        .map(canonical)
+        .unwrap_or_default();
+    let workspace = canonical(workspace);
+    checkout.starts_with(&workspace) || workspace.starts_with(&checkout)
+}
+
 fn find_on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -297,6 +326,25 @@ mod tests {
         assert!(holds(Path::new("/"), home));
         assert!(!holds(Path::new("/home/ada/code/app"), home));
         assert!(!holds(Path::new("/home/bob"), home));
+    }
+
+    #[test]
+    fn a_checkout_the_session_can_edit_is_never_run_for_it() {
+        let script = setup_script().unwrap();
+        let checkout = script.parent().unwrap().parent().unwrap();
+        // DaVinci started in its own repository, a subfolder, or above it.
+        assert!(checkout_in_workspace(&script, checkout));
+        assert!(checkout_in_workspace(
+            &script,
+            &checkout.join("crates").join("davinci-coding-agent")
+        ));
+        assert!(checkout_in_workspace(&script, checkout.parent().unwrap()));
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(!checkout_in_workspace(&script, elsewhere.path()));
+        if cfg!(windows) {
+            let refused = installer(checkout).unwrap_err();
+            assert!(refused.contains("separate terminal"), "{refused}");
+        }
     }
 
     #[test]

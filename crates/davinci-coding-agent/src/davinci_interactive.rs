@@ -9667,7 +9667,7 @@ fn ask_design_setup(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
         ));
         return Some(Next::Go);
     }
-    let installer = match (&needed, setup::installer()) {
+    let installer = match (&needed, setup::installer(&shell.agent.cwd)) {
         (setup::SetupNeeded::Disabled, _) => None,
         (setup::SetupNeeded::Runtime(_), Ok(installer)) => Some(installer),
         (setup::SetupNeeded::Runtime(reason), Err(why)) => {
