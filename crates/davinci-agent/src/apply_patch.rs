@@ -73,6 +73,13 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
+/// True for `C:` style prefixes. `Path` only sees them as a prefix on Windows,
+/// but a patch may come from another platform, so they are rejected everywhere.
+fn has_windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// Normalizes path strings: rejects absolute paths, path traversal (`..`), and symlink escapes.
 pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<PathBuf, String> {
     let trimmed = raw_path.trim();
@@ -80,7 +87,11 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
         return Err("Empty file path in patch".into());
     }
     // Reject absolute paths across platforms (Unix leading '/', Windows drive prefix 'C:', UNC '\\')
-    if trimmed.starts_with('/') || trimmed.starts_with('\\') || Path::new(trimmed).is_absolute() {
+    if trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || has_windows_drive_prefix(trimmed)
+        || Path::new(trimmed).is_absolute()
+    {
         return Err(format!("Absolute path rejected: {raw_path}"));
     }
     let p = Path::new(trimmed);
@@ -797,6 +808,39 @@ mod tests {
         if cfg!(windows) {
             assert!(sanitize_relative_path(dir.path(), "C:\\secret.txt").is_err());
         }
+    }
+
+    #[test]
+    fn wor71_windows_drive_paths_are_rejected_on_every_platform() {
+        let dir = tempdir().unwrap();
+        for raw in [
+            "C:foo",
+            "C:\\temp\\file",
+            "C:/temp/file",
+            "c:foo",
+            "\\\\server\\share\\file",
+        ] {
+            assert!(
+                sanitize_relative_path(dir.path(), raw).is_err(),
+                "{raw} accepted"
+            );
+        }
+        assert!(has_windows_drive_prefix("Z:x"));
+        assert!(!has_windows_drive_prefix("dir/a:b"));
+        assert!(!has_windows_drive_prefix("a"));
+        assert!(!has_windows_drive_prefix("1:x"));
+    }
+
+    #[test]
+    fn wor74_crlf_file_edit_does_not_double_carriage_returns() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("two.txt");
+        fs::write(&target, "a\r\nb\r\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: two.txt\n@@ b\n-b\n+changed\n*** End Patch";
+        execute_apply_patch(dir.path(), patch).unwrap();
+        let bytes = fs::read(&target).unwrap();
+        assert_eq!(bytes, b"a\r\nchanged\r\n");
+        assert!(!bytes.windows(3).any(|w| w == b"\r\r\n"));
     }
 
     #[test]
