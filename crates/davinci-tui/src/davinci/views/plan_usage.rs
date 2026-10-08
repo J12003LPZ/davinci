@@ -1,21 +1,30 @@
-//! ChatGPT plan usage under the context bar, for `openai-codex` models: the
-//! 5-hour window (Plus, Pro and the like) and the weekly one (every plan),
-//! each as what is left, a short rule, and when it resets.
+//! ChatGPT plan usage under the context bar, for `openai-codex` models: each
+//! window the plan reports (the 5-hour one, the weekly one) as chatgpt.com
+//! draws it, named, with when it resets and what is left, over a bar of what
+//! is left. Each card is built like the context bar above it: a header row,
+//! then a rule as wide as the context bar's.
 //!
 //! ```text
-//!   ◇ plus   5h ━━━━━━━━━━━━──── 73% left · 2h 14m   week ━━━━━━━───────── 41% left · 3d 4h
+//!   ◇ 5-hour limit                               resets in 4h 27m   100% left
+//!   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//!   ◇ weekly limit                                 resets in 6d 3h    84% left
+//!   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┄┄┄┄┄┄┄┄┄┄┄
 //! ```
 //!
-//! Narrow screens drop the rules, then put the weekly window on its own row.
-//! When nothing can be read it says why in one muted row.
-use ratatui::style::{Modifier, Style};
+//! A short terminal gets one row per window instead (`◇ 5-hour limit ━━━━━━
+//! 100% left · resets in 4h 27m`). When nothing can be read it says why in
+//! one muted row; when the last read failed, the reason follows the numbers.
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::davinci::model::{Model, PlanUsageView, PlanWindow};
-use crate::davinci::ui::{span, MEASURE};
+use crate::davinci::ui::{span, truncate_run, MEASURE};
 
 const INDENT: &str = "  ";
-const RULE: usize = 12;
+/// The bar on a one-row window.
+const RULE: usize = 16;
+const LEFT: &str = "━";
+const SPENT: &str = "┄";
 
 /// `2h 14m`, `3d 4h`, `45m`, `now`.
 pub fn format_reset(seconds: u64) -> String {
@@ -41,36 +50,137 @@ pub fn format_reset(seconds: u64) -> String {
     }
 }
 
-fn window_spans(model: &Model, window: &PlanWindow, rule: bool) -> Vec<Span<'static>> {
+/// The window's name the way chatgpt.com puts it: `5-hour limit`,
+/// `weekly limit`; any other length by its short label (`3d limit`).
+pub fn title(window: &PlanWindow) -> String {
+    match window.minutes {
+        300 => "5-hour limit".into(),
+        10_080 => "weekly limit".into(),
+        43_200 => "monthly limit".into(),
+        _ => format!("{} limit", window.label),
+    }
+}
+
+fn left_percent(window: &PlanWindow) -> f64 {
+    (100.0 - window.used_percent).clamp(0.0, 100.0)
+}
+
+fn tone(model: &Model, left: f64) -> Color {
     let th = &model.theme;
-    let cc = th.cc();
-    let left = (100.0 - window.used_percent).clamp(0.0, 100.0);
-    let tone = if left <= 10.0 {
+    if left <= 10.0 {
         th.error
     } else if left <= 30.0 {
         th.warning
     } else {
         th.success
-    };
-    let mut spans = vec![span(format!("{} ", window.label), th.muted)];
-    if rule {
-        let filled = ((left / 100.0) * RULE as f64).round() as usize;
-        spans.push(span("━".repeat(filled), tone));
-        spans.push(span("─".repeat(RULE - filled), cc.subtle));
-        spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled(
+}
+
+fn resets(window: &PlanWindow) -> Option<String> {
+    window.resets_in.map(|seconds| match format_reset(seconds) {
+        now if now == "now" => "resets now".to_string(),
+        later => format!("resets in {later}"),
+    })
+}
+
+fn percent_left(model: &Model, window: &PlanWindow) -> Span<'static> {
+    let left = left_percent(window);
+    Span::styled(
         format!("{left:.0}% left"),
-        Style::default().fg(tone).add_modifier(Modifier::BOLD),
-    ));
-    if let Some(seconds) = window.resets_in {
-        spans.push(span(format!(" · {}", format_reset(seconds)), th.muted));
+        Style::default()
+            .fg(tone(model, left))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// `cols` cells: what is left solid in its tone, what is spent dotted.
+fn bar(model: &Model, window: &PlanWindow, cols: usize) -> Vec<Span<'static>> {
+    let left = left_percent(window);
+    let filled = ((left / 100.0) * cols as f64).round() as usize;
+    // Anything left shows at least one cell; nothing left shows none.
+    let filled = if left > 0.0 { filled.max(1) } else { 0 }.min(cols);
+    let mut spans = Vec::with_capacity(2);
+    if filled > 0 {
+        spans.push(span(LEFT.repeat(filled), tone(model, left)));
+    }
+    if filled < cols {
+        spans.push(span(SPENT.repeat(cols - filled), model.theme.cc().subtle));
     }
     spans
 }
 
 fn width_of(spans: &[Span<'_>]) -> usize {
     spans.iter().map(Span::width).sum()
+}
+
+fn head(model: &Model, name: String) -> Vec<Span<'static>> {
+    let th = &model.theme;
+    vec![
+        span(INDENT, th.muted),
+        span("◇ ", th.cc().claude),
+        Span::styled(
+            name,
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
+/// A card: the header (name left; reset and what is left right), then the
+/// bar across `inner` columns. The reset goes first when there is no room.
+fn card(model: &Model, window: &PlanWindow, inner: usize) -> [Line<'static>; 2] {
+    let room = inner + INDENT.len();
+    let left = head(model, title(window));
+    let percent = percent_left(model, window);
+    let with_reset = resets(window).map(|text| {
+        vec![
+            span(text, model.theme.muted),
+            Span::raw("   "),
+            percent.clone(),
+        ]
+    });
+    let right = with_reset
+        .filter(|right| width_of(&left) + 1 + width_of(right) <= room)
+        .unwrap_or_else(|| vec![percent]);
+    let gap = room
+        .saturating_sub(width_of(&left) + width_of(&right))
+        .max(1);
+    let mut header = left;
+    header.push(Span::raw(" ".repeat(gap)));
+    header.extend(right);
+    let mut rule = vec![span(INDENT, model.theme.muted)];
+    rule.extend(bar(model, window, inner));
+    [
+        Line::from(truncate_run(header, room as u16)),
+        Line::from(rule),
+    ]
+}
+
+/// One row: the name padded to `name_width` so the bars line up, a short
+/// bar, what is left, when it resets. The reset drops first, then the bar,
+/// before the row is clipped.
+fn row(model: &Model, window: &PlanWindow, name_width: usize, width: usize) -> Line<'static> {
+    let name = format!("{:<name_width$}", title(window));
+    let percent = percent_left(model, window);
+    let reset = resets(window).map(|text| span(format!(" · {text}"), model.theme.muted));
+    let build = |with_bar: bool, with_reset: bool| {
+        let mut spans = head(model, name.clone());
+        spans.push(Span::raw(" "));
+        if with_bar {
+            spans.extend(bar(model, window, RULE));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(percent.clone());
+        if with_reset {
+            spans.extend(reset.clone());
+        }
+        spans
+    };
+    let spans = [(true, true), (true, false), (false, false)]
+        .into_iter()
+        .map(|(with_bar, with_reset)| build(with_bar, with_reset))
+        .find(|spans| width_of(spans) <= width)
+        .unwrap_or_else(|| build(false, false));
+    Line::from(truncate_run(spans, width as u16))
 }
 
 pub fn lines(model: &Model, height: usize) -> Vec<Line<'static>> {
@@ -81,77 +191,46 @@ pub fn lines(model: &Model, height: usize) -> Vec<Line<'static>> {
         return Vec::new();
     }
     let th = &model.theme;
-    let cc = th.cc();
     let width = usize::from(model.width.min(MEASURE + 6));
-    let head = |label: String| {
-        vec![
-            span(INDENT, th.muted),
-            span("◇ ", cc.claude),
-            span(label, th.text),
-        ]
-    };
+    // The context bar's rule width, so the two stacks line up.
+    let inner = width.saturating_sub(INDENT.len() * 2);
+    let note = view.note.as_ref();
     if view.windows.is_empty() {
-        let Some(note) = &view.note else {
+        let Some(note) = note else {
             return Vec::new();
         };
-        let mut spans = head("plan usage".into());
+        let mut spans = head(model, "plan usage".into());
         spans.push(span(format!(" · {note}"), th.muted));
-        return vec![Line::from(crate::davinci::ui::truncate_run(
-            spans,
+        return vec![Line::from(truncate_run(spans, width as u16))];
+    }
+    let mut rows: Vec<Line<'static>> = if height >= super::context_bar::FULL_HEIGHT && inner >= 24 {
+        view.windows
+            .iter()
+            .flat_map(|window| card(model, window, inner))
+            .collect()
+    } else {
+        let name_width = view
+            .windows
+            .iter()
+            .map(|window| title(window).chars().count())
+            .max()
+            .unwrap_or(0);
+        view.windows
+            .iter()
+            .map(|window| row(model, window, name_width, width))
+            .collect()
+    };
+    // The last read failed: the numbers above are old, and this says why.
+    if let Some(note) = note {
+        rows.push(Line::from(truncate_run(
+            vec![
+                span(INDENT, th.muted),
+                span(format!("⚠ {note}"), th.warning),
+            ],
             width as u16,
-        ))];
+        )));
     }
-    let label = view.plan.clone().unwrap_or_else(|| "plan".into());
-    let gap = "   ";
-    let indent = " ".repeat(width_of(&head(label.clone())));
-    // The last read failed: the numbers are old, and this says why.
-    let note = view
-        .note
-        .as_ref()
-        .map(|note| span(format!("{gap}⚠ {note}"), th.warning));
-    let clip = |spans: Vec<Span<'static>>| {
-        Line::from(crate::davinci::ui::truncate_run(spans, width as u16))
-    };
-    let row = |rule: bool| {
-        let mut spans = head(label.clone());
-        for window in &view.windows {
-            spans.push(Span::raw(gap));
-            spans.extend(window_spans(model, window, rule));
-        }
-        spans
-    };
-    // Everything on one row, with rules if they fit, else without.
-    for rule in [true, false] {
-        let mut spans = row(rule);
-        spans.extend(note.clone());
-        if width_of(&spans) <= width {
-            return vec![Line::from(spans)];
-        }
-    }
-    // The windows on one row, the note under them.
-    let note_row = note.map(|note| clip(vec![Span::raw(indent.clone()), note]));
-    for rule in [true, false] {
-        let spans = row(rule);
-        if width_of(&spans) <= width {
-            return std::iter::once(Line::from(spans)).chain(note_row).collect();
-        }
-    }
-    // One window per row, without rules, then the note.
-    view.windows
-        .iter()
-        .enumerate()
-        .map(|(index, window)| {
-            let mut spans = if index == 0 {
-                head(label.clone())
-            } else {
-                vec![Span::raw(indent.clone())]
-            };
-            spans.push(Span::raw(gap));
-            spans.extend(window_spans(model, window, false));
-            clip(spans)
-        })
-        .chain(note_row)
-        .collect()
+    rows
 }
 
 /// The view for a snapshot's windows, 5-hour first.
@@ -194,6 +273,22 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// The account in the chatgpt.com screenshot: 5-hour untouched and
+    /// resetting in 4h 27m, weekly at 84% left resetting in 6d 3h.
+    fn plus() -> PlanUsageView {
+        view(
+            Some("plus".into()),
+            vec![
+                window("week", 10_080, 16.0, Some(6 * 86_400 + 3 * 3600)),
+                window("5h", 300, 0.0, Some(4 * 3600 + 27 * 60)),
+            ],
+            None,
+        )
+    }
+
+    const TALL: usize = 44;
+    const SHORT: usize = 20;
+
     #[test]
     fn resets_read_as_short_durations() {
         assert_eq!(format_reset(0), "now");
@@ -206,136 +301,157 @@ mod tests {
     }
 
     #[test]
-    fn a_plus_plan_shows_both_windows_five_hour_first() {
-        let usage = view(
-            Some("plus".into()),
-            vec![
-                window("week", 10_080, 59.0, Some(5 * 86_400)),
-                window("5h", 300, 27.0, Some(2 * 3600 + 14 * 60)),
-            ],
-            None,
-        );
-        let rows: Vec<String> = lines(&model(130, usage), 40).iter().map(text).collect();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        let row = &rows[0];
-        assert!(row.starts_with("  ◇ plus"), "{row}");
-        let five = row.find("5h ").unwrap();
-        let week = row.find("week ").unwrap();
-        assert!(five < week, "{row}");
-        assert!(row.contains("73% left · 2h 14m"), "{row}");
-        assert!(row.contains("41% left · 5d"), "{row}");
-        assert!(row.contains('━'));
+    fn windows_are_named_like_chatgpt_names_them() {
+        assert_eq!(title(&window("5h", 300, 0.0, None)), "5-hour limit");
+        assert_eq!(title(&window("week", 10_080, 0.0, None)), "weekly limit");
+        assert_eq!(title(&window("month", 43_200, 0.0, None)), "monthly limit");
+        assert_eq!(title(&window("3d", 4_320, 0.0, None)), "3d limit");
     }
 
     #[test]
-    fn a_free_plan_shows_only_the_weekly_window() {
+    fn a_tall_screen_draws_one_card_per_window_five_hour_first() {
+        let m = model(100, plus());
+        let rows: Vec<String> = lines(&m, TALL).iter().map(text).collect();
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        // Header: name left; reset and what is left flush right, at the
+        // context bar's width (80 columns: the measure plus its margins).
+        assert!(rows[0].starts_with("  ◇ 5-hour limit "), "{rows:?}");
+        assert!(
+            rows[0].ends_with("resets in 4h 27m   100% left"),
+            "{rows:?}"
+        );
+        assert!(rows[2].starts_with("  ◇ weekly limit "), "{rows:?}");
+        assert!(rows[2].ends_with("resets in 6d 3h   84% left"), "{rows:?}");
+        for row in [&rows[0], &rows[2]] {
+            assert_eq!(row.chars().count(), 78, "{row}");
+        }
+        // Bars: as wide as the context bar's rule, filled with what is left.
+        let inner = 76;
+        for (bar, left) in [(&rows[1], 1.0), (&rows[3], 0.84)] {
+            let cells = bar.trim_start();
+            assert_eq!(cells.chars().count(), inner, "{bar}");
+            let filled = cells.chars().filter(|c| *c == '━').count();
+            assert_eq!(filled, (left * inner as f64).round() as usize, "{bar}");
+            assert!(cells.chars().all(|c| c == '━' || c == '┄'), "{bar}");
+        }
+        assert!(!rows.concat().contains("plus"), "the plan is not a label");
+    }
+
+    #[test]
+    fn a_short_screen_draws_one_aligned_row_per_window() {
+        let m = model(100, plus());
+        let rows: Vec<String> = lines(&m, SHORT).iter().map(text).collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("  ◇ 5-hour limit ━"), "{rows:?}");
+        assert!(
+            rows[0].ends_with("100% left · resets in 4h 27m"),
+            "{rows:?}"
+        );
+        assert!(rows[1].starts_with("  ◇ weekly limit ━"), "{rows:?}");
+        assert!(rows[1].ends_with("84% left · resets in 6d 3h"), "{rows:?}");
+        // The bars start in one column.
+        assert_eq!(rows[0].find('━'), rows[1].find('━'), "{rows:?}");
+    }
+
+    #[test]
+    fn a_free_plan_month_window_reads_as_a_monthly_limit() {
         let usage = view(
             Some("free".into()),
-            vec![window("week", 10_080, 12.0, None)],
+            vec![window("month", 43_200, 53.0, Some(29 * 86_400 + 15 * 3600))],
             None,
         );
-        let rows: Vec<String> = lines(&model(100, usage), 40).iter().map(text).collect();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains("week") && rows[0].contains("88% left"));
-        assert!(!rows[0].contains("5h"));
+        let rows: Vec<String> = lines(&model(100, usage), TALL).iter().map(text).collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("  ◇ monthly limit"), "{rows:?}");
+        assert!(
+            rows[0].ends_with("resets in 29d 15h   47% left"),
+            "{rows:?}"
+        );
     }
 
     #[test]
     fn the_tone_follows_what_is_left() {
-        let m = model(120, view(None, vec![window("5h", 300, 95.0, None)], None));
-        let row = &lines(&m, 40)[0];
-        let left = row
-            .spans
-            .iter()
-            .find(|s| s.content.contains("% left"))
-            .unwrap();
-        assert_eq!(left.style.fg, Some(m.theme.error));
-        let m = model(120, view(None, vec![window("5h", 300, 75.0, None)], None));
-        let row = &lines(&m, 40)[0];
-        let left = row
-            .spans
-            .iter()
-            .find(|s| s.content.contains("% left"))
-            .unwrap();
-        assert_eq!(left.style.fg, Some(m.theme.warning));
+        for (used, expect) in [(95.0, "error"), (75.0, "warning"), (20.0, "success")] {
+            let m = model(100, view(None, vec![window("5h", 300, used, None)], None));
+            let colour = match expect {
+                "error" => m.theme.error,
+                "warning" => m.theme.warning,
+                _ => m.theme.success,
+            };
+            for height in [TALL, SHORT] {
+                let rows = lines(&m, height);
+                let left = rows
+                    .iter()
+                    .flat_map(|row| row.spans.iter())
+                    .find(|s| s.content.contains("% left"))
+                    .unwrap();
+                assert_eq!(left.style.fg, Some(colour), "{used} at {height}");
+                let filled = rows
+                    .iter()
+                    .flat_map(|row| row.spans.iter())
+                    .find(|s| s.content.contains('━'))
+                    .unwrap();
+                assert_eq!(filled.style.fg, Some(colour), "{used} at {height}");
+            }
+        }
     }
 
     #[test]
-    fn narrow_screens_drop_rules_then_stack_and_always_fit() {
-        let usage = view(
-            Some("plus".into()),
-            vec![
-                window("5h", 300, 27.0, Some(8040)),
-                window("week", 10_080, 59.0, Some(400_000)),
-            ],
-            None,
-        );
-        for width in [40u16, 56, 70, 90, 140] {
-            let rows = lines(&model(width, usage.clone()), 40);
-            assert!(!rows.is_empty());
-            for row in &rows {
-                assert!(row.width() <= usize::from(width), "{width}: {}", text(row));
+    fn a_spent_window_draws_no_left_cells_and_a_sliver_still_shows() {
+        let spent = model(100, view(None, vec![window("5h", 300, 100.0, None)], None));
+        let all: String = lines(&spent, TALL).iter().map(text).collect();
+        assert!(!all.contains('━') && all.contains("0% left"), "{all}");
+        let sliver = model(100, view(None, vec![window("5h", 300, 99.9, None)], None));
+        let bar = text(&lines(&sliver, TALL)[1]);
+        assert_eq!(bar.chars().filter(|c| *c == '━').count(), 1, "{bar}");
+    }
+
+    #[test]
+    fn every_width_and_height_fits() {
+        for width in [24u16, 30, 40, 56, 70, 90, 140] {
+            for height in [SHORT, TALL] {
+                let rows = lines(&model(width, plus()), height);
+                assert!(!rows.is_empty());
+                for row in &rows {
+                    assert!(
+                        row.width() <= usize::from(width),
+                        "{width}x{height}: {}",
+                        text(row)
+                    );
+                }
+                let all: String = rows.iter().map(text).collect();
+                assert!(
+                    all.contains("100% left") || width < 30,
+                    "{width}x{height}: {all}"
+                );
             }
-            let all: String = rows.iter().map(text).collect();
-            assert!(all.contains("73% left") || width < 50, "{width}: {all}");
         }
+    }
+
+    #[test]
+    fn a_narrow_card_drops_the_reset_before_what_is_left() {
+        let rows: Vec<String> = lines(&model(30, plus()), TALL).iter().map(text).collect();
+        assert!(rows[0].ends_with("100% left"), "{rows:?}");
+        assert!(!rows[0].contains("resets"), "{rows:?}");
     }
 
     #[test]
     fn old_numbers_carry_the_reason_they_are_old() {
         let note = "Codex login expired · run `codex login` to see plan usage";
-        let usage = view(
-            Some("plus".into()),
-            vec![
-                window("5h", 300, 27.0, None),
-                window("week", 10_080, 59.0, None),
-            ],
-            Some(note.into()),
-        );
-        let rows: Vec<String> = lines(&model(200, usage.clone()), 40)
-            .iter()
-            .map(text)
-            .collect();
-        // Too long for one row at the content measure: the note goes under.
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert!(
-            rows[0].contains("73% left") && rows[0].contains('━'),
-            "{rows:?}"
-        );
-        assert!(rows[1].trim_start() == format!("⚠ {note}"), "{rows:?}");
-        // A short note fits on the row.
-        let short = view(
-            None,
-            vec![window("week", 10_080, 59.0, None)],
-            Some("retrying".into()),
-        );
-        let rows: Vec<String> = lines(&model(200, short), 40).iter().map(text).collect();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].ends_with("41% left   ⚠ retrying"), "{rows:?}");
-        // Stacked on a narrow screen: the note gets its own row, clipped.
-        let rows = lines(&model(44, usage), 40);
-        let last = text(rows.last().unwrap());
-        assert!(last.contains("⚠ Codex login"), "{last}");
+        let mut usage = plus();
+        usage.note = Some(note.into());
+        for (height, count) in [(TALL, 5), (SHORT, 3)] {
+            let rows: Vec<String> = lines(&model(100, usage.clone()), height)
+                .iter()
+                .map(text)
+                .collect();
+            assert_eq!(rows.len(), count, "{rows:?}");
+            assert_eq!(rows.last().unwrap(), &format!("  ⚠ {note}"), "{rows:?}");
+        }
+        let rows = lines(&model(44, usage), TALL);
         for row in &rows {
             assert!(row.width() <= 44, "{}", text(row));
         }
-    }
-
-    #[test]
-    fn a_free_plan_month_window_reads_as_a_month() {
-        let usage = view(
-            Some("free".into()),
-            vec![window("month", 43_200, 0.0, Some(29 * 86_400))],
-            None,
-        );
-        let rows: Vec<String> = lines(&model(100, usage), 40).iter().map(text).collect();
-        assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].starts_with("  ◇ free")
-                && rows[0].contains("month")
-                && rows[0].contains("100% left · 29d"),
-            "{rows:?}"
-        );
     }
 
     #[test]
