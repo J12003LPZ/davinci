@@ -73,22 +73,49 @@ impl RuntimeLogWriter {
 pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<Vec<T>, RuntimeLogError> {
+    read_runtime_log_capped(path, MAX_RUNTIME_RECORD_BYTES)
+}
+
+/// Upper bound on one runtime record line. Writers emit far smaller records;
+/// a longer line is corruption, such as a newline-free tail left by a crash,
+/// and is never buffered whole (WOR-83).
+const MAX_RUNTIME_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+fn read_runtime_log_capped<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    max_record_bytes: usize,
+) -> Result<Vec<T>, RuntimeLogError> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
 
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
+    let mut reader = BufReader::new(File::open(path)?);
     let mut records = Vec::new();
-    // Stream one line at a time. Peeking one ahead tells us whether the current
-    // line is the final one, which is the only line allowed to be torn.
-    let mut lines = reader.lines().enumerate().peekable();
-
-    while let Some((idx, line)) = lines.next() {
-        let line = line?;
-        let is_last = lines.peek().is_none();
-        let trimmed = line.trim();
+    let mut line = Vec::new();
+    let mut idx = 0usize;
+    // Stream one bounded line at a time. Only the final line may be torn, so
+    // after each line we check whether any input remains.
+    while let Some(oversized) = next_line(&mut reader, &mut line, max_record_bytes)? {
+        idx += 1;
+        let is_last = reader.fill_buf()?.is_empty();
+        // A crash can also cut a multi-byte character in the final line.
+        let Some(text) = (!oversized)
+            .then(|| std::str::from_utf8(&line).ok())
+            .flatten()
+        else {
+            if is_last {
+                break;
+            }
+            return Err(RuntimeLogError::CorruptRecord {
+                line: idx,
+                reason: if oversized {
+                    format!("record is longer than {max_record_bytes} bytes")
+                } else {
+                    "record is not valid UTF-8".into()
+                },
+            });
+        };
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -102,7 +129,7 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
                     break;
                 }
                 return Err(RuntimeLogError::CorruptRecord {
-                    line: idx + 1,
+                    line: idx,
                     reason: e.to_string(),
                 });
             }
@@ -125,7 +152,7 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
                     break;
                 }
                 return Err(RuntimeLogError::CorruptRecord {
-                    line: idx + 1,
+                    line: idx,
                     reason: e.to_string(),
                 });
             }
@@ -133,6 +160,42 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
     }
 
     Ok(records)
+}
+
+/// Reads the next line into `line`, keeping at most `max` bytes. Returns
+/// `None` at end of input, otherwise whether the line was longer than `max`;
+/// the rest of an oversized line is consumed and dropped, never buffered.
+fn next_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Option<bool>> {
+    line.clear();
+    let read = std::io::Read::take(&mut *reader, max as u64 + 1).read_until(b'\n', line)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() <= max || line.ends_with(b"\n") {
+        return Ok(Some(false));
+    }
+    line.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(end) => {
+                reader.consume(end + 1);
+                break;
+            }
+            None => {
+                let len = available.len();
+                reader.consume(len);
+            }
+        }
+    }
+    Ok(Some(true))
 }
 
 #[cfg(test)]
@@ -148,6 +211,66 @@ mod tests {
         sequence: u64,
         session_id: String,
         event: String,
+    }
+
+    fn envelope_line(sequence: u64) -> String {
+        format!(
+            "{{\"schema_version\":1,\"sequence\":{sequence},\"session_id\":\"s\",\"event\":\"e\"}}\n"
+        )
+    }
+
+    /// WOR-83: a newline-free tail longer than the record cap is a torn tail;
+    /// earlier rows still replay, and the tail is never buffered past the cap.
+    #[test]
+    fn wor83_oversized_final_line_is_a_torn_tail() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.runtime.jsonl");
+        let mut body = (0..3).map(envelope_line).collect::<String>();
+        body.push_str(&"x".repeat(10_000));
+        fs::write(&path, body).unwrap();
+        let rows: Vec<DummyEnvelope> = read_runtime_log_capped(&path, 1024).unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn wor83_oversized_middle_line_is_corrupt_and_skipped_unbuffered() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.runtime.jsonl");
+        let row = envelope_line(1);
+        fs::write(&path, format!("{row}{}\n{row}", "x".repeat(10_000))).unwrap();
+        let error = read_runtime_log_capped::<DummyEnvelope>(&path, 1024).unwrap_err();
+        assert!(
+            matches!(&error, RuntimeLogError::CorruptRecord { line: 2, reason }
+                if reason.contains("longer than 1024")),
+            "{error}"
+        );
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        let mut line = Vec::new();
+        assert_eq!(
+            next_line(&mut reader, &mut line, 1024).unwrap(),
+            Some(false)
+        );
+        assert_eq!(next_line(&mut reader, &mut line, 1024).unwrap(), Some(true));
+        assert!(line.is_empty() && line.capacity() <= 2048);
+        assert_eq!(
+            next_line(&mut reader, &mut line, 1024).unwrap(),
+            Some(false)
+        );
+        assert_eq!(line, row.as_bytes());
+        assert_eq!(next_line(&mut reader, &mut line, 1024).unwrap(), None);
+    }
+
+    /// A crash can cut a multi-byte character in the final line.
+    #[test]
+    fn torn_multibyte_utf8_tail_is_tolerated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.runtime.jsonl");
+        let mut bytes = envelope_line(1).into_bytes();
+        bytes.extend_from_slice(b"{\"event\":\"");
+        bytes.extend_from_slice(&"\u{00e9}".as_bytes()[..1]);
+        fs::write(&path, bytes).unwrap();
+        let rows: Vec<DummyEnvelope> = read_runtime_log(&path).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
