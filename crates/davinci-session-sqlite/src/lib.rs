@@ -527,6 +527,15 @@ impl SqliteSessionStore {
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<(String, String)>, SessionError> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The trigram index has no terms shorter than three characters, so a
+        // MATCH for one or two characters silently finds nothing. Scan the
+        // entries instead (case-insensitive for ASCII, like the index).
+        if query.chars().count() < 3 {
+            return self.search_short(query);
+        }
         let escaped = format!("\"{}\"", query.replace('"', "\"\""));
         let mut stmt = self
             .conn
@@ -540,6 +549,36 @@ impl SqliteSessionStore {
             .map_err(|err| SessionError::storage(format!("Unable to prepare FTS query: {err}")))?;
         let rows = stmt
             .query_map([escaped], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| SessionError::storage(format!("Unable to search sessions: {err}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| SessionError::storage(format!("Unable to read search hits: {err}")))
+    }
+
+    fn search_short(&self, query: &str) -> Result<Vec<(String, String)>, SessionError> {
+        let mut pattern = String::with_capacity(query.len() + 2);
+        pattern.push('%');
+        for ch in query.chars() {
+            if matches!(ch, '%' | '_' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        pattern.push('%');
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, payload FROM entries
+                 WHERE payload LIKE ?1 ESCAPE '\\'
+                 ORDER BY timestamp DESC, seq DESC
+                 LIMIT 50",
+            )
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to prepare short search: {err}"))
+            })?;
+        let rows = stmt
+            .query_map([pattern], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|err| SessionError::storage(format!("Unable to search sessions: {err}")))?;
@@ -1521,5 +1560,40 @@ mod tests {
             ids(&store),
             vec![new.header.id.clone(), old.header.id.clone()]
         );
+    }
+
+    /// WOR-56: one- and two-character queries cannot use the trigram index.
+    #[test]
+    fn one_and_two_character_searches_fall_back_instead_of_returning_nothing() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/work", Some("short")).unwrap();
+        for text in ["zq marker", "plain 100% sure", "snake_case here", "omega Ω"] {
+            session
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!([{"type":"text","text":text}]),
+                ))
+                .unwrap();
+        }
+        store.import_jsonl(&session).unwrap();
+        assert_eq!(store.search("zq").unwrap().len(), 1, "two characters");
+        assert_eq!(
+            store.search("ZQ").unwrap().len(),
+            1,
+            "ascii case-insensitive"
+        );
+        assert_eq!(store.search("Ω").unwrap().len(), 1, "one character");
+        assert_eq!(store.search("%").unwrap().len(), 1, "wildcards are literal");
+        assert_eq!(
+            store.search("_c").unwrap().len(),
+            1,
+            "underscore is literal"
+        );
+        assert!(store.search("\\").unwrap().is_empty());
+        assert!(store.search("").unwrap().is_empty());
+        assert!(store.search("xx9").unwrap().is_empty());
+        // Three or more characters still use the index.
+        assert_eq!(store.search("marker").unwrap().len(), 1);
     }
 }
