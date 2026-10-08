@@ -33,6 +33,36 @@ pub struct AssistantUsage {
     pub cost_input: f64,
     pub cost_cache_read: f64,
     pub cost_cache_write: f64,
+    /// The provider sent a usage block with a numeric `input`. When false,
+    /// every count above is a placeholder 0 meaning "unknown", not "none".
+    pub usage_reported: bool,
+    /// The provider sent a numeric `cacheRead`. A missing field is unknown:
+    /// reading it as 0 would claim a cache miss the provider never reported.
+    pub cache_read_reported: bool,
+}
+
+/// What the provider itself said about the prompt cache for one response.
+/// A local prefix hash or cache key never produces `ReadReported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCacheObservation {
+    /// No usage block, or no cache-read field: nothing is known.
+    Unknown,
+    /// The provider reported cache reads of zero.
+    NoReadReported,
+    /// The provider reported cache reads above zero.
+    ReadReported,
+}
+
+impl AssistantUsage {
+    pub fn cache_observation(&self) -> ProviderCacheObservation {
+        if !self.usage_reported || !self.cache_read_reported {
+            ProviderCacheObservation::Unknown
+        } else if self.cache_read > 0 {
+            ProviderCacheObservation::ReadReported
+        } else {
+            ProviderCacheObservation::NoReadReported
+        }
+    }
 }
 
 pub trait ModelPriceSource {
@@ -61,6 +91,10 @@ fn detect_miss(
     let prompt_tokens = message.input + message.cache_read + message.cache_write;
     let prev = prev?;
     if prompt_tokens == 0 {
+        return None;
+    }
+    // Unknown usage is not evidence of a miss.
+    if message.cache_observation() == ProviderCacheObservation::Unknown {
         return None;
     }
     if message.cache_read + message.cache_write == 0 && !prev.reported_cache {
@@ -95,7 +129,7 @@ fn detect_miss(
 
 fn as_previous_request(message: &AssistantUsage, reported_cache: bool) -> Option<PreviousRequest> {
     let prompt_tokens = message.input + message.cache_read + message.cache_write;
-    if prompt_tokens == 0 {
+    if prompt_tokens == 0 || !message.usage_reported {
         return None;
     }
     Some(PreviousRequest {
@@ -192,6 +226,14 @@ pub fn assistant_usage_from_value(message: &Value, fallback_timestamp: u64) -> A
             .get("timestamp")
             .and_then(Value::as_u64)
             .unwrap_or(fallback_timestamp),
+        usage_reported: usage
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        cache_read_reported: usage
+            .and_then(|value| value.get("cacheRead"))
+            .and_then(Value::as_u64)
+            .is_some(),
         input: usage_u64(usage, "input"),
         cache_read: usage_u64(usage, "cacheRead"),
         cache_write: usage_u64(usage, "cacheWrite"),
@@ -471,5 +513,176 @@ mod tests {
             format_compaction_cost_notice("compaction", &usage),
             "Compaction: 3.0k tokens billed (~$0.02)"
         );
+    }
+
+    // ---- WOR-57: local cache identity vs what the provider reported -------
+    //
+    // Every case uses recorded/fake usage blocks. Nothing here calls a
+    // provider, and none of it proves a billed cache hit: the local key only
+    // says two requests were eligible to share a slot.
+
+    use davinci_agent::CacheIdentity;
+
+    fn identity(permission: &str, context: &[&str]) -> CacheIdentity {
+        CacheIdentity {
+            provider: "openai-codex".into(),
+            model_id: "gpt-test".into(),
+            system_prompt_hash: "sys".into(),
+            tool_schema_hash: "tools".into(),
+            permission_surface_hash: permission.into(),
+            context_item_hashes: context.iter().map(|s| s.to_string()).collect(),
+            agent_profile_hash: None,
+            contract_hash: None,
+            role: Some("root".into()),
+        }
+    }
+
+    fn entry_with_usage(usage: Option<serde_json::Value>, timestamp: u64) -> SessionEntry {
+        let mut message = serde_json::json!({
+            "role": "assistant", "provider": "openai-codex",
+            "model": "gpt-test", "timestamp": timestamp,
+        });
+        if let Some(usage) = usage {
+            message["usage"] = usage;
+        }
+        SessionEntry {
+            id: "u".into(),
+            entry_type: "message".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp,
+            message: Some(message),
+            custom_type: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn usage(input: u64, read: u64, write: u64) -> serde_json::Value {
+        serde_json::json!({"input": input, "output": 5, "cacheRead": read, "cacheWrite": write})
+    }
+
+    fn observe(entry: &SessionEntry) -> ProviderCacheObservation {
+        assistant_usage_from_entry(entry)
+            .unwrap()
+            .cache_observation()
+    }
+
+    fn misses(entries: &[SessionEntry]) -> Vec<CacheMiss> {
+        collect_cache_misses(entries, &MODELS)
+            .into_iter()
+            .map(|(_, miss)| miss)
+            .collect()
+    }
+
+    #[test]
+    fn warm_turn_same_key_and_provider_read_is_a_reported_hit_and_no_miss() {
+        let a = identity("perm", &["ctx"]);
+        assert_eq!(a.cache_key(), identity("perm", &["ctx"]).cache_key());
+        let turns = [
+            entry_with_usage(Some(usage(0, 0, 100_000)), 0),
+            entry_with_usage(Some(usage(500, 100_000, 0)), 30_000),
+        ];
+        assert_eq!(observe(&turns[1]), ProviderCacheObservation::ReadReported);
+        assert!(misses(&turns).is_empty());
+    }
+
+    #[test]
+    fn a_mode_toggle_changes_the_local_key_and_a_zero_read_is_an_estimated_miss() {
+        let before = identity("perm-a", &["ctx"]).cache_key();
+        let after = identity("perm-b", &["ctx"]).cache_key();
+        assert_ne!(before, after, "different tool surface, different namespace");
+        let turns = [
+            entry_with_usage(Some(usage(0, 0, 100_000)), 0),
+            entry_with_usage(Some(usage(0, 100_000, 100)), 10_000),
+            entry_with_usage(Some(usage(0, 0, 100_100)), 20_000),
+        ];
+        let found = misses(&turns);
+        assert_eq!(found.len(), 1);
+        let notice = format_cache_miss_notice(&found[0]).unwrap();
+        assert!(notice.starts_with("Estimated cache miss"), "{notice}");
+    }
+
+    #[test]
+    fn a_fold_rotates_the_namespace_and_the_compaction_resets_the_baseline() {
+        let before = identity("perm", &["epoch-1"]).cache_key();
+        let after = identity("perm", &["epoch-2"]).cache_key();
+        assert_ne!(before, after);
+        let fold = SessionEntry {
+            id: "c".into(),
+            entry_type: "compaction".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: None,
+            extra: serde_json::Map::new(),
+        };
+        let turns = [
+            entry_with_usage(Some(usage(0, 0, 100_000)), 0),
+            entry_with_usage(Some(usage(0, 100_000, 100)), 10_000),
+            fold,
+            entry_with_usage(Some(usage(0, 0, 30_000)), 20_000),
+        ];
+        assert!(
+            misses(&turns).is_empty(),
+            "the fold is not billed as a miss"
+        );
+    }
+
+    #[test]
+    fn a_restarted_worker_has_the_same_key_but_the_provider_decides_the_hit() {
+        let first = identity("perm", &["ctx"]).cache_key();
+        let restarted = identity("perm", &["ctx"]).cache_key();
+        assert_eq!(first, restarted, "keys are stable across restarts");
+        // Same key, yet the provider reports a cold prefix: key equality is
+        // eligibility, never a hit.
+        let turns = [
+            entry_with_usage(Some(usage(0, 0, 100_000)), 0),
+            entry_with_usage(Some(usage(0, 100_000, 100)), 10_000),
+            entry_with_usage(Some(usage(0, 0, 100_100)), 20_000),
+        ];
+        assert_eq!(observe(&turns[2]), ProviderCacheObservation::NoReadReported);
+        assert_eq!(misses(&turns).len(), 1);
+    }
+
+    #[test]
+    fn provider_ttl_expiry_is_reported_as_an_uncertain_estimate_not_a_proven_cause() {
+        let turns = [
+            entry_with_usage(Some(usage(0, 0, 100_000)), 0),
+            entry_with_usage(Some(usage(0, 100_000, 100)), 60_000),
+            entry_with_usage(Some(usage(0, 0, 100_100)), 60_000 + 45 * 60_000),
+        ];
+        let found = misses(&turns);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].idle_ms, 45 * 60_000);
+        let notice = format_cache_miss_notice(&found[0]).unwrap();
+        assert!(
+            notice.contains("expiry/routing/eligibility uncertain"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn missing_usage_is_unknown_never_zero() {
+        let silent = entry_with_usage(None, 20_000);
+        assert_eq!(observe(&silent), ProviderCacheObservation::Unknown);
+        let parsed = assistant_usage_from_entry(&silent).unwrap();
+        assert!(!parsed.usage_reported);
+        // Usage with input but no cacheRead field: still unknown.
+        let partial = entry_with_usage(Some(serde_json::json!({"input": 120_000})), 30_000);
+        assert_eq!(observe(&partial), ProviderCacheObservation::Unknown);
+        // Neither can manufacture a miss after a healthy cached turn, and the
+        // unreported turn does not become the new baseline.
+        let turns = [
+            entry_with_usage(Some(usage(0, 0, 100_000)), 0),
+            entry_with_usage(Some(usage(0, 100_000, 100)), 10_000),
+            silent,
+            partial,
+            entry_with_usage(Some(usage(0, 100_100, 50)), 40_000),
+        ];
+        assert!(misses(&turns).is_empty());
+        // An explicit zero is a report, and is distinguishable from unknown.
+        let zero = entry_with_usage(Some(usage(100, 0, 0)), 1);
+        assert_eq!(observe(&zero), ProviderCacheObservation::NoReadReported);
     }
 }

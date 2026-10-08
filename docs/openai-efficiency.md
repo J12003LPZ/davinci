@@ -133,6 +133,12 @@ Local prefix fingerprints, Context VM affinity, WebSocket reuse, and previous-re
 
 Cache-miss notices derived locally are explicitly described as estimates. Idle time alone is not treated as proof of provider cache expiry.
 
+### Missing usage is unknown, not zero
+
+`cache_stats::assistant_usage_from_value` records whether the provider sent a usage block with `input` (`usage_reported`) and a numeric `cacheRead` (`cache_read_reported`). `AssistantUsage::cache_observation` maps that to `Unknown`, `NoReadReported` (an explicit zero) or `ReadReported`. An `Unknown` response never produces a miss estimate and never becomes the baseline for the next comparison. Only the provider's own usage can yield `ReadReported`; an equal local cache key, namespace or prefix fingerprint cannot.
+
+The recorded-usage matrix in `crates/davinci-coding-agent/src/cache_stats.rs` (warm turn, mode toggle, fold, restarted worker, provider TTL expiry, missing usage) runs offline against fake usage blocks. It checks that local key drift and provider-reported reads are tracked separately; it does not measure billed cache hits. Those still need a separately authorized live run.
+
 ## Context VM and workers
 
 Context VM uses an epoch-scoped cache namespace that remains stable while compatible content evolves. A separate content fingerprint records actual prefix changes. A fold rotates the epoch namespace.
