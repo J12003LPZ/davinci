@@ -769,6 +769,22 @@ impl GraphExecution {
             };
         }
 
+        // A worker that was stopped (operator, graph stop, deadline) never
+        // failed. Its replacement carries exactly the instructions the stopped
+        // attempt carried: none for a first attempt, the same retry notice and
+        // recovery context for a retry. The durable attempt history decides,
+        // not the task status: a saved pipeline resets stopped tasks to
+        // Pending, and a stop that lands after a real failure, before its
+        // retry spawned, must keep that failure's notice.
+        let stopped_attempt = self
+            .snapshot()
+            .continuation
+            .as_ref()
+            .and_then(|cursor| cursor.attempt_history.get(&task_id))
+            .and_then(|history| history.last())
+            .filter(|record| record.status == TaskStatus::Cancelled)
+            .cloned();
+
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(existing) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
@@ -988,6 +1004,36 @@ impl GraphExecution {
             return None;
         }
 
+        // A stop ends an attempt without classifying it, so its effects were
+        // never cleared for a replacement. Clear them now, before launching
+        // one: the prior owner must be gone and its tool ledger and operation
+        // reconciled, exactly as for an automatic retry.
+        if let Some(stopped) = &stopped_attempt {
+            let recovery = retry_recovery_gate(self.retry_recovery_input(
+                &task_id,
+                stopped.attempt,
+                1,
+                RetryDecision::RetrySameBudget,
+                stopped.worker_session.as_ref(),
+            ));
+            if !self.record_retry_recovery(&task_id, stopped.attempt, recovery.clone()) {
+                return None;
+            }
+            // An exhausted budget is not an effect hazard: the budget check
+            // below stops the node before anything is launched.
+            if !recovery.allowed
+                && recovery.status != super::recovery::RetryRecoveryStatus::BudgetExhausted
+            {
+                let reason = format!(
+                    "reconciliation required: {} ({:?})",
+                    recovery.reason, recovery.status
+                );
+                self.end_task(&task_id, TaskStatus::Failed, Some(reason));
+                self.checkpoint(Some("stopped worker not cleared for a replacement"));
+                return None;
+            }
+        }
+
         let mut last_failure_class: Option<WorkerFailureClass> = None;
         let mut retry_context_delta = crate::native_extensions::ecosystem::ContextPacket::empty();
         let mut attempts_run = 0;
@@ -1038,10 +1084,11 @@ impl GraphExecution {
                 self.checkpoint(None);
                 return None;
             }
-            let attempt_briefing = if attempt == 1 {
-                briefing.clone()
-            } else {
-                let notice = match last_failure_class {
+            let retry_instructions = match &stopped_attempt {
+                Some(stopped) if local_attempt == 1 => stopped.retry_instructions.clone(),
+                _ if attempt == 1 => None,
+                _ => {
+                    let notice = match last_failure_class {
                     Some(WorkerFailureClass::Timeout) => {
                         "the previous worker ran out of time before submitting; work economically, avoid repository-wide searches, and call graph_submit well before the deadline"
                     }
@@ -1062,12 +1109,17 @@ impl GraphExecution {
                     }
                     None => "the previous worker exited without a valid submitted artifact; complete the work and call graph_submit exactly once",
                 };
-                let mut retry = format!("{briefing}\n\nRETRY NOTICE: {notice}.");
-                if !retry_context_delta.is_empty() {
-                    retry.push_str("\n\nRETRY CONTEXT DELTA:\n");
-                    retry.push_str(&retry_context_delta.text);
+                    let mut retry = format!("\n\nRETRY NOTICE: {notice}.");
+                    if !retry_context_delta.is_empty() {
+                        retry.push_str("\n\nRETRY CONTEXT DELTA:\n");
+                        retry.push_str(&retry_context_delta.text);
+                    }
+                    Some(retry)
                 }
-                retry
+            };
+            let attempt_briefing = match &retry_instructions {
+                Some(retry) => format!("{briefing}{retry}"),
+                None => briefing.clone(),
             };
 
             let effective_briefing = if context_packet.text.is_empty() {
@@ -1105,7 +1157,7 @@ impl GraphExecution {
                 .and_then(|record| record.worker_session.as_ref())
                 .map_or_else(davinci_agent::AgentId::new, |binding| binding.agent);
             spec.runtime_agent_id = Some(worker_agent_id);
-            if !self.begin_attempt(&mut spec, attempt) {
+            if !self.begin_attempt(&mut spec, attempt, retry_instructions) {
                 return None;
             }
             if let Some(runtime) = &self.deps.runtime {
@@ -1328,6 +1380,14 @@ impl GraphExecution {
                     Some("node stopped by operator".into()),
                 );
                 self.checkpoint(Some("node stopped at safe boundary"));
+                return None;
+            }
+            // A graph stop that kills a worker is not a worker failure: its
+            // diagnostic text must not be classified, spend a retry, or block
+            // the node as Failed.
+            if !result.ok && self.exec_abort.load(Ordering::SeqCst) {
+                self.end_task(&task_id, TaskStatus::Cancelled, None);
+                self.checkpoint(Some(&format!("{task_id}: stopped with the graph")));
                 return None;
             }
             if result.ok {
@@ -3798,6 +3858,10 @@ mod revision_tests;
 #[cfg(test)]
 #[path = "controller_persistence_tests.rs"]
 mod persistence_tests;
+
+#[cfg(test)]
+#[path = "controller_loop_resume_tests.rs"]
+mod loop_resume_tests;
 
 #[cfg(test)]
 mod tests {

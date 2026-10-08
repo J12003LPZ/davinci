@@ -105,7 +105,12 @@ impl GraphExecution {
         )
     }
 
-    pub(super) fn begin_attempt(&self, spec: &mut WorkerSpec, attempt: u32) -> bool {
+    pub(super) fn begin_attempt(
+        &self,
+        spec: &mut WorkerSpec,
+        attempt: u32,
+        retry_instructions: Option<String>,
+    ) -> bool {
         let mut record = {
             let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             TaskAttemptRecord {
@@ -132,6 +137,7 @@ impl GraphExecution {
                 worker_session: None,
                 operation_binding: None,
                 retry_recovery: None,
+                retry_instructions,
             }
         };
         self.checkpoint_with(
