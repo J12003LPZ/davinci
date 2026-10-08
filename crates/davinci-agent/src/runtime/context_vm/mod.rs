@@ -460,8 +460,11 @@ impl ContextVmRuntime {
         Ok(root)
     }
 
-    /// Capture everything a fold changes, so a fold whose checkpoint cannot
-    /// be persisted can be undone and memory never runs ahead of the session.
+    /// Capture the state a fold changes, so a fold whose checkpoint cannot be
+    /// persisted can be undone and memory never runs ahead of the session.
+    /// The fold counters are restored; work counters (rebuilds, page lookups,
+    /// images compiled) record work that did happen and are kept, as are
+    /// content-addressed pages the fold saved to the object store.
     pub(crate) fn fold_undo_point(&self) -> FoldUndo {
         let metrics = self.metrics();
         FoldUndo {
@@ -650,7 +653,11 @@ impl ContextVmRuntime {
         let mut tokens = 0u64;
         let mut refs = Vec::new();
         for event in events.iter().rev() {
-            let estimate = event.visible_text.len().div_ceil(4).max(1) as u64;
+            // Images count at the provider ceiling, as the compiler counts them.
+            let estimate = (event.visible_text.len().div_ceil(4).max(1) as u64).saturating_add(
+                (event.images.len() as u64)
+                    .saturating_mul(crate::provider_budget::IMAGE_TOKEN_CEILING),
+            );
             if !refs.is_empty() && tokens.saturating_add(estimate) > self.config.hot_event_tokens {
                 break;
             }

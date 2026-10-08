@@ -2236,7 +2236,10 @@ impl Agent {
                 events
                     .iter()
                     .rev()
-                    .find(|event| event.kind == runtime::context_vm::ContextEventKind::User)
+                    .find(|event| {
+                        event.kind == runtime::context_vm::ContextEventKind::User
+                            && !event.visible_text.trim().is_empty()
+                    })
                     .map(|event| event.visible_text.clone())
             })
             .unwrap_or_else(|| "continue the current task".into());

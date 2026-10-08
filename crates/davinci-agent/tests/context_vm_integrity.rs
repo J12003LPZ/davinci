@@ -749,3 +749,108 @@ fn wor59_fold_with_a_live_tool_exchange_is_kept() {
     .unwrap();
     assert_eq!(persisted.checkpoint, folded.checkpoint);
 }
+
+/// The living plan (priority 500) outranks recent turns; a repository file
+/// (priority 100) does not.
+#[test]
+fn wor72_the_living_plan_outranks_recent_turns() {
+    use davinci_agent::runtime::context_vm::{
+        events_from_messages, ContextVmConfig, ContextVmRuntime,
+    };
+    use davinci_agent::{ContextItem, ContextPacket};
+    let vm = ContextVmRuntime::new(ContextVmConfig::default(), Default::default());
+    let messages = (0..10)
+        .map(|n| {
+            let role = if n % 2 == 0 { "user" } else { "assistant" };
+            ChatMessage::text(role, format!("turn-{n} {}", "detail ".repeat(40)))
+        })
+        .collect::<Vec<_>>();
+    let events = events_from_messages(&messages);
+    let item = |source: &str, priority: i32| ContextItem {
+        source: source.into(),
+        content: format!("{source} {}", "step ".repeat(300)),
+        estimated_tokens: 400,
+        priority,
+        stable_for_cache: true,
+        provenance: serde_json::json!({"provenance_kind": "user_decision"}),
+    };
+    let broker = ContextPacket {
+        items: vec![
+            item("file::README.md", 100),
+            item("agent::living_plan", 500),
+        ],
+        estimated_tokens: 800,
+        cache_key: "fixture".into(),
+    };
+    let everything = vm.compile(&events, &broker, 1_000_000).unwrap();
+    let tokens = |category: &str| -> u64 {
+        everything
+            .entries
+            .iter()
+            .filter(|entry| entry.category == category)
+            .map(|entry| entry.estimated_tokens)
+            .sum()
+    };
+    // Room for every turn and the plan, but not the README too.
+    let budget = everything.estimated_tokens - tokens("broker_context") / 4;
+    let image = vm.compile(&events, &broker, budget).unwrap();
+    let sources = image
+        .entries
+        .iter()
+        .filter(|entry| entry.category == "broker_context")
+        .map(|entry| entry.source_ref.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(sources, ["agent::living_plan"]);
+    // When turns must give way, they give way to the plan.
+    let tight = everything.estimated_tokens - tokens("broker_context") / 2 - tokens("hot_user") / 2;
+    let image = vm.compile(&events, &broker, tight).unwrap();
+    assert!(image
+        .entries
+        .iter()
+        .any(|entry| entry.source_ref == "agent::living_plan"));
+}
+
+/// The hot window is sized in tokens; an image costs as much there as it
+/// does in the compiled image, not one token.
+#[test]
+fn wor58_images_count_toward_the_hot_window() {
+    use davinci_agent::runtime::context_vm::{
+        events_from_messages, ContextVmConfig, ContextVmRuntime,
+    };
+    let vm = ContextVmRuntime::new(ContextVmConfig::default(), Default::default());
+    let messages = (0..12)
+        .map(|n| user_with_image(None, &format!("SU1BR0Ut{n:02}")))
+        .collect::<Vec<_>>();
+    let events = events_from_messages(&messages);
+    vm.compile(&events, &davinci_agent::ContextPacket::empty(), 1_000_000)
+        .unwrap();
+    let hot = vm.root().hot_event_refs.len();
+    assert!(
+        hot < events.len(),
+        "{hot} image events fit a 20k-token window"
+    );
+    assert!(hot >= 1);
+}
+
+/// An image-only last turn does not make the broker's goal an empty string.
+#[test]
+fn wor58_image_only_turn_keeps_a_textual_goal() {
+    let mut agent = sessionless_active_agent();
+    agent.messages = vec![
+        ChatMessage::text("user", "match this mockup"),
+        user_with_image(None, "UE5HLWdvYWw="),
+    ];
+    let state_before = agent.prepared_context_image().unwrap();
+    let goals = agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .context_vm
+        .load_state_from_root()
+        .unwrap()
+        .goals;
+    assert!(goals.iter().all(|goal| !goal.value.trim().is_empty()));
+    assert!(serde_json::to_string(&state_before.messages)
+        .unwrap()
+        .contains("UE5HLWdvYWw="));
+}
