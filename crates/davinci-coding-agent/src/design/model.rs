@@ -70,6 +70,10 @@ pub struct SubscriptionModel {
     model: Model,
     auth: ResolvedAuth,
     effort: davinci_protocol::ThinkingLevel,
+    /// Renew the stored login before each request: only for the route
+    /// [`Self::configured`] built from it. A host that injects credentials
+    /// keeps them as given.
+    renew: bool,
 }
 impl SubscriptionModel {
     pub fn from_host(agent: &Agent, model: Model, auth: ResolvedAuth) -> DesignResult<Self> {
@@ -77,6 +81,7 @@ impl SubscriptionModel {
             model,
             auth,
             effort: agent.request_thinking_level(),
+            renew: false,
         };
         route.validate(agent)?;
         Ok(route)
@@ -105,23 +110,33 @@ impl SubscriptionModel {
                         .into(),
                 )
             })?;
-        let storage = davinci_ai::AuthStorage::create().map_err(|_| {
-            DesignError::MissingCapability("subscription credentials are unavailable".into())
-        })?;
-        // No environment keys, config commands, implicit login, refresh or fallback.
-        let auth = davinci_ai::resolve_provider_auth(
-            &agent.provider,
-            &storage,
-            &Default::default(),
-            false,
-        )
-        .ok_or_else(|| {
+        let auth = subscription_auth(&agent.provider)?;
+        let mut route = Self::from_host(agent, model, auth)?;
+        route.renew = true;
+        Ok(route)
+    }
+}
+
+/// How long a token must still be valid before a design request uses it: a
+/// generation request can run for minutes.
+const AUTH_MIN_VALIDITY_MS: u64 = 15 * 60 * 1000;
+
+/// The stored ChatGPT-plan login, renewed through its refresh token when it
+/// is close to expiry, the way every other DaVinci request renews it. No
+/// environment keys, config commands, new login or API-key fallback.
+fn subscription_auth(provider: &str) -> DesignResult<ResolvedAuth> {
+    let mut storage = davinci_ai::AuthStorage::create().map_err(|_| {
+        DesignError::MissingCapability("subscription credentials are unavailable".into())
+    })?;
+    // A failed refresh leaves the stored token; resolving below decides.
+    let _ = storage.maybe_refresh(provider, davinci_ai::now_ms(), AUTH_MIN_VALIDITY_MS, false);
+    davinci_ai::resolve_provider_auth(provider, &storage, &Default::default(), false).ok_or_else(
+        || {
             DesignError::MissingCapability(
                 "subscription login is unavailable or expired; sign in through DaVinci".into(),
             )
-        })?;
-        Self::from_host(agent, model, auth)
-    }
+        },
+    )
 }
 fn design_stream_options(
     agent: &Agent,
@@ -142,7 +157,9 @@ fn design_stream_options(
         ),
         max_retries: Some(0),
         max_tokens: Some(output),
-        transport: agent.transport.clone(),
+        // Subscription-only admission takes SSE: auto may retry or fall back
+        // to another transport after a websocket failure.
+        transport: Some("sse".into()),
         abort_signal: Some(request.abort.clone()),
         session_id: agent
             .session
@@ -173,11 +190,6 @@ impl DesignModel for SubscriptionModel {
                     .into(),
             ));
         }
-        if agent.root_budget().is_none() {
-            return Err(DesignError::MissingCapability(
-                "design generation requires --root-budget admission configured by the host".into(),
-            ));
-        }
         Ok(())
     }
     fn supports_images(&self) -> bool {
@@ -189,6 +201,11 @@ impl DesignModel for SubscriptionModel {
         request: &DesignModelRequest,
     ) -> Result<CompleteOutput, String> {
         ensure_online().map_err(|error| error.to_string())?;
+        // Runs take minutes and retry: renew the login before each request
+        // rather than once at the start. Only the same OAuth route passes.
+        if self.renew {
+            self.auth = subscription_auth(&agent.provider).map_err(|e| e.to_string())?;
+        }
         self.validate(agent).map_err(|e| e.to_string())?;
         let remaining = request
             .deadline_ms
@@ -211,8 +228,11 @@ impl DesignModel for SubscriptionModel {
             .saturating_add(davinci_agent::provider_budget::text_token_ceiling(
                 &serde_json::to_string(&request.tools).map_err(|e| e.to_string())?,
             ));
-        if tokens.saturating_add(output) > self.model.context_window.min(agent.context_window) {
-            return Err("complete design request does not fit the selected model context".into());
+        let window = self.model.context_window.min(agent.context_window);
+        if tokens.saturating_add(output) > window {
+            return Err(format!(
+                "complete design request does not fit the selected model context ({tokens} input + {output} output tokens > {window})"
+            ));
         }
         davinci_ai::live_complete_streaming_with_sink_envelope(
             &self.model,
@@ -268,6 +288,7 @@ mod service_tier_regression_tests {
             assert_eq!(options.timeout_ms, Some(100));
             assert_eq!(options.max_retries, Some(0));
             assert_eq!(options.max_tokens, Some(64));
+            assert_eq!(options.transport.as_deref(), Some("sse"));
             assert!(Arc::ptr_eq(
                 options.abort_signal.as_ref().unwrap(),
                 &request.abort

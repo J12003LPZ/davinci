@@ -47,6 +47,7 @@ jobs:
         with:
           node-version: '24.19.0'
       - run: rustup show
+      - run: python -m unittest discover -s scripts/tests -p "test_design_contracts.py"
       - run: python scripts/design-contracts.py --check
       - name: Every design integration target and the offline evaluation manifest
         run: python scripts/test-design.py

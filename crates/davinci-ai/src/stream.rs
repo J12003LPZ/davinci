@@ -685,8 +685,23 @@ pub fn live_complete_with(
         None,
         message.usage.clone(),
     );
-    crate::provider_observation::validate_completion()?;
+    crate::provider_observation::validate_completion()
+        .map_err(|error| with_provider_error(&message, error))?;
     Ok(message)
+}
+
+/// A rejected receipt names its policy reason, which says nothing about why
+/// the provider failed. Lead with the provider's own error when it sent one:
+/// "usage limit reached" is the actionable part.
+fn with_provider_error(message: &AssistantMessage, rejection: String) -> String {
+    match message.error_message.as_deref().map(str::trim) {
+        Some(provider)
+            if !provider.is_empty() && message.stop_reason == Some(StopReason::Error) =>
+        {
+            format!("{provider} ({rejection})")
+        }
+        _ => rejection,
+    }
 }
 
 fn observe_request(model: &Model, body: &Value) {
@@ -790,8 +805,9 @@ pub fn live_complete_streaming_with_sink_envelope(
     let result = live_complete_streaming_with_sink_envelope_inner(
         model, messages, auth, system, tools, &options, on_event,
     );
-    if result.is_ok() {
-        crate::provider_observation::validate_completion()?;
+    if let Ok(envelope) = &result {
+        crate::provider_observation::validate_completion()
+            .map_err(|error| with_provider_error(&envelope.message, error))?;
     }
     if let (Some(dump), Ok(envelope)) = (&dump, &result) {
         dump.write(
@@ -2831,6 +2847,26 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rejected_receipt_leads_with_the_providers_own_error() {
+        let mut message: AssistantMessage = serde_json::from_value(serde_json::json!({
+            "id": "m", "role": "assistant", "content": [], "model": "gpt-5.6-luna",
+            "stopReason": "error",
+            "errorMessage": "You've hit your usage limit. Try again in 2 hours.",
+        }))
+        .unwrap();
+        assert_eq!(
+            with_provider_error(&message, "receipt rejected".into()),
+            "You've hit your usage limit. Try again in 2 hours. (receipt rejected)"
+        );
+        // A completed message carries no provider error to add.
+        message.stop_reason = Some(StopReason::Stop);
+        assert_eq!(
+            with_provider_error(&message, "receipt rejected".into()),
+            "receipt rejected"
+        );
+    }
+
     use super::*;
     use crate::catalog::load_builtin_models;
     use std::sync::Mutex;

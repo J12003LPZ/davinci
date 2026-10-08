@@ -3,6 +3,7 @@ pub mod acceptance;
 pub mod admission;
 pub mod assets;
 pub mod blob;
+pub mod budget;
 pub mod commands;
 pub mod compile;
 pub mod confinement;

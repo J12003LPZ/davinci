@@ -45,7 +45,7 @@ pub fn group_rank(key: &str) -> usize {
         | "fullscreen-scrollbar"
         | "fullscreen-copy-on-select"
         | "theme" => 1,
-        "skill-commands" | "autocomplete-max-visible" => 2,
+        "skill-commands" | "design" | "autocomplete-max-visible" => 2,
         "steering-mode"
         | "follow-up-mode"
         | "default-project-trust"

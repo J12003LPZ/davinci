@@ -32,12 +32,22 @@ try {
     }
   }
   const playwright = require('playwright-core');
-  const executable = fs.realpathSync(playwright.chromium.executablePath());
+  let executable = fs.realpathSync(playwright.chromium.executablePath());
   let directory = path.dirname(executable);
   while (!/^chromium-[0-9]+$/.test(path.basename(directory))) {
     const parent=path.dirname(directory);
     if(parent===directory)throw new Error('Expected the pinned Playwright Chromium cache');
     directory=parent;
+  }
+  if(process.platform==='win32') {
+    // Windows runs the design browser in an AppContainer, where Chrome's
+    // crash reporter cannot create its named pipe. The same revision's
+    // headless shell has no crash reporter and is what headless runs use.
+    const revision=path.basename(directory).slice('chromium-'.length);
+    const shellDirectory=path.join(path.dirname(directory),'chromium_headless_shell-'+revision);
+    const shell=path.join(shellDirectory,'chrome-headless-shell-win64','chrome-headless-shell.exe');
+    if(!fs.existsSync(shell))throw new Error('Expected the pinned Playwright headless shell; run: npx playwright install chromium-headless-shell');
+    directory=fs.realpathSync(shellDirectory); executable=fs.realpathSync(shell);
   }
   const browserFiles={};
   function visitBrowser(current) {

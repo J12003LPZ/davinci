@@ -31,6 +31,9 @@ pub enum SandboxBackendKind {
     Auto,
     LinuxBubblewrap,
     MacosSeatbelt,
+    /// Windows AppContainer with no network capability, inside the
+    /// supervisor's kill-on-close job.
+    WindowsAppContainer,
     Container,
     Host,
 }

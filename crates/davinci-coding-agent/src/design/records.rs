@@ -71,6 +71,8 @@ pub struct EditableBinding {
     pub node_id: NodeId,
     pub artboard_id: ArtboardId,
     pub source_file: String,
+    /// The host fills this in from the file's bytes; a model may leave it out.
+    #[serde(default)]
     pub source_hash: String,
     pub pointer: String,
     pub constraint: BindingConstraint,

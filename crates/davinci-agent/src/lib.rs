@@ -968,6 +968,34 @@ impl Agent {
         Ok(())
     }
 
+    /// Account the model requests `operation` makes to `budget`, for its
+    /// length only: a host operation with a ledger of its own (a design run)
+    /// in a session that has no root budget. Unlike [`Self::bind_root_budget`]
+    /// nothing is written to the session, and the agent has no budget again
+    /// afterwards, so ordinary turns are never accounted to it.
+    pub fn with_operation_budget<T>(
+        &mut self,
+        budget: runtime::capacity::RootBudget,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T, String> {
+        if self.root_budget().is_some() {
+            return Err("the session already has a root budget".into());
+        }
+        budget.snapshot()?;
+        self.set_operation_budget(Some(budget));
+        let output = operation(self);
+        self.set_operation_budget(None);
+        Ok(output)
+    }
+
+    fn set_operation_budget(&mut self, budget: Option<runtime::capacity::RootBudget>) {
+        if let Some(runtime) = &mut self.runtime {
+            runtime.root_budget = budget.clone();
+            self.tool_context.runtime = Some(runtime.clone());
+        }
+        self.root_budget = budget;
+    }
+
     /// Read the existing host-approved ledger; feature adapters must never
     /// create a replacement budget or use unaccounted provider transports.
     pub fn root_budget(&self) -> Option<&runtime::capacity::RootBudget> {

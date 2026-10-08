@@ -611,7 +611,16 @@ impl davinci_ai::provider_observation::AttemptBudget for RootBudget {
                     reservation.disposition = Disposition::Unknown;
                 }
                 self.write(&ledger)?;
-                return Err("subscription-only receipt rejected: unsuccessful or unidentified response; campaign halted".into());
+                return Err(format!(
+                    "subscription-only receipt rejected: response {}{}, model {}, expected {}; campaign halted",
+                    event.status,
+                    event
+                        .http_status
+                        .map(|code| format!(" (HTTP {code})"))
+                        .unwrap_or_default(),
+                    event.returned_model.as_deref().unwrap_or("not reported"),
+                    policy.model,
+                ));
             }
         }
         // Output can be measured even when input cache-write provenance is
@@ -671,5 +680,51 @@ mod tests {
         assert!(budget.write(&ledger).is_err());
         assert_eq!(std::fs::read(path).unwrap(), original);
         assert_eq!(budget.snapshot().unwrap().requests, 0);
+    }
+
+    #[test]
+    fn a_rejected_subscription_receipt_names_what_the_provider_returned() {
+        use davinci_ai::provider_observation::{AttemptBudget, ProviderAttemptObservation};
+        let directory = tempfile::tempdir().unwrap();
+        let budget = RootBudget::open(
+            directory.path().join("budget.json"),
+            "root",
+            BudgetLimits {
+                max_requests: 4,
+                max_output_tokens: None,
+                max_cost_microusd: None,
+                codex_subscription: Some(
+                    davinci_ai::subscription_policy::CodexSubscriptionPolicy {
+                        model: "gpt-5.6-luna".into(),
+                        effort: "medium".into(),
+                    },
+                ),
+                deadline_unix_ms: u64::MAX,
+            },
+        )
+        .unwrap();
+        let receipt = |status: &str, http: Option<u16>, model: Option<&str>| {
+            serde_json::from_value::<ProviderAttemptObservation>(serde_json::json!({
+                "schema_version": 1, "kind": "attempt_end", "logical_request_id": "r",
+                "attempt_id": 1, "purpose": "design", "model": "openai-codex/gpt-5.6-luna",
+                "returned_model": model, "selected_effort": "medium", "schema_hash": "",
+                "transport": "http", "elapsed_ms": 0.0, "duration_ms": null,
+                "status": status, "http_status": http, "usage": null,
+            }))
+            .unwrap()
+        };
+        let error =
+            AttemptBudget::reconcile(&budget, &receipt("failed", Some(429), None)).unwrap_err();
+        assert_eq!(
+            error,
+            "subscription-only receipt rejected: response failed (HTTP 429), model not reported, expected gpt-5.6-luna; campaign halted"
+        );
+        let error = AttemptBudget::reconcile(&budget, &receipt("completed", None, Some("gpt-5.6")))
+            .unwrap_err();
+        assert!(
+            error.contains("response completed, model gpt-5.6, expected gpt-5.6-luna"),
+            "{error}"
+        );
+        assert!(budget.read().unwrap().halted);
     }
 }

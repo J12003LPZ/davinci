@@ -154,9 +154,25 @@ Rustup toolchains and selected Cargo registry/git directories can be read-only r
 
 The required macOS job in `.github/workflows/ci.yml` runs native filesystem escapes, protected control paths, environment isolation, IPv4/IPv6/UDP/Unix socket controls, group-member cleanup, and the detached-descendant capability gap. Linux profile-generation tests alone do not establish native macOS enforcement. Phase 4.1's complete teardown requirement and Phase 4.2's macOS Auto default remain unfulfilled.
 
-### Native Windows
+### Native Windows: AppContainer
 
-Use WSL2 for native execution confinement now. Native Windows retains Job Object ownership and the existing approval policy without filesystem/network isolation claims. Explicit restricted/workspace-write requests still fail closed unless a selected capable backend can enforce them. No native restricted-token/ACL backend is claimed.
+`backend: "windows_app_container"` (aliases `appcontainer`, `app_container`) runs the command in a Windows AppContainer, inside the supervisor's kill-on-close Job Object:
+
+- **Network:** the token gets no network capability (`internetClient`, `internetClientServer`, `privateNetworkClientServer`), so it can open no socket off the machine and, without a loopback exemption, none to the host. Only `network: denied` is accepted.
+- **Filesystem:** each launch has a distinct AppContainer package SID. A mount gets a path-derived read or write capability, and the token holds only the capabilities selected for this launch. Windows may also grant ambient access to ALL APPLICATION PACKAGES (for example system fonts), so this is not a claim that *only* mounts can be read on every host. Mounts must be disjoint; a read-only child of a writable mount could inherit its parent's write grant. Before launch, read mounts are scanned (bounded at 10,000 entries) for links and pre-existing ALL APPLICATION PACKAGES write/delete ACL grants; if that scan cannot complete, launch fails closed. This does not revoke ambient AAP access elsewhere on the host. Hidden paths and workspace-write protected paths are **not supported** on Windows and fail closed. The launcher does not temporarily rewrite their ACLs.
+- **Environment and temp:** the explicit environment only, with `TEMP`/`TMP`, `USERPROFILE`/`HOME`, `LOCALAPPDATA` and `APPDATA` pointed at a per-launch AppContainer profile. On ordinary exit the launcher removes that profile; abrupt termination can leave an orphaned profile, but another launch has a different SID.
+- **Process tree:** the launcher (this executable re-entered with `--internal-appcontainer-exec`) holds the child in its own kill-on-close job, nested in the supervisor's; killing either kills the tree.
+
+`auto` never picks it. A confined process cannot create the global named pipes that Node (libuv) and Rust's standard library use for child stdio, so tools that start subprocesses with pipes fail or hang inside it. It suits a single program that needs no pipes of its own, such as the design browser. Memory, PID, CPU and temp-size budgets are not enforced. Do not use a writable mount for a repository or other host-controlled directory that needs protected children; the Windows backend refuses workspace-write mode.
+
+`crates/davinci-coding-agent/tests/sandbox_appcontainer.rs` checks the following on every Windows CI run:
+- mount access on a disposable fixture;
+- hidden, protected and nested mounts failing before child launch or ACL mutation;
+- `curl` failing to reach a host listener or the internet;
+- the child's token: AppContainer, Low integrity, no network capability;
+- the child dying with its launcher.
+
+Without a configured backend, native Windows keeps Job Object ownership and the approval policy, and restricted/workspace-write requests fail closed.
 
 ## Environment and secrets
 

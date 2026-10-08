@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `/design` renders on Windows. The generated-content browser runs in a per-launch AppContainer with no network capability and disjoint pinned-browser read and private-temp write mounts; Windows may also grant ambient ALL APPLICATION PACKAGES access. Native capture, prototype-action and hostile-page tests pass, and the hostile test checks each browser process's token. A completed live subscription generation remains unverified.
+- `scripts/setup-design-runtime.ps1`: one command prepares the pinned design runtime and turns `/design` on. `/config` gains a Design artifacts toggle; the runtime paths live in the global settings, and a project's own settings cannot set them.
+- `windows_app_container` sandbox backend, chosen explicitly (never by `auto`, because confined processes cannot create the named pipes most tools use for subprocesses).
+
+### Fixed
+- Design runs no longer need `--root-budget`. Each operation gets a subscription-only ledger of its own (12 requests and 15 minutes for a generation). A host-provided root budget still wins.
+- Design requests renew the ChatGPT login when it nears expiry, use SSE as subscription admission requires, and give the model the exact binding schema.
+- A rejected source tool call or binding now goes to a repair pass instead of ending the run, and its message names the rule that failed.
+- An HTML design entry that loads `./src/App.jsx` or TypeScript the dev-server way is bundled. Previously the browser refused the raw JSX as `text/plain`.
+- An image counts as at most 3,000 tokens in context accounting, not its base64 size. A pasted screenshot no longer looks like a million tokens.
+- A host model request that fails before sending reports the provider's error, not "did not produce settled root admission evidence".
+- A subscription request the provider refuses (a ChatGPT plan usage limit, for one) reports the provider's message, then the response status, HTTP code and returned model. Previously it said only "unsuccessful or unidentified response".
+- Two starts of one design operation agree on one budget deadline. The limits file is linked into place, so it is never overwritten or read half-written.
+
 ## 1.1.6
 
 Changes since `v1.1.5`.

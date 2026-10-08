@@ -18,26 +18,49 @@ pub fn validate_bindings(write: &RevisionWrite) -> DesignResult<()> {
             .files
             .get(&binding.source_file)
             .ok_or_else(|| DesignError::InvalidInput("binding source missing".into()))?;
-        if !nodes.insert(binding.node_id)
-            || !binding.source_file.ends_with(".json")
-            || binding.source_hash != source.sha256
-            || !binding.pointer.starts_with('/')
-            || binding.pointer.len() > 1024
-            || binding.pointer.split('/').any(|p| {
+        // Each rule says what failed: a generation run hands this message
+        // back to the model to repair.
+        let pointer_ok = binding.pointer.starts_with('/')
+            && binding.pointer.len() <= 1024
+            && !binding.pointer.split('/').any(|p| {
                 let decoded = p.replace("~1", "/").replace("~0", "~");
                 ["__proto__", "prototype", "constructor"].contains(&decoded.as_str())
                     || p.as_bytes()
                         .windows(2)
                         .any(|pair| pair[0] == b'~' && pair[1] != b'0' && pair[1] != b'1')
                     || p.ends_with('~')
-            })
-            || !write
-                .variants
-                .iter()
-                .flat_map(|v| &v.artboards)
-                .any(|b| b.id == binding.artboard_id)
-        {
-            return Err(DesignError::InvalidInput("invalid declared binding".into()));
+            });
+        let artboard_ok = write
+            .variants
+            .iter()
+            .flat_map(|v| &v.artboards)
+            .any(|b| b.id == binding.artboard_id);
+        let failure = if !nodes.insert(binding.node_id) {
+            Some("node_id is used by another binding".to_string())
+        } else if !binding.source_file.ends_with(".json") {
+            Some(format!(
+                "source_file {} must be a JSON file in files",
+                binding.source_file
+            ))
+        } else if binding.source_hash != source.sha256 {
+            Some("source_hash does not match the source file".to_string())
+        } else if !pointer_ok {
+            Some(format!(
+                "pointer {} must be a JSON Pointer such as /hero/title",
+                binding.pointer
+            ))
+        } else if !artboard_ok {
+            Some(format!(
+                "artboard_id {} is not an artboard in variants",
+                binding.artboard_id
+            ))
+        } else {
+            None
+        };
+        if let Some(failure) = failure {
+            return Err(DesignError::InvalidInput(format!(
+                "invalid declared binding: {failure}"
+            )));
         }
         let affected: BTreeSet<_> = write
             .bindings

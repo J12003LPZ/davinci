@@ -814,7 +814,7 @@ See [Security scan](docs/security-scan.md).
 
 ### Design artifacts (experimental)
 
-`/design` manages session-owned UI concepts, revisions, evidence, exports, and reviewed implementation proposals. It is disabled by default. Generation requires an explicitly enabled feature, a selected `openai-codex` subscription/model/effort, and an existing root-budget configuration. The browser companion additionally needs a separately prepared pinned Node/Chromium runtime; native generated-content rendering currently fails closed on Windows. No automatic API-key fallback or package installation occurs.
+`/design` manages session-owned UI concepts, revisions, evidence, exports, and reviewed implementation proposals. It is off by default. On Windows, `pwsh -NoProfile -File .\scripts\setup-design-runtime.ps1` prepares the runtime and turns it on (Node 24.19.0 required); other platforms use the manual setup in the linked guide. After that, `/config` → Design artifacts switches it. Generation uses the selected `openai-codex` subscription model and effort; each design operation is accounted to a small ledger of its own unless DaVinci was started with `--root-budget`. Generated pages render in a confined browser: Bubblewrap on Linux, an AppContainer with no network on Windows. No API-key fallback, and `/design` itself never installs packages.
 
 Start with [design setup, commands, and limitations](docs/design-artifacts.md) and [readiness](docs/readiness/design-artifacts.md), not an ordinary `/design new` invocation without prerequisites.
 

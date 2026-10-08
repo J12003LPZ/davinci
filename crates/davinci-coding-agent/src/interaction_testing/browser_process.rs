@@ -28,6 +28,71 @@ const FILES: [(&str, &str); 4] = [
     ("browser_transport.js", include_str!("browser_transport.js")),
 ];
 
+fn config_cache(environment: &BTreeMap<String, String>) -> Result<PathBuf, String> {
+    let cache = environment
+        .get("PLAYWRIGHT_BROWSERS_PATH")
+        .ok_or("design browser cache must be explicitly configured")?;
+    Path::new(cache)
+        .canonicalize()
+        .map_err(|_| "design browser cache unavailable".into())
+}
+
+/// The Windows design browser: Playwright starts the launcher (this host's
+/// own executable) instead of the browser, with a plan in the environment
+/// that runs the pinned browser in an AppContainer. The container has no
+/// network capability, reads only the pinned browser directory (and what
+/// Windows grants every AppContainer, such as system fonts) and writes only
+/// this launch's private temp, where Playwright puts the browser profile.
+fn windows_design(
+    host: &SupervisorCommand,
+    bundle: &Value,
+    directory: &Path,
+    cache: PathBuf,
+    environment: &mut BTreeMap<String, String>,
+) -> Result<Value, String> {
+    use davinci_agent::sandbox::appcontainer::{LaunchPlan, PLAN_ENV};
+    let browser = PathBuf::from(
+        bundle["executable"]
+            .as_str()
+            .ok_or("design browser executable missing")?,
+    )
+    .canonicalize()
+    .map_err(|_| "design browser executable unavailable")?;
+    // The pinned browser's own directory: the child of the cache holding it.
+    let pinned = browser
+        .ancestors()
+        .find(|path| path.parent() == Some(cache.as_path()))
+        .ok_or("design browser is outside its cache")?
+        .to_path_buf();
+    let launcher = host
+        .executable
+        .canonicalize()
+        .map_err(|_| "sandbox launcher unavailable")?;
+    let temp = directory.join("tmp");
+    fs::create_dir(&temp).map_err(|_| "browser private temp unavailable")?;
+    let text = |path: &Path| {
+        davinci_agent::strip_verbatim_prefix(path)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let plan = LaunchPlan {
+        executable: text(&browser),
+        argv: Vec::new(),
+        cwd: text(&temp),
+        read: vec![text(&pinned)],
+        write: vec![text(&temp)],
+        hidden: Vec::new(),
+        protected: Vec::new(),
+    };
+    environment.insert(PLAN_ENV.into(), plan.encode());
+    for name in ["TEMP", "TMP", "TMPDIR"] {
+        environment.insert(name.into(), text(&temp));
+    }
+    let mut bundle = bundle.clone();
+    bundle["executable"] = Value::String(text(&launcher));
+    Ok(bundle)
+}
+
 #[derive(Default)]
 struct State {
     frame: Vec<u8>,
@@ -237,7 +302,19 @@ impl BrowserProcess {
                 fs::write(directory.join(name), bytes)
                     .map_err(|_| "cannot materialize browser host")?;
             }
-            if let Some(bundle) = design {
+            // Windows: the browser, which runs the generated content, starts
+            // in an AppContainer through the launcher (see `windows_design`).
+            let design = match design {
+                Some(bundle) if cfg!(windows) => Some(windows_design(
+                    host,
+                    bundle,
+                    &directory,
+                    config_cache(&environment)?,
+                    &mut environment,
+                )?),
+                other => other.cloned(),
+            };
+            if let Some(bundle) = &design {
                 fs::write(
                     directory.join("design.json"),
                     serde_json::to_vec(bundle).map_err(|_| "invalid design bundle")?,
@@ -266,7 +343,9 @@ impl BrowserProcess {
             let event_state = state.clone();
             let owner: Arc<Mutex<Option<Weak<Supervisor>>>> = Arc::new(Mutex::new(None));
             let event_owner = owner.clone();
-            let sandbox = if design.is_some() {
+            // On Windows the host runs pinned trusted code in the supervisor's
+            // job; the confinement is the browser's AppContainer.
+            let sandbox = if design.is_some() && !cfg!(windows) {
                 Some(design_sandbox(&directory, &node, &package, &environment)?)
             } else {
                 None

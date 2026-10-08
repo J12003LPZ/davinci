@@ -1,0 +1,10 @@
+[
+  {"name":"recorded single-concept bare variant","directions":1,"shape":"single","accepted":true},
+  {"name":"ordinary single-concept array","directions":1,"shape":"array","accepted":true},
+  {"name":"single object cannot satisfy two concepts","directions":2,"shape":"single","accepted":false},
+  {"name":"keyed variant map is not a variant","directions":1,"shape":"keyed","accepted":false},
+  {"name":"extra property is not the recorded shape","directions":1,"shape":"extra","accepted":false},
+  {"name":"missing artboards is not the recorded shape","directions":1,"shape":"missing","accepted":false},
+  {"name":"malformed identifier remains invalid","directions":1,"shape":"bad-id","accepted":false},
+  {"name":"one-element array cannot satisfy two concepts","directions":2,"shape":"array","accepted":false}
+]
