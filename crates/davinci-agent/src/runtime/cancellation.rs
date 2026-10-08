@@ -107,10 +107,16 @@ impl CancellationToken {
     /// Cancelling the child does not cancel this parent.
     pub fn child_token(&self) -> Self {
         let child = Self::new();
+        // Read the flag under the children lock. `cancel` sets the flag before
+        // it takes this lock to drain the list, so either we see the flag here
+        // or `cancel` sees our registration. Checking outside the lock let a
+        // cancel run entirely between the check and the push (WOR-52).
+        let mut guard = self.children.lock().unwrap_or_else(|e| e.into_inner());
         if self.is_cancelled() {
+            drop(guard);
             child.cancel();
         } else {
-            let mut guard = self.children.lock().unwrap_or_else(|e| e.into_inner());
+            after_flag_check_hook();
             guard.push(Arc::downgrade(&child.node));
         }
         child
@@ -181,8 +187,79 @@ impl CancellationToken {
 }
 
 #[cfg(test)]
+thread_local! {
+    static AFTER_FLAG_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: runs once, on the calling thread, after `child_token` has seen
+/// the parent un-cancelled and before the child is registered.
+fn after_flag_check_hook() {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_FLAG_CHECK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WOR-52: a child registered while the parent is mid-cancel must still
+    /// end up cancelled. Before the fix `child_token` read the flag outside
+    /// the children lock, so a cancel that swapped the flag and drained the
+    /// list in between left the late child live forever.
+    #[test]
+    fn wor52_child_created_during_parent_cancel_is_never_missed() {
+        let parent = CancellationToken::new();
+        std::thread::scope(|scope| {
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let target = &parent;
+            let canceller = scope.spawn(move || {
+                wait.recv().unwrap();
+                target.cancel();
+            });
+            // Force the interleaving: parent.cancel() starts exactly between
+            // child_token's flag check and its registration.
+            let probe = parent.clone();
+            AFTER_FLAG_CHECK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    go.send(()).unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !probe.is_cancelled() && std::time::Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    // Give a lock-free cancel() time to finish draining.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }));
+            });
+            let child = parent.child_token();
+            canceller.join().unwrap();
+            assert!(parent.is_cancelled());
+            assert!(
+                child.is_cancelled(),
+                "child created concurrently with parent.cancel() missed propagation"
+            );
+        });
+    }
+
+    #[test]
+    fn wor52_child_token_race_stress() {
+        for _ in 0..2_000 {
+            let parent = CancellationToken::new();
+            let start = std::sync::Barrier::new(2);
+            let child = std::thread::scope(|scope| {
+                let creator = scope.spawn(|| {
+                    start.wait();
+                    parent.child_token()
+                });
+                start.wait();
+                parent.cancel();
+                creator.join().unwrap()
+            });
+            assert!(child.is_cancelled());
+        }
+    }
 
     #[test]
     fn f03_job_binding_is_bounded_and_does_not_retain_book() {
