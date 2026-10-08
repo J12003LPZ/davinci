@@ -493,3 +493,59 @@ fn wor50_dispose_after_failed_detach_relinquishes_once() {
     // The lease is gone, so a fresh exclusive lease is allowed.
     client.acquire_session(&handle.id, "exclusive").unwrap();
 }
+
+#[test]
+fn wor49_snapshot_listener_can_issue_requests_during_framed_connect() {
+    let client = SessionClient::with_loopback(|message| match message {
+        ClientMessage::Hello { version } => (hello(version), Vec::new()),
+        ClientMessage::Request { id, .. } => (ok(id, listing("live")), Vec::new()),
+    })
+    .unwrap();
+    let probe = client.clone();
+    let listed = Rc::new(RefCell::new(None));
+    let sink = listed.clone();
+    let _unsubscribe = client.subscribe(move |_| {
+        *sink.borrow_mut() = Some(probe.list_sessions().map(|sessions| sessions.len()));
+    });
+    client.connect().unwrap();
+    let outcome = listed.borrow_mut().take().expect("snapshot listener ran");
+    assert_eq!(outcome.expect("request from snapshot listener"), 1);
+    assert!(client.connected());
+}
+
+#[test]
+fn wor50_session_removed_during_attach_yields_no_live_handle() {
+    let server = Rc::new(RefCell::new(FakeServer::default()));
+    let client = SessionClient::new({
+        let server = server.clone();
+        move |message| {
+            let removed = matches!(
+                &message,
+                ClientMessage::Request {
+                    request: Command::Attach { .. },
+                    ..
+                }
+            ) && server.borrow().revision == 0;
+            let (response, mut events) = server.borrow_mut().handle(message);
+            if removed {
+                events.push(ServerEvent::SessionRemoved {
+                    session_id: "sess-1".into(),
+                });
+            }
+            (response, events)
+        }
+    });
+    client.connect().unwrap();
+    let error = client
+        .acquire_session("sess-1", "shared")
+        .err()
+        .expect("removal during attach must not hand out a lease");
+    assert!(error.to_string().contains("removed"), "{error}");
+
+    // No phantom handle exists, so an exclusive lease is free and its owner
+    // is the only one that can detach the session.
+    let owner = client.acquire_session("sess-1", "exclusive").unwrap();
+    assert!(owner.active());
+    owner.detach().unwrap();
+    assert_eq!(server.borrow().detaches, 1);
+}

@@ -37,6 +37,9 @@ struct SessionClientInner {
     /// Events received on the framed transport, applied once the transport
     /// call returns so client listeners never run inside a borrow.
     inbox: VecDeque<ServerEvent>,
+    /// Snapshot from a framed hello, applied once `connect` has returned so
+    /// snapshot listeners can issue requests on a fully connected client.
+    pending_snapshot: Option<ServerSnapshot>,
     state: ClientState,
     connected: bool,
     disposed: bool,
@@ -58,6 +61,7 @@ impl SessionClient {
                 last_response: None,
                 pending_request: None,
                 inbox: VecDeque::new(),
+                pending_snapshot: None,
                 state: ClientState::new(),
                 connected: false,
                 disposed: false,
@@ -92,6 +96,7 @@ impl SessionClient {
                 last_response: None,
                 pending_request: None,
                 inbox: VecDeque::new(),
+                pending_snapshot: None,
                 state: ClientState::new(),
                 connected: false,
                 disposed: false,
@@ -216,8 +221,7 @@ impl SessionClient {
         };
         let client = self.clone();
         connection.on_handshake(move |snapshot| {
-            let state = client.inner.borrow().state.clone();
-            state.apply_server_snapshot(snapshot.clone());
+            client.inner.borrow_mut().pending_snapshot = Some(snapshot.clone());
             Ok(())
         });
         let client = self.clone();
@@ -240,13 +244,21 @@ impl SessionClient {
         self.inner.borrow_mut().factory = Some(factory);
         match result {
             Ok(snapshot) => {
-                self.inner.borrow_mut().connected = true;
+                let (pending, state) = {
+                    let mut inner = self.inner.borrow_mut();
+                    inner.connected = true;
+                    (inner.pending_snapshot.take(), inner.state.clone())
+                };
+                if let Some(pending) = pending {
+                    state.apply_server_snapshot(pending);
+                }
                 self.drain_inbox();
                 Ok(snapshot)
             }
             Err(error) => {
                 let mut inner = self.inner.borrow_mut();
                 inner.connected = false;
+                inner.pending_snapshot = None;
                 inner.inbox.clear();
                 Err(error)
             }
@@ -358,15 +370,35 @@ impl SessionClient {
         mode: SessionLeaseMode,
     ) -> Result<SessionHandle, ClientError> {
         self.reserve_lease(session_id, mode)?;
+        // The generation the reservation belongs to. If the session is removed
+        // while the attach is in flight, the reservation is dropped with it and
+        // the handle must not come out active under the next generation.
+        let generation = self.generation(session_id);
         if !self.inner.borrow().state.is_session_attached(session_id) {
             if let Err(err) = self.request(Command::Attach {
                 session_id: session_id.to_string(),
             }) {
-                self.release_lease(session_id, mode);
+                if self.generation(session_id) == generation {
+                    self.release_lease(session_id, mode);
+                }
                 return Err(err);
             }
         }
-        Ok(self.lease(session_id.to_string(), mode))
+        if self.generation(session_id) != generation {
+            return Err(ClientError::Protocol(format!(
+                "Session {session_id} was removed while attaching"
+            )));
+        }
+        Ok(self.lease_at(session_id.to_string(), mode, generation))
+    }
+
+    fn generation(&self, session_id: &str) -> u64 {
+        self.inner
+            .borrow()
+            .generations
+            .get(session_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn attach_session(&self, session_id: &str) -> Result<SessionHandle, ClientError> {
@@ -380,8 +412,16 @@ impl SessionClient {
         if !self.connected() {
             return Err(ClientError::Protocol(DISCONNECTED.into()));
         }
-        if self.inner.borrow().factory.is_some() {
-            return self.request_framed(command);
+        {
+            let inner = self.inner.borrow();
+            if inner.connection.is_some() {
+                if inner.factory.is_none() {
+                    // `connect` is still running and owns the transport.
+                    return Err(ClientError::Protocol("Pi client is connecting".into()));
+                }
+                drop(inner);
+                return self.request_framed(command);
+            }
         }
         let (id, expected, message, events) = {
             let mut inner = self.inner.borrow_mut();
@@ -488,10 +528,16 @@ impl SessionClient {
     }
 
     fn lease(&self, session_id: String, mode: SessionLeaseMode) -> SessionHandle {
-        let generation = {
-            let inner = self.inner.borrow();
-            inner.generations.get(&session_id).copied().unwrap_or(0)
-        };
+        let generation = self.generation(&session_id);
+        self.lease_at(session_id, mode, generation)
+    }
+
+    fn lease_at(
+        &self,
+        session_id: String,
+        mode: SessionLeaseMode,
+        generation: u64,
+    ) -> SessionHandle {
         SessionHandle {
             id: session_id,
             client: self.clone(),
