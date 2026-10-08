@@ -113,16 +113,14 @@ pub fn retry_delay_from_headers(
         }
     }
     if let Some(retry_after) = error.header("retry-after") {
-        let delay_ms = if let Ok(seconds) = retry_after.parse::<f64>() {
-            if seconds.is_nan() {
-                http_date_delay_ms(retry_after, now_ms)
-            } else {
-                seconds * 1000.0
-            }
-        } else {
-            http_date_delay_ms(retry_after, now_ms)
+        let delay_ms = match retry_after.parse::<f64>() {
+            Ok(seconds) if !seconds.is_nan() => Some(seconds * 1000.0),
+            _ => http_date_delay_ms(retry_after, now_ms),
         };
-        return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
+        // An unparseable header falls through to exponential backoff.
+        if let Some(delay_ms) = delay_ms {
+            return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
+        }
     }
     let exponential = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0) * 1000.0;
     let jitter = if cfg!(test) {
@@ -133,10 +131,8 @@ pub fn retry_delay_from_headers(
     Ok((exponential * jitter) as u64)
 }
 
-fn http_date_delay_ms(value: &str, now_ms: i64) -> f64 {
-    parse_http_date_ms(value)
-        .map(|then| (then - now_ms) as f64)
-        .unwrap_or(0.0)
+fn http_date_delay_ms(value: &str, now_ms: i64) -> Option<f64> {
+    parse_http_date_ms(value).map(|then| (then - now_ms) as f64)
 }
 
 fn parse_http_date_ms(value: &str) -> Option<i64> {
@@ -441,6 +437,17 @@ mod tests {
         .unwrap();
         assert_eq!(result, "ok");
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn wor79_invalid_retry_after_falls_back_to_exponential_backoff() {
+        for (retry_index, expected) in [(0, 500), (1, 1000), (3, 4000)] {
+            for value in ["invalid-date", "", "NaN", "Tue, 99 Foo 2030 00:00:00 GMT"] {
+                let error = ProviderError::new(Some(429), "wait").with_header("retry-after", value);
+                let delay = retry_delay_from_headers(&error, retry_index, Some(60_000), 0).unwrap();
+                assert_eq!(delay, expected, "retry-after {value:?}");
+            }
+        }
     }
 
     #[test]
