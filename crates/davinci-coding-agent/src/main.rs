@@ -1227,6 +1227,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.tool_surface =
         settings.tool_surface(std::env::var("DAVINCI_TOOL_SURFACE").ok().as_deref());
     agent.compaction = settings.compaction_settings();
+    agent.set_context_vm_mode(
+        settings.context_vm_mode(std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref()),
+    );
     agent.auto_retry = settings.retry_enabled();
     agent.retry_attempts = settings.retry_max_retries();
     agent.retry_base_delay_ms = settings.retry_base_delay_ms();
@@ -8199,6 +8202,15 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
                 .to_string(),
             )
         }
+        "context-vm" => {
+            stored.context_vm = Some(
+                match value {
+                    "off" | "shadow" | "active" => value,
+                    _ => return Err(format!("context-vm is off, shadow or active, not {value}")),
+                }
+                .to_string(),
+            )
+        }
         "show-hardware-cursor" => stored.show_hardware_cursor = Some(value == "true"),
         "editor-padding" => stored.editor_padding_x = value.parse().ok(),
         "output-padding" => stored.output_pad = value.parse().ok(),
@@ -8287,6 +8299,9 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     agent.effort_policy =
         stored.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.compaction = stored.compaction_settings();
+    agent.set_context_vm_mode(
+        stored.context_vm_mode(std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref()),
+    );
     agent.block_images = stored.block_images();
     agent.auto_resize_images = stored.image_auto_resize();
     agent.transport = stored.transport.clone();

@@ -25,7 +25,7 @@ const TABS: [&str; 4] = ["Status", "Config", "Usage", "Stats"];
 
 pub fn group_rank(key: &str) -> usize {
     match key {
-        "autocompact" | "autocompact-threshold" | "context-bar" | "plan-usage" => 0,
+        "autocompact" | "autocompact-threshold" | "context-bar" | "context-vm" | "plan-usage" => 0,
         "show-images"
         | "image-width-cells"
         | "auto-resize-images"

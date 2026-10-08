@@ -134,6 +134,8 @@ pub struct InteractiveSettingsConfig {
     pub auto_compact_threshold: String,
     /// `off`, `compact` or `full`: the context bar above the input.
     pub context_bar: String,
+    /// `off`, `shadow` or `active`: the Context VM that builds provider context.
+    pub context_vm: String,
     /// ChatGPT plan usage (5-hour and weekly) under it, for openai-codex.
     pub plan_usage: bool,
     /// `/design`: UI concepts rendered in a sandboxed browser.
@@ -208,6 +210,7 @@ impl Default for InteractiveSettingsConfig {
             block_images: false,
             skill_commands: true,
             context_bar: "compact".into(),
+            context_vm: "off".into(),
             plan_usage: true,
             design: false,
             show_hardware_cursor: false,
@@ -317,6 +320,16 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 ),
                 current_value: config.context_bar.clone(),
                 values: vec!["off".into(), "compact".into(), "full".into()],
+            },
+            SettingItem {
+                id: "context-vm".into(),
+                label: "Context VM".into(),
+                description: Some(
+                    "How provider context is built: off (legacy message history), shadow (compile alongside and compare, send legacy), or active (send the Context VM projection). Applies from the next prompt. DAVINCI_CONTEXT_VM overrides it"
+                        .into(),
+                ),
+                current_value: config.context_vm.clone(),
+                values: vec!["off".into(), "shadow".into(), "active".into()],
             },
             bool_item(
                 "plan-usage",
@@ -660,6 +673,29 @@ mod tests {
         assert_eq!(item.label, "Tool output");
         assert_eq!(item.current_value, "false");
         assert_eq!(item.values, vec!["true", "false"]);
+    }
+
+    #[test]
+    fn the_context_vm_row_offers_three_modes_and_defaults_off() {
+        let list = interactive_settings_list(&InteractiveSettingsConfig::default());
+        let item = list
+            .items
+            .iter()
+            .find(|item| item.id == "context-vm")
+            .expect("context-vm");
+        assert_eq!(item.label, "Context VM");
+        assert_eq!(item.current_value, "off");
+        assert_eq!(item.values, vec!["off", "shadow", "active"]);
+        let active = interactive_settings_list(&InteractiveSettingsConfig {
+            context_vm: "active".into(),
+            ..InteractiveSettingsConfig::default()
+        });
+        let item = active
+            .items
+            .iter()
+            .find(|item| item.id == "context-vm")
+            .unwrap();
+        assert_eq!(item.current_value, "active");
     }
 
     #[test]

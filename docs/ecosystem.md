@@ -52,6 +52,10 @@ provider/KV cache = optional backend optimization
 - `active` sends the ContextImage and folds derived state without replacing
   `Agent::messages` or the authoritative session branch.
 
+Set the mode from `/config` (row "Context VM", stored as `contextVm` in
+`settings.json`); it applies from the next prompt. `DAVINCI_CONTEXT_VM`, when set
+to `off`, `shadow` or `active`, overrides the stored value.
+
 Context VM pages use the existing `CacheRuntime` under the `context` namespace
 with persistent immutable, content-addressed IDs. Missing or corrupt pages in
 active mode are replayed from the session branch; missing mandatory policy is a
