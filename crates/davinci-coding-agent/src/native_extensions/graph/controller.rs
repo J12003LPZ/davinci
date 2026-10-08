@@ -769,6 +769,20 @@ impl GraphExecution {
             };
         }
 
+        // A worker that was stopped (operator, graph stop, deadline) never
+        // failed. Reopened, its first attempt gets the original briefing rather
+        // than a retry notice about a failure that did not happen. The durable
+        // attempt history decides, not the task status: a saved pipeline
+        // resets stopped tasks to Pending, and a stop that lands after a real
+        // failure must keep that failure's notice.
+        let reopened_after_stop = self
+            .snapshot()
+            .continuation
+            .as_ref()
+            .and_then(|cursor| cursor.attempt_history.get(&task_id))
+            .and_then(|history| history.last())
+            .is_some_and(|record| record.status == TaskStatus::Cancelled);
+
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(existing) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
@@ -1038,7 +1052,7 @@ impl GraphExecution {
                 self.checkpoint(None);
                 return None;
             }
-            let attempt_briefing = if attempt == 1 {
+            let attempt_briefing = if attempt == 1 || (local_attempt == 1 && reopened_after_stop) {
                 briefing.clone()
             } else {
                 let notice = match last_failure_class {
@@ -1328,6 +1342,14 @@ impl GraphExecution {
                     Some("node stopped by operator".into()),
                 );
                 self.checkpoint(Some("node stopped at safe boundary"));
+                return None;
+            }
+            // A graph stop that kills a worker is not a worker failure: its
+            // diagnostic text must not be classified, spend a retry, or block
+            // the node as Failed.
+            if !result.ok && self.exec_abort.load(Ordering::SeqCst) {
+                self.end_task(&task_id, TaskStatus::Cancelled, None);
+                self.checkpoint(Some(&format!("{task_id}: stopped with the graph")));
                 return None;
             }
             if result.ok {
@@ -3798,6 +3820,10 @@ mod revision_tests;
 #[cfg(test)]
 #[path = "controller_persistence_tests.rs"]
 mod persistence_tests;
+
+#[cfg(test)]
+#[path = "controller_loop_resume_tests.rs"]
+mod loop_resume_tests;
 
 #[cfg(test)]
 mod tests {
