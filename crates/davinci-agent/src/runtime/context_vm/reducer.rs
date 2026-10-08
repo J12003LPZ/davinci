@@ -307,7 +307,7 @@ fn parent_provenance(parent: &CheckpointState) -> ParentSources {
 }
 
 /// Words that carry no claim of their own; they may be dropped from a quote.
-/// Negations are deliberately absent: "do not delete" never grounds "delete".
+/// Negations are deliberately absent: "do not delete" never equals "delete".
 const UNGROUNDED_WORDS: &[&str] = &[
     "a",
     "an",
@@ -349,16 +349,6 @@ const UNGROUNDED_WORDS: &[&str] = &[
     "please",
 ];
 
-/// Words that reverse what follows them in a clause, besides any "n't"
-/// contraction ("don't", "can't", "isn't").
-const NEGATIONS: &[&str] = &[
-    "not", "no", "never", "nor", "without", "avoid", "dont", "cannot", "stop",
-];
-
-fn is_negation(word: &str) -> bool {
-    NEGATIONS.contains(&word) || word.ends_with("n't") || word.ends_with("n\u{2019}t")
-}
-
 /// Whitespace-separated words, lowercased, with surrounding punctuation
 /// trimmed. Inner punctuation stays, so `src/main.rs` and `.env` remain
 /// distinct from `main` and `env`.
@@ -381,7 +371,8 @@ fn content_words(text: &str) -> Vec<String> {
 
 /// Clauses end at `;`, `!`, `?`, a line break, or a period that ends a
 /// sentence (followed by whitespace or the end), never at the dot in a name.
-fn clauses(text: &str) -> Vec<&str> {
+/// Each clause is returned with whether it is a question.
+fn clauses(text: &str) -> Vec<(&str, bool)> {
     let mut clauses = Vec::new();
     let mut start = 0;
     let mut chars = text.char_indices().peekable();
@@ -392,22 +383,24 @@ fn clauses(text: &str) -> Vec<&str> {
             _ => false,
         };
         if ends {
-            clauses.push(&text[start..index]);
+            clauses.push((&text[start..index], c == '?'));
             start = index + c.len_utf8();
         }
     }
-    clauses.push(&text[start..]);
+    clauses.push((&text[start..], false));
     clauses
 }
 
-/// True when `value` quotes one cited source: its content words appear as one
-/// contiguous run inside a single clause of that source, and no negation
-/// precedes the run in that clause. The summarizer may drop function words
-/// but cannot reorder ("tabs, not spaces" never grounds "spaces, not tabs"),
-/// stitch words from different messages, or drop a negation that scopes the
-/// quote ("don't delete the tests" never grounds "delete the tests"). A
-/// negation earlier in the clause rejects even an unrelated quote; that only
-/// costs the summarizer's copy, as the checkpoint keeps the user's own text.
+/// True when `value` reproduces whole clauses of one cited source: its content
+/// words equal those of one or more consecutive clauses, none of them a
+/// question. The summarizer may drop function words and punctuation, and
+/// choose which sentences matter, but cannot cut a clause. Cutting is what
+/// forges intent: "Should we drop the table?", "Deleting the tests is not
+/// acceptable", "I was going to force push but changed my mind" and "my
+/// coworker said to disable auth" all contain a command that is not the
+/// user's. Word-level checks cannot tell those apart; clause boundaries can.
+/// A rejected value costs only the summarizer's copy: the deterministic
+/// checkpoint keeps the user's own text.
 fn grounded_in_sources(
     value: &ProposedStateValue,
     events: &HashMap<&str, &ContextEvent>,
@@ -425,15 +418,23 @@ fn grounded_in_sources(
                 None => return false,
             },
         };
-        clauses(text).into_iter().any(|clause| {
-            let clause = content_words(clause);
-            clause
-                .windows(quote.len())
-                .enumerate()
-                .any(|(start, window)| {
-                    window == quote.as_slice()
-                        && !clause[..start].iter().any(|word| is_negation(word))
-                })
+        let clauses = clauses(text)
+            .into_iter()
+            .map(|(clause, question)| (content_words(clause), question))
+            .filter(|(words, _)| !words.is_empty())
+            .collect::<Vec<_>>();
+        (0..clauses.len()).any(|first| {
+            let mut joined = Vec::new();
+            for (words, question) in &clauses[first..] {
+                if *question {
+                    return false;
+                }
+                joined.extend(words.iter().cloned());
+                if joined.len() >= quote.len() {
+                    return joined == quote;
+                }
+            }
+            false
         })
     })
 }

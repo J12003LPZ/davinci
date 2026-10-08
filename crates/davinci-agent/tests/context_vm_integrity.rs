@@ -67,17 +67,28 @@ fn wor62_grounded_user_values_may_drop_function_words() {
         "user:1",
         1,
         ContextEventKind::User,
-        "Please keep the public API stable and never touch the migrations folder.",
+        "Please keep the public API stable. Never touch the migrations folder; ship by Friday.",
     )];
     let proposal = CheckpointProposal {
         goals: vec![user_value("keep public API stable", "user:1")],
-        constraints: vec![user_value("never touch migrations folder", "user:1")],
+        // Consecutive clauses may be quoted together.
+        constraints: vec![user_value(
+            "never touch migrations folder, ship by Friday",
+            "user:1",
+        )],
         ..CheckpointProposal::default()
     };
     let state = ContextStateReducer::validate_proposal(&Default::default(), &events, proposal);
     assert_eq!(state.goals.len(), 1);
     assert_eq!(state.goals[0].value, "keep public API stable");
     assert_eq!(state.constraints.len(), 1);
+    // Part of a clause is not a quote of it.
+    let proposal = CheckpointProposal {
+        constraints: vec![user_value("touch the migrations folder", "user:1")],
+        ..CheckpointProposal::default()
+    };
+    let state = ContextStateReducer::validate_proposal(&Default::default(), &events, proposal);
+    assert!(state.constraints.is_empty());
     // A negation is a content word: it cannot be added to a quote either.
     let proposal = CheckpointProposal {
         constraints: vec![user_value("do not keep the public API stable", "user:1")],
@@ -88,7 +99,8 @@ fn wor62_grounded_user_values_may_drop_function_words() {
 }
 
 /// Each value below uses only the user's words but says something the user
-/// did not: reordered, stitched across clauses, or stripped of a negation.
+/// did not: reordered, cut out of a negated clause, a question, or reported
+/// speech.
 #[test]
 fn wor62_quotes_cannot_invert_or_restitch_the_users_meaning() {
     let cases = [
@@ -111,6 +123,27 @@ fn wor62_quotes_cannot_invert_or_restitch_the_users_meaning() {
             "Do not, under any circumstances, drop the table.",
             "drop the table",
         ),
+        (
+            "Deleting the tests is not acceptable.",
+            "deleting the tests",
+        ),
+        (
+            "Should we drop the production table?",
+            "drop the production table",
+        ),
+        (
+            "Should we drop the production table?",
+            "we drop the production table",
+        ),
+        ("Rewrite it in Rust? No way.", "rewrite it in rust"),
+        (
+            "I was going to force push to main but changed my mind.",
+            "force push to main",
+        ),
+        (
+            "My coworker said to disable the auth check; I disagree.",
+            "disable the auth check",
+        ),
     ];
     for (said, forged) in cases {
         let events = vec![event("user:1", 1, ContextEventKind::User, said)];
@@ -126,7 +159,7 @@ fn wor62_quotes_cannot_invert_or_restitch_the_users_meaning() {
     }
     // The faithful quotes from the same messages still pass.
     let faithful = [
-        ("Use tabs, not spaces.", "use tabs"),
+        ("Use tabs, not spaces.", "use tabs, not spaces"),
         (
             "Don't delete the tests; clean the build dir.",
             "clean the build dir",
@@ -216,7 +249,7 @@ fn wor62_values_citing_folded_sources_are_grounded_in_parent_state() {
     let current = vec![event("user:2", 2, ContextEventKind::User, "continue")];
     let proposal = CheckpointProposal {
         constraints: vec![
-            user_value("public API stable", "user:1"),
+            user_value("keep public API stable", "user:1"),
             user_value("rewrite everything in Go", "user:1"),
         ],
         ..CheckpointProposal::default()
@@ -227,7 +260,7 @@ fn wor62_values_citing_folded_sources_are_grounded_in_parent_state() {
         .iter()
         .map(|value| value.value.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(values, ["public API stable"]);
+    assert_eq!(values, ["keep public API stable"]);
 }
 
 fn append_user(session: &mut davinci_session::JsonlSession, text: &str) {
