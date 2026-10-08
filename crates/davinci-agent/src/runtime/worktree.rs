@@ -649,12 +649,7 @@ mod tests {
         let precious = lease.path.join("wip.txt");
         std::fs::write(&precious, "uncommitted").unwrap();
         // Break the worktree's git link so every git command in it fails.
-        std::fs::write(
-            lease.path.join(".git"),
-            "gitdir: /nonexistent/gitdir
-",
-        )
-        .unwrap();
+        std::fs::write(lease.path.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
         assert!(manager.check_dirty(&lease).is_err());
         assert!(manager.is_dirty(&lease), "unreadable state is dirty");
         let err = manager.release_lease(&lease, false).unwrap_err();
