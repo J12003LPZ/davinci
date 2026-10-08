@@ -17,6 +17,7 @@ fn event(seq: u64, kind: ContextEventKind, provenance_kind: ProvenanceKind) -> C
         content_hash: format!("hash-{seq}"),
         visible_text: format!("text {seq}"),
         artifact_refs: Vec::new(),
+        images: Vec::new(),
     }
 }
 

@@ -225,6 +225,7 @@ mod request_tests {
             content_hash: format!("h{seq}"),
             visible_text: text.to_string(),
             artifact_refs: Vec::new(),
+            images: Vec::new(),
         }
     }
 
