@@ -9,7 +9,9 @@
 //! Every cell glyph here is in both fonts.
 //!
 //! In the TUI each section shows its heaviest rows and folds the rest into a
-//! count, so a long `/agents` list cannot push the grid off the screen.
+//! count, so one long list (eighty `/agents`) no longer pushes the grid off a
+//! 40-row screen. The cap is per section: three long sections together can
+//! still outgrow a short terminal, and then the block scrolls like any other.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -267,7 +269,10 @@ fn render(
         }
         out.push(Line::from(truncate_run(heading, width)));
         let mut items: Vec<&(String, u64)> = section.items.iter().collect();
-        items.sort_by(|a, b| b.1.cmp(&a.1));
+        if limit.is_some() {
+            // Heaviest first, so the rows kept are the ones worth seeing.
+            items.sort_by(|a, b| b.1.cmp(&a.1));
+        }
         // Folding a single row into "1 more" saves nothing.
         let shown = match limit {
             Some(limit) if items.len() > limit + 1 => limit,
@@ -291,7 +296,8 @@ fn render(
     out
 }
 
-/// The same block as text, for print mode, RPC and the legacy chrome.
+/// The same block as text, every row listed in reported order, for print
+/// mode, RPC and the legacy chrome, which all write to normal scrollback.
 pub fn plain_lines(view: &ContextUsageView, width: u16) -> Vec<String> {
     let theme = Theme::da_vinci(crate::davinci::theme::ColorDepth::TrueColor, true);
     render(&theme, view, width, None)
@@ -469,17 +475,20 @@ mod tests {
     #[test]
     fn print_mode_still_lists_every_row() {
         let rows = plain_lines(&many_agents(), 120);
-        assert_eq!(
-            rows.iter().filter(|row| row.contains("└ agent-")).count(),
-            80
-        );
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row.strip_prefix("     └ agent-"))
+            .collect();
+        assert_eq!(names.len(), 80);
+        // Print mode keeps the order the agent reported.
+        assert!(names[0].starts_with("00:") && names[79].starts_with("79:"));
         assert!(!rows.iter().any(|row| row.contains(" more:")));
     }
 
     #[test]
-    fn cell_glyphs_are_in_cascadia_mono_and_consolas() {
-        // Both fonts carry these WGL4 shapes; the misc-symbols block Claude
-        // Code uses (U+26C0..U+26FF) is in neither.
+    fn cell_glyphs_are_distinct_single_width_wgl4_shapes() {
+        // WGL4 is the set every Windows console font carries. Font coverage
+        // itself is checked against Cascadia Mono in tests/terminal_glyphs.rs.
         for glyph in [FULL, PARTIAL, FREE, BUFFER] {
             assert!(
                 ["■", "▪", "□", "▫", "░", "▒", "▓", "█"].contains(&glyph),

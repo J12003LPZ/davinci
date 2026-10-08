@@ -82,7 +82,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
 
 /// The selection gutter every row starts with, so connectors on spacer and
 /// detail rows sit in the same column as the ones on entry rows.
-const GUTTER: &str = "  ";
+const GUTTER: &str = ui::UNSELECTED_BAR;
 
 fn continuation(trunk: &str) -> String {
     trunk.replace("├── ", "│   ").replace("└── ", "    ")
@@ -174,11 +174,15 @@ mod tests {
         );
         for pair in rows.windows(2) {
             let above: Vec<char> = pair[0].chars().collect();
+            // A connector may hang from an entry's id, never from a digit in
+            // its label, detail or time.
+            let id_at = above.iter().position(|c| c.is_ascii_digit()).filter(|at| {
+                above.get(at + 2..at + 4) == Some(&[' ', ' ']) && above[at + 1].is_ascii_digit()
+            });
             for (index, ch) in pair[1].chars().enumerate() {
                 if ch == '│' || ch == '├' || ch == '└' {
-                    let joined = above
-                        .get(index)
-                        .is_some_and(|c| matches!(c, '│' | '├' | '0'..='9'));
+                    let joined = above.get(index).is_some_and(|c| matches!(c, '│' | '├'))
+                        || id_at == Some(index);
                     assert!(
                         joined,
                         "loose connector at {index}:
@@ -195,7 +199,18 @@ mod tests {
             row.find("fix the store")
                 .map(|at| row[..at].chars().count())
         };
-        assert!(label_at(&rows[focus]).is_some());
-        assert_eq!(label_at(&rows[focus + 1]), label_at(&rows[focus]));
+        let start = label_at(&rows[focus]).expect("focused label");
+        assert_eq!(label_at(&rows[focus + 1]), Some(start));
+        // Every detail row under the focus starts at the same column.
+        for row in rows[focus + 1..]
+            .iter()
+            .take_while(|row| !row.contains("── "))
+        {
+            let text_at = row
+                .chars()
+                .position(|c| !matches!(c, ' ' | '│'))
+                .unwrap_or(start);
+            assert_eq!(text_at, start, "{row}");
+        }
     }
 }

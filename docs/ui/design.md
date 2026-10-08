@@ -33,11 +33,13 @@ full, `▪` partial, `□` free, `▒` the autocompact buffer filling from the e
 beside a legend with the model, the used/total tokens and each category —
 system prompt, system tools, MCP tools, custom agents, memory files
 (repository context files), messages — then the members of the MCP, agent and
-memory categories, heaviest first: eight rows each, the rest folded into one
-`└ N more: X tokens` row so a long agent list never scrolls the grid away
-(print mode lists every row). Claude Code's own cells (`⛁ ⛀ ⛶ ⛝`) are not in
-Cascadia Mono or Consolas, and Windows terminals draw them as overlapping
-fallback boxes, so the grid uses WGL4 shapes every console font carries. Figures come from `Agent::context_usage()` and add up to the
+memory categories. In the TUI each category lists its eight heaviest rows
+and folds the rest into one `└ N more: X tokens` row (a list one row over the
+limit is shown whole), so a long agent list no longer scrolls the grid away;
+print mode lists every row in reported order. Claude Code's own cells
+(`⛁ ⛀ ⛶ ⛝`) are not in Cascadia Mono or Consolas, and Windows terminals
+draw them as overlapping fallback boxes, so the grid uses WGL4 shapes every
+console font carries. Figures come from `Agent::context_usage()` and add up to the
 same estimate that drives pruning and compaction. Below 72 columns the legend
 moves under the grid. There is no skills category: DaVinci loads skill bodies
 on demand, so they are not in the window. The prepared-manifest inspector
