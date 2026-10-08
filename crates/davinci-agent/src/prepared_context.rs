@@ -161,7 +161,7 @@ mod tests {
         for index in 0..200 {
             agent.messages.push(ChatMessage::text(
                 "user",
-                &format!("turn {index} {}", "x".repeat(200)),
+                format!("turn {index} {}", "x".repeat(200)),
             ));
         }
         let one_scan = {

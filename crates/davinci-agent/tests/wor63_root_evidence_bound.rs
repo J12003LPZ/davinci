@@ -11,9 +11,9 @@ fn wor63_root_evidence_refs_stay_bounded_in_tool_heavy_sessions() {
     let mut messages = vec![ChatMessage::text("user", "run many tools")];
     for index in 0..2_000 {
         messages.push(ChatMessage::tool_result(
-            &format!("call-{index}"),
+            format!("call-{index}"),
             "read",
-            &format!("output {index}"),
+            format!("output {index}"),
             false,
         ));
     }

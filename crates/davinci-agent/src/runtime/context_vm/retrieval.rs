@@ -87,35 +87,6 @@ fn page_lines<'a>(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wor68_first_page_pulls_only_one_line_past_the_limit() {
-        let pulled = std::cell::Cell::new(0usize);
-        let lines =
-            std::iter::repeat_n("line", 1_000_000).inspect(|_| pulled.set(pulled.get() + 1));
-        let (content, next) = page_lines(lines, 0, 1);
-        assert_eq!(content, "line");
-        assert_eq!(next, Some(1));
-        assert!(pulled.get() <= 2, "pulled {} lines", pulled.get());
-    }
-
-    #[test]
-    fn wor68_paging_matches_the_previous_offset_and_next_offset_semantics() {
-        let text = "a\nb\nc\nd\ne";
-        let page = |offset, limit| page_lines(text.lines(), offset, limit);
-        assert_eq!(page(0, 2), ("a\nb".to_string(), Some(2)));
-        assert_eq!(page(2, 2), ("c\nd".to_string(), Some(4)));
-        assert_eq!(page(4, 2), ("e".to_string(), None));
-        assert_eq!(page(9, 2), (String::new(), None));
-        assert_eq!(page(0, 5), ("a\nb\nc\nd\ne".to_string(), None));
-        let filtered = text.lines().filter(|line| *line != "b");
-        assert_eq!(page_lines(filtered, 1, 2), ("c\nd".to_string(), Some(3)));
-    }
-}
-
 pub fn retrieve_context_tool(
     input: &Value,
     context: &ToolContext,
@@ -162,4 +133,33 @@ fn retrieve_page(runtime: &ContextVmRuntime, requested: &str) -> Result<(String,
     let content = serde_json::to_string_pretty(&object)
         .map_err(|error| format!("context page render failed: {error}"))?;
     Ok((format!("ctx://page/{}", page.id), content))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wor68_first_page_pulls_only_one_line_past_the_limit() {
+        let pulled = std::cell::Cell::new(0usize);
+        let lines =
+            std::iter::repeat_n("line", 1_000_000).inspect(|_| pulled.set(pulled.get() + 1));
+        let (content, next) = page_lines(lines, 0, 1);
+        assert_eq!(content, "line");
+        assert_eq!(next, Some(1));
+        assert!(pulled.get() <= 2, "pulled {} lines", pulled.get());
+    }
+
+    #[test]
+    fn wor68_paging_matches_the_previous_offset_and_next_offset_semantics() {
+        let text = "a\nb\nc\nd\ne";
+        let page = |offset, limit| page_lines(text.lines(), offset, limit);
+        assert_eq!(page(0, 2), ("a\nb".to_string(), Some(2)));
+        assert_eq!(page(2, 2), ("c\nd".to_string(), Some(4)));
+        assert_eq!(page(4, 2), ("e".to_string(), None));
+        assert_eq!(page(9, 2), (String::new(), None));
+        assert_eq!(page(0, 5), ("a\nb\nc\nd\ne".to_string(), None));
+        let filtered = text.lines().filter(|line| *line != "b");
+        assert_eq!(page_lines(filtered, 1, 2), ("c\nd".to_string(), Some(3)));
+    }
 }

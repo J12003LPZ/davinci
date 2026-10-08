@@ -14,7 +14,7 @@ fn wor73_hot_entry_estimate_covers_the_wire_message_for_every_event_kind() {
     let events = events_from_messages(&[
         ChatMessage::text("user", format!("user {escapes}")),
         ChatMessage::text("assistant", format!("assistant {escapes}")),
-        ChatMessage::tool_result("call-1", "read", &format!("tool {escapes}"), false),
+        ChatMessage::tool_result("call-1", "read", format!("tool {escapes}"), false),
         ChatMessage::text("custom", format!("custom {escapes}")),
         ChatMessage::text("user", "latest"),
     ]);
