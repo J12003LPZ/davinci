@@ -79,12 +79,15 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
 
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let raw_lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
     let mut records = Vec::new();
-    let total = raw_lines.len();
+    // Stream one line at a time. Peeking one ahead tells us whether the current
+    // line is the final one, which is the only line allowed to be torn.
+    let mut lines = reader.lines().enumerate().peekable();
 
-    for (idx, line) in raw_lines.iter().enumerate() {
+    while let Some((idx, line)) = lines.next() {
+        let line = line?;
+        let is_last = lines.peek().is_none();
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -95,7 +98,7 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
             Ok(v) => v,
             Err(e) => {
                 // If this is the last line, tolerate an incomplete partial tail
-                if idx == total - 1 {
+                if is_last {
                     break;
                 }
                 return Err(RuntimeLogError::CorruptRecord {
@@ -118,7 +121,7 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
         match serde_json::from_value::<T>(value) {
             Ok(record) => records.push(record),
             Err(e) => {
-                if idx == total - 1 {
+                if is_last {
                     break;
                 }
                 return Err(RuntimeLogError::CorruptRecord {
