@@ -739,7 +739,7 @@ pub fn footnote(
 /// Instrumenta). The bar is three cells wide on screen, whatever its byte
 /// length.
 pub const SELECTION_BAR: &str = "❯ ";
-const UNSELECTED_BAR: &str = "  ";
+pub const UNSELECTED_BAR: &str = "  ";
 
 /// The selection bar on the tint, or its blank.
 pub fn selection_bar(selected: bool, theme: &Theme) -> Span<'static> {

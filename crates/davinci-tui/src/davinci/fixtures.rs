@@ -1825,7 +1825,7 @@ pub fn review() -> ReviewSheet {
                 "crates\\davinci-ai\\src\\openai.rs",
                 Some(64),
                 Some(19),
-                "✓ 14 tests pass",
+                "14 tests pass",
                 State::Done,
                 "hunk 2 of 5",
                 vec![
@@ -1855,7 +1855,7 @@ pub fn review() -> ReviewSheet {
                 "crates\\davinci-ai\\src\\stream.rs",
                 Some(38),
                 Some(11),
-                "✓ 6 tests pass",
+                "6 tests pass",
                 State::Done,
                 "hunk 1 of 3",
                 vec![
@@ -1899,7 +1899,7 @@ pub fn review() -> ReviewSheet {
                 "crates\\davinci-ai\\tests\\stream.rs · new",
                 Some(17),
                 None,
-                "✓ 4 tests pass",
+                "4 tests pass",
                 State::Done,
                 "the whole file",
                 vec![
