@@ -1,9 +1,15 @@
 //! `/context`: the context window as a ten-by-ten grid of cells beside a
 //! per-category legend, then the members of the categories that have them.
 //!
-//! Follows Claude Code's `/context` output: `⛁` a full cell, `⛀` a partly
-//! used one, `⛶` free space and `⛝` the autocompact buffer, which fills the
-//! grid from the end.
+//! Follows Claude Code's `/context` layout: `■` a full cell, `▪` a partly
+//! used one, `□` free space and `▒` the autocompact buffer, which fills the
+//! grid from the end. Claude Code draws `⛁ ⛀ ⛶ ⛝`, but neither Cascadia Mono
+//! (Windows Terminal) nor Consolas (conhost) has them, so the terminal falls
+//! back to a wider symbol font and the grid turns into overlapping boxes.
+//! Every cell glyph here is in both fonts.
+//!
+//! In the TUI each section shows its heaviest rows and folds the rest into a
+//! count, so a long `/agents` list cannot push the grid off the screen.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,10 +19,10 @@ use crate::davinci::model::{ContextKind, ContextUsageView};
 use crate::davinci::theme::{Cc, Theme};
 use crate::davinci::ui::{span, truncate_run};
 
-pub const FULL: &str = "⛁";
-pub const PARTIAL: &str = "⛀";
-pub const FREE: &str = "⛶";
-pub const BUFFER: &str = "⛝";
+pub const FULL: &str = "■";
+pub const PARTIAL: &str = "▪";
+pub const FREE: &str = "□";
+pub const BUFFER: &str = "▒";
 
 const COLUMNS: usize = 10;
 const ROWS: usize = 10;
@@ -25,6 +31,8 @@ const CELLS: usize = COLUMNS * ROWS;
 const INDENT: &str = "     ";
 /// Below this the legend moves under the grid.
 const SIDE_BY_SIDE: u16 = 72;
+/// Rows a section shows in the TUI before folding the rest into a count.
+pub const SECTION_ROWS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cell {
@@ -179,6 +187,28 @@ fn legend(theme: &Theme, view: &ContextUsageView) -> Vec<Vec<Span<'static>>> {
 }
 
 pub fn lines(theme: &Theme, view: &ContextUsageView, width: u16) -> Vec<Line<'static>> {
+    render(theme, view, width, Some(SECTION_ROWS))
+}
+
+fn item_row(cc: &Cc, theme: &Theme, name: String, tokens: u64, width: u16) -> Line<'static> {
+    Line::from(truncate_run(
+        vec![
+            Span::raw(INDENT),
+            span("└ ", cc.inactive),
+            span(format!("{name}: "), theme.text),
+            span(format!("{} tokens", format_tokens(tokens)), cc.inactive),
+        ],
+        width,
+    ))
+}
+
+/// `limit` caps each section's rows, heaviest first; `None` lists them all.
+fn render(
+    theme: &Theme,
+    view: &ContextUsageView,
+    width: u16,
+    limit: Option<usize>,
+) -> Vec<Line<'static>> {
     let cc = theme.cc();
     let mut out = vec![Line::from(vec![
         span(ELBOW, cc.inactive),
@@ -236,16 +266,26 @@ pub fn lines(theme: &Theme, view: &ContextUsageView, width: u16) -> Vec<Line<'st
             heading.push(span(format!(" · {command}"), cc.inactive));
         }
         out.push(Line::from(truncate_run(heading, width)));
-        for (name, tokens) in &section.items {
-            out.push(Line::from(truncate_run(
-                vec![
-                    Span::raw(INDENT),
-                    span("└ ", cc.inactive),
-                    span(format!("{name}: "), theme.text),
-                    span(format!("{} tokens", format_tokens(*tokens)), cc.inactive),
-                ],
+        let mut items: Vec<&(String, u64)> = section.items.iter().collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1));
+        // Folding a single row into "1 more" saves nothing.
+        let shown = match limit {
+            Some(limit) if items.len() > limit + 1 => limit,
+            _ => items.len(),
+        };
+        for (name, tokens) in &items[..shown] {
+            out.push(item_row(&cc, theme, name.clone(), *tokens, width));
+        }
+        let rest = &items[shown..];
+        if !rest.is_empty() {
+            let tokens = rest.iter().map(|(_, tokens)| tokens).sum();
+            out.push(item_row(
+                &cc,
+                theme,
+                format!("{} more", rest.len()),
+                tokens,
                 width,
-            )));
+            ));
         }
     }
     out
@@ -254,7 +294,7 @@ pub fn lines(theme: &Theme, view: &ContextUsageView, width: u16) -> Vec<Line<'st
 /// The same block as text, for print mode, RPC and the legacy chrome.
 pub fn plain_lines(view: &ContextUsageView, width: u16) -> Vec<String> {
     let theme = Theme::da_vinci(crate::davinci::theme::ColorDepth::TrueColor, true);
-    lines(&theme, view, width)
+    render(&theme, view, width, None)
         .into_iter()
         .map(|line| {
             line.spans
@@ -344,18 +384,18 @@ mod tests {
     fn plain_block_has_the_header_grid_legend_and_sections() {
         let rows = plain_lines(&view(), 120);
         assert_eq!(rows[0], "  ⎿  Context Usage");
-        assert!(rows[1].starts_with("     ⛁ ⛀ "));
+        assert!(rows[1].starts_with("     ■ ▪ "));
         assert!(rows[1].ends_with("claude-opus-5-5 · 40k/200k tokens (20%)"));
         assert!(rows[3].ends_with("Estimated usage by category"));
         assert!(rows
             .iter()
-            .any(|row| row.ends_with("⛁ System prompt: 3.1k tokens (1.6%)")));
+            .any(|row| row.ends_with("■ System prompt: 3.1k tokens (1.6%)")));
         assert!(rows
             .iter()
-            .any(|row| row.ends_with("⛶ Free space: 127.6k (63.8%)")));
+            .any(|row| row.ends_with("□ Free space: 127.6k (63.8%)")));
         assert!(rows
             .iter()
-            .any(|row| row.ends_with("⛝ Autocompact buffer: 32.4k tokens (16.2%)")));
+            .any(|row| row.ends_with("▒ Autocompact buffer: 32.4k tokens (16.2%)")));
         assert!(rows.iter().any(|row| row == "     Memory files"));
         assert!(rows.iter().any(|row| row == "     └ AGENTS.md: 900 tokens"));
     }
@@ -363,8 +403,92 @@ mod tests {
     #[test]
     fn narrow_terminals_put_the_legend_under_the_grid() {
         let rows = plain_lines(&view(), 40);
-        assert!(rows[1].trim_start().starts_with('⛁'));
+        assert!(rows[1].trim_start().starts_with('■'));
         assert!(!rows[1].contains("tokens"));
         assert!(rows.iter().all(|row| row.chars().count() <= 40));
+    }
+
+    fn many_agents() -> ContextUsageView {
+        let mut view = view();
+        view.sections = vec![ContextSection {
+            title: "Custom agents".into(),
+            command: Some("/agents".into()),
+            items: (0..80)
+                .map(|index| (format!("agent-{index:02}"), 40 + index as u64))
+                .collect(),
+        }];
+        view
+    }
+
+    fn text(view: &ContextUsageView, width: u16) -> Vec<String> {
+        let theme = Theme::da_vinci(crate::davinci::theme::ColorDepth::TrueColor, true);
+        lines(&theme, view, width)
+            .iter()
+            .map(|line| {
+                line.to_string()
+                    .replace('\u{a0}', " ")
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_section_shows_its_heaviest_rows_and_folds_the_rest() {
+        let rows = text(&many_agents(), 120);
+        let items: Vec<&String> = rows.iter().filter(|row| row.contains("└ ")).collect();
+        assert_eq!(items.len(), SECTION_ROWS + 1);
+        assert_eq!(items[0].as_str(), "     └ agent-79: 119 tokens");
+        assert_eq!(
+            items[SECTION_ROWS - 1].as_str(),
+            "     └ agent-72: 112 tokens"
+        );
+        // The other 72 rows hold 40..=111 tokens.
+        let rest: u64 = (40..=111).sum();
+        assert_eq!(
+            items[SECTION_ROWS].as_str(),
+            format!("     └ 72 more: {} tokens", format_tokens(rest))
+        );
+        // The whole block fits one 40-row screen, grid first.
+        assert!(rows.len() < 40, "{} rows", rows.len());
+        assert!(rows[1].starts_with("     ■"));
+    }
+
+    #[test]
+    fn a_section_one_over_the_limit_is_listed_whole() {
+        let mut view = many_agents();
+        view.sections[0].items.truncate(SECTION_ROWS + 1);
+        let rows = text(&view, 120);
+        assert!(!rows.iter().any(|row| row.contains(" more:")));
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("└ ")).count(),
+            SECTION_ROWS + 1
+        );
+    }
+
+    #[test]
+    fn print_mode_still_lists_every_row() {
+        let rows = plain_lines(&many_agents(), 120);
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("└ agent-")).count(),
+            80
+        );
+        assert!(!rows.iter().any(|row| row.contains(" more:")));
+    }
+
+    #[test]
+    fn cell_glyphs_are_in_cascadia_mono_and_consolas() {
+        // Both fonts carry these WGL4 shapes; the misc-symbols block Claude
+        // Code uses (U+26C0..U+26FF) is in neither.
+        for glyph in [FULL, PARTIAL, FREE, BUFFER] {
+            assert!(
+                ["■", "▪", "□", "▫", "░", "▒", "▓", "█"].contains(&glyph),
+                "{glyph} is not in the WGL4 set every Windows console font draws"
+            );
+            assert_eq!(unicode_width::UnicodeWidthStr::width(glyph), 1);
+        }
+        let distinct: std::collections::HashSet<_> =
+            [FULL, PARTIAL, FREE, BUFFER].into_iter().collect();
+        assert_eq!(distinct.len(), 4);
     }
 }
