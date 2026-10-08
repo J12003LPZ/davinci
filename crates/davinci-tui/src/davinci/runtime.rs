@@ -431,6 +431,12 @@ impl Session {
         self.terminal.clear()
     }
 
+    /// Forget what is on screen so the next draw paints every cell: for when
+    /// something wrote to the terminal behind the renderer's back.
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.terminal.clear()
+    }
+
     /// The next input event, or `None` when `timeout` passes without one.
     ///
     /// All davinci input comes through here so a paste that the platform

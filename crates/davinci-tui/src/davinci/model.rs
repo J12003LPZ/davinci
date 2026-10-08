@@ -402,6 +402,9 @@ pub struct Working {
     /// Ticks left on the glint drawn when the rolling count crosses a
     /// thousand. Zero when there is nothing to celebrate.
     pub glint: u8,
+    /// A fixed word for work that is not a turn (`Compacting conversation`),
+    /// in place of the seeded verb.
+    pub label: Option<&'static str>,
 }
 
 /// Quiet ticks before the spinner starts warming toward the error color.
@@ -473,6 +476,9 @@ impl Working {
     pub fn verb(&self) -> &'static str {
         if self.interrupting {
             return "Interrupting";
+        }
+        if let Some(label) = self.label {
+            return label;
         }
         const VERBS: [&str; 20] = [
             "Boondoggling",
@@ -4139,6 +4145,18 @@ mod tests {
         assert!(!m.transcript.is_empty(), "the transcript survives");
         assert!(m.working.as_ref().unwrap().interrupting);
         assert_eq!(m.working.as_ref().unwrap().verb(), "Interrupting");
+    }
+
+    #[test]
+    fn a_labelled_working_line_says_what_it_does() {
+        let mut working = Working::new();
+        working.verb_seed = 3;
+        let seeded = working.verb();
+        working.label = Some("Compacting conversation");
+        assert_eq!(working.verb(), "Compacting conversation");
+        assert_ne!(seeded, "Compacting conversation");
+        working.interrupting = true;
+        assert_eq!(working.verb(), "Interrupting");
     }
 
     #[test]

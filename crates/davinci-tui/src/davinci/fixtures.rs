@@ -1986,6 +1986,7 @@ fn working() -> crate::davinci::model::Working {
         verb_seed: 0,
         thought_for: None,
         reasoning: false,
+        label: None,
     }
 }
 
