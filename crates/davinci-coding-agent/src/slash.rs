@@ -131,6 +131,18 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Read-only planning with revisions, edits, and explicit execution handoff",
             Some("[show|diff|edit <id> <text>|reject|accept [mode]]"),
         ),
+        // Host-owned like /plan: listed here so the composer completes them,
+        // carried out by the design controller, not by `parse_line`.
+        (
+            "design",
+            "Design artifacts: generate, review and export UI concepts",
+            Some("[new \"brief\"|list|open|status|revise|verify|export|apply …]"),
+        ),
+        (
+            "design-sync",
+            "Retain repository facts for design artifacts",
+            Some("<relative-path>"),
+        ),
         (
             "workflow",
             "Workflow runs: list, status <id>, cancel <id>",
@@ -520,6 +532,30 @@ mod tests {
             assert!(!names.iter().any(|candidate| candidate == name));
             let input = format!("/{name}");
             assert_eq!(parse_line(&input), SlashAction::Prompt(input));
+        }
+    }
+
+    #[test]
+    fn design_commands_are_advertised_and_reach_the_design_controller() {
+        let commands = builtin_slash_commands();
+        for name in ["design", "design-sync"] {
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.name == name)
+                    .count(),
+                1,
+                "/{name}"
+            );
+        }
+        // Left as the typed line, which `design::is_command` routes.
+        for line in [
+            "/design",
+            "/design new \"a pricing page\"",
+            "/design-sync src",
+        ] {
+            assert_eq!(parse_line(line), SlashAction::Prompt(line.into()));
+            assert!(davinci_coding_agent::design::is_command(line), "{line}");
         }
     }
 

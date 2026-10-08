@@ -2509,6 +2509,80 @@ fn a_question_with_nothing_in_it_still_produces_a_panel() {
 }
 
 #[test]
+fn design_without_a_runtime_offers_to_install_it() {
+    use davinci_coding_agent::design::setup::{Installer, SetupNeeded};
+    let agent = davinci_agent::Agent::new("test");
+    let question = Question::DesignSetup {
+        line: "/design".into(),
+        needed: SetupNeeded::Runtime("no design runtime is installed".into()),
+        installer: Some(Installer {
+            program: "pwsh".into(),
+            script: "C:/davinci/scripts/setup-design-runtime.ps1".into(),
+        }),
+    };
+    let panel = question.ask(&agent);
+    assert_eq!(panel.key, "/design");
+    let labels: Vec<_> = panel.items.iter().map(|item| item.label.as_str()).collect();
+    assert_eq!(labels, ["Install now", "Not now"]);
+    assert!(panel.note.contains("no design runtime is installed"));
+    assert!(panel.note.contains("setup-design-runtime.ps1"));
+}
+
+#[test]
+fn design_with_a_runtime_but_switched_off_only_offers_the_switch() {
+    use davinci_coding_agent::design::setup::SetupNeeded;
+    let agent = davinci_agent::Agent::new("test");
+    let panel = Question::DesignSetup {
+        line: "/design list".into(),
+        needed: SetupNeeded::Disabled,
+        installer: None,
+    }
+    .ask(&agent);
+    let labels: Vec<_> = panel.items.iter().map(|item| item.label.as_str()).collect();
+    assert_eq!(labels, ["Turn on design artifacts", "Not now"]);
+    assert!(panel.note.contains("turned off"));
+}
+
+#[test]
+fn a_launcher_variable_that_settings_cannot_change_is_named_not_reinstalled() {
+    let stored = crate::settings::Settings {
+        design_enabled: Some(true),
+        design_runtime: Some("C:/rt/new".into()),
+        design_node: Some("C:/node.exe".into()),
+        ..Default::default()
+    };
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    };
+    // Startup copied settings into the environment: nothing overrides.
+    assert_eq!(
+        design_launch_override(
+            &stored,
+            env(&[
+                ("DAVINCI_DESIGN_ENABLED", "1"),
+                ("DAVINCI_DESIGN_RUNTIME", "C:/rt/new"),
+                ("DAVINCI_DESIGN_NODE", "C:/node.exe"),
+            ])
+        ),
+        None
+    );
+    assert_eq!(design_launch_override(&stored, env(&[])), None);
+    assert_eq!(
+        design_launch_override(&stored, env(&[("DAVINCI_DESIGN_RUNTIME", "C:/rt/old")])),
+        Some("DAVINCI_DESIGN_RUNTIME")
+    );
+    assert_eq!(
+        design_launch_override(&stored, env(&[("DAVINCI_DESIGN_ENABLED", "0")])),
+        Some("DAVINCI_DESIGN_ENABLED")
+    );
+}
+
+#[test]
 fn an_unknown_slash_command_is_still_a_prompt() {
     // Skills and templates arrive this way; the agent expands them.
     // Extension commands never reach here — `on_line` runs them first.

@@ -121,6 +121,9 @@ impl TrustedDesignRuntime {
         let node = node.canonicalize()?;
         let root = root.canonicalize()?;
         let workspace = workspace.canonicalize()?;
+        if super::setup::workspace_holds_home(&workspace) {
+            return Err(DesignError::Denied(super::setup::HOME_WORKSPACE.into()));
+        }
         if node.starts_with(&workspace) || root.starts_with(&workspace) {
             return Err(DesignError::Denied(
                 "design runtime must be installed outside the workspace".into(),
