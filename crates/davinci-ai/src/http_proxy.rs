@@ -69,7 +69,9 @@ fn should_proxy_hostname(hostname: &str, port: u16, env: Option<&HashMap<String,
                 return true;
             }
             if !proxy_hostname.starts_with(['.', '*']) {
-                return hostname != proxy_hostname;
+                // A bare domain also covers its subdomains, on a label boundary.
+                return hostname != proxy_hostname
+                    && !hostname.ends_with(&format!(".{proxy_hostname}"));
             }
             if let Some(stripped) = proxy_hostname.strip_prefix('*') {
                 proxy_hostname = stripped.to_string();
@@ -326,5 +328,35 @@ mod tests {
             "http://inherited.example:1"
         );
         std::env::remove_var("WOR85_PROBE_PROXY");
+    }
+
+    fn proxied(no_proxy: &str, target: &str) -> bool {
+        let scoped = env(&[
+            ("HTTPS_PROXY", "http://proxy.example:8080"),
+            ("NO_PROXY", no_proxy),
+        ]);
+        resolve_http_proxy_url_for_target(target, Some(&scoped))
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn wor77_bare_domain_no_proxy_covers_subdomains() {
+        assert!(!proxied("example.com", "https://example.com"));
+        assert!(!proxied("example.com", "https://api.example.com"));
+        assert!(!proxied("example.com", "https://a.b.example.com"));
+        assert!(proxied("example.com", "https://evil-example.com"));
+        assert!(proxied("example.com", "https://example.com.evil.org"));
+        // Port scoped entries keep their port scope.
+        assert!(!proxied("example.com:8443", "https://api.example.com:8443"));
+        assert!(proxied("example.com:8443", "https://api.example.com"));
+    }
+
+    #[test]
+    fn wor76_wildcard_entry_inside_list_bypasses_proxy() {
+        assert!(!proxied("localhost,*", "https://example.org"));
+        assert!(!proxied("*,localhost", "https://example.org"));
+        assert!(!proxied("localhost *", "https://example.org"));
+        assert!(proxied("localhost,internal.test", "https://example.org"));
     }
 }
