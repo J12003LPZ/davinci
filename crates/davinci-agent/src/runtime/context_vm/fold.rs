@@ -80,9 +80,15 @@ pub struct ContextFoldPolicy {
     pub window_pressure_percent: u8,
 }
 
+/// Delta-depth and delta-token folds are maintenance, not pressure relief. Every fold bumps the
+/// cache epoch and namespace, which discards the provider's warm prefix, so below this share of
+/// the window they wait for real pressure instead of rotating the cache on a fixed cadence.
+const MAINTENANCE_MIN_WINDOW_PERCENT: u64 = 50;
+
 impl ContextFoldPolicy {
     /// Honor the operator's compaction threshold in active VM mode too.
-    /// Delta maintenance remains independent of the context-pressure trigger.
+    /// Delta maintenance stays independent of the pressure trigger but is held back
+    /// until the compiled context fills `MAINTENANCE_MIN_WINDOW_PERCENT` of the window.
     pub fn decide_automatic(
         &self,
         root: &ContextRoot,
@@ -97,23 +103,38 @@ impl ContextFoldPolicy {
                 reason: None,
             };
         }
-        if settings.threshold.is_some() {
+        let decision = if settings.threshold.is_some() {
             if crate::should_compact(compiled_tokens, context_window, settings) {
                 return ContextFoldDecision {
                     should_fold: true,
                     reason: Some(FoldReason::WindowPressure),
                 };
             }
-            return self.decide(root, delta_tokens, 0, 0, false, false);
+            self.decide(root, delta_tokens, 0, 0, false, false)
+        } else {
+            self.decide(
+                root,
+                delta_tokens,
+                compiled_tokens,
+                context_window,
+                false,
+                false,
+            )
+        };
+        let maintenance = matches!(
+            decision.reason,
+            Some(FoldReason::DeltaDepth | FoldReason::DeltaTokens)
+        );
+        let below_floor = context_window > 0
+            && compiled_tokens.saturating_mul(100)
+                < context_window.saturating_mul(MAINTENANCE_MIN_WINDOW_PERCENT);
+        if maintenance && below_floor {
+            return ContextFoldDecision {
+                should_fold: false,
+                reason: None,
+            };
         }
-        self.decide(
-            root,
-            delta_tokens,
-            compiled_tokens,
-            context_window,
-            false,
-            false,
-        )
+        decision
     }
 
     pub fn decide(
@@ -217,14 +238,14 @@ mod threshold_tests {
         };
         assert_eq!(
             policy
-                .decide_automatic(&root, 2000, 3000, 100_000, &settings)
+                .decide_automatic(&root, 2000, 60_000, 100_000, &settings)
                 .reason,
             Some(FoldReason::DeltaTokens)
         );
         root.updates_since_fold = 3;
         assert_eq!(
             policy
-                .decide_automatic(&root, 0, 3000, 100_000, &settings)
+                .decide_automatic(&root, 0, 60_000, 100_000, &settings)
                 .reason,
             Some(FoldReason::DeltaDepth)
         );
@@ -237,6 +258,42 @@ mod threshold_tests {
                 .decide_automatic(&root, 0, 80_000, 100_000, &defaults)
                 .reason,
             Some(FoldReason::WindowPressure)
+        );
+    }
+
+    #[test]
+    fn maintenance_folds_wait_for_window_fill_so_the_provider_cache_stays_warm() {
+        let policy = ContextFoldPolicy {
+            max_delta_pages: 3,
+            max_delta_tokens: 2000,
+            window_pressure_percent: 80,
+        };
+        let root = ContextRoot {
+            updates_since_fold: 8,
+            ..ContextRoot::default()
+        };
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 1000,
+            threshold: None,
+        };
+        for threshold in [None, Some(CompactionThreshold::Percent(90))] {
+            let settings = CompactionSettings {
+                threshold,
+                ..settings
+            };
+            // Depth and token triggers are both met, but the window is nearly empty.
+            let early = policy.decide_automatic(&root, 5000, 3000, 100_000, &settings);
+            assert!(!early.should_fold, "{threshold:?}: {early:?}");
+            let filled = policy.decide_automatic(&root, 5000, 50_000, 100_000, &settings);
+            assert!(filled.should_fold, "{threshold:?}: {filled:?}");
+        }
+        // Unknown window keeps the structural triggers.
+        assert!(
+            policy
+                .decide_automatic(&root, 0, 3000, 0, &settings)
+                .should_fold
         );
     }
 }

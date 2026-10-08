@@ -567,3 +567,36 @@ fn persistent_and_file_read_boundaries_reject_symlink_escape() {
     )
     .is_err());
 }
+
+#[test]
+fn disabled_cache_reports_cancellation_that_happens_during_compute() {
+    let cache = CacheRuntime::new(
+        CacheConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        None,
+    );
+    let token = davinci_agent::CancellationToken::new();
+    let result = cache.get_or_compute(
+        &request("disabled-cancel", vec![]),
+        || Ok(()),
+        Some(&token),
+        || {
+            token.cancel();
+            Ok(7_u64)
+        },
+    );
+    assert!(matches!(result, Err(CacheError::Cancelled)));
+
+    let live = davinci_agent::CancellationToken::new();
+    let value = cache
+        .get_or_compute(
+            &request("disabled-live", vec![]),
+            || Ok(()),
+            Some(&live),
+            || Ok(7_u64),
+        )
+        .unwrap();
+    assert_eq!(*value, 7);
+}

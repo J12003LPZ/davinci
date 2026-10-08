@@ -496,6 +496,7 @@ impl StreamDecoder for CompletionsDecoder {
 /// reasoning token count the chat-completions shape carries.
 fn completions_usage(model: &Model, usage: &Value) -> davinci_protocol::Usage {
     let mut computed = usage_from_value(model, usage);
+    computed.cache_write_unreported = crate::stream_decoder::cache_write_unreported(usage);
     if let Some(reasoning) = usage
         .pointer("/completion_tokens_details/reasoning_tokens")
         .and_then(Value::as_u64)

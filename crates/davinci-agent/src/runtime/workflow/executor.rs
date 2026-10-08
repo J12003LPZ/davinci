@@ -907,6 +907,22 @@ impl WorkflowExecutor {
                 if outcome.is_ok() {
                     break;
                 }
+                // A failed attempt may already have applied part of its
+                // file changes, and nothing marks an operation boundary to
+                // resume from. Rerunning it would repeat those effects.
+                if attempt < retry_limit
+                    && crate::subagent::tools_may_mutate(
+                        &req.tools,
+                        &self.runtime.capability_registry,
+                    )
+                {
+                    if let Err(error) = &mut outcome {
+                        error.push_str(
+                            " (not retried: the worker can modify files and may have partly applied changes)",
+                        );
+                    }
+                    break;
+                }
                 attempt += 1;
             }
 
@@ -1450,6 +1466,93 @@ mod tests {
         let p_state = &final_state.phases["vote"];
         assert_eq!(p_state.status, PhaseStatus::Completed);
         assert_eq!(p_state.completed_workers.len(), 2);
+    }
+
+    fn retrying_writer_spec(tool: &str) -> WorkflowSpec {
+        WorkflowSpec {
+            schema_version: 1,
+            name: "retry-writer".into(),
+            max_parallel_agents: 1,
+            max_total_agents: 1,
+            max_cost_usd: None,
+            deadline_ms: None,
+            phases: vec![WorkflowPhaseSpec {
+                id: "step".into(),
+                depends_on: vec![],
+                join: WorkflowJoin::All,
+                workers: vec![WorkflowWorkerSpec {
+                    id: "writer".into(),
+                    prompt: "work".into(),
+                    agent_profile: None,
+                    model: None,
+                    tools: vec![tool.into()],
+                    isolation: None,
+                    max_turns: None,
+                    retry_budget: Some(2),
+                }],
+            }],
+        }
+    }
+
+    fn writer_launch() -> WorkflowLaunch {
+        WorkflowLaunch {
+            parent_permission_mode: Some(crate::PermissionMode::AlwaysApprove),
+            parent_tools: vec!["read".into(), "write".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wor26_failed_mutating_worker_is_not_retried_after_a_partial_effect() {
+        use std::io::Write as _;
+        let (executor, tmp) = setup_executor(None);
+        let target = tmp.path().join("effect.log");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (att, path) = (Arc::clone(&attempts), target.clone());
+        let runner = SubagentRunner::new(move |_| {
+            att.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "applied").unwrap();
+            Err("crashed before the success receipt".into())
+        });
+        let executor = WorkflowExecutor::new(
+            executor.runtime.clone(),
+            WorkflowStateStore::with_options(32 * 1024, tmp.path().to_path_buf()),
+            Some(runner),
+        );
+        let error = executor
+            .execute_with(retrying_writer_spec("write"), writer_launch())
+            .unwrap_err();
+        assert!(error.to_string().contains("not retried"), "{error}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "applied
+"
+        );
+    }
+
+    #[test]
+    fn wor26_failed_read_only_worker_is_still_retried_under_a_writer_launch() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let att = Arc::clone(&attempts);
+        let runner = SubagentRunner::new(move |_| {
+            if att.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err("transient glitch".into())
+            } else {
+                Ok("recovered".into())
+            }
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let state = executor
+            .execute_with(retrying_writer_spec("read"), writer_launch())
+            .unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

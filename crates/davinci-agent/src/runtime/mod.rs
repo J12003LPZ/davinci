@@ -462,6 +462,11 @@ impl RuntimeHandle {
         }
         let mut worker =
             Self::new(self.run_id, child, RuntimeBus::new()).with_worker_state_from(self);
+        // A child folds and binds sources on its own timeline. Sharing the
+        // parent's Arc-backed checkpoint, events and source binding would let
+        // either side overwrite the other's Context VM state.
+        worker.context_vm =
+            context_vm::ContextVmRuntime::new(self.context_vm.config().clone(), self.cache.clone());
         worker.agent_id = child;
         worker.parent_agent_id = Some(self.agent_id);
         worker.operations = worker
@@ -817,5 +822,57 @@ mod conversation_identity_tests {
         );
         assert_eq!(parent_context.agent_id, parent.agent_id);
         assert!(parent_context.worker_id.is_none());
+    }
+
+    #[test]
+    fn worker_context_vm_is_isolated_from_parent() {
+        let (parent, workspace) = runtime_with_operations();
+        let child_id = AgentId::new();
+        parent
+            .registry
+            .register_agent(AgentRecord {
+                id: child_id,
+                run_id: parent.run_id,
+                parent: Some(parent.agent_id),
+                kind: AgentKind::Subagent,
+                name: "vm-isolation-child".into(),
+                provider: String::new(),
+                model_id: String::new(),
+                cwd: workspace.path().to_path_buf(),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 1,
+                updated_ms: 1,
+                failure_reason: None,
+            })
+            .unwrap();
+        parent
+            .registry
+            .transition(child_id, AgentState::Running)
+            .unwrap();
+        parent.context_vm.bind_session_source(
+            workspace.path().join("parent.jsonl"),
+            "parent-session".into(),
+        );
+        let root_before = parent.context_vm.root();
+        let child = parent.for_worker(child_id, None).unwrap();
+        assert!(!child.context_vm.shares_state_with(&parent.context_vm));
+        let mut child_root = child.context_vm.root();
+        child_root.epoch = 99;
+        child_root.cache_namespace = "child-namespace".into();
+        child.context_vm.install_root(child_root, 7);
+        child
+            .context_vm
+            .bind_session_source(workspace.path().join("child.jsonl"), "child-session".into());
+        assert_eq!(parent.context_vm.root(), root_before);
+        assert_eq!(
+            parent.context_vm.bound_session_id().as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(
+            child.context_vm.bound_session_id().as_deref(),
+            Some("child-session")
+        );
     }
 }

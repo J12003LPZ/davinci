@@ -1,4 +1,4 @@
-use super::{ContextPageKind, ContextPageRef, ContextVmRuntime};
+use super::ContextVmRuntime;
 use crate::tools::{ToolContext, ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -94,16 +94,18 @@ fn retrieve_page(runtime: &ContextVmRuntime, requested: &str) -> Result<(String,
         .strip_prefix("ctx://page/")
         .or_else(|| requested.strip_prefix("context_vm:"))
         .unwrap_or(requested);
+    // Only pages the active root references are this conversation's. Page
+    // IDs are content-addressed and the cache is shared, so a well-formed ID
+    // from another session would otherwise load that session's state.
     let root = runtime.root();
-    let page = root
+    let Some(page) = root
         .checkpoint
         .iter()
         .chain(&root.deltas)
         .chain(&root.episodes)
         .find(|page| page.id == page_id)
         .cloned()
-        .or_else(|| parse_page_ref(page_id));
-    let Some(page) = page else {
+    else {
         return Err("context page unavailable; replay/rebuild required".into());
     };
     let object = runtime
@@ -113,26 +115,4 @@ fn retrieve_page(runtime: &ContextVmRuntime, requested: &str) -> Result<(String,
     let content = serde_json::to_string_pretty(&object)
         .map_err(|error| format!("context page render failed: {error}"))?;
     Ok((format!("ctx://page/{}", page.id), content))
-}
-
-fn parse_page_ref(id: &str) -> Option<ContextPageRef> {
-    let mut parts = id.splitn(3, ':');
-    let prefix = parts.next()?;
-    let kind = parts.next()?;
-    let hash = parts.next()?;
-    if prefix != "ctx" || hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let kind = match kind {
-        "checkpoint" => ContextPageKind::Checkpoint,
-        "delta" => ContextPageKind::Delta,
-        "episode" => ContextPageKind::Episode,
-        _ => return None,
-    };
-    Some(ContextPageRef {
-        id: id.into(),
-        kind,
-        content_hash: hash.into(),
-        estimated_tokens: 0,
-    })
 }

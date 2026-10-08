@@ -361,7 +361,16 @@ pub fn compact_messages_with_options(
             }
         }
     } else {
-        (local_summary(history, custom_instructions), None)
+        // No summarizer is installed (an embedder that supplied none): compress locally within a
+        // budget that is a fraction of the history, never a copy of the transcript.
+        let budget_tokens = (estimate_context_tokens(history) / LOCAL_SUMMARY_SHARE_DIVISOR).clamp(
+            LOCAL_SUMMARY_MIN_TOKENS,
+            reserve_tokens.max(LOCAL_SUMMARY_MIN_TOKENS),
+        );
+        (
+            local_summary(history, custom_instructions, budget_tokens as usize * 4),
+            None,
+        )
     };
     summary.push_str(&format_file_operations(
         &details.read_files,
@@ -411,16 +420,54 @@ pub fn branch_summary_context_message(summary: &str) -> ChatMessage {
     )
 }
 
-fn local_summary(messages: &[ChatMessage], custom_instructions: Option<&str>) -> String {
-    let mut summary = serialize_conversation(messages);
+/// The local fallback keeps at most this fraction (1/N) of the history it replaces.
+const LOCAL_SUMMARY_SHARE_DIVISOR: u64 = 4;
+const LOCAL_SUMMARY_MIN_TOKENS: u64 = 64;
+
+/// Deterministic fallback when no model summarizer is available. The serialized conversation
+/// is cut to `max_bytes`, keeping the opening request and the most recent work and marking the
+/// elided middle, so the result is always smaller than the history it replaces.
+fn local_summary(
+    messages: &[ChatMessage],
+    custom_instructions: Option<&str>,
+    max_bytes: usize,
+) -> String {
+    let conversation = serialize_conversation(messages);
+    let mut summary = if conversation.len() <= max_bytes {
+        conversation
+    } else {
+        let marker_budget = 96;
+        let keep = max_bytes.saturating_sub(marker_budget);
+        let head_len = floor_char_boundary(&conversation, keep / 4);
+        let tail_start = ceil_char_boundary(&conversation, conversation.len() - (keep - keep / 4));
+        let omitted = tail_start.saturating_sub(head_len);
+        format!(
+            "{}\n[... {omitted} bytes omitted by local compaction; no summarizer was available ...]\n{}",
+            &conversation[..head_len],
+            &conversation[tail_start..]
+        )
+    };
     if let Some(instructions) = custom_instructions {
         summary.push_str("\nInstructions: ");
         summary.push_str(instructions);
-    } else {
-        summary.push('\n');
-        summary.push_str(SUMMARIZATION_PROMPT);
     }
     summary
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn generate_compaction_summary(
@@ -562,6 +609,7 @@ fn combine_usage(first: &Usage, second: &Usage) -> Usage {
         output: first.output + second.output,
         cache_read: first.cache_read + second.cache_read,
         cache_write: first.cache_write + second.cache_write,
+        cache_write_unreported: first.cache_write_unreported || second.cache_write_unreported,
         reasoning: match (first.reasoning, second.reasoning) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),

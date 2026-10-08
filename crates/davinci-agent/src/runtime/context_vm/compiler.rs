@@ -42,7 +42,10 @@ impl ContextCompiler {
         for page in &request.root.deltas {
             let object = self.load_page(page)?;
             let content = object_content(&object)?;
-            let entry = page_entry(page, "delta", content, true);
+            // A delta changes on routine turns; keeping it out of the stable
+            // prefix lets the checkpoint before it stay cached.
+            let mut entry = page_entry(page, "delta", content, true);
+            entry.stable_for_cache = false;
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
             messages.push(ChatMessage::text("custom", entry.content.clone()));
             entries.push(entry);
@@ -97,6 +100,11 @@ impl ContextCompiler {
         }
 
         for page in &request.root.episodes {
+            // Episodes are optional: a descriptor is never smaller than its empty skeleton,
+            // so when even that cannot fit, skip without touching the object store.
+            if used_tokens.saturating_add(episode_descriptor_floor_tokens(page)) > optional_limit {
+                continue;
+            }
             let object = self.load_page(page)?;
             let content = episode_descriptor(&page.id, &object)?;
             let entry = page_entry(page, "episode", content, false);
@@ -330,6 +338,22 @@ fn episode_descriptor(page_id: &str, object: &ContextObject) -> Result<String, S
             return Ok(rendered);
         }
     }
+}
+
+/// Lower bound on the estimated tokens `episode_descriptor` can produce for `page`,
+/// computed without loading it: the descriptor with every variable field empty.
+fn episode_descriptor_floor_tokens(page: &ContextPageRef) -> u64 {
+    let skeleton = serde_json::json!({
+        "type": "episode",
+        "title": "",
+        "outcome": "",
+        "source_refs": Vec::<String>::new(),
+        "artifact_refs": Vec::<String>::new(),
+        "recover": episode_recovery_hint(&page.id),
+    })
+    .to_string();
+    let source_ref = format!("context_vm:{}", page.id);
+    estimate_tokens(wrap_untrusted_data(&source_ref, &skeleton).len())
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {

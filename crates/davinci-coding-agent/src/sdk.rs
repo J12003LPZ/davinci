@@ -40,6 +40,9 @@ pub struct CreateAgentSessionOptions {
     pub scoped_models: Option<Vec<String>>,
     /// Extra tool names to register (TS `customTools`).
     pub custom_tools: Option<Vec<String>>,
+    /// Model-backed summarizer for compaction. Without one, auto-compaction falls back to a
+    /// bounded local summary; the `davinci` CLI installs its live provider summarizer itself.
+    pub summarizer: Option<davinci_agent::Summarizer>,
 }
 
 #[derive(Debug, Clone)]
@@ -595,6 +598,7 @@ pub fn create_agent_session(
         .collect();
     agent.auto_compaction = settings.compaction_enabled();
     agent.compaction = settings.compaction_settings();
+    agent.summarizer = options.summarizer.clone();
     agent.block_images = settings.block_images();
     agent.auto_resize_images = settings.image_auto_resize();
 
@@ -841,6 +845,24 @@ mod tests {
             .as_ref()
             .expect("manifest must be present");
         assert_eq!(manifest.profile, "stable");
+    }
+
+    #[test]
+    fn sdk_session_installs_the_embedder_summarizer_for_compaction() {
+        let dir = tempdir().unwrap();
+        let build = |summarizer| {
+            create_agent_session(CreateAgentSessionOptions {
+                cwd: Some(dir.path().to_path_buf()),
+                agent_dir: Some(dir.path().join("agent")),
+                session_dir: Some(dir.path().join("sessions")),
+                summarizer,
+                ..CreateAgentSessionOptions::default()
+            })
+            .unwrap()
+        };
+        assert!(build(None).session.agent.summarizer.is_none());
+        let summarizer = davinci_agent::Summarizer::new(|_| Err("fixture".into()));
+        assert!(build(Some(summarizer)).session.agent.summarizer.is_some());
     }
 
     #[test]

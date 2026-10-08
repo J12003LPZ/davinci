@@ -174,6 +174,12 @@ impl ContextStateReducer {
                 _ => {}
             }
         }
+        // Without a summarizer nothing merges these excerpts, so a long run
+        // would grow the checkpoint by one goal per prompt forever. Keep the
+        // original request and the most recent ones; every dropped value stays
+        // retrievable by its source_ref.
+        keep_first_and_recent(&mut state.goals, FALLBACK_GOAL_LIMIT);
+        keep_recent(&mut state.verification, FALLBACK_VERIFICATION_LIMIT);
         state.through_seq = state
             .through_seq
             .max(events.iter().map(|event| event.seq).max().unwrap_or(0));
@@ -433,6 +439,21 @@ fn provenance(event: &ContextEvent, kind: ProvenanceKind) -> ProvenanceRef {
         kind,
         source_refs: vec![event.source_ref.clone()],
         content_hash: event.content_hash.clone(),
+    }
+}
+
+const FALLBACK_GOAL_LIMIT: usize = 16;
+const FALLBACK_VERIFICATION_LIMIT: usize = 8;
+
+fn keep_first_and_recent(values: &mut Vec<StateValue<String>>, limit: usize) {
+    if values.len() > limit && limit > 1 {
+        values.drain(1..values.len() - (limit - 1));
+    }
+}
+
+fn keep_recent(values: &mut Vec<StateValue<String>>, limit: usize) {
+    if values.len() > limit {
+        values.drain(..values.len() - limit);
     }
 }
 

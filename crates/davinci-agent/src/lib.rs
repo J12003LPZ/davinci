@@ -2375,22 +2375,47 @@ impl Agent {
         }
     }
 
+    /// Newest native Responses record on the active branch, for diagnostics.
     pub fn native_responses_resume_record(
         &self,
     ) -> Option<davinci_ai::NativeResponsesResumeRecord> {
-        let session = self.session.as_ref()?;
-        session.entries.iter().rev().find_map(|entry| {
-            if entry.entry_type != "custom"
-                || entry.custom_type.as_deref()
-                    != Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE)
-            {
-                return None;
-            }
-            entry.extra.get("data").and_then(|value| {
-                serde_json::from_value::<davinci_ai::NativeResponsesResumeRecord>(value.clone())
-                    .ok()
+        self.native_responses_resume_records().next()
+    }
+
+    /// Newest record on the active branch that can continue `provider_messages`.
+    /// A newer record whose projection no longer matches (a rewritten turn, a
+    /// compaction) must not hide an older ancestor that still does.
+    pub fn native_responses_resume_record_for(
+        &self,
+        provider_messages: &[ChatMessage],
+    ) -> Option<davinci_ai::NativeResponsesResumeRecord> {
+        self.native_responses_resume_records()
+            .find(|record| record.matches_provider_prefix(provider_messages))
+    }
+
+    /// Records on the active branch, newest first. Only this branch's ancestry
+    /// can continue the provider-side conversation; a record written on an
+    /// abandoned branch describes turns the request will not contain.
+    fn native_responses_resume_records(
+        &self,
+    ) -> impl Iterator<Item = davinci_ai::NativeResponsesResumeRecord> + '_ {
+        self.session
+            .iter()
+            .flat_map(|session| {
+                davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref())
             })
-        })
+            .rev()
+            .filter(|entry| {
+                entry.entry_type == "custom"
+                    && entry.custom_type.as_deref()
+                        == Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE)
+            })
+            .filter_map(|entry| {
+                entry.extra.get("data").and_then(|value| {
+                    serde_json::from_value::<davinci_ai::NativeResponsesResumeRecord>(value.clone())
+                        .ok()
+                })
+            })
     }
 
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
@@ -3818,10 +3843,12 @@ impl Agent {
                 estimated_tokens: estimated_before,
             });
         }
+        // Only the active branch's ancestry may seed the next summary; an
+        // abandoned branch's compaction describes a conversation that the
+        // user navigated away from.
         let previous_summary = self.session.as_ref().and_then(|session| {
-            session
-                .entries
-                .iter()
+            davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref())
+                .into_iter()
                 .rev()
                 .find(|entry| entry.entry_type == "compaction")
                 .and_then(|entry| {
@@ -3881,7 +3908,7 @@ impl Agent {
                         serde_json::to_value(usage).unwrap_or_default(),
                     );
                 }
-                let _ = session.append_entry(SessionEntry {
+                let saved = session.append_entry(SessionEntry {
                     id: String::new(),
                     entry_type: "compaction".into(),
                     parent_id: session.leaf_id.clone(),
@@ -3891,6 +3918,16 @@ impl Agent {
                     custom_type: None,
                     extra,
                 });
+                // A checkpoint that never reached the journal must not shorten
+                // live history: a restart would rebuild the uncompacted branch
+                // while this process kept only the summary.
+                if let Err(error) = saved {
+                    result.compacted = false;
+                    result.summary = format!("Compaction not saved: {error}");
+                    result.messages = self.messages.clone();
+                    result.first_kept_entry_id = String::new();
+                    result.tokens_after = result.tokens_before;
+                }
             }
         }
         if result.compacted {
@@ -4535,24 +4572,19 @@ fn first_kept_entry_id(
     before: &[ChatMessage],
     after: &[ChatMessage],
 ) -> String {
-    let kept = after.len().saturating_sub(1);
-    let first_kept_index = before.len().saturating_sub(kept);
-    let mut message_index = 0usize;
-    for entry in &session.entries {
-        if entry.entry_type == "compaction" {
-            continue;
-        }
-        if entry_to_chat(entry).is_none() {
-            continue;
-        }
-        if message_index == first_kept_index {
-            return entry.id.clone();
-        }
-        message_index += 1;
-    }
-    session
-        .entries
-        .last()
+    // `before` is the active branch's context projection (summary of any
+    // earlier compaction first, then the kept and newer messages), not the
+    // append-only journal. Align against that same projection, from the tail,
+    // because the kept messages are always the most recent ones.
+    let kept = after.len().saturating_sub(1).min(before.len());
+    let context: Vec<&SessionEntry> =
+        davinci_session::build_context_entries(&session.entries, session.leaf_id.as_deref())
+            .into_iter()
+            .filter(|entry| entry_to_chat(entry).is_some())
+            .collect();
+    context
+        .get(context.len().saturating_sub(kept))
+        .or_else(|| context.last())
         .map(|entry| entry.id.clone())
         .unwrap_or_default()
 }

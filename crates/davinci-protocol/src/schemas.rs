@@ -147,6 +147,14 @@ pub struct Usage {
     pub cache_read: u64,
     #[serde(rename = "cacheWrite")]
     pub cache_write: u64,
+    /// The provider did not report a cache-write count, so `cache_write` is a
+    /// placeholder 0 and not a measured zero.
+    #[serde(
+        rename = "cacheWriteUnreported",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub cache_write_unreported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
     #[serde(rename = "totalTokens")]
@@ -174,6 +182,7 @@ impl Usage {
             output,
             cache_read,
             cache_write,
+            cache_write_unreported: false,
             reasoning: None,
             total_tokens: input + output + cache_read + cache_write,
             cost,

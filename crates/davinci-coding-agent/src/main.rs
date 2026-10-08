@@ -2802,6 +2802,39 @@ fn effective_provider_tool_schema_hash(
     davinci_agent::runtime::compute_schema_hash(&serialized)
 }
 
+/// Prompt-cache routing key for a live provider request. Hashes only what is
+/// actually sent in the cacheable prefix, so a mode switch that leaves the
+/// system prompt and tool schema untouched keeps the same key.
+fn live_cache_key(
+    model: &davinci_ai::Model,
+    auth: &ResolvedAuth,
+    system: &str,
+    agent: &Agent,
+    request_tools: &[ToolSpec],
+) -> String {
+    davinci_agent::CacheIdentity {
+        provider: model.provider.clone(),
+        model_id: model.id.clone(),
+        system_prompt_hash: davinci_agent::hash_system_prompt_with_manifest(
+            system,
+            agent.prompt_manifest.as_ref(),
+        ),
+        tool_schema_hash: effective_provider_tool_schema_hash(model, auth, request_tools),
+        permission_surface_hash: davinci_agent::hash_tool_names(
+            &agent
+                .visible_tool_names()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+        context_item_hashes: agent.context_vm_cache_affinity().into_iter().collect(),
+        agent_profile_hash: None,
+        contract_hash: None,
+        role: Some("root".into()),
+    }
+    .cache_key()
+}
+
 fn complete_prompt_with_host(
     parsed: &Args,
     agent: &mut Agent,
@@ -3394,39 +3427,7 @@ fn complete_prompt_with_host(
                     let cache_key = std::env::var("PI_GRAPH_CACHE_KEY")
                         .ok()
                         .filter(|s| !s.is_empty())
-                        .or_else(|| {
-                            Some(
-                                davinci_agent::CacheIdentity {
-                                    provider: model.provider.clone(),
-                                    model_id: model.id.clone(),
-                                    system_prompt_hash:
-                                        davinci_agent::hash_system_prompt_with_manifest(
-                                            &system,
-                                            current.prompt_manifest.as_ref(),
-                                        ),
-                                    tool_schema_hash: effective_provider_tool_schema_hash(
-                                        model,
-                                        auth,
-                                        &request_tools,
-                                    ),
-                                    permission_surface_hash: davinci_agent::hash_tool_names(
-                                        &current
-                                            .visible_tool_names()
-                                            .iter()
-                                            .map(String::as_str)
-                                            .collect::<Vec<_>>(),
-                                    ),
-                                    context_item_hashes: current
-                                        .context_vm_cache_affinity()
-                                        .into_iter()
-                                        .collect(),
-                                    agent_profile_hash: None,
-                                    contract_hash: None,
-                                    role: Some("root".into()),
-                                }
-                                .cache_key(),
-                            )
-                        });
+                        .or_else(|| Some(live_cache_key(model, auth, &system, current, &request_tools)));
                     let result = live_complete_streaming_with_sink_envelope(
                         model,
                         &provider_messages,
@@ -3449,7 +3450,7 @@ fn complete_prompt_with_host(
                             cache_key,
                             cache_retention: None,
                             native_responses_resume:
-                                current.native_responses_resume_record(),
+                                current.native_responses_resume_record_for(&provider_messages),
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
                             output_schema: current.output_schema.clone(),
@@ -12876,6 +12877,10 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "wor33_cache_identity_tests.rs"]
+mod wor33_cache_identity_tests;
 
 fn teammate_idle_timeout() -> std::time::Duration {
     std::env::var("DAVINCI_TEAMMATE_IDLE_TIMEOUT_MS")

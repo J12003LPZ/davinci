@@ -96,6 +96,7 @@ mod tests {
             output: 200,
             cache_read: 300,
             cache_write: 50,
+            cache_write_unreported: false,
             reasoning: Some(100),
             total_tokens: 650,
             cost: Default::default(),

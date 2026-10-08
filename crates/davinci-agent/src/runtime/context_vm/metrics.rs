@@ -24,6 +24,13 @@ pub struct ContextVmMetrics {
     pub prefix_churn: u64,
     pub tokens_before_fold: u64,
     pub tokens_after_fold: u64,
+    /// Session JSONL lines read while resolving exact source references.
+    pub source_lines_scanned: u64,
+    /// Pages the cache did not persist (disabled, too large, disk failure).
+    /// The live process still holds them; a restart rebuilds from the session.
+    pub page_writes_not_durable: u64,
+    /// Page loads served from the in-process pin after the cache lost them.
+    pub pinned_page_loads: u64,
 }
 
 impl ContextVmMetrics {

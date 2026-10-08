@@ -60,6 +60,7 @@ pub struct ContextVmRuntime {
     pub(crate) events: Arc<RwLock<Vec<ContextEvent>>>,
     pub(crate) source_contents: Arc<RwLock<HashMap<String, String>>>,
     session_source: Arc<RwLock<Option<sources::SessionSource>>>,
+    source_index: Arc<std::sync::Mutex<sources::SourceIndex>>,
     metrics: Arc<RwLock<ContextVmMetrics>>,
     diagnostics: Arc<RwLock<diagnostics::ContextVmDiagnostics>>,
 }
@@ -83,6 +84,7 @@ impl ContextVmRuntime {
             events: Arc::new(RwLock::new(Vec::new())),
             source_contents: Arc::new(RwLock::new(HashMap::new())),
             session_source: Arc::new(RwLock::new(None)),
+            source_index: Arc::default(),
             metrics,
             diagnostics: Arc::default(),
         }
@@ -119,6 +121,7 @@ impl ContextVmRuntime {
             root.cache_namespace =
                 digest(format!("ctxvm_cache_namespace_v2:{}:{checkpoint}", root.epoch).as_bytes());
         }
+        self.store.retain_pinned(&root);
         let mut state = self
             .state
             .write()
@@ -315,13 +318,16 @@ impl ContextVmRuntime {
             );
             return Ok(root);
         }
+        // The checkpoint opens the provider's cached prefix, so a routine
+        // turn must not rewrite it. The newest delta carries the full state
+        // (see load_state_from_root) and replaces the previous one; a fold
+        // later merges it into a new checkpoint.
         let page = self
             .store
-            .save(&ContextObject::Checkpoint(delta.checkpoint_patch.clone()))
+            .save(&ContextObject::Delta(delta.clone()))
             .map_err(|error| error.to_string())?;
         let mut root = self.root();
-        root.checkpoint = Some(page);
-        root.deltas.clear();
+        root.deltas = vec![page];
         root.updates_since_fold = root.updates_since_fold.saturating_add(1);
         root.hot_event_refs = self.hot_refs(events);
         root.evidence_refs = evidence_refs(events);

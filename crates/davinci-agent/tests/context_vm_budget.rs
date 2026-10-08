@@ -400,3 +400,38 @@ fn oversized_complete_live_tool_exchange_blocks_dispatch() {
     assert!(result.unwrap_err().contains("compilation token budget"));
     assert_eq!(agent.run_stats().model_turns, 0);
 }
+
+#[test]
+fn optional_episodes_that_cannot_fit_are_never_loaded() {
+    use davinci_agent::runtime::context_vm::{ContextPageKind, ContextPageRef};
+
+    // Never saved: loading it would fail. Only a skipped page compiles cleanly.
+    let unsaved = ContextPageRef {
+        id: "ctx:episode:never-saved".into(),
+        kind: ContextPageKind::Episode,
+        content_hash: "0".repeat(64),
+        estimated_tokens: 10,
+    };
+    let root = ContextRoot {
+        episodes: vec![unsaved],
+        ..Default::default()
+    };
+    let compiler = ContextCompiler::new(ContextObjectStore::new(CacheRuntime::default()));
+    let packet = ContextPacket::empty();
+    let compile = |max_tokens| {
+        compiler.compile(ContextCompileRequest {
+            root: &root,
+            hot_events: &[],
+            broker_packet: &packet,
+            max_tokens,
+        })
+    };
+
+    let tight = compile(16).expect("episode that cannot fit must be skipped, not loaded");
+    assert!(tight
+        .entries
+        .iter()
+        .all(|entry| entry.category != "episode"));
+    // With room for the descriptor the page is a candidate, so the load happens and fails closed.
+    assert!(compile(100_000).is_err());
+}

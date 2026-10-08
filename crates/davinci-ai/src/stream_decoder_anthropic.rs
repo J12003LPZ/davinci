@@ -56,6 +56,8 @@ struct TokenCounts {
     output: u64,
     cache_read: u64,
     cache_write: u64,
+    /// Set once a usage object carried `cache_creation_input_tokens`.
+    cache_write_reported: bool,
     reasoning: Option<u64>,
 }
 
@@ -121,6 +123,7 @@ impl AnthropicDecoder {
             output: count(&usage, "output_tokens").unwrap_or(0),
             cache_read: count(&usage, "cache_read_input_tokens").unwrap_or(0),
             cache_write: count(&usage, "cache_creation_input_tokens").unwrap_or(0),
+            cache_write_reported: count(&usage, "cache_creation_input_tokens").is_some(),
             reasoning: None,
         };
         self.recompute_usage();
@@ -138,6 +141,7 @@ impl AnthropicDecoder {
             counts.cache_write,
         );
         usage.reasoning = counts.reasoning;
+        usage.cache_write_unreported = !counts.cache_write_reported;
         self.message.usage = Some(usage);
     }
 
@@ -376,6 +380,7 @@ impl AnthropicDecoder {
             }
             if let Some(cache_write) = count(usage, "cache_creation_input_tokens") {
                 self.counts.cache_write = cache_write;
+                self.counts.cache_write_reported = true;
             }
             // Reasoning tokens are a subset of output_tokens, reported only
             // on the final delta.

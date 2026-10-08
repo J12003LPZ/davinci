@@ -1166,10 +1166,10 @@ impl Agent {
                     let native_responses_resume = output.native_responses_resume.clone();
                     let message = output.message;
                     if let Some(usage) = &message.usage {
-                        self.tool_context.cache.record_provider_usage(
+                        self.tool_context.cache.record_provider_usage_with_write(
                             usage.input,
                             usage.cache_read,
-                            usage.cache_write,
+                            (!usage.cache_write_unreported).then_some(usage.cache_write),
                         );
                         self.tool_context
                             .cache

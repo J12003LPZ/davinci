@@ -456,6 +456,7 @@ mod tests {
             output: 2_000,
             cache_read: 0,
             cache_write: 0,
+            cache_write_unreported: false,
             reasoning: None,
             total_tokens: 3_000,
             cost: davinci_protocol::UsageCost {

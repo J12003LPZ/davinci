@@ -88,7 +88,8 @@ fn materialized_updates_do_not_repeat_full_states_in_a_delta_chain() {
     for n in 0..12 {
         messages.push(ChatMessage::text("user", format!("goal {n}")));
         vm.append_delta(&events_from_messages(&messages)).unwrap();
-        assert!(vm.root().deltas.is_empty());
+        // The newest delta replaces the previous one; it never chains.
+        assert!(vm.root().deltas.len() <= 1);
     }
     assert_eq!(vm.load_state_from_root().unwrap().goals.len(), 12);
     assert!(vm.root().updates_since_fold >= 8);
