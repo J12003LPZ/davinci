@@ -35,19 +35,22 @@ pub fn models_store_path(agent_dir: &Path) -> PathBuf {
 }
 
 pub fn load_models_store(agent_dir: &Path) -> ModelsStore {
-    fs::read_to_string(models_store_path(agent_dir))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let path = models_store_path(agent_dir);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return ModelsStore::default();
+    };
+    serde_json::from_str(&raw).unwrap_or_else(|_| {
+        // Keep the unreadable file for inspection instead of letting the next
+        // save overwrite it; the catalog is only a cache, so start empty.
+        let _ = fs::rename(&path, path.with_extension("json.corrupt"));
+        ModelsStore::default()
+    })
 }
 
 pub fn save_models_store(agent_dir: &Path, store: &ModelsStore) -> Result<(), String> {
-    fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
-    fs::write(
-        models_store_path(agent_dir),
-        serde_json::to_string_pretty(store).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())
+    let json = serde_json::to_string_pretty(store).map_err(|err| err.to_string())?;
+    davinci_sys::fs::atomic_write(&models_store_path(agent_dir), json.as_bytes())
+        .map_err(|err| err.to_string())
 }
 
 pub fn now_ms() -> u64 {
@@ -160,6 +163,39 @@ mod tests {
             .into_iter()
             .find(|model| model.provider == "openai" && model.base_url.is_some())
             .expect("built-in OpenAI model")
+    }
+
+    #[test]
+    fn wor82_save_replaces_the_file_instead_of_truncating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = ModelsStore::default();
+        old.providers
+            .insert("old".into(), ModelsStoreEntry::default());
+        save_models_store(dir.path(), &old).unwrap();
+        // A second link to the same file still sees the old bytes only if the
+        // save published a new file; an in-place truncating write would change it.
+        let alias = dir.path().join("alias.json");
+        fs::hard_link(models_store_path(dir.path()), &alias).unwrap();
+        let before = fs::read_to_string(&alias).unwrap();
+
+        let mut new = ModelsStore::default();
+        new.providers
+            .insert("new".into(), ModelsStoreEntry::default());
+        save_models_store(dir.path(), &new).unwrap();
+
+        assert_eq!(fs::read_to_string(&alias).unwrap(), before);
+        assert_eq!(load_models_store(dir.path()), new);
+    }
+
+    #[test]
+    fn wor82_corrupt_store_is_quarantined_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = models_store_path(dir.path());
+        fs::write(&path, "{ not json").unwrap();
+        assert_eq!(load_models_store(dir.path()), ModelsStore::default());
+        let quarantined = fs::read_to_string(dir.path().join("models-store.json.corrupt")).unwrap();
+        assert_eq!(quarantined, "{ not json");
+        assert!(!path.exists());
     }
 
     #[test]
