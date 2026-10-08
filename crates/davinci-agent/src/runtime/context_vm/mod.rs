@@ -724,12 +724,20 @@ pub fn context_checkpoint_entry(
     }
 }
 
+/// The root keeps only recent tool-result refs; older ones stay pageable
+/// through their sources, so a long session does not grow the checkpoint root.
+pub const MAX_ROOT_EVIDENCE_REFS: usize = 64;
+
 fn evidence_refs(events: &[ContextEvent]) -> Vec<String> {
-    events
+    let mut recent: Vec<String> = events
         .iter()
+        .rev()
         .filter(|event| event.kind == ContextEventKind::ToolResult)
+        .take(MAX_ROOT_EVIDENCE_REFS)
         .map(|event| event.source_ref.clone())
-        .collect()
+        .collect();
+    recent.reverse();
+    recent
 }
 
 fn estimate_state_tokens(state: &CheckpointState) -> u64 {
