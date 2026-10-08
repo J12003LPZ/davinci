@@ -483,7 +483,7 @@ fn a_replaced_conversation_with_fewer_rows_does_not_resurrect_a_stale_offset() {
     // Same first entry, same length, almost no rows (an agent mark draws none).
     let mut replaced = vec![Entry::agent("davinci"); len];
     replaced[0] = keep;
-    m.transcript = replaced;
+    m.transcript = replaced.into();
     let _ = frame(&m);
     assert_eq!(offset(&m), 0);
     // The conversation grows past the window again: still following newest.

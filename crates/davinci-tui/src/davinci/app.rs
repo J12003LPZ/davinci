@@ -2128,7 +2128,7 @@ mod tests {
     fn a_sheet_starts_under_the_header_and_ends_with_its_hint_row() {
         let mut m = model(100, 44);
         crate::davinci::fixtures::dress_screen(&mut m, "3b");
-        m.transcript = vec![Entry::user("keep this conversation visible")];
+        m.transcript = vec![Entry::user("keep this conversation visible")].into();
         let rows = compose(&m, 44);
         assert_eq!(rows.len(), 44);
         let title = rows
@@ -2152,7 +2152,7 @@ mod tests {
     fn model_picker_is_content_sized_and_keeps_the_conversation_visible_above_it() {
         let mut m = model(108, 30);
         crate::davinci::fixtures::dress_screen(&mut m, "3a");
-        m.transcript = vec![Entry::user("keep this conversation visible")];
+        m.transcript = vec![Entry::user("keep this conversation visible")].into();
         let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
         let conversation = rows
             .iter()
@@ -2280,7 +2280,7 @@ mod tests {
     #[test]
     fn a_short_conversation_follows_the_banner_and_keeps_spare_space_below() {
         let mut m = model(100, 20);
-        m.transcript = vec![Entry::user("run the tests")];
+        m.transcript = vec![Entry::user("run the tests")].into();
         let rows = compose(&m, 20);
         assert!(text(&rows[1]).contains("DaVinci"));
         let turn = rows
@@ -3021,7 +3021,8 @@ mod tests {
             Entry::user("run the tests"),
             Entry::Gap,
             Entry::agent("davinci"),
-        ];
+        ]
+        .into();
         let rows = compose(&m, 18);
         assert_eq!(rows.len(), 18);
         for row in &rows {

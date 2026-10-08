@@ -2032,11 +2032,12 @@ pub fn dress(model: &mut Model) {
     model.workshop = Some(workshop());
     model.failed_run = Some(failed_run());
     model.review = Some(review());
-    model.transcript = if model.narrow() {
+    model.transcript = (if model.narrow() {
         narrow_transcript()
     } else {
         transcript()
-    };
+    })
+    .into();
 }
 
 /// Dress the model as one named mockup screen, so it can be matched against
@@ -2069,7 +2070,8 @@ pub fn dress_screen(model: &mut Model, id: &str) {
                 Entry::user("add streaming to the anthropic adapter, keep TS parity"),
                 Entry::Gap,
                 Entry::agent("davinci"),
-            ];
+            ]
+            .into();
             model.composer = "keep step IV, but generate the fixtures from the\nexisting TS \
                               golden files under tests\\golden\\"
                 .into();
@@ -2077,12 +2079,12 @@ pub fn dress_screen(model: &mut Model, id: &str) {
         }
         "1e" => {
             model.toggle_codex();
-            model.transcript = codex_transcript();
+            model.transcript = codex_transcript().into();
             model.changes = (3, 91, 11);
             model.context = (78_000, 200_000);
         }
         "1g" | "1h" => {
-            model.transcript = narrow_transcript();
+            model.transcript = narrow_transcript().into();
             if id == "1g" {
                 model.working = Some(working());
             }
@@ -2101,7 +2103,8 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.transcript = vec![
                 Entry::user("/graph impact crates\\davinci-session\\src\\store.rs"),
                 Entry::Gap,
-            ];
+            ]
+            .into();
             model.composer = "/graph path davinci-cli::main → store::write".into();
         }
         "2b" => {
