@@ -19,16 +19,18 @@ const DEFAULT_PROXY_PORTS: &[(&str, u16)] = &[
     ("wss", 443),
 ];
 
+/// An explicit `env` map replaces the process environment: a key missing from
+/// it resolves to empty instead of falling back to the inherited value.
 fn get_proxy_env(key: &str, env: Option<&HashMap<String, String>>) -> String {
     let lower = key.to_ascii_lowercase();
     let upper = key.to_ascii_uppercase();
     if let Some(env) = env {
-        if let Some(value) = env.get(&lower).filter(|value| !value.is_empty()) {
-            return value.clone();
-        }
-        if let Some(value) = env.get(&upper).filter(|value| !value.is_empty()) {
-            return value.clone();
-        }
+        return env
+            .get(&lower)
+            .filter(|value| !value.is_empty())
+            .or_else(|| env.get(&upper).filter(|value| !value.is_empty()))
+            .cloned()
+            .unwrap_or_default();
     }
     std::env::var(&lower)
         .or_else(|_| std::env::var(&upper))
@@ -306,5 +308,23 @@ mod tests {
         drop(tcp);
         let received = thread.join().unwrap();
         assert!(received.starts_with("CONNECT chatgpt.com:443 HTTP/1.1"));
+    }
+
+    #[test]
+    fn wor85_explicit_env_map_does_not_fall_back_to_process_env() {
+        // Unique key so parallel tests that read the real proxy variables are unaffected.
+        std::env::set_var("WOR85_PROBE_PROXY", "http://inherited.example:1");
+        let empty = HashMap::new();
+        assert_eq!(get_proxy_env("wor85_probe_proxy", Some(&empty)), "");
+        let scoped = env(&[("WOR85_PROBE_PROXY", "http://scoped.example:2")]);
+        assert_eq!(
+            get_proxy_env("wor85_probe_proxy", Some(&scoped)),
+            "http://scoped.example:2"
+        );
+        assert_eq!(
+            get_proxy_env("wor85_probe_proxy", None),
+            "http://inherited.example:1"
+        );
+        std::env::remove_var("WOR85_PROBE_PROXY");
     }
 }
