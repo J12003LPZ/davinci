@@ -3736,9 +3736,20 @@ impl Agent {
                 observation: Box::new(observation),
             });
         }
-        let root = runtime
+        // The checkpoint entry below is the durable record of this fold. If it
+        // cannot be written, the in-memory VM must not stay a fold ahead of
+        // the session it reloads from (WOR-61).
+        let undo = runtime.context_vm.fold_undo_point();
+        let root = match runtime
             .context_vm
-            .fold_with_proposal(reason, &events, proposal)?;
+            .fold_with_proposal(reason, &events, proposal)
+        {
+            Ok(root) => root,
+            Err(error) => {
+                runtime.context_vm.undo_fold(undo);
+                return Err(error);
+            }
+        };
         let prefix_digest = self
             .prepared_context_image()
             .map(|image| image.prefix_digest.clone())
@@ -3759,9 +3770,14 @@ impl Agent {
                 session.leaf_id.clone(),
                 seq,
             );
-            session
-                .append_entry(entry)
-                .map_err(|error| format!("context checkpoint persistence failed: {error}"))?;
+            if let Err(error) = session.append_entry(entry) {
+                runtime.context_vm.undo_fold(undo);
+                let error = format!("context checkpoint persistence failed: {error}");
+                runtime
+                    .context_vm
+                    .record_failure("fold", format!("{error}; the fold was rolled back"));
+                return Err(error);
+            }
         }
         if reason != runtime::context_vm::FoldReason::Manual {
             runtime.context_vm.push_notice(format!(

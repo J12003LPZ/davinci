@@ -52,6 +52,18 @@ pub struct ContextVmState {
     pub stable_context_digest: Option<String>,
 }
 
+/// VM state from before a fold; see `ContextVmRuntime::fold_undo_point`.
+pub(crate) struct FoldUndo {
+    state: ContextVmState,
+    events: Vec<ContextEvent>,
+    source_contents: HashMap<String, String>,
+    pinned: HashMap<String, ContextObject>,
+    retrieval_offered: bool,
+    folds: u64,
+    tokens_before_fold: u64,
+    tokens_after_fold: u64,
+}
+
 #[derive(Clone)]
 pub struct ContextVmRuntime {
     config: ContextVmConfig,
@@ -435,6 +447,52 @@ impl ContextVmRuntime {
             metrics.tokens_after_fold = metrics.tokens_after_fold.saturating_add(after_tokens);
         });
         Ok(root)
+    }
+
+    /// Capture everything a fold changes, so a fold whose checkpoint cannot
+    /// be persisted can be undone and memory never runs ahead of the session.
+    pub(crate) fn fold_undo_point(&self) -> FoldUndo {
+        let metrics = self.metrics();
+        FoldUndo {
+            state: self
+                .state
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+            events: self.events(),
+            source_contents: self
+                .source_contents
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+            pinned: self.store.pinned_pages(),
+            retrieval_offered: self.retrieval_offered(),
+            folds: metrics.folds,
+            tokens_before_fold: metrics.tokens_before_fold,
+            tokens_after_fold: metrics.tokens_after_fold,
+        }
+    }
+
+    pub(crate) fn undo_fold(&self, undo: FoldUndo) {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = undo.state;
+        *self
+            .events
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = undo.events;
+        *self
+            .source_contents
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = undo.source_contents;
+        self.store.restore_pinned_pages(undo.pinned);
+        self.set_retrieval_offered(undo.retrieval_offered);
+        self.bump_metrics(|metrics| {
+            metrics.folds = undo.folds;
+            metrics.tokens_before_fold = undo.tokens_before_fold;
+            metrics.tokens_after_fold = undo.tokens_after_fold;
+        });
     }
 
     pub fn retrieve(

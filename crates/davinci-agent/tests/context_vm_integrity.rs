@@ -6,6 +6,9 @@ use davinci_agent::runtime::context_vm::{
     CheckpointProposal, ContextEvent, ContextEventKind, ContextStateReducer, ProposedStateValue,
     StateSlot, StateTransition, TransitionKind,
 };
+use davinci_agent::runtime::context_vm::{ContextVmMode, FoldReason};
+use davinci_agent::{Agent, AgentId, RunId, RuntimeBus, RuntimeHandle};
+use davinci_ai::ChatMessage;
 
 fn event(source_ref: &str, seq: u64, kind: ContextEventKind, text: &str) -> ContextEvent {
     let provenance_kind = match kind {
@@ -137,4 +140,94 @@ fn wor62_values_citing_folded_sources_are_grounded_in_parent_state() {
         .map(|value| value.value.as_str())
         .collect::<Vec<_>>();
     assert_eq!(values, ["public API stable"]);
+}
+
+fn append_user(session: &mut davinci_session::JsonlSession, text: &str) {
+    let seq = session.entries.len() as u64 + 1;
+    session
+        .append_entry(davinci_session::SessionEntry {
+            id: format!("event-{seq}"),
+            entry_type: "message".into(),
+            parent_id: session.leaf_id.clone(),
+            seq,
+            timestamp: 0,
+            message: Some(serde_json::to_value(ChatMessage::text("user", text)).unwrap()),
+            custom_type: None,
+            extra: Default::default(),
+        })
+        .unwrap();
+}
+
+fn runtime() -> RuntimeHandle {
+    RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+}
+
+fn active_agent_on(path: &std::path::Path) -> Agent {
+    let mut agent = Agent::new("system");
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.session = Some(davinci_session::JsonlSession::open(path).unwrap());
+    agent.set_runtime(runtime());
+    agent
+}
+
+/// WOR-61: the checkpoint entry is the durable record of a fold. When it
+/// cannot be written, the live VM must be exactly where it was, not a fold
+/// ahead of what a reload would see.
+#[test]
+fn wor61_failed_checkpoint_persistence_rolls_the_fold_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session =
+        davinci_session::JsonlSession::create(directory.path(), "fixture", None).unwrap();
+    append_user(&mut session, "keep the public API stable");
+    append_user(&mut session, "now add the retry flag");
+    let path = session.path.clone();
+    drop(session);
+
+    let mut agent = active_agent_on(&path);
+    agent.prepared_context_image().unwrap();
+    let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
+    let root = vm.root();
+    let state = vm.load_state_from_root().unwrap();
+    let affinity = vm.cache_affinity();
+    assert!(!agent.context_vm_offers_retrieval());
+
+    // Another writer holds the session, so the checkpoint append fails.
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    let held =
+        davinci_sys::lock::ExclusiveFileLock::try_acquire(std::path::Path::new(&lock)).unwrap();
+    let error = agent
+        .fold_context(FoldReason::WindowPressure, None)
+        .unwrap_err();
+    assert!(
+        error.contains("context checkpoint persistence failed"),
+        "{error}"
+    );
+    drop(held);
+
+    assert_eq!(vm.root(), root);
+    assert_eq!(vm.load_state_from_root().unwrap(), state);
+    assert_eq!(vm.cache_affinity(), affinity);
+    assert_eq!(vm.metrics().folds, 0);
+    assert_eq!(vm.last_fold_reason(), None);
+    assert!(!agent.context_vm_offers_retrieval());
+    assert_eq!(vm.failure_count(), 1, "the rollback is recorded");
+    assert!(agent
+        .session
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .all(|entry| entry.entry_type != "context_checkpoint"));
+
+    // A process that reloads the session sees the same state.
+    let reloaded = active_agent_on(&path);
+    reloaded.prepared_context_image().unwrap();
+    let reloaded_vm = &reloaded.runtime.as_ref().unwrap().context_vm;
+    assert_eq!(reloaded_vm.load_state_from_root().unwrap(), state);
+    assert_eq!(reloaded_vm.cache_affinity(), affinity);
+    assert_eq!(
+        agent.prepared_context_image().unwrap().prefix_digest,
+        reloaded.prepared_context_image().unwrap().prefix_digest
+    );
 }
