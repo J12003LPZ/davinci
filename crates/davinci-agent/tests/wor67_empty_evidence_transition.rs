@@ -15,7 +15,13 @@ fn event(seq: u64, kind: ContextEventKind, provenance_kind: ProvenanceKind) -> C
         kind,
         provenance_kind,
         content_hash: format!("hash-{seq}"),
-        visible_text: format!("text {seq}"),
+        // User values must quote their source (WOR-62), so the fixtures say
+        // what the proposals below cite them for.
+        visible_text: match seq {
+            1 => "ship it; keep the API; tests fail".into(),
+            2 => "x".into(),
+            _ => format!("text {seq}"),
+        },
         artifact_refs: Vec::new(),
         images: Vec::new(),
     }
