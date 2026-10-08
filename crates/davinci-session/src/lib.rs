@@ -81,7 +81,7 @@ impl JsonlSession {
         cwd: &str,
         name: Option<&str>,
     ) -> Result<Self, SessionError> {
-        fs::create_dir_all(sessions_root).map_err(|err| {
+        davinci_sys::fs::create_private_dir_all(sessions_root).map_err(|err| {
             SessionError::storage(format!("Unable to create session directory: {err}"))
         })?;
         let dir = sessions_root.join(encode_cwd_component(cwd));
@@ -95,7 +95,7 @@ impl JsonlSession {
         cwd: &str,
         name: Option<&str>,
     ) -> Result<Self, SessionError> {
-        fs::create_dir_all(dir).map_err(|err| {
+        davinci_sys::fs::create_private_dir_all(dir).map_err(|err| {
             SessionError::storage(format!("Unable to create cwd session directory: {err}"))
         })?;
         let id = Uuid::new_v4().to_string();
@@ -114,13 +114,9 @@ impl JsonlSession {
                 serde_json::Value::Object(map)
             }),
         };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|err| {
-                SessionError::storage(format!("Unable to create session file: {err}"))
-            })?;
+        let mut file = davinci_sys::fs::create_new_private(&path).map_err(|err| {
+            SessionError::storage(format!("Unable to create session file: {err}"))
+        })?;
         file.write_all(encode_header(&header).as_bytes())
             .and_then(|()| file.sync_all())
             .and_then(|()| sync_parent(&path))
@@ -511,7 +507,7 @@ impl JsonlSession {
         }
         let path = self.path.clone();
         self.persist(|_| {
-            davinci_sys::fs::atomic_write(&path, body.as_bytes()).map_err(|err| {
+            davinci_sys::fs::atomic_write_private(&path, body.as_bytes()).map_err(|err| {
                 SessionError::storage(format!("Unable to convert session to v4: {err}"))
             })
         })
@@ -531,15 +527,10 @@ impl JsonlSession {
                 body.push_str(line);
                 body.push('\n');
             }
-            let permissions = fs::metadata(path)
-                .map_err(|err| SessionError::storage(err.to_string()))?
-                .permissions();
             jsonl_repo::publish_atomically(path, |temporary| {
-                fs::write(temporary, body)
-                    .and_then(|()| fs::set_permissions(temporary, permissions))
-                    .map_err(|err| {
-                        SessionError::storage(format!("Unable to rewrite session header: {err}"))
-                    })
+                fs::write(temporary, body).map_err(|err| {
+                    SessionError::storage(format!("Unable to rewrite session header: {err}"))
+                })
             })
         })
     }
@@ -592,11 +583,7 @@ fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
         backup.push(format!(".torn-{}.bak", uuid::Uuid::new_v4()));
         let backup = PathBuf::from(backup);
         let preserve = || -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup)?;
-            file.set_permissions(fs::metadata(path)?.permissions())?;
+            let mut file = davinci_sys::fs::create_new_private(&backup)?;
             file.write_all(tail.as_bytes())?;
             file.sync_all()?;
             sync_parent(&backup)
@@ -625,6 +612,49 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcripts_are_owner_only_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let mut session = JsonlSession::create(&root, "/fixture", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("secret")))
+            .unwrap();
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(session.path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&session.path), 0o600);
+
+        // A transcript left world-readable by an older build is tightened
+        // the next time its header is rewritten, not copied forward.
+        fs::set_permissions(&session.path, fs::Permissions::from_mode(0o644)).unwrap();
+        session.set_name("renamed").unwrap();
+        assert_eq!(mode(&session.path), 0o600);
+
+        let entry = session.entries[0].id.clone();
+        let forked = session.fork(&entry, &root).unwrap();
+        assert_eq!(mode(&forked.path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_session_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let namespace = dir.path().join("--fixture--");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::set_permissions(&namespace, fs::Permissions::from_mode(0o755)).unwrap();
+        JsonlSession::create_in_directory(&namespace, "/fixture", None).unwrap();
+        assert_eq!(mode(&namespace), 0o700);
+    }
 
     #[test]
     fn first_write_failure_requires_reopening_even_after_storage_is_restored() {

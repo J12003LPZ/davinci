@@ -18,6 +18,70 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_with(path, bytes, true)
 }
 
+/// Create `path` and any missing parents so only the owner can enter them.
+/// On Unix new directories are created 0700, and an existing `path` that
+/// grants group or other access is tightened to 0700 (its parents are left
+/// alone). Use it for directories that hold transcripts or tool output.
+///
+/// Tightening is best effort: a directory owned by someone else cannot be
+/// chmod-ed, and refusing to work there would break existing setups. Files
+/// written into it should still be created owner-only.
+pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        let metadata = fs::metadata(path)?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Open a new file for writing that must not already exist. On Unix it is
+/// created 0600 so only its owner can read it.
+pub fn create_new_private(path: &Path) -> io::Result<fs::File> {
+    private_options().write(true).create_new(true).open(path)
+}
+
+/// Open `path` for appending, creating it 0600 on Unix when missing.
+pub fn open_append_private(path: &Path) -> io::Result<fs::File> {
+    private_options().create(true).append(true).open(path)
+}
+
+/// Restrict an existing file to its owner (0600 on Unix). No-op elsewhere.
+pub fn restrict_to_owner(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn private_options() -> fs::OpenOptions {
+    #[allow(unused_mut)]
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
 /// Remove an incomplete final line from an append-only JSONL file.
 ///
 /// Returns the number of bytes removed. A missing file is treated as empty.
@@ -256,6 +320,51 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["state.json".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_is_created_and_tightened_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("a").join("b");
+        create_private_dir_all(&nested).unwrap();
+        for path in [dir.path().join("a"), nested.clone()] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", path.display());
+        }
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir_all(&nested).unwrap();
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let created = dir.path().join("new.jsonl");
+        create_new_private(&created).unwrap();
+        let appended = dir.path().join("log.jsonl");
+        open_append_private(&appended).unwrap();
+        let legacy = dir.path().join("legacy.jsonl");
+        std::fs::write(&legacy, b"x").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        restrict_to_owner(&legacy).unwrap();
+        for path in [created, appended, legacy] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn create_new_private_refuses_an_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("taken");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(create_new_private(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
     }
 
     #[cfg(unix)]

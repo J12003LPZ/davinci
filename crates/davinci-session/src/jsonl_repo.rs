@@ -172,7 +172,7 @@ impl JsonlSessionRepo {
         }
         let created_at = now_ms();
         let dir = self.sessions_root.join(jsonl_session_directory_name(&cwd));
-        fs::create_dir_all(&dir).map_err(|err| {
+        davinci_sys::fs::create_private_dir_all(&dir).map_err(|err| {
             SessionError::storage(format!("Failed to create sessions directory: {err}"))
         })?;
         let path = dir.join(session_file_name(created_at, &id));
@@ -187,10 +187,7 @@ impl JsonlSessionRepo {
             metadata: options.metadata.clone(),
         };
         let write_header = || -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
+            let mut file = davinci_sys::fs::create_new_private(&path)?;
             file.write_all(encode_header(&header).as_bytes())?;
             file.sync_all()?;
             crate::sync_parent(&path)
@@ -303,7 +300,7 @@ impl JsonlSessionRepo {
         let mutations = source.session.state().create_fork_mutations(options)?;
         let created_at = now_ms();
         let dir = self.sessions_root.join(jsonl_session_directory_name(cwd));
-        fs::create_dir_all(&dir).map_err(|err| {
+        davinci_sys::fs::create_private_dir_all(&dir).map_err(|err| {
             SessionError::storage(format!("Failed to create sessions directory: {err}"))
         })?;
         let path = dir.join(session_file_name(created_at, &id));
@@ -363,6 +360,11 @@ pub(crate) fn publish_atomically(
     let temp_path = destination.with_file_name(format!(".session-{}.tmp", Uuid::new_v4()));
     let result = (|| {
         populate(&temp_path)?;
+        // Transcripts are private: the published file is owner-only whatever
+        // the umask, and a rewrite also tightens a legacy world-readable one.
+        davinci_sys::fs::restrict_to_owner(&temp_path).map_err(|err| {
+            SessionError::storage(format!("Failed to restrict staged session: {err}"))
+        })?;
         OpenOptions::new()
             .write(true)
             .open(&temp_path)
@@ -699,6 +701,30 @@ mod tests {
             reopened.append_message("recovered").unwrap();
             assert_eq!(reopened.get_stats().message_count, 2);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_sessions_and_forks_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let mut session = repo
+            .create(JsonlCreateOptions {
+                id: Some("private".into()),
+                cwd: "/fixture".into(),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .unwrap();
+        session.append_message("secret").unwrap();
+        assert_eq!(mode(session.info.path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&session.info.path), 0o600);
+        let forked = repo
+            .fork(&session, &ForkOptions::default(), "/fixture")
+            .unwrap();
+        assert_eq!(mode(&forked.info.path), 0o600);
     }
 
     #[test]

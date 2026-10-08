@@ -7847,13 +7847,20 @@ fn share_current_session(agent: &Agent) -> Result<String, String> {
     let Some(session) = &agent.session else {
         return Ok("No session to share".into());
     };
-    let tmp = std::env::temp_dir().join("pi-share-session.html");
+    // A fresh owner-only directory with a random name: a fixed path in the
+    // shared temp dir lets another local user pre-create or symlink it. The
+    // file keeps its stable name because gh uses it as the gist filename.
+    let staging = tempfile::Builder::new()
+        .prefix("pi-share-")
+        .tempdir()
+        .map_err(|err| format!("Unable to create share staging directory: {err}"))?;
+    let tmp = staging.path().join("pi-share-session.html");
     export::export_html(session, &tmp)?;
     let output = std::process::Command::new("gh")
         .args(["gist", "create", "--public=false"])
         .arg(&tmp)
         .output();
-    let _ = std::fs::remove_file(&tmp);
+    drop(staging);
     match output {
         Ok(result) if result.status.success() => {
             let gist_url = String::from_utf8_lossy(&result.stdout).trim().to_string();
