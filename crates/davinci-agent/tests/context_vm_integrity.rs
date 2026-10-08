@@ -316,3 +316,100 @@ fn wor60_fold_never_shows_another_historys_state_to_the_summarizer() {
         .unwrap()
         .contains("alpha-7731"));
 }
+
+fn tool_exchange(output: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::text("user", "read the log"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: vec![davinci_ai::MessageContent::ToolCall {
+                id: "live-call".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "build.log"}),
+            }],
+            ..Default::default()
+        },
+        ChatMessage::tool_result("live-call", "read", output, false),
+    ]
+}
+
+fn assert_exchange_sent_once(agent: &Agent, marker: &str) {
+    let image = agent.context_vm_image().unwrap();
+    let rendered = serde_json::to_string(&image.messages).unwrap();
+    assert_eq!(rendered.matches(marker).count(), 1, "{rendered}");
+    let wire = davinci_ai::openai_responses_input(&image.messages);
+    let rendered = serde_json::to_string(&wire).unwrap();
+    assert_eq!(rendered.matches(marker).count(), 1, "{rendered}");
+    assert_eq!(rendered.matches("build.log").count(), 1, "{rendered}");
+    assert!(wire
+        .iter()
+        .any(|item| item["type"] == "function_call_output"));
+    assert!(image
+        .entries
+        .iter()
+        .all(|entry| entry.category != "hot_tool_result" && entry.category != "hot_assistant"));
+    let live = image
+        .entries
+        .iter()
+        .filter(|entry| entry.category == "live_tool_exchange")
+        .count();
+    assert_eq!(live, 2);
+}
+
+/// WOR-59: the live exchange was compiled as hot evidence and then appended
+/// again as native messages, so its output went out (and was budgeted) twice.
+#[test]
+fn wor59_live_tool_exchange_is_sent_exactly_once() {
+    let mut agent = sessionless_active_agent();
+    agent.messages = tool_exchange("live output marker-5521");
+    assert_exchange_sent_once(&agent, "marker-5521");
+}
+
+#[test]
+fn wor59_live_tool_exchange_is_sent_once_from_a_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session =
+        davinci_session::JsonlSession::create(directory.path(), "fixture", None).unwrap();
+    let messages = tool_exchange("live output marker-5522");
+    for (index, message) in messages.iter().enumerate() {
+        let seq = index as u64 + 1;
+        session
+            .append_entry(davinci_session::SessionEntry {
+                id: format!("event-{seq}"),
+                entry_type: "message".into(),
+                parent_id: session.leaf_id.clone(),
+                seq,
+                timestamp: 0,
+                message: Some(serde_json::to_value(message).unwrap()),
+                custom_type: None,
+                extra: Default::default(),
+            })
+            .unwrap();
+    }
+    let mut agent = Agent::new("system");
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.session = Some(session);
+    agent.messages = messages;
+    agent.set_runtime(runtime());
+    assert_exchange_sent_once(&agent, "marker-5522");
+}
+
+/// An exchange that fits once but not twice must compile.
+#[test]
+fn wor59_large_live_output_is_budgeted_once() {
+    let mut agent = sessionless_active_agent();
+    let output = format!("marker-5523 {}", "x".repeat(60_000));
+    agent.messages = tool_exchange(&output);
+    let one_copy = davinci_agent::runtime::context_vm::events_from_messages(&agent.messages)
+        .iter()
+        .map(|event| event.visible_text.len() as u64)
+        .sum::<u64>();
+    let image = agent.context_vm_image().unwrap();
+    assert!(
+        // The estimate is a ceiling of about one token per byte; a second
+        // copy would put it near twice the history.
+        image.estimated_tokens < one_copy + one_copy / 2,
+        "estimated {} tokens for {one_copy} bytes of history",
+        image.estimated_tokens
+    );
+}

@@ -2172,7 +2172,10 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
-        let events = self.context_vm_events_for_runtime();
+        let mut events = self.context_vm_events_for_runtime();
+        if let Some(start) = self.live_tool_exchange_start() {
+            drop_live_exchange_events(&mut events, &self.messages[start..]);
+        }
         let selected = self.select_root_context(self.context_window);
         let mut items = Vec::new();
         for file in selected.repository_files {
@@ -2285,17 +2288,23 @@ impl Agent {
     }
 
     fn live_tool_exchange(&self) -> Vec<ChatMessage> {
+        self.live_tool_exchange_start()
+            .map(|start| convert_to_llm_for_provider(&self.messages[start..], self.block_images))
+            .unwrap_or_default()
+    }
+
+    /// Index of the assistant message that opens a complete, well-formed
+    /// trailing tool exchange, if the transcript ends with one.
+    fn live_tool_exchange_start(&self) -> Option<usize> {
         if self.messages.last().is_none_or(|m| m.role != "toolResult") {
-            return Vec::new();
+            return None;
         }
-        let Some(start) = self.messages.iter().rposition(|m| m.role == "assistant") else {
-            return Vec::new();
-        };
+        let start = self.messages.iter().rposition(|m| m.role == "assistant")?;
         let mut calls = std::collections::HashSet::new();
         for content in &self.messages[start].content {
             if let MessageContent::ToolCall { id, .. } = content {
                 if id.is_empty() || !calls.insert(id.as_str()) {
-                    return Vec::new();
+                    return None;
                 }
             }
         }
@@ -2309,9 +2318,9 @@ impl Agent {
             || results.len() != ids.len()
             || results.iter().any(|m| m.role != "toolResult")
         {
-            return Vec::new();
+            return None;
         }
-        convert_to_llm_for_provider(&self.messages[start..], self.block_images)
+        Some(start)
     }
 
     pub fn provider_context_budget(&self) -> provider_budget::ProviderContextBudget {
@@ -4574,6 +4583,28 @@ pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     // original journal intact, but exclude them at shared history conversion
     // so reopening, tree navigation, and Context VM cannot replay them.
     .filter(|message| !is_legacy_verification_notice(message))
+}
+
+/// The live tool exchange reaches the provider as native call/result
+/// messages. Its events must not also be compiled as hot evidence, or the
+/// same output is sent twice and charged twice against the budget (WOR-59).
+/// Events are dropped only when the history's tail is exactly that exchange.
+fn drop_live_exchange_events(
+    events: &mut Vec<runtime::context_vm::ContextEvent>,
+    exchange: &[ChatMessage],
+) {
+    let live = runtime::context_vm::events_from_messages(exchange);
+    let Some(tail) = events.len().checked_sub(live.len()) else {
+        return;
+    };
+    if !live.is_empty()
+        && events[tail..]
+            .iter()
+            .map(|event| &event.content_hash)
+            .eq(live.iter().map(|event| &event.content_hash))
+    {
+        events.truncate(tail);
+    }
 }
 
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {
