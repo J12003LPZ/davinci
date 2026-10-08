@@ -7,12 +7,12 @@ fn wor40_deterministic_fallback_stays_bounded_over_a_long_run() {
     for turn in 0..300 {
         messages.push(ChatMessage::text(
             "user",
-            &format!("request {turn}: {}", "detail ".repeat(60)),
+            format!("request {turn}: {}", "detail ".repeat(60)),
         ));
         messages.push(ChatMessage::tool_result(
-            &format!("call-{turn}"),
+            format!("call-{turn}"),
             "bash",
-            &format!("test run {turn} passed"),
+            format!("test run {turn} passed"),
             false,
         ));
     }

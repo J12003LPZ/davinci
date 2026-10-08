@@ -151,7 +151,7 @@ fn wor36_disabled_cache_does_not_rebuild_on_every_dispatch() {
     );
     let mut messages = vec![ChatMessage::text("user", "constraint: keep the API")];
     for turn in 0..4 {
-        messages.push(ChatMessage::text("user", &format!("step {turn}")));
+        messages.push(ChatMessage::text("user", format!("step {turn}")));
         let events = events_from_messages(&messages);
         vm.append_delta(&events).unwrap();
         vm.compile(&events, &ContextPacket::empty(), 20_000)

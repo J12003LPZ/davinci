@@ -23,11 +23,11 @@ fn wor38_routine_append_delta_keeps_the_cached_checkpoint_prefix() {
     let mut digests = vec![first.prefix_digest.clone()];
 
     for turn in 0..4 {
-        messages.push(ChatMessage::text("user", &format!("now do step {turn}")));
+        messages.push(ChatMessage::text("user", format!("now do step {turn}")));
         messages.push(ChatMessage::tool_result(
-            &format!("call-{turn}"),
+            format!("call-{turn}"),
             "bash",
-            &format!("test step {turn} passed"),
+            format!("test step {turn} passed"),
             false,
         ));
         let events = events_from_messages(&messages);

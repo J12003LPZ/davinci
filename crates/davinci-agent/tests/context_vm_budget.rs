@@ -325,24 +325,10 @@ fn latest_user_request_is_mandatory_after_many_tool_events() {
 }
 
 #[test]
-fn unrecoverable_page_storage_cannot_dispatch_an_unbounded_legacy_fallback() {
-    use davinci_agent::runtime::{
-        cache::CacheConfig,
-        context_vm::{ContextVmConfig, ContextVmRuntime},
-    };
-    let mut runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
-    runtime.context_vm = ContextVmRuntime::new(
-        ContextVmConfig::default(),
-        CacheRuntime::new(
-            CacheConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            None,
-        ),
-    );
+fn unrecoverable_context_vm_cannot_dispatch_an_unbounded_legacy_fallback() {
+    // An Active VM that cannot compile for a reason other than the budget must
+    // block dispatch rather than quietly send the unbounded legacy history.
     let mut agent = Agent::new("system");
-    agent.set_runtime(runtime);
     agent.set_context_vm_mode(ContextVmMode::Active);
     agent.auto_compaction = false;
     agent.context_window = 32_000;
@@ -363,6 +349,36 @@ fn unrecoverable_page_storage_cannot_dispatch_an_unbounded_legacy_fallback() {
     );
     assert!(result.is_err());
     assert_eq!(agent.run_stats().model_turns, 0);
+}
+
+#[test]
+fn disabled_page_cache_still_compiles_from_pinned_pages() {
+    use davinci_agent::runtime::{
+        cache::CacheConfig,
+        context_vm::{ContextVmConfig, ContextVmRuntime},
+    };
+    let mut runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    runtime.context_vm = ContextVmRuntime::new(
+        ContextVmConfig::default(),
+        CacheRuntime::new(
+            CacheConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            None,
+        ),
+    );
+    let mut agent = Agent::new("system");
+    agent.set_runtime(runtime);
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent
+        .messages
+        .push(ChatMessage::text("user", "keep the API"));
+    let image = agent.prepared_context_image().unwrap();
+    assert!(image
+        .entries
+        .iter()
+        .any(|entry| entry.content.contains("keep the API")));
 }
 
 #[test]
