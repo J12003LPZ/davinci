@@ -520,10 +520,11 @@ impl OutputStore {
     pub fn save(&self, content: &str) -> Result<StoredOutputRef, ToolError> {
         let digest = file_content_hash(content);
         let id = format!("out-{}", &digest[..12]);
-        fs::create_dir_all(&self.root).map_err(|err| ToolError::Failed(err.to_string()))?;
+        davinci_sys::fs::create_private_dir_all(&self.root)
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
         let path = self.root.join(format!("{id}.txt"));
         if !stored_output_is_intact(&path, &digest) {
-            davinci_sys::fs::atomic_write(&path, content.as_bytes())
+            davinci_sys::fs::atomic_write_private(&path, content.as_bytes())
                 .map_err(|err| ToolError::Failed(err.to_string()))?;
         }
         Ok(StoredOutputRef {
@@ -1647,6 +1648,21 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    fn stored_outputs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let store = OutputStore::new(dir.path().join("outputs").join("session"));
+        let stored = store.save("lossless tool output").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(store.root()), 0o700);
+        assert_eq!(
+            mode(&store.root().join(format!("{}.txt", stored.id))),
+            0o600
+        );
+    }
+
     fn ok(content: &str) -> ToolResult {
         ToolResult {
             content: content.into(),
@@ -1665,7 +1681,7 @@ mod tests {
 
     #[test]
     fn lsp_retained_output_is_denied_after_permission_revision() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let source = workspace.join("lib.rs");
@@ -1711,7 +1727,7 @@ mod tests {
 
     #[test]
     fn torn_stored_output_is_rewritten() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let store = OutputStore::new(dir.path().to_path_buf());
         let saved = store.save("full content").unwrap();
         let path = dir.path().join(format!("{}.txt", saved.id));

@@ -3,7 +3,7 @@
 //! Stores `RuntimeEventEnvelope` rows alongside session JSONL files without modifying
 //! the upstream session format.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -47,10 +47,10 @@ impl RuntimeLogWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RuntimeLogError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            davinci_sys::fs::create_private_dir_all(parent)?;
         }
         davinci_sys::fs::truncate_torn_tail(&path)?;
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = davinci_sys::fs::open_append_private(&path)?;
         Ok(Self { path, file })
     }
 
@@ -136,6 +136,7 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::fs::{self, OpenOptions};
     use tempfile::tempdir;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

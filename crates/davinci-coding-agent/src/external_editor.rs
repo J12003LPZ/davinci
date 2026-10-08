@@ -6,8 +6,9 @@ use std::process::Command;
 
 pub struct ExternalEditor {
     pub command: String,
-    pub temp_dir: PathBuf,
     pub file_path: PathBuf,
+    // Owns the draft's directory; dropping it removes the directory and draft.
+    _staging: tempfile::TempDir,
 }
 
 impl ExternalEditor {
@@ -19,14 +20,18 @@ impl ExternalEditor {
             .or_else(|| std::env::var("VISUAL").ok().filter(|s| !s.is_empty()))
             .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "vi".to_string());
-        let temp_dir = std::env::temp_dir().join(format!("pi-editor-{}", std::process::id()));
-        fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-        let file_path = temp_dir.join("prompt.md");
+        // Random, owner-only (0700 on Unix) and created exclusively, so another
+        // local user cannot pre-create or symlink the draft path.
+        let staging = tempfile::Builder::new()
+            .prefix("pi-editor-")
+            .tempdir()
+            .map_err(|e| e.to_string())?;
+        let file_path = staging.path().join("prompt.md");
         fs::write(&file_path, initial).map_err(|e| e.to_string())?;
         Ok(Self {
             command,
-            temp_dir,
             file_path,
+            _staging: staging,
         })
     }
 
@@ -63,13 +68,6 @@ impl ExternalEditor {
         }
         let text = fs::read_to_string(&self.file_path).map_err(|e| e.to_string())?;
         Ok(normalize(&text))
-    }
-}
-
-impl Drop for ExternalEditor {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.file_path);
-        let _ = fs::remove_dir(&self.temp_dir);
     }
 }
 
@@ -673,5 +671,34 @@ mod tests {
         std::env::remove_var("PI_CLIPBOARD_TEXT");
         assert!(clipboard_text().is_none());
         std::env::remove_var("PI_CLIPBOARD_DRY_RUN");
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn each_draft_gets_its_own_unpredictable_directory_removed_on_drop() {
+        let first = ExternalEditor::new(Some("true"), "one").unwrap();
+        let second = ExternalEditor::new(Some("true"), "two").unwrap();
+        // Not derived from the PID: two drafts in one process differ.
+        let dir = first.file_path.parent().unwrap().to_path_buf();
+        assert_ne!(dir, second.file_path.parent().unwrap());
+        let pid_dir = std::env::temp_dir().join(format!("pi-editor-{}", std::process::id()));
+        assert_ne!(dir, pid_dir);
+        assert_eq!(fs::read_to_string(&first.file_path).unwrap(), "one");
+        drop(first);
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_draft_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let editor = ExternalEditor::new(Some("true"), "secret").unwrap();
+        let dir = editor.file_path.parent().unwrap();
+        let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }
