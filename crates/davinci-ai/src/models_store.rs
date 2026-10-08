@@ -40,9 +40,11 @@ pub fn load_models_store(agent_dir: &Path) -> ModelsStore {
         return ModelsStore::default();
     };
     serde_json::from_str(&raw).unwrap_or_else(|_| {
-        // Keep the unreadable file for inspection instead of letting the next
-        // save overwrite it; the catalog is only a cache, so start empty.
-        let _ = fs::rename(&path, path.with_extension("json.corrupt"));
+        // Keep the unreadable bytes for inspection before the next save
+        // replaces them; the catalog is only a cache, so start empty. Copy
+        // what was read rather than rename the file: another process may
+        // have saved a valid store there since this read.
+        let _ = davinci_sys::fs::atomic_write(&path.with_extension("json.corrupt"), raw.as_bytes());
         ModelsStore::default()
     })
 }
@@ -195,7 +197,16 @@ mod tests {
         assert_eq!(load_models_store(dir.path()), ModelsStore::default());
         let quarantined = fs::read_to_string(dir.path().join("models-store.json.corrupt")).unwrap();
         assert_eq!(quarantined, "{ not json");
-        assert!(!path.exists());
+        // The live file is never moved: a concurrent valid save stays put.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+        let mut store = ModelsStore::default();
+        store.providers.insert("p".into(), Default::default());
+        save_models_store(dir.path(), &store).unwrap();
+        assert_eq!(load_models_store(dir.path()), store);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("models-store.json.corrupt")).unwrap(),
+            "{ not json"
+        );
     }
 
     #[test]
