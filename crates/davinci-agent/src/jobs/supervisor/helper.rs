@@ -237,7 +237,8 @@ fn run_owned() -> std::io::Result<()> {
         if let Some(status) = child.try_wait()? {
             // A grandchild may retain the pipes. Bound tail draining before
             // terminating the group instead of waiting for those pipes forever.
-            let deadline = Instant::now() + Duration::from_millis(100);
+            // The grace must cover pipe EOF delivery on a loaded Windows host.
+            let deadline = Instant::now() + Duration::from_millis(1000);
             while readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
                 thread::sleep(POLL);
             }
