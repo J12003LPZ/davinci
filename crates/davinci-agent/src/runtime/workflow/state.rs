@@ -28,6 +28,31 @@ pub enum WorkflowStateError {
     SerializationError(String),
 }
 
+/// Attempts at a fresh overflow file name before giving up.
+const MAX_OVERFLOW_CREATE_ATTEMPTS: usize = 8;
+
+/// Write `contents` to `<dir>/<id>.json` without ever replacing an existing
+/// file. A name collision draws a new ID from `next_id` instead of replacing
+/// the artifact that already owns the name. Returns the ID actually used.
+fn create_overflow_file(
+    dir: &Path,
+    mut id: Uuid,
+    contents: &[u8],
+    mut next_id: impl FnMut() -> Uuid,
+) -> Result<(Uuid, PathBuf), WorkflowStateError> {
+    for _ in 0..MAX_OVERFLOW_CREATE_ATTEMPTS {
+        let path = dir.join(format!("{id}.json"));
+        match write_atomic_new(&path, contents) {
+            Ok(()) => return Ok((id, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => id = next_id(),
+            Err(e) => return Err(WorkflowStateError::IoError(e.to_string())),
+        }
+    }
+    Err(WorkflowStateError::IoError(
+        "overflow artifact name collided repeatedly".into(),
+    ))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -72,17 +97,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Write `contents` so that `path` is either absent or complete: stage in a
 /// sibling temp file, flush it to disk, then rename into place.
 fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    stage_then(path, contents, |temp| std::fs::rename(temp, path))
+}
+
+/// Like `write_atomic`, but never replaces: if `path` already exists this
+/// fails with `AlreadyExists` and leaves it untouched. The staged file is
+/// hard-linked into place (which refuses an existing name) and then dropped.
+fn write_atomic_new(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    stage_then(path, contents, |temp| std::fs::hard_link(temp, path))?;
+    Ok(())
+}
+
+fn stage_then(
+    path: &Path,
+    contents: &[u8],
+    publish: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
     let result = (|| {
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, path)
+        publish(&temp)
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
+    // After a rename the temp name is gone; after a hard link it is the spare
+    // name. Either way, nothing may be left behind.
+    let _ = std::fs::remove_file(&temp);
     result
 }
 
@@ -337,7 +378,7 @@ impl WorkflowStateStore {
         let serialized = serde_json::to_string(&value)
             .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
         let byte_size = serialized.len();
-        let id = Uuid::now_v7();
+        let mut id = Uuid::now_v7();
         let now = now_ms();
 
         let (stored_value, is_overflow, overflow_path, overflow_sha256) =
@@ -348,9 +389,9 @@ impl WorkflowStateStore {
                     std::fs::create_dir_all(&wf_dir)
                         .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
                 }
-                let file_path = wf_dir.join(format!("{id}.json"));
-                write_atomic(&file_path, serialized.as_bytes())
-                    .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
+                let (new_id, file_path) =
+                    create_overflow_file(&wf_dir, id, serialized.as_bytes(), Uuid::now_v7)?;
+                id = new_id;
 
                 let mut reference = serde_json::json!({
                     "$overflow_ref": id.to_string(),
@@ -724,5 +765,43 @@ mod tests {
             .unwrap();
         let reopened = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
         assert_eq!(reopened.list_phase_artifacts(wf_id, "p"), [kept, next]);
+    }
+
+    // WOR-148: a colliding overflow ID must not truncate the file that owns it.
+    #[test]
+    fn wor148_overflow_collision_keeps_existing_artifact() {
+        let tmp = tempdir().unwrap();
+        let taken = Uuid::now_v7();
+        let existing = tmp.path().join(format!("{taken}.json"));
+        std::fs::write(&existing, "original artifact").unwrap();
+
+        let fresh = Uuid::now_v7();
+        let mut draws = vec![fresh].into_iter();
+        let (id, path) =
+            create_overflow_file(tmp.path(), taken, b"new artifact", || draws.next().unwrap())
+                .unwrap();
+
+        assert_eq!(id, fresh);
+        assert_ne!(path, existing);
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "original artifact"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new artifact");
+    }
+
+    #[test]
+    fn wor148_overflow_gives_up_when_every_name_is_taken() {
+        let tmp = tempdir().unwrap();
+        let taken = Uuid::now_v7();
+        let existing = tmp.path().join(format!("{taken}.json"));
+        std::fs::write(&existing, "original artifact").unwrap();
+
+        let err = create_overflow_file(tmp.path(), taken, b"new artifact", || taken).unwrap_err();
+        assert!(matches!(err, WorkflowStateError::IoError(_)));
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "original artifact"
+        );
     }
 }

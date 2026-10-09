@@ -226,6 +226,37 @@ impl TaskRecord {
     }
 }
 
+/// Move every Pending dependent of `completed` whose dependencies are all
+/// Completed to Ready, advancing its revision. One pass over the tasks (no key
+/// snapshot, no second lookup per candidate); a revision overflow aborts the
+/// caller's uncommitted candidate map instead of leaving a Ready task with a
+/// stale revision.
+fn promote_ready_dependents(
+    tasks: &mut HashMap<TaskId, TaskRecord>,
+    completed: TaskId,
+    committed_at: i64,
+) -> Result<(), TaskError> {
+    let ready: Vec<TaskId> = tasks
+        .values()
+        .filter(|t| t.state == TaskState::Pending && t.dependencies.contains(&completed))
+        .filter(|t| {
+            t.dependencies.iter().all(|dep| {
+                tasks
+                    .get(dep)
+                    .is_some_and(|d| d.state == TaskState::Completed)
+            })
+        })
+        .map(|t| t.id)
+        .collect();
+    for id in ready {
+        if let Some(dependent) = tasks.get_mut(&id) {
+            dependent.advance_revision(committed_at)?;
+            dependent.state = TaskState::Ready;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum TaskError {
     #[error("operation is already in progress; retry after it settles")]
@@ -256,6 +287,8 @@ pub enum TaskError {
     DuplicateTask(TaskId),
     #[error("task not found: {0}")]
     TaskNotFound(TaskId),
+    #[error("agent is not registered: {0}")]
+    UnknownAgent(AgentId),
     #[error("self-dependency is not allowed: {0}")]
     SelfDependency(TaskId),
     #[error("unknown dependency: {0}")]
@@ -1004,6 +1037,20 @@ impl TaskRegistry {
             if task.revision != expected_revision {
                 return Err(TaskError::RevisionConflict(task_id));
             }
+            // Only work that did not finish can be retried. Retrying a Pending,
+            // Ready or Running task would start a second attempt beside a live
+            // owner; a Completed or Cancelled task is final.
+            if !matches!(task.state, TaskState::Failed | TaskState::Blocked) {
+                return Err(TaskError::InvalidTransition {
+                    task_id,
+                    from: task.state,
+                    to: if new_agent_id.is_some() {
+                        TaskState::Running
+                    } else {
+                        TaskState::Ready
+                    },
+                });
+            }
             task.attempt = task.attempt.saturating_add(1);
             task.owner_generation = task
                 .owner_generation
@@ -1039,7 +1086,23 @@ impl TaskRegistry {
         Ok(response)
     }
 
-    /// Assign a task to an agent.
+    /// Assign a task to an agent that exists in `agents`. Host code must use
+    /// this rather than `assign_task`, which trusts the caller's ID and would
+    /// persist a Running task owned by a worker that does not exist.
+    pub fn assign_task_to_registered(
+        &self,
+        task_id: TaskId,
+        agent_id: AgentId,
+        agents: &super::registry::RuntimeRegistry,
+    ) -> Result<(), TaskError> {
+        if agents.get(&agent_id).is_none() {
+            return Err(TaskError::UnknownAgent(agent_id));
+        }
+        self.assign_task(task_id, agent_id)
+    }
+
+    /// Assign a task to an agent. The caller guarantees `agent_id` is a live
+    /// agent; see `assign_task_to_registered` for the checked form.
     pub fn assign_task(&self, task_id: TaskId, agent_id: AgentId) -> Result<(), TaskError> {
         let committed_at = (self.clock)();
         let (run_id, previous_agent) = {
@@ -1227,34 +1290,17 @@ impl TaskRegistry {
             task.state = TaskState::Completed;
             task.result = result;
 
+            // Evidence the evaluation relied on must land with the completion;
+            // a full evidence list rejects the whole (still uncommitted) clone.
             for dim in &evaluation.dimensions {
                 if let Some(ev_id) = dim.evidence_id {
-                    let _ = task.attach_evidence(ev_id);
+                    task.attach_evidence(ev_id)?;
                 }
             }
             task.clone()
         };
 
-        let all_keys: Vec<TaskId> = tasks.keys().cloned().collect();
-        for dep_key in all_keys {
-            if let Some(dependent) = tasks.get(&dep_key) {
-                if dependent.state == TaskState::Pending
-                    && dependent.dependencies.contains(&task_id)
-                {
-                    let all_deps_completed = dependent.dependencies.iter().all(|dep_id| {
-                        tasks
-                            .get(dep_id)
-                            .is_some_and(|d| d.state == TaskState::Completed)
-                    });
-                    if all_deps_completed {
-                        if let Some(dep_mut) = tasks.get_mut(&dep_key) {
-                            dep_mut.state = TaskState::Ready;
-                            let _ = dep_mut.advance_revision(committed_at);
-                        }
-                    }
-                }
-            }
-        }
+        promote_ready_dependents(&mut tasks, task_id, committed_at)?;
 
         self.persist_candidate(&stored, &tasks)?;
         *stored = tasks;
@@ -1462,28 +1508,7 @@ impl TaskRegistry {
             task.state = TaskState::Completed;
             task.result = result;
 
-            // Cascade: any Pending dependent whose dependencies are ALL completed transitions to Ready
-            let all_keys: Vec<TaskId> = tasks.keys().cloned().collect();
-            for dep_key in all_keys {
-                if let Some(dependent) = tasks.get(&dep_key) {
-                    if dependent.state == TaskState::Pending
-                        && dependent.dependencies.contains(&task_id)
-                    {
-                        let all_deps_done = dependent.dependencies.iter().all(|d| {
-                            tasks
-                                .get(d)
-                                .map(|t| t.state == TaskState::Completed)
-                                .unwrap_or(false)
-                        });
-                        if all_deps_done {
-                            if let Some(dep_mut) = tasks.get_mut(&dep_key) {
-                                dep_mut.advance_revision(now)?;
-                                dep_mut.state = TaskState::Ready;
-                            }
-                        }
-                    }
-                }
-            }
+            promote_ready_dependents(&mut tasks, task_id, now)?;
             let response = tasks[&task_id].clone();
             let receipt = operation.map(|(operation_id, request)| TaskOperationReceipt {
                 operation_id,
@@ -4102,5 +4127,248 @@ mod tests {
         let dec = plan.structured_decisions.get("dec_1").unwrap();
         assert_eq!(dec.state, crate::decisions::DecisionState::AnsweredByUser);
         assert!(dec.answer.is_some());
+    }
+
+    fn wor_manifest() -> SourceManifest {
+        SourceManifest {
+            entries: Vec::new(),
+            dependency_lock_hashes: Default::default(),
+            toolchain_fingerprint: None,
+            command_profile: None,
+            digest: "digest".into(),
+            complete_coverage: true,
+            scanned_at_ms: 0,
+        }
+    }
+
+    fn wor_evaluation(task: &TaskRecord, evidence: Vec<EvidenceId>) -> CompletionEvaluation {
+        use crate::runtime::completion::{DimensionCheck, DimensionKind};
+        use crate::runtime::evidence::DimensionState;
+        CompletionEvaluation {
+            task_id: task.id,
+            contract_digest: task.contract_digest.clone(),
+            evaluated_revision: task.revision,
+            evaluated_attempt: task.attempt,
+            allowed: true,
+            dimensions: evidence
+                .into_iter()
+                .map(|id| DimensionCheck {
+                    dimension: DimensionKind::Build,
+                    requirement_id: None,
+                    required: true,
+                    state: DimensionState::PassedCurrent,
+                    evidence_id: Some(id),
+                    details: None,
+                })
+                .collect(),
+            remaining_gaps: Vec::new(),
+            source_fingerprint: "digest".into(),
+            evaluated_at_ms: 0,
+        }
+    }
+
+    // WOR-153: completion must not succeed while evaluation evidence is dropped.
+    #[test]
+    fn wor153_completion_rejects_when_evidence_list_is_full() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let mut record = TaskRecord::new(run, "full evidence");
+        record.evidence_refs = (0..128).map(|_| EvidenceId::new()).collect();
+        let id = registry.create_task(record).unwrap();
+        let task = registry.get_task(&id).unwrap();
+        let evaluation = wor_evaluation(&task, vec![EvidenceId::new()]);
+
+        let err = registry
+            .complete_verified_task(id, &evaluation, &wor_manifest(), None)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            TaskError::MetadataTooLarge {
+                field: "evidence_refs",
+                ..
+            }
+        ));
+        assert_eq!(registry.get_task(&id).unwrap(), task, "nothing may commit");
+    }
+
+    #[test]
+    fn wor153_completion_attaches_evaluation_evidence() {
+        let registry = TaskRegistry::new();
+        let id = registry
+            .create_task(TaskRecord::new(RunId::new(), "evidence"))
+            .unwrap();
+        let task = registry.get_task(&id).unwrap();
+        let ev = EvidenceId::new();
+        let done = registry
+            .complete_verified_task(id, &wor_evaluation(&task, vec![ev]), &wor_manifest(), None)
+            .unwrap();
+        assert_eq!(done.state, TaskState::Completed);
+        assert_eq!(done.evidence_refs, vec![ev]);
+    }
+
+    // WOR-160: a revision overflow on a dependent must fail the whole commit.
+    #[test]
+    fn wor160_verified_completion_fails_atomically_on_dependent_overflow() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let prereq = registry
+            .create_task(TaskRecord::new(run, "prereq"))
+            .unwrap();
+        let mut dependent = TaskRecord::new(run, "dependent").with_dependencies(vec![prereq]);
+        // Creating a dependent advances its revision once; leave exactly one
+        // step of headroom so promotion is the operation that overflows.
+        dependent.revision = u64::MAX - 1;
+        let dependent = registry.create_task(dependent).unwrap();
+        assert_eq!(registry.get_task(&dependent).unwrap().revision, u64::MAX);
+        assert_eq!(
+            registry.get_task(&dependent).unwrap().state,
+            TaskState::Pending
+        );
+        let before_prereq = registry.get_task(&prereq).unwrap();
+        let before_dependent = registry.get_task(&dependent).unwrap();
+
+        let err = registry
+            .complete_verified_task(
+                prereq,
+                &wor_evaluation(&before_prereq, Vec::new()),
+                &wor_manifest(),
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(err, TaskError::RevisionOverflow(dependent));
+        assert_eq!(registry.get_task(&prereq).unwrap(), before_prereq);
+        assert_eq!(registry.get_task(&dependent).unwrap(), before_dependent);
+    }
+
+    // WOR-156: only failed or blocked work is retryable.
+    #[test]
+    fn wor156_retry_rejects_live_and_final_states() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let agent = AgentId::new();
+        let pending_dep = registry.create_task(TaskRecord::new(run, "dep")).unwrap();
+        let running = registry
+            .create_task(TaskRecord::new(run, "running"))
+            .unwrap();
+        registry.assign_task(running, agent).unwrap();
+        let done = registry.create_task(TaskRecord::new(run, "done")).unwrap();
+        registry.complete_task(done, None).unwrap();
+        let cancelled = registry
+            .create_task(TaskRecord::new(run, "cancelled"))
+            .unwrap();
+        registry.cancel_task(cancelled).unwrap();
+        let cases = [
+            pending_dep,
+            registry
+                .create_task(TaskRecord::new(run, "pending").with_dependencies(vec![pending_dep]))
+                .unwrap(),
+            running,
+            done,
+            cancelled,
+        ];
+        for id in cases {
+            let before = registry.get_task(&id).unwrap();
+            let err = registry
+                .retry_task(id, run, before.revision, Some(AgentId::new()))
+                .unwrap_err();
+            assert!(
+                matches!(err, TaskError::InvalidTransition { from, .. } if from == before.state),
+                "{:?}: {err:?}",
+                before.state
+            );
+            assert_eq!(registry.get_task(&id).unwrap(), before, "must not mutate");
+        }
+
+        let failed = registry
+            .create_task(TaskRecord::new(run, "failed"))
+            .unwrap();
+        registry.fail_task(failed, Some("boom".into())).unwrap();
+        let rev = registry.get_task(&failed).unwrap().revision;
+        let retried = registry.retry_task(failed, run, rev, None).unwrap();
+        assert_eq!(retried.state, TaskState::Ready);
+        assert_eq!(retried.attempt, 1);
+    }
+
+    // WOR-161: checked assignment refuses an agent that is not registered.
+    #[test]
+    fn wor161_assign_to_registered_requires_known_agent() {
+        use crate::runtime::events::{AgentKind, AgentRecord, AgentState};
+        let tasks = TaskRegistry::new();
+        let agents = crate::runtime::registry::RuntimeRegistry::new();
+        let run = RunId::new();
+        let id = tasks.create_task(TaskRecord::new(run, "assign")).unwrap();
+        let ghost = AgentId::new();
+
+        let err = tasks
+            .assign_task_to_registered(id, ghost, &agents)
+            .unwrap_err();
+        assert_eq!(err, TaskError::UnknownAgent(ghost));
+        let untouched = tasks.get_task(&id).unwrap();
+        assert_eq!(untouched.state, TaskState::Ready);
+        assert!(untouched.assigned_to.is_none());
+
+        let real = AgentId::new();
+        agents
+            .register_agent(AgentRecord {
+                id: real,
+                run_id: run,
+                parent: None,
+                kind: AgentKind::Main,
+                name: "worker".into(),
+                provider: "p".into(),
+                model_id: "m".into(),
+                cwd: std::path::PathBuf::new(),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 0,
+                updated_ms: 0,
+                failure_reason: None,
+            })
+            .unwrap();
+        tasks.assign_task_to_registered(id, real, &agents).unwrap();
+        let assigned = tasks.get_task(&id).unwrap();
+        assert_eq!(assigned.state, TaskState::Running);
+        assert_eq!(assigned.assigned_to, Some(real));
+    }
+
+    // WOR-163: the shared cascade promotes exactly the fully-satisfied
+    // dependents and leaves unrelated Pending tasks untouched.
+    #[test]
+    fn wor163_cascade_promotes_only_fully_satisfied_dependents() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let a = registry.create_task(TaskRecord::new(run, "a")).unwrap();
+        let b = registry.create_task(TaskRecord::new(run, "b")).unwrap();
+        let only_a = registry
+            .create_task(TaskRecord::new(run, "only a").with_dependencies(vec![a]))
+            .unwrap();
+        let a_and_b = registry
+            .create_task(TaskRecord::new(run, "a and b").with_dependencies(vec![a, b]))
+            .unwrap();
+        let bystanders: Vec<_> = (0..500)
+            .map(|_| {
+                registry
+                    .create_task(TaskRecord::new(run, "bystander").with_dependencies(vec![b]))
+                    .unwrap()
+            })
+            .collect();
+
+        let revision = |id| registry.get_task(&id).unwrap().revision;
+        let (only_a_rev, bystander_rev) = (revision(only_a), revision(bystanders[0]));
+
+        registry.complete_task(a, None).unwrap();
+        let state = |id| registry.get_task(&id).unwrap().state;
+        assert_eq!(state(only_a), TaskState::Ready);
+        assert_eq!(state(a_and_b), TaskState::Pending);
+        assert!(bystanders.iter().all(|id| state(*id) == TaskState::Pending));
+        assert_eq!(revision(only_a), only_a_rev + 1);
+        assert_eq!(revision(bystanders[0]), bystander_rev);
+
+        registry.complete_task(b, None).unwrap();
+        assert_eq!(state(a_and_b), TaskState::Ready);
+        assert!(bystanders.iter().all(|id| state(*id) == TaskState::Ready));
     }
 }
