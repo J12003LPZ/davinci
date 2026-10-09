@@ -85,6 +85,10 @@ pub struct BuildAffectedResult {
     pub affected_packages: Vec<String>,
     pub affected_targets: Vec<BuildTarget>,
     pub reverse_dependency_paths: BTreeMap<String, Vec<String>>,
+    /// Changed root files that configure the whole workspace (package
+    /// manager, task runner, shared tsconfig), which affect every package.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repository_wide_changes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -410,6 +410,7 @@ impl BuildResolver {
         let pkgs_res = self.discover_packages(None)?;
         let mut changed_inputs = Vec::new();
         let mut directly_affected_set = BTreeSet::new();
+        let mut repository_wide_changes = Vec::new();
 
         // 1. Resolve files to packages
         if let Some(file_list) = files {
@@ -417,6 +418,15 @@ impl BuildResolver {
                 self.validate_file_path(f)?;
                 changed_inputs.push(f.clone());
                 let normalized = f.replace('\\', "/");
+                if is_repository_wide_config(&normalized) {
+                    // Shared root configuration reaches every package, not
+                    // only the root package and its dependents.
+                    repository_wide_changes.push(normalized.clone());
+                    for pkg in &pkgs_res.packages {
+                        directly_affected_set.insert(pkg.name.clone());
+                    }
+                    continue;
+                }
                 let mut best_match: Option<&WorkspacePackage> = None;
 
                 for pkg in &pkgs_res.packages {
@@ -459,6 +469,7 @@ impl BuildResolver {
                 affected_packages: Vec::new(),
                 affected_targets: Vec::new(),
                 reverse_dependency_paths: BTreeMap::new(),
+                repository_wide_changes,
             });
         }
 
@@ -552,6 +563,7 @@ impl BuildResolver {
             affected_packages: all_affected,
             affected_targets,
             reverse_dependency_paths: rev_paths,
+            repository_wide_changes,
         })
     }
 
@@ -844,4 +856,32 @@ fn extract_dep_keys(manifest: &serde_json::Value, field: &str) -> Vec<String> {
     }
     list.sort();
     list
+}
+
+/// Root files whose change can affect every workspace package: workspace and
+/// package-manager configuration, task runners, lockfiles and shared
+/// TypeScript/Babel settings. Only files at the repository root qualify.
+fn is_repository_wide_config(path: &str) -> bool {
+    let path = path.trim_start_matches("./");
+    if path.contains('/') {
+        return false;
+    }
+    matches!(
+        path,
+        "package.json"
+            | "pnpm-workspace.yaml"
+            | "pnpm-lock.yaml"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | ".yarnrc.yml"
+            | ".npmrc"
+            | "turbo.json"
+            | "nx.json"
+            | "lerna.json"
+            | "rush.json"
+            | ".nvmrc"
+            | ".node-version"
+    ) || (path.starts_with("tsconfig") && path.ends_with(".json"))
+        || path.starts_with("babel.config.")
 }

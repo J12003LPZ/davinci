@@ -26,17 +26,43 @@ pub fn mutation_queue_key(file_path: &Path) -> String {
     }
 }
 
+/// Removes a path's queue once its last user is done, as the TS queue
+/// deletes its entry in `finally`. Every user clones the `Arc` while holding
+/// the map lock, so a count of two (map + this release) under that lock
+/// means nobody else holds or waits for it.
+struct QueueRelease {
+    key: String,
+    lock: Arc<Mutex<()>>,
+}
+
+impl Drop for QueueRelease {
+    fn drop(&mut self) {
+        let mut map = queues().lock().unwrap_or_else(|err| err.into_inner());
+        if Arc::strong_count(&self.lock) == 2
+            && map
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.lock))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
 /// Hold the per-file lock for the duration of `fn`.
 pub fn with_file_mutation_queue<T>(file_path: &Path, func: impl FnOnce() -> T) -> T {
     let key = mutation_queue_key(file_path);
     let lock = {
         let mut map = queues().lock().unwrap_or_else(|err| err.into_inner());
-        map.entry(key)
+        map.entry(key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     };
-    let _guard = lock.lock().unwrap_or_else(|err| err.into_inner());
-    func()
+    let release = QueueRelease { key, lock };
+    let guard = release.lock.lock().unwrap_or_else(|err| err.into_inner());
+    let result = func();
+    drop(guard);
+    drop(release);
+    result
 }
 
 #[cfg(test)]
@@ -46,6 +72,23 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn completed_file_queues_are_released() {
+        let dir = tempdir().unwrap();
+        let paths: Vec<_> = (0..32)
+            .map(|n| dir.path().join(format!("released-{n}.txt")))
+            .collect();
+        for path in &paths {
+            with_file_mutation_queue(path, || ());
+        }
+        let map = queues().lock().unwrap();
+        let retained = paths
+            .iter()
+            .filter(|path| map.contains_key(&mutation_queue_key(path)))
+            .count();
+        assert_eq!(retained, 0);
+    }
 
     #[test]
     fn serializes_operations_for_the_same_file() {

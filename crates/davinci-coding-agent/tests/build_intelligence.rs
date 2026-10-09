@@ -155,6 +155,34 @@ fn test_tsconfig_references_graph() {
 }
 
 #[test]
+fn test_root_configuration_change_affects_every_package() {
+    let root = fixture_path("turbo_monorepo");
+    let build_intel = BuildIntelligence::with_root(&root, CacheRuntime::default());
+    let res = build_intel
+        .execute_tool("build_affected", &json!({"files": ["turbo.json"]}))
+        .expect("build_affected should succeed");
+    let affected: BuildAffectedResult = serde_json::from_str(&res.content).unwrap();
+    for package in ["@repo/ui", "@repo/web"] {
+        assert!(
+            affected.affected_packages.contains(&package.to_string()),
+            "{package} must be affected by a root turbo.json change: {affected:?}"
+        );
+    }
+    assert_eq!(affected.repository_wide_changes, ["turbo.json"]);
+
+    // A nested file with a config-like name is not repository-wide.
+    let res = build_intel
+        .execute_tool(
+            "build_affected",
+            &json!({"files": ["packages/web/package.json"]}),
+        )
+        .expect("build_affected should succeed");
+    let nested: BuildAffectedResult = serde_json::from_str(&res.content).unwrap();
+    assert!(nested.repository_wide_changes.is_empty());
+    assert!(!nested.affected_packages.contains(&"@repo/ui".to_string()));
+}
+
+#[test]
 fn test_build_affected_with_downstream_dependents() {
     let root = fixture_path("turbo_monorepo");
     let cache = CacheRuntime::default();
