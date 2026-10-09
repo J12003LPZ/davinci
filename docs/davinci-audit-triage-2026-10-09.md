@@ -1,6 +1,6 @@
 # DaVinci audit triage: WOR-175–294
 
-> **Tracking-only PR.** This document records the source-review backlog and proposed implementation assignments. It is not a claim that any issue has been fixed, reproduced or tested by this PR.
+> **Triage plus the Sonnet 5.5 fixes.** This document records the source-review backlog and proposed implementation assignments. The "Implementation status" section at the end lists which issues this PR fixes and how each is covered; everything else is unfixed.
 
 Scope: 120 Linear issues added after the initial WOR-20–174 audit, organized into the eight issue areas agreed for DaVinci.
 
@@ -87,4 +87,19 @@ Proposed model routing: **Opus 5.5: 44** for complex architecture, concurrency, 
 - [ ] Relevant targeted tests, formatting and checks are reported with exact results.
 - [ ] The implementing PR descriptions identify which WOR issues were actually resolved.
 
-No source-code change or test execution is included in this triage-only PR.
+## Implementation status: Sonnet 5.5 set (76 issues)
+
+The Sonnet-assigned issues have source fixes with regression tests in this PR. The 44 Opus-assigned issues are untouched. Each finding was fixed from its Linear description and the current code; none was reproduced on an earlier commit first.
+
+| Area | Fixed | Regression coverage |
+| --- | --- | --- |
+| Sessions and streaming | WOR-178, 179, 181, 185–191 | `davinci-session` (`wor178_181_session_recovery`, `wor179_tree_depth`); `davinci-ai` handshake, OAuth callback and SSE tests |
+| Code Mode | WOR-196, 200 | Unit test for the budget helper; native tests in `codemode_supervisor_budget` are `#[ignore]` (need the admitted Node fixture) and were compiled but not run |
+| Learning and packages | WOR-202, 203, 205, 207–213 (and WOR-267, listed under Change Impact in the triage) | `learning::store`, `learning::skill_manager`, `package_intelligence_audit` |
+| Git, LSP and tool safety | WOR-216, 218–224, 226–228 | `git_intelligence_audit`, LSP client/session tests, `davinci-ai` parser tests |
+| AI providers and authentication | WOR-230–234, 236, 238, 241 | `davinci-ai` serializer, auth and model-config tests |
+| Build and repository analysis | WOR-244, 245, 247–255, 257 | `build_intelligence_audit`; WOR-257 has a unit test for the cancel budget only |
+| Change Impact and workspace recovery | WOR-260–264, 267, 270 | `change_impact_audit`; skill manager and TUI word-wrap tests |
+| TUI, plugins and CLI | WOR-271–282, 286–288, 293 | `davinci-tui` unit tests, `test_impact::analysis`, `file_processor` |
+
+Known gaps: WOR-286 (plugin uninstall cleanup warning) and WOR-280/281 (launch and clipboard failure reporting) have no failure-path test; they need an undeletable directory or a missing launcher. `repo_intelligence_edges` does not compile on Windows because of an existing unix-only import, so it was not run here.
