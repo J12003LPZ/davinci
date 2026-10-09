@@ -46,14 +46,20 @@ impl TeamRoster {
         root.get_or_insert_with(CancellationToken::new).clone()
     }
 
-    /// Register a worker and hand back the token that stops it.
+    /// Register a worker and hand back the token that stops it. Admitting a
+    /// worker that is already on the roster returns its live token, so
+    /// `cancel` still reaches the original holder.
     pub fn admit(&self, agent_id: AgentId) -> CancellationToken {
-        let token = self.session_token().child_token();
-        self.inner
+        let mut members = self
+            .inner
             .members
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(agent_id, token.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(live) = members.get(&agent_id).filter(|t| !t.is_cancelled()) {
+            return live.clone();
+        }
+        let token = self.session_token().child_token();
+        members.insert(agent_id, token.clone());
         token
     }
 
@@ -476,6 +482,20 @@ where
 mod tests {
     use super::*;
     use crate::runtime::ids::RunId;
+
+    #[test]
+    fn wor116_admitting_a_worker_twice_keeps_cancel_reaching_the_first_holder() {
+        let roster = TeamRoster::default();
+        let id = AgentId::new();
+        let first = roster.admit(id);
+        let second = roster.admit(id);
+        assert!(roster.cancel(&id));
+        assert!(first.is_cancelled(), "original holder was orphaned");
+        assert!(second.is_cancelled());
+        // A cancelled member may be admitted afresh with a live token.
+        let again = roster.admit(id);
+        assert!(!again.is_cancelled() || roster.session_token().is_cancelled());
+    }
 
     #[test]
     fn roster_cancel_targets_one_member_and_shutdown_cancels_all() {
