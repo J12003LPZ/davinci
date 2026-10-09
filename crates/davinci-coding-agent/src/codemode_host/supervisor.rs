@@ -31,6 +31,13 @@ fn sandbox_failure(result: &Value) -> CodeModeError {
     }
 }
 
+/// Milliseconds of the run's wall budget still unspent, or `None` once the
+/// budget is gone.
+fn remaining_wall_ms(wall_ms: u64, elapsed: Duration) -> Option<u64> {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    wall_ms.checked_sub(elapsed_ms).filter(|left| *left > 0)
+}
+
 fn node_fingerprint(node: &Path) -> io::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -495,6 +502,9 @@ impl NodeCodeModeHost {
         if matches!(context.mode, CodeModeMode::Off) {
             return Err(CodeModeError::new("UNAVAILABLE", "Codemode is disabled"));
         }
+        // The request's timeout covers the whole run: catalog discovery and
+        // host launch spend it too, not only script execution.
+        let admitted = Instant::now();
         context.limits_for_request(request)?;
         if node_fingerprint(&self.node)
             .map_err(|_| CodeModeError::new("UNAVAILABLE", "Node executable binding unavailable"))?
@@ -547,10 +557,16 @@ impl NodeCodeModeHost {
             cancellation: context.cancellation.clone(),
             slots,
         };
+        let Some(remaining_ms) = remaining_wall_ms(limits.wall_ms, admitted.elapsed()) else {
+            return Err(CodeModeError::new(
+                "TIMEOUT",
+                "run deadline expired during host setup",
+            ));
+        };
         let watchdog = watch_host(
             child.clone(),
             context.cancellation.clone(),
-            Duration::from_millis(limits.wall_ms),
+            Duration::from_millis(remaining_ms),
         );
         let (sender, receiver) = mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || loop {
@@ -560,7 +576,7 @@ impl NodeCodeModeHost {
                 break;
             }
         });
-        let started = Instant::now();
+        let started = admitted;
         let run_id = &context.identity.invocation_id;
         let mut hello = false;
         let mut seen = std::collections::BTreeSet::new();
@@ -616,8 +632,14 @@ impl NodeCodeModeHost {
                     ));
                 }
                 hello = true;
+                let Some(script_ms) = remaining_wall_ms(limits.wall_ms, started.elapsed()) else {
+                    return Err(CodeModeError::new(
+                        "TIMEOUT",
+                        "run deadline expired during host setup",
+                    ));
+                };
                 write_frame(&mut input, &json!({"version":1,"type":"execute","runId":run_id,
-                        "code":request.code,"tools":tools,"timeoutMs":limits.wall_ms,"memoryBytes":limits.vm_heap_bytes}))
+                        "code":request.code,"tools":tools,"timeoutMs":script_ms,"memoryBytes":limits.vm_heap_bytes}))
                         .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "host write failed"))?;
                 continue;
             }
@@ -682,10 +704,12 @@ impl NodeCodeModeHost {
                     text.truncate(end);
                 }
                 return Ok(CodeModeOutcome {
-                    status: if ok {
-                        CodeModeStatus::Completed
-                    } else {
-                        CodeModeStatus::Failed
+                    // Truncated output is not a complete result: a caller that
+                    // only checks for success must not take it as one.
+                    status: match (ok, complete) {
+                        (true, true) => CodeModeStatus::Completed,
+                        (true, false) => CodeModeStatus::Partial,
+                        (false, _) => CodeModeStatus::Failed,
                     },
                     script_completed: ok,
                     output_text: text,
@@ -864,6 +888,14 @@ impl CodeModeHost for NodeCodeModeHost {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn setup_time_is_charged_against_the_script_timeout() {
+        assert_eq!(remaining_wall_ms(100, Duration::from_millis(0)), Some(100));
+        assert_eq!(remaining_wall_ms(100, Duration::from_millis(60)), Some(40));
+        assert_eq!(remaining_wall_ms(100, Duration::from_millis(100)), None);
+        assert_eq!(remaining_wall_ms(100, Duration::from_secs(3)), None);
+    }
 
     #[test]
     fn a_sandbox_deadline_is_reported_as_a_timeout_not_a_sandbox_fault() {
