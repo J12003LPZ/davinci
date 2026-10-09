@@ -16,7 +16,7 @@ pub use limits::{
     MAX_CONCURRENT_AGENTS_CAP, MAX_TOTAL_AGENTS_CAP,
 };
 pub use spec::{WorkflowJoin, WorkflowLaunch, WorkflowPhaseSpec, WorkflowSpec, WorkflowWorkerSpec};
-pub use state::{WorkflowArtifact, WorkflowStateError, WorkflowStateStore};
+pub use state::{WorkflowArtifact, WorkflowAuthority, WorkflowStateError, WorkflowStateStore};
 pub use tools::{
     find_saved_workflow, save_workflow_to_project, workflow_run_tool,
     workflow_run_tool_with_parent, workflow_status_tool, workflow_tool_specs,

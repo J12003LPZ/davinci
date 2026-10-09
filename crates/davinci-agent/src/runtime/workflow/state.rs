@@ -105,6 +105,28 @@ type PhaseArtifactMap = HashMap<(WorkflowId, String), Vec<Uuid>>;
 /// value), so a new store over the same directory can resume the workflow.
 const MANIFEST_FILE: &str = "artifacts.jsonl";
 
+/// The authority a workflow was launched with (WOR-117).
+const AUTHORITY_FILE: &str = "authority.json";
+
+/// One line per mutating worker a resume was allowed to run again (WOR-125).
+const RESUME_GRANTS_FILE: &str = "resume_grants.jsonl";
+
+/// The permission ceiling a workflow was launched under. Recorded at launch
+/// so a resume, even in a later process, runs under the same ceiling rather
+/// than whatever the resuming caller passes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowAuthority {
+    pub parent_permission_mode: Option<crate::PermissionMode>,
+    pub parent_tools: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResumeGrant {
+    phase: String,
+    worker: String,
+    fingerprint: String,
+}
+
 /// Thread-safe artifact store. Large values overflow to their own file, and
 /// every artifact is recorded in its workflow's manifest before it is
 /// visible, so artifacts survive a restart (WOR-104).
@@ -149,6 +171,94 @@ impl WorkflowStateStore {
         self.overflow_dir
             .join(workflow_id.to_string())
             .join(MANIFEST_FILE)
+    }
+
+    fn workflow_file(
+        &self,
+        workflow_id: WorkflowId,
+        name: &str,
+    ) -> Result<PathBuf, std::io::Error> {
+        let dir = self.overflow_dir.join(workflow_id.to_string());
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join(name))
+    }
+
+    /// Record the authority a workflow was launched with.
+    pub fn save_authority(
+        &self,
+        workflow_id: WorkflowId,
+        authority: &WorkflowAuthority,
+    ) -> Result<(), WorkflowStateError> {
+        let bytes = serde_json::to_vec(authority)
+            .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
+        self.workflow_file(workflow_id, AUTHORITY_FILE)
+            .and_then(|path| write_atomic(&path, &bytes))
+            .map_err(|e| WorkflowStateError::IoError(e.to_string()))
+    }
+
+    /// The authority recorded at launch, `None` for a workflow launched
+    /// before it was recorded. A record that cannot be read is an error, so
+    /// a resume never widens to "unknown" over a damaged file.
+    pub fn authority(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<WorkflowAuthority>, WorkflowStateError> {
+        let path = self
+            .overflow_dir
+            .join(workflow_id.to_string())
+            .join(AUTHORITY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| WorkflowStateError::SerializationError(e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(WorkflowStateError::IoError(e.to_string())),
+        }
+    }
+
+    /// Durably spend a resume grant for one mutating worker. Written before
+    /// the worker runs, so a crash mid-run still counts as spent.
+    pub fn record_resume_grant(
+        &self,
+        workflow_id: WorkflowId,
+        phase_id: &str,
+        worker_id: &str,
+        fingerprint: &str,
+    ) -> Result<(), WorkflowStateError> {
+        let record = serde_json::to_vec(&ResumeGrant {
+            phase: phase_id.to_string(),
+            worker: worker_id.to_string(),
+            fingerprint: fingerprint.to_string(),
+        })
+        .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
+        self.workflow_file(workflow_id, RESUME_GRANTS_FILE)
+            .and_then(|path| crate::runtime::append_log::append_record(&path, &record))
+            .map_err(|e| WorkflowStateError::IoError(e.to_string()))
+    }
+
+    /// How many resume grants one worker has already spent.
+    pub fn resume_grants_spent(
+        &self,
+        workflow_id: WorkflowId,
+        phase_id: &str,
+        worker_id: &str,
+    ) -> Result<usize, WorkflowStateError> {
+        let path = self
+            .overflow_dir
+            .join(workflow_id.to_string())
+            .join(RESUME_GRANTS_FILE);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(WorkflowStateError::IoError(e.to_string())),
+        };
+        // A torn last line was never acknowledged, so it is not counted.
+        Ok(BufReader::new(file)
+            .split(b'\n')
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_slice::<ResumeGrant>(&line).ok())
+            .filter(|grant| grant.phase == phase_id && grant.worker == worker_id)
+            .count())
     }
 
     /// Read a workflow's manifest into memory once. A line that does not

@@ -246,6 +246,8 @@ pub enum TaskError {
     InUse,
     #[error("task revision exhausted: {0}")]
     RevisionOverflow(TaskId),
+    #[error("task attempt counter exhausted: {0}")]
+    AttemptOverflow(TaskId),
     #[error("task revision conflict: {0}")]
     RevisionConflict(TaskId),
     #[error("task {field} exceeds limit {limit}")]
@@ -532,6 +534,13 @@ impl TaskRegistry {
             store: None,
             lineage: None,
         }
+    }
+
+    /// Test hook: persist through `sink`, so a test can make a commit fail.
+    #[cfg(test)]
+    pub(crate) fn with_commit_sink(mut self, sink: Arc<dyn TaskCommitSink>) -> Self {
+        self.store = Some(sink);
+        self
     }
 
     /// Configure the host clock before sharing the registry with workers.
@@ -1859,7 +1868,10 @@ impl TaskRegistry {
 
         let task = next.get_mut(&task_id).unwrap();
         stale_evidence.extend(task.evidence_refs.iter().copied());
-        task.attempt += 1;
+        task.attempt = task
+            .attempt
+            .checked_add(1)
+            .ok_or(TaskError::AttemptOverflow(task_id))?;
         task.result = None;
         task.assigned_to = None;
         task.blocked_reasons.retain(|r| r.code != "rewound");
@@ -3031,6 +3043,27 @@ mod tests {
         );
         let after = registry.tasks.read().unwrap().clone();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn wor118_rewind_at_the_attempt_limit_is_an_explicit_error() {
+        let registry = TaskRegistry::new();
+        let root = registry
+            .create_task(TaskRecord::new(RunId::new(), "root"))
+            .unwrap();
+        registry
+            .tasks
+            .write()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .attempt = u32::MAX;
+        let before = registry.tasks.read().unwrap().clone();
+        assert_eq!(
+            registry.rewind_task_state(root, "checkpoint"),
+            Err(TaskError::AttemptOverflow(root))
+        );
+        assert_eq!(*registry.tasks.read().unwrap(), before);
     }
 
     #[test]
