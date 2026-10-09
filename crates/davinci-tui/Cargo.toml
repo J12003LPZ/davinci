@@ -9,6 +9,7 @@ description = "Terminal UI matching @earendil-works/pi-tui"
 [dependencies]
 base64.workspace = true
 crossterm.workspace = true
+davinci-sys = { path = "../davinci-sys" }
 fancy-regex.workspace = true
 icu_segmenter.workspace = true
 pulldown-cmark.workspace = true

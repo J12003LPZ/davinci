@@ -218,11 +218,11 @@ impl SessionSelector {
             };
         }
         match data {
-            "\x1b[A" | "k" => {
+            "\x1b[A" => {
                 self.move_sel(-1);
                 SessionSelectorAction::None
             }
-            "\x1b[B" | "j" => {
+            "\x1b[B" => {
                 self.move_sel(1);
                 SessionSelectorAction::None
             }
@@ -330,10 +330,9 @@ impl SessionSelector {
             }
         }
         match self.sort_mode {
-            SortMode::Recent if parsed.is_none() => {
+            SortMode::Recent => {
                 items.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
             }
-            SortMode::Recent => {}
             SortMode::Relevance | SortMode::Threaded if parsed.is_some() => {
                 let parsed = parsed.as_ref().expect("parsed query");
                 // Score once per item; running the matcher inside the
@@ -696,6 +695,35 @@ fn regex_is_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_session_search_accepts_j_and_k() {
+        let mut selector = SessionSelector::new(sample());
+        for ch in "java work".chars() {
+            selector.handle_key(&ch.to_string());
+        }
+        assert_eq!(selector.query, "java work");
+    }
+
+    #[test]
+    fn regression_recent_search_orders_by_modification_time() {
+        let mut items = sample();
+        items.reverse();
+        for item in &mut items {
+            item.name = Some("matching".into());
+        }
+        let mut selector = SessionSelector::new(items);
+        selector.sort_mode = SortMode::Recent;
+        selector.handle_key("matching");
+        assert_eq!(
+            selector
+                .filtered
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["aaa", "bbb"]
+        );
+    }
 
     fn sample() -> Vec<SessionItem> {
         vec![

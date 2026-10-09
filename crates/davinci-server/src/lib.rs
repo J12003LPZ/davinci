@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use davinci_agent::{Agent, AgentEvent, PromptProfile};
-use davinci_ai::{
-    content_text, get_supported_thinking_levels, AssistantMessage, ContentBlock, StopReason,
-};
+use davinci_ai::{content_text, get_supported_thinking_levels};
+#[cfg(test)]
+use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
 use davinci_protocol::{
     encode_server_message, AssistantContent, ClientMessage, ClientMessageDecoder, Command,
     CommandResult, ModelCost, ModelMetadata, ModelRef, ProtocolError, ProtocolErrorCode,
@@ -288,15 +288,19 @@ impl PiServer {
                 thinking_level,
             } => {
                 let cwd = cwd.unwrap_or_else(|| ".".into());
-                let session = JsonlSession::create(&self.sessions_dir, &cwd, name.as_deref())
+                let mut session = JsonlSession::create(&self.sessions_dir, &cwd, name.as_deref())
                     .map_err(internal)?;
+                let model = model.unwrap_or_else(davinci_protocol::default_model_ref);
+                let thinking_level = thinking_level.unwrap_or(ThinkingLevel::Off);
+                persist_model(&mut session, &model)?;
+                persist_thinking(&mut session, thinking_level)?;
                 let id = session.header.id.clone();
                 let live = LiveSession {
                     agent: new_runtime_agent(&cwd),
                     session,
                     phase: SessionPhase::Idle,
-                    model: model.unwrap_or_else(davinci_protocol::default_model_ref),
-                    thinking_level: thinking_level.unwrap_or(ThinkingLevel::Off),
+                    model,
+                    thinking_level,
                     queued_steer: Vec::new(),
                     connections: HashSet::new(),
                     operation_count: 0,
@@ -391,6 +395,7 @@ impl PiServer {
                     if live.phase != SessionPhase::Idle {
                         return Err(busy("Session is busy"));
                     }
+                    persist_model(&mut live.session, &model)?;
                     live.model = model;
                 }
                 Ok(CommandResult::SetModel {
@@ -410,6 +415,7 @@ impl PiServer {
                     if live.phase != SessionPhase::Idle {
                         return Err(busy("Session is busy"));
                     }
+                    persist_thinking(&mut live.session, thinking_level)?;
                     live.thinking_level = thinking_level;
                 }
                 Ok(CommandResult::SetThinking {
@@ -436,6 +442,7 @@ impl PiServer {
             return Ok(());
         }
         let session = open_named(&self.sessions_dir, session_id)?;
+        let (model, thinking_level) = session_preferences(&session);
         let mut agent = new_runtime_agent(&session.header.cwd);
         hydrate_agent_messages(&mut agent, &session);
         self.live.insert(
@@ -444,8 +451,8 @@ impl PiServer {
                 agent,
                 session,
                 phase: SessionPhase::Idle,
-                model: davinci_protocol::default_model_ref(),
-                thinking_level: ThinkingLevel::Off,
+                model,
+                thinking_level,
                 queued_steer: Vec::new(),
                 connections: HashSet::new(),
                 operation_count: 0,
@@ -567,51 +574,23 @@ impl PiServer {
                 .live
                 .get_mut(session_id)
                 .ok_or_else(|| not_found(session_id))?;
-            live.session
-                .append_entry(davinci_session::SessionEntry::message(
-                    "user",
-                    serde_json::json!([{"type":"text","text": text}]),
-                ))
+            live.agent
+                .load_from_session(live.session.clone())
                 .map_err(internal)?;
+            live.agent.provider = live.model.provider.clone();
+            live.agent.model_id = live.model.id.clone();
+            live.agent.thinking_level = live.thinking_level;
             live.agent.prompt(text);
+            live.session = live.agent.session.as_ref().expect("bound session").clone();
+            live.agent.ensure_session_persistence().map_err(internal)?;
             live.phase = SessionPhase::Turn;
             live.queued_steer.clear();
-            if std::env::var("PI_SERVER_KEEP_TURN").is_err() {
-                let user_text = text.to_string();
-                loop_events = live
-                    .agent
-                    .run_loop(|_| {
-                        let reply = std::env::var("PI_SERVER_PROMPT_REPLY")
-                            .ok()
-                            .map(|value| {
-                                if value.is_empty() {
-                                    format!("reply:{user_text}")
-                                } else {
-                                    value
-                                }
-                            })
-                            .unwrap_or_else(|| format!("reply:{user_text}"));
-                        Ok(AssistantMessage {
-                            extra: Default::default(),
-                            id: davinci_agent::new_message_id(),
-                            role: "assistant".into(),
-                            content: vec![ContentBlock::Text { text: reply }],
-                            model: "server".into(),
-                            usage: None,
-                            stop_reason: Some(StopReason::Stop),
-                            error_message: None,
-                        })
-                    })
-                    .map_err(internal)?;
-                if let Some(reply) = live.agent.last_assistant_text() {
-                    live.session
-                        .append_entry(davinci_session::SessionEntry::message(
-                            "assistant",
-                            serde_json::json!([{"type":"text","text": reply}]),
-                        ))
-                        .map_err(internal)?;
-                }
+            let keep_turn = cfg!(test) && std::env::var("PI_SERVER_KEEP_TURN").is_ok();
+            if !keep_turn {
+                let result = live.agent.run_loop(complete_server_prompt);
+                live.session = live.agent.session.as_ref().expect("bound session").clone();
                 live.phase = SessionPhase::Idle;
+                loop_events = result.map_err(internal)?;
             }
         }
         let session = self.live_snapshot(session_id)?;
@@ -634,6 +613,113 @@ impl PiServer {
     }
 }
 
+fn complete_server_prompt(agent: &Agent) -> Result<davinci_agent::CompleteOutput, String> {
+    #[cfg(test)]
+    if let Ok(reply) = std::env::var("PI_SERVER_PROMPT_REPLY") {
+        return Ok(AssistantMessage {
+            extra: Default::default(),
+            id: davinci_agent::new_message_id(),
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text { text: reply }],
+            model: format!("{}/{}", agent.provider, agent.model_id),
+            usage: None,
+            stop_reason: Some(StopReason::Stop),
+            error_message: None,
+        }
+        .into());
+    }
+    let auth_path = davinci_ai::try_default_auth_path().map_err(|error| error.to_string())?;
+    let agent_dir = auth_path
+        .parent()
+        .ok_or("credential directory unavailable")?;
+    let config = davinci_ai::ModelConfig::load(&davinci_ai::models_json_path(agent_dir));
+    let models = config.apply(&davinci_ai::load_builtin_models())?;
+    let model =
+        davinci_ai::find_model(&models, &agent.provider, &agent.model_id).ok_or_else(|| {
+            format!(
+                "No model available for {}/{}",
+                agent.provider, agent.model_id
+            )
+        })?;
+    let storage = davinci_ai::AuthStorage::open(&auth_path).map_err(|error| error.to_string())?;
+    let env = std::env::vars().collect();
+    let mut auth = davinci_ai::resolve_provider_auth(&agent.provider, &storage, &env, true)
+        .unwrap_or(davinci_ai::ResolvedAuth {
+            api_key: None,
+            headers: Default::default(),
+            source: "none".into(),
+        });
+    if agent.provider == "openai-codex" {
+        if !auth.source.eq_ignore_ascii_case("oauth") {
+            return Err(
+                "ChatGPT subscription authentication unavailable; log in with /login openai-codex"
+                    .into(),
+            );
+        }
+    } else {
+        davinci_ai::apply_config_auth(&mut auth, &config, &agent.provider, Some(model), &env);
+        if auth.api_key.is_none() && auth.headers.is_empty() && auth.source == "none" {
+            return Err(format!("No credentials available for {}", agent.provider));
+        }
+    }
+    let messages = agent.messages_for_provider();
+    let tools = agent
+        .provider_tool_specs()
+        .into_iter()
+        .map(|tool| davinci_ai::ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            constrained_sampling: None,
+        })
+        .collect::<Vec<_>>();
+    let system = agent.provider_system_prompt();
+    let envelope = davinci_ai::live_complete_streaming_with_sink_envelope(
+        model,
+        &messages,
+        &auth,
+        Some(&system),
+        &tools,
+        &davinci_ai::StreamOptions {
+            service_tier: Some(agent.service_tier),
+            thinking_level: Some(agent.request_thinking_level()),
+            thinking_budgets: agent.thinking_budgets.clone(),
+            timeout_ms: agent.provider_timeout_ms,
+            max_retries: agent.provider_max_retries,
+            max_retry_delay_ms: Some(agent.provider_max_retry_delay_ms),
+            max_tokens: agent.context_vm_provider_output_limit(),
+            transport: agent.transport.clone(),
+            session_id: agent
+                .session
+                .as_ref()
+                .map(|session| session.header.id.clone()),
+            native_responses_resume: agent.native_responses_resume_record_for(&messages),
+            install_telemetry: Some(agent.install_telemetry),
+            abort_signal: agent.abort_signal.clone(),
+            output_schema: agent.output_schema.clone(),
+            ..Default::default()
+        },
+        &mut |_| {},
+    )?;
+    let native_responses_resume = envelope.native_responses.map(|turn| {
+        let mut projection = messages;
+        projection.push(davinci_ai::assistant_to_chat(&envelope.message));
+        davinci_ai::NativeResponsesResumeRecord {
+            turn,
+            resume_provider_message_count: projection.len(),
+            resume_provider_messages_fingerprint: davinci_ai::provider_messages_fingerprint(
+                &projection,
+            ),
+        }
+    });
+    Ok(davinci_agent::CompleteOutput {
+        message: envelope.message,
+        stream_events: Some(envelope.stream_events),
+        native_responses_resume,
+        streamed_live: false,
+    })
+}
+
 fn open_named(dir: &std::path::Path, session_id: &str) -> Result<JsonlSession, ProtocolError> {
     let summary = davinci_session::resolve_session_ref(dir, None, session_id)
         .map_err(|_| not_found(session_id))?;
@@ -644,13 +730,72 @@ fn open_named(dir: &std::path::Path, session_id: &str) -> Result<JsonlSession, P
     })
 }
 
+fn persist_model(session: &mut JsonlSession, model: &ModelRef) -> Result<(), ProtocolError> {
+    let mut entry = davinci_session::SessionEntry::message("", Value::Null);
+    entry.entry_type = "model_change".into();
+    entry.message = None;
+    entry
+        .extra
+        .insert("provider".into(), Value::String(model.provider.clone()));
+    entry
+        .extra
+        .insert("modelId".into(), Value::String(model.id.clone()));
+    session.append_entry(entry).map_err(internal)
+}
+
+fn persist_thinking(session: &mut JsonlSession, level: ThinkingLevel) -> Result<(), ProtocolError> {
+    let mut entry = davinci_session::SessionEntry::message("", Value::Null);
+    entry.entry_type = "thinking_level_change".into();
+    entry.message = None;
+    entry
+        .extra
+        .insert("thinkingLevel".into(), Value::String(level.as_str().into()));
+    session.append_entry(entry).map_err(internal)
+}
+
+fn session_preferences(session: &JsonlSession) -> (ModelRef, ThinkingLevel) {
+    let mut model = davinci_protocol::default_model_ref();
+    let mut thinking = ThinkingLevel::Off;
+    for entry in davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref()) {
+        if entry.entry_type == "model_change" {
+            if let (Some(provider), Some(id)) = (
+                entry.extra.get("provider").and_then(Value::as_str),
+                entry.extra.get("modelId").and_then(Value::as_str),
+            ) {
+                model = ModelRef {
+                    provider: provider.into(),
+                    id: id.into(),
+                };
+            }
+        } else if entry.entry_type == "thinking_level_change" {
+            if let Some(level) = entry
+                .extra
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .and_then(ThinkingLevel::parse)
+            {
+                thinking = level;
+            }
+        }
+    }
+    (model, thinking)
+}
+
 fn snapshot_from_live(live: &LiveSession) -> SessionSnapshot {
     SessionSnapshot {
         id: live.session.header.id.clone(),
         name: live.session.display_name(),
         cwd: live.session.header.cwd.clone(),
         created_at: live.session.header.created_at,
-        updated_at: live.session.header.created_at,
+        updated_at: live
+            .session
+            .entries
+            .iter()
+            .map(|entry| entry.timestamp)
+            .chain(live.session.records.iter().map(|record| record.timestamp))
+            .max()
+            .unwrap_or(live.session.header.created_at)
+            .max(live.session.header.created_at),
         phase: live.phase,
         model: live.model.clone(),
         thinking_level: live.thinking_level,
@@ -664,9 +809,8 @@ fn snapshot_from_live(live: &LiveSession) -> SessionSnapshot {
 }
 
 fn transcript_from_jsonl(session: &JsonlSession, model: &ModelRef) -> Vec<TranscriptItem> {
-    session
-        .entries
-        .iter()
+    davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+        .into_iter()
         .filter_map(|entry| {
             if entry.entry_type != "message" {
                 return None;
@@ -683,18 +827,61 @@ fn transcript_from_jsonl(session: &JsonlSession, model: &ModelRef) -> Vec<Transc
                 "assistant" => Some(TranscriptItem::Assistant {
                     id: entry.id.clone(),
                     content: assistant_content(content),
-                    model: model.clone(),
-                    response_model: None,
-                    usage: None,
+                    model: historical_model(message, model),
+                    response_model: message
+                        .get("responseModel")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    usage: message
+                        .get("usage")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok()),
                     timestamp: entry.timestamp,
-                    status: "complete".into(),
-                    stop_reason: Some("stop".into()),
-                    error_message: None,
+                    status: message
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            match message.get("stopReason").and_then(Value::as_str) {
+                                Some("error") => "error",
+                                Some("aborted") => "aborted",
+                                _ => "complete",
+                            }
+                        })
+                        .into(),
+                    stop_reason: message
+                        .get("stopReason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    error_message: message
+                        .get("errorMessage")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 }),
                 _ => None,
             }
         })
         .collect()
+}
+
+fn historical_model(message: &Value, fallback: &ModelRef) -> ModelRef {
+    let Some(recorded) = message.get("model").and_then(Value::as_str) else {
+        return fallback.clone();
+    };
+    let (provider, id) = if let Some(provider) = message.get("provider").and_then(Value::as_str) {
+        (
+            provider,
+            recorded
+                .strip_prefix(&format!("{provider}/"))
+                .unwrap_or(recorded),
+        )
+    } else {
+        recorded
+            .split_once('/')
+            .unwrap_or((&fallback.provider, recorded))
+    };
+    ModelRef {
+        provider: provider.into(),
+        id: id.into(),
+    }
 }
 
 fn text_or_images(content: &Value) -> Vec<TextOrImage> {
@@ -826,28 +1013,17 @@ fn internal(err: impl ToString) -> ProtocolError {
 }
 
 fn hydrate_agent_messages(agent: &mut Agent, session: &JsonlSession) {
-    agent.messages = session
-        .entries
-        .iter()
+    agent.messages = davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+        .into_iter()
         .filter_map(|entry| {
-            let message = entry.message.as_ref()?;
-            let role = message.get("role").and_then(Value::as_str)?.to_string();
-            let text = message
-                .get("content")
-                .map(|content| {
-                    if let Some(text) = content.as_str() {
-                        return text.to_string();
-                    }
-                    content
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            Some(davinci_ai::ChatMessage::text(&role, text))
+            if entry.entry_type != "message" {
+                return None;
+            }
+            let mut message = entry.message.clone()?;
+            if let Some(text) = message.get("content").and_then(Value::as_str) {
+                message["content"] = serde_json::json!([{"type":"text","text":text}]);
+            }
+            serde_json::from_value(message).ok()
         })
         .collect();
 }
@@ -914,63 +1090,66 @@ pub fn serve_stream<S: Read + Write>(
     let mut buf = [0u8; 8192];
     let mut greeted = false;
     let mut connection_id = None;
-    loop {
-        let n = stream
-            .read(&mut buf)
-            .map_err(|err| ServerError::Io(err.to_string()))?;
-        if n == 0 {
-            break;
-        }
-        for message in decoder
-            .push(&buf[..n])
-            .map_err(|err| ServerError::Protocol(err.to_string()))?
-        {
-            let response = match message {
-                ClientMessage::Request { id, .. } if !greeted => ServerMessage::Response {
-                    id,
-                    ok: false,
-                    result: None,
-                    error: Some(ProtocolError {
-                        code: ProtocolErrorCode::InvalidRequest,
-                        message: "Hello must be the first protocol message".into(),
-                        details: None,
-                    }),
-                },
-                message => {
-                    let response = server.handle(message);
-                    if let ServerMessage::Hello {
-                        connection_id: id, ..
-                    } = &response
-                    {
-                        greeted = true;
-                        connection_id = Some(id.clone());
+    let result = (|| {
+        loop {
+            let n = stream
+                .read(&mut buf)
+                .map_err(|err| ServerError::Io(err.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            for message in decoder
+                .push(&buf[..n])
+                .map_err(|err| ServerError::Protocol(err.to_string()))?
+            {
+                let response = match message {
+                    ClientMessage::Request { id, .. } if !greeted => ServerMessage::Response {
+                        id,
+                        ok: false,
+                        result: None,
+                        error: Some(ProtocolError {
+                            code: ProtocolErrorCode::InvalidRequest,
+                            message: "Hello must be the first protocol message".into(),
+                            details: None,
+                        }),
+                    },
+                    message => {
+                        let response = server.handle(message);
+                        if let ServerMessage::Hello {
+                            connection_id: id, ..
+                        } = &response
+                        {
+                            greeted = true;
+                            connection_id = Some(id.clone());
+                        }
+                        response
                     }
-                    response
+                };
+                let mut outgoing = vec![response];
+                outgoing.extend(
+                    server
+                        .take_events()
+                        .into_iter()
+                        .map(|event| ServerMessage::Event { event }),
+                );
+                for message in outgoing {
+                    let bytes = encode_server_message(&message, None)
+                        .map_err(|err| ServerError::Protocol(err.to_string()))?;
+                    stream
+                        .write_all(&bytes)
+                        .map_err(|err| ServerError::Io(err.to_string()))?;
                 }
-            };
-            let mut outgoing = vec![response];
-            outgoing.extend(
-                server
-                    .take_events()
-                    .into_iter()
-                    .map(|event| ServerMessage::Event { event }),
-            );
-            for message in outgoing {
-                let bytes = encode_server_message(&message, None)
-                    .map_err(|err| ServerError::Protocol(err.to_string()))?;
-                stream
-                    .write_all(&bytes)
-                    .map_err(|err| ServerError::Io(err.to_string()))?;
             }
         }
-    }
-    decoder
-        .end()
-        .map_err(|err| ServerError::Protocol(err.to_string()))?;
+        decoder
+            .end()
+            .map_err(|err| ServerError::Protocol(err.to_string()))?;
+        Ok(())
+    })();
     if let Some(connection_id) = connection_id {
         server.disconnect(&connection_id);
     }
-    Ok(())
+    result
 }
 
 pub fn memory_roundtrip(server: &mut PiServer, message: ClientMessage) -> ServerMessage {
@@ -986,13 +1165,296 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn historical_models_keep_provider_qualified_model_ids() {
+        let fallback = davinci_protocol::default_model_ref();
+        for recorded in [
+            "anthropic/claude-fixture",
+            "openrouter/anthropic/claude-fixture",
+        ] {
+            let model = historical_model(
+                &serde_json::json!({
+                    "provider":"openrouter", "model":recorded
+                }),
+                &fallback,
+            );
+            assert_eq!(
+                model,
+                ModelRef {
+                    provider: "openrouter".into(),
+                    id: "anthropic/claude-fixture".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn regression_selected_settings_survive_session_reopen() {
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        let selected = ModelRef {
+            provider: "openai-codex".into(),
+            id: "gpt-6-luna".into(),
+        };
+        server
+            .dispatch(Command::SetModel {
+                session_id: created.id.clone(),
+                model: selected.clone(),
+            })
+            .unwrap();
+        server
+            .dispatch(Command::SetThinking {
+                session_id: created.id.clone(),
+                thinking_level: ThinkingLevel::High,
+            })
+            .unwrap();
+        server
+            .dispatch(Command::Detach {
+                session_id: created.id.clone(),
+            })
+            .unwrap();
+        let reopened = server
+            .dispatch(Command::Attach {
+                session_id: created.id.clone(),
+            })
+            .unwrap();
+        let CommandResult::Attach { session } = reopened else {
+            panic!("expected attach")
+        };
+        assert_eq!(session.model, selected);
+        assert_eq!(session.thinking_level, ThinkingLevel::High);
+    }
+
+    #[test]
+    fn regression_server_transcript_and_hydration_follow_active_branch() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), ".", None).unwrap();
+        session
+            .append_entry(davinci_session::SessionEntry::message(
+                "user",
+                serde_json::json!("root"),
+            ))
+            .unwrap();
+        let root = session.leaf_id.clone();
+        session
+            .append_entry(davinci_session::SessionEntry::message(
+                "user",
+                serde_json::json!("abandoned"),
+            ))
+            .unwrap();
+        session.set_leaf(root);
+        session
+            .append_entry(davinci_session::SessionEntry::message(
+                "user",
+                serde_json::json!("active"),
+            ))
+            .unwrap();
+        let transcript = transcript_from_jsonl(&session, &davinci_protocol::default_model_ref());
+        assert_eq!(transcript.len(), 2);
+        let mut agent = new_runtime_agent(".");
+        hydrate_agent_messages(&mut agent, &session);
+        assert_eq!(agent.messages.len(), 2);
+        assert_eq!(content_text(&agent.messages[1].content), "active");
+    }
+
+    #[test]
+    fn regression_server_hydration_preserves_structured_content_and_tool_metadata() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), ".", None).unwrap();
+        for value in [
+            serde_json::json!({"role":"user","content":[{"type":"image","data":"image-fixture","mimeType":"image/png"}]}),
+            serde_json::json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"thought","signature":"opaque","redacted":false},
+                {"type":"toolCall","id":"call","name":"read","arguments":{"path":"file"}}],
+                "model":"old/model","stopReason":"toolUse"}),
+            serde_json::json!({"role":"toolResult","toolCallId":"call","toolName":"read","isError":false,
+                "content":[{"type":"text","text":"output"}],"details":{"fixture":true}}),
+        ] {
+            let mut entry = davinci_session::SessionEntry::message("", Value::Null);
+            entry.message = Some(value);
+            session.append_entry(entry).unwrap();
+        }
+        let mut agent = new_runtime_agent(".");
+        hydrate_agent_messages(&mut agent, &session);
+        assert!(
+            matches!(&agent.messages[0].content[0], davinci_ai::MessageContent::Image { data, .. } if data == "image-fixture")
+        );
+        assert!(
+            matches!(&agent.messages[1].content[0], davinci_ai::MessageContent::Thinking { signature: Some(value), .. } if value == "opaque")
+        );
+        assert!(
+            matches!(&agent.messages[1].content[1], davinci_ai::MessageContent::ToolCall { id, .. } if id == "call")
+        );
+        assert_eq!(agent.messages[2].tool_call_id.as_deref(), Some("call"));
+        assert_eq!(agent.messages[2].tool_name.as_deref(), Some("read"));
+        assert_eq!(agent.messages[2].is_error, Some(false));
+    }
+
+    #[test]
+    fn regression_server_preserves_assistant_metadata_and_updated_timestamp() {
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        let live = server.live.get_mut(&created.id).unwrap();
+        let usage = davinci_protocol::Usage::from_tokens(
+            5,
+            2,
+            1,
+            0,
+            &ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+        );
+        let mut entry = davinci_session::SessionEntry::message("assistant", serde_json::json!([]));
+        entry.message = Some(serde_json::json!({
+            "role":"assistant","content":[],"provider":"openai-codex","model":"gpt-old",
+            "responseModel":"resolved-old","usage":usage,"stopReason":"aborted","errorMessage":"cancelled"
+        }));
+        entry.timestamp = created.created_at + 100;
+        live.session.append_entry(entry).unwrap();
+        let snapshot = snapshot_from_live(live);
+        assert!(snapshot.updated_at > snapshot.created_at);
+        let TranscriptItem::Assistant {
+            model,
+            response_model,
+            usage: actual_usage,
+            status,
+            stop_reason,
+            error_message,
+            ..
+        } = &snapshot.transcript[0]
+        else {
+            panic!("assistant")
+        };
+        assert_eq!(model.provider, "openai-codex");
+        assert_eq!(model.id, "gpt-old");
+        assert_eq!(response_model.as_deref(), Some("resolved-old"));
+        assert_eq!(actual_usage.as_ref(), Some(&usage));
+        assert_eq!(status, "aborted");
+        assert_eq!(stop_reason.as_deref(), Some("aborted"));
+        assert_eq!(error_message.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn regression_transport_failures_release_connections_and_sessions() {
+        struct BrokenStream {
+            input: std::io::Cursor<Vec<u8>>,
+            read_error: bool,
+            write_error: bool,
+            writes: usize,
+        }
+        impl Read for BrokenStream {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.input.position() == self.input.get_ref().len() as u64 && self.read_error {
+                    return Err(std::io::Error::other("fixture read failure"));
+                }
+                self.input.read(buf)
+            }
+        }
+        impl Write for BrokenStream {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                if self.write_error && self.writes > 1 {
+                    Err(std::io::Error::other("fixture write failure"))
+                } else {
+                    Ok(buf.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (read_error, write_error, incomplete) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let dir = tempdir().unwrap();
+            let mut server = PiServer::new(dir.path().to_path_buf());
+            let mut bytes = encode_client_message(
+                &ClientMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                },
+                None,
+            )
+            .unwrap();
+            bytes.extend(
+                encode_client_message(
+                    &ClientMessage::Request {
+                        id: "create".into(),
+                        request: Command::Create {
+                            cwd: Some(dir.path().display().to_string()),
+                            name: None,
+                            model: None,
+                            thinking_level: None,
+                        },
+                    },
+                    None,
+                )
+                .unwrap(),
+            );
+            if incomplete {
+                bytes.extend([0, 0]);
+            }
+            let result = serve_stream(
+                &mut server,
+                BrokenStream {
+                    input: std::io::Cursor::new(bytes),
+                    read_error,
+                    write_error,
+                    writes: 0,
+                },
+            );
+            assert!(result.is_err());
+            assert!(server.connections.is_empty());
+            assert!(server.live.is_empty());
+        }
+    }
+
+    #[test]
+    fn regression_server_does_not_echo_when_selected_model_is_unavailable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        server
+            .dispatch(Command::SetModel {
+                session_id: created.id.clone(),
+                model: ModelRef {
+                    provider: "unavailable-fixture".into(),
+                    id: "unavailable-fixture".into(),
+                },
+            })
+            .unwrap();
+        let result = server.dispatch(Command::Prompt {
+            session_id: created.id.clone(),
+            text: "hello".into(),
+        });
+        assert!(result.is_err());
+        let live = server.live.get(&created.id).unwrap();
+        assert_eq!(live.phase, SessionPhase::Idle);
+        assert!(!snapshot_from_live(live)
+            .transcript
+            .iter()
+            .any(|item| matches!(
+                item, TranscriptItem::Assistant { content, .. } if content.iter().any(|part|
+                    matches!(part, AssistantContent::Text { text } if text == "reply:hello"))
+            )));
+    }
+
     fn create_session(server: &mut PiServer) -> SessionSnapshot {
+        let cwd = server.sessions_dir.join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
         match memory_roundtrip(
             server,
             ClientMessage::Request {
                 id: "req-1".into(),
                 request: Command::Create {
-                    cwd: Some("/tmp/work".into()),
+                    cwd: Some(cwd.display().to_string()),
                     name: Some("demo".into()),
                     model: None,
                     thinking_level: None,
@@ -1261,20 +1723,120 @@ mod tests {
     }
 
     #[test]
-    fn prompt_runs_agent_loop_without_fixture() {
+    fn prompt_runs_selected_provider_and_reasoning_through_localhost() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("PI_SERVER_PROMPT_REPLY");
         std::env::remove_var("PI_SERVER_KEEP_TURN");
         let dir = tempdir().unwrap();
+        struct RestoreDirs(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for RestoreDirs {
+            fn drop(&mut self) {
+                for (name, value) in [
+                    ("DAVINCI_CODING_AGENT_DIR", &self.0),
+                    ("PI_CODING_AGENT_DIR", &self.1),
+                ] {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+        let _restore = RestoreDirs(
+            std::env::var_os("DAVINCI_CODING_AGENT_DIR"),
+            std::env::var_os("PI_CODING_AGENT_DIR"),
+        );
+        std::env::set_var("DAVINCI_CODING_AGENT_DIR", dir.path());
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let provider = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "provider was never called"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 8192];
+            let body = loop {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..start]);
+                    assert!(headers.starts_with("POST /v1/responses "));
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= start + 4 + length {
+                        break serde_json::from_slice::<Value>(
+                            &request[start + 4..start + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            let response = serde_json::json!({
+                "id":"fixture-response","model":"fixture-model","status":"completed",
+                "output":[{"id":"message-fixture","type":"message","role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":"provider answer"}]}],
+                "usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}
+            }).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            body
+        });
+        std::fs::write(dir.path().join("models.json"), serde_json::json!({
+            "providers":{"fixture-provider":{
+                "api":"openai-responses","baseUrl":format!("http://{address}/v1"),
+                "apiKey":"disposable-fixture",
+                "models":[{"id":"fixture-model","name":"Fixture","reasoning":true,"input":["text"],
+                    "contextWindow":16384,"maxTokens":2048,
+                    "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]
+            }}
+        }).to_string()).unwrap();
         let mut server = PiServer::new(dir.path().to_path_buf());
         let created = create_session(&mut server);
+        server
+            .dispatch(Command::SetModel {
+                session_id: created.id.clone(),
+                model: ModelRef {
+                    provider: "fixture-provider".into(),
+                    id: "fixture-model".into(),
+                },
+            })
+            .unwrap();
+        server
+            .dispatch(Command::SetThinking {
+                session_id: created.id.clone(),
+                thinking_level: ThinkingLevel::High,
+            })
+            .unwrap();
         let prompted = match memory_roundtrip(
             &mut server,
             ClientMessage::Request {
                 id: "p1".into(),
                 request: Command::Prompt {
                     session_id: created.id.clone(),
-                    text: "hello-loop".into(),
+                    text: "Say provider answer".into(),
                 },
             },
         ) {
@@ -1285,10 +1847,19 @@ mod tests {
             other => panic!("expected prompt: {other:?}"),
         };
         assert_eq!(prompted.phase, SessionPhase::Idle);
+        let request = provider.join().unwrap();
+        assert_eq!(request["model"], "fixture-model");
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert!(request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user"
+                && message["content"][0]["text"] == "Say provider answer"));
         assert!(prompted.transcript.iter().any(|item| matches!(
             item,
             TranscriptItem::Assistant { content, .. }
-                if content.iter().any(|part| matches!(part, AssistantContent::Text { text } if text == "reply:hello-loop"))
+                if content.iter().any(|part| matches!(part, AssistantContent::Text { text } if text == "provider answer"))
         )));
     }
 

@@ -344,6 +344,19 @@ pub fn builtin_themes() -> Vec<Theme> {
 
 pub fn load_themes_from_dir(dir: &std::path::Path) -> Vec<Theme> {
     let mut themes = builtin_themes();
+    // Resource discovery may select a single allowed file.
+    if dir.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(dir) {
+            if let Ok(theme) = serde_json::from_str::<Theme>(&raw) {
+                if let Some(existing) = themes.iter_mut().find(|item| item.name == theme.name) {
+                    *existing = theme;
+                } else {
+                    themes.push(theme);
+                }
+            }
+        }
+        return themes;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return themes;
     };
@@ -369,6 +382,18 @@ pub fn load_themes_from_dir(dir: &std::path::Path) -> Vec<Theme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_theme_file_loading_does_not_rescan_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["allowed", "excluded"] {
+            std::fs::write(dir.path().join(format!("{name}.json")),
+                format!(r##"{{"name":"{name}","background":"#000","foreground":"#fff","accent":"#f80"}}"##)).unwrap();
+        }
+        let themes = load_themes_from_dir(&dir.path().join("allowed.json"));
+        assert!(themes.iter().any(|theme| theme.name == "allowed"));
+        assert!(!themes.iter().any(|theme| theme.name == "excluded"));
+    }
 
     #[test]
     fn vox_is_a_separate_builtin_with_matching_native_palette() {

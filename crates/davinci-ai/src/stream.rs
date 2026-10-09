@@ -1092,9 +1092,7 @@ fn live_complete_streaming_with_sink_envelope_inner(
                     .map(|value| (name.clone(), value.to_string()))
             })
             .collect();
-        if let Some(snapshot) = crate::codex_usage::parse_usage_headers(&response_headers) {
-            crate::codex_usage::record(snapshot);
-        }
+        record_codex_response_usage(&response_headers);
     }
     let http_status = response.status();
     let result = (|| match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
@@ -1179,6 +1177,12 @@ pub struct RawProviderReply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+}
+
+fn record_codex_response_usage(headers: &[(String, String)]) {
+    if let Some(snapshot) = crate::codex_usage::parse_usage_headers(headers) {
+        crate::codex_usage::record_update(snapshot);
+    }
 }
 
 /// Perform one direct provider POST without retries or response decoding.
@@ -3237,6 +3241,29 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn regression_provider_headers_preserve_other_quota_windows() {
+        crate::codex_usage::record(
+            crate::codex_usage::parse_app_server_rate_limits(&serde_json::json!({
+                "primary": {"usedPercent":10,"windowDurationMins":300},
+                "secondary": {"usedPercent":40,"windowDurationMins":10080},
+                "planType":"plus"
+            }))
+            .unwrap(),
+        );
+        super::record_codex_response_usage(&[
+            ("x-codex-primary-used-percent".into(), "25".into()),
+            ("x-codex-primary-window-minutes".into(), "300".into()),
+        ]);
+        let snapshot = crate::codex_usage::latest().unwrap();
+        assert_eq!(snapshot.five_hour().unwrap().used_percent, 25.0);
+        assert_eq!(
+            snapshot.weekly().map(|window| window.used_percent),
+            Some(40.0)
+        );
+        assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
+        crate::codex_usage::withdraw("test complete");
+    }
     #[test]
     fn a_rejected_receipt_leads_with_the_providers_own_error() {
         let mut message: AssistantMessage = serde_json::from_value(serde_json::json!({

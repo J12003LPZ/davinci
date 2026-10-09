@@ -3,7 +3,9 @@
 //! `run_bounded` runs a helper with bounded time, captured output, and
 //! cancellation. It writes stdin independently, drains both output streams,
 //! terminates the process tree when needed, and gives inherited pipes a short
-//! grace period to close after the direct child exits.
+//! grace period to close after the direct child exits. The tree is owned from
+//! spawn (a Unix process group, a Windows job), so that cleanup still reaches
+//! descendants once the direct child is gone.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -85,7 +87,8 @@ pub fn resolve_program_in(name: &str, path_var: &OsStr, pathext: Option<&str>) -
 }
 
 /// Put the child in its own Unix process group so `kill_tree` also reaches
-/// descendants. Windows process-tree termination uses `taskkill /T`.
+/// descendants. Windows `kill_tree` uses `taskkill /T`, which needs the root
+/// alive; `run_bounded` uses a job object instead.
 pub fn set_own_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -161,8 +164,44 @@ fn take(shared: &Arc<Mutex<Captured>>) -> (Vec<u8>, bool) {
     (std::mem::take(&mut captured.bytes), captured.truncated)
 }
 
-fn stop_child(child: &mut Child) {
-    kill_tree(child.id());
+/// What `run_bounded` owns of the child's process tree.
+///
+/// On Windows the child starts suspended and joins a fresh job before its
+/// first instruction, so every descendant is a member. Terminating the job
+/// still reaches them after the direct child has exited, which
+/// `taskkill /PID <root> /T` cannot: it walks the tree from a root that no
+/// longer exists. Without a job (assignment refused), it falls back to that.
+struct Tree {
+    #[cfg(windows)]
+    job: Option<windows_job::Job>,
+}
+
+impl Tree {
+    fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
+        #[cfg(windows)]
+        {
+            windows_job::spawn(command).map(|(child, job)| (child, Self { job }))
+        }
+        #[cfg(not(windows))]
+        {
+            command.spawn().map(|child| (child, Self {}))
+        }
+    }
+
+    /// Kill every remaining process of the tree, including after the direct
+    /// child has been reaped.
+    fn kill(&self, child: &Child) {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+            return;
+        }
+        kill_tree(child.id());
+    }
+}
+
+fn stop_child(child: &mut Child, tree: &Tree) {
+    tree.kill(child);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -184,7 +223,7 @@ pub fn run_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     set_own_process_group(&mut command);
-    let mut child = command.spawn()?;
+    let (mut child, tree) = Tree::spawn(&mut command)?;
 
     if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // A child that exits without reading gives the writer BrokenPipe.
@@ -194,7 +233,7 @@ pub fn run_bounded(
                 let _ = pipe.write_all(&bytes);
             })
         {
-            stop_child(&mut child);
+            stop_child(&mut child, &tree);
             return Err(err);
         }
     }
@@ -202,14 +241,14 @@ pub fn run_bounded(
     let stdout = match child.stdout.take() {
         Some(pipe) => pipe,
         None => {
-            stop_child(&mut child);
+            stop_child(&mut child, &tree);
             return Err(io::Error::other("child stdout pipe was not available"));
         }
     };
     let stderr = match child.stderr.take() {
         Some(pipe) => pipe,
         None => {
-            stop_child(&mut child);
+            stop_child(&mut child, &tree);
             return Err(io::Error::other("child stderr pipe was not available"));
         }
     };
@@ -222,14 +261,14 @@ pub fn run_bounded(
     ) {
         Ok(out) => out,
         Err(err) => {
-            stop_child(&mut child);
+            stop_child(&mut child, &tree);
             return Err(err);
         }
     };
     let err = match drain(stderr, limits.output_cap, done_tx, "davinci-child-stderr") {
         Ok(err) => err,
         Err(err) => {
-            stop_child(&mut child);
+            stop_child(&mut child, &tree);
             return Err(err);
         }
     };
@@ -244,7 +283,7 @@ pub fn run_bounded(
             }
             Ok(None) => {}
             Err(err) => {
-                stop_child(&mut child);
+                stop_child(&mut child, &tree);
                 return Err(err);
             }
         }
@@ -252,7 +291,7 @@ pub fn run_bounded(
         if was_cancelled || started.elapsed() >= limits.timeout {
             result.cancelled = was_cancelled;
             result.timed_out = !was_cancelled;
-            stop_child(&mut child);
+            stop_child(&mut child, &tree);
             break;
         }
         std::thread::sleep(POLL);
@@ -263,15 +302,15 @@ pub fn run_bounded(
     while closed < 2 {
         let left = READER_GRACE.saturating_sub(grace_started.elapsed());
         if left.is_zero() {
-            kill_tree(child.id());
+            tree.kill(&child);
             break;
         }
         match done_rx.recv_timeout(left) {
             Ok(()) => closed += 1,
             Err(_) => {
-                // A descendant still holds a pipe. Kill the process group and
+                // A descendant still holds a pipe. Kill the whole tree and
                 // return instead of joining a reader thread without a bound.
-                kill_tree(child.id());
+                tree.kill(&child);
                 break;
             }
         }
@@ -279,6 +318,123 @@ pub fn run_bounded(
     (result.stdout, result.stdout_truncated) = take(&out);
     (result.stderr, result.stderr_truncated) = take(&err);
     Ok(result)
+}
+
+#[cfg(windows)]
+mod windows_job {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[repr(C)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn TerminateJobObject(job: *mut c_void, code: u32) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Thread32First(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
+        fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut c_void;
+        fn ResumeThread(thread: *mut c_void) -> u32;
+    }
+
+    /// An unnamed, non-inheritable job that only this process can reach.
+    /// No kill-on-close: like the Unix process group, members outlive the
+    /// handle unless `run_bounded` decides to terminate them.
+    pub(super) struct Job(OwnedHandle);
+
+    impl Job {
+        pub(super) fn terminate(&self) {
+            unsafe {
+                TerminateJobObject(self.0.as_raw_handle(), 1);
+            }
+        }
+    }
+
+    /// Spawn suspended, join a job, then resume. The child runs no code
+    /// before it is a member, so it cannot start a descendant outside it.
+    /// Overrides any creation flags already set on `command`.
+    pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Option<Job>)> {
+        command.creation_flags(CREATE_SUSPENDED);
+        let mut child = command.spawn()?;
+        let job = assign(&child);
+        if let Err(error) = resume(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok((child, job))
+    }
+
+    fn assign(child: &Child) -> Option<Job> {
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return None;
+        }
+        let job = Job(unsafe { OwnedHandle::from_raw_handle(raw) });
+        let joined =
+            unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), child.as_raw_handle()) } != 0;
+        joined.then_some(job)
+    }
+
+    /// Resume the suspended child's threads. A process created suspended has
+    /// exactly its primary thread, and std does not keep that handle, so it
+    /// is found by owner process id. The id is not stale: the child is
+    /// unreaped, so its id cannot be reused yet.
+    fn resume(process_id: u32) -> io::Result<()> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot as isize == INVALID_HANDLE_VALUE || snapshot.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+        let mut entry = ThreadEntry32 {
+            size: std::mem::size_of::<ThreadEntry32>() as u32,
+            usage: 0,
+            thread_id: 0,
+            owner_process_id: 0,
+            base_priority: 0,
+            delta_priority: 0,
+            flags: 0,
+        };
+        let mut resumed = 0;
+        let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
+        while more {
+            if entry.owner_process_id == process_id {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
+                if thread.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+                if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                resumed += 1;
+            }
+            more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
+        }
+        if resumed == 0 {
+            return Err(io::Error::other("suspended child has no thread to resume"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

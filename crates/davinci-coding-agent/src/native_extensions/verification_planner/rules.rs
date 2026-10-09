@@ -5,6 +5,7 @@ use super::model::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
@@ -158,7 +159,8 @@ pub fn build_plan_with_snapshot(
         classification.security = true;
         classification.ci = true;
     }
-    classification.docs_only = !classification.source
+    classification.docs_only = classification.docs_only
+        && !classification.source
         && !classification.frontend
         && !classification.tests
         && !classification.dependency
@@ -195,6 +197,9 @@ pub fn build_plan_with_snapshot(
                 &mut requirements,
                 StepSpec::tests(manager, root, &source_identity),
             );
+            if matches!(manager, PackageManager::Generic) {
+                warnings.push("no supported test command was detected; verification requires an external test receipt".into());
+            }
         }
         if classification.frontend || classification.source || classification.public_api {
             if has_script(root, manager, "typecheck", snapshot)
@@ -241,9 +246,9 @@ pub fn build_plan_with_snapshot(
                 &mut requirements,
                 StepSpec::build(manager, root, &source_identity),
             );
-            if matches!(manager, PackageManager::Generic) {
+            if matches!(manager, PackageManager::Generic | PackageManager::Python) {
                 warnings.push(
-                    "no supported package manager was detected; build verification requires an external process receipt".into(),
+                    "no supported build command was detected; build verification requires an external process receipt".into(),
                 );
             }
         }
@@ -368,8 +373,20 @@ fn source_identity(root: &Path, paths: &[String], transaction_identity: Option<&
     for path in paths {
         digest.update(path.as_bytes());
         digest.update([0]);
-        match fs::read(root.join(path)) {
-            Ok(bytes) => digest.update(bytes),
+        let mut candidate = digest.clone();
+        let read = (|| -> std::io::Result<()> {
+            let mut file = fs::File::open(root.join(path))?;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    return Ok(());
+                }
+                candidate.update(&buffer[..count]);
+            }
+        })();
+        match read {
+            Ok(()) => digest = candidate,
             Err(_) => digest.update(b"<missing>"),
         }
         digest.update([0xff]);
@@ -516,6 +533,10 @@ fn classify_path(
         classification.source = true;
         classification.label("source");
     }
+    if !docs && !source && !frontend && !test && !dependency && !ci {
+        classification.source = true;
+        classification.label("unknown-change");
+    }
     if test {
         classification.tests = true;
         classification.label("tests");
@@ -553,9 +574,15 @@ fn classify_path(
         classification.docs_only = false;
     }
 
-    if let Ok(bytes) = fs::read(root.join(path)) {
-        let sample =
-            String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_FILE_BYTES)]).to_ascii_lowercase();
+    let sample_bytes = (|| -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        fs::File::open(root.join(path))?
+            .take(MAX_FILE_BYTES as u64)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    if let Ok(bytes) = sample_bytes {
+        let sample = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
         if sample.contains("password")
             || sample.contains("client_secret")
             || sample.contains("private_key")
@@ -676,14 +703,15 @@ impl StepSpec {
             PackageManager::Yarn => vec!["test".into()],
             PackageManager::Bun => vec!["test".into()],
             PackageManager::Python => vec!["-m".into(), "pytest".into()],
-            PackageManager::Generic => vec!["diff".into(), "--check".into()],
+            PackageManager::Generic => Vec::new(),
         };
         Self {
             id: "targeted-tests",
             tier: 1,
             required: true,
             operation: "tests",
-            program: Some(manager.command().into()),
+            program: (!matches!(manager, PackageManager::Generic))
+                .then(|| manager.command().into()),
             argv,
             cwd: root.to_path_buf(),
             reason: "current source or test files require matching test evidence".into(),
@@ -718,7 +746,21 @@ impl StepSpec {
             required: true,
             operation: "lint",
             program: Some(manager.command().into()),
-            argv: vec!["run".into(), "lint".into()],
+            argv: if manager == PackageManager::Cargo {
+                [
+                    "clippy",
+                    "--offline",
+                    "--locked",
+                    "--all-targets",
+                    "--",
+                    "-D",
+                    "warnings",
+                ]
+                .map(str::to_string)
+                .to_vec()
+            } else {
+                vec!["run".into(), "lint".into()]
+            },
             cwd: root.to_path_buf(),
             reason: "repository lint script is available for changed source".into(),
             evidence_kind: "process_receipt",
@@ -732,7 +774,7 @@ impl StepSpec {
                 Some("cargo".into()),
                 vec!["build".into(), "--offline".into(), "--locked".into()],
             ),
-            PackageManager::Generic => (None, Vec::new()),
+            PackageManager::Generic | PackageManager::Python => (None, Vec::new()),
             _ => (
                 Some(manager.command().into()),
                 vec!["run".into(), "build".into()],
@@ -818,6 +860,165 @@ impl StepSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static LARGEST_ALLOCATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    struct AllocationProbe;
+    #[global_allocator]
+    static ALLOCATOR: AllocationProbe = AllocationProbe;
+
+    unsafe impl std::alloc::GlobalAlloc for AllocationProbe {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            note_allocation(layout.size());
+            std::alloc::System.alloc(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            std::alloc::System.dealloc(ptr, layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            note_allocation(size);
+            std::alloc::System.realloc(ptr, layout, size)
+        }
+    }
+
+    fn note_allocation(size: usize) {
+        let _ = LARGEST_ALLOCATION.try_with(|largest| {
+            if let Some(previous) = largest.get() {
+                largest.set(Some(previous.max(size)));
+            }
+        });
+    }
+
+    #[test]
+    fn regression_planner_file_reads_use_bounded_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::File::create(dir.path().join("large.rs"))
+            .unwrap()
+            .set_len(4 * 1024 * 1024)
+            .unwrap();
+        LARGEST_ALLOCATION.with(|largest| largest.set(Some(0)));
+        let plan = plan_for(dir.path(), "large.rs");
+        let largest = LARGEST_ALLOCATION.with(|largest| largest.replace(None).unwrap());
+        assert!(plan.source_identity.starts_with("sha256:"));
+        assert!(
+            largest <= 1024 * 1024,
+            "planner allocated {largest} bytes at once"
+        );
+        // Source identity must still cover bytes beyond the classification sample.
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("large.rs"))
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(b"x").unwrap();
+        let changed = plan_for(dir.path(), "large.rs");
+        assert_ne!(plan.source_identity, changed.source_identity);
+    }
+
+    fn plan_for(root: &Path, file: &str) -> VerificationPlan {
+        build_plan(
+            root,
+            &VerificationPlanArgs {
+                files: vec![file.into()],
+                ..Default::default()
+            },
+            None,
+            None,
+            &VerificationPlannerConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn regression_cargo_lint_is_clippy() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'",
+        )
+        .unwrap();
+        fs::write(dir.path().join("source.rs"), "fn main() {}").unwrap();
+        let plan = plan_for(dir.path(), "source.rs");
+        let lint = plan
+            .steps
+            .iter()
+            .find(|step| step.operation == "lint")
+            .unwrap();
+        assert_eq!(lint.program.as_deref(), Some("cargo"));
+        assert_eq!(
+            lint.argv,
+            [
+                "clippy",
+                "--offline",
+                "--locked",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
+    }
+
+    #[test]
+    fn regression_generic_tests_require_external_test_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.go"), "package main").unwrap();
+        let plan = plan_for(dir.path(), "main.go");
+        let tests = plan
+            .steps
+            .iter()
+            .find(|step| step.operation == "tests")
+            .unwrap();
+        assert!(tests.program.is_none());
+        assert!(tests.argv.is_empty());
+        assert_eq!(tests.evidence_kind, "test_receipt");
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("external test")));
+    }
+
+    #[test]
+    fn regression_python_build_requires_external_build_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname='fixture'",
+        )
+        .unwrap();
+        let plan = plan_for(dir.path(), "pyproject.toml");
+        let build = plan
+            .steps
+            .iter()
+            .find(|step| step.operation == "build")
+            .unwrap();
+        assert!(build.program.is_none());
+        assert!(build.argv.is_empty());
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("external process")));
+    }
+
+    #[test]
+    fn regression_unknown_non_document_files_require_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["script.sh", "schema.sql", "unknown.custom"] {
+            fs::write(dir.path().join(name), "hello").unwrap();
+            let plan = plan_for(dir.path(), name);
+            assert!(
+                !plan.classification.contains(&"documentation-only".into()),
+                "{name}"
+            );
+            assert!(
+                plan.steps.iter().any(|step| step.operation == "tests"),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn docs_only_change_does_not_activate_runtime_checks() {

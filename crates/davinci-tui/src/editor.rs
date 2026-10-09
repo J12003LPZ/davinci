@@ -345,11 +345,12 @@ impl Editor {
         }
         self.push_undo();
         if let Some((start, end)) = marker_ending_at(&self.buffer, self.cursor, &self.pastes) {
-            if let Some(id) = parse_marker_id(&self.buffer[start..end]) {
-                self.remove_paste_id(id);
-            }
+            let id = parse_marker_id(&self.buffer[start..end]);
             self.buffer.drain(start..end);
             self.cursor = start;
+            if let Some(id) = id {
+                self.remove_paste_id(id);
+            }
             return;
         }
         let prev = prev_grapheme_len(&self.buffer[..self.cursor]);
@@ -365,10 +366,11 @@ impl Editor {
         }
         self.push_undo();
         if let Some((start, end)) = marker_starting_at(&self.buffer, self.cursor, &self.pastes) {
-            if let Some(id) = parse_marker_id(&self.buffer[start..end]) {
+            let id = parse_marker_id(&self.buffer[start..end]);
+            self.buffer.drain(start..end);
+            if let Some(id) = id {
                 self.remove_paste_id(id);
             }
-            self.buffer.drain(start..end);
             return;
         }
         let next = next_grapheme_len(&self.buffer[self.cursor..]);
@@ -390,6 +392,7 @@ impl Editor {
                 self.pastes.insert(id - 1, content);
             }
         }
+        self.cursor = renumber_markers(&self.buffer[..self.cursor], target_id).len();
         self.buffer = renumber_markers(&self.buffer, target_id);
     }
 
@@ -439,17 +442,18 @@ impl Editor {
 
     pub fn move_word_backwards(&mut self) {
         self.clear_last_action();
-        self.cursor = crate::word_nav::find_word_backward_default(&self.buffer, self.cursor);
+        self.cursor = self.word_backward();
     }
 
     pub fn move_word_forwards(&mut self) {
         self.clear_last_action();
-        self.cursor = crate::word_nav::find_word_forward_default(&self.buffer, self.cursor);
+        self.cursor = self.word_forward();
     }
 
     pub fn delete_word_backwards(&mut self) {
+        self.exit_history_browsing();
         self.push_undo();
-        let start = crate::word_nav::find_word_backward_default(&self.buffer, self.cursor);
+        let start = self.word_backward();
         let deleted = self.buffer[start..self.cursor].to_string();
         self.buffer.drain(start..self.cursor);
         self.cursor = start;
@@ -459,8 +463,9 @@ impl Editor {
     }
 
     pub fn delete_word_forwards(&mut self) {
+        self.exit_history_browsing();
         self.push_undo();
-        let end = crate::word_nav::find_word_forward_default(&self.buffer, self.cursor);
+        let end = self.word_forward();
         let deleted = self.buffer[self.cursor..end].to_string();
         self.buffer.drain(self.cursor..end);
         self.kill_ring
@@ -469,6 +474,7 @@ impl Editor {
     }
 
     pub fn delete_to_line_start(&mut self) {
+        self.exit_history_browsing();
         self.push_undo();
         let start = self.buffer[..self.cursor]
             .rfind('\n')
@@ -483,6 +489,7 @@ impl Editor {
     }
 
     pub fn delete_to_line_end(&mut self) {
+        self.exit_history_browsing();
         self.push_undo();
         let end = self.buffer[self.cursor..]
             .find('\n')
@@ -493,6 +500,25 @@ impl Editor {
         self.kill_ring
             .push(&deleted, false, self.last_action == Some(LastAction::Kill));
         self.last_action = Some(LastAction::Kill);
+    }
+
+    fn word_backward(&self) -> usize {
+        let before = &self.buffer[..self.cursor];
+        crate::word_nav::find_word_backward(
+            &self.buffer,
+            self.cursor,
+            &marker_word_segments(before, &self.pastes),
+        )
+    }
+
+    fn word_forward(&self) -> usize {
+        let after = &self.buffer[self.cursor..];
+        self.cursor
+            + crate::word_nav::find_word_forward(
+                after,
+                0,
+                &marker_word_segments(after, &self.pastes),
+            )
     }
 
     pub fn yank(&mut self) {
@@ -865,15 +891,31 @@ fn set_cursor_line_col(buffer: &str, cursor: &mut usize, line: usize, col: usize
 
 fn expand_paste_markers(text: &str, pastes: &BTreeMap<usize, String>) -> String {
     let mut result = text.to_string();
-    for (id, content) in pastes {
-        let markers = paste_markers(&result);
-        for (start, end) in markers.into_iter().rev() {
-            if parse_marker_id(&result[start..end]) == Some(*id) {
-                result.replace_range(start..end, content);
-            }
+    for (start, end) in paste_markers(text).into_iter().rev() {
+        if let Some(content) = parse_marker_id(&text[start..end]).and_then(|id| pastes.get(&id)) {
+            result.replace_range(start..end, content);
         }
     }
     result
+}
+
+fn marker_word_segments(
+    text: &str,
+    pastes: &BTreeMap<usize, String>,
+) -> Vec<crate::word_nav::WordSegment> {
+    let mut segments = Vec::new();
+    let mut offset = 0;
+    for (start, end) in valid_markers(text, pastes) {
+        segments.extend(crate::word_nav::default_word_segments(&text[offset..start]));
+        segments.push(crate::word_nav::WordSegment {
+            text: text[start..end].to_string(),
+            is_word_like: false,
+            is_atomic: true,
+        });
+        offset = end;
+    }
+    segments.extend(crate::word_nav::default_word_segments(&text[offset..]));
+    segments
 }
 
 fn paste_markers(text: &str) -> Vec<(usize, usize)> {
@@ -1149,6 +1191,78 @@ impl Component for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_deleting_low_paste_id_renumbers_before_cursor_safely() {
+        for forward in [false, true] {
+            let mut editor = Editor::new();
+            for _ in 0..10 {
+                editor.move_line_start();
+                editor.handle_paste(&"x".repeat(1001));
+            }
+            editor.move_line_end();
+            if forward {
+                editor.move_left();
+                editor.delete_forward();
+            } else {
+                editor.backspace();
+            }
+            assert_eq!(editor.get_expanded_text(), "x".repeat(9009));
+            assert_eq!(editor.cursor, editor.buffer.len());
+            editor.insert('!');
+            editor.undo();
+            editor.undo();
+            assert_eq!(editor.get_expanded_text(), "x".repeat(10010));
+        }
+    }
+
+    #[test]
+    fn regression_paste_expansion_preserves_literal_markers_in_content() {
+        let mut editor = Editor::new();
+        let first = format!("{}[paste #2]", "a".repeat(1001));
+        let second = "b".repeat(1001);
+        editor.handle_paste(&first);
+        editor.handle_paste(&second);
+        assert_eq!(editor.submit(), format!("{first}{second}"));
+    }
+
+    #[test]
+    fn regression_word_shortcuts_treat_paste_as_atomic() {
+        let mut editor = Editor::new();
+        editor.handle_paste(&"x".repeat(1001));
+        let end = editor.buffer.len();
+        editor.move_word_backwards();
+        assert_eq!(editor.cursor, 0);
+        editor.move_word_forwards();
+        assert_eq!(editor.cursor, end);
+        editor.delete_word_backwards();
+        assert_eq!(editor.get_text(), "");
+        editor.yank();
+        assert_eq!(editor.get_expanded_text(), "x".repeat(1001));
+        editor.move_line_start();
+        editor.delete_word_forwards();
+        assert_eq!(editor.submit(), "");
+    }
+
+    #[test]
+    fn regression_kill_shortcuts_exit_history_browsing() {
+        for kill in [
+            Editor::delete_word_backwards,
+            Editor::delete_word_forwards,
+            Editor::delete_to_line_start,
+            Editor::delete_to_line_end,
+        ] {
+            let mut editor = Editor::new();
+            editor.set_text("draft");
+            editor.add_to_history("old prompt");
+            editor.navigate_history(-1);
+            editor.move_right();
+            kill(&mut editor);
+            let edited = editor.get_text().to_string();
+            editor.cursor_down();
+            assert_eq!(editor.get_text(), edited);
+        }
+    }
 
     #[test]
     fn editor_history_and_render() {
