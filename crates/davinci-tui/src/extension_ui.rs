@@ -187,7 +187,7 @@ impl ExtensionEditor {
         let mut editor = Editor::new();
         let prefill = prefill.into();
         if !prefill.is_empty() {
-            editor.handle_input(&prefill);
+            editor.set_text(&prefill);
         }
         Self {
             title: title.into(),
@@ -199,8 +199,19 @@ impl ExtensionEditor {
         match data {
             "\x1b" => ExtensionDialogAction::Cancel,
             "\x13" => ExtensionDialogAction::Submit(self.editor.submit()),
+            "\r" | "\n" => {
+                self.editor.insert('\n');
+                ExtensionDialogAction::None
+            }
             other => {
-                self.editor.handle_input(other);
+                if !crate::interaction::apply_editor_key(
+                    &mut self.editor,
+                    &crate::keybindings::Keybindings::default(),
+                    other,
+                ) && !other.contains('\x1b')
+                {
+                    self.editor.handle_input(other);
+                }
                 ExtensionDialogAction::None
             }
         }
@@ -220,6 +231,31 @@ impl Component for ExtensionEditor {
     }
 
     fn invalidate(&mut self) {}
+}
+
+#[cfg(test)]
+mod editor_regressions {
+    use super::*;
+
+    #[test]
+    fn regression_extension_editor_preserves_multiline_prefill() {
+        let editor = ExtensionEditor::new("Edit", "first line\nsecond line");
+        assert_eq!(editor.editor.get_text(), "first line\nsecond line");
+    }
+
+    #[test]
+    fn regression_extension_editor_dispatches_navigation_and_newlines() {
+        let mut editor = ExtensionEditor::new("Edit", "ab");
+        editor.handle_key("\x1b[D");
+        editor.handle_key("X");
+        editor.handle_key("\r");
+        editor.handle_key("Y");
+        editor.handle_key("\x1b[3~");
+        assert_eq!(
+            editor.handle_key("\x13"),
+            ExtensionDialogAction::Submit("aX\nY".into())
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

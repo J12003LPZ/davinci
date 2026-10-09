@@ -57,8 +57,9 @@
       // Labels are stored in 'label' entries that reference their target via targetId
       const labelMap = new Map();
       for (const entry of entries) {
-        if (entry.type === 'label' && entry.targetId && entry.label) {
-          labelMap.set(entry.targetId, entry.label);
+        if (entry.type === 'label' && entry.targetId) {
+          if (entry.label) labelMap.set(entry.targetId, entry.label);
+          else labelMap.delete(entry.targetId);
         }
       }
 
@@ -849,7 +850,7 @@
       }
 
       function findToolResult(toolCallId) {
-        for (const entry of entries) {
+        for (const entry of getPath(currentLeafId)) {
           if (entry.type === 'message' && entry.message.role === 'toolResult') {
             if (entry.message.toolCallId === toolCallId) {
               return entry.message;
@@ -1507,6 +1508,8 @@
       }
 
       function navigateTo(targetId, scrollMode = 'target', scrollToEntryId = null) {
+        // Tool results rendered into shared ancestors depend on the selected path.
+        if (currentLeafId !== targetId) entryCache.clear();
         currentLeafId = targetId;
         currentTargetId = scrollToEntryId || targetId;
         const path = getPath(targetId);

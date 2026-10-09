@@ -698,6 +698,7 @@ version = "1.1.6"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
+ "davinci-sys",
  "fancy-regex 0.14.0",
  "icu_segmenter",
  "pulldown-cmark",
