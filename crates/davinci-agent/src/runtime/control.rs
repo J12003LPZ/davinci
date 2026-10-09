@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -369,21 +369,96 @@ fn load_control_receipts(
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     let mut receipts = HashMap::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.map_err(|error| error.to_string())?;
-        if line.trim().is_empty() {
-            continue;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let newline = bytes[offset..].iter().position(|byte| *byte == b'\n');
+        let end = newline.map_or(bytes.len(), |at| offset + at);
+        let line = std::str::from_utf8(&bytes[offset..end]).map_err(|error| error.to_string());
+        let frame = line.and_then(|line| {
+            if line.trim().is_empty() {
+                return Ok(None);
+            }
+            serde_json::from_str::<ControlReceiptFrame>(line)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        });
+        match frame {
+            Ok(Some(frame)) => {
+                if frame.command_id != frame.receipt.command_id {
+                    return Err("control receipt ledger command identity mismatch".into());
+                }
+                receipts.insert(frame.command_id, (frame.command_digest, frame.receipt));
+            }
+            Ok(None) => {}
+            // Appends write the frame and then its newline, so a crash can
+            // only leave a partial frame at the very end with no newline.
+            // Cut it off so later appends do not fuse onto it; every earlier
+            // frame is intact.  Anything else is real corruption.
+            Err(_) if newline.is_none() => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .and_then(|file| file.set_len(offset as u64))
+                    .map_err(|error| error.to_string())?;
+                break;
+            }
+            Err(error) => return Err(error),
         }
-        let frame: ControlReceiptFrame =
-            serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        if frame.command_id != frame.receipt.command_id {
-            return Err("control receipt ledger command identity mismatch".into());
+        if newline.is_none() {
+            // A complete final frame that lost only its newline: restore it
+            // so the next append starts on its own line.
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|error| error.to_string())?;
+            file.write_all(b"\n").map_err(|error| error.to_string())?;
         }
-        receipts.insert(frame.command_id, (frame.command_digest, frame.receipt));
+        offset = end + 1;
     }
     Ok(receipts)
+}
+
+/// In-flight claim on a command ID.  Dropped without `commit` it releases the
+/// ID, so only commands that actually executed consume it.
+struct CommandClaim<'a> {
+    seen: &'a RwLock<HashSet<Uuid>>,
+    id: Uuid,
+    acquired: bool,
+    committed: bool,
+}
+
+impl<'a> CommandClaim<'a> {
+    fn new(seen: &'a RwLock<HashSet<Uuid>>, id: Uuid) -> Self {
+        // A poisoned lock cannot prove a duplicate; the receipt ledger check
+        // above remains the durable guard.
+        let acquired = seen.write().map(|mut set| set.insert(id)).unwrap_or(true);
+        Self {
+            seen,
+            id,
+            acquired,
+            committed: false,
+        }
+    }
+
+    fn acquired(&self) -> bool {
+        self.acquired
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CommandClaim<'_> {
+    fn drop(&mut self) {
+        if self.acquired && !self.committed {
+            if let Ok(mut set) = self.seen.write() {
+                set.remove(&self.id);
+            }
+        }
+    }
 }
 
 /// Controller responsible for querying snapshots and dispatching control commands.
@@ -570,17 +645,12 @@ impl WorkerController {
 
         let digest = command_digest(&cmd).unwrap_or_default();
         if let Ok(receipts) = self.command_receipts.read() {
-            if let Some((prior_digest, _receipt)) = receipts.get(&cmd.id) {
+            if let Some((prior_digest, prior_receipt)) = receipts.get(&cmd.id) {
                 if prior_digest == &digest {
-                    return WorkerControlReceipt {
-                        command_id: cmd.id,
-                        task_id: cmd.task_id,
-                        agent_id: cmd.agent_id,
-                        generation: cmd.generation,
-                        action: action_name,
-                        status: ControlStatus::Rejected,
-                        reason: Some("duplicate_command".to_string()),
-                    };
+                    // Replay of an executed command: hand back the original
+                    // receipt so a caller that lost the response can tell
+                    // what actually happened.
+                    return prior_receipt.clone();
                 }
                 return WorkerControlReceipt {
                     command_id: cmd.id,
@@ -594,19 +664,20 @@ impl WorkerController {
             }
         }
 
-        // 1. Check duplicate command ID
-        if let Ok(mut seen) = self.seen_commands.write() {
-            if !seen.insert(cmd.id) {
-                return WorkerControlReceipt {
-                    command_id: cmd.id,
-                    task_id: cmd.task_id,
-                    agent_id: cmd.agent_id,
-                    generation: cmd.generation,
-                    action: action_name,
-                    status: ControlStatus::Rejected,
-                    reason: Some("duplicate_command".to_string()),
-                };
-            }
+        // 1. Claim the command ID against concurrent duplicates.  The claim is
+        // released on every rejection below, so a command that was refused
+        // before it did anything can be retried under the same ID.
+        let mut claim = CommandClaim::new(&self.seen_commands, cmd.id);
+        if !claim.acquired() {
+            return WorkerControlReceipt {
+                command_id: cmd.id,
+                task_id: cmd.task_id,
+                agent_id: cmd.agent_id,
+                generation: cmd.generation,
+                action: action_name,
+                status: ControlStatus::Rejected,
+                reason: Some("duplicate_command".to_string()),
+            };
         }
 
         // 2. Check actor authorization
@@ -690,9 +761,9 @@ impl WorkerController {
 
         // 7. Write ahead. The command is recorded as in flight before it acts,
         // so a crash or a failed final write can never let a retry of the
-        // same ID act twice: after a restart the ledger still rejects it and
-        // reports the outcome as unknown. If even this record cannot be
-        // written, nothing has happened yet and the ID stays free for a retry.
+        // same ID act twice: after a restart the ledger still answers with
+        // this record. If even this record cannot be written, nothing has
+        // happened yet and the dropped claim frees the ID for a retry.
         let in_flight = WorkerControlReceipt {
             command_id: cmd.id,
             task_id: cmd.task_id,
@@ -703,22 +774,44 @@ impl WorkerController {
             reason: Some("control_in_flight".to_string()),
         };
         if !self.remember_receipt(&cmd, &digest, &in_flight) {
-            if let Ok(mut seen) = self.seen_commands.write() {
-                seen.remove(&cmd.id);
-            }
             return WorkerControlReceipt {
                 status: ControlStatus::Rejected,
                 reason: Some("control_receipt_persistence_failed".to_string()),
                 ..in_flight
             };
         }
+        // A receipt now exists for this ID: it stays consumed, and a repeat
+        // gets that receipt back (the in-flight one while this still runs).
+        claim.commit();
 
-        // 8. Apply action
+        // 8. Apply action. A transition the state machine refuses is this
+        // command's outcome, recorded like any other (WOR-97, WOR-98).
+        let transition_rejected = |error: &dyn std::fmt::Display| {
+            (
+                ControlStatus::Rejected,
+                Some(format!("transition_rejected: {error}")),
+            )
+        };
         let (status, reason) = match &cmd.action {
             WorkerControlAction::Inspect => (ControlStatus::Accepted, None),
             WorkerControlAction::Steer { .. } => (ControlStatus::Accepted, None),
             WorkerControlAction::Stop { reason } => {
-                let _ = self.registry.transition(cmd.agent_id, AgentState::Stopping);
+                // A repeated stop under a new ID is still allowed to re-signal
+                // a worker that is already stopping.
+                if let Err(error) = self.registry.transition(cmd.agent_id, AgentState::Stopping) {
+                    let already_stopping = self
+                        .registry
+                        .get(&cmd.agent_id)
+                        .is_some_and(|record| record.state == AgentState::Stopping);
+                    if !already_stopping {
+                        return self.finish(
+                            &cmd,
+                            &digest,
+                            action_name,
+                            transition_rejected(&error),
+                        );
+                    }
+                }
                 if let Some(lease) = self.get_lease(&cmd.agent_id) {
                     crate::jobs::kill_tree(lease.os_handle_identity);
                     for child_pid in &lease.child_tree {
@@ -731,13 +824,30 @@ impl WorkerController {
                 (ControlStatus::Stopping, reason.clone())
             }
             WorkerControlAction::Retry { reason } => {
-                self.registry.advance_generation_and_revision(&cmd.agent_id);
-                let _ = self.registry.transition(cmd.agent_id, AgentState::Starting);
-                (ControlStatus::Accepted, reason.clone())
+                // Verify the transition first: advancing the generation of a
+                // worker that does not restart would invalidate its in-flight
+                // messages and control handles for nothing.
+                match self.registry.transition(cmd.agent_id, AgentState::Starting) {
+                    Ok(()) => {
+                        self.registry.advance_generation_and_revision(&cmd.agent_id);
+                        (ControlStatus::Accepted, reason.clone())
+                    }
+                    Err(error) => transition_rejected(&error),
+                }
             }
             WorkerControlAction::Diff => (ControlStatus::Accepted, None),
         };
+        self.finish(&cmd, &digest, action_name, (status, reason))
+    }
 
+    /// Record a command's outcome over its in-flight record and acknowledge it.
+    fn finish(
+        &self,
+        cmd: &WorkerControlCommand,
+        digest: &str,
+        action_name: String,
+        (status, reason): (ControlStatus, Option<String>),
+    ) -> WorkerControlReceipt {
         let mut receipt = WorkerControlReceipt {
             command_id: cmd.id,
             task_id: cmd.task_id,
@@ -747,7 +857,7 @@ impl WorkerController {
             status,
             reason,
         };
-        if !self.remember_receipt(&cmd, &digest, &receipt) {
+        if !self.remember_receipt(cmd, digest, &receipt) {
             // The action ran but its outcome is not durable; the in-flight
             // record stands, and the caller is told the outcome is unknown.
             receipt.status = ControlStatus::Unknown;
@@ -947,8 +1057,7 @@ mod tests {
         assert_eq!(first.status, ControlStatus::Accepted);
 
         let second = controller.execute_command(cmd, true);
-        assert_eq!(second.status, ControlStatus::Rejected);
-        assert_eq!(second.reason.as_deref(), Some("duplicate_command"));
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -1147,12 +1256,13 @@ mod tests {
         let restarted = WorkerController::new(registry.clone())
             .with_receipt_store(&ledger)
             .unwrap();
+        // The retry is answered from the ledger instead of acting again: the
+        // outcome is reported as unknown, for the caller to reconcile.
         let retry = restarted.execute_command(cmd.clone(), true);
-        assert_eq!(retry.status, ControlStatus::Rejected);
-        assert_eq!(retry.reason.as_deref(), Some("duplicate_command"));
-        let known = restarted.receipt_for(&cmd.id).unwrap();
-        assert_eq!(known.status, ControlStatus::Unknown);
-        assert_eq!(known.reason.as_deref(), Some("control_in_flight"));
+        assert_eq!(retry.status, ControlStatus::Unknown);
+        assert_eq!(retry.reason.as_deref(), Some("control_in_flight"));
+        assert_eq!(restarted.receipt_for(&cmd.id), Some(retry));
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap().lines().count(), 1);
     }
 
     /// WOR-106: a snapshot's state and revision come from one version, even

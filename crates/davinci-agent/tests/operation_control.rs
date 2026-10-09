@@ -290,10 +290,6 @@ fn worker_receipt_store_replays_after_controller_restart() {
         first.status,
         davinci_agent::runtime::ControlStatus::Accepted
     );
-    assert_eq!(
-        second.status,
-        davinci_agent::runtime::ControlStatus::Rejected
-    );
-    assert_eq!(second.reason.as_deref(), Some("duplicate_command"));
+    assert_eq!(second, first);
     assert_eq!(restarted.receipt_for(&first.command_id), Some(first));
 }
