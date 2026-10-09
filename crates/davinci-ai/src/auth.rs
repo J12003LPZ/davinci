@@ -689,6 +689,28 @@ pub fn vertex_ambient_auth(
     None
 }
 
+const URL_VAR_HEADER_PREFIX: &str = "x-davinci-url-var-";
+
+/// Internal carrier for values that belong in the request URL, not on the
+/// wire; request builders must skip these entries when sending headers.
+pub(crate) fn is_url_var_header(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(URL_VAR_HEADER_PREFIX)
+}
+
+/// `(VARIABLE_NAME, value)` pairs carried by `auth` for URL templates.
+pub(crate) fn url_vars(auth: &ResolvedAuth) -> Vec<(String, &str)> {
+    auth.headers
+        .iter()
+        .filter(|(name, _)| is_url_var_header(name))
+        .map(|(name, value)| {
+            (
+                name[URL_VAR_HEADER_PREFIX.len()..].to_ascii_uppercase(),
+                value.as_str(),
+            )
+        })
+        .collect()
+}
+
 pub fn cloudflare_auth(
     provider: &str,
     credential: Option<&Credential>,
@@ -703,15 +725,24 @@ pub fn cloudflare_auth(
         .and_then(|cred| cred.key.clone())
         .filter(|key| !key.is_empty())
         .or_else(|| lookup_env("CLOUDFLARE_API_KEY", env))?;
-    credential
+    let mut headers = HashMap::new();
+    let account_id = credential
         .and_then(|cred| cred.env.get("CLOUDFLARE_ACCOUNT_ID").cloned())
         .or_else(|| lookup_env("CLOUDFLARE_ACCOUNT_ID", env))
         .filter(|value| !value.is_empty())?;
+    headers.insert(
+        format!("{URL_VAR_HEADER_PREFIX}CLOUDFLARE_ACCOUNT_ID"),
+        account_id,
+    );
     if require_gateway {
-        credential
+        let gateway_id = credential
             .and_then(|cred| cred.env.get("CLOUDFLARE_GATEWAY_ID").cloned())
             .or_else(|| lookup_env("CLOUDFLARE_GATEWAY_ID", env))
             .filter(|value| !value.is_empty())?;
+        headers.insert(
+            format!("{URL_VAR_HEADER_PREFIX}CLOUDFLARE_GATEWAY_ID"),
+            gateway_id,
+        );
     }
     let source = if credential.is_some() {
         "stored credential".into()
@@ -721,7 +752,6 @@ pub fn cloudflare_auth(
     if require_gateway {
         // The gateway token has its own header; `Authorization` is the
         // upstream provider's slot and may be forwarded upstream.
-        let mut headers = HashMap::new();
         headers.insert("cf-aig-authorization".into(), format!("Bearer {api_key}"));
         return Some(ResolvedAuth {
             api_key: None,
@@ -731,7 +761,7 @@ pub fn cloudflare_auth(
     }
     Some(ResolvedAuth {
         api_key: Some(api_key),
-        headers: HashMap::new(),
+        headers,
         source,
     })
 }
@@ -1075,6 +1105,52 @@ mod tests {
         assert!(
             resolve_provider_auth("openai-codex", &storage, &Default::default(), true,).is_none()
         );
+    }
+
+    #[test]
+    fn anthropic_oauth_environment_token_is_not_an_api_key() {
+        let storage = AuthStorage::in_memory();
+        let mut env = HashMap::new();
+        env.insert(
+            "ANTHROPIC_OAUTH_TOKEN".to_string(),
+            "sk-ant-oat01-x".to_string(),
+        );
+        assert!(resolve_provider_auth("anthropic", &storage, &env, true).is_none());
+        env.insert("ANTHROPIC_API_KEY".to_string(), "sk-ant-api-y".to_string());
+        let resolved = resolve_provider_auth("anthropic", &storage, &env, true).unwrap();
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-ant-api-y"));
+    }
+
+    #[test]
+    fn cloudflare_urls_are_materialized_and_ids_never_sent_as_headers() {
+        let mut env = HashMap::new();
+        env.insert("CLOUDFLARE_API_KEY".to_string(), "cf-key".to_string());
+        env.insert("CLOUDFLARE_ACCOUNT_ID".to_string(), "acct1".to_string());
+        env.insert("CLOUDFLARE_GATEWAY_ID".to_string(), "gw1".to_string());
+        let workers = cloudflare_auth("cloudflare-workers-ai", None, &env).unwrap();
+        let gateway = cloudflare_auth("cloudflare-ai-gateway", None, &env).unwrap();
+        let mut model = crate::load_builtin_models()
+            .into_iter()
+            .next()
+            .expect("a model");
+        model.api = "openai-completions".into();
+        model.base_url = Some(
+            "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1".into(),
+        );
+        assert_eq!(
+            crate::stream::request_url(&model, &workers),
+            "https://api.cloudflare.com/client/v4/accounts/acct1/ai/v1/chat/completions"
+        );
+        model.api = "anthropic-messages".into();
+        model.base_url = Some(
+            "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/anthropic"
+                .into(),
+        );
+        assert_eq!(
+            crate::stream::request_url(&model, &gateway),
+            "https://gateway.ai.cloudflare.com/v1/acct1/gw1/anthropic/v1/messages"
+        );
+        assert!(gateway.headers.keys().all(|name| is_url_var_header(name)));
     }
 
     #[test]

@@ -39,11 +39,7 @@ pub const PROVIDER_SPECS: &[ProviderSpec] = &[
         name: "Anthropic",
         base_url: "https://api.anthropic.com",
         api: "anthropic-messages",
-        env_vars: &[
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        ],
+        env_vars: &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
         oauth: true,
         oauth_name: Some("Anthropic (Claude Pro/Max)"),
     },

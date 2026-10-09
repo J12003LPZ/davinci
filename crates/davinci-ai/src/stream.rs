@@ -1260,7 +1260,9 @@ fn collect_request_headers(
     }
     let mut headers = Vec::new();
     for (key, value) in &auth.headers {
-        headers.push((key.clone(), value.clone()));
+        if !crate::auth::is_url_var_header(key) {
+            headers.push((key.clone(), value.clone()));
+        }
     }
     for (key, value) in &model.headers {
         headers.push((key.clone(), value.clone()));
@@ -1563,6 +1565,8 @@ pub struct ResponsesInputOptions<'a> {
     pub native_items_model: Option<&'a str>,
     /// Tools represented as Responses custom/freeform tools.
     pub custom_tools: &'a [&'a str],
+    /// Send image content (the model accepts image input).
+    pub images: bool,
 }
 
 pub fn attach_native_items(chat: &mut ChatMessage, items: &[Value], model_key: &str) {
@@ -1587,6 +1591,23 @@ fn native_items<'m>(message: &'m ChatMessage, model_key: Option<&str>) -> Option
 }
 
 #[doc(hidden)]
+/// Whether the model accepts image input.
+fn model_accepts_images(model: &Model) -> bool {
+    model.input.iter().any(|kind| kind == "image")
+}
+
+/// `(mime type, base64 data)` of every image block in a message.
+fn message_images(message: &ChatMessage) -> Vec<(&str, &str)> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            MessageContent::Image { data, mime_type } => Some((mime_type.as_str(), data.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     openai_responses_input_with(messages, &ResponsesInputOptions::default())
 }
@@ -1684,7 +1705,12 @@ fn openai_responses_input_with_prefix(
             continue;
         }
         let text = content_text(&message.content);
-        if text.is_empty() {
+        let images = if options.images {
+            message_images(message)
+        } else {
+            Vec::new()
+        };
+        if text.is_empty() && images.is_empty() {
             continue;
         }
         let role = match message.role.as_str() {
@@ -1692,10 +1718,20 @@ fn openai_responses_input_with_prefix(
             "system" => "system",
             _ => "user",
         };
+        let mut parts = Vec::new();
+        if !text.is_empty() {
+            parts.push(serde_json::json!({"type": "input_text", "text": text}));
+        }
+        for (mime, data) in images {
+            parts.push(serde_json::json!({
+                "type": "input_image",
+                "image_url": format!("data:{mime};base64,{data}"),
+            }));
+        }
         input.push(serde_json::json!({
             "type": "message",
             "role": role,
-            "content": [{"type": "input_text", "text": text}],
+            "content": parts,
         }));
     }
     input
@@ -1749,6 +1785,7 @@ fn openai_responses_body(
     let input_options = ResponsesInputOptions {
         native_items_model: Some(&model_key),
         custom_tools: &custom_tool_names,
+        images: model_accepts_images(model),
     };
     let mut input = openai_responses_input_with(messages, &input_options);
     if cache_plan.use_stable_bootstrap_breakpoint {
@@ -1965,6 +2002,7 @@ fn apply_native_responses_resume(
         &ResponsesInputOptions {
             native_items_model: Some(&model_key),
             custom_tools: &custom_tool_names,
+            images: model_accepts_images(model),
         },
         &input,
     );
@@ -2035,7 +2073,9 @@ pub fn live_stream(
     let url = request_url_checked(model, auth)?;
     let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(&url);
     for (key, value) in &auth.headers {
-        request = request.set(key, value);
+        if !crate::auth::is_url_var_header(key) {
+            request = request.set(key, value);
+        }
     }
     for (key, value) in &model.headers {
         request = request.set(key, value);
@@ -2151,12 +2191,23 @@ fn bedrock_body(
     } else {
         None
     };
+    let vision = model_accepts_images(model);
     let mut converted: Vec<Value> = messages
         .iter()
         .map(|message| {
+            let mut content = vec![serde_json::json!({"text": content_text(&message.content)})];
+            if vision {
+                for (mime, data) in message_images(message) {
+                    let format = mime.rsplit('/').next().unwrap_or("png");
+                    let format = if format == "jpg" { "jpeg" } else { format };
+                    content.push(serde_json::json!({
+                        "image": {"format": format, "source": {"bytes": data}},
+                    }));
+                }
+            }
             serde_json::json!({
                 "role": if message.role == "assistant" { "assistant" } else { "user" },
-                "content": [{"text": content_text(&message.content)}],
+                "content": content,
             })
         })
         .collect();
@@ -2262,11 +2313,16 @@ fn request_url_checked(model: &Model, auth: &ResolvedAuth) -> Result<String, Str
     Ok(request_url(model, auth))
 }
 
-pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
-    let base = model
+pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
+    let mut base = model
         .base_url
         .clone()
         .unwrap_or_else(|| "https://api.openai.com/v1".into());
+    // Route templates such as Cloudflare's `{CLOUDFLARE_ACCOUNT_ID}` are filled
+    // from the values the credentials were validated with.
+    for (name, value) in crate::auth::url_vars(auth) {
+        base = base.replace(&format!("{{{name}}}"), value);
+    }
     let base = base.trim_end_matches('/');
     match model.api.as_str() {
         "anthropic-messages" => format!("{base}/v1/messages"),
@@ -2341,9 +2397,28 @@ fn openai_body(
                 "tool_calls": tool_calls,
             }));
         } else {
+            let images = if model_accepts_images(model) {
+                message_images(message)
+            } else {
+                Vec::new()
+            };
+            let content = if images.is_empty() {
+                Value::String(content_text(&message.content))
+            } else {
+                let mut parts = vec![
+                    serde_json::json!({"type": "text", "text": content_text(&message.content)}),
+                ];
+                for (mime, data) in images {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{mime};base64,{data}")},
+                    }));
+                }
+                Value::Array(parts)
+            };
             out.push(serde_json::json!({
                 "role": message.role,
-                "content": content_text(&message.content),
+                "content": content,
             }));
         }
     }
@@ -2644,9 +2719,30 @@ fn anthropic_body(
                     }));
                 serde_json::json!({"role":"assistant","content": content})
             } else {
+                let images = if model_accepts_images(model) {
+                    message_images(message)
+                } else {
+                    Vec::new()
+                };
+                let content = if images.is_empty() {
+                    Value::String(content_text(&message.content))
+                } else {
+                    let mut blocks = Vec::new();
+                    for (mime, data) in images {
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": data},
+                        }));
+                    }
+                    let text = content_text(&message.content);
+                    if !text.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": text}));
+                    }
+                    Value::Array(blocks)
+                };
                 serde_json::json!({
                     "role": if message.role == "assistant" { "assistant" } else { "user" },
-                    "content": content_text(&message.content),
+                    "content": content,
                 })
             }
         })
@@ -2740,9 +2836,17 @@ fn google_body(
     let contents: Vec<Value> = messages
         .iter()
         .map(|message| {
+            let mut parts = vec![serde_json::json!({"text": content_text(&message.content)})];
+            if model_accepts_images(model) {
+                for (mime, data) in message_images(message) {
+                    parts.push(serde_json::json!({
+                        "inlineData": {"mimeType": mime, "data": data},
+                    }));
+                }
+            }
             serde_json::json!({
                 "role": if message.role == "assistant" { "model" } else { "user" },
-                "parts": [{"text": content_text(&message.content)}],
+                "parts": parts,
             })
         })
         .collect();
@@ -3648,6 +3752,7 @@ mod tests {
             &ResponsesInputOptions {
                 native_items_model: Some("openai-codex/gpt-5.6-luna"),
                 custom_tools: &[],
+                images: false,
             },
         );
         assert_eq!(input[1]["type"], "reasoning");
@@ -3944,6 +4049,49 @@ mod tests {
             })
         ));
         let _ = server.join();
+    }
+
+    fn image_message() -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: vec![
+                MessageContent::Text {
+                    text: "what is this".into(),
+                },
+                MessageContent::Image {
+                    data: "QUJD".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            ..ChatMessage::text("user", "")
+        }
+    }
+
+    #[test]
+    fn vision_models_receive_images_in_every_serializer() {
+        let messages = [image_message()];
+        let options = StreamOptions::default();
+        for (api, find) in [
+            ("openai-completions", "image_url"),
+            ("anthropic-messages", "\"image\""),
+            ("google-generative-ai", "inlineData"),
+            ("bedrock-converse-stream", "\"image\""),
+            ("openai-responses", "input_image"),
+        ] {
+            let Some(mut model) = load_builtin_models().into_iter().find(|m| m.api == api) else {
+                continue;
+            };
+            model.input = vec!["text".into(), "image".into()];
+            let body = request_body_with(&model, &messages, None, &[], &options).to_string();
+            assert!(body.contains(find), "{api}: {body}");
+            assert!(body.contains("QUJD"), "{api}: {body}");
+            model.input = vec!["text".into()];
+            let body = request_body_with(&model, &messages, None, &[], &options).to_string();
+            assert!(
+                !body.contains("QUJD"),
+                "{api} sent an image to a text-only model"
+            );
+        }
     }
 
     #[test]
