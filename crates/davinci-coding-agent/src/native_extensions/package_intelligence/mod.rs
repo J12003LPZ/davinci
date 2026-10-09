@@ -379,10 +379,11 @@ impl PackageIntelligence {
 
         // Search in lockfile for packages requiring this package
         if let Some(ref lock) = resolved.lock_data {
-            for (parent_pkg, locked_info) in &lock.packages {
+            // Every installed version of every parent, not one per name.
+            for locked_info in lock.all_resolutions() {
                 if let Some(req_ver) = locked_info.dependencies.get(pkg) {
                     reasons.push(DependencyReason {
-                        from_package: format!("{}@{}", parent_pkg, locked_info.version),
+                        from_package: format!("{}@{}", locked_info.name, locked_info.version),
                         dependency_type: "lock_dependency".to_string(),
                         required_range: req_ver.clone(),
                         resolved_version: resolved
@@ -408,6 +409,12 @@ impl PackageIntelligence {
             locked_version: resolved.locked_version,
             declared_range: resolved.declared_version,
             dependency_type: resolved.dependency_type,
+            locked_versions: resolved
+                .lock_data
+                .as_ref()
+                .and_then(|lock| lock.resolutions.get(pkg))
+                .map(|versions| versions.iter().map(|p| p.version.clone()).collect())
+                .unwrap_or_default(),
             reasons,
             warnings,
         };

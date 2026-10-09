@@ -121,17 +121,10 @@ impl LearningStore {
     }
 
     pub fn upsert_candidate(&mut self, candidate: LearningCandidate) -> Result<(), String> {
-        self.candidates
-            .insert(candidate.id.clone(), candidate.clone());
-        let candidates_path = self.root.join("candidates.jsonl");
+        // Durable first: a failed append must leave the in-memory view as it was.
         let line = serde_json::to_string(&candidate).map_err(|e| e.to_string())?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&candidates_path)
-            .map_err(|e| format!("failed to open {candidates_path:?}: {e}"))?;
-        writeln!(file, "{line}")
-            .map_err(|e| format!("failed to append to {candidates_path:?}: {e}"))?;
+        append_record(&self.root.join("candidates.jsonl"), &line)?;
+        self.candidates.insert(candidate.id.clone(), candidate);
         let _ = self.save_state();
         Ok(())
     }
@@ -166,24 +159,18 @@ impl LearningStore {
     }
 
     pub fn upsert_skill(&mut self, skill: SkillLedgerRecord) -> Result<(), String> {
+        // Durable first: a failed append must leave the in-memory view as it was.
+        let line = serde_json::to_string(&skill).map_err(|e| e.to_string())?;
+        append_record(&self.root.join("skills.jsonl"), &line)?;
         self.skill_versions
             .insert((skill.name.clone(), skill.version as u64), skill.clone());
-        if let Some(existing) = self.skills.get(&skill.name) {
-            if skill.version >= existing.version {
-                self.skills.insert(skill.name.clone(), skill.clone());
-            }
-        } else {
-            self.skills.insert(skill.name.clone(), skill.clone());
+        if self
+            .skills
+            .get(&skill.name)
+            .is_none_or(|existing| skill.version >= existing.version)
+        {
+            self.skills.insert(skill.name.clone(), skill);
         }
-        let skills_path = self.root.join("skills.jsonl");
-        let line = serde_json::to_string(&skill).map_err(|e| e.to_string())?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&skills_path)
-            .map_err(|e| format!("failed to open {skills_path:?}: {e}"))?;
-        writeln!(file, "{line}")
-            .map_err(|e| format!("failed to append to {skills_path:?}: {e}"))?;
         let _ = self.save_state();
         Ok(())
     }
@@ -331,12 +318,44 @@ impl LearningStore {
     }
 }
 
+/// Append one JSONL record and flush it to disk before the caller publishes
+/// the change in memory.
+fn append_record(path: &Path, line: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("failed to open {path:?}: {e}"))?;
+    file.write_all(format!("{line}\n").as_bytes())
+        .and_then(|()| file.sync_data())
+        .map_err(|e| format!("failed to append to {path:?}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native_extensions::learning::types::{
         LearningArtifact, LearningScope, VerificationEvidence,
     };
+
+    #[test]
+    fn failed_append_leaves_in_memory_state_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        let original = fixture_candidate("cand-1");
+        store.upsert_candidate(original.clone()).unwrap();
+        // A directory where the ledger file should be makes every append fail.
+        let candidates = dir.path().join("candidates.jsonl");
+        fs::remove_file(&candidates).unwrap();
+        fs::create_dir(&candidates).unwrap();
+
+        let mut changed = original.clone();
+        changed.rationale = "not durable".into();
+        assert!(store.upsert_candidate(changed).is_err());
+        assert!(store.upsert_candidate(fixture_candidate("cand-2")).is_err());
+        assert_eq!(store.candidate("cand-1"), Some(&original));
+        assert!(store.candidate("cand-2").is_none());
+    }
 
     fn fixture_candidate(id: &str) -> LearningCandidate {
         LearningCandidate {

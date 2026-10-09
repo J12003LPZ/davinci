@@ -7,6 +7,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
         lockfile_version: None,
         packages: BTreeMap::new(),
         workspace_packages: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut current_section = "";
@@ -49,15 +50,15 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                      integrity: Option<String>,
                      deps: BTreeMap<String, String>| {
         if !name.is_empty() && !ver.is_empty() {
-            data.packages
-                .entry(name.to_string())
-                .or_insert_with(|| LockedPackage {
-                    name: name.to_string(),
-                    version: ver.to_string(),
-                    resolved: None,
-                    integrity,
-                    dependencies: deps,
-                });
+            let locked = LockedPackage {
+                name: name.to_string(),
+                version: ver.to_string(),
+                resolved: None,
+                integrity,
+                dependencies: deps,
+            };
+            data.record_resolution(&locked);
+            data.packages.entry(name.to_string()).or_insert(locked);
         }
     };
 

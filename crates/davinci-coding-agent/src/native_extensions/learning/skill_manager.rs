@@ -268,6 +268,7 @@ impl SkillManager {
             format!("---\nname: {name}\ndescription: {description}\n---\n\n{redacted}")
         };
 
+        let created_dir = !skill_dir.exists();
         atomic_write_file(&skill_file, &content)
             .map_err(|e| ToolError::Failed(format!("failed to write skill file: {e}")))?;
 
@@ -300,9 +301,17 @@ impl SkillManager {
             LearningScope::Project => ctx.project_store,
             LearningScope::Global => ctx.global_store,
         };
-        store
-            .upsert_skill(record)
-            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {e}")))?;
+        if let Err(error) = store.upsert_skill(record) {
+            // Without its ledger record the file would be an orphan that blocks
+            // a retry with "already exists"; undo the create.
+            let _ = std::fs::remove_file(&skill_file);
+            if created_dir {
+                let _ = std::fs::remove_dir(&skill_dir);
+            }
+            return Err(ToolError::Failed(format!(
+                "failed to update skill ledger: {error}"
+            )));
+        }
 
         let body = json!({
             "status": "created",
@@ -527,6 +536,17 @@ impl SkillManager {
             .ok_or_else(|| ToolError::Failed("missing 'filePath'".into()))?;
         let validated_rel =
             validate_relative_support_path(rel_path_str).map_err(ToolError::Failed)?;
+        // SKILL.md is the ledger-tracked primary file: it changes only through
+        // patch, which checks expectedHash and records a new version.
+        if validated_rel
+            .components()
+            .filter(|component| matches!(component, Component::Normal(_)))
+            .eq(Path::new("SKILL.md").components())
+        {
+            return Err(ToolError::Failed(
+                "SKILL.md cannot be written as a support file; use patch".into(),
+            ));
+        }
 
         if ctx.origin == SkillWriteOrigin::BackgroundReview
             && rel_path_str.replace('\\', "/").starts_with("scripts/")
@@ -613,6 +633,19 @@ impl SkillManager {
                         }
                     }
                 }
+            }
+        }
+
+        // Overwriting needs proof the caller saw the current content.
+        if target_file.exists() {
+            let current = std::fs::read_to_string(&target_file).map_err(|e| {
+                ToolError::Failed(format!("failed to read existing support file: {e}"))
+            })?;
+            let expected = args.get("expectedHash").and_then(Value::as_str);
+            if expected != Some(content_hash(&current).as_str()) {
+                return Err(ToolError::Failed(
+                    "support file exists; pass its current 'expectedHash' to overwrite".into(),
+                ));
             }
         }
 
@@ -1067,6 +1100,92 @@ mod tests {
             SkillManager::execute(ctx, &args).expect_err("out-of-root ledger path must fail");
         assert!(error.to_string().contains("outside configured skill root"));
         assert!(!outside_dir.join("references").join("note.md").exists());
+    }
+
+    #[test]
+    fn create_rolls_back_skill_file_when_ledger_append_fails() {
+        let (dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let ledger = dir.path().join("project_learning").join("skills.jsonl");
+        let _ = fs::remove_file(&ledger);
+        fs::create_dir_all(&ledger).unwrap();
+        let args = json!({
+            "action": "create",
+            "name": "orphan-check",
+            "scope": "project",
+            "description": "d",
+            "body": "b"
+        });
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        assert!(SkillManager::execute(ctx, &args).is_err());
+        assert!(!p_skills.join("orphan-check").exists());
+        assert!(p_store.skill("orphan-check").is_none());
+
+        fs::remove_dir(&ledger).unwrap();
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        assert!(!SkillManager::execute(ctx, &args).unwrap().is_error);
+    }
+
+    #[test]
+    fn write_file_cannot_replace_skill_md_or_overwrite_without_hash() {
+        let (_dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let mut run = |args: Value| {
+            SkillManager::execute(
+                SkillManagerContext {
+                    project_skills_dir: &p_skills,
+                    global_skills_dir: &g_skills,
+                    project_store: &mut p_store,
+                    global_store: &mut g_store,
+                    project_trusted: true,
+                    auto_apply_global: false,
+                    origin: SkillWriteOrigin::ForegroundUserDirected,
+                    read_set: &read_set,
+                },
+                &args,
+            )
+        };
+        run(json!({"action":"create","name":"guarded","scope":"project",
+            "description":"d","body":"b"}))
+        .unwrap();
+        let skill_md = p_skills.join("guarded").join("SKILL.md");
+        let before = fs::read_to_string(&skill_md).unwrap();
+        let error = run(json!({"action":"write_file","name":"guarded",
+            "filePath":"SKILL.md","content":"replaced"}))
+        .unwrap_err();
+        assert!(error.to_string().contains("use patch"), "{error}");
+        assert_eq!(fs::read_to_string(&skill_md).unwrap(), before);
+
+        let write = |content: &str, hash: Option<String>| {
+            let mut args = json!({"action":"write_file","name":"guarded",
+                "filePath":"references/note.md","content":content});
+            if let Some(hash) = hash {
+                args["expectedHash"] = json!(hash);
+            }
+            args
+        };
+        run(write("one", None)).unwrap();
+        assert!(run(write("two", None)).is_err());
+        assert!(run(write("two", Some(content_hash("stale")))).is_err());
+        run(write("two", Some(content_hash("one")))).unwrap();
+        let note = p_skills.join("guarded").join("references").join("note.md");
+        assert_eq!(fs::read_to_string(note).unwrap(), "two");
     }
 
     #[test]
