@@ -278,9 +278,13 @@ fn handshake(rpc: &mut Rpc) -> Result<Handshake> {
     let initialize: InitializeResult = serde_json::from_value(init)
         .map_err(|err| Error::Protocol(format!("initialize: {err}")))?;
     rpc.notify("notifications/initialized", json!({}))?;
-    let (tools, skipped) = parse_tools(
-        list_pages(rpc, "tools/list", "tools").map_err(|err| named("tools/list", err))?,
-    );
+    // Only negotiated capabilities are used (MCP lifecycle): a resources-only
+    // server has no `tools/list` to call.
+    let (tools, skipped) = if declares(&initialize.capabilities, "tools") {
+        parse_tools(list_pages(rpc, "tools/list", "tools").map_err(|err| named("tools/list", err))?)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let resources = if declares(&initialize.capabilities, "resources") {
         match list_pages(rpc, "resources/list", "resources") {
             Ok(items) => parse_resources(items),
@@ -653,6 +657,18 @@ mod tests {
         let mut client = fixture_client(&["--malformed-reply"]);
         let error = client.call_tool("echo", json!({"text": "x"})).unwrap_err();
         assert!(matches!(error, Error::Protocol(_)), "{error}");
+    }
+
+    #[test]
+    fn stdio_batched_replies_are_flattened_and_correlated() {
+        // Every reply, including initialize and tools/list, arrives as one
+        // JSON-RPC batch with a notification and a server ping ahead of it.
+        let mut client = fixture_client(&["--batch"]);
+        assert_eq!(client.tools.len(), 1);
+        let ok = client
+            .call_tool("echo", json!({"text": "batched"}))
+            .unwrap();
+        assert_eq!(ok.text(), "batched");
     }
 
     #[test]

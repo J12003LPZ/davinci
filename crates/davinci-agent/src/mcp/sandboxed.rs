@@ -13,18 +13,49 @@ const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const WRITE_CHUNK: usize = 16 * 1024;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Server-to-client requests are answered only while a call waits, so they
+/// queue between calls. A well-behaved server sends a few pings at most;
+/// past either bound the transport fails instead of growing the host.
+const MAX_QUEUED_SERVER_REQUESTS: usize = 64;
+const MAX_QUEUED_SERVER_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 struct State {
     stdout: Vec<u8>,
+    /// The id of the one call waiting for a reply. Calls are sequential, so
+    /// any other id (a late reply to a timed-out call, or one never asked
+    /// for) is dropped rather than retained.
+    awaiting: Option<u64>,
     responses: BTreeMap<u64, Value>,
     server_requests: VecDeque<Value>,
+    server_request_bytes: usize,
     failure: Option<String>,
     closed: bool,
     stderr: Vec<u8>,
 }
 
 impl State {
+    fn queue_server_request(&mut self, value: Value, bytes: usize) {
+        if self.server_requests.len() >= MAX_QUEUED_SERVER_REQUESTS
+            || self.server_request_bytes.saturating_add(bytes) > MAX_QUEUED_SERVER_REQUEST_BYTES
+        {
+            self.server_requests.clear();
+            self.server_request_bytes = 0;
+            self.failure = Some(format!(
+                "MCP server queued more than {MAX_QUEUED_SERVER_REQUESTS} unanswered requests \
+                 or {MAX_QUEUED_SERVER_REQUEST_BYTES} bytes of them"
+            ));
+            return;
+        }
+        self.server_request_bytes += bytes;
+        self.server_requests.push_back(value);
+    }
+
+    fn take_server_requests(&mut self) -> Vec<Value> {
+        self.server_request_bytes = 0;
+        self.server_requests.drain(..).collect()
+    }
+
     fn receive_stdout(&mut self, bytes: &[u8]) {
         if self.failure.is_some() {
             return;
@@ -57,15 +88,21 @@ impl State {
             };
             if object.get("method").and_then(Value::as_str).is_some() {
                 if object.get("id").is_some() {
-                    self.server_requests.push_back(value);
+                    self.queue_server_request(value, line.len());
+                    if self.failure.is_some() {
+                        self.stdout = Vec::new();
+                        return;
+                    }
                 }
                 continue;
             }
             let Some(id) = object.get("id").and_then(Value::as_u64) else {
                 continue;
             };
-            if object.contains_key("result") || object.contains_key("error") {
-                self.responses.insert(id, value);
+            if self.awaiting == Some(id)
+                && (object.contains_key("result") || object.contains_key("error"))
+            {
+                self.responses.entry(id).or_insert(value);
             }
         }
     }
@@ -246,13 +283,20 @@ impl SupervisedMcpTransport {
         self.write_value(&reply)
     }
 
+    fn set_awaiting(&self, id: Option<u64>) {
+        let (lock, _) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        state.awaiting = id;
+        state.responses.clear();
+    }
+
     fn wait_response(&self, id: u64) -> Result<Value> {
         let deadline = Instant::now() + self.call_timeout;
         loop {
             let requests = {
                 let (lock, _) = &*self.state;
                 let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-                state.server_requests.drain(..).collect::<Vec<_>>()
+                state.take_server_requests()
             };
             for request in requests {
                 self.answer_server_request(request)?;
@@ -264,6 +308,9 @@ impl SupervisedMcpTransport {
                 return decode_response(response, id);
             }
             if let Some(error) = state.failure.clone() {
+                // A failed transport never recovers; stop the owned service
+                // now rather than at drop.
+                self.supervisor.stop();
                 return Err(Error::Transport(format!(
                     "{error}{}",
                     stderr_excerpt(&state.stderr)
@@ -301,13 +348,18 @@ impl RpcTransport for SupervisedMcpTransport {
             .next_id
             .checked_add(1)
             .ok_or_else(|| Error::Transport("MCP request id exhausted".into()))?;
-        self.write_value(&json!({
-            "jsonrpc":"2.0",
-            "id":id,
-            "method":method,
-            "params":params
-        }))?;
-        self.wait_response(id)
+        // Admit the reply before sending, so a fast server cannot beat it.
+        self.set_awaiting(Some(id));
+        let result = self
+            .write_value(&json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "method":method,
+                "params":params
+            }))
+            .and_then(|()| self.wait_response(id));
+        self.set_awaiting(None);
+        result
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -335,6 +387,15 @@ impl RpcTransport for SupervisedMcpTransport {
 fn decode_response(response: Value, expected_id: u64) -> Result<Value> {
     if response.get("id").and_then(Value::as_u64) != Some(expected_id) {
         return Err(Error::Protocol("MCP response id mismatch".into()));
+    }
+    // Same envelope contract as the native stdio and HTTP transports.
+    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || response.get("method").is_some()
+        || response.get("result").is_some() == response.get("error").is_some()
+    {
+        return Err(Error::Protocol(format!(
+            "invalid MCP response envelope `{response}`"
+        )));
     }
     if let Some(error) = response.get("error") {
         let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32603);
@@ -420,6 +481,184 @@ fn resolve_program(command: &str, cwd: &Path) -> std::result::Result<PathBuf, St
 mod tests {
     use super::*;
 
+    #[test]
+    fn audit_supervised_mcp_rejects_response_without_jsonrpc_version() {
+        let mut state = State {
+            awaiting: Some(7),
+            ..Default::default()
+        };
+        state.receive_stdout(b"{\"id\":7,\"result\":{\"ok\":true}}\n");
+        let response = state.responses.remove(&7).unwrap();
+        let decoded = decode_response(response, 7);
+        assert!(
+            matches!(decoded, Err(Error::Protocol(_))),
+            "invalid envelope reached the consumer: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn supervised_mcp_rejects_every_malformed_envelope_but_keeps_null_results() {
+        for bad in [
+            json!({"jsonrpc":"1.0","id":7,"result":{}}),
+            json!({"id":7,"result":{}}),
+            json!({"jsonrpc":"2.0","id":7}),
+            json!({"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-1,"message":"x"}}),
+            json!({"jsonrpc":"2.0","id":7,"method":"ping","result":{}}),
+        ] {
+            let decoded = decode_response(bad.clone(), 7);
+            assert!(
+                matches!(decoded, Err(Error::Protocol(_))),
+                "{bad}: {decoded:?}"
+            );
+        }
+        assert_eq!(
+            decode_response(json!({"jsonrpc":"2.0","id":7,"result":null}), 7).unwrap(),
+            Value::Null
+        );
+    }
+
+    const FLOOD_FIXTURE_ENV: &str = "DAVINCI_MCP_IDLE_FLOOD_FIXTURE";
+
+    /// Disposable MCP "server": floods pings and unsolicited replies while
+    /// nobody calls it, then idles for a bounded time.
+    #[test]
+    fn idle_flood_fixture() {
+        if std::env::var(FLOOD_FIXTURE_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        for id in 1..=10_000u64 {
+            let _ = writeln!(out, "{}", json!({"jsonrpc":"2.0","id":id,"method":"ping"}));
+            let _ = writeln!(out, "{}", json!({"jsonrpc":"2.0","id":id,"result":{}}));
+        }
+        let _ = out.flush();
+        drop(out);
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn supervised_idle_flood_fails_the_transport_and_stops_the_service() {
+        let root = tempfile::tempdir().unwrap();
+        let server = ServerConfig {
+            command: Some(std::env::current_exe().unwrap().to_string_lossy().into()),
+            args: vec![
+                "--exact".into(),
+                "mcp::sandboxed::tests::idle_flood_fixture".into(),
+                "--nocapture".into(),
+            ],
+            env: BTreeMap::from([(FLOOD_FIXTURE_ENV.into(), "1".into())]),
+            ..Default::default()
+        };
+        let mut spec = sandbox(&["PATH", "SYSTEMROOT", "TEMP", "TMP"]);
+        spec.workspace = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut transport = SupervisedMcpTransport::spawn(
+            &crate::command_receipt::test_supervisor(),
+            &server,
+            root.path(),
+            &spec,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = transport.state.0.lock().unwrap();
+            assert!(state.responses.is_empty(), "unsolicited reply retained");
+            assert!(state.server_requests.len() <= MAX_QUEUED_SERVER_REQUESTS);
+            if state.failure.is_some() {
+                break;
+            }
+            assert!(!state.closed, "fixture exited before flooding");
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "idle flood never tripped the bound"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let error = transport.call("tools/list", json!({})).unwrap_err();
+        assert!(error.to_string().contains("unanswered requests"), "{error}");
+        assert!(transport.supervisor.is_stopping());
+        assert!(
+            transport.supervisor.wait(Duration::from_secs(10)).is_some(),
+            "owned service still running after the transport failed"
+        );
+    }
+
+    #[test]
+    fn idle_flood_of_replies_and_requests_stays_bounded() {
+        let mut state = State::default();
+        for id in 1..=10_000 {
+            let frame = format!(
+                "{}\n{}\n",
+                json!({"jsonrpc": "2.0", "id": id, "result": {"data": "fixture"}}),
+                json!({"jsonrpc": "2.0", "id": id, "method": "ping"})
+            );
+            state.receive_stdout(frame.as_bytes());
+        }
+        assert!(state.responses.is_empty(), "unsolicited replies retained");
+        assert!(state.server_requests.len() <= MAX_QUEUED_SERVER_REQUESTS);
+        assert!(state.stdout.is_empty());
+        let failure = state.failure.as_deref().unwrap_or_default();
+        assert!(failure.contains("unanswered requests"), "{failure:?}");
+    }
+
+    #[test]
+    fn oversized_queued_requests_fail_by_bytes_before_count() {
+        let mut state = State::default();
+        let padding = "x".repeat(64 * 1024);
+        for id in 1..=32 {
+            let frame = format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "id": id, "method": "ping", "params": {"pad": padding}})
+            );
+            state.receive_stdout(frame.as_bytes());
+        }
+        assert!(state.server_request_bytes <= MAX_QUEUED_SERVER_REQUEST_BYTES);
+        assert!(state.failure.is_some(), "1 MiB of queued requests accepted");
+    }
+
+    #[test]
+    fn only_the_awaited_reply_is_admitted() {
+        let mut state = State {
+            awaiting: Some(7),
+            ..Default::default()
+        };
+        for id in [3, 7, 7, 9] {
+            let frame = format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "id": id, "result": {"n": id}})
+            );
+            state.receive_stdout(frame.as_bytes());
+        }
+        assert_eq!(state.responses.len(), 1);
+        assert_eq!(state.responses[&7]["result"]["n"], 7);
+        assert!(state.failure.is_none());
+    }
+
+    #[test]
+    fn draining_requests_frees_their_budget() {
+        let mut state = State::default();
+        for round in 0..10 {
+            for id in 0..MAX_QUEUED_SERVER_REQUESTS {
+                let frame = format!(
+                    "{}\n",
+                    json!({"jsonrpc": "2.0", "id": round * 1000 + id, "method": "ping"})
+                );
+                state.receive_stdout(frame.as_bytes());
+            }
+            assert_eq!(
+                state.take_server_requests().len(),
+                MAX_QUEUED_SERVER_REQUESTS
+            );
+        }
+        assert!(state.failure.is_none(), "{:?}", state.failure);
+    }
+
     fn sandbox(allow: &[&str]) -> SandboxSpec {
         use davinci_protocol::{
             EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
@@ -493,7 +732,10 @@ mod tests {
 
     #[test]
     fn stdout_parser_ignores_logs_and_queues_server_requests() {
-        let mut state = State::default();
+        let mut state = State {
+            awaiting: Some(9),
+            ..Default::default()
+        };
         state.receive_stdout(
             b"log line\n{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"ok\":true}}\n",
         );
@@ -536,7 +778,10 @@ mod codemode_structured_tests {
         });
         let mut frame = serde_json::to_vec(&response).unwrap();
         frame.push(b'\n');
-        let mut state = State::default();
+        let mut state = State {
+            awaiting: Some(7),
+            ..Default::default()
+        };
         for chunk in frame.chunks(3) {
             state.receive_stdout(chunk);
         }

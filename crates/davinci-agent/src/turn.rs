@@ -3040,11 +3040,10 @@ impl Agent {
         if let Ok(mut ledger) = self.tool_ledger.lock() {
             ledger.fail_persistence(error.clone());
         }
+        // cancel(), not a raw store: the runtime's children and job-book
+        // cleanup must stop with the dispatch loop (WOR-164).
         if let Some(runtime) = &self.runtime {
-            runtime
-                .cancellation_token
-                .as_atomic_bool()
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            runtime.cancellation_token.cancel();
         }
         if let Some(abort) = &self.abort_signal {
             abort.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -5138,6 +5137,36 @@ mod session_persistence_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durability_failure_cancels_runtime_children_and_runs_cleanup() {
+        use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut agent = Agent::new("durability fixture");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        let token = agent.runtime.as_ref().unwrap().cancellation_token.clone();
+        let child = token.child_token();
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let observed = cleanups.clone();
+        token.on_cancel(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let result = agent.tool_durability_failure("ledger write failed".into());
+
+        assert!(result.is_error);
+        assert!(token.is_cancelled());
+        assert!(child.is_cancelled(), "durability abort skipped the child");
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        token.cancel();
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1, "cleanup ran twice");
+    }
+
     #[test]
     fn max_retries_counts_retries_not_total_attempts() {
         use davinci_ai::AssistantMessage;
