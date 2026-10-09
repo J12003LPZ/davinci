@@ -514,8 +514,12 @@ impl BrowserProcess {
                 // The control response follows target completion on the same
                 // ordered stream, so correlation can be retired without a
                 // tombstone or retry of an unknown action outcome.
-                let cancelled =
-                    self.request(json!({"op":"cancel","target":id}), Duration::from_secs(5));
+                // The handshake spends what is left of the caller's deadline
+                // (never more than 5s), so a stalled host cannot stretch it.
+                let cancelled = self.request(
+                    json!({"op":"cancel","target":id}),
+                    cancel_budget(timeout, started.elapsed()),
+                );
                 if !cancelled
                     .as_ref()
                     .is_ok_and(|value| value["cancelled"].is_boolean())
@@ -660,6 +664,15 @@ impl Drop for BrowserProcess {
     }
 }
 
+/// Time the cancel handshake may take: what remains of the request's own
+/// deadline, never more than 5s, with a small floor so it can still be sent.
+fn cancel_budget(timeout: Duration, elapsed: Duration) -> Duration {
+    timeout
+        .saturating_sub(elapsed)
+        .min(Duration::from_secs(5))
+        .max(Duration::from_millis(10))
+}
+
 fn valid_hash(hash: &str) -> bool {
     hash.len() == 64
         && hash
@@ -703,6 +716,18 @@ fn clean_directory(directory: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_handshake_stays_inside_the_request_deadline() {
+        let ms = Duration::from_millis;
+        assert_eq!(cancel_budget(ms(100), ms(40)), ms(60));
+        assert_eq!(cancel_budget(ms(100), ms(100)), ms(10));
+        assert_eq!(cancel_budget(ms(100), ms(900)), ms(10));
+        assert_eq!(
+            cancel_budget(Duration::from_secs(30), ms(0)),
+            Duration::from_secs(5)
+        );
+    }
 
     #[test]
     fn private_font_cache_is_removed_without_touching_neighbor_data() {

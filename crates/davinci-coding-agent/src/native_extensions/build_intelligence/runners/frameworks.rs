@@ -124,7 +124,8 @@ pub fn detect_package_manager(root: &Path) -> PackageManager {
         PackageManager::Pnpm
     } else if root.join("bun.lockb").is_file()
         || root.join("bun.lock").is_file()
-        || root.join("bunfig.toml").is_file() {
+        || root.join("bunfig.toml").is_file()
+    {
         PackageManager::Bun
     } else if root.join("yarn.lock").is_file() {
         PackageManager::Yarn

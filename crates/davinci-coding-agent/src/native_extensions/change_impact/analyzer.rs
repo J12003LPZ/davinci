@@ -58,9 +58,17 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         files: Option<Vec<String>>,
         symbols: Option<Vec<String>>,
         transaction_id: Option<String>,
-        _scope: Option<String>,
+        scope: Option<String>,
         limit: Option<usize>,
     ) -> Result<ChangeImpactReport, String> {
+        let scope = match scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let normalized = self.normalize_path(raw)?;
+                let normalized = normalized.trim_matches('/').to_string();
+                (!normalized.is_empty() && normalized != ".").then_some(normalized)
+            }
+            None => None,
+        };
         let mut target_files = BTreeSet::new();
         let mut target_symbols = BTreeSet::new();
         let mut warnings = Vec::new();
@@ -86,8 +94,23 @@ impl<'a> ChangeImpactAnalyzer<'a> {
             }
         }
 
-        // 4. If neither files nor symbols are provided, inspect working tree via git or repo
+        // 4. If neither files nor symbols are provided, inspect the working tree
+        // first (staged, unstaged and untracked edits), then committed history.
         if target_files.is_empty() && target_symbols.is_empty() {
+            let working_tree = self.working_tree_changes();
+            if !working_tree.is_empty() {
+                warnings.push(
+                    "Changed files taken from the working tree (staged, unstaged and untracked)"
+                        .to_string(),
+                );
+                target_files.extend(working_tree);
+            }
+        }
+        if target_files.is_empty() && target_symbols.is_empty() {
+            warnings.push(
+                "Working tree is clean; changed files taken from the latest commit comparison"
+                    .to_string(),
+            );
             if let Ok(res) = self
                 .git_intelligence
                 .execute_tool("git_changed_symbols", &json!({}))
@@ -127,6 +150,19 @@ impl<'a> ChangeImpactAnalyzer<'a> {
             }
         }
 
+        if let Some(scope) = &scope {
+            let prefix = format!("{scope}/");
+            let before = target_files.len();
+            target_files.retain(|file| file == scope || file.starts_with(&prefix));
+            if target_files.len() < before {
+                warnings.push(format!(
+                    "{} changed file(s) outside scope '{scope}' were excluded",
+                    before - target_files.len()
+                ));
+                is_partial = true;
+            }
+        }
+
         if target_files.is_empty() && target_symbols.is_empty() {
             return Err(
                 "No changed files, symbols, or transaction ID specified for impact analysis"
@@ -150,6 +186,7 @@ impl<'a> ChangeImpactAnalyzer<'a> {
             .cloned()
             .collect();
         let symbol_list: Vec<String> = target_symbols.iter().cloned().collect();
+        let scope_prefix = scope.as_ref().map(|scope| format!("{scope}/"));
 
         // 5. Direct Semantic Impact (LSP)
         let semantic_limit = limit
@@ -162,10 +199,17 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         }
 
         // 6. Structural Impact (AST)
-        let structural_impact = self.analyze_structural(&file_list, &symbol_list);
+        let structural_impact =
+            self.analyze_structural(&file_list, &symbol_list, scope_prefix.as_deref());
 
         // 7. Tests (TestImpact)
-        let tests_impact = self.analyze_tests(&file_list, &symbol_list);
+        let tests_impact = self.analyze_tests(
+            &file_list,
+            &symbol_list,
+            scope_prefix.as_deref(),
+            &mut warnings,
+            &mut is_partial,
+        );
 
         // 8. Packages (PackageIntelligence / WorkspaceMetadata)
         let packages_impact = self.analyze_packages(&file_list);
@@ -516,7 +560,12 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         )
     }
 
-    fn analyze_structural(&self, files: &[String], symbols: &[String]) -> StructuralImpact {
+    fn analyze_structural(
+        &self,
+        files: &[String],
+        symbols: &[String],
+        scope_prefix: Option<&str>,
+    ) -> StructuralImpact {
         let mut items = Vec::new();
         let mut importing_modules = BTreeSet::new();
         let mut imported_modules = BTreeSet::new();
@@ -524,6 +573,9 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         let index_res = self.repo.refresh();
         if let Ok(index) = index_res {
             for (file_path, repo_file) in &index.files {
+                if scope_prefix.is_some_and(|prefix| !file_path.starts_with(prefix)) {
+                    continue;
+                }
                 // Refresh structural evidence from the live source when
                 // possible. The repository index may legitimately retain a
                 // file entry while its parsed import list is stale during a
@@ -597,49 +649,141 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         }
     }
 
-    fn analyze_tests(&self, files: &[String], symbols: &[String]) -> TestsImpact {
+    /// Files with staged, unstaged or untracked changes, relative to the root.
+    fn working_tree_changes(&self) -> Vec<String> {
+        use crate::native_extensions::git_intelligence::runner;
+        let mut files = BTreeSet::new();
+        for args in [
+            &["diff", "-z", "--name-only", "HEAD"][..],
+            &["ls-files", "-z", "--others", "--exclude-standard"][..],
+        ] {
+            let Ok(out) = runner::run(self.root, args) else {
+                continue;
+            };
+            for raw in out.split(|byte| *byte == 0) {
+                let path = String::from_utf8_lossy(raw);
+                if path.is_empty() {
+                    continue;
+                }
+                if let Ok(normalized) = self.normalize_path(&path) {
+                    files.insert(normalized);
+                }
+            }
+        }
+        files.into_iter().collect()
+    }
+
+    /// Resolves symbol names (or ids) to the AST symbol ids TestImpact needs.
+    fn resolve_symbol_ids(
+        &self,
+        symbols: &[String],
+        scope_prefix: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<String> {
+        if symbols.is_empty() {
+            return Vec::new();
+        }
+        let Ok(index) = self.repo.refresh() else {
+            warnings.push("Symbol ids could not be resolved: repository index unavailable".into());
+            return Vec::new();
+        };
+        let mut ids = BTreeSet::new();
+        for wanted in symbols {
+            let matches: Vec<&str> = index
+                .files
+                .iter()
+                .filter(|(path, _)| scope_prefix.is_none_or(|prefix| path.starts_with(prefix)))
+                .flat_map(|(_, file)| &file.symbols)
+                .filter(|symbol| symbol.id == *wanted || symbol.name == *wanted)
+                .map(|symbol| symbol.id.as_str())
+                .collect();
+            match matches.len() {
+                0 => warnings.push(format!(
+                    "Symbol '{wanted}' not found in the index; no test evidence for it"
+                )),
+                1 => {
+                    ids.insert(matches[0].to_string());
+                }
+                count => {
+                    warnings.push(format!(
+                        "Symbol '{wanted}' is ambiguous ({count} definitions); tests selected for all of them"
+                    ));
+                    ids.extend(matches.into_iter().map(str::to_string));
+                }
+            }
+        }
+        ids.into_iter().collect()
+    }
+
+    fn analyze_tests(
+        &self,
+        files: &[String],
+        symbols: &[String],
+        scope_prefix: Option<&str>,
+        warnings: &mut Vec<String>,
+        is_partial: &mut bool,
+    ) -> TestsImpact {
         let mut items = Vec::new();
         let mut selected_tests = BTreeSet::new();
         let mut test_command = None;
         let mut broader_verification = false;
 
+        let symbol_ids = self.resolve_symbol_ids(symbols, scope_prefix, warnings);
         let args = json!({
             "paths": files,
-            "symbolIds": symbols,
+            "symbolIds": symbol_ids,
             "limit": 50
         });
 
-        if let Ok(res) = self.test_impact.execute("test_impacted", &args) {
-            if let Some(details) = res.details {
-                if let Some(tests) = details.get("tests").and_then(|t| t.as_array()) {
-                    for t in tests {
-                        if let Some(path) = t["path"].as_str() {
-                            selected_tests.insert(path.to_string());
-                            items.push(ImpactItem {
-                                name: path.to_string(),
-                                path: path.to_string(),
-                                evidence_source: EvidenceSource::TestMap,
-                                description: format!("Test impacted by change: {path}"),
-                                range: None,
-                                details: Some(t.clone()),
-                            });
+        if files.is_empty() && symbol_ids.is_empty() {
+            // TestImpact requires at least one resolvable input.
+        } else {
+            match self.test_impact.execute("test_impacted", &args) {
+                Ok(res) => {
+                    if let Some(details) = res.details {
+                        if let Some(tests) = details.get("results").and_then(|t| t.as_array()) {
+                            for t in tests {
+                                if let Some(path) = t["path"].as_str() {
+                                    selected_tests.insert(path.to_string());
+                                    items.push(ImpactItem {
+                                        name: path.to_string(),
+                                        path: path.to_string(),
+                                        evidence_source: EvidenceSource::TestMap,
+                                        description: format!("Test impacted by change: {path}"),
+                                        range: None,
+                                        details: Some(t.clone()),
+                                    });
+                                }
+                            }
                         }
+                        if details.get("partial").and_then(|p| p.as_bool()) == Some(true) {
+                            *is_partial = true;
+                        }
+                        if let Some(extra) = details.get("warnings").and_then(|w| w.as_array()) {
+                            warnings.extend(
+                                extra
+                                    .iter()
+                                    .filter_map(|w| w.as_str())
+                                    .map(|w| format!("test impact: {w}")),
+                            );
+                        }
+                        let commands = |key: &str| -> Vec<String> {
+                            details
+                                .get(key)
+                                .and_then(|c| c.as_array())
+                                .map(|list| list.iter().filter_map(render_command).collect())
+                                .unwrap_or_default()
+                        };
+                        let first = commands("first_tier");
+                        if !first.is_empty() {
+                            test_command = Some(first.join(" && "));
+                        }
+                        broader_verification = !commands("broader_verification").is_empty();
                     }
                 }
-            }
-        }
-
-        // Also check test_plan
-        if let Ok(plan_res) = self.test_impact.execute("test_plan", &args) {
-            if let Some(details) = plan_res.details {
-                if let Some(cmd) = details.get("command").and_then(|c| c.as_str()) {
-                    test_command = Some(cmd.to_string());
-                }
-                if let Some(broader) = details
-                    .get("broaderVerificationRequired")
-                    .and_then(|b| b.as_bool())
-                {
-                    broader_verification = broader;
+                Err(err) => {
+                    warnings.push(format!("Test impact unavailable: {err}"));
+                    *is_partial = true;
                 }
             }
         }
@@ -1018,30 +1162,66 @@ fn normalized_source_range(value: Option<&Value>) -> Option<SourceRange> {
     })
 }
 
-fn import_matches_target(importing_file: &str, specifier: &str, target_file: &str) -> bool {
-    let spec = specifier.trim_start_matches("./");
-    let target_stem = target_file
-        .strip_suffix(".ts")
-        .or_else(|| target_file.strip_suffix(".tsx"))
-        .or_else(|| target_file.strip_suffix(".js"))
-        .or_else(|| target_file.strip_suffix(".jsx"))
-        .unwrap_or(target_file);
-
-    if spec == target_file || spec == target_stem {
-        return true;
-    }
-
-    if let Some(parent) = Path::new(importing_file).parent() {
-        let parent_str = parent.to_str().unwrap_or("").replace('\\', "/");
-        let resolved = if parent_str.is_empty() || parent_str == "." {
-            spec.to_string()
-        } else {
-            format!("{parent_str}/{spec}")
-        };
-        if resolved == target_file || resolved == target_stem {
-            return true;
+/// Collapses `.` and `..` segments of a slash-separated relative path.
+fn collapse_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
         }
     }
+    parts.join("/")
+}
 
-    target_file.ends_with(spec) || target_stem.ends_with(spec)
+/// Whether `specifier`, imported from `importing_file`, names `target_file`.
+/// Relative specifiers resolve against the importing directory; others match
+/// only whole path segments. Names that merely end alike never match.
+fn import_matches_target(importing_file: &str, specifier: &str, target_file: &str) -> bool {
+    let target_stem = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]
+        .iter()
+        .find_map(|ext| target_file.strip_suffix(ext))
+        .unwrap_or(target_file);
+    let target_index_dir = target_stem.strip_suffix("/index");
+    let names_target = |candidate: &str| {
+        candidate == target_file
+            || candidate == target_stem
+            || target_index_dir.is_some_and(|dir| candidate == dir)
+    };
+
+    if specifier.starts_with('.') {
+        let parent = Path::new(importing_file)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .replace('\\', "/");
+        let resolved = collapse_path(&format!("{parent}/{specifier}"));
+        return names_target(&resolved);
+    }
+
+    let spec = collapse_path(specifier);
+    names_target(&spec)
+        || (spec.contains('/')
+            && [target_file, target_stem]
+                .iter()
+                .any(|name| name.ends_with(&format!("/{spec}"))))
+}
+
+/// `program arg arg ...` for a TestImpact verification command object.
+fn render_command(command: &Value) -> Option<String> {
+    let program = command.get("program")?.as_str()?;
+    let args = command
+        .get("argv")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Some(
+        std::iter::once(program)
+            .chain(args)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }

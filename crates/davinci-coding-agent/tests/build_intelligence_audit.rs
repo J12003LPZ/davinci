@@ -152,7 +152,11 @@ fn package_manager_follows_corepack_field_and_bun_text_lockfile() {
     assert_eq!(build_command(declared.path(), &[]).program, "pnpm");
 
     let bun = tempfile::tempdir().unwrap();
-    write(bun.path(), "package.json", r#"{"name":"root","scripts":{"build":"x"}}"#);
+    write(
+        bun.path(),
+        "package.json",
+        r#"{"name":"root","scripts":{"build":"x"}}"#,
+    );
     write(bun.path(), "bun.lock", "");
     assert_eq!(build_command(bun.path(), &[]).program, "bun");
 }
@@ -182,7 +186,11 @@ fn repo_intelligence_reads_jsonc_tsconfig_aliases() {
         "{\n  // path aliases\n  \"compilerOptions\": {\"baseUrl\": \".\", \"paths\": {\"@/*\": [\"src/*\",],},},\n}\n",
     );
     write(repo.path(), "src/lib.ts", "export const lib = 1;");
-    write(repo.path(), "src/app.ts", "import { lib } from '@/lib'; lib;");
+    write(
+        repo.path(),
+        "src/app.ts",
+        "import { lib } from '@/lib'; lib;",
+    );
     let manager = RepoIntelligence::new(repo.path(), cache.path(), Default::default());
     let deps = manager
         .query("file_dependencies", &json!({"path":"src/app.ts"}))
@@ -245,7 +253,11 @@ fn turbo_package_override_replaces_the_generic_task() {
     );
     write(root, "packages/app/package.json", &pkg("app"));
     let result: BuildTargetsResult = call(root, "build_targets", json!({"package": "app"}));
-    let builds: Vec<_> = result.targets.iter().filter(|t| t.target == "build").collect();
+    let builds: Vec<_> = result
+        .targets
+        .iter()
+        .filter(|t| t.target == "build")
+        .collect();
     assert_eq!(builds.len(), 1, "{builds:?}");
     assert!(!builds[0].cacheable);
 }

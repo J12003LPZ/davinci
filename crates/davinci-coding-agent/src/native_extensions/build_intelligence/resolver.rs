@@ -693,7 +693,6 @@ impl BuildResolver {
                         supports_cache: true,
                     })
                 } else {
-
                     Ok(BuildCommandResult {
                         program,
                         argv,
@@ -812,7 +811,10 @@ impl BuildResolver {
             return Vec::new();
         }
 
-        let canonical_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
         let mut dirs = Vec::new();
         let mut stack = vec![(self.root.clone(), 0usize)];
         let mut visited = 0usize;

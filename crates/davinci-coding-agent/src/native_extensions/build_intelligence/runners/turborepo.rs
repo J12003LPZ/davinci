@@ -52,31 +52,37 @@ pub fn extract_turbo_targets(config: &TurboConfig, package_name: &str) -> Vec<Bu
         if task_name.contains('#') {
             if let Some((pkg, t)) = task_name.split_once('#') {
                 if pkg == package_name {
-                    overrides.insert(t.to_string(), BuildTarget {
-                        target: t.to_string(),
-                        package: package_name.to_string(),
-                        runner: "turbo".to_string(),
-                        executor: None,
-                        command: Some(format!("turbo run {t}")),
-                        inputs: task.inputs.clone(),
-                        outputs: task.outputs.clone(),
-                        depends_on: task.depends_on.clone(),
-                        cacheable: task.cache,
-                    });
+                    overrides.insert(
+                        t.to_string(),
+                        BuildTarget {
+                            target: t.to_string(),
+                            package: package_name.to_string(),
+                            runner: "turbo".to_string(),
+                            executor: None,
+                            command: Some(format!("turbo run {t}")),
+                            inputs: task.inputs.clone(),
+                            outputs: task.outputs.clone(),
+                            depends_on: task.depends_on.clone(),
+                            cacheable: task.cache,
+                        },
+                    );
                 }
             }
         } else {
-            resolved.insert(task_name.clone(), BuildTarget {
-                target: task_name.clone(),
-                package: package_name.to_string(),
-                runner: "turbo".to_string(),
-                executor: None,
-                command: Some(format!("turbo run {task_name}")),
-                inputs: task.inputs.clone(),
-                outputs: task.outputs.clone(),
-                depends_on: task.depends_on.clone(),
-                cacheable: task.cache,
-            });
+            resolved.insert(
+                task_name.clone(),
+                BuildTarget {
+                    target: task_name.clone(),
+                    package: package_name.to_string(),
+                    runner: "turbo".to_string(),
+                    executor: None,
+                    command: Some(format!("turbo run {task_name}")),
+                    inputs: task.inputs.clone(),
+                    outputs: task.outputs.clone(),
+                    depends_on: task.depends_on.clone(),
+                    cacheable: task.cache,
+                },
+            );
         }
     }
 
