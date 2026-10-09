@@ -1,9 +1,11 @@
-//! HTTP(S) proxy resolution matching TS `utils/node-http-proxy.ts`.
+//! HTTP(S) proxy resolution, based on TS `utils/node-http-proxy.ts`. One
+//! deliberate difference: a bare `NO_PROXY` domain also covers its subdomains
+//! (WOR-77), as curl and most proxy clients do.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 use url::Url;
 
@@ -19,16 +21,18 @@ const DEFAULT_PROXY_PORTS: &[(&str, u16)] = &[
     ("wss", 443),
 ];
 
+/// An explicit `env` map replaces the process environment: a key missing from
+/// it resolves to empty instead of falling back to the inherited value.
 fn get_proxy_env(key: &str, env: Option<&HashMap<String, String>>) -> String {
     let lower = key.to_ascii_lowercase();
     let upper = key.to_ascii_uppercase();
     if let Some(env) = env {
-        if let Some(value) = env.get(&lower).filter(|value| !value.is_empty()) {
-            return value.clone();
-        }
-        if let Some(value) = env.get(&upper).filter(|value| !value.is_empty()) {
-            return value.clone();
-        }
+        return env
+            .get(&lower)
+            .filter(|value| !value.is_empty())
+            .or_else(|| env.get(&upper).filter(|value| !value.is_empty()))
+            .cloned()
+            .unwrap_or_default();
     }
     std::env::var(&lower)
         .or_else(|_| std::env::var(&upper))
@@ -67,7 +71,9 @@ fn should_proxy_hostname(hostname: &str, port: u16, env: Option<&HashMap<String,
                 return true;
             }
             if !proxy_hostname.starts_with(['.', '*']) {
-                return hostname != proxy_hostname;
+                // A bare domain also covers its subdomains, on a label boundary.
+                return hostname != proxy_hostname
+                    && !hostname.ends_with(&format!(".{proxy_hostname}"));
             }
             if let Some(stripped) = proxy_hostname.strip_prefix('*') {
                 proxy_hostname = stripped.to_string();
@@ -142,7 +148,39 @@ pub fn http_connect_request(target_host: &str, target_port: u16, proxy: &Url) ->
 }
 
 pub fn connect_response_ok(response: &str) -> bool {
-    response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
+    let status_line = response.lines().next().unwrap_or_default();
+    let mut fields = status_line.splitn(3, ' ');
+    matches!(fields.next(), Some("HTTP/1.1" | "HTTP/1.0")) && fields.next() == Some("200")
+}
+
+/// Upper bound on the proxy's CONNECT response headers. Real proxies answer
+/// with well under 1 KiB; the cap stops a hostile one from growing memory.
+const MAX_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
+
+/// Tries each address in turn, giving every attempt only what is left of the
+/// shared `deadline`, so N unreachable addresses cost one timeout, not N.
+fn connect_within_deadline<I, F>(
+    addrs: I,
+    deadline: Instant,
+    mut connect: F,
+) -> Result<TcpStream, String>
+where
+    I: IntoIterator<Item = SocketAddr>,
+    F: FnMut(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+{
+    let mut last_error = "WebSocket connect failed".to_string();
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            last_error = "WebSocket connect failed: timed out".to_string();
+            break;
+        }
+        match connect(&addr, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = format!("WebSocket connect failed: {err}"),
+        }
+    }
+    Err(last_error)
 }
 
 pub fn tcp_connect_via_http_proxy(
@@ -160,18 +198,11 @@ pub fn tcp_connect_via_http_proxy(
     let addrs = (proxy_host, proxy_port)
         .to_socket_addrs()
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
-    let mut last_error = "WebSocket connect failed".to_string();
-    let mut tcp = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                tcp = Some(stream);
-                break;
-            }
-            Err(err) => last_error = format!("WebSocket connect failed: {err}"),
-        }
-    }
-    let mut tcp = tcp.ok_or(last_error)?;
+    // One deadline covers address attempts and the header read.
+    let deadline = Instant::now() + timeout;
+    let mut tcp = connect_within_deadline(addrs, deadline, |addr, remaining| {
+        TcpStream::connect_timeout(addr, remaining)
+    })?;
     tcp.set_nodelay(true)
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
     tcp.set_read_timeout(Some(timeout))
@@ -182,18 +213,33 @@ pub fn tcp_connect_via_http_proxy(
     tcp.write_all(request.as_bytes())
         .and_then(|_| tcp.flush())
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
-    let mut buf = vec![0u8; 4096];
+    // Read one byte at a time: the stream is returned to the caller as the
+    // tunnel, so nothing past the header terminator may be consumed here.
+    let mut byte = [0u8; 1];
     let mut collected = Vec::new();
+    // The per-read timeout alone never fires on a proxy that keeps
+    // trickling bytes, so every read is bounded by the shared deadline.
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("WebSocket connect failed: proxy CONNECT response timed out".to_string());
+        }
+        tcp.set_read_timeout(Some(remaining))
+            .map_err(|err| format!("WebSocket connect failed: {err}"))?;
         let n = tcp
-            .read(&mut buf)
+            .read(&mut byte)
             .map_err(|err| format!("WebSocket connect failed: {err}"))?;
         if n == 0 {
             break;
         }
-        collected.extend_from_slice(&buf[..n]);
-        if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+        collected.push(byte[0]);
+        if collected.ends_with(b"\r\n\r\n") {
             break;
+        }
+        if collected.len() > MAX_CONNECT_RESPONSE_BYTES {
+            return Err(
+                "WebSocket connect failed: proxy CONNECT response headers too large".to_string(),
+            );
         }
     }
     let response = String::from_utf8_lossy(&collected);
@@ -201,6 +247,10 @@ pub fn tcp_connect_via_http_proxy(
         let status = response.lines().next().unwrap_or("proxy CONNECT failed");
         return Err(format!("WebSocket connect failed: {status}"));
     }
+    // The header read shrank the read timeout to what was left of the
+    // deadline; the tunnel gets the full timeout back.
+    tcp.set_read_timeout(Some(timeout))
+        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
     Ok(tcp)
 }
 
@@ -306,5 +356,163 @@ mod tests {
         drop(tcp);
         let received = thread.join().unwrap();
         assert!(received.starts_with("CONNECT chatgpt.com:443 HTTP/1.1"));
+    }
+
+    #[test]
+    fn wor85_explicit_env_map_does_not_fall_back_to_process_env() {
+        // Unique key so parallel tests that read the real proxy variables are unaffected.
+        std::env::set_var("WOR85_PROBE_PROXY", "http://inherited.example:1");
+        let empty = HashMap::new();
+        assert_eq!(get_proxy_env("wor85_probe_proxy", Some(&empty)), "");
+        let scoped = env(&[("WOR85_PROBE_PROXY", "http://scoped.example:2")]);
+        assert_eq!(
+            get_proxy_env("wor85_probe_proxy", Some(&scoped)),
+            "http://scoped.example:2"
+        );
+        assert_eq!(
+            get_proxy_env("wor85_probe_proxy", None),
+            "http://inherited.example:1"
+        );
+        std::env::remove_var("WOR85_PROBE_PROXY");
+    }
+
+    fn proxied(no_proxy: &str, target: &str) -> bool {
+        let scoped = env(&[
+            ("HTTPS_PROXY", "http://proxy.example:8080"),
+            ("NO_PROXY", no_proxy),
+        ]);
+        resolve_http_proxy_url_for_target(target, Some(&scoped))
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn wor77_bare_domain_no_proxy_covers_subdomains() {
+        assert!(!proxied("example.com", "https://example.com"));
+        assert!(!proxied("example.com", "https://api.example.com"));
+        assert!(!proxied("example.com", "https://a.b.example.com"));
+        assert!(proxied("example.com", "https://evil-example.com"));
+        assert!(proxied("example.com", "https://example.com.evil.org"));
+        // Port scoped entries keep their port scope.
+        assert!(!proxied("example.com:8443", "https://api.example.com:8443"));
+        assert!(proxied("example.com:8443", "https://api.example.com"));
+    }
+
+    #[test]
+    fn wor76_wildcard_entry_inside_list_bypasses_proxy() {
+        assert!(!proxied("localhost,*", "https://example.org"));
+        assert!(!proxied("*,localhost", "https://example.org"));
+        assert!(!proxied("localhost *", "https://example.org"));
+        assert!(proxied("localhost,internal.test", "https://example.org"));
+    }
+
+    #[test]
+    fn wor75_connect_response_requires_exact_200_status_field() {
+        assert!(connect_response_ok(
+            "HTTP/1.1 200 Connection established\r\n\r\n"
+        ));
+        assert!(connect_response_ok("HTTP/1.0 200 OK\r\n\r\n"));
+        assert!(connect_response_ok("HTTP/1.1 200\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/1.1 2000 Bad\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/1.1 200X\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/1.1  200 OK\r\n\r\n"));
+        assert!(!connect_response_ok("HTTP/2 200\r\n\r\n"));
+        assert!(!connect_response_ok(""));
+    }
+
+    /// Runs `serve` against the first connection and returns the client result
+    /// plus how long the client call took.
+    fn connect_to_fake_proxy<F>(
+        timeout: Duration,
+        serve: F,
+    ) -> (Result<TcpStream, String>, Duration)
+    where
+        F: FnOnce(TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            serve(stream);
+        });
+        let proxy = Url::parse(&format!("http://{addr}")).unwrap();
+        let started = Instant::now();
+        let result = tcp_connect_via_http_proxy(&proxy, "chatgpt.com", 443, timeout);
+        let elapsed = started.elapsed();
+        if result.is_err() {
+            server.join().unwrap();
+        }
+        (result, elapsed)
+    }
+
+    #[test]
+    fn wor69_connect_response_headers_are_size_capped() {
+        let (result, _) = connect_to_fake_proxy(Duration::from_secs(10), |mut stream| {
+            // Endless header bytes with no CRLFCRLF terminator, then close.
+            let chunk = [b'a'; 4096];
+            for _ in 0..64 {
+                if stream.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+        });
+        let error = result.unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn wor69_connect_response_has_total_deadline_against_slow_drip() {
+        let (result, elapsed) = connect_to_fake_proxy(Duration::from_millis(400), |mut stream| {
+            // One byte every 100ms keeps every individual read under the read timeout.
+            for _ in 0..60 {
+                if stream.write_all(b"a").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn wor70_connect_keeps_tunneled_bytes_that_arrive_with_headers() {
+        let (result, _) = connect_to_fake_proxy(Duration::from_secs(5), |mut stream| {
+            // A slow answer uses up part of the deadline; the tunnel must
+            // still get the full read timeout back.
+            thread::sleep(Duration::from_millis(300));
+            // Headers and the first tunneled bytes in a single write.
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\ntunnel-payload")
+                .unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut tcp = result.unwrap();
+        assert_eq!(tcp.read_timeout().unwrap(), Some(Duration::from_secs(5)));
+        let mut payload = [0u8; 14];
+        tcp.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"tunnel-payload");
+    }
+
+    #[test]
+    fn wor80_connect_deadline_is_shared_across_resolved_addresses() {
+        let addrs: Vec<SocketAddr> = (1..=4)
+            .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
+            .collect();
+        let timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let mut attempts = 0;
+        let result = connect_within_deadline(addrs, started + timeout, |_, remaining| {
+            attempts += 1;
+            // An unreachable address burns whatever time it is granted.
+            thread::sleep(remaining);
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        });
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert!(elapsed < Duration::from_millis(600), "took {elapsed:?}");
     }
 }

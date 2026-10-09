@@ -168,15 +168,19 @@ fn modified_at(path: &Path) -> u64 {
 }
 
 fn summarize_file(path: &Path) -> Option<SessionSummary> {
-    // One read serves both the header and the message-text digest; reading the
-    // file for the header and re-opening it through `JsonlSession::open` for
-    // the text doubled I/O and parsing across every session in a listing.
-    let content = fs::read_to_string(path).ok()?;
-    let mut lines = content.lines();
-    let first_line = lines.next()?;
-    if let Ok(header) = parse_header(first_line) {
+    // One streamed pass serves both the header and the message-text digest;
+    // reading the file for the header and re-opening it through
+    // `JsonlSession::open` for the text doubled I/O and parsing across every
+    // session in a listing. Only one line is resident at a time, so a listing
+    // never holds a whole transcript besides the digest it returns.
+    let mut reader = BufReader::new(fs::File::open(path).ok()?);
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).ok()? == 0 {
+        return None;
+    }
+    if let Ok(header) = parse_header(first_line.trim_end()) {
         let mut summary = crate::codec::metadata_from_header(&header, path, modified_at(path));
-        let (text, count) = messages_text_from_lines(lines);
+        let (text, count) = messages_text_from_reader(reader).ok()?;
         summary.all_messages_text = text;
         summary.message_count = count;
         return Some(summary);
@@ -279,12 +283,17 @@ fn message_text(message: &serde_json::Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Digest a v4 file's already-read lines without building a full session.
-fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> (String, usize) {
+/// Digest the remaining lines of a v4 file without building a full session.
+fn messages_text_from_reader(mut reader: impl BufRead) -> std::io::Result<(String, usize)> {
     let mut count = 0usize;
-    let mut parts = Vec::new();
-    for line in lines {
-        let line = line.trim();
+    let mut text = String::new();
+    let mut raw = String::new();
+    loop {
+        raw.clear();
+        if reader.read_line(&mut raw)? == 0 {
+            break;
+        }
+        let line = raw.trim();
         // Cheap pre-filter: only message entries can contribute text.
         if line.is_empty() || !line.contains("\"message\"") {
             continue;
@@ -298,11 +307,14 @@ fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> (String
             continue;
         }
         count += 1;
-        if let Some(text) = value.get("message").and_then(message_text) {
-            parts.push(text);
+        if let Some(part) = value.get("message").and_then(message_text) {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&part);
         }
     }
-    (parts.join(" "), count)
+    Ok((text, count))
 }
 
 fn messages_text_from_entries(entries: &[crate::SessionEntry]) -> (String, usize) {

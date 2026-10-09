@@ -95,6 +95,20 @@ impl ContextObjectStore {
         result
     }
 
+    pub(crate) fn pinned_pages(&self) -> HashMap<String, ContextObject> {
+        self.pinned
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn restore_pinned_pages(&self, pages: HashMap<String, ContextObject>) {
+        *self
+            .pinned
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = pages;
+    }
+
     /// Drop pins for pages the installed root no longer references.
     pub(crate) fn retain_pinned(&self, root: &ContextRoot) {
         let live = root

@@ -10,10 +10,11 @@ pub struct PreparedContextImage {
     pub image: Result<Arc<ContextImage>, String>,
 }
 
-struct Fingerprint(Sha256);
+struct Fingerprint(Sha256, usize);
 impl Write for Fingerprint {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.update(bytes);
+        self.1 += bytes.len();
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -21,9 +22,18 @@ impl Write for Fingerprint {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Transcript bytes streamed through `history_fingerprint` on this thread.
+    static HISTORY_BYTES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Agent {
-    fn context_image_revision(&self) -> String {
-        let mut out = Fingerprint(Sha256::new());
+    /// The O(history) part of the revision. Building an image only takes
+    /// `&self`, so the transcript cannot change during a build and one digest
+    /// serves both the lookup and the post-build revision.
+    fn history_fingerprint(&self) -> String {
+        let mut out = Fingerprint(Sha256::new(), 0);
         // Public mutable fields remain compatible: stream their fingerprint
         // without allocating/cloning the transcript or traversing its branch.
         out.feed(&(
@@ -40,6 +50,14 @@ impl Agent {
                 &session.entries,
             ));
         }
+        #[cfg(test)]
+        HISTORY_BYTES_HASHED.with(|hashed| hashed.set(hashed.get() + out.1));
+        format!("{:x}", davinci_sys::hex::Lower(&out.0.finalize()))
+    }
+
+    fn context_image_revision(&self, history: &str) -> String {
+        let mut out = Fingerprint(Sha256::new(), 0);
+        out.feed(&history);
         out.feed(&(
             &self.system_prompt,
             &self.provider_system_prompt_suffix,
@@ -74,7 +92,8 @@ impl Agent {
             .prepared_context_image
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let revision = self.context_image_revision();
+        let history = self.history_fingerprint();
+        let revision = self.context_image_revision(&history);
         if let Some(prepared) = cache.as_ref().filter(|p| p.revision == revision) {
             return prepared.image.clone();
         }
@@ -95,7 +114,7 @@ impl Agent {
         }
         let image = image.map(Arc::new);
         *cache = Some(PreparedContextImage {
-            revision: self.context_image_revision(),
+            revision: self.context_image_revision(&history),
             image: image.clone(),
         });
         image
@@ -116,5 +135,56 @@ impl Fingerprint {
     fn feed<T: Serialize>(&mut self, value: &T) {
         serde_json::to_writer(&mut *self, value).expect("context fields serialize");
         self.0.update(b"\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::context_vm::ContextVmMode;
+    use crate::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    use davinci_ai::ChatMessage;
+
+    fn hashed() -> usize {
+        HISTORY_BYTES_HASHED.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn wor64_cache_miss_hashes_the_transcript_once() {
+        let mut agent = Agent::new("system");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(ContextVmMode::Active);
+        for index in 0..200 {
+            agent.messages.push(ChatMessage::text(
+                "user",
+                format!("turn {index} {}", "x".repeat(200)),
+            ));
+        }
+        let one_scan = {
+            let before = hashed();
+            agent.history_fingerprint();
+            hashed() - before
+        };
+        assert!(one_scan > 40_000);
+
+        let before = hashed();
+        agent.prepared_context_image().unwrap();
+        assert_eq!(
+            hashed() - before,
+            one_scan,
+            "miss scanned the history more than once"
+        );
+
+        let before = hashed();
+        agent.prepared_context_image().unwrap();
+        assert_eq!(
+            hashed() - before,
+            one_scan,
+            "hit scanned the history more than once"
+        );
     }
 }

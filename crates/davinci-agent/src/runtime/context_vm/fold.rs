@@ -1,5 +1,35 @@
 use super::ContextRoot;
 
+/// Per-event text cap in the fold prompt. User turns carry constraints and
+/// corrections, so they get a wider window than tool output and assistant text,
+/// and are sent whole when they fit (see `fold_request`).
+const EXCERPT_CHARS: usize = 1024;
+const USER_EXCERPT_CHARS: usize = 8 * 1024;
+/// Room kept back for the trailing note that says some events did not fit.
+const OMITTED_NOTE_RESERVE: usize = 64;
+
+/// Keeps the head and the tail of long text: a correction or a test verdict is
+/// as likely to sit at the end as at the start.
+fn excerpt(text: &str, cap: usize) -> (String, bool) {
+    let total = text.chars().count();
+    if total <= cap {
+        return (text.to_string(), false);
+    }
+    let head = cap / 2;
+    let mut out: String = text.chars().take(head).collect();
+    out.push_str(" [...] ");
+    out.extend(text.chars().skip(total - (cap - head)));
+    (out, true)
+}
+
+fn fold_record(event: &super::ContextEvent, cap: usize) -> String {
+    let (text, truncated) = excerpt(&event.visible_text, cap);
+    serde_json::json!({"source_ref":event.source_ref,"seq":event.seq,
+        "kind":event.kind,"provenance_kind":event.provenance_kind,"text":text,
+        "excerpt":truncated})
+    .to_string()
+}
+
 pub(crate) fn fold_request(
     parent: &super::CheckpointState,
     events: &[super::ContextEvent],
@@ -11,7 +41,7 @@ pub(crate) fn fold_request(
     use crate::compaction::{
         SummarizeRequest, CONTEXT_VM_FOLD_PROMPT, CONTEXT_VM_FOLD_SYSTEM_PROMPT,
     };
-    let schema = r#"Fields goals, constraints, completed, in_progress (current strategies), blockers, decisions, modified_files, verification are arrays of {value,source_refs,provenance_kind}. narrative is null or one such object and must use agent_inference. Omitted fields preserve parent values. transitions is an array of {slot,kind,previous,evidence,replacement}. slot is goal|constraint|strategy|blocker|decision|verification|modified_file. kind is resolve|supersede|reject. previous must exactly match the active value. evidence and replacement use the same value/source_refs/provenance_kind format. Supersede requires a replacement. Lifecycle evidence must be newer than the previous value; only a user may change a user constraint. Use transitions for corrections, resolved blockers, passing tests replacing failures, completed goals, and rejected strategies. Never treat assistant speculation as repository/tool evidence. Keep values concise, <=1024 UTF-8 bytes. Retrieve source references for details instead of copying bodies."#;
+    let schema = r#"Fields goals, constraints, completed, in_progress (current strategies), blockers, decisions, modified_files, verification are arrays of {value,source_refs,provenance_kind}. narrative is null or one such object and must use agent_inference. Omitted fields preserve parent values. transitions is an array of {slot,kind,previous,evidence,replacement}. slot is goal|constraint|strategy|blocker|decision|verification|modified_file. kind is resolve|supersede|reject. previous must exactly match the active value. evidence and replacement use the same value/source_refs/provenance_kind format. Supersede requires a replacement. Lifecycle evidence must be newer than the previous value; only a user may change a user constraint. Use transitions for corrections, resolved blockers, passing tests replacing failures, completed goals, and rejected strategies. Never treat assistant speculation as repository/tool evidence. A user_decision or mandatory_policy value must reproduce one or more whole consecutive sentences or clauses of a single cited event, dropping only filler words and punctuation: never cut a clause, quote a question, or add words. Keep values concise, <=1024 UTF-8 bytes. Retrieve source references for details instead of copying bodies."#;
     let base = serde_json::json!({"parent":parent,"instructions":instructions,"schema":schema});
     let max_tokens = 4096.min(window / 4);
     let limit = window.saturating_sub(max_tokens).saturating_sub(512) as usize;
@@ -21,19 +51,36 @@ pub(crate) fn fold_request(
     if prefix.len() + CONTEXT_VM_FOLD_SYSTEM_PROMPT.len() >= limit {
         return None;
     }
-    let mut remaining = limit - prefix.len() - CONTEXT_VM_FOLD_SYSTEM_PROMPT.len();
+    let mut remaining = (limit - prefix.len() - CONTEXT_VM_FOLD_SYSTEM_PROMPT.len())
+        .saturating_sub(OMITTED_NOTE_RESERVE);
     let mut records = Vec::new();
+    let mut omitted = 0usize;
     for event in events.iter().rev() {
-        let text: String = event.visible_text.chars().take(1024).collect();
-        let record = serde_json::json!({"source_ref":event.source_ref,"seq":event.seq,
-            "kind":event.kind,"provenance_kind":event.provenance_kind,"text":text,
-            "excerpt":text.len() < event.visible_text.len()})
-        .to_string();
+        let cap = if event.kind == super::ContextEventKind::User {
+            USER_EXCERPT_CHARS
+        } else {
+            EXCERPT_CHARS
+        };
+        // A user message goes in whole when it takes at most half of what is
+        // left: a constraint can sit anywhere in a long paste, but one paste
+        // must not push every older event out (WOR-66).
+        let whole = (event.kind == super::ContextEventKind::User)
+            .then(|| fold_record(event, usize::MAX))
+            .filter(|record| record.len() < remaining / 2);
+        let mut record = whole.unwrap_or_else(|| fold_record(event, cap));
+        if record.len() + 1 > remaining && cap > EXCERPT_CHARS {
+            record = fold_record(event, EXCERPT_CHARS);
+        }
+        // One oversized record must not hide the older events behind it.
         if record.len() + 1 > remaining {
-            break;
+            omitted += 1;
+            continue;
         }
         remaining -= record.len() + 1;
         records.push(record);
+    }
+    if omitted > 0 {
+        records.push(serde_json::json!({"omitted_events":omitted}).to_string());
     }
     records.reverse();
     Some(SummarizeRequest {
@@ -167,6 +214,85 @@ impl ContextFoldPolicy {
             should_fold: reason.is_some(),
             reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use crate::runtime::context_manifest::ProvenanceKind;
+    use crate::runtime::context_vm::{CheckpointState, ContextEvent, ContextEventKind};
+
+    fn event(seq: u64, kind: ContextEventKind, text: &str) -> ContextEvent {
+        ContextEvent {
+            source_ref: format!("session:e{seq}"),
+            seq,
+            kind,
+            provenance_kind: ProvenanceKind::UserDecision,
+            content_hash: format!("h{seq}"),
+            visible_text: text.to_string(),
+            artifact_refs: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    fn prompt(events: &[ContextEvent], window: u64) -> String {
+        fold_request(&CheckpointState::default(), events, None, window, "p", "m")
+            .expect("fold request fits")
+            .prompt
+    }
+
+    #[test]
+    fn wor65_oversized_recent_record_does_not_drop_older_events() {
+        let mut huge = event(2, ContextEventKind::ToolResult, "recent");
+        huge.source_ref = format!("session:{}", "x".repeat(200_000));
+        let events = [
+            event(1, ContextEventKind::User, "NEVER-TOUCH-MIGRATIONS"),
+            huge,
+        ];
+        let prompt = prompt(&events, 32_000);
+        assert!(prompt.contains("NEVER-TOUCH-MIGRATIONS"));
+        assert!(prompt.contains("\"omitted_events\":1"));
+    }
+
+    #[test]
+    fn wor66_user_constraint_after_1024_chars_reaches_the_fold_prompt() {
+        let text = format!(
+            "{}MUST-KEEP-CONSTRAINT{}",
+            "a".repeat(3000),
+            "b".repeat(3000)
+        );
+        let prompt = prompt(&[event(1, ContextEventKind::User, &text)], 128_000);
+        assert!(prompt.contains("MUST-KEEP-CONSTRAINT"));
+    }
+
+    /// A constraint in the middle of a long paste survives when the message
+    /// fits; head-and-tail excerpts are only the fallback.
+    #[test]
+    fn wor66_mid_message_user_constraint_reaches_the_fold_prompt() {
+        let text = format!("{}MID-CONSTRAINT{}", "a".repeat(6_000), "b".repeat(14_000));
+        let prompt = prompt(&[event(1, ContextEventKind::User, &text)], 128_000);
+        assert!(prompt.contains("MID-CONSTRAINT"));
+        assert!(prompt.contains("\"excerpt\":false"));
+    }
+
+    /// A paste larger than half the budget is excerpted, so older events
+    /// still reach the summarizer.
+    #[test]
+    fn wor66_one_huge_paste_does_not_crowd_out_older_events() {
+        let older = event(1, ContextEventKind::User, "OLDER-CONSTRAINT");
+        let huge = event(2, ContextEventKind::User, &"z".repeat(400_000));
+        let prompt = prompt(&[older, huge], 128_000);
+        assert!(prompt.contains("OLDER-CONSTRAINT"));
+        assert!(prompt.contains("\"excerpt\":true"));
+    }
+
+    #[test]
+    fn wor66_very_long_text_keeps_its_head_and_tail() {
+        let text = format!("HEAD{}TAIL", "m".repeat(50_000));
+        let prompt = prompt(&[event(1, ContextEventKind::ToolResult, &text)], 128_000);
+        assert!(prompt.contains("HEAD") && prompt.contains("TAIL"));
+        assert!(prompt.contains("\"excerpt\":true"));
     }
 }
 

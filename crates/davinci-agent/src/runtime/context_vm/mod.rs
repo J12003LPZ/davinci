@@ -16,7 +16,7 @@ pub(crate) const CONTEXT_BUDGET_EXCEEDED: &str =
 pub use compiler::{ContextCompileRequest, ContextCompiler};
 pub use diagnostics::ContextVmFailure;
 pub use events::{
-    events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind,
+    events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind, EventImage,
 };
 pub(crate) use fold::fold_request;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
@@ -50,6 +50,18 @@ pub struct ContextVmState {
     pub last_fold_tokens: Option<(u64, u64)>,
     pub last_prefix_digest: Option<String>,
     pub stable_context_digest: Option<String>,
+}
+
+/// VM state from before a fold; see `ContextVmRuntime::fold_undo_point`.
+pub(crate) struct FoldUndo {
+    state: ContextVmState,
+    events: Vec<ContextEvent>,
+    source_contents: HashMap<String, String>,
+    pinned: HashMap<String, ContextObject>,
+    retrieval_offered: bool,
+    folds: u64,
+    tokens_before_fold: u64,
+    tokens_after_fold: u64,
 }
 
 #[derive(Clone)]
@@ -128,6 +140,17 @@ impl ContextVmRuntime {
             .unwrap_or_else(|error| error.into_inner());
         state.root = root;
         state.last_source_seq = last_source_seq;
+    }
+
+    /// True when `events` extend what this VM last recorded: the same
+    /// conversation, possibly with newer events. A VM that has recorded
+    /// nothing continues anything.
+    pub fn continues(&self, events: &[ContextEvent]) -> bool {
+        let recorded = self.events.read().unwrap_or_else(|e| e.into_inner());
+        recorded.len() <= events.len()
+            && recorded.iter().zip(events).all(|(a, b)| {
+                a.source_ref == b.source_ref && a.content_hash == b.content_hash && a.seq == b.seq
+            })
     }
 
     pub fn events(&self) -> Vec<ContextEvent> {
@@ -437,6 +460,55 @@ impl ContextVmRuntime {
         Ok(root)
     }
 
+    /// Capture the state a fold changes, so a fold whose checkpoint cannot be
+    /// persisted can be undone and memory never runs ahead of the session.
+    /// The fold counters are restored; work counters (rebuilds, page lookups,
+    /// images compiled) record work that did happen and are kept, as are
+    /// content-addressed pages the fold saved to the object store.
+    pub(crate) fn fold_undo_point(&self) -> FoldUndo {
+        let metrics = self.metrics();
+        FoldUndo {
+            state: self
+                .state
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+            events: self.events(),
+            source_contents: self
+                .source_contents
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+            pinned: self.store.pinned_pages(),
+            retrieval_offered: self.retrieval_offered(),
+            folds: metrics.folds,
+            tokens_before_fold: metrics.tokens_before_fold,
+            tokens_after_fold: metrics.tokens_after_fold,
+        }
+    }
+
+    pub(crate) fn undo_fold(&self, undo: FoldUndo) {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = undo.state;
+        *self
+            .events
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = undo.events;
+        *self
+            .source_contents
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = undo.source_contents;
+        self.store.restore_pinned_pages(undo.pinned);
+        self.set_retrieval_offered(undo.retrieval_offered);
+        self.bump_metrics(|metrics| {
+            metrics.folds = undo.folds;
+            metrics.tokens_before_fold = undo.tokens_before_fold;
+            metrics.tokens_after_fold = undo.tokens_after_fold;
+        });
+    }
+
     pub fn retrieve(
         &self,
         request: &RetrieveContextRequest,
@@ -555,6 +627,7 @@ impl ContextVmRuntime {
                 provenance_kind: event.provenance_kind,
                 visible_text: String::new(),
                 artifact_refs: event.artifact_refs.clone(),
+                images: Vec::new(),
             })
             .collect();
         drop(old);
@@ -580,7 +653,11 @@ impl ContextVmRuntime {
         let mut tokens = 0u64;
         let mut refs = Vec::new();
         for event in events.iter().rev() {
-            let estimate = event.visible_text.len().div_ceil(4).max(1) as u64;
+            // Images count at the provider ceiling, as the compiler counts them.
+            let estimate = (event.visible_text.len().div_ceil(4).max(1) as u64).saturating_add(
+                (event.images.len() as u64)
+                    .saturating_mul(crate::provider_budget::IMAGE_TOKEN_CEILING),
+            );
             if !refs.is_empty() && tokens.saturating_add(estimate) > self.config.hot_event_tokens {
                 break;
             }
@@ -647,12 +724,20 @@ pub fn context_checkpoint_entry(
     }
 }
 
+/// The root keeps only recent tool-result refs; older ones stay pageable
+/// through their sources, so a long session does not grow the checkpoint root.
+pub const MAX_ROOT_EVIDENCE_REFS: usize = 64;
+
 fn evidence_refs(events: &[ContextEvent]) -> Vec<String> {
-    events
+    let mut recent: Vec<String> = events
         .iter()
+        .rev()
         .filter(|event| event.kind == ContextEventKind::ToolResult)
+        .take(MAX_ROOT_EVIDENCE_REFS)
         .map(|event| event.source_ref.clone())
-        .collect()
+        .collect();
+    recent.reverse();
+    recent
 }
 
 fn estimate_state_tokens(state: &CheckpointState) -> u64 {

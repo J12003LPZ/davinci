@@ -236,6 +236,7 @@ fn reducer_requires_resolvable_provenance_and_preserves_parent_state() {
             content_hash: "user-hash".into(),
             visible_text: "preserve the public API".into(),
             artifact_refs: Vec::new(),
+            images: Vec::new(),
         },
         ContextEvent {
             source_ref: "tool:1".into(),
@@ -245,6 +246,7 @@ fn reducer_requires_resolvable_provenance_and_preserves_parent_state() {
             content_hash: "tool-hash".into(),
             visible_text: "test passed".into(),
             artifact_refs: Vec::new(),
+            images: Vec::new(),
         },
     ];
     let parent =

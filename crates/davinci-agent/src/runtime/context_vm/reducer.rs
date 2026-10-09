@@ -153,6 +153,8 @@ impl ContextStateReducer {
             match event.kind {
                 // The exact user text is authoritative. Keeping it as a goal preserves the
                 // prompt reference without asking the deterministic path to infer intent.
+                // An image-only message has no words to keep as a goal.
+                ContextEventKind::User if event.visible_text.trim().is_empty() => {}
                 ContextEventKind::User => push_unique(
                     &mut state.goals,
                     StateValue {
@@ -205,13 +207,32 @@ fn is_user_authority(value: &ProposedStateValue) -> bool {
 fn validate_value(
     value: ProposedStateValue,
     events: &HashMap<&str, &ContextEvent>,
-    parent: &HashMap<String, ProvenanceKind>,
+    parent: &ParentSources,
+) -> Option<StateValue<String>> {
+    validate_cited_value(value, events, parent, true)
+}
+
+/// `grounded` is false only for the evidence of a supersede, whose grounded
+/// replacement already carries the user's words. That evidence records why a
+/// value retired rather than quoting the user, so it is kept out of later
+/// grounding text.
+fn validate_cited_value(
+    value: ProposedStateValue,
+    events: &HashMap<&str, &ContextEvent>,
+    parent: &ParentSources,
+    grounded: bool,
 ) -> Option<StateValue<String>> {
     if value.value.trim().is_empty()
         || value.value.len() > 1024
         || value.source_refs.is_empty()
         || value.source_refs.len() > 16
     {
+        return None;
+    }
+    // A matching source type is not enough for authority: the summarizer
+    // could pin any claim to a real user message. User and policy values
+    // must be grounded in the text they cite (WOR-62).
+    if grounded && is_user_authority(&value) && !grounded_in_sources(&value, events, parent) {
         return None;
     }
     let mut sources = Vec::new();
@@ -222,7 +243,7 @@ fn validate_value(
         } else {
             parent
                 .get(&source_ref)
-                .is_some_and(|kind| provenance_matches_parent(value.provenance_kind, *kind))
+                .is_some_and(|(kind, _)| provenance_matches_parent(value.provenance_kind, *kind))
         };
         if !valid {
             return None;
@@ -276,16 +297,169 @@ fn provenance_matches_parent(requested: ProvenanceKind, existing: ProvenanceKind
     }
 }
 
-fn parent_provenance(parent: &CheckpointState) -> HashMap<String, ProvenanceKind> {
-    let mut result = HashMap::new();
+/// Source refs already accepted into the parent checkpoint: their provenance
+/// kind and the accepted values citing them. Folded events are no longer in
+/// the event list, so a new value citing one is grounded in those values.
+type ParentSources = HashMap<String, (ProvenanceKind, String)>;
+
+fn parent_provenance(parent: &CheckpointState) -> ParentSources {
+    let mut result: ParentSources = HashMap::new();
+    // Retirement evidence may be an ungrounded description, so it lends its
+    // refs' provenance kind but never its text as grounding for a new value.
+    let evidence: HashSet<*const StateValue<String>> = parent
+        .retired
+        .iter()
+        .map(|retired| &retired.evidence as *const _)
+        .collect();
     for value in all_values(parent) {
+        let grounding = !evidence.contains(&(value as *const _));
         for provenance in &value.provenance {
             for source_ref in &provenance.source_refs {
-                result.insert(source_ref.clone(), provenance.kind);
+                let (kind, text) = result
+                    .entry(source_ref.clone())
+                    .or_insert_with(|| (provenance.kind, String::new()));
+                *kind = provenance.kind;
+                if grounding {
+                    text.push('\n');
+                    text.push_str(&value.value);
+                }
             }
         }
     }
     result
+}
+
+/// Words that carry no claim of their own; they may be dropped from a quote.
+/// Negations are deliberately absent: "do not delete" never equals "delete".
+const UNGROUNDED_WORDS: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "for",
+    "from",
+    "with",
+    "as",
+    "is",
+    "are",
+    "be",
+    "was",
+    "were",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "user",
+    "users",
+    "wants",
+    "want",
+    "asked",
+    "asks",
+    "requires",
+    "require",
+    "requested",
+    "should",
+    "must",
+    "please",
+];
+
+/// Whitespace-separated words, lowercased, with surrounding punctuation
+/// trimmed. Inner punctuation stays, so `src/main.rs` and `.env` remain
+/// distinct from `main` and `env`.
+fn content_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let word = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+            let start = word.find(|c: char| c.is_alphanumeric())?;
+            // Keep the dot of a dotfile name: ".env" is not "env".
+            let start = if start > 0 && word[..start].ends_with('.') {
+                start - 1
+            } else {
+                start
+            };
+            Some(word[start..].to_lowercase())
+        })
+        .filter(|word| !UNGROUNDED_WORDS.contains(&word.as_str()))
+        .collect()
+}
+
+/// Clauses end at `;`, `!`, `?`, a line break, or a period that ends a
+/// sentence (followed by whitespace or the end), never at the dot in a name.
+/// Each clause is returned with whether it is a question.
+fn clauses(text: &str) -> Vec<(&str, bool)> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        let ends = match c {
+            ';' | '!' | '?' | '\n' => true,
+            '.' => chars.peek().is_none_or(|(_, next)| next.is_whitespace()),
+            _ => false,
+        };
+        if ends {
+            clauses.push((&text[start..index], c == '?'));
+            start = index + c.len_utf8();
+        }
+    }
+    clauses.push((&text[start..], false));
+    clauses
+}
+
+/// True when `value` reproduces whole clauses of one cited source: its content
+/// words equal those of one or more consecutive clauses, none of them a
+/// question. The summarizer may drop function words and punctuation, and
+/// choose which sentences matter, but cannot cut a clause. Cutting is what
+/// forges intent: "Should we drop the table?", "Deleting the tests is not
+/// acceptable", "I was going to force push but changed my mind" and "my
+/// coworker said to disable auth" all contain a command that is not the
+/// user's. Word-level checks cannot tell those apart; clause boundaries can.
+/// A rejected value costs only the summarizer's copy: the deterministic
+/// checkpoint keeps the user's own text.
+fn grounded_in_sources(
+    value: &ProposedStateValue,
+    events: &HashMap<&str, &ContextEvent>,
+    parent: &ParentSources,
+) -> bool {
+    let quote = content_words(&value.value);
+    if quote.is_empty() {
+        return false;
+    }
+    value.source_refs.iter().any(|source_ref| {
+        let text = match events.get(source_ref.as_str()) {
+            Some(event) => event.visible_text.as_str(),
+            None => match parent.get(source_ref) {
+                Some((_, text)) => text.as_str(),
+                None => return false,
+            },
+        };
+        let clauses = clauses(text)
+            .into_iter()
+            .map(|(clause, question)| (content_words(clause), question))
+            .filter(|(words, _)| !words.is_empty())
+            .collect::<Vec<_>>();
+        (0..clauses.len()).any(|first| {
+            let mut joined = Vec::new();
+            for (words, question) in &clauses[first..] {
+                if *question {
+                    return false;
+                }
+                joined.extend(words.iter().cloned());
+                if joined.len() >= quote.len() {
+                    return joined == quote;
+                }
+            }
+            false
+        })
+    })
 }
 
 fn state_provenance_refs(state: &CheckpointState) -> HashSet<String> {
@@ -336,7 +510,7 @@ fn apply_transition(
     state: &mut CheckpointState,
     transition: StateTransition,
     events: &HashMap<&str, &ContextEvent>,
-    parent: &HashMap<String, ProvenanceKind>,
+    parent: &ParentSources,
 ) {
     let Some(previous) = slot_values(state, transition.slot)
         .iter()
@@ -386,7 +560,14 @@ fn apply_transition(
     if !new_authority {
         return;
     }
-    let Some(evidence) = validate_value(transition.evidence, events, parent) else {
+    // A reject or resolve stands on its evidence alone (and a resolved goal
+    // stores it as completed work), so that evidence must quote the user. A
+    // supersede is justified by its replacement, which is grounded below, so
+    // its evidence may describe the change ("latest user correction").
+    let evidence_grounded = transition.replacement.is_none();
+    let Some(evidence) =
+        validate_cited_value(transition.evidence, events, parent, evidence_grounded)
+    else {
         return;
     };
     let replacement = match transition.replacement {

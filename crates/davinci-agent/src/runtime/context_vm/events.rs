@@ -25,6 +25,31 @@ pub struct ContextEvent {
     pub visible_text: String,
     #[serde(default)]
     pub artifact_refs: Vec<ArtifactRef>,
+    /// Images a user attached. They are model input like the text, so they
+    /// reach the provider and count in `content_hash` (WOR-58).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<EventImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventImage {
+    pub mime_type: String,
+    pub data: String,
+}
+
+impl ContextEvent {
+    /// The provider content of a user event: its text, then its images.
+    pub fn user_content(&self) -> Vec<MessageContent> {
+        let text = (!self.visible_text.is_empty()).then(|| MessageContent::Text {
+            text: self.visible_text.clone(),
+        });
+        text.into_iter()
+            .chain(self.images.iter().map(|image| MessageContent::Image {
+                data: image.data.clone(),
+                mime_type: image.mime_type.clone(),
+            }))
+            .collect()
+    }
 }
 
 pub fn events_from_session_branch(
@@ -54,10 +79,11 @@ pub fn events_from_messages(messages: &[ChatMessage]) -> Vec<ContextEvent> {
         .enumerate()
         .filter_map(|(index, message)| {
             let visible = visible_text(message);
-            if visible.is_empty() {
+            let images = user_images(message);
+            if visible.is_empty() && images.is_empty() {
                 return None;
             }
-            let content_hash = digest(visible.as_bytes());
+            let content_hash = content_hash(&visible, &images);
             let source_ref = format!(
                 "transient:{index}:{}",
                 &content_hash[..content_hash.len().min(16)]
@@ -76,7 +102,8 @@ pub(super) fn event_from_message(
         return None;
     }
     let visible_text = visible_text(message);
-    if visible_text.is_empty() {
+    let images = user_images(message);
+    if visible_text.is_empty() && images.is_empty() {
         return None;
     }
     let (kind, provenance_kind) = match message.role.as_str() {
@@ -92,10 +119,44 @@ pub(super) fn event_from_message(
         seq,
         kind,
         provenance_kind,
-        content_hash: digest(visible_text.as_bytes()),
+        content_hash: content_hash(&visible_text, &images),
         visible_text,
         artifact_refs: artifact_refs_from_message(message, &source_ref),
+        images,
     })
+}
+
+fn user_images(message: &ChatMessage) -> Vec<EventImage> {
+    if message.role != "user" {
+        return Vec::new();
+    }
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            MessageContent::Image { data, mime_type } => Some(EventImage {
+                mime_type: mime_type.clone(),
+                data: data.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Text-only events keep their existing hash, so stored roots stay valid.
+fn content_hash(visible_text: &str, images: &[EventImage]) -> String {
+    if images.is_empty() {
+        return digest(visible_text.as_bytes());
+    }
+    let mut identity = visible_text.to_string();
+    for image in images {
+        identity.push_str(&format!(
+            "\n[image {} {}]",
+            image.mime_type,
+            digest(image.data.as_bytes())
+        ));
+    }
+    digest(identity.as_bytes())
 }
 
 fn artifact_refs_from_message(message: &ChatMessage, source_ref: &str) -> Vec<ArtifactRef> {

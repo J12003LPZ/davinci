@@ -879,10 +879,18 @@ impl Agent {
         // One Context VM per conversation. Hosts build a fresh handle for each
         // prompt; the derived state, metrics and diagnostics of the handle it
         // replaces carry over while the bound session is unchanged.
+        // Without a session there is no id to compare (None == None), so the
+        // transcript decides: a VM carries over only while the messages still
+        // extend what it recorded. Otherwise a new, unrelated run on this
+        // Agent would inherit the old checkpoint, sources and notices (WOR-60).
         if let Some(previous) = &self.runtime {
             let session_id = self.session.as_ref().map(|session| &session.header.id);
             if !runtime.context_vm.shares_state_with(&previous.context_vm)
                 && previous.context_vm.bound_session_id().as_ref() == session_id
+                && (session_id.is_some()
+                    || previous
+                        .context_vm
+                        .continues(&runtime::context_vm::events_from_messages(&self.messages)))
             {
                 runtime.context_vm = previous.context_vm.clone();
             }
@@ -2155,6 +2163,12 @@ impl Agent {
         ))
     }
 
+    /// The event list the run loop hands to `append_delta` each round.
+    #[doc(hidden)]
+    pub fn context_vm_events_for_test(&self) -> Vec<runtime::context_vm::ContextEvent> {
+        self.context_vm_events_for_vm()
+    }
+
     #[doc(hidden)]
     pub fn legacy_messages_for_provider_for_test(&self) -> Vec<ChatMessage> {
         self.legacy_messages_for_provider()
@@ -2164,7 +2178,7 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
-        let events = self.context_vm_events_for_runtime();
+        let events = self.context_vm_events_for_vm();
         let selected = self.select_root_context(self.context_window);
         let mut items = Vec::new();
         for file in selected.repository_files {
@@ -2222,7 +2236,10 @@ impl Agent {
                 events
                     .iter()
                     .rev()
-                    .find(|event| event.kind == runtime::context_vm::ContextEventKind::User)
+                    .find(|event| {
+                        event.kind == runtime::context_vm::ContextEventKind::User
+                            && !event.visible_text.trim().is_empty()
+                    })
                     .map(|event| event.visible_text.clone())
             })
             .unwrap_or_else(|| "continue the current task".into());
@@ -2254,6 +2271,9 @@ impl Agent {
         let mut image = runtime
             .context_vm
             .compile(&events, &broker_packet, max_tokens)?;
+        if self.block_images {
+            image.messages = apply_block_images(&image.messages);
+        }
         // The most recent, complete tool exchange remains protocol data. Older
         // exchanges are evidence only. Reserve this suffix before compilation.
         for (index, message) in live.iter().enumerate() {
@@ -2277,17 +2297,23 @@ impl Agent {
     }
 
     fn live_tool_exchange(&self) -> Vec<ChatMessage> {
+        self.live_tool_exchange_start()
+            .map(|start| convert_to_llm_for_provider(&self.messages[start..], self.block_images))
+            .unwrap_or_default()
+    }
+
+    /// Index of the assistant message that opens a complete, well-formed
+    /// trailing tool exchange, if the transcript ends with one.
+    fn live_tool_exchange_start(&self) -> Option<usize> {
         if self.messages.last().is_none_or(|m| m.role != "toolResult") {
-            return Vec::new();
+            return None;
         }
-        let Some(start) = self.messages.iter().rposition(|m| m.role == "assistant") else {
-            return Vec::new();
-        };
+        let start = self.messages.iter().rposition(|m| m.role == "assistant")?;
         let mut calls = std::collections::HashSet::new();
         for content in &self.messages[start].content {
             if let MessageContent::ToolCall { id, .. } = content {
                 if id.is_empty() || !calls.insert(id.as_str()) {
-                    return Vec::new();
+                    return None;
                 }
             }
         }
@@ -2301,9 +2327,9 @@ impl Agent {
             || results.len() != ids.len()
             || results.iter().any(|m| m.role != "toolResult")
         {
-            return Vec::new();
+            return None;
         }
-        convert_to_llm_for_provider(&self.messages[start..], self.block_images)
+        Some(start)
     }
 
     pub fn provider_context_budget(&self) -> provider_budget::ProviderContextBudget {
@@ -2341,6 +2367,18 @@ impl Agent {
     pub fn context_vm_provider_output_limit(&self) -> Option<u64> {
         (self.context_vm_mode() == ContextVmMode::Active)
             .then(|| self.provider_context_budget().output_limit())
+    }
+
+    /// The events every VM recorder (compile, delta, fold) works from. The
+    /// live tool exchange is excluded: it goes to the provider as native
+    /// messages, and recorders that disagreed on it would read the shorter
+    /// list as a diverged history and rebuild (WOR-59).
+    pub(crate) fn context_vm_events_for_vm(&self) -> Vec<runtime::context_vm::ContextEvent> {
+        let mut events = self.context_vm_events_for_runtime();
+        if let Some(start) = self.live_tool_exchange_start() {
+            drop_live_exchange_events(&mut events, &self.messages[start..]);
+        }
+        events
     }
 
     pub(crate) fn context_vm_events_for_runtime(&self) -> Vec<runtime::context_vm::ContextEvent> {
@@ -3694,11 +3732,17 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
-        let events = self.context_vm_events_for_runtime();
-        let parent = runtime
-            .context_vm
-            .load_state_from_root()
-            .unwrap_or_default();
+        let events = self.context_vm_events_for_vm();
+        // A VM whose recorded events this history no longer extends holds
+        // another history's state; the summarizer must not see it.
+        let parent = if runtime.context_vm.continues(&events) {
+            runtime
+                .context_vm
+                .load_state_from_root()
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let observations = self.provider_observation_scope("compaction");
         let proposal = self.summarizer.as_ref().and_then(|summarizer| {
             let request = runtime::context_vm::fold_request(
@@ -3736,9 +3780,20 @@ impl Agent {
                 observation: Box::new(observation),
             });
         }
-        let root = runtime
+        // The checkpoint entry below is the durable record of this fold. If it
+        // cannot be written, the in-memory VM must not stay a fold ahead of
+        // the session it reloads from (WOR-61).
+        let undo = runtime.context_vm.fold_undo_point();
+        let root = match runtime
             .context_vm
-            .fold_with_proposal(reason, &events, proposal)?;
+            .fold_with_proposal(reason, &events, proposal)
+        {
+            Ok(root) => root,
+            Err(error) => {
+                runtime.context_vm.undo_fold(undo);
+                return Err(error);
+            }
+        };
         let prefix_digest = self
             .prepared_context_image()
             .map(|image| image.prefix_digest.clone())
@@ -3759,9 +3814,14 @@ impl Agent {
                 session.leaf_id.clone(),
                 seq,
             );
-            session
-                .append_entry(entry)
-                .map_err(|error| format!("context checkpoint persistence failed: {error}"))?;
+            if let Err(error) = session.append_entry(entry) {
+                runtime.context_vm.undo_fold(undo);
+                let error = format!("context checkpoint persistence failed: {error}");
+                runtime
+                    .context_vm
+                    .record_failure("fold", format!("{error}; the fold was rolled back"));
+                return Err(error);
+            }
         }
         if reason != runtime::context_vm::FoldReason::Manual {
             runtime.context_vm.push_notice(format!(
@@ -4544,6 +4604,28 @@ pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     // original journal intact, but exclude them at shared history conversion
     // so reopening, tree navigation, and Context VM cannot replay them.
     .filter(|message| !is_legacy_verification_notice(message))
+}
+
+/// The live tool exchange reaches the provider as native call/result
+/// messages. Its events must not also be compiled as hot evidence, or the
+/// same output is sent twice and charged twice against the budget (WOR-59).
+/// Events are dropped only when the history's tail is exactly that exchange.
+fn drop_live_exchange_events(
+    events: &mut Vec<runtime::context_vm::ContextEvent>,
+    exchange: &[ChatMessage],
+) {
+    let live = runtime::context_vm::events_from_messages(exchange);
+    let Some(tail) = events.len().checked_sub(live.len()) else {
+        return;
+    };
+    if !live.is_empty()
+        && events[tail..]
+            .iter()
+            .map(|event| &event.content_hash)
+            .eq(live.iter().map(|event| &event.content_hash))
+    {
+        events.truncate(tail);
+    }
 }
 
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {
