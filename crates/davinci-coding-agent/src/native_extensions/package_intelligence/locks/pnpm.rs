@@ -26,10 +26,8 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
     let flush_importer_dep =
         |data: &mut LockfileData, importer: &str, pkg: &str, spec: &str, ver: &str| {
             if !importer.is_empty() && !pkg.is_empty() {
-                let resolved_ver = ver.to_string();
-                if resolved_ver.starts_with("link:") {
-                    // Workspace link
-                }
+                // v9 appends the peer-dependency context: `2.0.0(react@18.2.0)`.
+                let resolved_ver = ver.split('(').next().unwrap_or(ver).trim().to_string();
                 let locked = LockedPackage {
                     name: pkg.to_string(),
                     version: resolved_ver,
@@ -48,8 +46,32 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                      name: &str,
                      ver: &str,
                      integrity: Option<String>,
-                     deps: BTreeMap<String, String>| {
-        if !name.is_empty() && !ver.is_empty() {
+                     deps: BTreeMap<String, String>,
+                     snapshot: bool| {
+        if !name.is_empty() && !ver.is_empty() && snapshot {
+            // v9 keeps resolved dependency edges under `snapshots:`, apart
+            // from the `packages:` metadata that names the version.
+            if let Some(known) = data
+                .resolutions
+                .get_mut(name)
+                .and_then(|all| all.iter_mut().find(|known| known.version == ver))
+            {
+                known.dependencies.extend(deps.clone());
+            }
+            let entry = data
+                .packages
+                .entry(name.to_string())
+                .or_insert_with(|| LockedPackage {
+                    name: name.to_string(),
+                    version: ver.to_string(),
+                    resolved: None,
+                    integrity: None,
+                    dependencies: BTreeMap::new(),
+                });
+            if entry.version == ver {
+                entry.dependencies.extend(deps);
+            }
+        } else if !name.is_empty() && !ver.is_empty() {
             let locked = LockedPackage {
                 name: name.to_string(),
                 version: ver.to_string(),
@@ -81,13 +103,14 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
         let indent = line.len() - line.trim_start().len();
 
         if indent == 0 {
-            if current_section == "packages" {
+            if current_section == "packages" || current_section == "snapshots" {
                 flush_pkg(
                     &mut data,
                     &current_pkg_name,
                     &current_pkg_version,
                     current_pkg_integrity.take(),
                     std::mem::take(&mut current_pkg_deps),
+                    current_section == "snapshots",
                 );
                 current_pkg_name.clear();
                 current_pkg_version.clear();
@@ -108,6 +131,8 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                 current_section = "importers";
             } else if trimmed == "packages:" {
                 current_section = "packages";
+            } else if trimmed == "snapshots:" {
+                current_section = "snapshots";
             } else {
                 current_section = "";
             }
@@ -126,7 +151,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                 current_importer_pkg.clear();
                 current_importer_spec.clear();
                 current_importer_ver.clear();
-                current_importer = trimmed.trim_end_matches(':');
+                current_importer = trimmed.trim_end_matches(':').trim_matches(['\'', '"']);
                 in_importer_deps = false;
             } else if indent == 4 {
                 flush_importer_dep(
@@ -164,7 +189,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                     current_importer_ver = ver.trim().trim_matches(['\'', '"']).to_string();
                 }
             }
-        } else if current_section == "packages" {
+        } else if current_section == "packages" || current_section == "snapshots" {
             if indent == 2 {
                 flush_pkg(
                     &mut data,
@@ -172,6 +197,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                     &current_pkg_version,
                     current_pkg_integrity.take(),
                     std::mem::take(&mut current_pkg_deps),
+                    current_section == "snapshots",
                 );
                 current_pkg_name.clear();
                 current_pkg_version.clear();
@@ -195,7 +221,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                 current_pkg_name = name;
                 current_pkg_version = clean_ver.to_string();
             } else if indent == 4 {
-                in_pkg_deps = trimmed == "dependencies:";
+                in_pkg_deps = matches!(trimmed, "dependencies:" | "optionalDependencies:");
                 if let Some(res) = trimmed.strip_prefix("resolution:") {
                     if let Some(pos) = res.find("integrity:") {
                         let integ = res[pos..]
@@ -216,13 +242,14 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
         }
     }
 
-    if current_section == "packages" {
+    if current_section == "packages" || current_section == "snapshots" {
         flush_pkg(
             &mut data,
             &current_pkg_name,
             &current_pkg_version,
             current_pkg_integrity.take(),
             std::mem::take(&mut current_pkg_deps),
+            current_section == "snapshots",
         );
     } else if current_section == "importers" {
         flush_importer_dep(

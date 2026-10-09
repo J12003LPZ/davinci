@@ -427,6 +427,40 @@ impl PackageIntelligence {
         })
     }
 
+    /// A digest of the installed package's manifest and declared type entry
+    /// points, or a fixed marker when it is not installed (so installing it
+    /// invalidates results cached while it was missing).
+    fn installed_package_stamp(&self, ws_dir: &Path, pkg: &str) -> String {
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let ws_dir = ws_dir
+            .canonicalize()
+            .unwrap_or_else(|_| ws_dir.to_path_buf());
+        let mut ignored = Vec::new();
+        let (dir, manifest) = resolver::find_installed_package(&ws_dir, &root, pkg, &mut ignored);
+        let (Some(dir), Some(manifest)) = (dir, manifest) else {
+            return "installed:none".to_string();
+        };
+        let mut material = manifest.clone().into_bytes();
+        if let Ok(value) = serde_json::from_str::<Value>(&manifest) {
+            let mut entries: Vec<String> = ["types", "typings"]
+                .iter()
+                .filter_map(|key| value.get(*key).and_then(Value::as_str))
+                .map(str::to_string)
+                .collect();
+            entries.push("index.d.ts".to_string());
+            for entry in entries {
+                if let Ok(bytes) = fs::read(dir.join(&entry)) {
+                    material.extend_from_slice(entry.as_bytes());
+                    material.extend_from_slice(&bytes);
+                }
+            }
+        }
+        format!("installed:{}", digest(&material))
+    }
+
     fn compute_cache_key(
         &self,
         tool: &str,
@@ -447,6 +481,13 @@ impl PackageIntelligence {
                 break;
             }
         }
+
+        // Results also describe the installed package (version, exports, type
+        // declarations), which changes independently of the manifest and lock.
+        let pkg = pkg_or_symbol.split('#').next().unwrap_or(pkg_or_symbol);
+        deps.push(CacheDependency::ContentHash(
+            self.installed_package_stamp(&ws_dir, pkg),
+        ));
 
         Some(CacheKey::new(
             CacheNamespace::Package,

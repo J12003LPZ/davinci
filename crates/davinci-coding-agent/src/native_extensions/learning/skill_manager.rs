@@ -278,7 +278,10 @@ impl SkillManager {
                     ))
                 }
             }
-            if fields.get("description").is_none_or(|d| d.trim().is_empty()) {
+            if fields
+                .get("description")
+                .is_none_or(|d| d.trim().is_empty())
+            {
                 return Err(ToolError::Failed(
                     "frontmatter must declare a non-empty 'description'".into(),
                 ));

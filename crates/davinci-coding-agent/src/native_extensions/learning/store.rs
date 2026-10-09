@@ -71,9 +71,13 @@ fn repair_journal_tail(path: &Path) -> Result<Option<String>, String> {
         return Ok(None);
     }
     let mut backup = path.as_os_str().to_owned();
-    backup.push(format!(".torn-{}.bak", crate::native_extensions::learning::types::now_ms()));
+    backup.push(format!(
+        ".torn-{}.bak",
+        crate::native_extensions::learning::types::now_ms()
+    ));
     let backup = PathBuf::from(backup);
-    fs::write(&backup, tail).map_err(|e| format!("failed to preserve torn tail {backup:?}: {e}"))?;
+    fs::write(&backup, tail)
+        .map_err(|e| format!("failed to preserve torn tail {backup:?}: {e}"))?;
     let file = OpenOptions::new()
         .write(true)
         .open(path)
@@ -487,7 +491,9 @@ mod tests {
         fs::write(&path, format!("{first}\n{{\"id\":")).unwrap();
 
         let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
-        store.upsert_candidate(fixture_candidate("cand-second")).unwrap();
+        store
+            .upsert_candidate(fixture_candidate("cand-second"))
+            .unwrap();
         assert!(store.diagnostics().iter().any(|d| d.contains("torn")));
 
         let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
@@ -509,7 +515,9 @@ mod tests {
         fs::write(&path, &first).unwrap();
 
         let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
-        store.upsert_candidate(fixture_candidate("cand-second")).unwrap();
+        store
+            .upsert_candidate(fixture_candidate("cand-second"))
+            .unwrap();
         let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
         assert!(reopened.candidate("cand-first").is_some());
         assert!(reopened.candidate("cand-second").is_some());
@@ -540,7 +548,9 @@ mod tests {
 
         let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
         assert!(store.candidate("cand-first").is_some());
-        store.upsert_candidate(fixture_candidate("cand-second")).unwrap();
+        store
+            .upsert_candidate(fixture_candidate("cand-second"))
+            .unwrap();
         let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
         assert!(reopened.candidate("cand-second").is_some());
     }
