@@ -289,9 +289,9 @@ impl CacheRuntime {
                 if self.revoked(request) {
                     return Err(CacheError::Invalidated);
                 }
-                if cancel.is_some_and(crate::CancellationToken::is_cancelled) {
-                    return Err(CacheError::Cancelled);
-                }
+                // A finished value is valid even if this caller was cancelled
+                // meanwhile: the flight returns `Cancelled` to this caller only
+                // and still shares the value with its followers (WOR-101).
                 self.insert(request, value.clone());
                 Ok(value)
             },

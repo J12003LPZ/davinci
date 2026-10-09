@@ -24,6 +24,18 @@ impl std::fmt::Debug for SingleFlight {
 }
 
 impl SingleFlight {
+    /// Run `compute` once per `key` across concurrent callers.
+    ///
+    /// The first caller leads and runs `compute` on its own thread, to
+    /// completion: `compute` borrows the caller's state, so it cannot be
+    /// abandoned midway, and its own I/O must carry its own deadline (the
+    /// semantic launcher passes the same timeout to the server it starts).
+    /// `timeout` bounds how long every other caller waits for the leader;
+    /// a follower gives up with `Timeout` and the flight carries on.
+    ///
+    /// `cancel` belongs to its caller alone (WOR-101). A cancelled follower
+    /// stops waiting; a leader cancelled during `compute` returns
+    /// `Cancelled` but still hands the finished value to its followers.
     pub fn run<T: Send + Sync + 'static>(
         &self,
         key: &str,
@@ -51,19 +63,16 @@ impl SingleFlight {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compute))
                 .map_err(|_| CacheError::Panicked)
                 .and_then(|r| r)
-                .and_then(|value| {
-                    if cancel.is_some_and(CancellationToken::is_cancelled) {
-                        Err(CacheError::Cancelled)
-                    } else {
-                        Ok(Arc::new(value) as Shared)
-                    }
-                });
+                .map(|value| Arc::new(value) as Shared);
             *flight.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
             flight.ready.notify_all();
             self.active
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(key);
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(CacheError::Cancelled);
+            }
             return result
                 .and_then(|v| v.downcast::<T>().map_err(|_| CacheError::TypeMismatch))
                 .map(|value| (value, true));

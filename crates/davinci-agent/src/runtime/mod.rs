@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod append_log;
 pub mod bus;
 pub mod cache;
 pub mod cancellation;

@@ -600,3 +600,107 @@ fn disabled_cache_reports_cancellation_that_happens_during_compute() {
         .unwrap();
     assert_eq!(*value, 7);
 }
+
+/// WOR-101: a leader cancelled while computing keeps its cancellation to
+/// itself; a follower that was never cancelled still gets the value.
+#[test]
+fn wor101_leader_cancellation_does_not_cancel_followers() {
+    let flight = Arc::new(SingleFlight::default());
+    let cancel = davinci_agent::CancellationToken::new();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+    let leader = {
+        let flight = flight.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            flight.run("shared", Duration::from_secs(5), Some(&cancel), || {
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                Ok(7_u64)
+            })
+        })
+    };
+    started_rx.recv().unwrap();
+    let follower = {
+        let flight = flight.clone();
+        std::thread::spawn(move || flight.run("shared", Duration::from_secs(5), None, || Ok(0_u64)))
+    };
+    // The leader is parked until `finish_tx`, so a long pause only gives the
+    // follower ample time to join the flight; it never races the leader.
+    std::thread::sleep(Duration::from_millis(300));
+    cancel.cancel();
+    finish_tx.send(()).unwrap();
+    assert!(matches!(leader.join().unwrap(), Err(CacheError::Cancelled)));
+    let (value, led) = follower.join().unwrap().unwrap();
+    assert_eq!((*value, led), (7, false));
+}
+
+/// WOR-101: `timeout` bounds a follower's wait on a slow leader; the leader
+/// runs its borrowed computation to completion and returns its value.
+#[test]
+fn wor101_timeout_bounds_followers_while_the_leader_finishes() {
+    let flight = Arc::new(SingleFlight::default());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let leader = {
+        let flight = flight.clone();
+        std::thread::spawn(move || {
+            flight.run("slow", Duration::from_millis(50), None, || {
+                started_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(9_u64)
+            })
+        })
+    };
+    started_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        flight.run("slow", Duration::from_millis(50), None, || Ok(0_u64)),
+        Err(CacheError::Timeout)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert_eq!(*leader.join().unwrap().unwrap().0, 9);
+}
+
+/// WOR-101: through the cache, a leader cancelled mid-computation does not
+/// cancel the callers that joined its flight.
+#[test]
+fn wor101_cache_leader_cancellation_still_serves_followers() {
+    let cache = Arc::new(CacheRuntime::default());
+    let cancel = davinci_agent::CancellationToken::new();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+    let leader = {
+        let (cache, cancel) = (cache.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            cache.get_or_compute(
+                &request("cancelled-leader", vec![]),
+                || Ok(()),
+                Some(&cancel),
+                || {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    Ok(11_u64)
+                },
+            )
+        })
+    };
+    started_rx.recv().unwrap();
+    let follower = {
+        let cache = cache.clone();
+        std::thread::spawn(move || {
+            cache.get_or_compute(
+                &request("cancelled-leader", vec![]),
+                || Ok(()),
+                None,
+                || Ok(0_u64),
+            )
+        })
+    };
+    // The leader is parked until `finish_tx`, so a long pause only gives the
+    // follower ample time to join the flight; it never races the leader.
+    std::thread::sleep(Duration::from_millis(300));
+    cancel.cancel();
+    finish_tx.send(()).unwrap();
+    assert!(matches!(leader.join().unwrap(), Err(CacheError::Cancelled)));
+    assert_eq!(*follower.join().unwrap().unwrap(), 11);
+}

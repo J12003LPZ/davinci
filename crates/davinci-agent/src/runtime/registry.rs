@@ -45,6 +45,19 @@ pub fn is_valid_transition(from: AgentState, to: AgentState) -> bool {
     }
 }
 
+/// Increments a per-agent counter that starts at 1. Callers hold the record
+/// write lock (lock order: records, then counters).
+fn bump(counters: &RwLock<HashMap<AgentId, u64>>, id: &AgentId) -> u64 {
+    match counters.write() {
+        Ok(mut counters) => {
+            let value = counters.entry(*id).or_insert(1);
+            *value += 1;
+            *value
+        }
+        Err(_) => 1,
+    }
+}
+
 /// In-memory thread-safe registry of active and historical agent records.
 #[derive(Clone, Default)]
 pub struct RuntimeRegistry {
@@ -122,14 +135,14 @@ impl RuntimeRegistry {
                 return Err(RegistryError::DuplicateAgent(record.id));
             }
             map.insert(record.id, record.clone());
+            if let Ok(mut gens) = self.generations.write() {
+                gens.entry(record.id).or_insert(1);
+            }
+            if let Ok(mut revs) = self.revisions.write() {
+                revs.entry(record.id).or_insert(1);
+            }
         }
 
-        if let Ok(mut gens) = self.generations.write() {
-            gens.entry(record.id).or_insert(1);
-        }
-        if let Ok(mut revs) = self.revisions.write() {
-            revs.entry(record.id).or_insert(1);
-        }
         if let Ok(mut act) = self.last_activity_ms.write() {
             act.entry(record.id).or_insert(record.started_ms);
         }
@@ -189,11 +202,13 @@ impl RuntimeRegistry {
 
             record.state = to;
             record.updated_ms = Self::now_ms();
+            // Bumped under the record lock, so `versioned` never pairs the
+            // new state with the old revision (WOR-106).
+            bump(&self.revisions, &id);
             (from, record.run_id, record.parent)
         };
 
         self.record_activity(&id);
-        self.advance_revision(&id);
 
         if let Some(bus) = &self.bus {
             let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -220,13 +235,24 @@ impl RuntimeRegistry {
     }
 
     pub fn advance_generation(&self, id: &AgentId) -> u64 {
-        if let Ok(mut g) = self.generations.write() {
-            let val = g.entry(*id).or_insert(1);
-            *val += 1;
-            *val
-        } else {
-            1
-        }
+        let _records = self.records.write();
+        bump(&self.generations, id)
+    }
+
+    /// Start a new generation and revision in one step, as a retry does, so
+    /// no reader sees the new generation with the old revision.
+    pub fn advance_generation_and_revision(&self, id: &AgentId) -> (u64, u64) {
+        let _records = self.records.write();
+        (bump(&self.generations, id), bump(&self.revisions, id))
+    }
+
+    /// The record with the generation and revision it was read at. Every
+    /// writer of the three holds the record lock, so the triple is one
+    /// consistent point in time (WOR-106).
+    pub fn versioned(&self, id: &AgentId) -> Option<(AgentRecord, u64, u64)> {
+        let map = self.records.read().ok()?;
+        let record = map.get(id)?.clone();
+        Some((record, self.get_generation(id), self.get_revision(id)))
     }
 
     pub fn get_revision(&self, id: &AgentId) -> u64 {
@@ -238,13 +264,8 @@ impl RuntimeRegistry {
     }
 
     pub fn advance_revision(&self, id: &AgentId) -> u64 {
-        if let Ok(mut r) = self.revisions.write() {
-            let val = r.entry(*id).or_insert(1);
-            *val += 1;
-            *val
-        } else {
-            1
-        }
+        let _records = self.records.write();
+        bump(&self.revisions, id)
     }
 
     pub fn record_activity(&self, id: &AgentId) {

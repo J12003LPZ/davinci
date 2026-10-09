@@ -2178,4 +2178,52 @@ mod tests {
             .count();
         assert_eq!(unfinished, 0);
     }
+
+    /// WOR-104 review: a phase whose worker output overflowed to disk in an
+    /// earlier process is still recognised as done, not run again.
+    #[test]
+    fn resume_after_restart_reuses_an_overflowed_phase() {
+        let (executor, tmp) = setup_executor(None);
+        let spec: WorkflowSpec = serde_json::from_str(
+            r#"{
+            "schema_version": 1,
+            "name": "overflow-resume",
+            "max_parallel_agents": 1,
+            "max_total_agents": 2,
+            "phases": [
+                {
+                    "id": "research",
+                    "join": "all",
+                    "workers": [
+                        {"id": "researcher-1", "prompt": "find", "tools": ["read"]}
+                    ]
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let wf_id = WorkflowId::new();
+        let earlier = WorkflowStateStore::with_options(32 * 1024, tmp.path().to_path_buf());
+        let artifact = earlier
+            .put_artifact(
+                wf_id,
+                "research",
+                AgentId::new(),
+                serde_json::json!({"worker": "researcher-1", "output": "z".repeat(40 * 1024)}),
+                None,
+            )
+            .unwrap();
+        assert!(artifact.is_overflow);
+        drop(earlier);
+
+        let state = executor
+            .resume_execution(wf_id, spec, &HashSet::new())
+            .expect("resume succeeds");
+        assert_eq!(state.phases["research"].status, PhaseStatus::Completed);
+        assert_eq!(
+            executor.store.list_phase_artifacts(wf_id, "research").len(),
+            1,
+            "the overflowed phase ran again"
+        );
+    }
 }
