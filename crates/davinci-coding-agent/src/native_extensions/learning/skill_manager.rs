@@ -262,6 +262,27 @@ impl SkillManager {
             .unwrap_or_default();
 
         let content = if raw_body.starts_with("---") {
+            // Submitted frontmatter must agree with the requested identity and
+            // be closed, or the ledger and SKILL.md would name different skills.
+            let (fields, _) = davinci_agent::parse_frontmatter(raw_body);
+            match fields.get("name") {
+                Some(declared) if declared == name => {}
+                Some(declared) => {
+                    return Err(ToolError::Failed(format!(
+                        "frontmatter name '{declared}' does not match skill name '{name}'"
+                    )))
+                }
+                None => {
+                    return Err(ToolError::Failed(
+                        "frontmatter must be closed with '---' and declare 'name'".into(),
+                    ))
+                }
+            }
+            if fields.get("description").is_none_or(|d| d.trim().is_empty()) {
+                return Err(ToolError::Failed(
+                    "frontmatter must declare a non-empty 'description'".into(),
+                ));
+            }
             redact_secrets(raw_body)
         } else {
             let redacted = redact_secrets(raw_body);
@@ -425,6 +446,14 @@ impl SkillManager {
             ));
         }
 
+        // Validate every argument before the first write: a bad applicability
+        // must not leave a changed SKILL.md behind with an unadvanced ledger.
+        let applicability_update: Option<SkillApplicability> = args
+            .get("applicability")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| ToolError::Failed(format!("invalid applicability metadata: {e}")))?;
+
         let redacted_new = redact_secrets(new_text);
         let patched = current.replacen(old_text, &redacted_new, 1);
         let new_hash = content_hash(&patched);
@@ -494,9 +523,7 @@ impl SkillManager {
             applicability: Default::default(),
             pinned: false,
         });
-        if let Some(value) = args.get("applicability") {
-            let parsed: SkillApplicability = serde_json::from_value(value.clone())
-                .map_err(|e| ToolError::Failed(format!("invalid applicability metadata: {e}")))?;
+        if let Some(parsed) = applicability_update {
             rec.applicability = parsed;
         }
         rec.version = updated_version;
@@ -507,9 +534,18 @@ impl SkillManager {
             LearningScope::Project => ctx.project_store,
             LearningScope::Global => ctx.global_store,
         };
-        store
-            .upsert_skill(rec)
-            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {e}")))?;
+        if let Err(e) = store.upsert_skill(rec) {
+            // Keep file and ledger in step: put the previous content back.
+            let restored = atomic_write_file(&path, &current);
+            return Err(ToolError::Failed(format!(
+                "failed to update skill ledger: {e}{}",
+                if restored.is_err() {
+                    "; restoring the previous SKILL.md also failed"
+                } else {
+                    ""
+                }
+            )));
+        }
 
         let body = json!({
             "status": "patched",
@@ -943,6 +979,104 @@ mod tests {
         });
         let err = SkillManager::execute(ctx, &args).unwrap_err();
         assert!(err.to_string().contains("skill changed since review"));
+    }
+
+    #[test]
+    fn patch_with_invalid_applicability_leaves_the_skill_untouched() {
+        let (_dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let skill_dir = p_skills.join("learned-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "Original text").unwrap();
+        p_store
+            .upsert_skill(SkillLedgerRecord {
+                skill_id: "learned-skill".into(),
+                name: "learned-skill".into(),
+                scope: LearningScope::Project,
+                origin: SkillOrigin::LearnedReview,
+                status: ArtifactStatus::Active,
+                path: skill_file.clone(),
+                content_hash: content_hash("Original text"),
+                version: 1,
+                success_count: 0,
+                failure_count: 0,
+                neutral_count: 0,
+                last_used_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+                applicability: Default::default(),
+                pinned: false,
+            })
+            .unwrap();
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        let args = json!({
+            "action": "patch",
+            "name": "learned-skill",
+            "oldText": "Original text",
+            "newText": "Patched text",
+            "expectedHash": content_hash("Original text"),
+            "applicability": {"languages": 5}
+        });
+        assert!(SkillManager::execute(ctx, &args).is_err());
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), "Original text");
+        let record = p_store.skill("learned-skill").unwrap();
+        assert_eq!(record.version, 1);
+        assert_eq!(record.content_hash, content_hash("Original text"));
+        assert!(!p_store.root().join("history").exists());
+    }
+
+    fn create_with_body(body: &str, name: &str) -> (Result<ToolResult, ToolError>, PathBuf) {
+        let (dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        let args = json!({
+            "action": "create", "name": name, "scope": "project",
+            "description": "ignored when frontmatter is supplied", "body": body,
+        });
+        let result = SkillManager::execute(ctx, &args);
+        let file = p_skills.join(name).join("SKILL.md");
+        std::mem::forget(dir);
+        (result, file)
+    }
+
+    #[test]
+    fn create_rejects_frontmatter_that_names_another_skill() {
+        let (result, file) =
+            create_with_body("---\nname: fix-b\ndescription: wrong\n---\nBody", "fix-a");
+        assert!(result.is_err());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn create_rejects_unclosed_frontmatter() {
+        let (result, file) = create_with_body("---\nname: fix-a\ndescription: d\nBody", "fix-a");
+        assert!(result.is_err());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn create_accepts_matching_frontmatter() {
+        let (result, file) =
+            create_with_body("---\nname: fix-a\ndescription: right\n---\nBody", "fix-a");
+        assert!(!result.unwrap().is_error);
+        assert!(fs::read_to_string(file).unwrap().contains("name: fix-a"));
     }
 
     #[test]
