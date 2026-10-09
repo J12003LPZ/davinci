@@ -13,6 +13,8 @@ use davinci_protocol::{
 use crate::ClientError;
 
 pub const MAX_UINT32: u64 = 0xffff_ffff;
+const MAX_INBOUND_MESSAGES: usize = 256;
+const MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 
 pub type TransportFactory =
     Box<dyn FnMut(ByteTransportHandlers) -> Result<Box<dyn ByteTransport>, ClientError>>;
@@ -72,7 +74,8 @@ struct ConnectionInner {
     transport: Option<Box<dyn ByteTransport>>,
     transport_attached: bool,
     handshake: Option<Result<ServerSnapshot, ClientError>>,
-    inbound: Vec<ServerMessage>,
+    inbound: VecDeque<(ServerMessage, usize)>,
+    inbound_bytes: usize,
     on_handshake: Option<HandshakeListener>,
     on_message: Option<MessageListener>,
     on_state_change: Option<StateChangeListener>,
@@ -122,7 +125,8 @@ impl Connection {
                 transport: None,
                 transport_attached: false,
                 handshake: None,
-                inbound: Vec::new(),
+                inbound: VecDeque::new(),
+                inbound_bytes: 0,
                 on_handshake: None,
                 on_message: None,
                 on_state_change: None,
@@ -155,8 +159,15 @@ impl Connection {
         self.inner.borrow().max_frame_length
     }
 
+    /// Recent diagnostic messages, capped by count and serialized payload bytes.
+    /// Live listeners receive every message regardless of diagnostic retention.
     pub fn inbound(&self) -> Vec<ServerMessage> {
-        self.inner.borrow().inbound.clone()
+        self.inner
+            .borrow()
+            .inbound
+            .iter()
+            .map(|(message, _)| message.clone())
+            .collect()
     }
 
     pub fn connect(&self, factory: &mut TransportFactory) -> Result<ServerSnapshot, ClientError> {
@@ -173,6 +184,7 @@ impl Connection {
             inner.handshake = None;
             inner.transport_attached = false;
             inner.inbound.clear();
+            inner.inbound_bytes = 0;
             inner.decoder = Some(
                 create_server_message_decoder(Some(FrameDecoderOptions {
                     max_frame_length: Some(inner.max_frame_length),
@@ -381,7 +393,27 @@ impl Connection {
             self.fail_and_close(ClientError::Protocol("Unexpected handshake message".into()));
             return;
         }
-        self.inner.borrow_mut().inbound.push(message.clone());
+        // Keep a bounded diagnostic history. Every message still reaches listeners.
+        if let Ok(encoded) = encode_server_message(
+            &message,
+            Some(FrameDecoderOptions {
+                max_frame_length: Some(self.max_frame_length()),
+            }),
+        ) {
+            let bytes = encoded.len();
+            if bytes <= MAX_INBOUND_BYTES {
+                let mut inner = self.inner.borrow_mut();
+                while inner.inbound.len() >= MAX_INBOUND_MESSAGES
+                    || inner.inbound_bytes + bytes > MAX_INBOUND_BYTES
+                {
+                    if let Some((_, removed)) = inner.inbound.pop_front() {
+                        inner.inbound_bytes -= removed;
+                    }
+                }
+                inner.inbound_bytes += bytes;
+                inner.inbound.push_back((message.clone(), bytes));
+            }
+        }
         self.notify(Notice::Message(Box::new(message)));
     }
 
@@ -605,6 +637,51 @@ pub fn loopback_factory(
 mod tests {
     use super::*;
     use davinci_protocol::{ProtocolError, ProtocolErrorCode, ServerSnapshot};
+
+    #[test]
+    fn regression_inbound_retention_is_bounded_and_delivers_every_message() {
+        let connection = Connection::new(None).unwrap();
+        connection
+            .connect(&mut hello_factory(empty_snapshot()))
+            .unwrap();
+        let delivered = Rc::new(RefCell::new(0));
+        let sink = delivered.clone();
+        connection.on_message(move |_| *sink.borrow_mut() += 1);
+        for index in 0..300 {
+            connection.handle_message(ServerMessage::Response {
+                id: index.to_string(),
+                ok: true,
+                result: None,
+                error: None,
+            });
+        }
+        assert_eq!(*delivered.borrow(), 300);
+        assert!(connection.inbound().len() <= 256);
+        assert!(
+            matches!(connection.inbound().last(), Some(ServerMessage::Response { id, .. }) if id == "299")
+        );
+    }
+
+    #[test]
+    fn regression_inbound_retention_bounds_payload_bytes() {
+        let connection = Connection::new(None).unwrap();
+        connection
+            .connect(&mut hello_factory(empty_snapshot()))
+            .unwrap();
+        for index in 0..6 {
+            connection.handle_message(ServerMessage::Response {
+                id: index.to_string(),
+                ok: false,
+                result: None,
+                error: Some(ProtocolError {
+                    code: ProtocolErrorCode::InternalError,
+                    message: "x".repeat(4 * 1024 * 1024),
+                    details: None,
+                }),
+            });
+        }
+        assert!(connection.inbound().len() < 4);
+    }
 
     fn empty_snapshot() -> ServerSnapshot {
         ServerSnapshot {

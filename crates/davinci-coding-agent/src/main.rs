@@ -7803,11 +7803,7 @@ fn available_themes_with(parsed: Option<&Args>) -> Vec<Theme> {
             &default_agent_dir(),
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         ) {
-            if path.is_dir() {
-                themes.extend(load_themes_from_dir(&path));
-            } else if let Some(parent) = path.parent() {
-                themes.extend(load_themes_from_dir(parent));
-            }
+            themes.extend(load_themes_from_dir(&path));
         }
     }
     themes

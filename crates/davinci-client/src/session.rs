@@ -219,14 +219,19 @@ impl SessionClient {
                 .ok_or_else(|| ClientError::Protocol("Pi client is disconnected".into()))?;
             (connection, factory)
         };
-        let client = self.clone();
+        let client = Rc::downgrade(&self.inner);
         connection.on_handshake(move |snapshot| {
-            client.inner.borrow_mut().pending_snapshot = Some(snapshot.clone());
+            if let Some(client) = client.upgrade() {
+                client.borrow_mut().pending_snapshot = Some(snapshot.clone());
+            }
             Ok(())
         });
-        let client = self.clone();
+        let client = Rc::downgrade(&self.inner);
         connection.on_message(move |message| {
-            let mut inner = client.inner.borrow_mut();
+            let Some(client) = client.upgrade() else {
+                return;
+            };
+            let mut inner = client.borrow_mut();
             match message {
                 ServerMessage::Event { event } => inner.inbox.push_back(event.clone()),
                 // Only the reply to the request in flight is accepted. A late
@@ -809,6 +814,32 @@ mod tests {
     use davinci_protocol::{SessionMetadata, SessionPhase};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn regression_framed_client_is_released_after_disposal() {
+        let client = SessionClient::with_loopback(|_| {
+            (
+                ServerMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    connection_id: "c".into(),
+                    snapshot: ServerSnapshot {
+                        server_id: "s".into(),
+                        protocol_version: PROTOCOL_VERSION,
+                        revision: 0,
+                        sessions: vec![],
+                        models: vec![],
+                    },
+                },
+                vec![],
+            )
+        })
+        .unwrap();
+        let weak = Rc::downgrade(&client.inner);
+        client.connect().unwrap();
+        client.dispose();
+        drop(client);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn audit_regression_rejects_incompatible_dispatch_hello() {

@@ -193,10 +193,9 @@ pub fn merge(base: Option<CodexUsageSnapshot>, update: CodexUsageSnapshot) -> Co
                 // A reset time already past means the window rolled over:
                 // better no time than "now" forever.
                 let now = now_seconds();
-                window.resets_at = window
-                    .resets_at
-                    .or(previous.resets_at.filter(|at| *at > now));
-                window.resets_in_seconds = window.resets_in_seconds.or(previous.resets_in_seconds);
+                if window.resets_at.is_none() && window.resets_in_seconds.is_none() {
+                    window.resets_at = previous.resets_at.filter(|at| *at > now);
+                }
             }
         }
         *slot = Some(window);
@@ -225,6 +224,8 @@ fn record_locked(state: &mut State, mut snapshot: CodexUsageSnapshot) {
         .flatten()
     {
         window.resets_at = window.reset_time(now);
+        // Once anchored, the relative duration must never be anchored again.
+        window.resets_in_seconds = None;
     }
     if let Some(leading) = snapshot.leading() {
         let used = leading.used_percent;
@@ -321,6 +322,40 @@ mod tests {
 
     fn h(name: &str, value: &str) -> (String, String) {
         (name.into(), value.into())
+    }
+
+    #[test]
+    fn regression_expired_relative_reset_is_not_reanchored() {
+        let mut state = State {
+            latest: None,
+            warned_primary: 0.0,
+            pending: None,
+            unavailable: None,
+        };
+        let mut snapshot = parse_usage_headers(&[
+            h("x-codex-primary-used-percent", "10"),
+            h("x-codex-primary-window-minutes", "300"),
+            h("x-codex-primary-reset-after-seconds", "1200"),
+        ])
+        .unwrap();
+        // Model the already-pinned window after its absolute deadline passes.
+        snapshot.primary.as_mut().unwrap().resets_at = Some(now_seconds() - 1);
+        record_locked(&mut state, snapshot);
+        let update = parse_app_server_rate_limits(&json!({
+            "primary": { "usedPercent": 20, "windowDurationMins": 300 }
+        }))
+        .unwrap();
+        let merged = merge(state.latest.take(), update);
+        record_locked(&mut state, merged);
+        assert_eq!(
+            state
+                .latest
+                .unwrap()
+                .five_hour()
+                .unwrap()
+                .reset_time(now_seconds()),
+            None
+        );
     }
 
     #[test]

@@ -892,6 +892,7 @@ fn collect_manifest_resources(
     pkg: &PackageSource,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    let unfiltered = PackageSource::Spec(pkg.source().to_string());
     for entry in entries.iter().filter(|item| !is_override_pattern(item)) {
         if entry.contains('*') || entry.contains('?') {
             collect_glob_files(root, entry, &mut out);
@@ -899,11 +900,33 @@ fn collect_manifest_resources(
         }
         let path = root.join(entry);
         if path.is_dir() {
-            out.extend(collect_dir_resources(root, &path, pkg, kind));
+            out.extend(collect_dir_resources(root, &path, &unfiltered, kind));
         } else if path.is_file() {
-            push_if_allowed(root, path, pkg, kind, &mut out);
+            out.push(path);
         }
     }
+    out.retain(|path| {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let excluded = entries
+            .iter()
+            .filter_map(|entry| entry.strip_prefix('!'))
+            .any(|pattern| glob_match(pattern, &relative));
+        let forced_in = entries
+            .iter()
+            .filter_map(|entry| entry.strip_prefix('+'))
+            .any(|pattern| exact_resource_match(pattern, &relative));
+        let forced_out = entries
+            .iter()
+            .filter_map(|entry| entry.strip_prefix('-'))
+            .any(|pattern| exact_resource_match(pattern, &relative));
+        (!excluded || forced_in) && !forced_out && pkg.allows_resource(kind, &relative)
+    });
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -964,18 +987,21 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     if pattern == "*" || pattern == "**" || pattern == "**/*" {
         return true;
     }
-    if let Some(suffix) = pattern.strip_prefix("**/") {
-        return path == suffix
-            || path.ends_with(&format!("/{suffix}"))
-            || glob_match(suffix, &path);
-    }
-    if let Some((head, tail)) = pattern.split_once('*') {
-        return path.starts_with(head)
-            && path[head.len()..].find(tail).is_some_and(|index| {
-                path[head.len() + index..].ends_with(tail) || tail.is_empty()
-            });
-    }
-    path == pattern || path.ends_with(&format!("/{pattern}"))
+    let pattern = pattern.strip_prefix("./").unwrap_or(&pattern);
+    let matches = |candidate: &str| {
+        globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .ok()
+            .is_some_and(|glob| glob.compile_matcher().is_match(candidate))
+    };
+    matches(&path) || (!pattern.contains('/') && path.rsplit('/').next().is_some_and(matches))
+}
+
+fn exact_resource_match(pattern: &str, path: &str) -> bool {
+    let normalized = pattern.replace('\\', "/");
+    let pattern = normalized.strip_prefix("./").unwrap_or(&normalized);
+    path == pattern || path.strip_suffix("/SKILL.md") == Some(pattern)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1866,6 +1892,76 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn regression_manifest_globs_obey_package_filters() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("extensions")).unwrap();
+        fs::write(root.path().join("extensions/one.js"), "").unwrap();
+        fs::write(root.path().join("extensions/two.js"), "").unwrap();
+        let entries = vec!["extensions/*.js".to_string()];
+        let mut pkg = PackageFilter {
+            source: ".".into(),
+            autoload: Some(false),
+            ..Default::default()
+        };
+        assert!(collect_manifest_resources(
+            root.path(),
+            "extensions",
+            &entries,
+            &PackageSource::Filtered(pkg.clone())
+        )
+        .is_empty());
+        pkg.extensions = Some(vec!["extensions/one.js".into()]);
+        assert_eq!(
+            collect_manifest_resources(
+                root.path(),
+                "extensions",
+                &entries,
+                &PackageSource::Filtered(pkg)
+            ),
+            [root.path().join("extensions/one.js")]
+        );
+    }
+
+    #[test]
+    fn regression_manifest_overrides_exclude_and_force_exact_paths() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("extensions")).unwrap();
+        for file in ["one.js", "two.js", "three.js"] {
+            fs::write(root.path().join("extensions").join(file), "").unwrap();
+        }
+        let pkg = PackageSource::Spec(".".into());
+        let entries = [
+            "extensions",
+            "!extensions/*.js",
+            "+extensions/two.js",
+            "+extensions/three.js",
+            "-extensions/three.js",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            collect_manifest_resources(root.path(), "extensions", &entries, &pkg),
+            [root.path().join("extensions/two.js")]
+        );
+    }
+
+    #[test]
+    fn regression_resource_globs_support_question_and_compound_stars() {
+        use super::*;
+        for (pattern, path, expected) in [
+            ("extensions/plugin?.js", "extensions/plugin1.js", true),
+            ("extensions/plugin?.js", "extensions/plugin12.js", false),
+            ("src/**/*.js", "src/nested/deep/file.js", true),
+            ("src/**/*.js", "src/file.js", true),
+            ("extensions/*test*.js", "extensions/mytestfile.js", true),
+            ("extensions/*.js", "extensions/nested/file.js", false),
+        ] {
+            assert_eq!(glob_match(pattern, path), expected, "{pattern}: {path}");
+        }
+    }
+
     #[test]
     fn requirement_review_defaults_on_and_environment_selects_evaluation_arm() {
         let default = super::Settings::default();

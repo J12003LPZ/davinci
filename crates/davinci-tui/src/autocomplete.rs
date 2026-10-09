@@ -651,8 +651,10 @@ fn extract_path_prefix(text: &str, force: bool) -> Option<String> {
         return None;
     }
     let start = text
-        .rfind(|ch: char| ch.is_whitespace() || ch == '=' || ch == '"' || ch == '\'')
-        .map(|i| i + 1)
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace() || *ch == '=' || *ch == '"' || *ch == '\'')
+        .map(|(i, ch)| i + ch.len_utf8())
         .unwrap_or(0);
     Some(text[start..].to_string())
 }
@@ -723,8 +725,8 @@ fn get_fuzzy_file_suggestions(
         .map(|s| s.base_dir.clone())
         .unwrap_or_else(|| cwd.to_path_buf());
     let fd_query = scoped.as_ref().map(|s| s.query.as_str()).unwrap_or(query);
-    let base_dir_entries = walk_directory_with_fd(&fd_base, fd_query, Some(1));
-    let recursive_entries = walk_directory_with_fd(&fd_base, fd_query, None);
+    let base_dir_entries = walk_directory_with_fd(&fd_base, fd_query, Some(1))?;
+    let recursive_entries = walk_directory_with_fd(&fd_base, fd_query, None)?;
     let mut seen = std::collections::HashSet::new();
     let mut entries = Vec::new();
     for entry in base_dir_entries.into_iter().chain(recursive_entries) {
@@ -827,25 +829,23 @@ fn resolve_fd_binary() -> Option<PathBuf> {
         }
     }
     for name in ["fd", "fdfind"] {
-        if let Ok(output) = Command::new("which").arg(name).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Some(PathBuf::from(path));
-                }
-            }
+        let path = davinci_sys::process::resolve_program(name);
+        if path.is_file() {
+            return Some(path);
         }
     }
     None
 }
 
-fn walk_directory_with_fd(base_dir: &Path, query: &str, max_depth: Option<u32>) -> Vec<FdEntry> {
+fn walk_directory_with_fd(
+    base_dir: &Path,
+    query: &str,
+    max_depth: Option<u32>,
+) -> Option<Vec<FdEntry>> {
     if let Ok(reply) = std::env::var("PI_FD_REPLY") {
-        return parse_fd_stdout(&reply, max_depth);
+        return Some(parse_fd_stdout(&reply, max_depth));
     }
-    let Some(fd_path) = resolve_fd_binary() else {
-        return Vec::new();
-    };
+    let fd_path = resolve_fd_binary()?;
     let mut cmd = Command::new(fd_path);
     cmd.arg("--base-directory")
         .arg(base_dir)
@@ -870,15 +870,25 @@ fn walk_directory_with_fd(base_dir: &Path, query: &str, max_depth: Option<u32>) 
         cmd.arg("--full-path");
     }
     if !query.is_empty() {
-        cmd.arg(build_fd_path_query(query));
+        cmd.arg("--").arg(build_fd_path_query(query));
     }
-    let Ok(output) = cmd.output() else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
+    let output = davinci_sys::process::run_bounded(
+        cmd,
+        None,
+        davinci_sys::process::RunLimits {
+            timeout: std::time::Duration::from_millis(250),
+            output_cap: 256 * 1024,
+        },
+        &|| false,
+    )
+    .ok()?;
+    if !output.status.is_some_and(|status| status.success()) || output.stdout_truncated {
+        return None;
     }
-    parse_fd_stdout(&String::from_utf8_lossy(&output.stdout), None)
+    Some(parse_fd_stdout(
+        &String::from_utf8_lossy(&output.stdout),
+        None,
+    ))
 }
 
 fn parse_fd_stdout(stdout: &str, max_depth: Option<u32>) -> Vec<FdEntry> {
@@ -930,7 +940,7 @@ fn escape_regex(value: &str) -> String {
 pub fn build_fd_path_query(query: &str) -> String {
     let normalized = to_display_path(query);
     if !normalized.contains('/') {
-        return normalized;
+        return escape_regex(&normalized);
     }
     let has_trailing_separator = normalized.ends_with('/');
     let trimmed = normalized.trim_matches('/');
@@ -1018,7 +1028,7 @@ fn build_completion_value(
     is_at_prefix: bool,
     is_quoted_prefix: bool,
 ) -> String {
-    let needs_quotes = is_quoted_prefix || path.contains(' ');
+    let needs_quotes = is_quoted_prefix || path.chars().any(char::is_whitespace);
     let prefix = if is_at_prefix { "@" } else { "" };
     if !needs_quotes {
         return format!("{prefix}{path}");
@@ -1033,20 +1043,21 @@ fn readdir_file_suggestions(
     is_quoted: bool,
 ) -> Vec<AutocompleteItem> {
     let expanded = expand_path(cwd, raw_prefix);
-    let (dir, file_prefix) = if raw_prefix.ends_with('/') || raw_prefix.ends_with('\\') {
-        (expanded, String::new())
-    } else {
-        let parent = expanded
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cwd.to_path_buf());
-        let name = expanded
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        (parent, name)
-    };
+    let (dir, file_prefix) =
+        if raw_prefix.is_empty() || raw_prefix.ends_with('/') || raw_prefix.ends_with('\\') {
+            (expanded, String::new())
+        } else {
+            let parent = expanded
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.to_path_buf());
+            let name = expanded
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            (parent, name)
+        };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -1068,24 +1079,13 @@ fn readdir_file_suggestions(
         if is_dir {
             label.push('/');
         }
-        let mut path = if raw_prefix.contains('/') || raw_prefix.contains('\\') {
+        let path = if raw_prefix.contains('/') || raw_prefix.contains('\\') {
             let parent = raw_prefix.trim_end_matches(|c| c != '/' && c != '\\');
             format!("{parent}{label}")
         } else {
             label.clone()
         };
-        if at_prefix && !path.starts_with('@') {
-            path = format!("@{path}");
-        }
-        let value = if is_quoted && !path.contains('"') {
-            if let Some(rest) = path.strip_prefix('@') {
-                format!("@\"{rest}\"")
-            } else {
-                format!("\"{path}\"")
-            }
-        } else {
-            path
-        };
+        let value = build_completion_value(&path, is_dir, at_prefix, is_quoted);
         items.push(AutocompleteItem {
             value,
             label,
@@ -1122,6 +1122,131 @@ mod tests {
     use tempfile::tempdir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn regression_forced_path_prefix_after_unicode_whitespace() {
+        assert_eq!(
+            extract_path_prefix("hello\u{3000}file", true),
+            Some("file".into())
+        );
+    }
+
+    #[test]
+    fn regression_readdir_lists_cwd_for_bare_attachment() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("local.txt"), "").unwrap();
+        let items = readdir_file_suggestions(dir.path(), "", true, false);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            ["@local.txt"]
+        );
+    }
+
+    #[test]
+    fn regression_readdir_quotes_discovered_space_paths() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("my document.txt"), "").unwrap();
+        let items = readdir_file_suggestions(dir.path(), "my", true, false);
+        assert_eq!(items[0].value, "@\"my document.txt\"");
+    }
+
+    #[test]
+    fn regression_fd_queries_escape_literal_filenames() {
+        assert_eq!(build_fd_path_query("file[1].rs"), r"file\[1\]\.rs");
+        assert_eq!(build_fd_path_query("file["), r"file\[");
+    }
+
+    fn with_fd_helper(source: &str, check: impl FnOnce(&Path)) {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("helper.rs");
+        let exe = dir.path().join(if cfg!(windows) {
+            "helper.exe"
+        } else {
+            "helper"
+        });
+        std::fs::write(&src, source).unwrap();
+        assert!(Command::new("rustc")
+            .arg(&src)
+            .arg("-o")
+            .arg(&exe)
+            .status()
+            .unwrap()
+            .success());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in [("PI_FD_PATH", &self.0), ("PI_FD_REPLY", &self.1)] {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            std::env::var_os("PI_FD_PATH"),
+            std::env::var_os("PI_FD_REPLY"),
+        );
+        std::env::set_var("PI_FD_PATH", &exe);
+        std::env::remove_var("PI_FD_REPLY");
+        check(dir.path());
+    }
+
+    #[test]
+    fn regression_fd_option_shaped_filename_is_a_pattern() {
+        with_fd_helper(
+            r#"fn main() {
+            let args: Vec<_> = std::env::args().collect();
+            if args.windows(2).any(|pair| pair == ["--", "--help"]) {
+                println!("--help");
+            } else { std::process::exit(1); }
+        }"#,
+            |dir| {
+                let items = file_suggestions(dir, "--help", true, false);
+                assert_eq!(
+                    items
+                        .iter()
+                        .map(|item| item.value.as_str())
+                        .collect::<Vec<_>>(),
+                    ["@--help"]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn regression_failing_fd_uses_filesystem_fallback() {
+        with_fd_helper("fn main() { std::process::exit(1); }", |dir| {
+            std::fs::write(dir.join("local.txt"), "").unwrap();
+            let items = file_suggestions(dir, "local", true, false);
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.value.as_str())
+                    .collect::<Vec<_>>(),
+                ["@local.txt"]
+            );
+        });
+    }
+
+    #[test]
+    fn regression_stalled_fd_returns_within_deadline() {
+        with_fd_helper(
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(2)); }",
+            |dir| {
+                std::fs::write(dir.join("local.txt"), "").unwrap();
+                let start = std::time::Instant::now();
+                let items = file_suggestions(dir, "local", true, false);
+                assert!(start.elapsed() < std::time::Duration::from_millis(1500));
+                assert_eq!(items[0].value, "@local.txt");
+            },
+        );
+    }
 
     fn with_fd_reply<T>(reply: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap();

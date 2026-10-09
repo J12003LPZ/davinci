@@ -547,6 +547,9 @@ impl WorkspaceSnapshot {
         fs::create_dir_all(self.store_dir(cwd))
             .map_err(|error| format!("create checkpoint store: {error}"))?;
         let bytes = serde_json::to_vec_pretty(checkpoint).map_err(|error| error.to_string())?;
+        if bytes.len() > self.record_byte_limit() {
+            return Err("checkpoint record exceeds the configured bound".into());
+        }
         atomic_write(
             &self.store_dir(cwd).join(format!("{}.json", checkpoint.id)),
             &bytes,
@@ -562,13 +565,41 @@ impl WorkspaceSnapshot {
         {
             return Err("invalid checkpointId".into());
         }
-        let bytes = fs::read(self.store_dir(cwd).join(format!("{id}.json")))
+        let limit = self.record_byte_limit();
+        let mut bytes = Vec::new();
+        File::open(self.store_dir(cwd).join(format!("{id}.json")))
+            .and_then(|file| file.take(limit as u64 + 1).read_to_end(&mut bytes))
             .map_err(|error| format!("checkpoint '{id}' unavailable: {error}"))?;
-        if bytes.len() > self.config.max_total_bytes.saturating_mul(2) {
+        if bytes.len() > limit {
             return Err("checkpoint record exceeds the configured bound".into());
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|error| format!("invalid checkpoint record: {error}"))
+        let checkpoint: WorkspaceCheckpoint = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid checkpoint record: {error}"))?;
+        let mut total = 0usize;
+        if checkpoint.entries.len() > self.config.max_files {
+            return Err("checkpoint exceeds the configured file count".into());
+        }
+        for entry in &checkpoint.entries {
+            if let Some(bytes) = &entry.bytes {
+                if bytes.len() > self.config.max_file_bytes || entry.size != bytes.len() as u64 {
+                    return Err("checkpoint file bytes exceed bounds or disagree with size".into());
+                }
+                total = total.saturating_add(bytes.len());
+            }
+        }
+        if total > self.config.max_total_bytes {
+            return Err("checkpoint exceeds the configured total byte bound".into());
+        }
+        Ok(checkpoint)
+    }
+
+    fn record_byte_limit(&self) -> usize {
+        // Pretty JSON encodes each byte as a decimal value plus indentation.
+        // Reserve metadata separately, including when the content limit is tiny.
+        self.config
+            .max_total_bytes
+            .saturating_mul(16)
+            .saturating_add(1024 * 1024)
     }
 
     fn prune_records(&self, cwd: &Path) -> Result<(), String> {
@@ -831,6 +862,26 @@ fn capture_entry(
             "workspace path '{relative}' is not a regular file or symlink"
         ));
     }
+    let file =
+        File::open(&path).map_err(|error| format!("open workspace file {relative}: {error}"))?;
+    capture_file(
+        relative,
+        &metadata,
+        file,
+        max_file_bytes,
+        max_total_bytes,
+        total,
+    )
+}
+
+fn capture_file(
+    relative: &str,
+    metadata: &fs::Metadata,
+    reader: impl Read,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    total: &mut usize,
+) -> Result<SnapshotEntry, String> {
     let size = metadata.len();
     if size > max_file_bytes as u64 {
         return Err(format!(
@@ -843,10 +894,21 @@ fn capture_entry(
         return Err("workspace checkpoint exceeds the total byte bound".into());
     }
     let mut bytes = Vec::with_capacity(size_usize);
-    File::open(&path)
-        .map_err(|error| format!("open workspace file {relative}: {error}"))?
+    let read_limit = max_file_bytes.min(max_total_bytes.saturating_sub(*total));
+    reader
+        .take(read_limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read workspace file {relative}: {error}"))?;
+    if bytes.len() > read_limit {
+        return Err(format!(
+            "workspace file '{relative}' exceeds the actual read byte bound"
+        ));
+    }
+    if bytes.len() as u64 != size {
+        return Err(format!(
+            "workspace file '{relative}' changed size during capture"
+        ));
+    }
     *total = total.saturating_add(bytes.len());
     let hash = digest(&bytes);
     Ok(SnapshotEntry {
@@ -854,7 +916,7 @@ fn capture_entry(
         kind: SnapshotEntryKind::File,
         hash: Some(hash),
         bytes: Some(bytes),
-        mode: file_mode(&metadata),
+        mode: file_mode(metadata),
         size,
     })
 }
@@ -888,6 +950,13 @@ fn safe_restore(
     let Some(transaction) = transaction else {
         return false;
     };
+    // Content receipts carry no ownership of independently changed file modes.
+    if matches!(actual.kind, SnapshotEntryKind::File)
+        && matches!(expected.kind, SnapshotEntryKind::File)
+        && actual.mode != expected.mode
+    {
+        return false;
+    }
     transaction
         .applied_hashes
         .get(&actual.path)
@@ -1080,4 +1149,97 @@ fn append_identity_file(material: &mut Vec<u8>, label: &str, path: &Path) {
         value.extend_from_slice(b"missing");
     }
     append_identity_field(material, label, &value);
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+
+    #[test]
+    fn regression_snapshot_roundtrips_maximum_byte_content() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file.bin"), vec![255; 4096]).unwrap();
+        let service = WorkspaceSnapshot::new(
+            root.path(),
+            WorkspaceSnapshotConfig {
+                enabled: true,
+                max_file_bytes: 4096,
+                max_total_bytes: 4096,
+                ..Default::default()
+            },
+        );
+        let entries = service
+            .capture_paths(root.path(), &["file.bin".into()], None)
+            .unwrap();
+        let checkpoint = WorkspaceCheckpoint {
+            schema_version: SCHEMA_VERSION,
+            id: "fixture".into(),
+            workspace: root.path().display().to_string(),
+            workspace_identity: "fixture".into(),
+            entries,
+            transaction_id: None,
+            label: None,
+            created_at_ms: 1,
+        };
+        service.save_record(root.path(), &checkpoint).unwrap();
+        let loaded = service.load_record(root.path(), "fixture").unwrap();
+        assert_eq!(
+            loaded.entries[0].bytes.as_deref(),
+            Some(vec![255; 4096].as_slice())
+        );
+    }
+
+    #[test]
+    fn regression_content_ownership_does_not_own_newer_permission_modes() {
+        let expected = SnapshotEntry {
+            path: "file".into(),
+            kind: SnapshotEntryKind::File,
+            hash: Some("before".into()),
+            bytes: Some(vec![1]),
+            mode: Some(0o644),
+            size: 1,
+        };
+        let mut actual = expected.clone();
+        actual.hash = Some("after".into());
+        actual.mode = Some(0o600);
+        let transaction = serde_json::from_value(json!({
+            "id": "fixture", "owner": TransactionOwner::default(), "workspace": ".",
+            "workspace_identity": "fixture", "base_revision": null,
+            "affected_files": ["file"], "before_hashes": {"file":"before"},
+            "proposed_hashes": {"file":"after"}, "applied_hashes": {"file":"after"},
+            "state":"applied", "verification_state":"unverified", "timestamp_ms":1,
+            "sequence":1, "conflict":null
+        }))
+        .unwrap();
+        assert!(!safe_restore(&actual, &expected, Some(&transaction)));
+        actual.mode = Some(0o644);
+        assert!(safe_restore(&actual, &expected, Some(&transaction)));
+    }
+
+    #[test]
+    fn regression_snapshot_actual_reads_obey_file_and_total_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, [1]).unwrap();
+        let metadata = fs::metadata(path).unwrap();
+        for (file_limit, total_limit, used) in [(4, 10, 0), (10, 4, 0), (10, 10, 8)] {
+            let mut total = used;
+            let mut reader = std::io::Cursor::new(vec![1; 5]);
+            // Bytes grow after the metadata observation, before the reader runs.
+            let result = capture_file(
+                "file",
+                &metadata,
+                &mut reader,
+                file_limit,
+                total_limit,
+                &mut total,
+            );
+            assert!(
+                result.is_err(),
+                "file={file_limit} total={total_limit} used={used}"
+            );
+            assert_eq!(total, used);
+            assert!(reader.position() <= file_limit.min(total_limit - used) as u64 + 1);
+        }
+    }
 }
