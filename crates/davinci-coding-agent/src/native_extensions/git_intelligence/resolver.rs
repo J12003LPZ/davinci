@@ -15,6 +15,67 @@ pub struct GitResolver {
     config: GitIntelligenceConfig,
 }
 
+/// Source text of a symbol, from its 1-based inclusive line range.
+fn symbol_text(content: &str, start_line: usize, end_line: usize) -> String {
+    content
+        .lines()
+        .skip(start_line.saturating_sub(1))
+        .take(end_line.saturating_sub(start_line) + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parses `git diff -z --name-status` output into `(status, path)`. Rename and
+/// copy records carry two paths; the destination is the one that exists now.
+fn parse_name_status_z(out: &[u8]) -> Vec<(String, String)> {
+    let mut tokens = out
+        .split(|byte| *byte == 0)
+        .map(|token| String::from_utf8_lossy(token).into_owned())
+        .filter(|token| !token.is_empty());
+    let mut records = Vec::new();
+    while let Some(status) = tokens.next() {
+        let Some(first) = tokens.next() else { break };
+        let path = if status.starts_with('R') || status.starts_with('C') {
+            tokens.next().unwrap_or(first)
+        } else {
+            first
+        };
+        records.push((status, path));
+    }
+    records
+}
+
+/// Parses `git diff -z --numstat` output into `(insertions, deletions, path)`.
+/// Binary files report `-` counts (read as 0); a rename record has an empty
+/// path field followed by the old and new paths as separate NUL fields.
+fn parse_numstat_z(out: &[u8]) -> Vec<(usize, usize, String)> {
+    let tokens: Vec<String> = out
+        .split(|byte| *byte == 0)
+        .map(|token| String::from_utf8_lossy(token).into_owned())
+        .collect();
+    let mut records = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let mut fields = tokens[index].splitn(3, '\t');
+        let (Some(ins), Some(del), Some(path)) = (fields.next(), fields.next(), fields.next())
+        else {
+            index += 1;
+            continue;
+        };
+        let (path, advance) = if path.is_empty() {
+            match tokens.get(index + 2) {
+                Some(new_path) => (new_path.clone(), 3),
+                None => break,
+            }
+        } else {
+            (path.to_string(), 1)
+        };
+        records.push((ins.parse().unwrap_or(0), del.parse().unwrap_or(0), path));
+        index += advance;
+    }
+    records
+}
+
 impl GitResolver {
     pub fn new(root: &Path, config: GitIntelligenceConfig) -> Result<Self, String> {
         let git_root = runner::git_root(root)?;
@@ -162,7 +223,11 @@ impl GitResolver {
         let mut file_movements = Vec::new();
 
         let mut current_commit_info: Option<(String, String, String, String, String)> = None;
-        let mut path_at_commit = target_file.clone();
+        // `--follow` lists newest first. A rename line belongs to the commit it
+        // appears under, whose tree holds the *new* name; only older commits
+        // use the old one.
+        let mut commit_path = target_file.clone();
+        let mut older_path = target_file.clone();
 
         for line in text.lines() {
             let line = line.trim();
@@ -171,8 +236,9 @@ impl GitResolver {
             }
             if let Some(rest) = line.strip_prefix("COMMIT\0") {
                 if let Some((sha, author, email, date, summary)) = current_commit_info.take() {
-                    raw_commits.push((sha, author, email, date, summary, path_at_commit.clone()));
+                    raw_commits.push((sha, author, email, date, summary, commit_path.clone()));
                 }
+                commit_path = older_path.clone();
                 let parts: Vec<&str> = rest.split('\0').collect();
                 if parts.len() >= 5 {
                     current_commit_info = Some((
@@ -196,12 +262,12 @@ impl GitResolver {
                             commit: sha.clone(),
                         });
                     }
-                    path_at_commit = old_p;
+                    older_path = old_p;
                 }
             }
         }
         if let Some((sha, author, email, date, summary)) = current_commit_info.take() {
-            raw_commits.push((sha, author, email, date, summary, path_at_commit.clone()));
+            raw_commits.push((sha, author, email, date, summary, commit_path.clone()));
         }
 
         let history_exceeded_limit = raw_commits.len() > max_commits;
@@ -475,6 +541,7 @@ impl GitResolver {
 
         let mut diff_args = vec![
             "diff",
+            "-z",
             "--name-status",
             "--no-renames",
             &base_rev,
@@ -493,22 +560,13 @@ impl GitResolver {
         }
 
         let out = run(&self.root, &diff_args)?;
-        let text = String::from_utf8_lossy(&out);
 
         let mut changed_symbols = Vec::new();
         let supported_exts = ["ts", "tsx", "js", "jsx", "rs", "py", "go"];
 
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let status = parts[0];
-            let file_path = parts[1].replace('\\', "/");
+        for (status, file_path) in parse_name_status_z(&out) {
+            let status = status.as_str();
+            let file_path = file_path.replace('\\', "/");
 
             let ext = Path::new(&file_path)
                 .extension()
@@ -580,6 +638,15 @@ impl GitResolver {
                     if base_sym.range.start_line != head_sym.range.start_line
                         || base_sym.range.end_line != head_sym.range.end_line
                         || base_sym.signature != head_sym.signature
+                        || symbol_text(
+                            &base_content,
+                            base_sym.range.start_line,
+                            base_sym.range.end_line,
+                        ) != symbol_text(
+                            &head_content,
+                            head_sym.range.start_line,
+                            head_sym.range.end_line,
+                        )
                     {
                         changed_symbols.push(ChangedSymbol {
                             name: head_sym.name.clone(),
@@ -661,24 +728,21 @@ impl GitResolver {
         };
 
         // Diff stats
-        let out = run(&self.root, &["diff", "--numstat", &base_sha, &head_sha])?;
-        let text = String::from_utf8_lossy(&out);
+        let out = run(
+            &self.root,
+            &["diff", "-z", "--numstat", &base_sha, &head_sha],
+        )?;
 
         let mut files = Vec::new();
         let mut total_ins = 0usize;
         let mut total_del = 0usize;
+        // Every changed path counts; `files` is only the bounded preview.
+        let mut files_changed = 0usize;
 
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                let ins: usize = parts[0].parse().unwrap_or(0);
-                let del: usize = parts[1].parse().unwrap_or(0);
-                let path = parts[2].replace('\\', "/");
-
+        for (ins, del, path) in parse_numstat_z(&out) {
+            {
+                let path = path.replace('\\', "/");
+                files_changed += 1;
                 total_ins += ins;
                 total_del += del;
 
@@ -708,7 +772,6 @@ impl GitResolver {
             }
         }
 
-        let files_changed = files.len();
         Ok(BranchDiffResult {
             base: base_sha,
             head: head_sha,
@@ -768,6 +831,9 @@ impl GitResolver {
         let mut current_author = String::new();
         let mut current_date = String::new();
         let mut current_line_num = start_line;
+        // Porcelain prints author fields once per commit; later hunks of the
+        // same commit omit them.
+        let mut commit_meta: HashMap<String, (String, String)> = HashMap::new();
 
         for raw_line in text.lines() {
             if let Some(content) = raw_line.strip_prefix('\t') {
@@ -788,10 +854,16 @@ impl GitResolver {
                 let parts: Vec<&str> = raw_line.split_whitespace().collect();
                 if parts.len() >= 4 && (parts[0].len() == 40 || parts[0].len() == 64) {
                     current_sha = parts[0].to_string();
+                    if let Some((author, date)) = commit_meta.get(&current_sha) {
+                        current_author = author.clone();
+                        current_date = date.clone();
+                    }
                 } else if let Some(author) = raw_line.strip_prefix("author ") {
                     current_author = author.trim().to_string();
+                    commit_meta.entry(current_sha.clone()).or_default().0 = current_author.clone();
                 } else if let Some(time) = raw_line.strip_prefix("author-time ") {
                     current_date = time.trim().to_string();
+                    commit_meta.entry(current_sha.clone()).or_default().1 = current_date.clone();
                 }
             }
         }
@@ -854,34 +926,43 @@ impl GitResolver {
         let parents: Vec<String> = parents_str.split_whitespace().map(str::to_string).collect();
 
         // Diff stats
-        let diff_out = run(
-            &self.root,
-            &[
-                "diff-tree",
-                "--root",
-                "--no-commit-id",
-                "--numstat",
-                "-r",
-                &sha,
-            ],
-        )?;
-        let diff_text = String::from_utf8_lossy(&diff_out);
+        // Plain `diff-tree <merge>` prints nothing, so compare against the
+        // first parent explicitly; a root commit is compared with nothing.
+        let diff_out = match parents.first() {
+            Some(parent) => run(
+                &self.root,
+                &[
+                    "diff-tree",
+                    "-z",
+                    "--no-commit-id",
+                    "--numstat",
+                    "-r",
+                    parent,
+                    &sha,
+                ],
+            )?,
+            None => run(
+                &self.root,
+                &[
+                    "diff-tree",
+                    "-z",
+                    "--root",
+                    "--no-commit-id",
+                    "--numstat",
+                    "-r",
+                    &sha,
+                ],
+            )?,
+        };
 
         let mut files_changed = Vec::new();
         let mut total_ins = 0usize;
         let mut total_del = 0usize;
 
-        for line in diff_text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                if let Ok(i) = parts[0].parse::<usize>() {
-                    total_ins += i;
-                }
-                if let Ok(d) = parts[1].parse::<usize>() {
-                    total_del += d;
-                }
-                files_changed.push(parts[2].replace('\\', "/"));
-            }
+        for (ins, del, path) in parse_numstat_z(&diff_out) {
+            total_ins += ins;
+            total_del += del;
+            files_changed.push(path.replace('\\', "/"));
         }
 
         // Modified symbols across changed files
