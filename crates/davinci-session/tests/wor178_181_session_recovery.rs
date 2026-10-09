@@ -106,7 +106,9 @@ fn unsupported_version_header_with_nested_role_is_not_migrated() {
             "cwd": "/w", "metadata": metadata,
         });
         let (_directory, path) = write_first_line(&header.to_string());
-        let err = JsonlSession::open(&path).err().expect("must fail closed");
+        let Err(err) = JsonlSession::open(&path) else {
+            panic!("must fail closed");
+        };
         assert!(
             err.to_string().contains("unsupported session version"),
             "{err}"

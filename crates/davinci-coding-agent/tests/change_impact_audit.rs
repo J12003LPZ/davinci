@@ -8,7 +8,6 @@ use davinci_coding_agent::native_extensions::{
     package_intelligence::PackageIntelligence,
     repo_intelligence::RepoIntelligence,
     test_impact::TestImpact,
-    NativeExtensionHost,
 };
 use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
