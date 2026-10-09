@@ -2830,13 +2830,14 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let arguments = call
-                .pointer("/function/arguments")
-                .and_then(|value| match value {
-                    Value::String(raw) => serde_json::from_str(raw).ok(),
-                    other => Some(other.clone()),
-                })
-                .unwrap_or(Value::Object(Default::default()));
+            // Same rule as the streaming decoders: malformed or non-object
+            // arguments keep the invalid-arguments sentinel and never execute.
+            let arguments = match call.pointer("/function/arguments") {
+                None | Some(Value::Null) => Value::Object(Default::default()),
+                Some(Value::String(raw)) => crate::final_tool_arguments(raw),
+                Some(object @ Value::Object(_)) => object.clone(),
+                Some(other) => crate::invalid_arguments(&other.to_string()),
+            };
             content.push(ContentBlock::ToolCall {
                 id,
                 name,
@@ -3802,6 +3803,22 @@ mod tests {
         );
         let done = complete_from_events(&events).unwrap();
         assert_eq!(done.usage.unwrap().input, 3);
+    }
+
+    #[test]
+    fn non_streaming_malformed_tool_arguments_keep_the_sentinel() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.provider == "openai")
+            .expect("openai model");
+        let message = parse_provider_response(
+            &model,
+            r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+        );
+        let Some(ContentBlock::ToolCall { arguments, .. }) = message.content.first() else {
+            panic!("expected a tool call: {message:?}");
+        };
+        assert_eq!(arguments, &crate::invalid_arguments("{\"path\":"));
     }
 
     #[test]

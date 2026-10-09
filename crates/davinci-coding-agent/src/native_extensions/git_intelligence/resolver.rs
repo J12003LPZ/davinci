@@ -535,13 +535,8 @@ impl GitResolver {
             let base_file = parse_source(&file_path, &base_content).ok();
             let head_file = parse_source(&file_path, &head_content).ok();
 
-            let base_symbols: HashMap<String, _> = base_file
-                .map(|f| f.symbols.into_iter().map(|s| (s.name.clone(), s)).collect())
-                .unwrap_or_default();
-
-            let head_symbols: HashMap<String, _> = head_file
-                .map(|f| f.symbols.into_iter().map(|s| (s.name.clone(), s)).collect())
-                .unwrap_or_default();
+            let base_symbols = scoped_symbols(base_file.map(|f| f.symbols).unwrap_or_default());
+            let head_symbols = scoped_symbols(head_file.map(|f| f.symbols).unwrap_or_default());
 
             // Added
             for (name, head_sym) in &head_symbols {
@@ -625,12 +620,15 @@ impl GitResolver {
         max_files: Option<usize>,
     ) -> Result<BranchDiffResult, String> {
         let max_files = max_files.unwrap_or(50).min(100);
-        let base_name = base.unwrap_or("main");
         let head_name = head.unwrap_or("HEAD");
 
-        let base_sha = runner::resolve_commit(&self.root, base_name)
-            .or_else(|_| runner::resolve_commit(&self.root, "master"))
-            .unwrap_or_else(|_| base_name.to_string());
+        // Only resolved commit IDs reach git: an explicit base must resolve,
+        // and the master fallback applies only to the default base.
+        let base_sha = match base {
+            Some(base) => runner::resolve_commit(&self.root, base)?,
+            None => runner::resolve_commit(&self.root, "main")
+                .or_else(|_| runner::resolve_commit(&self.root, "master"))?,
+        };
         let head_sha = runner::resolve_commit(&self.root, head_name)?;
 
         // Compute merge-base if possible
@@ -1057,4 +1055,30 @@ impl GitResolver {
             zero_mutation_guaranteed: true,
         })
     }
+}
+
+type ScopedSymbolKey = (String, String, usize);
+
+/// Key symbols by qualified name, kind and occurrence, so `A.run` and
+/// `B.run` (or two overloads) are compared with their own counterparts.
+fn scoped_symbols(
+    symbols: Vec<crate::native_extensions::repo_intelligence::Symbol>,
+) -> BTreeMap<ScopedSymbolKey, crate::native_extensions::repo_intelligence::Symbol> {
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    symbols
+        .into_iter()
+        .map(|symbol| {
+            let scope = if symbol.qualified_name.is_empty() {
+                symbol.name.clone()
+            } else {
+                symbol.qualified_name.clone()
+            };
+            let ordinal = seen
+                .entry((scope.clone(), symbol.kind.clone()))
+                .or_default();
+            let key = (scope, symbol.kind.clone(), *ordinal);
+            *ordinal += 1;
+            (key, symbol)
+        })
+        .collect()
 }

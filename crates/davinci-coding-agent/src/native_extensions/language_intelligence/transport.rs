@@ -238,11 +238,13 @@ impl Transport {
         budget.check()?;
         self.send_until(
             json!({"jsonrpc":"2.0", "method":method, "params":params}),
-            budget.deadline,
+            budget,
         )
     }
 
-    fn send_until(&self, mut value: Value, deadline: Instant) -> Result<()> {
+    /// Wait for room in the write queue, rechecking the caller's budget
+    /// (cancellation as well as deadline) on every backpressure retry.
+    fn send_until(&self, mut value: Value, budget: &RequestBudget) -> Result<()> {
         if serde_json::to_vec(&value)
             .map_err(|_| protocol_error())?
             .len()
@@ -256,11 +258,15 @@ impl Transport {
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Full(returned)) => {
                     value = returned;
-                    if Instant::now() >= deadline {
-                        return Err(IntelligenceError::new(
-                            "request_timeout",
-                            "Language-server write queue stayed full until the deadline",
-                        ));
+                    if let Err(error) = budget.check() {
+                        return Err(if error.code == "request_timeout" {
+                            IntelligenceError::new(
+                                "request_timeout",
+                                "Language-server write queue stayed full until the deadline",
+                            )
+                        } else {
+                            error
+                        });
                     }
                     thread::sleep(Duration::from_millis(2));
                 }
@@ -300,7 +306,7 @@ impl Transport {
         };
         if let Err(error) = self.send_until(
             json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
-            budget.deadline,
+            budget,
         ) {
             self.shared
                 .state
@@ -961,6 +967,38 @@ mod tests {
             state.diagnostics[&diagnostic_key("file:///fixture.ts")].version,
             Some(1)
         );
+    }
+
+    #[test]
+    fn cancellation_interrupts_write_queue_backpressure() {
+        let transport = fixture("stop-reading");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let budget = RequestBudget {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancelled: Some(cancelled.clone()),
+        };
+        // Large notifications fill the OS pipe and then the 32-entry queue.
+        let filler = json!({"text": "x".repeat(256 * 1024)});
+        let flag = cancelled.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        let error = loop {
+            match transport.notify_with_budget("fixture/fill", filler.clone(), &budget) {
+                Ok(()) => continue,
+                Err(error) => break error,
+            }
+        };
+        canceller.join().unwrap();
+        assert_eq!(
+            error.code,
+            "request_cancelled",
+            "{:?}",
+            String::from_utf8_lossy(&transport.shared.state.lock().unwrap().stderr)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
