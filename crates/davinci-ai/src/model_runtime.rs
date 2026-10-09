@@ -639,20 +639,12 @@ mod tests {
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".into(),
             "/creds".into(),
         );
-        assert_eq!(
-            check_auth("amazon-bedrock", &config, &storage, &ecs)
-                .unwrap()
-                .source,
-            "ECS task role"
-        );
+        // Role-based sources need an STS exchange this build does not do,
+        // so they must not make Bedrock look usable.
+        assert!(check_auth("amazon-bedrock", &config, &storage, &ecs).is_none());
         let mut web = HashMap::new();
         web.insert("AWS_WEB_IDENTITY_TOKEN_FILE".into(), "/token".into());
-        assert_eq!(
-            check_auth("amazon-bedrock", &config, &storage, &web)
-                .unwrap()
-                .source,
-            "web identity token"
-        );
+        assert!(check_auth("amazon-bedrock", &config, &storage, &web).is_none());
     }
 
     #[test]
@@ -664,7 +656,11 @@ mod tests {
         project_only.insert("GOOGLE_CLOUD_PROJECT".into(), "demo".into());
         assert!(check_auth("google-vertex", &config, &storage, &project_only).is_none());
         let creds = dir.path().join("adc.json");
-        std::fs::write(&creds, "{}").unwrap();
+        std::fs::write(
+            &creds,
+            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#,
+        )
+        .unwrap();
         let mut env = HashMap::new();
         env.insert(
             "GOOGLE_APPLICATION_CREDENTIALS".into(),

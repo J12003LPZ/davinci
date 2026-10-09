@@ -16,6 +16,7 @@ fn parse_classic(content: &str) -> Result<LockfileData, String> {
         lockfile_version: Some("1".to_string()),
         packages: BTreeMap::new(),
         workspace_packages: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut current_names = Vec::new();
@@ -33,15 +34,15 @@ fn parse_classic(content: &str) -> Result<LockfileData, String> {
                  deps: BTreeMap<String, String>| {
         if !ver.is_empty() {
             for name in names.drain(..) {
-                data.packages
-                    .entry(name.clone())
-                    .or_insert_with(|| LockedPackage {
-                        name,
-                        version: ver.to_string(),
-                        resolved: res.clone(),
-                        integrity: integ.clone(),
-                        dependencies: deps.clone(),
-                    });
+                let locked = LockedPackage {
+                    name: name.clone(),
+                    version: ver.to_string(),
+                    resolved: res.clone(),
+                    integrity: integ.clone(),
+                    dependencies: deps.clone(),
+                };
+                data.record_resolution(&locked);
+                data.packages.entry(name).or_insert(locked);
             }
         }
         names.clear();
@@ -135,6 +136,7 @@ fn parse_berry(content: &str) -> Result<LockfileData, String> {
         lockfile_version: Some("berry".to_string()),
         packages: BTreeMap::new(),
         workspace_packages: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut current_name = String::new();
@@ -151,15 +153,15 @@ fn parse_berry(content: &str) -> Result<LockfileData, String> {
                  integ: Option<String>,
                  deps: BTreeMap<String, String>| {
         if !name.is_empty() && !ver.is_empty() {
-            data.packages
-                .entry(name.to_string())
-                .or_insert_with(|| LockedPackage {
-                    name: name.to_string(),
-                    version: ver.to_string(),
-                    resolved: res,
-                    integrity: integ,
-                    dependencies: deps,
-                });
+            let locked = LockedPackage {
+                name: name.to_string(),
+                version: ver.to_string(),
+                resolved: res,
+                integrity: integ,
+                dependencies: deps,
+            };
+            data.record_resolution(&locked);
+            data.packages.entry(name.to_string()).or_insert(locked);
         }
     };
 

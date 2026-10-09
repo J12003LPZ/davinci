@@ -89,6 +89,62 @@ fn checkpoint_and_diff_are_bounded_and_do_not_expose_file_bytes() {
 }
 
 #[test]
+fn an_interrupted_restore_journal_fails_closed_until_it_is_finished() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    write(root.path(), "src/a.rs", "a");
+    write(root.path(), "src/b.rs", "b");
+    let mut host = host(root.path(), state.path());
+    let checkpoint = call(
+        &mut host,
+        root.path(),
+        "workspace_checkpoint",
+        json!({"paths":["src/a.rs","src/b.rs"]}),
+    );
+    let id = checkpoint["checkpoint"]["id"].as_str().unwrap().to_string();
+    // A restore that stopped between files leaves its journal behind.
+    std::fs::write(
+        root.path().join(".davinci-workspace-restore.json"),
+        json!({
+            "schema_version": 1,
+            "checkpoint_id": id,
+            "paths": ["src/a.rs", "src/b.rs"],
+            "started_at_ms": 1
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let error = host
+        .execute_tool(
+            root.path(),
+            "workspace_checkpoint",
+            &json!({"path":"src/a.rs","label":"after"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("interrupted workspace_restore"), "{error}");
+
+    let diff = call(
+        &mut host,
+        root.path(),
+        "workspace_diff",
+        json!({"checkpointId":id}),
+    );
+    assert_eq!(diff["pendingRestore"]["checkpointId"], id.as_str());
+
+    // Re-running the same restore is allowed (nothing differs, so it is a no-op).
+    let restore = call(
+        &mut host,
+        root.path(),
+        "workspace_restore",
+        json!({"checkpointId":id}),
+    );
+    assert_eq!(restore["complete"], true);
+    assert!(!root.path().join(".davinci-workspace-restore.json").exists());
+}
+
+#[test]
 fn context_workspace_uses_its_own_snapshot_store_and_journal() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();

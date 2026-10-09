@@ -120,6 +120,16 @@ pub fn word_wrap_line(
             wrap_opp_index = -1;
         }
 
+        if g_width > max_width && grapheme_segments(grapheme).len() <= 1 {
+            // A single grapheme wider than the viewport cannot be split; it
+            // occupies a chunk of its own (recursing on it would never end).
+            chunk_start = char_index;
+            current_width = g_width;
+            wrap_opp_index = -1;
+            i += 1;
+            continue;
+        }
+
         if g_width > max_width {
             let sub = word_wrap_line(grapheme, max_width, None);
             for sc in sub.iter().take(sub.len().saturating_sub(1)) {
@@ -186,6 +196,15 @@ fn is_cjk_break(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_grapheme_wider_than_the_viewport_does_not_recurse_forever() {
+        for text in ["界", "✅", "ab界cd", "界界"] {
+            let chunks = word_wrap_line(text, 1, None);
+            let joined: String = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+            assert_eq!(joined, text, "{text}");
+        }
+    }
 
     #[test]
     fn wraps_at_word_boundaries_and_breaks_long_words() {

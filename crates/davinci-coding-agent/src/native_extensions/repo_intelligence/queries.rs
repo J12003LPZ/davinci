@@ -194,6 +194,15 @@ pub(super) fn related(
 
 pub(super) fn repo_map(index: &RepoIndex, scope: &str, depth: usize, limit: usize) -> Value {
     let edges = graph::dependencies(index);
+    // One pass over the edges instead of one per file (O(F + E)). A self
+    // edge counts once, as the per-file filter did.
+    let mut degree = std::collections::HashMap::<&str, usize>::new();
+    for edge in &edges {
+        *degree.entry(edge.from.as_str()).or_default() += 1;
+        if let Some(to) = edge.to.as_deref().filter(|to| *to != edge.from) {
+            *degree.entry(to).or_default() += 1;
+        }
+    }
     let mut languages = BTreeMap::<String, usize>::new();
     let mut modules = BTreeMap::<String, usize>::new();
     let mut ranked = Vec::new();
@@ -207,10 +216,7 @@ pub(super) fn repo_map(index: &RepoIndex, scope: &str, depth: usize, limit: usiz
             .collect::<Vec<_>>()
             .join("/");
         *modules.entry(module).or_default() += 1;
-        let connections = edges
-            .iter()
-            .filter(|e| e.from == file.path || e.to.as_ref() == Some(&file.path))
-            .count();
+        let connections = degree.get(file.path.as_str()).copied().unwrap_or(0);
         ranked.push((connections, file));
     }
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.path.cmp(&b.1.path)));

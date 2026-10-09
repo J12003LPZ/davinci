@@ -200,6 +200,7 @@ impl JsonlSessionRepo {
         })?;
         Ok(JsonlStoredSession {
             persistence_error: None,
+            durable_len: encode_header(&header).len() as u64,
             session: Session::with_metadata(id, created_at, options.parent_session_id),
             info: JsonlSessionInfo::from_header(&header, &path),
         })
@@ -393,11 +394,15 @@ pub struct JsonlStoredSession {
     pub session: Session,
     pub info: JsonlSessionInfo,
     persistence_error: Option<String>,
+    /// File length this handle last observed as its own durable tail. Appends
+    /// are fenced on it, so a stale handle (another writer appended since it
+    /// loaded) is rejected instead of reusing a sequence number.
+    durable_len: u64,
 }
 
 impl JsonlStoredSession {
     pub fn load(path: &Path) -> Result<Self, SessionError> {
-        let content = fs::read_to_string(path).map_err(|err| {
+        let (content, torn_utf8_tail) = crate::read_session_text(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 SessionError::not_found(format!("Session not found: {}", path.display()))
             } else {
@@ -439,6 +444,7 @@ impl JsonlStoredSession {
                     })?;
                     return Ok(Self {
                         persistence_error: None,
+                        durable_len: valid_prefix.len() as u64,
                         session,
                         info: JsonlSessionInfo::from_header(&header, path),
                     });
@@ -446,7 +452,17 @@ impl JsonlStoredSession {
                 Err(err) => return Err(invalid_file(path, index + 1, err)),
             }
         }
-        if !content.ends_with('\n') {
+        if torn_utf8_tail {
+            // `content` is the complete-record prefix; drop the torn bytes.
+            publish_atomically(path, |temp_path| {
+                fs::write(temp_path, &content).map_err(|write_err| {
+                    SessionError::storage(format!(
+                        "Failed to stage torn-tail repair {}: {write_err}",
+                        path.display()
+                    ))
+                })
+            })?;
+        } else if !content.ends_with('\n') {
             let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
                 SessionError::storage(format!(
                     "Failed to repair unterminated session tail {}: {err}",
@@ -464,6 +480,7 @@ impl JsonlStoredSession {
         }
         Ok(Self {
             persistence_error: None,
+            durable_len: content.len() as u64 + u64::from(!content.ends_with('\n')),
             session,
             info: JsonlSessionInfo::from_header(&header, path),
         })
@@ -631,6 +648,34 @@ impl JsonlStoredSession {
     }
 
     fn append_mutation(&mut self, mutation: SessionMutation) -> Result<(), SessionError> {
+        let mut lock_path = self.info.path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let _lock = davinci_sys::lock::ExclusiveFileLock::try_acquire(Path::new(&lock_path))
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    SessionError::storage(format!(
+                        "Session {} is being written by another handle; reopen it",
+                        self.info.path.display()
+                    ))
+                } else {
+                    SessionError::storage(format!("Unable to lock session: {err}"))
+                }
+            })?;
+        let current_len = fs::metadata(&self.info.path)
+            .map_err(|err| {
+                SessionError::storage(format!(
+                    "Failed to append session {}: {err}",
+                    self.info.path.display()
+                ))
+            })?
+            .len();
+        if current_len != self.durable_len {
+            return Err(SessionError::storage(format!(
+                "Session {} changed since this handle loaded it; reopen it before writing",
+                self.info.path.display()
+            )));
+        }
+        let line = encode_mutation(&mutation);
         let mut file = OpenOptions::new()
             .append(true)
             .open(&self.info.path)
@@ -640,7 +685,7 @@ impl JsonlStoredSession {
                     self.info.path.display()
                 ))
             })?;
-        file.write_all(encode_mutation(&mutation).as_bytes())
+        file.write_all(line.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(|err| {
                 SessionError::storage(format!(
@@ -648,6 +693,7 @@ impl JsonlStoredSession {
                     self.info.path.display()
                 ))
             })?;
+        self.durable_len += line.len() as u64;
         self.info.modified_at = now_ms();
         Ok(())
     }

@@ -37,7 +37,10 @@ pub fn parse_turbo_json(root: &Path) -> Option<TurboConfig> {
 }
 
 pub fn extract_turbo_targets(config: &TurboConfig, package_name: &str) -> Vec<BuildTarget> {
-    let mut targets = Vec::new();
+    // One entry per task name: a `pkg#task` override replaces the generic task
+    // of the same name for that package.
+    let mut resolved: BTreeMap<String, BuildTarget> = BTreeMap::new();
+    let mut overrides: BTreeMap<String, BuildTarget> = BTreeMap::new();
     let tasks = if !config.tasks.is_empty() {
         &config.tasks
     } else {
@@ -49,33 +52,40 @@ pub fn extract_turbo_targets(config: &TurboConfig, package_name: &str) -> Vec<Bu
         if task_name.contains('#') {
             if let Some((pkg, t)) = task_name.split_once('#') {
                 if pkg == package_name {
-                    targets.push(BuildTarget {
-                        target: t.to_string(),
-                        package: package_name.to_string(),
-                        runner: "turbo".to_string(),
-                        executor: None,
-                        command: Some(format!("turbo run {t}")),
-                        inputs: task.inputs.clone(),
-                        outputs: task.outputs.clone(),
-                        depends_on: task.depends_on.clone(),
-                        cacheable: task.cache,
-                    });
+                    overrides.insert(
+                        t.to_string(),
+                        BuildTarget {
+                            target: t.to_string(),
+                            package: package_name.to_string(),
+                            runner: "turbo".to_string(),
+                            executor: None,
+                            command: Some(format!("turbo run {t}")),
+                            inputs: task.inputs.clone(),
+                            outputs: task.outputs.clone(),
+                            depends_on: task.depends_on.clone(),
+                            cacheable: task.cache,
+                        },
+                    );
                 }
             }
         } else {
-            targets.push(BuildTarget {
-                target: task_name.clone(),
-                package: package_name.to_string(),
-                runner: "turbo".to_string(),
-                executor: None,
-                command: Some(format!("turbo run {task_name}")),
-                inputs: task.inputs.clone(),
-                outputs: task.outputs.clone(),
-                depends_on: task.depends_on.clone(),
-                cacheable: task.cache,
-            });
+            resolved.insert(
+                task_name.clone(),
+                BuildTarget {
+                    target: task_name.clone(),
+                    package: package_name.to_string(),
+                    runner: "turbo".to_string(),
+                    executor: None,
+                    command: Some(format!("turbo run {task_name}")),
+                    inputs: task.inputs.clone(),
+                    outputs: task.outputs.clone(),
+                    depends_on: task.depends_on.clone(),
+                    cacheable: task.cache,
+                },
+            );
         }
     }
 
-    targets
+    resolved.extend(overrides);
+    resolved.into_values().collect()
 }

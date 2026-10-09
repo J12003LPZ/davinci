@@ -40,10 +40,21 @@ impl Agent {
         self.staged_codemode.is_some()
     }
 
-    /// Turn Codemode off: later turns no longer register or run it.
+    /// Turn Codemode off: later turns no longer register, advertise, or run it.
     pub fn clear_codemode(&mut self) {
         self.staged_codemode = None;
         self.codemode = None;
+        if let Some(runtime) = &self.runtime {
+            runtime.capability_registry.unregister("codemode");
+        }
+        self.tools.retain(|name| name != "codemode");
+        self.tool_registry.retain(|name| name != "codemode");
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .activate_authorized("codemode", false);
+        self.sync_tool_authorization();
     }
 
     /// Register a staged host on the current runtime. Call after each new
@@ -57,6 +68,9 @@ impl Agent {
             .as_ref()
             .is_some_and(|runtime| runtime.capability_registry.get("codemode").is_some())
         {
+            // The capability survives on this runtime; the binding must still
+            // point at the staged host, not a cleared or replaced one.
+            self.bind_codemode(binding.host);
             return Ok(());
         }
         self.enable_read_only_codemode(binding.host)
@@ -104,6 +118,11 @@ impl Agent {
         capability.declared_effects.clear();
         capability.replay_policy = ReplayPolicy::NeverAutoReplay;
         runtime.capability_registry.register(capability);
+        self.bind_codemode(host);
+        Ok(())
+    }
+
+    fn bind_codemode(&mut self, host: Arc<dyn CodeModeHost>) {
         self.codemode = Some(CodeModeBinding { host });
         self.apply_extension_tools(&["codemode".into()]);
         let authorized = self
@@ -117,7 +136,6 @@ impl Agent {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .activate_authorized("codemode", authorized);
-        Ok(())
     }
 
     pub(crate) fn run_codemode(

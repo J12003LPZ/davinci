@@ -10,7 +10,12 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 pub const UNSUPPORTED_PROXY_PROTOCOL_MESSAGE: &str =
-    "Unsupported proxy protocol. SOCKS and PAC proxy URLs are not supported; use an HTTP or HTTPS proxy URL.";
+    "Unsupported proxy protocol. SOCKS and PAC proxy URLs are not supported; use an HTTP proxy URL.";
+
+/// The CONNECT tunnel is opened over plain TCP. An `https://` proxy expects
+/// TLS first, and its credentials would otherwise cross the network in clear.
+pub const UNSUPPORTED_TLS_PROXY_MESSAGE: &str =
+    "HTTPS (TLS) proxy URLs are not supported; use an http:// proxy URL. The tunnel to the target is still TLS-encrypted.";
 
 const DEFAULT_PROXY_PORTS: &[(&str, u16)] = &[
     ("ftp", 21),
@@ -121,7 +126,10 @@ pub fn resolve_http_proxy_url_for_target(
     }
     let proxy_url =
         Url::parse(&proxy).map_err(|error| format!("Invalid proxy URL {proxy:?}: {error}"))?;
-    if proxy_url.scheme() != "http" && proxy_url.scheme() != "https" {
+    if proxy_url.scheme() == "https" {
+        return Err(UNSUPPORTED_TLS_PROXY_MESSAGE.into());
+    }
+    if proxy_url.scheme() != "http" {
         return Err(format!(
             "{UNSUPPORTED_PROXY_PROTOCOL_MESSAGE} Got {}:",
             proxy_url.scheme()
@@ -310,6 +318,15 @@ mod tests {
             .map(|url| url.to_string()),
             Some("http://scoped-proxy.example:8080/".into())
         );
+    }
+
+    #[test]
+    fn rejects_https_proxy_urls_instead_of_plaintext_connect() {
+        let scoped = env(&[("HTTPS_PROXY", "https://user:secret@proxy.example:8443")]);
+        let error = resolve_http_proxy_url_for_target("https://chatgpt.com/backend", Some(&scoped))
+            .unwrap_err();
+        assert_eq!(error, UNSUPPORTED_TLS_PROXY_MESSAGE);
+        assert!(!error.contains("secret"));
     }
 
     #[test]

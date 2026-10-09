@@ -99,6 +99,12 @@ function handle(message) {
     return;
   }
   if (mode === 'timeout') return;
+  if (mode === 'stop-reading') {
+    // Stay alive without reading, so the client's write queue backs up.
+    process.stdin.pause();
+    setInterval(() => {}, 1000);
+    return;
+  }
   if (message.method === 'shutdown') {
     send({ id: message.id, result: null });
     return;

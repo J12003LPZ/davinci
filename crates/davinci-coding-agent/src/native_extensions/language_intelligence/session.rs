@@ -175,16 +175,20 @@ impl Session {
         for path in paths {
             budget.check()?;
             if !path.exists() && Some(path.as_path()) != source {
-                if let Some(old) = self.documents.remove(&path) {
+                // Keep the document tracked until didClose is delivered, so a
+                // failed send is retried by the next synchronization instead
+                // of leaving the server with a stale open document.
+                if let Some(uri) = self.documents.get(&path).map(|old| old.uri.clone()) {
                     self.transport.notify_with_budget(
                         "textDocument/didClose",
-                        json!({"textDocument":{"uri":old.uri}}),
+                        json!({"textDocument":{"uri":uri}}),
                         budget,
                     )?;
-                    self.transport.unwatch_document(&old.uri);
-                    self.diagnostic_floor.remove(&old.uri);
-                    self.diagnostic_result_ids.remove(&old.uri);
-                    self.diagnostic_pull_items.remove(&old.uri);
+                    self.documents.remove(&path);
+                    self.transport.unwatch_document(&uri);
+                    self.diagnostic_floor.remove(&uri);
+                    self.diagnostic_result_ids.remove(&uri);
+                    self.diagnostic_pull_items.remove(&uri);
                     changed = true;
                 }
                 continue;
@@ -317,13 +321,13 @@ impl Session {
             }
         }
         if method == "textDocument/diagnostic" {
-            if self.supports("diagnosticProvider") || self.transport.has_dynamic_diagnostics() {
-                let path = source.ok_or_else(|| {
-                    IntelligenceError::new(
-                        "invalid_source_path",
-                        "Diagnostics require a source file",
-                    )
-                })?;
+            let path = source.ok_or_else(|| {
+                IntelligenceError::new("invalid_source_path", "Diagnostics require a source file")
+            })?;
+            let covered = adapter
+                .language_id(path)
+                .is_some_and(|language| self.transport.has_dynamic_diagnostics(language));
+            if self.supports("diagnosticProvider") || covered {
                 let document = &self.documents[path];
                 if let Some(previous) = self.diagnostic_result_ids.get(&document.uri) {
                     params["previousResultId"] = json!(previous);
@@ -532,6 +536,39 @@ mod tests {
         assert_eq!(session.documents[&a].version, 2);
         assert_eq!(session.documents.len(), 2);
         assert!(session.transport.is_alive());
+    }
+
+    #[test]
+    fn a_failed_did_close_keeps_the_deleted_document_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let a = root.join("a.ts");
+        std::fs::write(&a, "first").unwrap();
+        let mut session = Session::start(fixture(&root, "session"), deadline()).unwrap();
+        session
+            .execute(
+                "textDocument/hover",
+                "hoverProvider",
+                Some(&a),
+                json!({"position":{"line":0,"character":0}}),
+                &TypeScriptAdapter,
+                deadline(),
+            )
+            .unwrap();
+        assert!(session.documents.contains_key(&a));
+
+        std::fs::remove_file(&a).unwrap();
+        session.transport.kill_for_tests();
+        // The writer thread only learns the pipe is gone when it writes.
+        let _ = session.transport.notify("$/probe", json!({}));
+        std::thread::sleep(Duration::from_millis(300));
+        let budget = RequestBudget::from_timeout(Duration::from_secs(3));
+        assert!(session
+            .synchronize(None, &TypeScriptAdapter, &budget)
+            .is_err());
+        // didClose never reached the server, so the document must still be
+        // tracked for a later synchronization to close it.
+        assert!(session.documents.contains_key(&a));
     }
 
     #[test]

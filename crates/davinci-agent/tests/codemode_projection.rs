@@ -79,3 +79,30 @@ fn tool_errors_and_oversized_structured_data_fail_explicitly() {
     assert_eq!(error.code, "INCOMPLETE_DATA");
     assert!(error.message.contains("no authorized artifact"));
 }
+
+#[test]
+fn truncated_and_image_reads_are_not_complete() {
+    let with = |details| ToolResult {
+        content: "partial".into(),
+        is_error: false,
+        details: Some(details),
+    };
+    let truncated = with(json!({"path":"a","truncation":{"truncated":true}}));
+    assert!(
+        !project_script_result(truncated, None, "op".into(), 1048576)
+            .unwrap()
+            .complete
+    );
+    let image = with(json!({"path":"a.png","image":{"type":"image","data":"AA=="}}));
+    assert!(
+        !project_script_result(image, None, "op".into(), 1048576)
+            .unwrap()
+            .complete
+    );
+    let whole = with(json!({"path":"a","truncation":{"truncated":false}}));
+    assert!(
+        project_script_result(whole, None, "op".into(), 1048576)
+            .unwrap()
+            .complete
+    );
+}

@@ -24,8 +24,7 @@ pub(super) struct ClientRequestState {
 #[derive(Debug, Clone)]
 struct Registration {
     method: String,
-    // Retained for diagnostics of dynamic registrations; routing uses `method`.
-    #[allow(dead_code)]
+    /// Languages from the registration's `documentSelector`; empty means all.
     selectors: BTreeSet<String>,
 }
 
@@ -149,12 +148,19 @@ impl ClientRequestState {
         }
     }
 
-    pub fn has_document_diagnostics(&self) -> bool {
+    /// Whether a dynamic `textDocument/diagnostic` registration covers a
+    /// document of `language`. A registration without language selectors
+    /// covers every document; one with selectors covers only those languages.
+    pub fn has_document_diagnostics(&self, language: &str) -> bool {
         self.registrations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|registration| registration.method == "textDocument/diagnostic")
+            .any(|registration| {
+                registration.method == "textDocument/diagnostic"
+                    && (registration.selectors.is_empty()
+                        || registration.selectors.contains(language))
+            })
     }
 
     pub fn refresh_generation(&self) -> u64 {
@@ -221,6 +227,9 @@ impl ClientRequestState {
             return Err((-32602, "Registration capacity exceeded"));
         }
         let mut state = self.registrations.lock().unwrap_or_else(|e| e.into_inner());
+        // Validate the whole batch before touching state: a rejected request
+        // must not leave its earlier entries registered.
+        let mut staged: Vec<(String, Registration)> = Vec::with_capacity(registrations.len());
         for registration in registrations {
             let id = registration
                 .get("id")
@@ -233,7 +242,7 @@ impl ClientRequestState {
             if method != "textDocument/diagnostic" {
                 return Err((-32602, "Unsupported dynamic registration"));
             }
-            if state.contains_key(id) {
+            if state.contains_key(id) || staged.iter().any(|(staged_id, _)| staged_id == id) {
                 return Err((-32602, "Duplicate registration id"));
             }
             let selectors = registration
@@ -250,14 +259,18 @@ impl ClientRequestState {
                         .collect()
                 })
                 .unwrap_or_default();
-            state.insert(
+            staged.push((
                 id.to_string(),
                 Registration {
                     method: method.into(),
                     selectors,
                 },
-            );
+            ));
         }
+        if state.len() + staged.len() > 32 {
+            return Err((-32602, "Registration capacity exceeded"));
+        }
+        state.extend(staged);
         Ok(Value::Null)
     }
 
@@ -342,6 +355,71 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(90));
         reporter.join().unwrap();
         assert_eq!(state.status()["serverStatus"]["quiescent"], true);
+    }
+
+    fn register(
+        state: &ClientRequestState,
+        registrations: Value,
+    ) -> std::result::Result<Value, (i64, &'static str)> {
+        state.handle_request(
+            "client/registerCapability",
+            &json!({ "registrations": registrations }),
+        )
+    }
+
+    #[test]
+    fn a_rejected_registration_batch_registers_nothing() {
+        let (_dir, state) = state();
+        let result = register(
+            &state,
+            json!([
+                {"id": "a", "method": "textDocument/diagnostic"},
+                {"id": "b", "method": "textDocument/hover"},
+            ]),
+        );
+        assert_eq!(result.unwrap_err().0, -32602);
+        assert_eq!(state.status()["dynamicRegistrations"], 0);
+        assert!(!state.has_document_diagnostics("typescript"));
+
+        let duplicate_in_batch = register(
+            &state,
+            json!([
+                {"id": "a", "method": "textDocument/diagnostic"},
+                {"id": "a", "method": "textDocument/diagnostic"},
+            ]),
+        );
+        assert!(duplicate_in_batch.is_err());
+        assert_eq!(state.status()["dynamicRegistrations"], 0);
+
+        register(
+            &state,
+            json!([{"id": "a", "method": "textDocument/diagnostic"}]),
+        )
+        .unwrap();
+        assert_eq!(state.status()["dynamicRegistrations"], 1);
+    }
+
+    #[test]
+    fn dynamic_diagnostics_follow_the_registered_document_selector() {
+        let (_dir, state) = state();
+        register(
+            &state,
+            json!([{
+                "id": "ts",
+                "method": "textDocument/diagnostic",
+                "registerOptions": {"documentSelector": [{"language": "typescript"}]},
+            }]),
+        )
+        .unwrap();
+        assert!(state.has_document_diagnostics("typescript"));
+        assert!(!state.has_document_diagnostics("rust"));
+
+        register(
+            &state,
+            json!([{"id": "all", "method": "textDocument/diagnostic"}]),
+        )
+        .unwrap();
+        assert!(state.has_document_diagnostics("rust"));
     }
 
     #[test]

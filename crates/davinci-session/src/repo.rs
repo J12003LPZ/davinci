@@ -401,7 +401,19 @@ impl SessionState {
         Ok(entry)
     }
 
-    pub fn apply_record(&mut self, mut record: LaneRecord) -> Result<LaneRecord, SessionError> {
+    pub fn apply_record(&mut self, record: LaneRecord) -> Result<LaneRecord, SessionError> {
+        self.apply_record_with_policy(record, true)
+    }
+
+    /// Durable replay keeps every record that is already on disk. The
+    /// single-open-operation rule belongs to append planning: a journal with
+    /// two open starts must stay loadable so `find_open_operations(.., 2)` can
+    /// report it as corrupt for recovery.
+    fn apply_record_with_policy(
+        &mut self,
+        mut record: LaneRecord,
+        enforce_single_open: bool,
+    ) -> Result<LaneRecord, SessionError> {
         if record.seq == 0 {
             record.seq = self.next_sequence();
         }
@@ -414,7 +426,7 @@ impl SessionState {
             .ok_or_else(|| SessionError::invalid_lane("Lane not found: ".to_string()))?;
         self.require_lane(&lane)?;
         self.validate_unused_id(&record.id)?;
-        if record.record_type == "operation_started" {
+        if enforce_single_open && record.record_type == "operation_started" {
             if let Some(open) = self.find_open_operations(&lane, Some(1))?.first() {
                 return Err(SessionError::storage(format!(
                     "Lane {lane} already has an open operation {}",
@@ -479,8 +491,26 @@ impl SessionState {
     }
 
     pub fn apply_lane(&mut self, lane: &str, leaf_id: Option<&str>) -> Result<(), SessionError> {
+        self.apply_lane_at(self.next_sequence(), lane, leaf_id)
+    }
+
+    fn require_next_sequence(&self, seq: u64) -> Result<(), SessionError> {
+        if seq != self.next_sequence() {
+            return Err(SessionError::invalid_entry(format!(
+                "Invalid session mutation: has non-consecutive seq {seq}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_lane_at(
+        &mut self,
+        seq: u64,
+        lane: &str,
+        leaf_id: Option<&str>,
+    ) -> Result<(), SessionError> {
+        self.require_next_sequence(seq)?;
         self.validate_target(leaf_id)?;
-        let seq = self.next_sequence();
         self.sequence = seq;
         if !self.lanes.contains_key(lane) {
             self.lane_order.push(lane.to_string());
@@ -496,13 +526,19 @@ impl SessionState {
     }
 
     pub fn apply_name(&mut self, name: Option<&str>) {
-        let seq = self.next_sequence();
+        self.apply_name_at(self.next_sequence(), name)
+            .expect("next sequence is always consecutive");
+    }
+
+    fn apply_name_at(&mut self, seq: u64, name: Option<&str>) -> Result<(), SessionError> {
+        self.require_next_sequence(seq)?;
         self.sequence = seq;
         self.name = name.map(str::to_string);
         self.log.push(LogItem::FactName {
             seq,
             name: name.map(str::to_string),
         });
+        Ok(())
     }
 
     pub fn apply_label(
@@ -510,8 +546,17 @@ impl SessionState {
         target_id: &str,
         label: Option<&str>,
     ) -> Result<(), SessionError> {
+        self.apply_label_at(self.next_sequence(), target_id, label)
+    }
+
+    fn apply_label_at(
+        &mut self,
+        seq: u64,
+        target_id: &str,
+        label: Option<&str>,
+    ) -> Result<(), SessionError> {
+        self.require_next_sequence(seq)?;
         self.validate_target(Some(target_id))?;
-        let seq = self.next_sequence();
         self.sequence = seq;
         if let Some(label) = label {
             self.labels.insert(target_id.to_string(), label.to_string());
@@ -677,18 +722,25 @@ impl SessionState {
                 self.apply_entry_mutation(lane.as_deref(), entry)?;
             }
             crate::SessionMutation::Record { record, .. } => {
-                self.apply_record(record)?;
+                if record.seq == 0 {
+                    return Err(SessionError::invalid_entry(
+                        "Invalid session mutation: has non-consecutive seq 0",
+                    ));
+                }
+                self.apply_record_with_policy(record, false)?;
             }
-            crate::SessionMutation::Lane { lane, leaf_id, .. } => {
-                self.apply_lane(&lane, leaf_id.as_deref())?;
+            crate::SessionMutation::Lane { seq, lane, leaf_id } => {
+                self.apply_lane_at(seq, &lane, leaf_id.as_deref())?;
             }
-            crate::SessionMutation::FactName { name, .. } => {
-                self.apply_name(name.as_deref());
+            crate::SessionMutation::FactName { seq, name } => {
+                self.apply_name_at(seq, name.as_deref())?;
             }
             crate::SessionMutation::FactLabel {
-                target_id, label, ..
+                seq,
+                target_id,
+                label,
             } => {
-                self.apply_label(&target_id, label.as_deref())?;
+                self.apply_label_at(seq, &target_id, label.as_deref())?;
             }
         }
         Ok(())

@@ -330,7 +330,9 @@ pub fn apply_config_auth_with_shell(
     let Some(provider_config) = config.get_provider(provider) else {
         if let Some(model) = model {
             for (key, value) in &model.headers {
-                auth.headers.insert(key.clone(), value.clone());
+                if let Some(resolved) = resolve_config_value_with_shell(value, env, shell_path) {
+                    auth.headers.insert(key.clone(), resolved);
+                }
             }
         }
         return;
@@ -354,9 +356,14 @@ pub fn apply_config_auth_with_shell(
     if let Some(model) = model {
         for (key, value) in &model.headers {
             let lower = key.to_ascii_lowercase();
+            // Model composition copies provider headers verbatim, so a
+            // `$VAR` / `!command` template must be resolved again here.
+            let Some(resolved) = resolve_config_value_with_shell(value, env, shell_path) else {
+                continue;
+            };
             auth.headers
                 .retain(|existing, _| existing.to_ascii_lowercase() != lower);
-            auth.headers.insert(key.clone(), value.clone());
+            auth.headers.insert(key.clone(), resolved);
         }
     }
     if provider_config.auth_header == Some(true) {
@@ -1431,6 +1438,35 @@ mod tests {
         assert_eq!(
             auth.headers.get("Authorization").map(String::as_str),
             Some("Bearer sk-test")
+        );
+    }
+
+    #[test]
+    fn provider_header_templates_are_resolved_after_model_composition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"local":{
+                "baseUrl":"http://127.0.0.1:9","api":"openai-completions","apiKey":"k",
+                "headers":{"X-Secret":"$AUDIT_HEADER"},
+                "models":[{"id":"demo","name":"Demo"}]}}}"#,
+        )
+        .unwrap();
+        let config = ModelConfig::load(&path);
+        assert!(config.error().is_none(), "{:?}", config.error());
+        let models = config.apply(&[]).unwrap();
+        let mut env = HashMap::new();
+        env.insert("AUDIT_HEADER".to_string(), "resolved-secret".to_string());
+        let mut auth = crate::ResolvedAuth {
+            api_key: None,
+            headers: Default::default(),
+            source: "none".into(),
+        };
+        apply_config_auth(&mut auth, &config, "local", models.first(), &env);
+        assert_eq!(
+            auth.headers.get("X-Secret").map(String::as_str),
+            Some("resolved-secret")
         );
     }
 

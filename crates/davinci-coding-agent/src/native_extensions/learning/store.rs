@@ -7,6 +7,90 @@ use crate::native_extensions::learning::types::{
     ArtifactStatus, LearningCandidate, SkillLedgerRecord, SkillOutcome, SkillVersionRef,
 };
 
+/// Reads one JSONL journal. A missing file is `None`. Read errors and invalid
+/// UTF-8 inside a completed record are errors: opening as an empty store would
+/// let the next write or compaction overwrite the learned history. Invalid
+/// bytes in the unterminated final record are a crash-torn append; they are
+/// left out here and removed by `repair_journal_tail` before the next append.
+fn read_journal(path: &Path) -> Result<Option<String>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read {path:?}: {err}")),
+    };
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) => {
+            let valid_up_to = err.utf8_error().valid_up_to();
+            let bytes = err.into_bytes();
+            match bytes.iter().rposition(|byte| *byte == b'\n') {
+                Some(newline) if valid_up_to > newline => {
+                    String::from_utf8(bytes[..=newline].to_vec())
+                        .map(Some)
+                        .map_err(|err| format!("{path:?} is not valid UTF-8: {err}"))
+                }
+                _ => Err(format!(
+                    "{path:?} is not valid UTF-8 (first bad byte at offset {valid_up_to}); \
+                     refusing to open it as an empty store"
+                )),
+            }
+        }
+    }
+}
+
+/// Makes the journal end on a record boundary before appending. A complete
+/// final record that only lacks its newline is terminated; a torn one is saved
+/// byte-for-byte next to the journal and cut off, so a new record is never
+/// glued onto it. Returns a diagnostic when it had to cut.
+fn repair_journal_tail(path: &Path) -> Result<Option<String>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to inspect {path:?}: {err}")),
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(None);
+    }
+    let tail_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let tail = &bytes[tail_start..];
+    let complete = std::str::from_utf8(tail)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
+        .is_some_and(|value| value.is_object());
+    if complete {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("failed to open {path:?}: {e}"))?;
+        file.write_all(b"\n")
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("failed to terminate {path:?}: {e}"))?;
+        return Ok(None);
+    }
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!(
+        ".torn-{}.bak",
+        crate::native_extensions::learning::types::now_ms()
+    ));
+    let backup = PathBuf::from(backup);
+    fs::write(&backup, tail)
+        .map_err(|e| format!("failed to preserve torn tail {backup:?}: {e}"))?;
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("failed to open {path:?}: {e}"))?;
+    file.set_len(tail_start as u64)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("failed to cut torn tail of {path:?}: {e}"))?;
+    Ok(Some(format!(
+        "{path:?}: cut a torn final record ({} bytes) kept in {backup:?}",
+        tail.len()
+    )))
+}
+
 #[derive(Debug, Clone)]
 pub struct LearningStore {
     root: PathBuf,
@@ -32,7 +116,7 @@ impl LearningStore {
 
         let candidates_path = root.join("candidates.jsonl");
         if candidates_path.exists() {
-            if let Ok(content) = fs::read_to_string(&candidates_path) {
+            if let Some(content) = read_journal(&candidates_path)? {
                 candidate_line_count = content.lines().count();
                 for (line_no, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
@@ -57,7 +141,7 @@ impl LearningStore {
 
         let skills_path = root.join("skills.jsonl");
         if skills_path.exists() {
-            if let Ok(content) = fs::read_to_string(&skills_path) {
+            if let Some(content) = read_journal(&skills_path)? {
                 skill_line_count = content.lines().count();
                 for (line_no, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
@@ -121,17 +205,11 @@ impl LearningStore {
     }
 
     pub fn upsert_candidate(&mut self, candidate: LearningCandidate) -> Result<(), String> {
-        self.candidates
-            .insert(candidate.id.clone(), candidate.clone());
-        let candidates_path = self.root.join("candidates.jsonl");
+        // Durable first: a failed append must leave the in-memory view as it was.
         let line = serde_json::to_string(&candidate).map_err(|e| e.to_string())?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&candidates_path)
-            .map_err(|e| format!("failed to open {candidates_path:?}: {e}"))?;
-        writeln!(file, "{line}")
-            .map_err(|e| format!("failed to append to {candidates_path:?}: {e}"))?;
+        let candidates_path = self.root.join("candidates.jsonl");
+        self.append_line(&candidates_path, &line)?;
+        self.candidates.insert(candidate.id.clone(), candidate);
         let _ = self.save_state();
         Ok(())
     }
@@ -166,26 +244,29 @@ impl LearningStore {
     }
 
     pub fn upsert_skill(&mut self, skill: SkillLedgerRecord) -> Result<(), String> {
+        // Durable first: a failed append must leave the in-memory view as it was.
+        let line = serde_json::to_string(&skill).map_err(|e| e.to_string())?;
+        let skills_path = self.root.join("skills.jsonl");
+        self.append_line(&skills_path, &line)?;
         self.skill_versions
             .insert((skill.name.clone(), skill.version as u64), skill.clone());
-        if let Some(existing) = self.skills.get(&skill.name) {
-            if skill.version >= existing.version {
-                self.skills.insert(skill.name.clone(), skill.clone());
-            }
-        } else {
-            self.skills.insert(skill.name.clone(), skill.clone());
+        if self
+            .skills
+            .get(&skill.name)
+            .is_none_or(|existing| skill.version >= existing.version)
+        {
+            self.skills.insert(skill.name.clone(), skill);
         }
-        let skills_path = self.root.join("skills.jsonl");
-        let line = serde_json::to_string(&skill).map_err(|e| e.to_string())?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&skills_path)
-            .map_err(|e| format!("failed to open {skills_path:?}: {e}"))?;
-        writeln!(file, "{line}")
-            .map_err(|e| format!("failed to append to {skills_path:?}: {e}"))?;
         let _ = self.save_state();
         Ok(())
+    }
+
+    /// Repair a torn tail left by a crash, then append durably.
+    fn append_line(&mut self, path: &Path, line: &str) -> Result<(), String> {
+        if let Some(diagnostic) = repair_journal_tail(path)? {
+            self.diagnostics.push(diagnostic);
+        }
+        append_record(path, line)
     }
 
     #[allow(dead_code)]
@@ -287,7 +368,7 @@ impl LearningStore {
     pub fn reload(&mut self) -> Result<(), String> {
         let candidates_path = self.root.join("candidates.jsonl");
         if candidates_path.exists() {
-            if let Ok(content) = fs::read_to_string(&candidates_path) {
+            if let Some(content) = read_journal(&candidates_path)? {
                 for line in content.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -302,7 +383,7 @@ impl LearningStore {
 
         let skills_path = self.root.join("skills.jsonl");
         if skills_path.exists() {
-            if let Ok(content) = fs::read_to_string(&skills_path) {
+            if let Some(content) = read_journal(&skills_path)? {
                 for line in content.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -331,12 +412,44 @@ impl LearningStore {
     }
 }
 
+/// Append one JSONL record and flush it to disk before the caller publishes
+/// the change in memory.
+fn append_record(path: &Path, line: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("failed to open {path:?}: {e}"))?;
+    file.write_all(format!("{line}\n").as_bytes())
+        .and_then(|()| file.sync_data())
+        .map_err(|e| format!("failed to append to {path:?}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native_extensions::learning::types::{
         LearningArtifact, LearningScope, VerificationEvidence,
     };
+
+    #[test]
+    fn failed_append_leaves_in_memory_state_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        let original = fixture_candidate("cand-1");
+        store.upsert_candidate(original.clone()).unwrap();
+        // A directory where the ledger file should be makes every append fail.
+        let candidates = dir.path().join("candidates.jsonl");
+        fs::remove_file(&candidates).unwrap();
+        fs::create_dir(&candidates).unwrap();
+
+        let mut changed = original.clone();
+        changed.rationale = "not durable".into();
+        assert!(store.upsert_candidate(changed).is_err());
+        assert!(store.upsert_candidate(fixture_candidate("cand-2")).is_err());
+        assert_eq!(store.candidate("cand-1"), Some(&original));
+        assert!(store.candidate("cand-2").is_none());
+    }
 
     fn fixture_candidate(id: &str) -> LearningCandidate {
         LearningCandidate {
@@ -368,6 +481,78 @@ mod tests {
 
         let store = LearningStore::open(dir.path().to_path_buf()).unwrap();
         assert_eq!(store.candidate("cand-1"), Some(&candidate));
+    }
+
+    #[test]
+    fn append_after_a_torn_final_record_is_not_glued_onto_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidates.jsonl");
+        let first = serde_json::to_string(&fixture_candidate("cand-first")).unwrap();
+        fs::write(&path, format!("{first}\n{{\"id\":")).unwrap();
+
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        store
+            .upsert_candidate(fixture_candidate("cand-second"))
+            .unwrap();
+        assert!(store.diagnostics().iter().any(|d| d.contains("torn")));
+
+        let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(reopened.candidate("cand-first").is_some());
+        assert!(reopened.candidate("cand-second").is_some());
+        let backups: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".torn-"))
+            .collect();
+        assert_eq!(fs::read(backups[0].path()).unwrap(), b"{\"id\":");
+    }
+
+    #[test]
+    fn complete_final_record_missing_its_newline_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidates.jsonl");
+        let first = serde_json::to_string(&fixture_candidate("cand-first")).unwrap();
+        fs::write(&path, &first).unwrap();
+
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        store
+            .upsert_candidate(fixture_candidate("cand-second"))
+            .unwrap();
+        let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(reopened.candidate("cand-first").is_some());
+        assert!(reopened.candidate("cand-second").is_some());
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_completed_record_fails_open_and_keeps_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidates.jsonl");
+        let first = serde_json::to_string(&fixture_candidate("cand-first")).unwrap();
+        let mut bytes = format!("{first}\n").into_bytes();
+        bytes.extend_from_slice(b"{\"id\":\"\xFF\"}\n");
+        fs::write(&path, &bytes).unwrap();
+
+        let err = LearningStore::open(dir.path().to_path_buf()).unwrap_err();
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn partial_utf8_tail_is_a_torn_append_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidates.jsonl");
+        let first = serde_json::to_string(&fixture_candidate("cand-first")).unwrap();
+        let mut bytes = format!("{first}\n{{\"id\":\"").into_bytes();
+        bytes.extend_from_slice(&[0xF0, 0x9F]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(store.candidate("cand-first").is_some());
+        store
+            .upsert_candidate(fixture_candidate("cand-second"))
+            .unwrap();
+        let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(reopened.candidate("cand-second").is_some());
     }
 
     #[test]

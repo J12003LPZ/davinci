@@ -131,6 +131,35 @@ pub struct SkillManagerContext<'a> {
 
 pub struct SkillManager;
 
+/// The policy every background-review mutation (patch, write_file, and
+/// archive/activate/reject) must pass; create applies the same rules for a
+/// skill that does not exist yet. User-directed actions are not limited.
+fn background_gate(
+    ctx: &SkillManagerContext<'_>,
+    scope: LearningScope,
+    skill_origin: SkillOrigin,
+) -> Result<(), ToolError> {
+    if ctx.origin != SkillWriteOrigin::BackgroundReview {
+        return Ok(());
+    }
+    if skill_origin == SkillOrigin::User || skill_origin == SkillOrigin::Imported {
+        return Err(ToolError::Failed(
+            "background review cannot mutate user-origin or imported skills".into(),
+        ));
+    }
+    if scope == LearningScope::Project && !ctx.project_trusted {
+        return Err(ToolError::Failed(
+            "untrusted project cannot receive autonomous writes".into(),
+        ));
+    }
+    if scope == LearningScope::Global && !ctx.auto_apply_global {
+        return Err(ToolError::Failed(
+            "global automatic writes are disabled by default".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl SkillManager {
     pub fn execute(ctx: SkillManagerContext<'_>, args: &Value) -> Result<ToolResult, ToolError> {
         let action = args
@@ -262,12 +291,37 @@ impl SkillManager {
             .unwrap_or_default();
 
         let content = if raw_body.starts_with("---") {
+            // Submitted frontmatter must agree with the requested identity and
+            // be closed, or the ledger and SKILL.md would name different skills.
+            let (fields, _) = davinci_agent::parse_frontmatter(raw_body);
+            match fields.get("name") {
+                Some(declared) if declared == name => {}
+                Some(declared) => {
+                    return Err(ToolError::Failed(format!(
+                        "frontmatter name '{declared}' does not match skill name '{name}'"
+                    )))
+                }
+                None => {
+                    return Err(ToolError::Failed(
+                        "frontmatter must be closed with '---' and declare 'name'".into(),
+                    ))
+                }
+            }
+            if fields
+                .get("description")
+                .is_none_or(|d| d.trim().is_empty())
+            {
+                return Err(ToolError::Failed(
+                    "frontmatter must declare a non-empty 'description'".into(),
+                ));
+            }
             redact_secrets(raw_body)
         } else {
             let redacted = redact_secrets(raw_body);
             format!("---\nname: {name}\ndescription: {description}\n---\n\n{redacted}")
         };
 
+        let created_dir = !skill_dir.exists();
         atomic_write_file(&skill_file, &content)
             .map_err(|e| ToolError::Failed(format!("failed to write skill file: {e}")))?;
 
@@ -300,9 +354,17 @@ impl SkillManager {
             LearningScope::Project => ctx.project_store,
             LearningScope::Global => ctx.global_store,
         };
-        store
-            .upsert_skill(record)
-            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {e}")))?;
+        if let Err(error) = store.upsert_skill(record) {
+            // Without its ledger record the file would be an orphan that blocks
+            // a retry with "already exists"; undo the create.
+            let _ = std::fs::remove_file(&skill_file);
+            if created_dir {
+                let _ = std::fs::remove_dir(&skill_dir);
+            }
+            return Err(ToolError::Failed(format!(
+                "failed to update skill ledger: {error}"
+            )));
+        }
 
         let body = json!({
             "status": "created",
@@ -355,18 +417,7 @@ impl SkillManager {
             .map(|r| r.origin)
             .unwrap_or(SkillOrigin::User);
 
-        if ctx.origin == SkillWriteOrigin::BackgroundReview {
-            if skill_origin == SkillOrigin::User || skill_origin == SkillOrigin::Imported {
-                return Err(ToolError::Failed(
-                    "background review cannot mutate user-origin or imported skills".into(),
-                ));
-            }
-            if scope == LearningScope::Project && !ctx.project_trusted {
-                return Err(ToolError::Failed(
-                    "untrusted project cannot receive autonomous writes".into(),
-                ));
-            }
-        }
+        background_gate(&ctx, scope, skill_origin)?;
 
         let current = fs::read_to_string(&path)
             .map_err(|e| ToolError::Failed(format!("failed to read {path:?}: {e}")))?;
@@ -415,6 +466,14 @@ impl SkillManager {
                 "oldText matched multiple times in target file; patch must be unique".into(),
             ));
         }
+
+        // Validate every argument before the first write: a bad applicability
+        // must not leave a changed SKILL.md behind with an unadvanced ledger.
+        let applicability_update: Option<SkillApplicability> = args
+            .get("applicability")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| ToolError::Failed(format!("invalid applicability metadata: {e}")))?;
 
         let redacted_new = redact_secrets(new_text);
         let patched = current.replacen(old_text, &redacted_new, 1);
@@ -485,9 +544,7 @@ impl SkillManager {
             applicability: Default::default(),
             pinned: false,
         });
-        if let Some(value) = args.get("applicability") {
-            let parsed: SkillApplicability = serde_json::from_value(value.clone())
-                .map_err(|e| ToolError::Failed(format!("invalid applicability metadata: {e}")))?;
+        if let Some(parsed) = applicability_update {
             rec.applicability = parsed;
         }
         rec.version = updated_version;
@@ -498,9 +555,18 @@ impl SkillManager {
             LearningScope::Project => ctx.project_store,
             LearningScope::Global => ctx.global_store,
         };
-        store
-            .upsert_skill(rec)
-            .map_err(|e| ToolError::Failed(format!("failed to update skill ledger: {e}")))?;
+        if let Err(e) = store.upsert_skill(rec) {
+            // Keep file and ledger in step: put the previous content back.
+            let restored = atomic_write_file(&path, &current);
+            return Err(ToolError::Failed(format!(
+                "failed to update skill ledger: {e}{}",
+                if restored.is_err() {
+                    "; restoring the previous SKILL.md also failed"
+                } else {
+                    ""
+                }
+            )));
+        }
 
         let body = json!({
             "status": "patched",
@@ -527,6 +593,17 @@ impl SkillManager {
             .ok_or_else(|| ToolError::Failed("missing 'filePath'".into()))?;
         let validated_rel =
             validate_relative_support_path(rel_path_str).map_err(ToolError::Failed)?;
+        // SKILL.md is the ledger-tracked primary file: it changes only through
+        // patch, which checks expectedHash and records a new version.
+        if validated_rel
+            .components()
+            .filter(|component| matches!(component, Component::Normal(_)))
+            .eq(Path::new("SKILL.md").components())
+        {
+            return Err(ToolError::Failed(
+                "SKILL.md cannot be written as a support file; use patch".into(),
+            ));
+        }
 
         if ctx.origin == SkillWriteOrigin::BackgroundReview
             && rel_path_str.replace('\\', "/").starts_with("scripts/")
@@ -576,22 +653,7 @@ impl SkillManager {
             .as_ref()
             .map(|r| r.origin)
             .unwrap_or(SkillOrigin::User);
-        if ctx.origin == SkillWriteOrigin::BackgroundReview
-            && (skill_origin == SkillOrigin::User || skill_origin == SkillOrigin::Imported)
-        {
-            return Err(ToolError::Failed(
-                "background review cannot mutate user-origin or imported skills".into(),
-            ));
-        }
-
-        if scope == LearningScope::Project
-            && ctx.origin == SkillWriteOrigin::BackgroundReview
-            && !ctx.project_trusted
-        {
-            return Err(ToolError::Failed(
-                "untrusted project cannot receive autonomous writes".into(),
-            ));
-        }
+        background_gate(&ctx, scope, skill_origin)?;
 
         let target_file = skill_dir.join(validated_rel);
 
@@ -613,6 +675,19 @@ impl SkillManager {
                         }
                     }
                 }
+            }
+        }
+
+        // Overwriting needs proof the caller saw the current content.
+        if target_file.exists() {
+            let current = std::fs::read_to_string(&target_file).map_err(|e| {
+                ToolError::Failed(format!("failed to read existing support file: {e}"))
+            })?;
+            let expected = args.get("expectedHash").and_then(Value::as_str);
+            if expected != Some(content_hash(&current).as_str()) {
+                return Err(ToolError::Failed(
+                    "support file exists; pass its current 'expectedHash' to overwrite".into(),
+                ));
             }
         }
 
@@ -643,6 +718,7 @@ impl SkillManager {
     ) -> Result<ToolResult, ToolError> {
         let record = if let Some(rec) = ctx.project_store.skill(name) {
             let mut r = rec.clone();
+            background_gate(&ctx, LearningScope::Project, r.origin)?;
             r.status = status;
             ctx.project_store
                 .upsert_skill(r.clone())
@@ -650,6 +726,7 @@ impl SkillManager {
             r
         } else if let Some(rec) = ctx.global_store.skill(name) {
             let mut r = rec.clone();
+            background_gate(&ctx, LearningScope::Global, r.origin)?;
             r.status = status;
             ctx.global_store
                 .upsert_skill(r.clone())
@@ -913,6 +990,104 @@ mod tests {
     }
 
     #[test]
+    fn patch_with_invalid_applicability_leaves_the_skill_untouched() {
+        let (_dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let skill_dir = p_skills.join("learned-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "Original text").unwrap();
+        p_store
+            .upsert_skill(SkillLedgerRecord {
+                skill_id: "learned-skill".into(),
+                name: "learned-skill".into(),
+                scope: LearningScope::Project,
+                origin: SkillOrigin::LearnedReview,
+                status: ArtifactStatus::Active,
+                path: skill_file.clone(),
+                content_hash: content_hash("Original text"),
+                version: 1,
+                success_count: 0,
+                failure_count: 0,
+                neutral_count: 0,
+                last_used_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+                applicability: Default::default(),
+                pinned: false,
+            })
+            .unwrap();
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        let args = json!({
+            "action": "patch",
+            "name": "learned-skill",
+            "oldText": "Original text",
+            "newText": "Patched text",
+            "expectedHash": content_hash("Original text"),
+            "applicability": {"languages": 5}
+        });
+        assert!(SkillManager::execute(ctx, &args).is_err());
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), "Original text");
+        let record = p_store.skill("learned-skill").unwrap();
+        assert_eq!(record.version, 1);
+        assert_eq!(record.content_hash, content_hash("Original text"));
+        assert!(!p_store.root().join("history").exists());
+    }
+
+    fn create_with_body(body: &str, name: &str) -> (Result<ToolResult, ToolError>, PathBuf) {
+        let (dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        let args = json!({
+            "action": "create", "name": name, "scope": "project",
+            "description": "ignored when frontmatter is supplied", "body": body,
+        });
+        let result = SkillManager::execute(ctx, &args);
+        let file = p_skills.join(name).join("SKILL.md");
+        std::mem::forget(dir);
+        (result, file)
+    }
+
+    #[test]
+    fn create_rejects_frontmatter_that_names_another_skill() {
+        let (result, file) =
+            create_with_body("---\nname: fix-b\ndescription: wrong\n---\nBody", "fix-a");
+        assert!(result.is_err());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn create_rejects_unclosed_frontmatter() {
+        let (result, file) = create_with_body("---\nname: fix-a\ndescription: d\nBody", "fix-a");
+        assert!(result.is_err());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn create_accepts_matching_frontmatter() {
+        let (result, file) =
+            create_with_body("---\nname: fix-a\ndescription: right\n---\nBody", "fix-a");
+        assert!(!result.unwrap().is_error);
+        assert!(fs::read_to_string(file).unwrap().contains("name: fix-a"));
+    }
+
+    #[test]
     fn foreground_learn_patches_learned_skill_allowed() {
         let (_dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
         let skill_dir = p_skills.join("learned-skill");
@@ -1067,6 +1242,166 @@ mod tests {
             SkillManager::execute(ctx, &args).expect_err("out-of-root ledger path must fail");
         assert!(error.to_string().contains("outside configured skill root"));
         assert!(!outside_dir.join("references").join("note.md").exists());
+    }
+
+    #[test]
+    fn create_rolls_back_skill_file_when_ledger_append_fails() {
+        let (dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let ledger = dir.path().join("project_learning").join("skills.jsonl");
+        let _ = fs::remove_file(&ledger);
+        fs::create_dir_all(&ledger).unwrap();
+        let args = json!({
+            "action": "create",
+            "name": "orphan-check",
+            "scope": "project",
+            "description": "d",
+            "body": "b"
+        });
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        assert!(SkillManager::execute(ctx, &args).is_err());
+        assert!(!p_skills.join("orphan-check").exists());
+        assert!(p_store.skill("orphan-check").is_none());
+
+        fs::remove_dir(&ledger).unwrap();
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        assert!(!SkillManager::execute(ctx, &args).unwrap().is_error);
+    }
+
+    #[test]
+    fn write_file_cannot_replace_skill_md_or_overwrite_without_hash() {
+        let (_dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let mut run = |args: Value| {
+            SkillManager::execute(
+                SkillManagerContext {
+                    project_skills_dir: &p_skills,
+                    global_skills_dir: &g_skills,
+                    project_store: &mut p_store,
+                    global_store: &mut g_store,
+                    project_trusted: true,
+                    auto_apply_global: false,
+                    origin: SkillWriteOrigin::ForegroundUserDirected,
+                    read_set: &read_set,
+                },
+                &args,
+            )
+        };
+        run(json!({"action":"create","name":"guarded","scope":"project",
+            "description":"d","body":"b"}))
+        .unwrap();
+        let skill_md = p_skills.join("guarded").join("SKILL.md");
+        let before = fs::read_to_string(&skill_md).unwrap();
+        let error = run(json!({"action":"write_file","name":"guarded",
+            "filePath":"SKILL.md","content":"replaced"}))
+        .unwrap_err();
+        assert!(error.to_string().contains("use patch"), "{error}");
+        assert_eq!(fs::read_to_string(&skill_md).unwrap(), before);
+
+        let write = |content: &str, hash: Option<String>| {
+            let mut args = json!({"action":"write_file","name":"guarded",
+                "filePath":"references/note.md","content":content});
+            if let Some(hash) = hash {
+                args["expectedHash"] = json!(hash);
+            }
+            args
+        };
+        run(write("one", None)).unwrap();
+        assert!(run(write("two", None)).is_err());
+        assert!(run(write("two", Some(content_hash("stale")))).is_err());
+        run(write("two", Some(content_hash("one")))).unwrap();
+        let note = p_skills.join("guarded").join("references").join("note.md");
+        assert_eq!(fs::read_to_string(note).unwrap(), "two");
+    }
+
+    #[test]
+    fn background_review_status_changes_follow_the_write_policy() {
+        let (_dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let record = |name: &str, scope: LearningScope, origin: SkillOrigin, root: &Path| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), "body").unwrap();
+            SkillLedgerRecord {
+                skill_id: name.into(),
+                name: name.into(),
+                scope,
+                origin,
+                status: ArtifactStatus::Active,
+                path: dir.join("SKILL.md"),
+                content_hash: content_hash("body"),
+                version: 1,
+                success_count: 0,
+                failure_count: 0,
+                neutral_count: 0,
+                last_used_at_ms: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                applicability: Default::default(),
+                pinned: false,
+            }
+        };
+        p_store
+            .upsert_skill(record(
+                "user-skill",
+                LearningScope::Project,
+                SkillOrigin::User,
+                &p_skills,
+            ))
+            .unwrap();
+        g_store
+            .upsert_skill(record(
+                "global-learned",
+                LearningScope::Global,
+                SkillOrigin::LearnedReview,
+                &g_skills,
+            ))
+            .unwrap();
+        let mut run = |args: Value| {
+            SkillManager::execute(
+                SkillManagerContext {
+                    project_skills_dir: &p_skills,
+                    global_skills_dir: &g_skills,
+                    project_store: &mut p_store,
+                    global_store: &mut g_store,
+                    project_trusted: true,
+                    auto_apply_global: false,
+                    origin: SkillWriteOrigin::BackgroundReview,
+                    read_set: &read_set,
+                },
+                &args,
+            )
+        };
+        for action in ["archive", "reject"] {
+            assert!(run(json!({"action":action,"name":"user-skill"})).is_err());
+            assert!(run(json!({"action":action,"name":"global-learned"})).is_err());
+        }
+        assert!(run(json!({"action":"write_file","name":"global-learned",
+            "filePath":"references/n.md","content":"x"}))
+        .is_err());
+        assert_eq!(
+            p_store.skill("user-skill").unwrap().status,
+            ArtifactStatus::Active
+        );
+        assert_eq!(
+            g_store.skill("global-learned").unwrap().status,
+            ArtifactStatus::Active
+        );
     }
 
     #[test]

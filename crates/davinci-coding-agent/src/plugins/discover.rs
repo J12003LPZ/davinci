@@ -1219,6 +1219,11 @@ pub fn registry_installs(path: &Path) -> std::collections::BTreeMap<String, Stri
 /// Add `name` to the `mcpServers` of `path`, creating the file if needed,
 /// keeping everything else in it and its permissions.
 pub fn add_server(path: &Path, name: &str, config: Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    // Held across read, modify and write so a concurrent edit is not lost.
+    let _lock = store::lock_registry(path)?;
     let mut doc = match std::fs::read_to_string(path) {
         Ok(body) => serde_json::from_str::<Value>(&body)
             .map_err(|err| format!("{}: {err}", path.display()))?,
@@ -1238,9 +1243,6 @@ pub fn add_server(path: &Path, name: &str, config: Value) -> Result<(), String> 
     }
     servers.insert(name.into(), config);
     let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
     store::write_json_atomic(path, &doc)?;
     if let Some(permissions) = permissions {
         std::fs::set_permissions(path, permissions).map_err(|err| err.to_string())?;

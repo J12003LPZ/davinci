@@ -77,10 +77,20 @@ pub fn project_script_result(
     if let Some(value) = &structured {
         validate_json(value, 64)?;
     }
+    let complete = result.details.as_ref().is_none_or(|details| {
+        // Script values carry text only: a truncated read or an image that
+        // lives in `details.image` is not the whole result.
+        let truncated = details
+            .pointer("/truncation/truncated")
+            .or_else(|| details.get("truncated"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        !truncated && details.get("image").is_none_or(Value::is_null)
+    });
     let value = CodeModeToolValue {
         text: result.content,
         structured_content: structured,
-        complete: true,
+        complete,
         artifact: None,
         operation_ref,
     };

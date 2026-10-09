@@ -379,10 +379,11 @@ impl PackageIntelligence {
 
         // Search in lockfile for packages requiring this package
         if let Some(ref lock) = resolved.lock_data {
-            for (parent_pkg, locked_info) in &lock.packages {
+            // Every installed version of every parent, not one per name.
+            for locked_info in lock.all_resolutions() {
                 if let Some(req_ver) = locked_info.dependencies.get(pkg) {
                     reasons.push(DependencyReason {
-                        from_package: format!("{}@{}", parent_pkg, locked_info.version),
+                        from_package: format!("{}@{}", locked_info.name, locked_info.version),
                         dependency_type: "lock_dependency".to_string(),
                         required_range: req_ver.clone(),
                         resolved_version: resolved
@@ -408,6 +409,12 @@ impl PackageIntelligence {
             locked_version: resolved.locked_version,
             declared_range: resolved.declared_version,
             dependency_type: resolved.dependency_type,
+            locked_versions: resolved
+                .lock_data
+                .as_ref()
+                .and_then(|lock| lock.resolutions.get(pkg))
+                .map(|versions| versions.iter().map(|p| p.version.clone()).collect())
+                .unwrap_or_default(),
             reasons,
             warnings,
         };
@@ -418,6 +425,40 @@ impl PackageIntelligence {
             details: Some(val),
             is_error: false,
         })
+    }
+
+    /// A digest of the installed package's manifest and declared type entry
+    /// points, or a fixed marker when it is not installed (so installing it
+    /// invalidates results cached while it was missing).
+    fn installed_package_stamp(&self, ws_dir: &Path, pkg: &str) -> String {
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let ws_dir = ws_dir
+            .canonicalize()
+            .unwrap_or_else(|_| ws_dir.to_path_buf());
+        let mut ignored = Vec::new();
+        let (dir, manifest) = resolver::find_installed_package(&ws_dir, &root, pkg, &mut ignored);
+        let (Some(dir), Some(manifest)) = (dir, manifest) else {
+            return "installed:none".to_string();
+        };
+        let mut material = manifest.clone().into_bytes();
+        if let Ok(value) = serde_json::from_str::<Value>(&manifest) {
+            let mut entries: Vec<String> = ["types", "typings"]
+                .iter()
+                .filter_map(|key| value.get(*key).and_then(Value::as_str))
+                .map(str::to_string)
+                .collect();
+            entries.push("index.d.ts".to_string());
+            for entry in entries {
+                if let Ok(bytes) = fs::read(dir.join(&entry)) {
+                    material.extend_from_slice(entry.as_bytes());
+                    material.extend_from_slice(&bytes);
+                }
+            }
+        }
+        format!("installed:{}", digest(&material))
     }
 
     fn compute_cache_key(
@@ -440,6 +481,13 @@ impl PackageIntelligence {
                 break;
             }
         }
+
+        // Results also describe the installed package (version, exports, type
+        // declarations), which changes independently of the manifest and lock.
+        let pkg = pkg_or_symbol.split('#').next().unwrap_or(pkg_or_symbol);
+        deps.push(CacheDependency::ContentHash(
+            self.installed_package_stamp(&ws_dir, pkg),
+        ));
 
         Some(CacheKey::new(
             CacheNamespace::Package,

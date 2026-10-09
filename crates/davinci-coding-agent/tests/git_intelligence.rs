@@ -450,6 +450,45 @@ fn test_security_guards_option_injection_and_traversal() {
 
     // 3. Control character in revision
     assert!(runner::validate_revision("HEAD\nrm -rf /").is_err());
+
+    // 4. A rejected branch_diff base never reaches git as an option.
+    let probe = repo.path().join("probe-output");
+    let base = format!("--output={}", probe.display());
+    assert!(resolver
+        .branch_diff(Some(&base), Some("HEAD"), Some(true), None)
+        .is_err());
+    assert!(!probe.exists());
+    assert!(resolver
+        .branch_diff(Some("no-such-branch"), Some("HEAD"), Some(true), None)
+        .is_err());
+}
+
+#[test]
+fn test_changed_symbols_keeps_same_named_methods_in_different_scopes() {
+    let repo = TestRepo::new();
+    repo.write_file(
+        "src/jobs.ts",
+        "export class A {\n  run(): number { return 1; }\n}\nexport class B {\n  run(): number { return 2; }\n}\n",
+    );
+    let base_sha = repo.commit("base");
+    repo.write_file(
+        "src/jobs.ts",
+        "export class A {\n  run(): number { return 1; }\n}\nexport class B {\n}\n",
+    );
+    let head_sha = repo.commit("delete B.run");
+
+    let resolver = GitResolver::new(repo.path(), GitIntelligenceConfig::default()).unwrap();
+    let res = resolver
+        .changed_symbols(Some(&base_sha), Some(&head_sha), None)
+        .unwrap();
+    let deleted: Vec<_> = res
+        .symbols
+        .iter()
+        .filter(|s| s.change_type == "deleted" && s.name == "run")
+        .map(|s| s.qualified_name.as_str())
+        .collect();
+    assert_eq!(deleted.len(), 1, "{:?}", res.symbols);
+    assert!(deleted[0].contains('B'), "{deleted:?}");
 }
 
 // ----------------------------------------------------------------------------

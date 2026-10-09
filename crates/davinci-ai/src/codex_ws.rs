@@ -678,27 +678,55 @@ fn handshake(
         .and_then(|_| stream.flush())
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
     let response = read_http_head(stream)?;
-    if !response.starts_with("HTTP/1.1 101") && !response.starts_with("HTTP/1.0 101") {
+    validate_handshake_response(&response, &accept_key(&key))
+}
+
+/// Validates the server's upgrade response per RFC 6455 section 4.1.
+fn validate_handshake_response(response: &str, expected_accept: &str) -> Result<(), String> {
+    let mut lines = response.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next().unwrap_or("");
+    let code = parts.next().unwrap_or("");
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") || code != "101" {
         return Err(format!(
             "WebSocket connect failed: {}",
-            response.lines().next().unwrap_or("invalid handshake")
+            if status_line.is_empty() {
+                "invalid handshake"
+            } else {
+                status_line
+            }
         ));
     }
-    let expected = accept_key(&key);
-    let accept = response
-        .lines()
-        .find_map(|line| line.split_once(':'))
-        .and_then(|(name, value)| {
-            name.eq_ignore_ascii_case("sec-websocket-accept")
-                .then_some(value.trim())
-        });
-    if accept != Some(expected.as_str()) {
-        // Some loopback fixtures omit the accept header after a 101.
-        if accept.is_some() {
-            return Err("WebSocket connect failed: invalid accept key".into());
+    let mut upgrade = false;
+    let mut connection = false;
+    let mut accept = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("upgrade") {
+            upgrade |= value.eq_ignore_ascii_case("websocket");
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection |= value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+        } else if name.eq_ignore_ascii_case("sec-websocket-accept") {
+            accept = Some(value);
         }
     }
-    Ok(())
+    if !upgrade {
+        return Err("WebSocket connect failed: missing Upgrade: websocket header".into());
+    }
+    if !connection {
+        return Err("WebSocket connect failed: missing Connection: Upgrade header".into());
+    }
+    match accept {
+        Some(value) if value == expected_accept => Ok(()),
+        Some(_) => Err("WebSocket connect failed: invalid accept key".into()),
+        None => Err("WebSocket connect failed: missing Sec-WebSocket-Accept header".into()),
+    }
 }
 
 fn websocket_key() -> String {
@@ -1039,6 +1067,92 @@ pub(crate) fn write_unmasked_text(stream: &mut impl Write, text: &str) -> std::i
 mod tests {
     use super::*;
     use crate::catalog::ModelCost;
+
+    fn handshake_response(status: &str, headers: &[&str]) -> String {
+        let mut out = format!("{status}\r\n");
+        for header in headers {
+            out.push_str(header);
+            out.push_str("\r\n");
+        }
+        out.push_str("\r\n");
+        out
+    }
+
+    #[test]
+    fn handshake_accepts_valid_upgrade_response() {
+        let response = handshake_response(
+            "HTTP/1.1 101 Switching Protocols",
+            &[
+                "upgrade: WebSocket",
+                "Connection: keep-alive, Upgrade",
+                "Sec-WebSocket-Accept: abc",
+            ],
+        );
+        assert_eq!(validate_handshake_response(&response, "abc"), Ok(()));
+    }
+
+    #[test]
+    fn handshake_rejects_missing_accept_header() {
+        let response = handshake_response(
+            "HTTP/1.1 101 Switching Protocols",
+            &["Upgrade: websocket", "Connection: Upgrade"],
+        );
+        let err = validate_handshake_response(&response, "abc").unwrap_err();
+        assert!(err.contains("Sec-WebSocket-Accept"), "{err}");
+    }
+
+    #[test]
+    fn handshake_rejects_wrong_accept_header() {
+        let response = handshake_response(
+            "HTTP/1.1 101 Switching Protocols",
+            &[
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                "Sec-WebSocket-Accept: nope",
+            ],
+        );
+        let err = validate_handshake_response(&response, "abc").unwrap_err();
+        assert!(err.contains("invalid accept key"), "{err}");
+    }
+
+    #[test]
+    fn handshake_rejects_missing_upgrade_or_connection_headers() {
+        let no_upgrade = handshake_response(
+            "HTTP/1.1 101 Switching Protocols",
+            &["Connection: Upgrade", "Sec-WebSocket-Accept: abc"],
+        );
+        assert!(validate_handshake_response(&no_upgrade, "abc")
+            .unwrap_err()
+            .contains("Upgrade"));
+        let no_connection = handshake_response(
+            "HTTP/1.1 101 Switching Protocols",
+            &["Upgrade: websocket", "Sec-WebSocket-Accept: abc"],
+        );
+        assert!(validate_handshake_response(&no_connection, "abc")
+            .unwrap_err()
+            .contains("Connection"));
+    }
+
+    #[test]
+    fn handshake_rejects_malformed_status_codes() {
+        let headers = [
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Accept: abc",
+        ];
+        for status in [
+            "HTTP/1.1 1010 Switching Protocols",
+            "HTTP/1.1 101foo",
+            "HTTP/1.1 200 OK",
+            "HTTP/2 101",
+        ] {
+            let response = handshake_response(status, &headers);
+            assert!(
+                validate_handshake_response(&response, "abc").is_err(),
+                "{status}"
+            );
+        }
+    }
 
     fn codex_model() -> Model {
         Model {

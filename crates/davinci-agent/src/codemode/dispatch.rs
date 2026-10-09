@@ -219,6 +219,14 @@ impl AgentCodeModeBroker {
         self.state.lock().unwrap().requests.len()
     }
 
+    fn record_child(&self, outcome: CodeModeChildOutcome) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .children
+            .push(outcome);
+    }
+
     fn authorized_tools(&self) -> std::collections::BTreeSet<String> {
         self.agent.sync_tool_authorization();
         self.agent
@@ -293,6 +301,27 @@ impl CodeModeBroker for AgentCodeModeBroker {
         })
     }
 
+    /// The host's launch catalog is privileged bootstrap, not guest metadata:
+    /// it is bounded by `max_tools` but never charged to the script budgets.
+    fn catalog(&self, max_tools: usize) -> Result<Vec<String>, CodeModeError> {
+        self.live()?;
+        let authorized = self.authorized_tools();
+        let names: Vec<String> = self
+            .policy
+            .tools()
+            .into_iter()
+            .filter(|capability| authorized.contains(&capability.name))
+            .map(|capability| capability.name.clone())
+            .collect();
+        if names.len() > max_tools {
+            return Err(CodeModeError::new(
+                "LIMIT_EXCEEDED",
+                "capability catalog limit",
+            ));
+        }
+        Ok(names)
+    }
+
     fn describe(&self, canonical_name: &str) -> Result<Value, CodeModeError> {
         self.live()?;
         self.require_authorized(canonical_name)?;
@@ -343,20 +372,41 @@ impl CodeModeBroker for AgentCodeModeBroker {
                 ));
             }
             state.in_flight += 1;
-            state.requests.len()
+            // The guest numbers requests in source order; callback threads may
+            // reach this lock in any order, so admission order is not stable.
+            call.request_id as usize
         };
         let _in_flight = InFlight(self);
         // A private leaf lane serializes effects without holding parent journal,
         // agent or admission-state locks while a child or approval waits.
-        let _lane = self
+        let lane = self
             .dispatch
             .acquire(max_concurrency, || {
                 self.context.cancellation.is_cancelled()
                     || self.agent.abort_requested()
                     || super::remaining_root_wall_ms(self.context.root_budget.as_ref()).is_err()
             })
-            .ok_or_else(|| CodeModeError::new("CANCELLED", "queued child cancelled"))?;
-        self.live()?;
+            .ok_or_else(|| CodeModeError::new("CANCELLED", "queued child cancelled"))
+            .and_then(|lane| self.live().map(|()| lane));
+        let _lane = match lane {
+            Ok(lane) => lane,
+            Err(error) => {
+                // Admitted but never dispatched: the parent must still see it.
+                self.record_child(CodeModeChildOutcome {
+                    request_id: call.request_id,
+                    ordinal: ordinal as u32,
+                    tool: call.tool,
+                    operation_ref: String::new(),
+                    status: if error.code == "CANCELLED" {
+                        CodeModeChildStatus::Cancelled
+                    } else {
+                        CodeModeChildStatus::NotStarted
+                    },
+                    error: Some(error.clone()),
+                });
+                return Err(error);
+            }
+        };
         let id = format!("{}#codemode:{ordinal}", self.context.identity.invocation_id);
         let (result, structured, operation_ref) = self.agent.dispatch_script_child(
             &self.agent.cwd,
@@ -469,31 +519,27 @@ impl CodeModeBroker for AgentCodeModeBroker {
             state.terminal = true;
             state.terminal_code = "RECOVERY_REQUIRED";
         }
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .children
-            .push(CodeModeChildOutcome {
-                request_id: call.request_id,
-                ordinal: ordinal as u32,
-                tool: call.tool,
-                operation_ref: operation_ref.clone(),
-                status: if error
-                    .as_ref()
-                    .is_some_and(|error| error.code == "RECOVERY_REQUIRED")
-                {
-                    CodeModeChildStatus::RecoveryRequired
-                } else if error.is_some() {
-                    match error.as_ref().map(|error| error.code.as_str()) {
-                        Some("DENIED") => CodeModeChildStatus::NotStarted,
-                        Some("CANCELLED") => CodeModeChildStatus::Cancelled,
-                        _ => CodeModeChildStatus::Failed,
-                    }
-                } else {
-                    CodeModeChildStatus::Succeeded
-                },
-                error: error.clone(),
-            });
+        self.record_child(CodeModeChildOutcome {
+            request_id: call.request_id,
+            ordinal: ordinal as u32,
+            tool: call.tool,
+            operation_ref: operation_ref.clone(),
+            status: if error
+                .as_ref()
+                .is_some_and(|error| error.code == "RECOVERY_REQUIRED")
+            {
+                CodeModeChildStatus::RecoveryRequired
+            } else if error.is_some() {
+                match error.as_ref().map(|error| error.code.as_str()) {
+                    Some("DENIED") => CodeModeChildStatus::NotStarted,
+                    Some("CANCELLED") => CodeModeChildStatus::Cancelled,
+                    _ => CodeModeChildStatus::Failed,
+                }
+            } else {
+                CodeModeChildStatus::Succeeded
+            },
+            error: error.clone(),
+        });
         if let Some(error) = error {
             return Err(error);
         }

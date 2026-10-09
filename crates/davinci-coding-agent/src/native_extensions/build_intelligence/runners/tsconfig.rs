@@ -70,14 +70,53 @@ pub fn strip_json_comments(input: &str) -> String {
     out
 }
 
+/// Drops commas that directly precede `}` or `]` (outside strings), which
+/// TypeScript accepts in `tsconfig.json` but strict JSON does not.
+pub fn strip_trailing_commas(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.get(index + 1) {
+                    out.push(*escaped);
+                    index += 1;
+                }
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if ch == ',' {
+            let next = chars[index + 1..].iter().find(|c| !c.is_whitespace());
+            if !matches!(next, Some('}' | ']')) {
+                out.push(ch);
+            }
+        } else {
+            out.push(ch);
+        }
+        index += 1;
+    }
+    out
+}
+
+/// Parses JSON with comments and trailing commas, as TypeScript reads tsconfig.
+pub fn parse_jsonc<T: serde::de::DeserializeOwned>(content: &str) -> serde_json::Result<T> {
+    serde_json::from_str(&strip_trailing_commas(&strip_json_comments(content)))
+}
+
 pub fn parse_tsconfig(dir: &Path) -> Option<(PathBuf, Tsconfig)> {
     let candidates = ["tsconfig.json", "tsconfig.base.json", "tsconfig.build.json"];
     for candidate in candidates {
         let tsconfig_file = dir.join(candidate);
         if tsconfig_file.is_file() {
             if let Ok(content) = std::fs::read_to_string(&tsconfig_file) {
-                let stripped = strip_json_comments(&content);
-                if let Ok(parsed) = serde_json::from_str::<Tsconfig>(&stripped) {
+                if let Ok(parsed) = parse_jsonc::<Tsconfig>(&content) {
                     return Some((tsconfig_file, parsed));
                 }
             }

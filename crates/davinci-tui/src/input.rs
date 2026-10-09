@@ -75,7 +75,13 @@ impl Input {
 
     pub fn set_value(&mut self, value: impl Into<String>) {
         self.value = value.into();
-        self.cursor = self.cursor.min(self.value.len());
+        // A byte offset from the old text may fall inside a character of the
+        // new one; snap back to a boundary so slicing never panics.
+        let mut cursor = self.cursor.min(self.value.len());
+        while !self.value.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        self.cursor = cursor;
     }
 
     pub fn handle_key(&mut self, data: &str) -> InputAction {
@@ -506,6 +512,16 @@ mod tests {
 
     fn feed(input: &mut Input, data: &str) -> InputAction {
         input.handle_key(data)
+    }
+
+    #[test]
+    fn set_value_snaps_the_cursor_to_a_character_boundary() {
+        let mut input = Input::new();
+        feed(&mut input, "a"); // cursor now at byte 1
+        input.set_value("é"); // 2 bytes: byte 1 is inside the character
+        feed(&mut input, "\x1b[D");
+        feed(&mut input, "y");
+        assert_eq!(input.get_value(), "yé");
     }
 
     #[test]

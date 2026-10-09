@@ -54,7 +54,19 @@ pub fn resolve_package(
         if !candidate.starts_with(&canonical_root) {
             return Err(format!("workspace escapes repository root: {ws_rel}"));
         }
-        candidate.canonicalize().unwrap_or(candidate)
+        // A repository symlink can point anywhere: the lexical check above is
+        // not enough, the resolved directory must stay inside the root too.
+        if candidate.exists() {
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|err| format!("workspace {ws_rel} is not accessible: {err}"))?;
+            if !canonical.starts_with(&canonical_root) {
+                return Err(format!("workspace escapes repository root: {ws_rel}"));
+            }
+            canonical
+        } else {
+            candidate
+        }
     };
 
     let mut warnings = Vec::new();
@@ -112,12 +124,17 @@ pub fn resolve_package(
 
     let mut locked_version = None;
     if let Some(ref lock) = lock_data {
-        // First check workspace importers if workspace != "."
-        if ws_rel != "." && !ws_rel.is_empty() {
-            if let Some(importer_pkgs) = lock.workspace_packages.get(ws_rel) {
-                if let Some(pkg) = importer_pkgs.get(target_pkg) {
-                    locked_version = Some(pkg.version.clone());
-                }
+        // The selected workspace's own importer is authoritative, the root
+        // (`.`) included; the name-keyed package map may hold another
+        // workspace's version.
+        let importer = if ws_rel == "." || ws_rel.is_empty() {
+            "."
+        } else {
+            ws_rel
+        };
+        if let Some(importer_pkgs) = lock.workspace_packages.get(importer) {
+            if let Some(pkg) = importer_pkgs.get(target_pkg) {
+                locked_version = Some(pkg.version.clone());
             }
         }
         if locked_version.is_none() {
@@ -296,7 +313,7 @@ fn find_and_parse_lockfile(
     (None, None)
 }
 
-fn find_installed_package(
+pub(crate) fn find_installed_package(
     ws_dir: &Path,
     root: &Path,
     target_pkg: &str,
@@ -333,23 +350,35 @@ fn find_installed_package(
         }
     }
 
-    // Check .pnpm virtual store if present
+    // Check .pnpm virtual store if present. Directories are named
+    // `<name>@<version>[_peers]`, with `/` in scoped names written as `+`.
     let pnpm_store = root.join("node_modules").join(".pnpm");
     if pnpm_store.is_dir() {
+        let prefix = format!("{}@", target_pkg.replace('/', "+"));
         if let Ok(entries) = fs::read_dir(&pnpm_store) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let clean_name = name.strip_prefix('/').unwrap_or(&name);
-                if clean_name.starts_with(target_pkg) {
-                    let candidate = entry.path().join("node_modules").join(target_pkg);
-                    if candidate.is_dir() {
-                        let manifest = candidate.join("package.json");
-                        if manifest.is_file() {
-                            if let Ok(content) = fs::read_to_string(&manifest) {
-                                return (Some(candidate), Some(content));
-                            }
-                        }
-                    }
+            let mut matches: Vec<_> = entries
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    name.strip_prefix('/').unwrap_or(&name).starts_with(&prefix)
+                })
+                .collect();
+            matches.sort_by_key(|entry| entry.file_name());
+            for entry in matches {
+                let candidate = entry.path().join("node_modules").join(target_pkg);
+                // Links inside the virtual store may point anywhere; apply the
+                // same containment rule as the top-level lookup.
+                let Ok(canonical) = candidate.canonicalize() else {
+                    continue;
+                };
+                if !canonical.starts_with(root) {
+                    warnings.push(format!(
+                        "security refusal: package link escapes repository root for {target_pkg}"
+                    ));
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(canonical.join("package.json")) {
+                    return (Some(canonical), Some(content));
                 }
             }
         }

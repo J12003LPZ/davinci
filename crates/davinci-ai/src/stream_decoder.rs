@@ -54,6 +54,9 @@ pub fn decoder_for(model: &Model) -> Option<Box<dyn StreamDecoder>> {
         "anthropic-messages" => Some(Box::new(
             crate::stream_decoder_anthropic::AnthropicDecoder::new(model),
         )),
+        "pi-messages" => Some(Box::new(crate::stream_decoder_pi::PiMessagesDecoder::new(
+            model,
+        ))),
         _ => None,
     }
 }
@@ -67,6 +70,7 @@ pub fn supports_incremental_stream(model: &Model) -> bool {
             | "openai-codex-responses"
             | "openai-completions"
             | "anthropic-messages"
+            | "pi-messages"
     )
 }
 
@@ -94,6 +98,9 @@ pub struct SseFramer {
     data: String,
     has_data: bool,
     saw_done: bool,
+    /// The first `data:` payload that was not valid JSON, so a reader can
+    /// fail the turn instead of reporting a stream with a hole as complete.
+    malformed: Option<String>,
 }
 
 /// One SSE frame: the `event:` name (often empty) and the parsed `data:` JSON.
@@ -138,6 +145,11 @@ impl SseFramer {
         self.saw_done
     }
 
+    /// Description of the first frame whose payload failed to parse, if any.
+    pub fn malformed(&self) -> Option<&str> {
+        self.malformed.as_deref()
+    }
+
     /// End of input: whatever is pending is a frame too.
     pub fn flush(&mut self) -> Option<SseFrame> {
         if !self.has_data {
@@ -159,6 +171,9 @@ impl SseFramer {
                 if crate::trace::enabled() {
                     crate::trace::log(&format!("sse frame dropped: {err} ({} bytes)", data.len()));
                 }
+                self.malformed.get_or_insert_with(|| {
+                    format!("malformed SSE frame ({} bytes): {err}", data.len())
+                });
                 return None;
             }
         };

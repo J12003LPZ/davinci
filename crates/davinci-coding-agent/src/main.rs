@@ -8518,6 +8518,16 @@ fn login_provider_with_wait(
         println!("Usage: /login <provider> <api-key>");
         return Ok(false);
     }
+    if davinci_ai::is_device_code_provider(provider) {
+        let device = davinci_ai::start_device_authorization(provider)?;
+        println!(
+            "Open {} and enter code {}",
+            device.verification_uri, device.user_code
+        );
+        println!("Waiting for {provider} to confirm the login...");
+        let tokens = davinci_ai::poll_device_authorization(&device, &|| false)?;
+        return store_oauth_tokens(&mut storage, provider, tokens);
+    }
     if let Some(request) = davinci_ai::fresh_authorize_request_checked(provider)? {
         if let Ok(code) = std::env::var("PI_OAUTH_CODE") {
             let callback = davinci_ai::AuthorizationCallbackInput {
@@ -12819,6 +12829,14 @@ fn start_login(
     session.open_login_dialog(provider, name, None);
     if let Some(key) = key {
         login_provider(provider, Some(key))?;
+        if let Some(dialog) = &mut session.chrome.login_dialog {
+            dialog.show_progress(&format!("stored credentials for {provider}"));
+        }
+        return Ok(());
+    }
+    if davinci_ai::is_device_code_provider(provider) {
+        // Device login prints the code and blocks until it is approved.
+        login_provider(provider, None)?;
         if let Some(dialog) = &mut session.chrome.login_dialog {
             dialog.show_progress(&format!("stored credentials for {provider}"));
         }

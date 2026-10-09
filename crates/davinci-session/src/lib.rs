@@ -136,7 +136,7 @@ impl JsonlSession {
     }
 
     pub fn open(path: &Path) -> Result<Self, SessionError> {
-        let content = fs::read_to_string(path).map_err(|err| {
+        let (content, _) = read_session_text(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 SessionError::not_found(format!("Session file not found: {}", path.display()))
             } else {
@@ -154,7 +154,7 @@ impl JsonlSession {
         let last_index = physical.len().saturating_sub(1);
         let header = match parse_header(first) {
             Ok(header) => header,
-            Err(_err) if first.contains("\"type\"") || first.contains("\"role\"") => {
+            Err(_err) if is_legacy_first_line(first) => {
                 return migrate_v3_to_v4(
                     path,
                     first,
@@ -202,10 +202,14 @@ impl JsonlSession {
                     session.records.push(record);
                 }
                 Ok(
-                    SessionMutation::Lane { .. }
-                    | SessionMutation::FactName { .. }
-                    | SessionMutation::FactLabel { .. },
-                ) => {}
+                    SessionMutation::Lane { seq, .. }
+                    | SessionMutation::FactName { seq, .. }
+                    | SessionMutation::FactLabel { seq, .. },
+                ) => {
+                    // Repository-written lane and fact mutations share the
+                    // sequence; skipping them would reuse their seq on append.
+                    session.max_seq = session.max_seq.max(seq);
+                }
                 Err(_) if index == last_index && !terminated => break,
                 Err(err) => {
                     return Err(SessionError::invalid_entry(format!(
@@ -346,23 +350,59 @@ impl JsonlSession {
         Ok(self.leaf_id.clone().unwrap_or_default())
     }
 
+    /// Fork the root-to-`entry_id` ancestry into a new session. Entries keep
+    /// their IDs, as in the TS `createBranchedSession`, so references such as
+    /// a compaction's `firstKeptEntryId` still resolve; entries on sibling
+    /// branches are not copied.
     pub fn fork(&self, entry_id: &str, sessions_root: &Path) -> Result<Self, SessionError> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == entry_id)
-            .ok_or_else(|| SessionError::not_found(format!("Entry {entry_id} not found")))?;
+        let path = self.ancestry(entry_id)?;
         let mut forked = Self::create(sessions_root, &self.header.cwd, None)?;
         forked.prepare_first_write()?;
         forked.header.parent_session_id = Some(self.header.id.clone());
         forked.rewrite_header()?;
-        for entry in self.entries.iter().take(index + 1) {
+        for entry in path {
             let mut clone = entry.clone();
-            clone.id = Uuid::new_v4().to_string();
             clone.parent_id = forked.leaf_id.clone();
             forked.append_entry(clone)?;
         }
         Ok(forked)
+    }
+
+    /// Entries from the root to `entry_id`, oldest first.
+    fn ancestry(&self, entry_id: &str) -> Result<Vec<&SessionEntry>, SessionError> {
+        let by_id: std::collections::HashMap<_, _> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect();
+        let mut path = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut current = by_id.get(entry_id).copied();
+        if current.is_none() {
+            return Err(SessionError::not_found(format!(
+                "Entry {entry_id} not found"
+            )));
+        }
+        while let Some(entry) = current {
+            if !seen.insert(entry.id.as_str()) {
+                return Err(SessionError::invalid_entry(format!(
+                    "Session branch contains a cycle at {}",
+                    entry.id
+                )));
+            }
+            path.push(entry);
+            current = match entry.parent_id.as_deref() {
+                Some(parent) => Some(by_id.get(parent).copied().ok_or_else(|| {
+                    SessionError::invalid_entry(format!(
+                        "Entry {} references missing parent {parent}",
+                        entry.id
+                    ))
+                })?),
+                None => None,
+            };
+        }
+        path.reverse();
+        Ok(path)
     }
 
     pub fn clone_session(&self, sessions_root: &Path) -> Result<Self, SessionError> {
@@ -550,21 +590,71 @@ impl JsonlSession {
     }
 }
 
+/// Whether the first line has the legacy (v3) shape: a JSON object whose own
+/// top-level `type` or `role` is a string, and that is not a v4-style header.
+/// Substrings nested in metadata must not select migration, and a recognized
+/// header with an unsupported version must fail closed instead.
+fn is_legacy_first_line(first: &str) -> bool {
+    let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_str::<serde_json::Value>(first.trim())
+    else {
+        return false;
+    };
+    if object.contains_key("kind") {
+        return false;
+    }
+    ["type", "role"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(serde_json::Value::is_string))
+}
+
+/// Reads a session file as text. A suffix that is not valid UTF-8 and lies in
+/// the unterminated final record is a crash-torn write: it is left out (and
+/// reported through the returned flag) so the intact prefix stays readable.
+/// Invalid UTF-8 in any completed record is still an error.
+pub(crate) fn read_session_text(path: &Path) -> std::io::Result<(String, bool)> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    };
+    let bytes = fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok((text, false)),
+        Err(err) => {
+            let valid_up_to = err.utf8_error().valid_up_to();
+            let bytes = err.into_bytes();
+            let last_newline = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .filter(|index| valid_up_to > *index)
+                .ok_or_else(invalid)?;
+            let text = String::from_utf8(bytes[..=last_newline].to_vec()).map_err(|_| invalid())?;
+            Ok((text, true))
+        }
+    }
+}
+
 fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
-    let content = fs::read_to_string(path)
+    let bytes = fs::read(path)
         .map_err(|err| SessionError::storage(format!("Unable to inspect session tail: {err}")))?;
-    if content.is_empty() || content.ends_with('\n') {
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
         return Ok(());
     }
 
-    let tail = content
-        .rsplit_once('\n')
-        .map(|(_, tail)| tail)
-        .unwrap_or(&content);
-    let complete = if content.contains('\n') {
-        parse_mutation(tail).is_ok()
-    } else {
-        parse_header(tail).is_ok()
+    // Locate the tail as bytes: a write torn inside a multibyte character
+    // leaves a tail that is not valid UTF-8, and that is still a torn tail.
+    let has_newline = bytes.contains(&b'\n');
+    let tail_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let tail = &bytes[tail_start..];
+    let complete = match std::str::from_utf8(tail) {
+        Ok(text) if has_newline => parse_mutation(text).is_ok(),
+        Ok(text) => parse_header(text).is_ok(),
+        Err(_) => false,
     };
     if complete {
         let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
@@ -584,7 +674,7 @@ fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
         let backup = PathBuf::from(backup);
         let preserve = || -> std::io::Result<()> {
             let mut file = davinci_sys::fs::create_new_private(&backup)?;
-            file.write_all(tail.as_bytes())?;
+            file.write_all(tail)?;
             file.sync_all()?;
             sync_parent(&backup)
         };

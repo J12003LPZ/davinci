@@ -29,6 +29,7 @@ mod attribution;
 mod auth;
 pub mod cache;
 mod catalog;
+mod cloud_auth;
 mod codex;
 pub mod codex_capabilities;
 pub mod codex_flags;
@@ -38,6 +39,7 @@ pub mod codex_transport;
 pub mod codex_usage;
 mod codex_ws;
 mod deferred;
+mod device_login;
 pub mod fixtures;
 mod http;
 mod http_proxy;
@@ -60,6 +62,7 @@ pub mod responses_tools;
 mod retry;
 pub mod service_tier;
 mod shell;
+mod stream_decoder_pi;
 pub use service_tier::CodexServiceTier;
 mod stream;
 pub mod subscription_policy;
@@ -116,6 +119,10 @@ pub use codex_models::{
 };
 pub use deferred::{
     cancel_deferred, fetch_deferred, DeferredFetchOptions, DeferredFetchResult, DeferredHandle,
+};
+pub use device_login::{
+    copilot_token, device_token_request, is_device_code_provider, poll_device_authorization,
+    start_device_authorization, DeviceAuthorization, DEVICE_CODE_GRANT,
 };
 pub use http_proxy::{
     resolve_http_proxy_url_for_target, tcp_connect_via_http_proxy,

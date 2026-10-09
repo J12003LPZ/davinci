@@ -353,6 +353,7 @@ fn older_native_custom_call_repairs_missing_metadata_across_model_projection() {
             &ResponsesInputOptions {
                 native_items_model: model,
                 custom_tools: &[],
+                ..ResponsesInputOptions::default()
             },
         );
         assert_eq!(input[0]["type"], "custom_tool_call");

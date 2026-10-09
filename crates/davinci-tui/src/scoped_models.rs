@@ -279,6 +279,7 @@ impl ScopedModelsSelector {
             "\x03" => {
                 if !self.query.is_empty() {
                     self.query.clear();
+                    self.selected = 0;
                     ScopedModelsAction::None
                 } else {
                     ScopedModelsAction::Cancel
@@ -287,10 +288,13 @@ impl ScopedModelsSelector {
             "\x1b" => ScopedModelsAction::Cancel,
             "\x7f" | "\x08" => {
                 self.query.pop();
+                // The filtered list changed; the old row index may not exist.
+                self.selected = 0;
                 ScopedModelsAction::None
             }
             other if !other.chars().any(|ch| ch.is_control()) => {
                 self.query.push_str(other);
+                self.selected = 0;
                 ScopedModelsAction::None
             }
             _ => ScopedModelsAction::None,
@@ -318,7 +322,11 @@ impl ScopedModelsSelector {
             {
                 self.enabled_ids = move_id(self.enabled_ids.clone(), &id, delta);
                 self.dirty = true;
-                self.selected = (self.selected as isize + delta) as usize;
+                // Hidden or disabled rows can sit between the swapped models,
+                // so follow the moved model by id, not by row arithmetic.
+                if let Some(position) = self.filtered_ids().iter().position(|item| item == &id) {
+                    self.selected = position;
+                }
                 return self.notify_change();
             }
         }
@@ -414,6 +422,38 @@ impl Component for ScopedModelsSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn searching_resets_the_selection_so_enter_acts_on_a_visible_row() {
+        let mut selector = ScopedModelsSelector::new(models(), None);
+        selector.selected = 2; // "three", near the end of the unfiltered list
+        selector.handle_key("t");
+        selector.handle_key("w");
+        selector.handle_key("o");
+        assert_eq!(selector.filtered_ids(), vec!["faux/two".to_string()]);
+        assert_eq!(selector.selected, 0);
+        selector.handle_key("\r");
+        assert!(is_enabled(&selector.enabled_ids, "faux/two"));
+        assert!(!is_enabled(&selector.enabled_ids, "faux/three"));
+    }
+
+    #[test]
+    fn reorder_follows_the_moved_model_across_disabled_rows() {
+        let mut selector =
+            ScopedModelsSelector::new(models(), Some(vec!["faux/one".into(), "faux/three".into()]));
+        // Display order: one, three (enabled) then two (disabled).
+        assert_eq!(
+            selector.filtered_ids(),
+            vec!["faux/one", "faux/three", "faux/two"]
+        );
+        selector.selected = 0;
+        selector.handle_key("\x1b[1;3B"); // Alt+Down: move "one" below "three"
+        assert_eq!(
+            selector.filtered_ids(),
+            vec!["faux/three", "faux/one", "faux/two"]
+        );
+        assert_eq!(selector.selected, 1);
+    }
 
     fn models() -> Vec<ScopedModel> {
         vec![

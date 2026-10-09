@@ -162,6 +162,37 @@ pub trait CodeModeBroker: Send + Sync {
     fn search(&self, query: ToolQuery) -> Result<ToolPage, CodeModeError>;
     fn describe(&self, canonical_name: &str) -> Result<serde_json::Value, CodeModeError>;
     fn call(&self, call: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError>;
+    /// Canonical names of every tool the script may call, for the host's
+    /// launch-time catalog. Brokers that meter `search` should override this
+    /// so the host's bootstrap does not spend the guest's metadata budget.
+    fn catalog(&self, max_tools: usize) -> Result<Vec<String>, CodeModeError> {
+        let mut names = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.search(ToolQuery {
+                query: String::new(),
+                limit: 20,
+                cursor: cursor.clone(),
+            })?;
+            if names.len() + page.tools.len() > max_tools {
+                return Err(CodeModeError::new(
+                    "LIMIT_EXCEEDED",
+                    "capability catalog limit",
+                ));
+            }
+            names.extend(page.tools.into_iter().map(|tool| tool.canonical_name));
+            match page.cursor {
+                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                None => return Ok(names),
+                _ => {
+                    return Err(CodeModeError::new(
+                        "PROTOCOL_ERROR",
+                        "invalid catalog cursor",
+                    ))
+                }
+            }
+        }
+    }
 }
 pub trait CodeModeHost: Send + Sync {
     fn execute(

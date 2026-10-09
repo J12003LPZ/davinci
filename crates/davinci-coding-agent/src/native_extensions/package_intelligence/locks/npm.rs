@@ -14,6 +14,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
         lockfile_version: Some(lockfile_version_num.to_string()),
         packages: BTreeMap::new(),
         workspace_packages: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     // If lockfileVersion >= 2, packages map is preferred
@@ -56,6 +57,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                     integrity: integrity.clone(),
                     dependencies: dependencies.clone(),
                 };
+                data.record_resolution(&locked);
                 data.workspace_packages
                     .entry(ws_prefix.to_string())
                     .or_default()
@@ -78,6 +80,7 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
                     integrity,
                     dependencies,
                 };
+                data.record_resolution(&locked);
                 data.packages.insert(pkg_name.to_string(), locked);
             }
         }
@@ -86,17 +89,14 @@ pub fn parse(content: &str) -> Result<LockfileData, String> {
     // Fallback or v1 dependencies
     if data.packages.is_empty() {
         if let Some(deps) = root.get("dependencies").and_then(Value::as_object) {
-            collect_v1_dependencies(deps, &mut data.packages);
+            collect_v1_dependencies(deps, &mut data);
         }
     }
 
     Ok(data)
 }
 
-fn collect_v1_dependencies(
-    deps: &serde_json::Map<String, Value>,
-    out: &mut BTreeMap<String, LockedPackage>,
-) {
+fn collect_v1_dependencies(deps: &serde_json::Map<String, Value>, data: &mut LockfileData) {
     for (name, val) in deps {
         let version = val
             .get("version")
@@ -122,15 +122,17 @@ fn collect_v1_dependencies(
                 }
             }
         }
-        out.entry(name.clone()).or_insert_with(|| LockedPackage {
+        let locked = LockedPackage {
             name: name.clone(),
             version,
             resolved,
             integrity,
             dependencies,
-        });
+        };
+        data.record_resolution(&locked);
+        data.packages.entry(name.clone()).or_insert(locked);
         if let Some(nested) = val.get("dependencies").and_then(Value::as_object) {
-            collect_v1_dependencies(nested, out);
+            collect_v1_dependencies(nested, data);
         }
     }
 }

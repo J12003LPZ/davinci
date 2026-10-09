@@ -288,9 +288,86 @@ impl AssistantMessageEvent {
             Self::Error { error, .. } => error,
         }
     }
+
+    fn partial_mut(&mut self) -> Option<&mut Arc<AssistantMessage>> {
+        match self {
+            Self::Start { partial }
+            | Self::TextStart { partial, .. }
+            | Self::TextDelta { partial, .. }
+            | Self::TextEnd { partial, .. }
+            | Self::ThinkingStart { partial, .. }
+            | Self::ThinkingDelta { partial, .. }
+            | Self::ThinkingEnd { partial, .. }
+            | Self::ToolcallStart { partial, .. }
+            | Self::ToolcallDelta { partial, .. }
+            | Self::ToolcallEnd { partial, .. } => Some(partial),
+            Self::Done { .. } | Self::Error { .. } => None,
+        }
+    }
+}
+
+/// Keeps the event history of a running stream from retaining every
+/// cumulative snapshot. Once a newer snapshot appears, events already
+/// delivered live drop theirs for the stream's first (near-empty) snapshot;
+/// `finish` then points every event at one copy of the final message. Each
+/// event is rewritten at most twice, so retention stays linear.
+#[derive(Default)]
+pub(crate) struct PartialRetention {
+    placeholder: Option<Arc<AssistantMessage>>,
+    latest: Option<Arc<AssistantMessage>>,
+    compacted: usize,
+}
+
+impl PartialRetention {
+    pub(crate) fn compact(&mut self, events: &mut [AssistantMessageEvent]) {
+        let Some(latest) = events
+            .iter_mut()
+            .rev()
+            .find_map(|event| event.partial_mut().map(|partial| Arc::clone(partial)))
+        else {
+            return;
+        };
+        if self
+            .latest
+            .as_ref()
+            .is_some_and(|known| Arc::ptr_eq(known, &latest))
+        {
+            return;
+        }
+        self.latest = Some(Arc::clone(&latest));
+        let mut first_latest = None;
+        for (offset, event) in events[self.compacted..].iter_mut().enumerate() {
+            let Some(partial) = event.partial_mut() else {
+                continue;
+            };
+            let placeholder = self.placeholder.get_or_insert_with(|| Arc::clone(partial));
+            if Arc::ptr_eq(partial, &latest) {
+                first_latest.get_or_insert(self.compacted + offset);
+            } else if !Arc::ptr_eq(partial, placeholder) {
+                *partial = Arc::clone(placeholder);
+            }
+        }
+        if let Some(index) = first_latest {
+            self.compacted = index;
+        }
+    }
+
+    pub(crate) fn finish(events: &mut [AssistantMessageEvent], message: &AssistantMessage) {
+        let shared = Arc::new(message.clone());
+        for partial in events
+            .iter_mut()
+            .filter_map(AssistantMessageEvent::partial_mut)
+        {
+            *partial = Arc::clone(&shared);
+        }
+    }
 }
 
 pub type StreamEvent = AssistantMessageEvent;
+
+/// Total bytes one provider stream may deliver. One frame is separately
+/// capped by `stream_reader::MAX_FRAME_BYTES`.
+const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ProviderCompletionEnvelope {
@@ -400,15 +477,20 @@ fn read_provider_stream(
     let mut aborted = false;
     let mut read_error: Option<String> = None;
 
-    let feed = |data: &Value,
-                decoder: &mut dyn crate::stream_decoder::StreamDecoder,
-                events: &mut Vec<AssistantMessageEvent>,
-                on_event: &mut dyn FnMut(&AssistantMessageEvent)| {
+    // Raw frames are only needed to assemble native Responses output.
+    let keep_raw_events = native_responses_api(model);
+    let mut stream_bytes = 0usize;
+    let mut retention = PartialRetention::default();
+    let mut feed = |data: &Value,
+                    decoder: &mut dyn crate::stream_decoder::StreamDecoder,
+                    events: &mut Vec<AssistantMessageEvent>,
+                    on_event: &mut dyn FnMut(&AssistantMessageEvent)| {
         let start = events.len();
         decoder.feed(data, events);
         for event in &events[start..] {
             on_event(event);
         }
+        retention.compact(events);
     };
 
     loop {
@@ -426,6 +508,11 @@ fn read_provider_stream(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        stream_bytes = stream_bytes.saturating_add(line.len());
+        if stream_bytes > MAX_STREAM_BYTES {
+            read_error = Some("provider stream exceeds 256 MiB".into());
+            break;
+        }
         if frames == 0 {
             if raw.len().saturating_add(line.len()) > crate::stream_reader::MAX_FRAME_BYTES {
                 read_error = Some("non-streaming provider response exceeds 16 MiB".into());
@@ -443,7 +530,9 @@ fn read_provider_stream(
                     crate::trace::describe_event(&frame.data)
                 ));
             }
-            raw_events.push(frame.data.clone());
+            if keep_raw_events {
+                raw_events.push(frame.data.clone());
+            }
             feed(&frame.data, decoder, &mut events, on_event);
             if decoder.is_done() {
                 break;
@@ -465,8 +554,19 @@ fn read_provider_stream(
         if let Some(frame) = framer.flush() {
             frames += 1;
             raw.clear();
-            raw_events.push(frame.data.clone());
+            if keep_raw_events {
+                raw_events.push(frame.data.clone());
+            }
             feed(&frame.data, decoder, &mut events, on_event);
+        }
+    }
+
+    if !aborted && read_error.is_none() {
+        // A frame that failed to parse may have carried content or tool-call
+        // bytes; a terminal event after the hole must not make the turn
+        // look complete.
+        if let Some(reason) = framer.malformed() {
+            read_error = Some(format!("Provider stream contained a {reason}"));
         }
     }
 
@@ -507,6 +607,7 @@ fn read_provider_stream(
         };
         on_event(&event);
         events.push(event);
+        PartialRetention::finish(&mut events, &message);
         return Ok((message, events, None));
     }
 
@@ -526,6 +627,7 @@ fn read_provider_stream(
     for event in &events[start..] {
         on_event(event);
     }
+    PartialRetention::finish(&mut events, &message);
     let native = if native_responses_api(model)
         && message.stop_reason != Some(StopReason::Error)
         && message.stop_reason != Some(StopReason::Aborted)
@@ -648,12 +750,15 @@ pub fn live_complete_with(
     }
     let url = request_url_checked(model, auth)?;
     crate::provider_observation::validate_request(model, auth, &options, body, &url)?;
-    let headers = crate::merge_provider_attribution_headers(
+    let mut headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
         &collect_request_headers(model, auth, &options),
     );
+    headers.extend(crate::cloud_auth::request_auth_headers(
+        model, auth, &url, body,
+    )?);
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let (text, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
@@ -841,7 +946,8 @@ fn live_complete_streaming_with_sink_envelope_inner(
             tools.len()
         ));
     }
-    if incremental {
+    // pi-messages always streams and has no `stream` field.
+    if incremental && model.api != "pi-messages" {
         if let Value::Object(map) = &mut body {
             map.insert("stream".into(), Value::Bool(true));
             // TS asks completions endpoints for a trailing usage chunk.
@@ -932,12 +1038,15 @@ fn live_complete_streaming_with_sink_envelope_inner(
         }
     }
     let url = request_url_checked(model, auth)?;
-    let headers = crate::merge_provider_attribution_headers(
+    let mut headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
         &collect_request_headers(model, auth, options),
     );
+    headers.extend(crate::cloud_auth::request_auth_headers(
+        model, auth, &url, body,
+    )?);
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd =
         model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model);
@@ -1155,7 +1264,9 @@ fn collect_request_headers(
     }
     let mut headers = Vec::new();
     for (key, value) in &auth.headers {
-        headers.push((key.clone(), value.clone()));
+        if !crate::auth::is_url_var_header(key) {
+            headers.push((key.clone(), value.clone()));
+        }
     }
     for (key, value) in &model.headers {
         headers.push((key.clone(), value.clone()));
@@ -1331,10 +1442,13 @@ pub fn request_body_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Value {
+    if model.api == "pi-messages" {
+        // Its own `{ model, context, options }` envelope; none of the
+        // per-provider body adjustments below apply.
+        return pi_messages_body(model, messages, system, tools, options);
+    }
     let mut body = match model.api.as_str() {
-        "anthropic-messages" | "pi-messages" => {
-            anthropic_body(model, messages, system, tools, options)
-        }
+        "anthropic-messages" => anthropic_body(model, messages, system, tools, options),
         "google-generative-ai" | "google-vertex" => {
             google_body(model, messages, system, tools, options)
         }
@@ -1455,6 +1569,8 @@ pub struct ResponsesInputOptions<'a> {
     pub native_items_model: Option<&'a str>,
     /// Tools represented as Responses custom/freeform tools.
     pub custom_tools: &'a [&'a str],
+    /// Send image content (the model accepts image input).
+    pub images: bool,
 }
 
 pub fn attach_native_items(chat: &mut ChatMessage, items: &[Value], model_key: &str) {
@@ -1479,6 +1595,23 @@ fn native_items<'m>(message: &'m ChatMessage, model_key: Option<&str>) -> Option
 }
 
 #[doc(hidden)]
+/// Whether the model accepts image input.
+fn model_accepts_images(model: &Model) -> bool {
+    model.input.iter().any(|kind| kind == "image")
+}
+
+/// `(mime type, base64 data)` of every image block in a message.
+fn message_images(message: &ChatMessage) -> Vec<(&str, &str)> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            MessageContent::Image { data, mime_type } => Some((mime_type.as_str(), data.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     openai_responses_input_with(messages, &ResponsesInputOptions::default())
 }
@@ -1576,7 +1709,12 @@ fn openai_responses_input_with_prefix(
             continue;
         }
         let text = content_text(&message.content);
-        if text.is_empty() {
+        let images = if options.images {
+            message_images(message)
+        } else {
+            Vec::new()
+        };
+        if text.is_empty() && images.is_empty() {
             continue;
         }
         let role = match message.role.as_str() {
@@ -1584,10 +1722,20 @@ fn openai_responses_input_with_prefix(
             "system" => "system",
             _ => "user",
         };
+        let mut parts = Vec::new();
+        if !text.is_empty() {
+            parts.push(serde_json::json!({"type": "input_text", "text": text}));
+        }
+        for (mime, data) in images {
+            parts.push(serde_json::json!({
+                "type": "input_image",
+                "image_url": format!("data:{mime};base64,{data}"),
+            }));
+        }
         input.push(serde_json::json!({
             "type": "message",
             "role": role,
-            "content": [{"type": "input_text", "text": text}],
+            "content": parts,
         }));
     }
     input
@@ -1641,6 +1789,7 @@ fn openai_responses_body(
     let input_options = ResponsesInputOptions {
         native_items_model: Some(&model_key),
         custom_tools: &custom_tool_names,
+        images: model_accepts_images(model),
     };
     let mut input = openai_responses_input_with(messages, &input_options);
     if cache_plan.use_stable_bootstrap_breakpoint {
@@ -1857,6 +2006,7 @@ fn apply_native_responses_resume(
         &ResponsesInputOptions {
             native_items_model: Some(&model_key),
             custom_tools: &custom_tool_names,
+            images: model_accepts_images(model),
         },
         &input,
     );
@@ -1927,7 +2077,9 @@ pub fn live_stream(
     let url = request_url_checked(model, auth)?;
     let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(&url);
     for (key, value) in &auth.headers {
-        request = request.set(key, value);
+        if !crate::auth::is_url_var_header(key) {
+            request = request.set(key, value);
+        }
     }
     for (key, value) in &model.headers {
         request = request.set(key, value);
@@ -1935,7 +2087,7 @@ pub fn live_stream(
     if let Some(key) = &auth.api_key {
         if model.api == "google-generative-ai" {
             request = request.set("x-goog-api-key", key);
-        } else if model.api == "anthropic-messages" || model.api == "pi-messages" {
+        } else if model.api == "anthropic-messages" {
             request = request
                 .set("x-api-key", key)
                 .set("anthropic-version", "2023-06-01");
@@ -2043,12 +2195,23 @@ fn bedrock_body(
     } else {
         None
     };
+    let vision = model_accepts_images(model);
     let mut converted: Vec<Value> = messages
         .iter()
         .map(|message| {
+            let mut content = vec![serde_json::json!({"text": content_text(&message.content)})];
+            if vision {
+                for (mime, data) in message_images(message) {
+                    let format = mime.rsplit('/').next().unwrap_or("png");
+                    let format = if format == "jpg" { "jpeg" } else { format };
+                    content.push(serde_json::json!({
+                        "image": {"format": format, "source": {"bytes": data}},
+                    }));
+                }
+            }
             serde_json::json!({
                 "role": if message.role == "assistant" { "assistant" } else { "user" },
-                "content": [{"text": content_text(&message.content)}],
+                "content": content,
             })
         })
         .collect();
@@ -2154,14 +2317,20 @@ fn request_url_checked(model: &Model, auth: &ResolvedAuth) -> Result<String, Str
     Ok(request_url(model, auth))
 }
 
-pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
-    let base = model
+pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
+    let mut base = model
         .base_url
         .clone()
         .unwrap_or_else(|| "https://api.openai.com/v1".into());
+    // Route templates such as Cloudflare's `{CLOUDFLARE_ACCOUNT_ID}` are filled
+    // from the values the credentials were validated with.
+    for (name, value) in crate::auth::url_vars(auth) {
+        base = base.replace(&format!("{{{name}}}"), value);
+    }
     let base = base.trim_end_matches('/');
     match model.api.as_str() {
-        "anthropic-messages" | "pi-messages" => format!("{base}/v1/messages"),
+        "anthropic-messages" => format!("{base}/v1/messages"),
+        "pi-messages" => format!("{base}/messages"),
         "google-generative-ai" => format!("{base}/models/{}:generateContent", model.id),
         "google-vertex" => vertex_url(
             model,
@@ -2174,7 +2343,12 @@ pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
             format!("{base}/responses")
         }
         "mistral-conversations" => format!("{base}/v1/conversations"),
-        "bedrock-converse-stream" => format!("{base}/model/{}/converse", model.id),
+        // Model IDs and inference-profile ARNs carry ':' and '/': one path
+        // segment, percent-encoded (SigV4 signs the encoded form).
+        "bedrock-converse-stream" => format!(
+            "{base}/model/{}/converse",
+            url::form_urlencoded::byte_serialize(model.id.as_bytes()).collect::<String>()
+        ),
         _ => format!("{base}/chat/completions"),
     }
 }
@@ -2227,9 +2401,28 @@ fn openai_body(
                 "tool_calls": tool_calls,
             }));
         } else {
+            let images = if model_accepts_images(model) {
+                message_images(message)
+            } else {
+                Vec::new()
+            };
+            let content = if images.is_empty() {
+                Value::String(content_text(&message.content))
+            } else {
+                let mut parts = vec![
+                    serde_json::json!({"type": "text", "text": content_text(&message.content)}),
+                ];
+                for (mime, data) in images {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{mime};base64,{data}")},
+                    }));
+                }
+                Value::Array(parts)
+            };
             out.push(serde_json::json!({
                 "role": message.role,
-                "content": content_text(&message.content),
+                "content": content,
             }));
         }
     }
@@ -2412,6 +2605,56 @@ fn apply_openai_thinking(body: &mut Value, model: &Model, options: &StreamOption
     }
 }
 
+/// TS `pi-messages` request: `{ model, context, options }` posted to
+/// `<baseUrl>/messages`, where `context` is pi's own message shape.
+fn pi_messages_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+) -> Value {
+    let mut context = serde_json::json!({ "messages": messages });
+    if let Some(system) = system.filter(|system| !system.is_empty()) {
+        context["systemPrompt"] = Value::String(system.into());
+    }
+    if !tools.is_empty() {
+        context["tools"] = tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect();
+    }
+    let mut request_options = serde_json::Map::new();
+    request_options.insert(
+        "maxTokens".into(),
+        Value::from(options.max_tokens.unwrap_or(model.max_tokens)),
+    );
+    if let Some(level) = options
+        .thinking_level
+        .and_then(crate::thinking::clamp_reasoning)
+        .and_then(|level| serde_json::to_value(level).ok())
+    {
+        request_options.insert("reasoning".into(), level);
+    }
+    if let Some(retention) = &options.cache_retention {
+        request_options.insert("cacheRetention".into(), Value::String(retention.clone()));
+    }
+    if let Some(session_id) = &options.session_id {
+        request_options.insert("sessionId".into(), Value::String(session_id.clone()));
+    }
+    serde_json::json!({
+        "model": model.id,
+        "context": context,
+        "options": request_options,
+    })
+}
+
 fn anthropic_body(
     model: &Model,
     messages: &[ChatMessage],
@@ -2480,9 +2723,30 @@ fn anthropic_body(
                     }));
                 serde_json::json!({"role":"assistant","content": content})
             } else {
+                let images = if model_accepts_images(model) {
+                    message_images(message)
+                } else {
+                    Vec::new()
+                };
+                let content = if images.is_empty() {
+                    Value::String(content_text(&message.content))
+                } else {
+                    let mut blocks = Vec::new();
+                    for (mime, data) in images {
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": data},
+                        }));
+                    }
+                    let text = content_text(&message.content);
+                    if !text.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": text}));
+                    }
+                    Value::Array(blocks)
+                };
                 serde_json::json!({
                     "role": if message.role == "assistant" { "assistant" } else { "user" },
-                    "content": content_text(&message.content),
+                    "content": content,
                 })
             }
         })
@@ -2576,9 +2840,17 @@ fn google_body(
     let contents: Vec<Value> = messages
         .iter()
         .map(|message| {
+            let mut parts = vec![serde_json::json!({"text": content_text(&message.content)})];
+            if model_accepts_images(model) {
+                for (mime, data) in message_images(message) {
+                    parts.push(serde_json::json!({
+                        "inlineData": {"mimeType": mime, "data": data},
+                    }));
+                }
+            }
             serde_json::json!({
                 "role": if message.role == "assistant" { "model" } else { "user" },
-                "parts": [{"text": content_text(&message.content)}],
+                "parts": parts,
             })
         })
         .collect();
@@ -2684,13 +2956,97 @@ fn usage_from_google_metadata(model: &Model, metadata: &Value) -> Usage {
     computed
 }
 
+/// Every text part of a non-streaming reply, in order. Each wire format is
+/// read whole: a reply with several text parts must not lose all but the first.
+fn response_text_parts(value: &Value) -> Vec<String> {
+    let mut parts = Vec::new();
+    fn push(parts: &mut Vec<String>, text: &str) {
+        if !text.is_empty() {
+            parts.push(text.to_string());
+        }
+    }
+    match value.pointer("/choices/0/message/content") {
+        Some(Value::String(text)) => push(&mut parts, text),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    push(&mut parts, text);
+                }
+            }
+        }
+        _ => {}
+    }
+    if parts.is_empty() {
+        if let Some(blocks) = value.get("content").and_then(Value::as_array) {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str).unwrap_or("text") == "text" {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        push(&mut parts, text);
+                    }
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        if let Some(items) = value
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+        {
+            for item in items {
+                if item.get("thought").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    push(&mut parts, text);
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        if let Some(text) = value.pointer("/output_text").and_then(Value::as_str) {
+            push(&mut parts, text);
+        }
+    }
+    parts
+}
+
+/// Whether a non-streaming reply stopped because it ran out of output tokens.
+fn response_hit_token_limit(value: &Value) -> bool {
+    let reason = |pointer: &str| value.pointer(pointer).and_then(Value::as_str);
+    matches!(reason("/choices/0/finish_reason"), Some("length"))
+        || matches!(reason("/stop_reason"), Some("max_tokens"))
+        || matches!(reason("/stopReason"), Some("max_tokens"))
+        || matches!(
+            reason("/candidates/0/finishReason"),
+            Some("MAX_TOKENS" | "max_tokens")
+        )
+}
+
 pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(_) if raw.lines().any(|line| line.starts_with("data:")) => {
             return fixture_complete(model, &[], raw);
         }
-        Err(_) => Value::Null,
+        Err(_) if raw.trim().is_empty() => Value::Null,
+        Err(err) => {
+            // An HTML error page or truncated JSON behind an HTTP 200 is a
+            // failed exchange, not assistant text. Report only its size: the
+            // body may carry user content or provider prompt fragments.
+            return AssistantMessage {
+                extra: Default::default(),
+                id: Uuid::new_v4().to_string(),
+                role: "assistant".into(),
+                content: Vec::new(),
+                model: format!("{}/{}", model.provider, model.id),
+                usage: None,
+                stop_reason: Some(StopReason::Error),
+                error_message: Some(format!(
+                    "provider returned a malformed response body ({} bytes): {err}",
+                    raw.len()
+                )),
+            };
+        }
     };
     let mut content = Vec::new();
     let response = value.get("response").unwrap_or(&value);
@@ -2707,25 +3063,11 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
         );
         return decoder.finish(&mut events);
     }
-    if content.is_empty() {
-        if let Some(text) = value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .or_else(|| value.pointer("/content/0/text").and_then(Value::as_str))
-            .or_else(|| {
-                value
-                    .pointer("/candidates/0/content/parts/0/text")
-                    .and_then(Value::as_str)
-            })
-            .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
-        {
-            if !text.is_empty() {
-                content.push(ContentBlock::Text {
-                    text: text.to_string(),
-                });
-            }
-        }
-    }
+    content.extend(
+        response_text_parts(&value)
+            .into_iter()
+            .map(|text| ContentBlock::Text { text }),
+    );
     if let Some(calls) = value
         .pointer("/choices/0/message/tool_calls")
         .and_then(Value::as_array)
@@ -2741,13 +3083,14 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let arguments = call
-                .pointer("/function/arguments")
-                .and_then(|value| match value {
-                    Value::String(raw) => serde_json::from_str(raw).ok(),
-                    other => Some(other.clone()),
-                })
-                .unwrap_or(Value::Object(Default::default()));
+            // Same rule as the streaming decoders: malformed or non-object
+            // arguments keep the invalid-arguments sentinel and never execute.
+            let arguments = match call.pointer("/function/arguments") {
+                None | Some(Value::Null) => Value::Object(Default::default()),
+                Some(Value::String(raw)) => crate::final_tool_arguments(raw),
+                Some(object @ Value::Object(_)) => object.clone(),
+                Some(other) => crate::invalid_arguments(&other.to_string()),
+            };
             content.push(ContentBlock::ToolCall {
                 id,
                 name,
@@ -2848,6 +3191,8 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
         .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
     {
         Some(StopReason::ToolUse)
+    } else if response_hit_token_limit(&value) {
+        Some(StopReason::Length)
     } else {
         Some(StopReason::Stop)
     };
@@ -3242,6 +3587,69 @@ mod tests {
     }
 
     #[test]
+    fn pi_messages_uses_its_gateway_wire_protocol() {
+        let mut model = load_builtin_models().into_iter().next().unwrap();
+        model.api = "pi-messages".into();
+        model.provider = "radius".into();
+        model.id = "audit-radius".into();
+        model.base_url = Some("https://radius.pi.dev/v1".into());
+        let auth = ResolvedAuth {
+            api_key: Some("tok".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        assert_eq!(
+            request_url(&model, &auth),
+            "https://radius.pi.dev/v1/messages"
+        );
+        let tool = ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            constrained_sampling: None,
+        };
+        let body = request_body(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            Some("system"),
+            &[tool],
+        );
+        assert_eq!(body["model"], "audit-radius");
+        assert_eq!(body["context"]["systemPrompt"], "system");
+        assert_eq!(body["context"]["messages"][0]["role"], "user");
+        assert_eq!(body["context"]["tools"][0]["name"], "read");
+        assert!(body["options"]["maxTokens"].is_u64());
+        assert!(body.get("stream").is_none() && body.get("messages").is_none());
+        assert!(crate::stream_decoder::supports_incremental_stream(&model));
+        let headers = collect_request_headers(&model, &auth, &StreamOptions::default());
+        assert!(headers.iter().any(
+            |(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer tok"
+        ));
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-api-key")));
+    }
+
+    #[test]
+    fn bedrock_url_encodes_the_model_id_segment() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "bedrock-converse-stream")
+            .unwrap();
+        model.id = "us.anthropic.claude-v2:1".into();
+        model.base_url = Some("https://bedrock-runtime.us-east-1.amazonaws.com".into());
+        let auth = ResolvedAuth {
+            api_key: None,
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        assert_eq!(
+            request_url(&model, &auth),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-v2%3A1/converse"
+        );
+    }
+
+    #[test]
     fn stub_providers_refuse_tool_use() {
         for api in [
             "google-generative-ai",
@@ -3371,6 +3779,7 @@ mod tests {
             &ResponsesInputOptions {
                 native_items_model: Some("openai-codex/gpt-5.6-luna"),
                 custom_tools: &[],
+                images: false,
             },
         );
         assert_eq!(input[1]["type"], "reasoning");
@@ -3462,6 +3871,63 @@ mod tests {
             headers: Default::default(),
             source: "test".into(),
         }
+    }
+
+    #[test]
+    fn stream_event_history_does_not_retain_cumulative_snapshots() {
+        let chunk = "x".repeat(4096);
+        let mut rest = String::new();
+        for _ in 0..64 {
+            rest.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{chunk}\"}}}}]}}\n\n"
+            ));
+        }
+        rest.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let (base, release, server) = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
+            rest.leak(),
+            Duration::from_secs(5),
+        );
+        let _ = release.send(());
+        let model = loopback_model(&base);
+        let mut live_partial_lengths = Vec::new();
+        let (message, events) = live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions::default(),
+            &mut |event| {
+                if let AssistantMessageEvent::TextDelta { partial, .. } = event {
+                    live_partial_lengths.push(serde_json::to_string(partial).unwrap().len());
+                }
+            },
+        )
+        .expect("stream");
+        server.join().unwrap();
+        let final_len = serde_json::to_string(&message).unwrap().len();
+        assert!(final_len > 64 * 4096);
+        // Live callbacks still saw growing snapshots.
+        assert!(live_partial_lengths.last() > live_partial_lengths.first());
+
+        let mut distinct: Vec<*const AssistantMessage> = Vec::new();
+        let mut retained = 0usize;
+        for event in &events {
+            if let Some(partial) = event.clone().partial_mut() {
+                let pointer = Arc::as_ptr(partial);
+                if !distinct.contains(&pointer) {
+                    distinct.push(pointer);
+                    retained += serde_json::to_string(partial.as_ref()).unwrap().len();
+                }
+            }
+        }
+        assert!(
+            retained <= 2 * final_len,
+            "retained {retained} bytes of snapshots for a {final_len}-byte message"
+        );
     }
 
     #[test]
@@ -3580,6 +4046,154 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_sse_frame_fails_the_turn_even_with_a_terminal_event() {
+        let (base, _release, server) = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            Duration::from_secs(5),
+        );
+        let model = loopback_model(&base);
+        let (message, events) = live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions::default(),
+            &mut |_| {},
+        )
+        .expect("stream");
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert!(message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.contains("malformed SSE frame")));
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error {
+                reason: StopReason::Error,
+                ..
+            })
+        ));
+        let _ = server.join();
+    }
+
+    fn image_message() -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: vec![
+                MessageContent::Text {
+                    text: "what is this".into(),
+                },
+                MessageContent::Image {
+                    data: "QUJD".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            ..ChatMessage::text("user", "")
+        }
+    }
+
+    #[test]
+    fn vision_models_receive_images_in_every_serializer() {
+        let messages = [image_message()];
+        let options = StreamOptions::default();
+        for (api, find) in [
+            ("openai-completions", "image_url"),
+            ("anthropic-messages", "\"image\""),
+            ("google-generative-ai", "inlineData"),
+            ("bedrock-converse-stream", "\"image\""),
+            ("openai-responses", "input_image"),
+        ] {
+            let Some(mut model) = load_builtin_models().into_iter().find(|m| m.api == api) else {
+                continue;
+            };
+            model.input = vec!["text".into(), "image".into()];
+            let body = request_body_with(&model, &messages, None, &[], &options).to_string();
+            assert!(body.contains(find), "{api}: {body}");
+            assert!(body.contains("QUJD"), "{api}: {body}");
+            model.input = vec!["text".into()];
+            let body = request_body_with(&model, &messages, None, &[], &options).to_string();
+            assert!(
+                !body.contains("QUJD"),
+                "{api} sent an image to a text-only model"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_ok_body_is_an_error_not_assistant_text() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("model");
+        for body in [
+            "<html>502 Bad Gateway</html>",
+            r#"{"choices":[{"message":{"con"#,
+        ] {
+            let parsed = parse_provider_response(&model, body);
+            assert_eq!(parsed.stop_reason, Some(StopReason::Error), "{body}");
+            assert!(parsed.content.is_empty());
+            let message = parsed.error_message.expect("error message");
+            assert!(message.contains("malformed response body"), "{message}");
+            assert!(!message.contains("Bad Gateway"), "body leaked: {message}");
+        }
+    }
+
+    #[test]
+    fn non_streaming_reply_keeps_every_text_part() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("model");
+        let parsed = parse_provider_response(
+            &model,
+            r#"{"content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}"#,
+        );
+        let texts: Vec<_> = parsed
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["one", "two"]);
+        let gemini = parse_provider_response(
+            &model,
+            r#"{"candidates":[{"content":{"parts":[{"text":"a"},{"text":"b"}]}}]}"#,
+        );
+        assert_eq!(gemini.content.len(), 2);
+        let chat = parse_provider_response(
+            &model,
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"x"},{"type":"text","text":"y"}]}}]}"#,
+        );
+        assert_eq!(chat.content.len(), 2);
+    }
+
+    #[test]
+    fn non_streaming_token_limit_is_not_reported_complete() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("model");
+        for body in [
+            r#"{"choices":[{"message":{"content":"cut"},"finish_reason":"length"}]}"#,
+            r#"{"content":[{"type":"text","text":"cut"}],"stop_reason":"max_tokens"}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}]}"#,
+            r#"{"output":{"message":{"content":[{"text":"cut"}]}},"stopReason":"max_tokens"}"#,
+        ] {
+            let parsed = parse_provider_response(&model, body);
+            assert_eq!(parsed.stop_reason, Some(StopReason::Length), "{body}");
+        }
+        let done = parse_provider_response(
+            &model,
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        );
+        assert_eq!(done.stop_reason, Some(StopReason::Stop));
+    }
+
+    #[test]
     fn an_abort_flag_stops_a_stalled_stream_at_once() {
         let (base, _release, server) = sse_server(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
@@ -3679,6 +4293,22 @@ mod tests {
         );
         let done = complete_from_events(&events).unwrap();
         assert_eq!(done.usage.unwrap().input, 3);
+    }
+
+    #[test]
+    fn non_streaming_malformed_tool_arguments_keep_the_sentinel() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.provider == "openai")
+            .expect("openai model");
+        let message = parse_provider_response(
+            &model,
+            r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+        );
+        let Some(ContentBlock::ToolCall { arguments, .. }) = message.content.first() else {
+            panic!("expected a tool call: {message:?}");
+        };
+        assert_eq!(arguments, &crate::invalid_arguments("{\"path\":"));
     }
 
     #[test]

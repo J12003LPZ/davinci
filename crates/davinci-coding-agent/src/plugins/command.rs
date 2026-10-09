@@ -556,11 +556,22 @@ fn uninstall(agent_dir: &Path, target: &str) -> Result<String, String> {
             .remove(&key)
             .ok_or_else(|| "plugin disappeared".to_string())
     })?;
+    let mut leftover = None;
     if let Some(path) = record.install_path {
         let cache = store::plugins_dir(agent_dir).join("cache");
         if record.origin == Origin::Davinci && path.starts_with(&cache) {
-            let _ = std::fs::remove_dir_all(&path);
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                if path.exists() {
+                    leftover = Some((path, err));
+                }
+            }
         }
+    }
+    if let Some((path, err)) = leftover {
+        return Ok(format!(
+            "Uninstalled {key}, but its files could not be deleted from {}: {err}. Remove that directory manually.",
+            path.display()
+        ));
     }
     Ok(match record.origin {
         Origin::Davinci => format!("Uninstalled {key}."),

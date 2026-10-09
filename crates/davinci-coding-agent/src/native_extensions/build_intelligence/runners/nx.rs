@@ -21,8 +21,7 @@ pub struct NxTargetDefault {
     pub inputs: Vec<serde_json::Value>,
     #[serde(default)]
     pub outputs: Vec<String>,
-    #[serde(default = "default_cache")]
-    pub cache: bool,
+    pub cache: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -41,12 +40,8 @@ pub struct NxProjectTarget {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub outputs: Vec<String>,
-    #[serde(default = "default_cache")]
-    pub cache: bool,
-}
-
-fn default_cache() -> bool {
-    true
+    /// `None` when the project does not say, so a default may apply.
+    pub cache: Option<bool>,
 }
 
 pub fn parse_nx_json(root: &Path) -> Option<NxConfig> {
@@ -90,8 +85,8 @@ pub fn extract_nx_targets(
                     if outputs.is_empty() {
                         outputs = def.outputs.clone();
                     }
-                    if !cacheable && def.cache {
-                        cacheable = true;
+                    if cacheable.is_none() {
+                        cacheable = def.cache;
                     }
                 }
             }
@@ -112,25 +107,13 @@ pub fn extract_nx_targets(
                 inputs: Vec::new(),
                 outputs,
                 depends_on,
-                cacheable,
-            });
-        }
-    } else if let Some(nc) = nx_config {
-        // Fallback to nx.json target defaults if project.json not present
-        for (target_name, def) in &nc.target_defaults {
-            targets.push(BuildTarget {
-                target: target_name.clone(),
-                package: package_name.to_string(),
-                runner: "nx".to_string(),
-                executor: None,
-                command: Some(format!("nx run {package_name}:{target_name}")),
-                inputs: Vec::new(),
-                outputs: def.outputs.clone(),
-                depends_on: def.depends_on.clone(),
-                cacheable: def.cache,
+                cacheable: cacheable.unwrap_or(true),
             });
         }
     }
+    // `targetDefaults` only configure targets that exist; without a project
+    // declaration they say nothing about what this package can run.
+    let _ = nx_config;
 
     targets
 }

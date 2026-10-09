@@ -435,23 +435,38 @@ impl CallbackServer {
         mut stream: TcpStream,
         read_timeout: Duration,
     ) -> Result<Option<CallbackResponse>, String> {
-        stream
-            .set_read_timeout(Some(read_timeout))
-            .map_err(|err| err.to_string())?;
+        // The timeout bounds the whole request, not each read: a peer trickling
+        // one byte at a time must not hold the login past its deadline.
+        let conn_deadline = std::time::Instant::now() + read_timeout;
+        // A request may arrive in several TCP segments; read until the request
+        // line is complete (or the buffer fills) instead of trusting one read.
         let mut buf = [0u8; 8192];
-        let n = match stream.read(&mut buf) {
-            Ok(0) => return Ok(None),
-            Ok(n) => n,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(None);
+        let mut n = 0;
+        while n < buf.len() && !buf[..n].contains(&b'\n') {
+            let remaining = conn_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            Err(err) => return Err(err.to_string()),
-        };
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|err| err.to_string())?;
+            match stream.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(read) => n += read,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        if n == 0 || (!buf[..n].contains(&b'\n') && n < buf.len()) {
+            return Ok(None);
+        }
         let request = String::from_utf8_lossy(&buf[..n]);
         let response = match parse_http_target(&request) {
             Some((path, query)) => handle_callback_request(
@@ -483,7 +498,8 @@ fn parse_http_target(request: &str) -> Option<(String, String)> {
     let line = request.lines().next()?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?;
-    if method != "GET" && method != "HEAD" {
+    // Only GET may carry the one-time code; a HEAD probe must not consume it.
+    if method != "GET" {
         return Some(("/".into(), String::new()));
     }
     let target = parts.next()?;
@@ -645,6 +661,55 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_callback_request_is_reassembled() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream.write_all(b"GET /auth/callback?co").unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            stream
+                .write_all(b"de=real&state=state-1 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let response = server.accept_until(deadline).unwrap();
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn head_request_does_not_consume_the_callback() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for method in ["HEAD", "GET"] {
+                let mut stream = std::net::TcpStream::connect(addr).unwrap();
+                write!(
+                    stream,
+                    "{method} /auth/callback?code=real&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink);
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let response = server.accept_until(deadline).unwrap();
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+        assert!(!response.body.is_empty());
+    }
+
+    #[test]
     fn stray_requests_do_not_consume_the_callback() {
         let mut server =
             CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
@@ -701,6 +766,31 @@ mod tests {
             .unwrap();
         client.join().unwrap();
         assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn trickling_peer_cannot_outlive_the_login_deadline() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "s").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            // One byte every 100ms, never a newline: each read would succeed
+            // before a per-read timeout fired.
+            for _ in 0..40 {
+                if stream.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = server.accept_until(started + Duration::from_millis(600));
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        client.join().unwrap();
     }
 
     #[test]

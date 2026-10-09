@@ -130,6 +130,9 @@ pub struct PackageWhyResult {
     pub declared_range: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_type: Option<String>,
+    /// Every version the lockfile resolves for this package name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locked_versions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<DependencyReason>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

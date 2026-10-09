@@ -31,11 +31,44 @@ pub struct TestMapping {
 }
 
 pub fn is_test(path: &str) -> bool {
-    path.contains(".test.")
-        || path.contains(".spec.")
-        || path
-            .split('/')
-            .any(|part| matches!(part, "__tests__" | "tests" | "test"))
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.contains(".test.") || name.contains(".spec.") {
+        return true;
+    }
+    // Files merely stored under a test directory are tests only when they are
+    // not fixtures, helpers, mocks, setup files or type declarations.
+    let mut dirs = path.split('/').collect::<Vec<_>>();
+    dirs.pop();
+    let in_test_dir = dirs
+        .iter()
+        .any(|part| matches!(*part, "__tests__" | "tests" | "test"));
+    let support_dir = dirs.iter().any(|part| {
+        matches!(
+            *part,
+            "fixtures"
+                | "fixture"
+                | "__fixtures__"
+                | "helpers"
+                | "helper"
+                | "support"
+                | "mocks"
+                | "__mocks__"
+                | "utils"
+                | "snapshots"
+                | "__snapshots__"
+                | "setup"
+        )
+    });
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let support_file = name.ends_with(".d.ts")
+        || matches!(
+            stem,
+            "setup" | "helper" | "helpers" | "utils" | "util" | "mock" | "mocks" | "fixture"
+        )
+        || stem.starts_with("setup")
+        || stem.ends_with("-helper")
+        || stem.ends_with("_helper");
+    in_test_dir && !support_dir && !support_file
 }
 
 impl TestMapping {
@@ -154,7 +187,10 @@ impl TestMapping {
                         "config",
                         vec![origin.clone(), test.clone()],
                     );
-                } else if owner == test_owner && stem(origin) == stem(test) && test != origin {
+                } else if owner == test_owner
+                    && pair_key(origin) == pair_key(test)
+                    && test != origin
+                {
                     add(
                         &mut selected,
                         test,
@@ -190,6 +226,21 @@ impl TestMapping {
     }
 }
 
+/// Identity of the module a source or test file is about: its directory
+/// (ignoring `src` / `test` containers) plus its stem, so `src/auth/config.ts`
+/// pairs with `tests/auth/config.test.ts` but not with `src/payments/config.ts`.
+fn pair_key(path: &str) -> (Vec<&str>, &str) {
+    let mut parts: Vec<&str> = path.split('/').collect();
+    parts.pop();
+    parts.retain(|part| {
+        !matches!(
+            *part,
+            "src" | "lib" | "test" | "tests" | "__tests__" | "spec"
+        )
+    });
+    (parts, stem(path))
+}
+
 fn stem(path: &str) -> &str {
     let filename = path.rsplit('/').next().unwrap_or(path);
     let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
@@ -218,6 +269,42 @@ fn add(selection: &mut Selection, path: &str, kind: &str, source: &str, chain: V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helpers_and_fixtures_under_test_directories_are_not_tests() {
+        for path in [
+            "tests/fixtures/helper.ts",
+            "test/setup.ts",
+            "tests/helpers/db.ts",
+            "src/__tests__/__mocks__/api.ts",
+            "tests/types.d.ts",
+        ] {
+            assert!(!is_test(path), "{path}");
+        }
+        for path in [
+            "src/a.test.ts",
+            "src/b.spec.js",
+            "tests/auth/config.ts",
+            "src/__tests__/login.ts",
+            "tests/fixtures/case.test.ts",
+        ] {
+            assert!(is_test(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn pairing_requires_the_same_module_directory() {
+        let source = "src/payments/config.ts";
+        assert_ne!(pair_key(source), pair_key("tests/auth/config.test.ts"));
+        assert_eq!(
+            pair_key("src/auth/config.ts"),
+            pair_key("tests/auth/config.test.ts")
+        );
+        assert_eq!(
+            pair_key("src/auth/config.ts"),
+            pair_key("src/auth/config.test.ts")
+        );
+    }
 
     #[test]
     fn test_impact_caps_evidence_without_emitting_unexplained_rows() {
