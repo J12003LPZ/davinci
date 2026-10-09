@@ -45,6 +45,11 @@ struct State {
     bytes: usize,
     sequence: u64,
     stats: CacheStats,
+    /// Provider requests whose usage carried a cache-write count, and those
+    /// whose usage omitted it. `stats.provider.cache_write_tokens` sums only
+    /// the former.
+    cache_write_reported: u64,
+    cache_write_unreported: u64,
     revoked: HashSet<String>,
     revocation_capacity_reached: bool,
 }
@@ -71,6 +76,17 @@ impl Default for CacheRuntime {
         Self::new(CacheConfig::default(), None)
     }
 }
+/// Where a `put_reporting` write landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOutcome {
+    /// Written to the persistent store; survives a restart.
+    Durable,
+    /// Held in memory only; lost on restart and subject to eviction.
+    MemoryOnly,
+    /// Not stored anywhere.
+    Skipped(&'static str),
+}
+
 impl CacheRuntime {
     /// Share mechanics across hosts in this process without retaining dead runtimes.
     pub fn shared(config: CacheConfig, agent_dir: PathBuf) -> Self {
@@ -245,6 +261,9 @@ impl CacheRuntime {
         if !self.inner.config.enabled || !request.cacheable() || self.revoked(request) {
             let value = compute()?;
             authorize()?;
+            if cancel.is_some_and(crate::CancellationToken::is_cancelled) {
+                return Err(CacheError::Cancelled);
+            }
             return Ok(Arc::new(value));
         }
         // The inner result is an Arc so the leader and waiters share the same allocation.
@@ -270,9 +289,9 @@ impl CacheRuntime {
                 if self.revoked(request) {
                     return Err(CacheError::Invalidated);
                 }
-                if cancel.is_some_and(crate::CancellationToken::is_cancelled) {
-                    return Err(CacheError::Cancelled);
-                }
+                // A finished value is valid even if this caller was cancelled
+                // meanwhile: the flight returns `Cancelled` to this caller only
+                // and still shares the value with its followers (WOR-101).
                 self.insert(request, value.clone());
                 Ok(value)
             },
@@ -299,25 +318,48 @@ impl CacheRuntime {
         value: T,
         authorize: impl Fn() -> Result<(), CacheError>,
     ) -> Result<(), CacheError> {
-        authorize()?;
-        self.insert(request, Arc::new(value));
-        Ok(())
+        self.put_reporting(request, value, authorize).map(|_| ())
     }
-    fn insert<T: Serialize + Send + Sync + 'static>(&self, request: &CacheRequest, value: Arc<T>) {
-        if !self.inner.config.enabled || !request.cacheable() || self.revoked(request) {
-            return;
+    /// Like `put`, but says where the value actually landed. Writes are
+    /// best-effort, so callers that hand out references to the value must
+    /// check this instead of assuming it was stored.
+    pub fn put_reporting<T: Serialize + Send + Sync + 'static>(
+        &self,
+        request: &CacheRequest,
+        value: T,
+        authorize: impl Fn() -> Result<(), CacheError>,
+    ) -> Result<StoreOutcome, CacheError> {
+        authorize()?;
+        Ok(self.insert(request, Arc::new(value)))
+    }
+    fn insert<T: Serialize + Send + Sync + 'static>(
+        &self,
+        request: &CacheRequest,
+        value: Arc<T>,
+    ) -> StoreOutcome {
+        if !self.inner.config.enabled {
+            return StoreOutcome::Skipped("cache disabled");
+        }
+        if !request.cacheable() {
+            return StoreOutcome::Skipped("request is not cacheable");
+        }
+        if self.revoked(request) {
+            return StoreOutcome::Skipped("dependency revoked");
         }
         let mut writer = BoundedWriter {
             bytes: Vec::new(),
             limit: self.inner.config.max_object_bytes,
         };
         if serde_json::to_writer(&mut writer, value.as_ref()).is_err() {
-            return;
+            return StoreOutcome::Skipped(
+                "value exceeds the object size limit or failed to encode",
+            );
         }
         let bytes = writer.bytes;
         if bytes.len() > self.inner.config.max_object_bytes {
-            return;
+            return StoreOutcome::Skipped("value exceeds the object size limit");
         }
+        let mut durable = false;
         if request.policy.persistent() && self.inner.config.persistent_enabled {
             if let Some(agent) = self.agent_dir() {
                 match super::persistent::write(
@@ -328,6 +370,7 @@ impl CacheRuntime {
                     &self.inner.config,
                 ) {
                     Ok(disk) => {
+                        durable = true;
                         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                         let stats = state
                             .stats
@@ -352,14 +395,21 @@ impl CacheRuntime {
                 }
             }
         }
-        self.insert_memory(request, value, bytes.len());
+        let in_memory = self.insert_memory(request, value, bytes.len());
+        match (durable, in_memory) {
+            (true, _) => StoreOutcome::Durable,
+            (false, true) => StoreOutcome::MemoryOnly,
+            (false, false) => {
+                StoreOutcome::Skipped("persistent write failed and memory refused it")
+            }
+        }
     }
     fn insert_memory<T: Send + Sync + 'static>(
         &self,
         request: &CacheRequest,
         value: Arc<T>,
         serialized_bytes: usize,
-    ) {
+    ) -> bool {
         let weight = serialized_bytes
             .saturating_add(std::mem::size_of::<T>())
             .saturating_add(serde_json::to_vec(&request.key).map_or(0, |bytes| bytes.len()))
@@ -368,7 +418,7 @@ impl CacheRuntime {
             || weight > self.inner.config.memory_max_bytes
             || self.inner.config.max_entries == 0
         {
-            return;
+            return false;
         }
         let id = request.identity::<T>();
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -377,7 +427,7 @@ impl CacheRuntime {
                 !state.revoked.is_empty() && state.revoked.contains(&dependency_digest(dep))
             })
         {
-            return;
+            return false;
         }
         remove(&mut state, &id);
         while state.entries.len() >= self.inner.config.max_entries
@@ -424,6 +474,7 @@ impl CacheRuntime {
             .entry(request.key.namespace())
             .or_default()
             .writes += 1;
+        true
     }
     pub fn invalidate(&self, dependency: &CacheDependency, reason: LocalMissReason) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -470,11 +521,32 @@ impl CacheRuntime {
         }
     }
     pub fn record_provider_usage(&self, input: u64, read: u64, write: u64) {
+        self.record_provider_usage_with_write(input, read, Some(write));
+    }
+
+    /// `write` is `None` when the provider omitted its cache-write count. That
+    /// is not a measured zero, so it adds nothing to the write total and is
+    /// counted in [`Self::provider_cache_write_coverage`] instead.
+    pub fn record_provider_usage_with_write(&self, input: u64, read: u64, write: Option<u64>) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let provider = &mut state.stats.provider;
         provider.input_tokens = provider.input_tokens.saturating_add(input);
         provider.cache_read_tokens = provider.cache_read_tokens.saturating_add(read);
-        provider.cache_write_tokens = provider.cache_write_tokens.saturating_add(write);
+        match write {
+            Some(write) => {
+                provider.cache_write_tokens = provider.cache_write_tokens.saturating_add(write);
+                state.cache_write_reported = state.cache_write_reported.saturating_add(1);
+            }
+            None => {
+                state.cache_write_unreported = state.cache_write_unreported.saturating_add(1);
+            }
+        }
+    }
+
+    /// `(reported, unreported)` provider request counts for cache writes.
+    pub fn provider_cache_write_coverage(&self) -> (u64, u64) {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.cache_write_reported, state.cache_write_unreported)
     }
 
     pub fn record_provider_cost(&self, cost_usd: f64) {

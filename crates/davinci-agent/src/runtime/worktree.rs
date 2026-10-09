@@ -281,47 +281,56 @@ impl WorktreeManager {
     }
 
     /// Check whether a worktree has uncommitted or unmerged changes.
+    /// Evidence that cannot be read counts as dirty: see [`Self::check_dirty`].
     pub fn is_dirty(&self, lease: &WorktreeLease) -> bool {
+        self.check_dirty(lease).unwrap_or(true)
+    }
+
+    /// Whether the worktree holds work that would be lost by removing it.
+    ///
+    /// A failing `git status` or `rev-parse` is an error, never "clean":
+    /// treating unreadable state as clean let a forced cleanup delete
+    /// uncommitted work. Commits made in the worktree count as integrated once
+    /// they are reachable from the repository's current HEAD (the branch they
+    /// were merged into), or once every one of their patches already exists
+    /// there (rebase, cherry-pick or squash). Comparing against the lease's
+    /// recorded `base_head` instead made every worker commit look unmerged
+    /// forever, since a commit made after the lease is never an ancestor of
+    /// the commit the lease started from.
+    pub fn check_dirty(&self, lease: &WorktreeLease) -> Result<bool, WorktreeError> {
         if !lease.path.exists() {
-            return false;
+            return Ok(false);
         }
-
-        // 1. Check uncommitted changes (git status --porcelain)
-        let status = run_git(&lease.path, &["status", "--porcelain"]);
-        if let Ok(st) = status {
-            if !st.trim().is_empty() {
-                return true;
-            }
+        if !run_git(&lease.path, &["status", "--porcelain"])?.is_empty() {
+            return Ok(true);
         }
-
-        // 2. Check if current HEAD differs from base_head
-        let current_head = run_git(&lease.path, &["rev-parse", "HEAD"]).unwrap_or_default();
-        if !current_head.is_empty() && current_head != lease.base_head {
-            // New commits were made. Check if they were merged into base_head
-            let is_ancestor = Command::new("git")
-                .current_dir(&self.repo_root)
-                .args([
-                    "merge-base",
-                    "--is-ancestor",
-                    &current_head,
-                    &lease.base_head,
-                ])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            if !is_ancestor {
-                return true;
-            }
+        let current_head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
+        if current_head.is_empty() || current_head == lease.base_head {
+            return Ok(false);
         }
-
-        false
+        let integrated = Command::new("git")
+            .current_dir(&self.repo_root)
+            .args(["merge-base", "--is-ancestor", &current_head, "HEAD"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if integrated {
+            return Ok(false);
+        }
+        // Not an ancestor: still integrated if every patch already landed.
+        let cherry = run_git(&self.repo_root, &["cherry", "HEAD", &current_head])?;
+        Ok(cherry.lines().any(|line| line.starts_with('+')))
     }
 
     /// Release an existing worktree lease.
     /// If dirty and `force` is false, preserves the worktree directory and returns `DirtyWorktreePreserved`.
     pub fn release_lease(&self, lease: &WorktreeLease, force: bool) -> Result<(), WorktreeError> {
-        let dirty = self.is_dirty(lease);
+        // Unreadable state preserves the worktree unless the caller forces.
+        let dirty = match self.check_dirty(lease) {
+            Ok(dirty) => dirty,
+            Err(error) if !force => return Err(error),
+            Err(_) => true,
+        };
         if dirty && !force {
             return Err(WorktreeError::DirtyWorktreePreserved {
                 path: lease.path.clone(),
@@ -613,5 +622,88 @@ mod tests {
         // Now release with force: true
         manager.release_lease(&lease, true).unwrap();
         assert!(!lease.path.exists());
+    }
+
+    fn git_in(path: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// WOR-53: a status that cannot run must preserve the lease, not read as clean.
+    #[test]
+    fn a_failing_git_status_preserves_the_lease_instead_of_reading_clean() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let precious = lease.path.join("wip.txt");
+        std::fs::write(&precious, "uncommitted").unwrap();
+        // Break the worktree's git link so every git command in it fails.
+        std::fs::write(lease.path.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
+        assert!(manager.check_dirty(&lease).is_err());
+        assert!(manager.is_dirty(&lease), "unreadable state is dirty");
+        let err = manager.release_lease(&lease, false).unwrap_err();
+        assert!(matches!(err, WorktreeError::GitError(_)), "{err:?}");
+        assert!(precious.exists(), "nothing was deleted");
+        assert!(manager.get_lease(&lease.path).is_none() || lease.path.exists());
+    }
+
+    /// WOR-54: once the worker's commit is merged, the lease is clean.
+    #[test]
+    fn integrated_worker_commits_do_not_keep_the_lease_dirty() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        std::fs::write(lease.path.join("work.txt"), "done").unwrap();
+        git_in(&lease.path, &["add", "work.txt"]);
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+        git_in(&lease.path, &["commit", "-m", "worker change"]);
+        // Committed but not integrated: still holds unmerged work.
+        assert!(manager.is_dirty(&lease));
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        // Integrate into the repository's checked-out branch.
+        git_in(
+            repo_dir.path(),
+            &["merge", "--no-ff", "-m", "merge worker", &lease.branch],
+        );
+        assert!(!manager.is_dirty(&lease), "merged work is not dirty");
+        manager.release_lease(&lease, false).unwrap();
+        assert!(!lease.path.exists());
+    }
+
+    #[test]
+    fn a_squash_integrated_worker_commit_is_also_clean() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        std::fs::write(lease.path.join("sq.txt"), "x").unwrap();
+        git_in(&lease.path, &["add", "sq.txt"]);
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+        git_in(&lease.path, &["commit", "-m", "squash me"]);
+        git_in(repo_dir.path(), &["merge", "--squash", &lease.branch]);
+        git_in(repo_dir.path(), &["commit", "-m", "squashed"]);
+        assert!(!manager.is_dirty(&lease));
+        manager.release_lease(&lease, false).unwrap();
     }
 }

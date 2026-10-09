@@ -46,14 +46,20 @@ impl TeamRoster {
         root.get_or_insert_with(CancellationToken::new).clone()
     }
 
-    /// Register a worker and hand back the token that stops it.
+    /// Register a worker and hand back the token that stops it. Admitting a
+    /// worker that is already on the roster returns its live token, so
+    /// `cancel` still reaches the original holder.
     pub fn admit(&self, agent_id: AgentId) -> CancellationToken {
-        let token = self.session_token().child_token();
-        self.inner
+        let mut members = self
+            .inner
             .members
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(agent_id, token.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(live) = members.get(&agent_id).filter(|t| !t.is_cancelled()) {
+            return live.clone();
+        }
+        let token = self.session_token().child_token();
+        members.insert(agent_id, token.clone());
         token
     }
 
@@ -284,7 +290,8 @@ pub enum TeammateExit {
     Stopped,
     /// No message arrived within the idle timeout.
     IdleTimeout,
-    /// `MAX_CONSECUTIVE_FAILURES` turns in a row failed.
+    /// `MAX_CONSECUTIVE_FAILURES` turns in a row failed, or the registry
+    /// refused a lifecycle transition the loop depends on.
     Failed(String),
 }
 
@@ -378,6 +385,21 @@ fn stop_requested(worker: &RuntimeHandle) -> bool {
         })
 }
 
+/// A lifecycle transition the loop needs was refused. A concurrent Stop
+/// explains that; anything else means the record no longer tracks this
+/// teammate, so it must not keep running turns nobody can see.
+fn lifecycle_exit(
+    worker: &RuntimeHandle,
+    step: &str,
+    error: super::registry::RegistryError,
+) -> TeammateExit {
+    if stop_requested(worker) {
+        TeammateExit::Stopped
+    } else {
+        TeammateExit::Failed(format!("teammate could not {step}: {error}"))
+    }
+}
+
 /// Drive a persistent teammate: run a turn, report it, go idle, wake on the
 /// next message. `turn` runs one model turn for the given prompt and
 /// returns its final text. The caller owns the terminal registry transition
@@ -415,7 +437,9 @@ where
         // Idle until a message arrives. A wake that yields no deliverable
         // message (rejected by generation, or already drained mid-turn by
         // turn.rs) goes back to waiting; it never re-runs the old prompt.
-        let _ = worker.registry.transition(me, AgentState::Idle);
+        if let Err(error) = worker.registry.transition(me, AgentState::Idle) {
+            return lifecycle_exit(worker, "go idle", error);
+        }
         let next_prompt = loop {
             match worker
                 .mailbox
@@ -435,13 +459,20 @@ where
             }
         };
         // `send` normally moved Idle -> Running already; this covers a
-        // message that was queued before the transition to Idle.
-        if worker
-            .registry
-            .get(&me)
-            .is_some_and(|record| record.state == AgentState::Idle)
-        {
-            let _ = worker.registry.transition(me, AgentState::Running);
+        // message that was queued before the transition to Idle. A turn only
+        // starts from a recorded Running state, so a Stop that won the race
+        // for the record ends the loop instead of running the next prompt.
+        match worker.registry.get(&me).map(|record| record.state) {
+            Some(AgentState::Running) => {}
+            Some(AgentState::Idle) => {
+                if let Err(error) = worker.registry.transition(me, AgentState::Running) {
+                    return lifecycle_exit(worker, "wake", error);
+                }
+            }
+            _ if stop_requested(worker) => return TeammateExit::Stopped,
+            state => {
+                return TeammateExit::Failed(format!("teammate cannot wake from state {state:?}"))
+            }
         }
         prompt = next_prompt;
     }
@@ -451,6 +482,20 @@ where
 mod tests {
     use super::*;
     use crate::runtime::ids::RunId;
+
+    #[test]
+    fn wor116_admitting_a_worker_twice_keeps_cancel_reaching_the_first_holder() {
+        let roster = TeamRoster::default();
+        let id = AgentId::new();
+        let first = roster.admit(id);
+        let second = roster.admit(id);
+        assert!(roster.cancel(&id));
+        assert!(first.is_cancelled(), "original holder was orphaned");
+        assert!(second.is_cancelled());
+        // A cancelled member may be admitted afresh with a live token.
+        let again = roster.admit(id);
+        assert!(!again.is_cancelled() || roster.session_token().is_cancelled());
+    }
 
     #[test]
     fn roster_cancel_targets_one_member_and_shutdown_cancels_all() {
@@ -763,5 +808,91 @@ mod tests {
             prompts,
             vec!["start".to_string(), "summarize in one line".to_string()]
         );
+    }
+
+    /// WOR-115: a refused idle transition ends the loop. Before, the error
+    /// was dropped and the next queued message ran as a new turn while the
+    /// registry still showed the teammate in another state.
+    #[test]
+    fn wor115_a_refused_lifecycle_transition_starts_no_new_turn() {
+        let (lead, worker) = team_pair();
+        let mate = worker.agent_id;
+        let mut prompts = Vec::new();
+        let exit = run_teammate_loop(
+            &worker,
+            "first task",
+            std::time::Duration::from_millis(200),
+            |prompt| {
+                prompts.push(prompt.to_string());
+                // Waiting -> Idle is not a valid transition, and the next
+                // message is already queued when the turn ends.
+                lead.registry.transition(mate, AgentState::Waiting).unwrap();
+                lead.send_message(mate, "second task").unwrap();
+                Ok("done".into())
+            },
+        );
+        assert_eq!(prompts, vec!["first task".to_string()]);
+        assert!(
+            matches!(&exit, TeammateExit::Failed(error) if error.contains("go idle")),
+            "{exit:?}"
+        );
+    }
+
+    /// WOR-115: a Stop that lands while the teammate is idle wins over the
+    /// message that woke it.
+    #[test]
+    fn wor115_stop_during_idle_wins_over_the_waking_message() {
+        let (lead, worker) = team_pair();
+        let mate = worker.agent_id;
+        let lead_for_thread = lead.clone();
+        let driver = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while lead_for_thread.registry.get(&mate).unwrap().state != AgentState::Idle {
+                assert!(std::time::Instant::now() < deadline, "never went idle");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            lead_for_thread
+                .registry
+                .transition(mate, AgentState::Stopping)
+                .unwrap();
+            let _ = lead_for_thread.send_message(mate, "late task");
+        });
+        let mut turns = 0;
+        let exit = run_teammate_loop(
+            &worker,
+            "first task",
+            std::time::Duration::from_secs(5),
+            |_| {
+                turns += 1;
+                Ok("done".into())
+            },
+        );
+        driver.join().unwrap();
+        assert_eq!(exit, TeammateExit::Stopped);
+        assert_eq!(turns, 1);
+    }
+
+    /// WOR-147: a teammate whose record vanished (registry replayed from a
+    /// history without it) runs no further turn.
+    #[test]
+    fn wor147_teammate_without_a_record_runs_no_new_turn() {
+        let (lead, worker) = team_pair();
+        let mate = worker.agent_id;
+        let mut prompts = Vec::new();
+        let exit = run_teammate_loop(
+            &worker,
+            "first task",
+            std::time::Duration::from_secs(5),
+            |prompt| {
+                prompts.push(prompt.to_string());
+                if prompts.len() == 1 {
+                    lead.send_message(mate, "second task").unwrap();
+                    lead.registry.rehydrate_from_events(&[]).unwrap();
+                }
+                Ok("ok".into())
+            },
+        );
+        assert_eq!(prompts, vec!["first task".to_string()]);
+        assert!(matches!(exit, TeammateExit::Failed(_)), "{exit:?}");
     }
 }

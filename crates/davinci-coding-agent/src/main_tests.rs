@@ -4693,6 +4693,58 @@ fn a_subagent_model_override_runs_that_model_or_fails_loudly() {
 }
 
 #[test]
+fn config_context_vm_row_persists_and_switches_the_live_agent() {
+    use davinci_agent::runtime::ContextVmMode;
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    // An empty value is not a mode, so the stored setting decides.
+    let _env = EnvRestore::set("DAVINCI_CONTEXT_VM", "");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut agent = Agent::new("fixture");
+    agent.cwd = workspace;
+    let saved = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap()
+    };
+
+    super::sync_agent_from_settings(&mut agent);
+    assert_eq!(
+        agent.context_vm_mode(),
+        ContextVmMode::Off,
+        "default is off"
+    );
+
+    for (value, mode) in [
+        ("shadow", ContextVmMode::Shadow),
+        ("active", ContextVmMode::Active),
+        ("off", ContextVmMode::Off),
+    ] {
+        super::persist_interactive_setting(&format!("context-vm={value}")).unwrap();
+        assert_eq!(saved()["contextVm"], value);
+        super::sync_agent_from_settings(&mut agent);
+        assert_eq!(agent.context_vm_mode(), mode, "{value}");
+    }
+
+    let error = super::persist_interactive_setting("context-vm=turbo").unwrap_err();
+    assert!(error.contains("off, shadow or active"), "{error}");
+    assert_eq!(
+        saved()["contextVm"],
+        "off",
+        "a refused value must not be stored"
+    );
+
+    // The environment variable still wins over the stored value.
+    super::persist_interactive_setting("context-vm=active").unwrap();
+    let _forced = EnvRestore::set("DAVINCI_CONTEXT_VM", "off");
+    super::sync_agent_from_settings(&mut agent);
+    assert_eq!(agent.context_vm_mode(), ContextVmMode::Off);
+}
+
+#[test]
 fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()

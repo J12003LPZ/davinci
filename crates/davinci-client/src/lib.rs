@@ -1,6 +1,7 @@
 //! Protocol client matching `@earendil-works/pi-client`.
 
 mod connection;
+mod inbound;
 mod session;
 mod state;
 #[cfg(unix)]

@@ -1761,6 +1761,62 @@ fn openai_responses_body(
     body
 }
 
+/// Why a recorded native Responses turn cannot continue this request. The
+/// caller falls back to a full replay; the reason says which side moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeResponsesReplaySkip {
+    /// The request's provider messages no longer start with the recorded
+    /// projection: history was rewritten, compacted, or is on another branch.
+    ProviderPrefixChanged {
+        recorded_messages: usize,
+        request_messages: usize,
+    },
+    /// Instructions, tools or another stable request field changed since the
+    /// recorded turn, so the provider would reject or misread the replay.
+    StableContractChanged,
+}
+
+impl std::fmt::Display for NativeResponsesReplaySkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderPrefixChanged {
+                recorded_messages,
+                request_messages,
+            } if request_messages < recorded_messages => write!(
+                f,
+                "provider prefix changed: record covers {recorded_messages} messages, request has only {request_messages} (history shortened or another branch)"
+            ),
+            Self::ProviderPrefixChanged {
+                recorded_messages, ..
+            } => write!(
+                f,
+                "provider prefix changed: the first {recorded_messages} request messages differ from the record (history rewritten or another branch)"
+            ),
+            Self::StableContractChanged => f.write_str(
+                "stable request contract changed: instructions, tools or request options differ from the recorded turn",
+            ),
+        }
+    }
+}
+
+pub fn native_responses_replay_skip(
+    body: &Value,
+    resume: &crate::responses_ledger::NativeResponsesResumeRecord,
+    messages: &[ChatMessage],
+) -> Option<NativeResponsesReplaySkip> {
+    if !resume.matches_provider_prefix(messages) {
+        return Some(NativeResponsesReplaySkip::ProviderPrefixChanged {
+            recorded_messages: resume.resume_provider_message_count,
+            request_messages: messages.len(),
+        });
+    }
+    let current = crate::responses_request::PreparedProviderRequest::new(body.clone());
+    (!current
+        .manifest()
+        .stable_contract_compatible_with(&resume.turn.wire_manifest))
+    .then_some(NativeResponsesReplaySkip::StableContractChanged)
+}
+
 fn apply_native_responses_resume(
     body: &mut Value,
     model: &Model,
@@ -1775,20 +1831,9 @@ fn apply_native_responses_resume(
     let Some(resume) = options.native_responses_resume.as_ref() else {
         return;
     };
-    if !resume.matches_provider_prefix(messages) {
+    if let Some(skip) = native_responses_replay_skip(body, resume, messages) {
         if crate::trace::enabled() {
-            crate::trace::log("native responses replay skipped: provider prefix changed");
-        }
-        return;
-    }
-
-    let current = crate::responses_request::PreparedProviderRequest::new(body.clone());
-    if !current
-        .manifest()
-        .stable_contract_compatible_with(&resume.turn.wire_manifest)
-    {
-        if crate::trace::enabled() {
-            crate::trace::log("native responses replay skipped: stable request contract changed");
+            crate::trace::log(&format!("native responses replay skipped: {skip}"));
         }
         return;
     }
@@ -5098,6 +5143,65 @@ mod openai_cache_wire_tests {
             input.last().unwrap()["type"],
             "function_call_output",
             "only the new tail follows the exact native replay prefix"
+        );
+    }
+
+    #[test]
+    fn wor39_native_replay_skip_names_which_side_moved() {
+        let model = public_model(true, "https://api.openai.com/v1");
+        let options = StreamOptions {
+            cache_key: Some("partition".into()),
+            ..StreamOptions::default()
+        };
+        let recorded = vec![
+            ChatMessage::text("user", "first"),
+            ChatMessage::text("assistant", "answer"),
+        ];
+        let body = openai_responses_body(&model, &recorded, Some("stable"), &[], &options);
+        let turn = crate::responses_ledger::NativeResponsesTurn::from_prepared(
+            &crate::responses_request::PreparedProviderRequest::new(body.clone()),
+            crate::responses_ledger::NativeResponsesOutput {
+                response_id: Some("resp_1".into()),
+                output_items: vec![],
+                final_response: None,
+                terminal_event_type: "response.completed".into(),
+            },
+        )
+        .unwrap();
+        let record = crate::responses_ledger::NativeResponsesResumeRecord {
+            turn,
+            resume_provider_message_count: recorded.len(),
+            resume_provider_messages_fingerprint:
+                crate::responses_ledger::provider_messages_fingerprint(&recorded),
+        };
+
+        assert_eq!(
+            native_responses_replay_skip(&body, &record, &recorded),
+            None
+        );
+        let shortened = native_responses_replay_skip(&body, &record, &recorded[..1]).unwrap();
+        assert_eq!(
+            shortened,
+            NativeResponsesReplaySkip::ProviderPrefixChanged {
+                recorded_messages: 2,
+                request_messages: 1
+            }
+        );
+        assert!(
+            shortened.to_string().contains("request has only 1"),
+            "{shortened}"
+        );
+        let mut rewritten = recorded.clone();
+        rewritten[0] = ChatMessage::text("user", "edited");
+        assert!(native_responses_replay_skip(&body, &record, &rewritten)
+            .unwrap()
+            .to_string()
+            .contains("first 2 request messages differ"));
+        let other_instructions =
+            openai_responses_body(&model, &recorded, Some("changed"), &[], &options);
+        assert_eq!(
+            native_responses_replay_skip(&other_instructions, &record, &recorded),
+            Some(NativeResponsesReplaySkip::StableContractChanged)
         );
     }
 

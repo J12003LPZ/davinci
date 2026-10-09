@@ -1,6 +1,7 @@
 //! Framed `Connection` + `ByteTransport` matching TypeScript `connection.ts` / `transport.ts`.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use davinci_protocol::{
@@ -75,6 +76,27 @@ struct ConnectionInner {
     on_handshake: Option<HandshakeListener>,
     on_message: Option<MessageListener>,
     on_state_change: Option<StateChangeListener>,
+    /// Notifications waiting for delivery. Listeners run with no borrow of
+    /// `ConnectionInner` held, so they may call back into the connection;
+    /// anything they trigger is queued here and delivered after they return.
+    notices: VecDeque<Notice>,
+    notifying: bool,
+}
+
+enum Notice {
+    State(ConnectionStateChange),
+    Message(Box<ServerMessage>),
+}
+
+/// Clears `notifying` even if a listener panics.
+struct NotifyingGuard<'a>(&'a RefCell<ConnectionInner>);
+
+impl Drop for NotifyingGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.borrow_mut();
+        inner.notifying = false;
+        inner.notices.clear();
+    }
 }
 
 pub struct Connection {
@@ -104,6 +126,8 @@ impl Connection {
                 on_handshake: None,
                 on_message: None,
                 on_state_change: None,
+                notices: VecDeque::new(),
+                notifying: false,
             })),
         })
     }
@@ -185,12 +209,36 @@ impl Connection {
                 max_frame_length: Some(self.max_frame_length()),
             }),
         )
-        .map_err(|err| ClientError::Protocol(err.to_string()))?;
+        .map_err(|err| ClientError::Protocol(err.to_string()));
+        let hello = match hello {
+            Ok(hello) => hello,
+            Err(error) => {
+                // The transport is already attached; leaving the state at
+                // `Connecting` would refuse every later connect.
+                self.fail_and_close(error.clone());
+                return Err(error);
+            }
+        };
         if let Err(error) = self.send_on_current_transport(&hello) {
             self.fail_and_close(error.clone());
             return Err(error);
         }
-        self.take_handshake()
+        self.finish_handshake()
+    }
+
+    /// Hand back the handshake, or tear the attempt down. `connect` is
+    /// synchronous: once the hello has been sent and the transport has had
+    /// its turn to deliver, an attempt with no outcome is a failed attempt.
+    /// Returning the error while still `Connecting` strands the client, as
+    /// every later `connect` is refused as "already connecting".
+    fn finish_handshake(&self) -> Result<ServerSnapshot, ClientError> {
+        let result = self.take_handshake();
+        if let Err(error) = &result {
+            if self.state() == ConnectionState::Connecting {
+                self.fail_and_close(error.clone());
+            }
+        }
+        result
     }
 
     pub fn disconnect(&self, reason: impl Into<String>) {
@@ -301,15 +349,7 @@ impl Connection {
                         let mut inner = self.inner.borrow_mut();
                         inner.state = ConnectionState::Connected;
                     }
-                    let handshake_err = {
-                        let mut inner = self.inner.borrow_mut();
-                        if let Some(listener) = inner.on_handshake.as_mut() {
-                            listener(&snapshot).err()
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(error) = handshake_err {
+                    if let Err(error) = self.run_handshake_listener(&snapshot) {
                         self.fail_and_close(error);
                         return;
                     }
@@ -341,13 +381,8 @@ impl Connection {
             self.fail_and_close(ClientError::Protocol("Unexpected handshake message".into()));
             return;
         }
-        {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(listener) = inner.on_message.as_mut() {
-                listener(&message);
-            }
-            inner.inbound.push(message);
-        }
+        self.inner.borrow_mut().inbound.push(message.clone());
+        self.notify(Notice::Message(Box::new(message)));
     }
 
     fn handle_close(&self) {
@@ -410,9 +445,62 @@ impl Connection {
     }
 
     fn emit_state(&self, state: ConnectionState, error: Option<String>) {
-        let change = ConnectionStateChange { state, error };
-        if let Some(listener) = self.inner.borrow_mut().on_state_change.as_mut() {
-            listener(&change);
+        self.notify(Notice::State(ConnectionStateChange { state, error }));
+    }
+
+    /// Run the handshake listener with no borrow held (WOR-49). A listener
+    /// that installs a replacement for itself keeps the replacement.
+    fn run_handshake_listener(&self, snapshot: &ServerSnapshot) -> Result<(), ClientError> {
+        let Some(mut listener) = self.inner.borrow_mut().on_handshake.take() else {
+            return Ok(());
+        };
+        let result = listener(snapshot);
+        let mut inner = self.inner.borrow_mut();
+        if inner.on_handshake.is_none() {
+            inner.on_handshake = Some(listener);
+        }
+        result
+    }
+
+    /// Deliver a notification to its listener with no borrow held (WOR-49).
+    /// Notifications raised while a listener runs are queued and delivered in
+    /// order once it returns, so no listener is ever re-entered.
+    fn notify(&self, notice: Notice) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.notices.push_back(notice);
+            if inner.notifying {
+                return;
+            }
+            inner.notifying = true;
+        }
+        let _guard = NotifyingGuard(&self.inner);
+        loop {
+            let Some(notice) = self.inner.borrow_mut().notices.pop_front() else {
+                break;
+            };
+            match notice {
+                Notice::State(change) => {
+                    let Some(mut listener) = self.inner.borrow_mut().on_state_change.take() else {
+                        continue;
+                    };
+                    listener(&change);
+                    let mut inner = self.inner.borrow_mut();
+                    if inner.on_state_change.is_none() {
+                        inner.on_state_change = Some(listener);
+                    }
+                }
+                Notice::Message(message) => {
+                    let Some(mut listener) = self.inner.borrow_mut().on_message.take() else {
+                        continue;
+                    };
+                    listener(&message);
+                    let mut inner = self.inner.borrow_mut();
+                    if inner.on_message.is_none() {
+                        inner.on_message = Some(listener);
+                    }
+                }
+            }
         }
     }
 
@@ -548,6 +636,101 @@ mod tests {
                 Vec::new(),
             ),
         })
+    }
+
+    struct CountingTransport {
+        closes: Rc<RefCell<usize>>,
+        fail_send: bool,
+    }
+
+    impl ByteTransport for CountingTransport {
+        fn send(&mut self, _chunk: &[u8]) -> Result<(), ClientError> {
+            if self.fail_send {
+                Err(ClientError::Io("socket write failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn close(&mut self) {
+            *self.closes.borrow_mut() += 1;
+        }
+    }
+
+    fn counting_factory(closes: Rc<RefCell<usize>>, fail_send: bool) -> TransportFactory {
+        Box::new(move |_handlers| {
+            Ok(Box::new(CountingTransport {
+                closes: closes.clone(),
+                fail_send,
+            }))
+        })
+    }
+
+    /// WOR-46: a handshake that produces no hello must not leave the client
+    /// stuck in `Connecting`; the next attempt has to be allowed.
+    #[test]
+    fn a_handshake_that_never_answers_cleans_up_and_allows_reconnect() {
+        let connection = Connection::new(None).unwrap();
+        let closes = Rc::new(RefCell::new(0));
+        let mut silent = counting_factory(closes.clone(), false);
+        let err = connection.connect(&mut silent).unwrap_err().to_string();
+        assert_eq!(err, "Expected server hello as first message");
+        assert_eq!(connection.state(), ConnectionState::Disconnected);
+        assert_eq!(*closes.borrow(), 1, "the half-open transport is closed");
+
+        let mut good = hello_factory(empty_snapshot());
+        let snapshot = connection.connect(&mut good).unwrap();
+        assert_eq!(snapshot.server_id, "s");
+        assert_eq!(connection.state(), ConnectionState::Connected);
+    }
+
+    #[test]
+    fn a_hello_that_cannot_be_encoded_does_not_leave_connecting_behind() {
+        // A one-byte frame limit cannot carry the client hello.
+        let connection = Connection::new(Some(1)).unwrap();
+        let closes = Rc::new(RefCell::new(0));
+        let mut factory = counting_factory(closes.clone(), false);
+        let err = connection.connect(&mut factory).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(connection.state(), ConnectionState::Disconnected);
+        assert_eq!(*closes.borrow(), 1);
+        let mut again = counting_factory(closes.clone(), false);
+        let err = connection.connect(&mut again).unwrap_err().to_string();
+        assert_ne!(err, "PiClient is already connecting");
+    }
+
+    #[test]
+    fn a_failed_hello_write_and_a_failed_factory_both_end_disconnected() {
+        let connection = Connection::new(None).unwrap();
+        let closes = Rc::new(RefCell::new(0));
+        let mut failing_write = counting_factory(closes.clone(), true);
+        let err = connection.connect(&mut failing_write).unwrap_err();
+        assert!(err.to_string().contains("socket write failed"));
+        assert_eq!(connection.state(), ConnectionState::Disconnected);
+        assert_eq!(*closes.borrow(), 1);
+
+        let mut refused: TransportFactory =
+            Box::new(|_| Err(ClientError::Io("connection refused".into())));
+        let err = connection.connect(&mut refused).unwrap_err();
+        assert!(err.to_string().contains("connection refused"));
+        assert_eq!(connection.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn state_changes_report_the_failed_attempt_and_end_disconnected() {
+        let connection = Connection::new(None).unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        connection.on_state_change(move |change| {
+            sink.borrow_mut().push((change.state, change.error.clone()));
+        });
+        let closes = Rc::new(RefCell::new(0));
+        let mut silent = counting_factory(closes, false);
+        let _ = connection.connect(&mut silent);
+        let seen = seen.borrow();
+        assert_eq!(seen[0].0, ConnectionState::Connecting);
+        let last = seen.last().unwrap();
+        assert_eq!(last.0, ConnectionState::Disconnected);
+        assert!(last.1.as_deref().is_some_and(|e| e.contains("hello")));
     }
 
     #[test]

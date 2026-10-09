@@ -2113,7 +2113,9 @@ mod tests {
         assert_eq!(polled_data["status"], "stopping");
         assert!(!polled_data["completed"].as_bool().unwrap());
 
-        // 5. Control retry on active worker (accepted command, not yet terminal/completed)
+        // 5. Control retry on an active worker. No lifecycle path leads back
+        // to Starting, so a retry restarts nothing; it is reported as
+        // rejected rather than accepted (WOR-97).
         let worker_id2 = davinci_agent::AgentId::new();
         let record2 = davinci_agent::runtime::AgentRecord {
             id: worker_id2,
@@ -2152,8 +2154,12 @@ mod tests {
         );
         assert!(retry_res.success);
         let retry_data = retry_res.data.as_ref().unwrap();
-        assert_eq!(retry_data["status"], "accepted");
-        assert!(!retry_data["completed"].as_bool().unwrap());
+        assert_eq!(retry_data["status"], "rejected");
+        assert!(retry_data["completed"].as_bool().unwrap());
+        assert!(retry_data["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("transition_rejected"));
     }
 
     #[test]

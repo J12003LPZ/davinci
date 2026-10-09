@@ -5,9 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -24,6 +26,31 @@ pub enum WorkflowStateError {
     IoError(String),
     #[error("serialization error: {0}")]
     SerializationError(String),
+}
+
+/// Attempts at a fresh overflow file name before giving up.
+const MAX_OVERFLOW_CREATE_ATTEMPTS: usize = 8;
+
+/// Write `contents` to `<dir>/<id>.json` without ever replacing an existing
+/// file. A name collision draws a new ID from `next_id` instead of replacing
+/// the artifact that already owns the name. Returns the ID actually used.
+fn create_overflow_file(
+    dir: &Path,
+    mut id: Uuid,
+    contents: &[u8],
+    mut next_id: impl FnMut() -> Uuid,
+) -> Result<(Uuid, PathBuf), WorkflowStateError> {
+    for _ in 0..MAX_OVERFLOW_CREATE_ATTEMPTS {
+        let path = dir.join(format!("{id}.json"));
+        match write_atomic_new(&path, contents) {
+            Ok(()) => return Ok((id, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => id = next_id(),
+            Err(e) => return Err(WorkflowStateError::IoError(e.to_string())),
+        }
+    }
+    Err(WorkflowStateError::IoError(
+        "overflow artifact name collided repeatedly".into(),
+    ))
 }
 
 fn now_ms() -> i64 {
@@ -48,7 +75,56 @@ pub struct WorkflowArtifact {
     pub byte_size: usize,
     #[serde(default)]
     pub overflow_path: Option<PathBuf>,
+    /// SHA-256 of the overflow file contents, checked on every full read.
+    #[serde(default)]
+    pub overflow_sha256: Option<String>,
     pub created_ms: i64,
+}
+
+fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
+}
+
+/// Write `contents` so that `path` is either absent or complete: stage in a
+/// sibling temp file, flush it to disk, then rename into place.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    stage_then(path, contents, |temp| std::fs::rename(temp, path))
+}
+
+/// Like `write_atomic`, but never replaces: if `path` already exists this
+/// fails with `AlreadyExists` and leaves it untouched. The staged file is
+/// hard-linked into place (which refuses an existing name) and then dropped.
+fn write_atomic_new(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    stage_then(path, contents, |temp| std::fs::hard_link(temp, path))?;
+    Ok(())
+}
+
+fn stage_then(
+    path: &Path,
+    contents: &[u8],
+    publish: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        publish(&temp)
+    })();
+    // After a rename the temp name is gone; after a hard link it is the spare
+    // name. Either way, nothing may be left behind.
+    let _ = std::fs::remove_file(&temp);
+    result
 }
 
 impl WorkflowArtifact {
@@ -66,7 +142,35 @@ impl WorkflowArtifact {
 
 type PhaseArtifactMap = HashMap<(WorkflowId, String), Vec<Uuid>>;
 
-/// Thread-safe in-memory and disk-overflow artifact store.
+/// Per-workflow append-only record of every artifact's metadata (and inline
+/// value), so a new store over the same directory can resume the workflow.
+const MANIFEST_FILE: &str = "artifacts.jsonl";
+
+/// The authority a workflow was launched with (WOR-117).
+const AUTHORITY_FILE: &str = "authority.json";
+
+/// One line per mutating worker a resume was allowed to run again (WOR-125).
+const RESUME_GRANTS_FILE: &str = "resume_grants.jsonl";
+
+/// The permission ceiling a workflow was launched under. Recorded at launch
+/// so a resume, even in a later process, runs under the same ceiling rather
+/// than whatever the resuming caller passes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowAuthority {
+    pub parent_permission_mode: Option<crate::PermissionMode>,
+    pub parent_tools: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResumeGrant {
+    phase: String,
+    worker: String,
+    fingerprint: String,
+}
+
+/// Thread-safe artifact store. Large values overflow to their own file, and
+/// every artifact is recorded in its workflow's manifest before it is
+/// visible, so artifacts survive a restart (WOR-104).
 #[derive(Debug, Clone)]
 pub struct WorkflowStateStore {
     max_inline_bytes: usize,
@@ -74,6 +178,8 @@ pub struct WorkflowStateStore {
     artifacts: Arc<RwLock<HashMap<Uuid, WorkflowArtifact>>>,
     // (workflow_id, phase_id) -> list of artifact ids
     phase_index: Arc<RwLock<PhaseArtifactMap>>,
+    /// Workflows whose manifest has been read into memory.
+    loaded: Arc<RwLock<HashSet<WorkflowId>>>,
 }
 
 impl Default for WorkflowStateStore {
@@ -98,7 +204,164 @@ impl WorkflowStateStore {
             overflow_dir,
             artifacts: Arc::new(RwLock::new(HashMap::new())),
             phase_index: Arc::new(RwLock::new(HashMap::new())),
+            loaded: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    fn manifest_path(&self, workflow_id: WorkflowId) -> PathBuf {
+        self.overflow_dir
+            .join(workflow_id.to_string())
+            .join(MANIFEST_FILE)
+    }
+
+    fn workflow_file(
+        &self,
+        workflow_id: WorkflowId,
+        name: &str,
+    ) -> Result<PathBuf, std::io::Error> {
+        let dir = self.overflow_dir.join(workflow_id.to_string());
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join(name))
+    }
+
+    /// Record the authority a workflow was launched with.
+    pub fn save_authority(
+        &self,
+        workflow_id: WorkflowId,
+        authority: &WorkflowAuthority,
+    ) -> Result<(), WorkflowStateError> {
+        let bytes = serde_json::to_vec(authority)
+            .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
+        self.workflow_file(workflow_id, AUTHORITY_FILE)
+            .and_then(|path| write_atomic(&path, &bytes))
+            .map_err(|e| WorkflowStateError::IoError(e.to_string()))
+    }
+
+    /// The authority recorded at launch, `None` for a workflow launched
+    /// before it was recorded. A record that cannot be read is an error, so
+    /// a resume never widens to "unknown" over a damaged file.
+    pub fn authority(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<WorkflowAuthority>, WorkflowStateError> {
+        let path = self
+            .overflow_dir
+            .join(workflow_id.to_string())
+            .join(AUTHORITY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| WorkflowStateError::SerializationError(e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(WorkflowStateError::IoError(e.to_string())),
+        }
+    }
+
+    /// Durably spend a resume grant for one mutating worker. Written before
+    /// the worker runs, so a crash mid-run still counts as spent.
+    pub fn record_resume_grant(
+        &self,
+        workflow_id: WorkflowId,
+        phase_id: &str,
+        worker_id: &str,
+        fingerprint: &str,
+    ) -> Result<(), WorkflowStateError> {
+        let record = serde_json::to_vec(&ResumeGrant {
+            phase: phase_id.to_string(),
+            worker: worker_id.to_string(),
+            fingerprint: fingerprint.to_string(),
+        })
+        .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
+        self.workflow_file(workflow_id, RESUME_GRANTS_FILE)
+            .and_then(|path| crate::runtime::append_log::append_record(&path, &record))
+            .map_err(|e| WorkflowStateError::IoError(e.to_string()))
+    }
+
+    /// How many resume grants one worker has already spent.
+    pub fn resume_grants_spent(
+        &self,
+        workflow_id: WorkflowId,
+        phase_id: &str,
+        worker_id: &str,
+    ) -> Result<usize, WorkflowStateError> {
+        let path = self
+            .overflow_dir
+            .join(workflow_id.to_string())
+            .join(RESUME_GRANTS_FILE);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(WorkflowStateError::IoError(e.to_string())),
+        };
+        // A torn last line was never acknowledged, so it is not counted.
+        Ok(BufReader::new(file)
+            .split(b'\n')
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_slice::<ResumeGrant>(&line).ok())
+            .filter(|grant| grant.phase == phase_id && grant.worker == worker_id)
+            .count())
+    }
+
+    /// Read a workflow's manifest into memory once. A line that does not
+    /// parse is skipped: only a crash mid-append leaves one, and only last.
+    fn ensure_loaded(&self, workflow_id: WorkflowId) {
+        if read_lock(&self.loaded).contains(&workflow_id) {
+            return;
+        }
+        let mut loaded = write_lock(&self.loaded);
+        if !loaded.insert(workflow_id) {
+            return;
+        }
+        let Ok(file) = std::fs::File::open(self.manifest_path(workflow_id)) else {
+            return;
+        };
+        // Same lock order as `put_artifact` and the readers: index, then artifacts.
+        let mut index = write_lock(&self.phase_index);
+        let mut arts = write_lock(&self.artifacts);
+        // Split on raw bytes: a line torn inside a multi-byte character is
+        // not UTF-8, and must be skipped like any other torn line rather
+        // than end the read and hide every artifact after it.
+        for line in BufReader::new(file).split(b'\n').map_while(Result::ok) {
+            let Ok(artifact) = serde_json::from_slice::<WorkflowArtifact>(&line) else {
+                continue;
+            };
+            if artifact.workflow_id != workflow_id || arts.contains_key(&artifact.id) {
+                continue;
+            }
+            index
+                .entry((workflow_id, artifact.phase_id.clone()))
+                .or_default()
+                .push(artifact.id);
+            arts.insert(artifact.id, artifact);
+        }
+    }
+
+    /// Load every workflow manifest under the store directory, for a lookup
+    /// by artifact ID alone.
+    fn load_all(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.overflow_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<WorkflowId>().ok())
+            {
+                self.ensure_loaded(id);
+            }
+        }
+    }
+
+    fn append_manifest(&self, artifact: &WorkflowArtifact) -> Result<(), WorkflowStateError> {
+        let io = |e: std::io::Error| WorkflowStateError::IoError(e.to_string());
+        let path = self.manifest_path(artifact.workflow_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io)?;
+        }
+        let record = serde_json::to_vec(artifact)
+            .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
+        crate::runtime::append_log::append_record(&path, &record).map_err(io)
     }
 
     /// Store an artifact produced by a worker.
@@ -110,33 +373,46 @@ impl WorkflowStateStore {
         value: Value,
         schema: Option<Value>,
     ) -> Result<WorkflowArtifact, WorkflowStateError> {
+        // Earlier artifacts of this workflow keep their place ahead of it.
+        self.ensure_loaded(workflow_id);
         let serialized = serde_json::to_string(&value)
             .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
         let byte_size = serialized.len();
-        let id = Uuid::now_v7();
+        let mut id = Uuid::now_v7();
         let now = now_ms();
 
-        let (stored_value, is_overflow, overflow_path) = if byte_size > self.max_inline_bytes {
-            // Write overflow artifact to disk
-            let wf_dir = self.overflow_dir.join(workflow_id.to_string());
-            if !wf_dir.exists() {
-                std::fs::create_dir_all(&wf_dir)
-                    .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
-            }
-            let file_path = wf_dir.join(format!("{id}.json"));
-            std::fs::write(&file_path, &serialized)
-                .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
+        let (stored_value, is_overflow, overflow_path, overflow_sha256) =
+            if byte_size > self.max_inline_bytes {
+                // Write overflow artifact to disk
+                let wf_dir = self.overflow_dir.join(workflow_id.to_string());
+                if !wf_dir.exists() {
+                    std::fs::create_dir_all(&wf_dir)
+                        .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
+                }
+                let (new_id, file_path) =
+                    create_overflow_file(&wf_dir, id, serialized.as_bytes(), Uuid::now_v7)?;
+                id = new_id;
 
-            let reference = serde_json::json!({
-                "$overflow_ref": id.to_string(),
-                "phase": phase_id,
-                "byte_size": byte_size,
-                "file": file_path.to_string_lossy(),
-            });
-            (reference, true, Some(file_path))
-        } else {
-            (value, false, None)
-        };
+                let mut reference = serde_json::json!({
+                    "$overflow_ref": id.to_string(),
+                    "phase": phase_id,
+                    "byte_size": byte_size,
+                    "file": file_path.to_string_lossy(),
+                });
+                // Resume matches a phase's artifacts to its workers by this
+                // field, so the reference keeps it.
+                if let Some(worker) = value.get("worker") {
+                    reference["worker"] = worker.clone();
+                }
+                (
+                    reference,
+                    true,
+                    Some(file_path),
+                    Some(sha256_hex(serialized.as_bytes())),
+                )
+            } else {
+                (value, false, None, None)
+            };
 
         let artifact = WorkflowArtifact {
             id,
@@ -148,16 +424,24 @@ impl WorkflowStateStore {
             is_overflow,
             byte_size,
             overflow_path,
+            overflow_sha256,
             created_ms: now,
         };
 
-        {
-            let mut arts = self.artifacts.write().unwrap();
-            arts.insert(id, artifact.clone());
+        if let Err(error) = self.append_manifest(&artifact) {
+            if let Some(path) = &artifact.overflow_path {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
         }
 
+        // Both maps change under both locks, in the same order readers use,
+        // and a poisoned lock is recovered rather than panicking between the
+        // two inserts and leaving an artifact the phase listing cannot see.
         {
-            let mut index = self.phase_index.write().unwrap();
+            let mut index = write_lock(&self.phase_index);
+            let mut arts = write_lock(&self.artifacts);
+            arts.insert(id, artifact.clone());
             index
                 .entry((workflow_id, phase_id.to_string()))
                 .or_default()
@@ -169,8 +453,11 @@ impl WorkflowStateStore {
 
     /// Get an artifact by ID.
     pub fn get_artifact(&self, id: &Uuid) -> Option<WorkflowArtifact> {
-        let arts = self.artifacts.read().unwrap();
-        arts.get(id).cloned()
+        if let Some(artifact) = read_lock(&self.artifacts).get(id) {
+            return Some(artifact.clone());
+        }
+        self.load_all();
+        read_lock(&self.artifacts).get(id).cloned()
     }
 
     /// Retrieve the full artifact content even if stored in overflow.
@@ -181,9 +468,16 @@ impl WorkflowStateStore {
 
         if artifact.is_overflow {
             if let Some(path) = &artifact.overflow_path {
-                let content = std::fs::read_to_string(path)
-                    .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
-                let val: Value = serde_json::from_str(&content)
+                let bytes =
+                    std::fs::read(path).map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
+                if let Some(expected) = &artifact.overflow_sha256 {
+                    if &sha256_hex(&bytes) != expected {
+                        return Err(WorkflowStateError::IoError(format!(
+                            "overflow artifact {id} failed checksum verification"
+                        )));
+                    }
+                }
+                let val: Value = serde_json::from_slice(&bytes)
                     .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
                 Ok(val)
             } else {
@@ -200,8 +494,9 @@ impl WorkflowStateStore {
         workflow_id: WorkflowId,
         phase_id: &str,
     ) -> Vec<WorkflowArtifact> {
-        let index = self.phase_index.read().unwrap();
-        let arts = self.artifacts.read().unwrap();
+        self.ensure_loaded(workflow_id);
+        let index = read_lock(&self.phase_index);
+        let arts = read_lock(&self.artifacts);
         if let Some(ids) = index.get(&(workflow_id, phase_id.to_string())) {
             ids.iter().filter_map(|id| arts.get(id).cloned()).collect()
         } else {
@@ -294,5 +589,219 @@ mod tests {
         let full_val = store.get_full_value(&artifact.id).unwrap();
         assert_eq!(full_val["status"], "ok");
         assert_eq!(full_val["large_data"].as_str().unwrap().len(), 1024 * 1024);
+    }
+
+    /// WOR-104: a new store over the same directory finds the artifacts of an
+    /// earlier process, inline and overflow, in their original order.
+    #[test]
+    fn wor104_artifacts_survive_a_restart() {
+        let tmp = tempdir().unwrap();
+        let wf_id = WorkflowId::new();
+        let worker = AgentId::new();
+        let (small, large) = {
+            let store = WorkflowStateStore::with_options(64, tmp.path().to_path_buf());
+            let small = store
+                .put_artifact(wf_id, "plan", worker, serde_json::json!({"step": 1}), None)
+                .unwrap();
+            let large = store
+                .put_artifact(
+                    wf_id,
+                    "plan",
+                    worker,
+                    serde_json::json!({"blob": "y".repeat(500)}),
+                    None,
+                )
+                .unwrap();
+            assert!(large.is_overflow);
+            (small, large)
+        };
+
+        let restarted = WorkflowStateStore::with_options(64, tmp.path().to_path_buf());
+        let ids: Vec<_> = restarted
+            .list_phase_artifacts(wf_id, "plan")
+            .into_iter()
+            .map(|artifact| artifact.id)
+            .collect();
+        assert_eq!(ids, [small.id, large.id]);
+        assert_eq!(
+            restarted.get_full_value(&large.id).unwrap()["blob"],
+            "y".repeat(500)
+        );
+
+        // A lookup by ID alone finds it too, and new artifacts go after.
+        let by_id = WorkflowStateStore::with_options(64, tmp.path().to_path_buf());
+        assert_eq!(by_id.get_artifact(&small.id).unwrap(), small);
+        let next = by_id
+            .put_artifact(wf_id, "plan", worker, serde_json::json!({"step": 2}), None)
+            .unwrap();
+        let ids: Vec<_> = by_id
+            .list_phase_artifacts(wf_id, "plan")
+            .into_iter()
+            .map(|artifact| artifact.id)
+            .collect();
+        assert_eq!(ids, [small.id, large.id, next.id]);
+    }
+
+    /// A crash mid-append leaves a torn last line; the rest still loads.
+    #[test]
+    fn wor104_torn_manifest_tail_is_skipped() {
+        let tmp = tempdir().unwrap();
+        let wf_id = WorkflowId::new();
+        let store = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let kept = store
+            .put_artifact(wf_id, "p", AgentId::new(), serde_json::json!(1), None)
+            .unwrap();
+        let manifest = store.manifest_path(wf_id);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&manifest)
+            .unwrap();
+        file.write_all(b"{\"id\":\"trunc").unwrap();
+        drop(file);
+        let restarted = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        assert_eq!(restarted.list_phase_artifacts(wf_id, "p"), [kept.clone()]);
+
+        // The next append starts a fresh line instead of joining the torn one.
+        let next = restarted
+            .put_artifact(wf_id, "p", AgentId::new(), serde_json::json!(2), None)
+            .unwrap();
+        let again = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        assert_eq!(again.list_phase_artifacts(wf_id, "p"), [kept, next]);
+    }
+
+    #[test]
+    fn wor102_poisoned_phase_index_does_not_orphan_artifact() {
+        let tmp = tempdir().unwrap();
+        let store = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let index = Arc::clone(&store.phase_index);
+        let _ = std::thread::spawn(move || {
+            let _guard = index.write().unwrap();
+            panic!("poison the phase index");
+        })
+        .join();
+        assert!(store.phase_index.is_poisoned());
+
+        let wf_id = WorkflowId::new();
+        let artifact = store
+            .put_artifact(
+                wf_id,
+                "p",
+                AgentId::new(),
+                serde_json::json!({"a": 1}),
+                None,
+            )
+            .expect("poisoned lock must not abort the insert");
+        let listed = store.list_phase_artifacts(wf_id, "p");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, artifact.id);
+        assert!(store.get_artifact(&artifact.id).is_some());
+    }
+
+    #[test]
+    fn wor103_overflow_write_leaves_only_the_final_file() {
+        let tmp = tempdir().unwrap();
+        let store = WorkflowStateStore::with_options(16, tmp.path().to_path_buf());
+        let wf_id = WorkflowId::new();
+        let val = serde_json::json!({"data": "y".repeat(256)});
+        let artifact = store
+            .put_artifact(wf_id, "p", AgentId::new(), val.clone(), None)
+            .unwrap();
+        let dir = artifact.overflow_path.as_ref().unwrap().parent().unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != MANIFEST_FILE)
+            .collect();
+        assert_eq!(names, vec![format!("{}.json", artifact.id)]);
+        assert_eq!(store.get_full_value(&artifact.id).unwrap(), val);
+    }
+
+    #[test]
+    fn wor103_tampered_overflow_file_is_rejected_on_read() {
+        let tmp = tempdir().unwrap();
+        let store = WorkflowStateStore::with_options(16, tmp.path().to_path_buf());
+        let val = serde_json::json!({"data": "y".repeat(256)});
+        let artifact = store
+            .put_artifact(WorkflowId::new(), "p", AgentId::new(), val, None)
+            .unwrap();
+        // Still valid JSON, but not what was written.
+        std::fs::write(
+            artifact.overflow_path.as_ref().unwrap(),
+            br#"{"data":"other"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.get_full_value(&artifact.id),
+            Err(WorkflowStateError::IoError(_))
+        ));
+    }
+
+    /// A crash can cut a line inside a multi-byte character. That line is
+    /// skipped like any torn line, and artifacts appended after it still load.
+    #[test]
+    fn wor104_torn_multibyte_line_does_not_hide_later_artifacts() {
+        let tmp = tempdir().unwrap();
+        let wf_id = WorkflowId::new();
+        let store = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let kept = store
+            .put_artifact(
+                wf_id,
+                "p",
+                AgentId::new(),
+                serde_json::json!("caf\u{e9}"),
+                None,
+            )
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.manifest_path(wf_id))
+            .unwrap();
+        file.write_all(b"{\"value\":\"caf\xc3").unwrap();
+        drop(file);
+
+        let recovered = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let next = recovered
+            .put_artifact(wf_id, "p", AgentId::new(), serde_json::json!(2), None)
+            .unwrap();
+        let reopened = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        assert_eq!(reopened.list_phase_artifacts(wf_id, "p"), [kept, next]);
+    }
+
+    // WOR-148: a colliding overflow ID must not truncate the file that owns it.
+    #[test]
+    fn wor148_overflow_collision_keeps_existing_artifact() {
+        let tmp = tempdir().unwrap();
+        let taken = Uuid::now_v7();
+        let existing = tmp.path().join(format!("{taken}.json"));
+        std::fs::write(&existing, "original artifact").unwrap();
+
+        let fresh = Uuid::now_v7();
+        let mut draws = vec![fresh].into_iter();
+        let (id, path) =
+            create_overflow_file(tmp.path(), taken, b"new artifact", || draws.next().unwrap())
+                .unwrap();
+
+        assert_eq!(id, fresh);
+        assert_ne!(path, existing);
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "original artifact"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new artifact");
+    }
+
+    #[test]
+    fn wor148_overflow_gives_up_when_every_name_is_taken() {
+        let tmp = tempdir().unwrap();
+        let taken = Uuid::now_v7();
+        let existing = tmp.path().join(format!("{taken}.json"));
+        std::fs::write(&existing, "original artifact").unwrap();
+
+        let err = create_overflow_file(tmp.path(), taken, b"new artifact", || taken).unwrap_err();
+        assert!(matches!(err, WorkflowStateError::IoError(_)));
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "original artifact"
+        );
     }
 }

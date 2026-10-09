@@ -4634,3 +4634,218 @@ fn provider_attribution_is_off_unless_the_host_opts_in() {
     // they do not configure, such as a subagent, must not attribute by default.
     assert!(!Agent::new("x").install_telemetry);
 }
+
+fn legacy_compaction_agent(dir: &std::path::Path) -> Agent {
+    let mut agent = Agent::new("fixture");
+    agent.set_context_vm_mode(ContextVmMode::Off);
+    agent
+        .load_from_session(JsonlSession::create(dir, "fixture", None).unwrap())
+        .unwrap();
+    agent.set_context_vm_mode(ContextVmMode::Off);
+    agent.compaction.keep_recent_tokens = 1;
+    agent
+}
+
+fn chat_texts(messages: &[ChatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .map(|message| format!("{}:{}", message.role, content_text(&message.content)))
+        .collect()
+}
+
+#[test]
+fn wor21_repeated_compaction_reloads_the_same_branch_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = legacy_compaction_agent(dir.path());
+    for turn in 0..4 {
+        agent.prompt(&format!("first round question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("first round answer {turn} {}", "y".repeat(400)));
+    }
+    assert!(agent.compact(None).compacted);
+    for turn in 0..4 {
+        agent.prompt(&format!("second round question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("second round answer {turn} {}", "y".repeat(400)));
+    }
+    let second = agent.compact(None);
+    assert!(second.compacted, "{}", second.summary);
+    let live = chat_texts(&agent.messages);
+
+    let path = agent.session.as_ref().unwrap().path.clone();
+    let reopened = JsonlSession::open(&path).unwrap();
+    assert_eq!(chat_texts(&messages_from_session(&reopened)), live);
+}
+
+#[test]
+fn wor20_failed_compaction_checkpoint_keeps_live_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = legacy_compaction_agent(dir.path());
+    for turn in 0..4 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("answer {turn} {}", "y".repeat(400)));
+    }
+    let before = chat_texts(&agent.messages);
+    let path = agent.session.as_ref().unwrap().path.clone();
+    let mut readonly = std::fs::metadata(&path).unwrap().permissions();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&path, readonly).unwrap();
+
+    let result = agent.compact(None);
+
+    let mut writable = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    writable.set_readonly(false);
+    std::fs::set_permissions(&path, writable).unwrap();
+    assert!(!result.compacted, "unsaved compaction reported success");
+    assert!(result.summary.contains("not saved"), "{}", result.summary);
+    assert_eq!(chat_texts(&agent.messages), before);
+}
+
+#[test]
+fn wor32_abandoned_branch_summary_does_not_seed_the_active_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = legacy_compaction_agent(dir.path());
+    // Echo the prompt so each summary shows exactly which previous summary
+    // the compaction was seeded with.
+    agent.summarizer = Some(crate::compaction::Summarizer::new(|request| {
+        Ok(crate::compaction::SummarizeResponse {
+            text: request.prompt.clone(),
+            usage: Default::default(),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    for turn in 0..3 {
+        agent.prompt(&format!("shared question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("shared answer {turn} {}", "y".repeat(400)));
+    }
+    let branch_point = agent.session.as_ref().unwrap().leaf_id.clone();
+    for turn in 0..3 {
+        agent.prompt(&format!("branch b question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("branch b answer {turn} {}", "y".repeat(400)));
+    }
+    let abandoned = agent.compact(Some("ABANDONED-BRANCH-MARKER"));
+    assert!(abandoned.compacted);
+    assert!(abandoned.summary.contains("ABANDONED-BRANCH-MARKER"));
+
+    let session = agent.session.as_mut().unwrap();
+    session.set_leaf(branch_point);
+    agent.messages = messages_from_session(agent.session.as_ref().unwrap());
+    for turn in 0..3 {
+        agent.prompt(&format!("branch a question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("branch a answer {turn} {}", "y".repeat(400)));
+    }
+    let active = agent.compact(None);
+    assert!(active.compacted, "{}", active.summary);
+    assert!(
+        !active.summary.contains("ABANDONED-BRANCH-MARKER"),
+        "abandoned branch summary leaked: {}",
+        active.summary
+    );
+}
+
+fn append_resume_record(agent: &mut Agent, response_id: &str, provider_messages: &[ChatMessage]) {
+    let prepared = davinci_ai::PreparedProviderRequest::new(serde_json::json!({
+        "model": "fixture",
+        "input": [],
+    }));
+    let turn = davinci_ai::NativeResponsesTurn::from_prepared(
+        &prepared,
+        davinci_ai::NativeResponsesOutput {
+            response_id: Some(response_id.into()),
+            output_items: vec![],
+            final_response: None,
+            terminal_event_type: "response.completed".into(),
+        },
+    )
+    .unwrap();
+    let record = davinci_ai::NativeResponsesResumeRecord {
+        turn,
+        resume_provider_message_count: provider_messages.len(),
+        resume_provider_messages_fingerprint: davinci_ai::provider_messages_fingerprint(
+            provider_messages,
+        ),
+    };
+    let mut extra = serde_json::Map::new();
+    extra.insert("data".into(), serde_json::to_value(record).unwrap());
+    agent
+        .session
+        .as_mut()
+        .unwrap()
+        .append_entry(SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE.into()),
+            extra,
+        })
+        .unwrap();
+}
+
+fn resume_response_id(record: Option<davinci_ai::NativeResponsesResumeRecord>) -> Option<String> {
+    record.and_then(|record| record.turn.output.response_id)
+}
+
+#[test]
+fn wor28_native_resume_record_comes_from_the_active_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = legacy_compaction_agent(dir.path());
+    agent.prompt("shared question");
+    agent.record_assistant("shared answer");
+    let provider_a = agent.messages.clone();
+    append_resume_record(&mut agent, "resp_branch_a", &provider_a);
+    let branch_a_leaf = agent.session.as_ref().unwrap().leaf_id.clone();
+
+    agent.prompt("branch b question");
+    agent.record_assistant("branch b answer");
+    let provider_b = agent.messages.clone();
+    append_resume_record(&mut agent, "resp_branch_b", &provider_b);
+    assert_eq!(
+        resume_response_id(agent.native_responses_resume_record()).as_deref(),
+        Some("resp_branch_b")
+    );
+
+    agent.session.as_mut().unwrap().set_leaf(branch_a_leaf);
+    agent.messages = messages_from_session(agent.session.as_ref().unwrap());
+    assert_eq!(
+        resume_response_id(agent.native_responses_resume_record()).as_deref(),
+        Some("resp_branch_a"),
+        "a newer record from the abandoned branch hid this branch's own one"
+    );
+    assert_eq!(
+        resume_response_id(agent.native_responses_resume_record_for(&provider_a)).as_deref(),
+        Some("resp_branch_a")
+    );
+}
+
+#[test]
+fn wor39_native_resume_falls_back_to_a_compatible_ancestor_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = legacy_compaction_agent(dir.path());
+    agent.prompt("first question");
+    agent.record_assistant("first answer");
+    let compatible = agent.messages.clone();
+    append_resume_record(&mut agent, "resp_compatible", &compatible);
+    agent.prompt("second question");
+    agent.record_assistant("second answer");
+    let mut rewritten = agent.messages.clone();
+    rewritten[2] = ChatMessage::text("user", "a projection the next request will not contain");
+    append_resume_record(&mut agent, "resp_stale", &rewritten);
+
+    let request = agent.messages.clone();
+    assert_eq!(
+        resume_response_id(agent.native_responses_resume_record()).as_deref(),
+        Some("resp_stale")
+    );
+    assert_eq!(
+        resume_response_id(agent.native_responses_resume_record_for(&request)).as_deref(),
+        Some("resp_compatible")
+    );
+    assert_eq!(
+        agent.native_responses_resume_record_for(&request[..1]),
+        None
+    );
+}

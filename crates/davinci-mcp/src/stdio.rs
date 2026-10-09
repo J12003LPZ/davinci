@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -61,7 +62,7 @@ struct StderrTail {
 }
 
 pub struct StdioTransport {
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: StdinWriter,
     lines: Receiver<std::io::Result<String>>,
     stderr: Arc<(Mutex<StderrTail>, Condvar)>,
     next_id: u64,
@@ -89,10 +90,12 @@ impl StdioTransport {
         let mut child = cmd
             .spawn()
             .map_err(|err| Error::Transport(format!("spawn `{command}`: {err}")))?;
-        let stdin =
-            Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
-                Error::Transport("stdio server has no stdin".into())
-            })?));
+        let stdin = StdinWriter::spawn(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::Transport("stdio server has no stdin".into()))?,
+        );
         let stdout = child
             .stdout
             .take()
@@ -131,7 +134,7 @@ impl StdioTransport {
             }
         }
         let (sender, lines) = stdout_channel();
-        let response_writer = Arc::clone(&stdin);
+        let response_writer = stdin.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -154,12 +157,9 @@ impl StdioTransport {
                     };
                     if let Some(method) = message.get("method").and_then(Value::as_str) {
                         if let Some(id) = message.get("id").cloned() {
-                            let reply = server_request_reply(id, method);
-                            if let Err(error) = write_shared_line(&response_writer, &reply) {
-                                let _ = sender.send(Err(error));
-                                stop = true;
-                                break;
-                            }
+                            // Never wait here: a server that is not reading its
+                            // stdin must not also stall this stdout drain.
+                            response_writer.enqueue(&server_request_reply(id, method));
                         }
                         continue;
                     }
@@ -236,13 +236,24 @@ impl StdioTransport {
         self.transport_error(what)
     }
 
-    fn write_line(&mut self, value: &Value) -> Result<()> {
-        write_shared_line(&self.stdin, value)
-            .map_err(|err| self.closed_error(&format!("mcp server stdin: {err}")))
+    /// Write one line, waiting for it to reach the pipe until `deadline`.
+    fn write_line(&mut self, value: &Value, deadline: Instant) -> Result<()> {
+        match self.stdin.write(value, deadline) {
+            Ok(()) => Ok(()),
+            Err(WriteError::TimedOut) => Err(self.transport_error(&format!(
+                "mcp server stdin: write timed out after {}s; the server is not reading its input",
+                self.call_timeout.as_secs_f32()
+            ))),
+            Err(WriteError::Backlog) => Err(self.transport_error(
+                "mcp server stdin: not written; earlier lines are still unread by the server",
+            )),
+            Err(WriteError::Io(err)) => Err(self.closed_error(&format!("mcp server stdin: {err}"))),
+        }
     }
 
+    /// Best effort, never waits: the request already failed.
     fn cancel_request(&mut self, id: &Value) {
-        let _ = self.write_line(&json!({
+        self.stdin.enqueue(&json!({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
             "params": { "requestId": id, "reason": "timeout" }
@@ -251,8 +262,7 @@ impl StdioTransport {
 
     /// Wait for the reply to `id`, answering server-to-client requests and
     /// skipping notifications and stray log lines on the way.
-    fn read_response(&mut self, id: &Value) -> Result<Value> {
-        let deadline = Instant::now() + self.call_timeout;
+    fn read_response(&mut self, id: &Value, deadline: Instant) -> Result<Value> {
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -317,13 +327,112 @@ fn server_request_reply(id: Value, method: &str) -> Value {
     }
 }
 
-fn write_shared_line(stdin: &Arc<Mutex<ChildStdin>>, value: &Value) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(value)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    line.push(b'\n');
-    let mut writer = stdin.lock().unwrap_or_else(|error| error.into_inner());
-    writer.write_all(&line)?;
-    writer.flush()
+/// Lines queued for the child's stdin beyond the one being written. A full
+/// queue means the server has stopped reading, so further writes fail at
+/// once instead of piling up behind the stuck one.
+const MAX_QUEUED_STDIN_LINES: usize = 16;
+
+struct WriteJob {
+    line: Vec<u8>,
+    done: Option<SyncSender<std::io::Result<()>>>,
+    /// Set by a caller that stopped waiting. A job still queued when its
+    /// caller gave up is skipped, so a request the caller already reported
+    /// as failed does not reach the server later.
+    abandoned: Arc<AtomicBool>,
+}
+
+enum WriteError {
+    TimedOut,
+    Backlog,
+    Io(std::io::Error),
+}
+
+/// Owns the child's stdin on a dedicated thread (WOR-51). `write_all` on a
+/// pipe the server never drains blocks forever, so callers wait for the
+/// thread's acknowledgement with a deadline instead of writing themselves.
+/// Lines are written whole and in order. A stuck write is released once every
+/// holder of the pipe's read end exits. Killing the child is enough for a
+/// direct child; a `.cmd` shim on Windows can leave a grandchild holding the
+/// pipe, and then this thread stays blocked until that process exits. The
+/// caller never waits on it either way.
+#[derive(Clone)]
+struct StdinWriter {
+    jobs: SyncSender<WriteJob>,
+}
+
+impl StdinWriter {
+    fn spawn(mut stdin: impl Write + Send + 'static) -> Self {
+        let (jobs, queue) = mpsc::sync_channel::<WriteJob>(MAX_QUEUED_STDIN_LINES);
+        std::thread::spawn(move || {
+            let mut broken: Option<(std::io::ErrorKind, String)> = None;
+            for job in queue {
+                if job.abandoned.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let result = match &broken {
+                    Some((kind, message)) => Err(std::io::Error::new(*kind, message.clone())),
+                    None => stdin.write_all(&job.line).and_then(|()| stdin.flush()),
+                };
+                if let Err(error) = &result {
+                    broken.get_or_insert_with(|| (error.kind(), error.to_string()));
+                }
+                if let Some(done) = job.done {
+                    let _ = done.send(result);
+                }
+            }
+        });
+        Self { jobs }
+    }
+
+    fn encode(value: &Value) -> std::io::Result<Vec<u8>> {
+        let mut line = serde_json::to_vec(value)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        line.push(b'\n');
+        Ok(line)
+    }
+
+    fn write(&self, value: &Value, deadline: Instant) -> std::result::Result<(), WriteError> {
+        let line = Self::encode(value).map_err(WriteError::Io)?;
+        let (done, ack) = mpsc::sync_channel(1);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        match self.jobs.try_send(WriteJob {
+            line,
+            done: Some(done),
+            abandoned: Arc::clone(&abandoned),
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(WriteError::Backlog),
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(WriteError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdin writer stopped",
+                )))
+            }
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match ack.recv_timeout(wait) {
+            Ok(result) => result.map_err(WriteError::Io),
+            Err(RecvTimeoutError::Timeout) => {
+                abandoned.store(true, Ordering::SeqCst);
+                Err(WriteError::TimedOut)
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(WriteError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdin writer stopped",
+            ))),
+        }
+    }
+
+    /// Queue a line without waiting for it; dropped if the queue is full.
+    fn enqueue(&self, value: &Value) {
+        if let Ok(line) = Self::encode(value) {
+            let _ = self.jobs.try_send(WriteJob {
+                line,
+                done: None,
+                abandoned: Arc::default(),
+            });
+        }
+    }
 }
 
 const MAX_STDOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -375,15 +484,24 @@ impl RpcTransport for StdioTransport {
         let request = Request::new(id, method, params);
         let value = serde_json::to_value(&request)
             .map_err(|err| Error::Protocol(format!("encode: {err}")))?;
-        self.write_line(&value)?;
-        self.read_response(&Value::from(id))
+        // One deadline covers both writing the request and reading the reply.
+        let deadline = Instant::now() + self.call_timeout;
+        let id = Value::from(id);
+        if let Err(error) = self.write_line(&value, deadline) {
+            // The request may already be partly in the pipe and reach the
+            // server once it reads again; tell it the caller gave up.
+            self.cancel_request(&id);
+            return Err(error);
+        }
+        self.read_response(&id, deadline)
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         let note = Notification::new(method, params);
         let value =
             serde_json::to_value(&note).map_err(|err| Error::Protocol(format!("encode: {err}")))?;
-        self.write_line(&value)
+        let deadline = Instant::now() + self.call_timeout;
+        self.write_line(&value, deadline)
     }
 }
 
@@ -463,6 +581,53 @@ pub fn resolve_command_in(command: &str, dirs: &[PathBuf], exts: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writer whose first write blocks until released, recording every line.
+    struct GatedPipe {
+        gate: Option<Receiver<()>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for GatedPipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.recv();
+            }
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wor51_a_request_abandoned_while_queued_is_never_written() {
+        let (release, gate) = mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writer = StdinWriter::spawn(GatedPipe {
+            gate: Some(gate),
+            written: Arc::clone(&written),
+        });
+        let soon = || Instant::now() + Duration::from_millis(100);
+        assert!(matches!(
+            writer.write(&json!({"n": 1}), soon()),
+            Err(WriteError::TimedOut)
+        ));
+        assert!(matches!(
+            writer.write(&json!({"n": 2}), soon()),
+            Err(WriteError::TimedOut)
+        ));
+        release.send(()).unwrap();
+        writer
+            .write(&json!({"n": 3}), soon() + Duration::from_secs(5))
+            .ok()
+            .unwrap();
+        let text = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        // n=1 was already being written when its caller gave up, so it lands;
+        // n=2 never started and is dropped; n=3 is written after n=1.
+        assert_eq!(text, "{\"n\":1}\n{\"n\":3}\n");
+    }
 
     #[test]
     fn child_environment_is_allowlisted_plus_config() {

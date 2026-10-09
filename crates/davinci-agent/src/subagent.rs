@@ -386,6 +386,14 @@ pub fn scoped_tools_for_access(
         .collect()
 }
 
+/// True when any of `tools` can change state outside the model's reply. A
+/// tool the registry does not know counts as mutating.
+pub(crate) fn tools_may_mutate(tools: &[String], registry: &RuntimeCapabilityRegistry) -> bool {
+    tools
+        .iter()
+        .any(|name| MUTATION_TOOLS.contains(&name.as_str()) || !registry.is_read_only(name))
+}
+
 pub fn scoped_tools(requested: Option<&[String]>, parent: &[String]) -> Vec<String> {
     scoped_tools_with_policy(requested, parent, false)
 }
@@ -647,6 +655,49 @@ fn cap_output(mut content: String, cap: usize) -> String {
     content
 }
 
+/// Workers without a worktree lease run in the parent's working directory. Two
+/// of them that can edit files would race on the same files, so a batch may
+/// hold at most one such writer; the rest must be read-only or isolated.
+fn reject_shared_cwd_writers(
+    specs: &[TaskSpec],
+    parent: &SubagentParent,
+    parent_tools: &[String],
+) -> Result<(), ToolError> {
+    if specs.len() < 2 {
+        return Ok(());
+    }
+    let fallback_registry;
+    let registry = if let Some(runtime) = &parent.runtime {
+        &runtime.capability_registry
+    } else {
+        fallback_registry = RuntimeCapabilityRegistry::with_builtins();
+        &fallback_registry
+    };
+    let writers: Vec<usize> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.isolation.as_deref() != Some("worktree"))
+        .filter(|(_, spec)| {
+            let access = WorkerAccess::for_worker(parent.permission_mode, false);
+            scoped_tools_for_access(spec.tools.as_deref(), parent_tools, access, registry)
+                .iter()
+                .any(|tool| MUTATION_TOOLS.contains(&tool.as_str()))
+        })
+        .map(|(index, _)| index + 1)
+        .collect();
+    if writers.len() > 1 {
+        let list = writers
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ToolError::Failed(format!(
+            "Tasks {list} can all edit files in the shared working directory and would overwrite each other. Set isolation 'worktree' on each writer, or limit all but one of them to read-only tools."
+        )));
+    }
+    Ok(())
+}
+
 pub fn run_tool(
     input: &Value,
     parent_tools: &[String],
@@ -734,6 +785,8 @@ pub fn run_tool(
             }
         }
     }
+
+    reject_shared_cwd_writers(&specs, parent, parent_tools)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1350,6 +1403,92 @@ fn run_journaled_subagent(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn writer_parent() -> SubagentParent {
+        SubagentParent {
+            permission_mode: Some(PermissionMode::AlwaysApprove),
+            ..Default::default()
+        }
+    }
+
+    fn counting_runner() -> (SubagentRunner, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let runner = SubagentRunner::new(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("done".into())
+        });
+        (runner, calls)
+    }
+
+    fn parent_tools() -> Vec<String> {
+        ["read", "grep", "write", "edit"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn wor25_two_shared_cwd_writers_are_rejected_before_any_worker_starts() {
+        let (runner, calls) = counting_runner();
+        let err = run_tool(
+            &json!({"tasks": [
+                {"prompt": "edit a.txt", "tools": ["write"]},
+                {"prompt": "edit a.txt too"}
+            ]}),
+            &parent_tools(),
+            Some(&runner),
+            &writer_parent(),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Tasks 1, 2"), "{message}");
+        assert!(message.contains("worktree"), "{message}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn wor25_one_writer_beside_read_only_tasks_still_runs() {
+        let (runner, calls) = counting_runner();
+        run_tool(
+            &json!({"tasks": [
+                {"prompt": "edit a.txt", "tools": ["edit"]},
+                {"prompt": "look around", "tools": ["read", "grep"]}
+            ]}),
+            &parent_tools(),
+            Some(&runner),
+            &writer_parent(),
+        )
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn wor25_worktree_isolated_writers_are_not_flagged() {
+        let specs = vec![
+            TaskSpec {
+                prompt: "a".into(),
+                tools: None,
+                description: None,
+                agent: None,
+                mode: AgentSpawnMode::Oneshot,
+                model: None,
+                isolation: Some("worktree".into()),
+                name: None,
+            },
+            TaskSpec {
+                prompt: "b".into(),
+                tools: None,
+                description: None,
+                agent: None,
+                mode: AgentSpawnMode::Oneshot,
+                model: None,
+                isolation: Some("worktree".into()),
+                name: None,
+            },
+        ];
+        reject_shared_cwd_writers(&specs, &writer_parent(), &parent_tools()).unwrap();
+    }
 
     #[test]
     fn normalize_agent_args_folds_loose_shapes() {

@@ -72,3 +72,45 @@ fn retrieve_context_supports_exact_sources_bounded_lines_and_page_fault_metrics(
     assert_eq!(metrics.retrieval_misses, 1);
     assert_eq!(metrics.context_recovery_rate(), 2.0 / 3.0);
 }
+
+#[test]
+fn wor29_page_ids_from_another_session_are_not_retrievable() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = CacheRuntime::new(CacheConfig::default(), Some(directory.path().to_path_buf()));
+    let session_a = ContextVmRuntime::new(ContextVmConfig::default(), cache.clone());
+    let session_b = ContextVmRuntime::new(ContextVmConfig::default(), cache);
+    let packet = ContextPacket {
+        items: Vec::new(),
+        estimated_tokens: 0,
+        cache_key: "fixture".into(),
+    };
+    let image_a = session_a
+        .compile(
+            &events_from_messages(&[ChatMessage::text("user", "session A secret plan")]),
+            &packet,
+            1_000,
+        )
+        .unwrap();
+    session_b
+        .compile(
+            &events_from_messages(&[ChatMessage::text("user", "session B work")]),
+            &packet,
+            1_000,
+        )
+        .unwrap();
+    let foreign = image_a.root.checkpoint.as_ref().unwrap().id.clone();
+
+    let own = session_a.retrieve(&RetrieveContextRequest {
+        page: Some(foreign.clone()),
+        ..RetrieveContextRequest::default()
+    });
+    assert!(own.unwrap().content.contains("session A secret plan"));
+    let stolen = session_b.retrieve(&RetrieveContextRequest {
+        page: Some(format!("ctx://page/{foreign}")),
+        ..RetrieveContextRequest::default()
+    });
+    assert_eq!(
+        stolen.unwrap_err(),
+        "context page unavailable; replay/rebuild required"
+    );
+}

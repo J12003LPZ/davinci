@@ -325,24 +325,10 @@ fn latest_user_request_is_mandatory_after_many_tool_events() {
 }
 
 #[test]
-fn unrecoverable_page_storage_cannot_dispatch_an_unbounded_legacy_fallback() {
-    use davinci_agent::runtime::{
-        cache::CacheConfig,
-        context_vm::{ContextVmConfig, ContextVmRuntime},
-    };
-    let mut runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
-    runtime.context_vm = ContextVmRuntime::new(
-        ContextVmConfig::default(),
-        CacheRuntime::new(
-            CacheConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            None,
-        ),
-    );
+fn unrecoverable_context_vm_cannot_dispatch_an_unbounded_legacy_fallback() {
+    // An Active VM that cannot compile for a reason other than the budget must
+    // block dispatch rather than quietly send the unbounded legacy history.
     let mut agent = Agent::new("system");
-    agent.set_runtime(runtime);
     agent.set_context_vm_mode(ContextVmMode::Active);
     agent.auto_compaction = false;
     agent.context_window = 32_000;
@@ -363,6 +349,36 @@ fn unrecoverable_page_storage_cannot_dispatch_an_unbounded_legacy_fallback() {
     );
     assert!(result.is_err());
     assert_eq!(agent.run_stats().model_turns, 0);
+}
+
+#[test]
+fn disabled_page_cache_still_compiles_from_pinned_pages() {
+    use davinci_agent::runtime::{
+        cache::CacheConfig,
+        context_vm::{ContextVmConfig, ContextVmRuntime},
+    };
+    let mut runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    runtime.context_vm = ContextVmRuntime::new(
+        ContextVmConfig::default(),
+        CacheRuntime::new(
+            CacheConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            None,
+        ),
+    );
+    let mut agent = Agent::new("system");
+    agent.set_runtime(runtime);
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent
+        .messages
+        .push(ChatMessage::text("user", "keep the API"));
+    let image = agent.prepared_context_image().unwrap();
+    assert!(image
+        .entries
+        .iter()
+        .any(|entry| entry.content.contains("keep the API")));
 }
 
 #[test]
@@ -399,4 +415,39 @@ fn oversized_complete_live_tool_exchange_blocks_dispatch() {
     assert!(!called);
     assert!(result.unwrap_err().contains("compilation token budget"));
     assert_eq!(agent.run_stats().model_turns, 0);
+}
+
+#[test]
+fn optional_episodes_that_cannot_fit_are_never_loaded() {
+    use davinci_agent::runtime::context_vm::{ContextPageKind, ContextPageRef};
+
+    // Never saved: loading it would fail. Only a skipped page compiles cleanly.
+    let unsaved = ContextPageRef {
+        id: "ctx:episode:never-saved".into(),
+        kind: ContextPageKind::Episode,
+        content_hash: "0".repeat(64),
+        estimated_tokens: 10,
+    };
+    let root = ContextRoot {
+        episodes: vec![unsaved],
+        ..Default::default()
+    };
+    let compiler = ContextCompiler::new(ContextObjectStore::new(CacheRuntime::default()));
+    let packet = ContextPacket::empty();
+    let compile = |max_tokens| {
+        compiler.compile(ContextCompileRequest {
+            root: &root,
+            hot_events: &[],
+            broker_packet: &packet,
+            max_tokens,
+        })
+    };
+
+    let tight = compile(16).expect("episode that cannot fit must be skipped, not loaded");
+    assert!(tight
+        .entries
+        .iter()
+        .all(|entry| entry.category != "episode"));
+    // With room for the descriptor the page is a candidate, so the load happens and fails closed.
+    assert!(compile(100_000).is_err());
 }

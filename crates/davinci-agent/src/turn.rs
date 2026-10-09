@@ -482,7 +482,7 @@ impl Agent {
             // folds its derived state instead.
             let tokens = if active_context_vm {
                 self.invalidate_context_image();
-                let events = self.context_vm_events_for_runtime();
+                let events = self.context_vm_events_for_vm();
                 if let Some(runtime) = &self.runtime {
                     if let Err(error) = runtime.context_vm.append_delta(&events) {
                         runtime.context_vm.record_failure("append_delta", error);
@@ -1166,10 +1166,10 @@ impl Agent {
                     let native_responses_resume = output.native_responses_resume.clone();
                     let message = output.message;
                     if let Some(usage) = &message.usage {
-                        self.tool_context.cache.record_provider_usage(
+                        self.tool_context.cache.record_provider_usage_with_write(
                             usage.input,
                             usage.cache_read,
-                            usage.cache_write,
+                            (!usage.cache_write_unreported).then_some(usage.cache_write),
                         );
                         self.tool_context
                             .cache

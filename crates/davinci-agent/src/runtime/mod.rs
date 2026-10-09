@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod append_log;
 pub mod bus;
 pub mod cache;
 pub mod cancellation;
@@ -156,6 +157,9 @@ pub struct RuntimeHandle {
     pub team: TeamRoster,
     pub worktree_manager: Option<WorktreeManager>,
     pub workflow_executor: Option<Arc<WorkflowExecutor>>,
+    /// Executor created on demand when no host executor is attached. Shared
+    /// by every clone of this handle so the runs it starts stay queryable.
+    local_workflow_executor: Arc<std::sync::OnceLock<Arc<WorkflowExecutor>>>,
     pub operations: Option<operations::ToolOperationRuntime>,
     pub capability_registry: RuntimeCapabilityRegistry,
     pub project_trusted: bool,
@@ -273,6 +277,7 @@ impl RuntimeHandle {
             team: TeamRoster::default(),
             worktree_manager: None,
             workflow_executor: None,
+            local_workflow_executor: Arc::default(),
             operations: None,
             capability_registry: RuntimeCapabilityRegistry::with_builtins(),
             project_trusted: false,
@@ -348,6 +353,35 @@ impl RuntimeHandle {
         self
     }
 
+    /// The executor workflow tools run through: the attached one, else a
+    /// local one created once and shared by every clone of this handle, so
+    /// `workflow_status` sees the runs `workflow_run` started.
+    pub fn workflow_executor_or_local(&self) -> Arc<WorkflowExecutor> {
+        if let Some(executor) = &self.workflow_executor {
+            return executor.clone();
+        }
+        self.local_workflow_executor
+            .get_or_init(|| {
+                // The executor keeps a runtime clone; give it its own empty
+                // slot so the executor does not own itself through it.
+                let mut runtime = self.clone();
+                runtime.local_workflow_executor = Arc::default();
+                Arc::new(WorkflowExecutor::new(
+                    runtime,
+                    workflow::WorkflowStateStore::new(),
+                    None,
+                ))
+            })
+            .clone()
+    }
+
+    /// The executor whose runs this handle can query, if one exists yet.
+    pub fn active_workflow_executor(&self) -> Option<Arc<WorkflowExecutor>> {
+        self.workflow_executor
+            .clone()
+            .or_else(|| self.local_workflow_executor.get().cloned())
+    }
+
     pub fn with_operation_runtime(mut self, operations: operations::ToolOperationRuntime) -> Self {
         self.operations = Some(operations);
         self
@@ -409,6 +443,7 @@ impl RuntimeHandle {
         if previous.workflow_executor.is_some() {
             self.workflow_executor = previous.workflow_executor.clone();
         }
+        self.local_workflow_executor = previous.local_workflow_executor.clone();
         self.task_registry = previous.task_registry.clone();
         self.operations = previous.operations.clone();
         self.progress_watchdog = previous.progress_watchdog.clone();
@@ -462,6 +497,11 @@ impl RuntimeHandle {
         }
         let mut worker =
             Self::new(self.run_id, child, RuntimeBus::new()).with_worker_state_from(self);
+        // A child folds and binds sources on its own timeline. Sharing the
+        // parent's Arc-backed checkpoint, events and source binding would let
+        // either side overwrite the other's Context VM state.
+        worker.context_vm =
+            context_vm::ContextVmRuntime::new(self.context_vm.config().clone(), self.cache.clone());
         worker.agent_id = child;
         worker.parent_agent_id = Some(self.agent_id);
         worker.operations = worker
@@ -817,5 +857,57 @@ mod conversation_identity_tests {
         );
         assert_eq!(parent_context.agent_id, parent.agent_id);
         assert!(parent_context.worker_id.is_none());
+    }
+
+    #[test]
+    fn worker_context_vm_is_isolated_from_parent() {
+        let (parent, workspace) = runtime_with_operations();
+        let child_id = AgentId::new();
+        parent
+            .registry
+            .register_agent(AgentRecord {
+                id: child_id,
+                run_id: parent.run_id,
+                parent: Some(parent.agent_id),
+                kind: AgentKind::Subagent,
+                name: "vm-isolation-child".into(),
+                provider: String::new(),
+                model_id: String::new(),
+                cwd: workspace.path().to_path_buf(),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 1,
+                updated_ms: 1,
+                failure_reason: None,
+            })
+            .unwrap();
+        parent
+            .registry
+            .transition(child_id, AgentState::Running)
+            .unwrap();
+        parent.context_vm.bind_session_source(
+            workspace.path().join("parent.jsonl"),
+            "parent-session".into(),
+        );
+        let root_before = parent.context_vm.root();
+        let child = parent.for_worker(child_id, None).unwrap();
+        assert!(!child.context_vm.shares_state_with(&parent.context_vm));
+        let mut child_root = child.context_vm.root();
+        child_root.epoch = 99;
+        child_root.cache_namespace = "child-namespace".into();
+        child.context_vm.install_root(child_root, 7);
+        child
+            .context_vm
+            .bind_session_source(workspace.path().join("child.jsonl"), "child-session".into());
+        assert_eq!(parent.context_vm.root(), root_before);
+        assert_eq!(
+            parent.context_vm.bound_session_id().as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(
+            child.context_vm.bound_session_id().as_deref(),
+            Some("child-session")
+        );
     }
 }

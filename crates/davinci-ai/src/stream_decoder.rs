@@ -796,6 +796,19 @@ impl ResponsesDecoder {
     }
 }
 
+/// True when the provider's usage object carries no cache-write count under
+/// any key the decoders read, so a 0 in `Usage::cache_write` is a placeholder.
+pub(crate) fn cache_write_unreported(usage: &Value) -> bool {
+    [
+        "/cache_creation_input_tokens",
+        "/cacheWriteInputTokens",
+        "/input_tokens_details/cache_write_tokens",
+        "/prompt_tokens_details/cache_write_tokens",
+    ]
+    .iter()
+    .all(|pointer| usage.pointer(pointer).and_then(Value::as_u64).is_none())
+}
+
 /// TS `finalizeResponse` usage mapping: OpenAI counts cached and cache-write
 /// tokens inside `input_tokens`, so both are subtracted, and the cost is
 /// applied from the model's table.
@@ -819,6 +832,7 @@ pub(crate) fn responses_usage(model: &Model, usage: &Value) -> davinci_protocol:
         .and_then(Value::as_u64);
     let mut computed = crate::calculate_usage(model, input, output, cached, cache_write);
     computed.reasoning = reasoning;
+    computed.cache_write_unreported = cache_write_unreported(usage);
     let total = get("total_tokens");
     if total > 0 {
         computed.total_tokens = total;

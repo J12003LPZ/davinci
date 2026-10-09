@@ -2793,7 +2793,7 @@ fn drive(execution: &GraphExecution) -> GraphRun {
             .take(max_researchers as usize)
             .cloned()
             .collect();
-        let evidences: Mutex<Vec<EvidenceArtifact>> = Mutex::new(Vec::new());
+        let evidences: Mutex<Vec<(usize, EvidenceArtifact)>> = Mutex::new(Vec::new());
         let failed_kinds: Mutex<Vec<ResearchKind>> = Mutex::new(Vec::new());
         let next = AtomicUsize::new(0);
         let parallelism = execution
@@ -2823,7 +2823,7 @@ fn drive(execution: &GraphExecution) -> GraphRun {
                         Some(evidence) => evidences
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
-                            .push(evidence),
+                            .push((index, evidence)),
                         None => failed_kinds
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
@@ -2844,9 +2844,11 @@ fn drive(execution: &GraphExecution) -> GraphRun {
             return execution.snapshot();
         }
         evidence_digest = build_evidence_digest(
-            &evidences
-                .into_inner()
-                .unwrap_or_else(|error| error.into_inner()),
+            &evidence_in_request_order(
+                evidences
+                    .into_inner()
+                    .unwrap_or_else(|error| error.into_inner()),
+            ),
             &failed_kinds,
             EVIDENCE_DIGEST_MAX_CHARS,
         );
@@ -3838,6 +3840,17 @@ fn deliver_goal(
         }
     }
 }
+
+/// Workers finish in scheduler order, but the digest dedups claims and keeps
+/// the first test baseline, so its text must follow request order instead.
+fn evidence_in_request_order(mut indexed: Vec<(usize, EvidenceArtifact)>) -> Vec<EvidenceArtifact> {
+    indexed.sort_by_key(|(index, _)| *index);
+    indexed.into_iter().map(|(_, evidence)| evidence).collect()
+}
+
+#[cfg(test)]
+#[path = "wor34_evidence_order_tests.rs"]
+mod wor34_evidence_order_tests;
 
 #[cfg(test)]
 #[path = "controller_continuation_tests.rs"]

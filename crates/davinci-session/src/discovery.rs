@@ -122,6 +122,38 @@ fn legacy_encode_cwd_component(cwd: &str) -> String {
     }
 }
 
+/// Whether a session recorded under `recorded` belongs to the working
+/// directory `requested`.
+///
+/// The encoded directory name is lossy (`/a/b-c` and `/a/b/c` both become
+/// `--a-b-c--`), and renaming the scheme would orphan every existing session
+/// directory, so the name only narrows the scan. The header's own `cwd` is
+/// the authority. Separator style and trailing separators are ignored (older
+/// builds recorded either), as is case on Windows, where `C:\Dev` and
+/// `c:\dev` are one directory. A session with no recorded `cwd` cannot be
+/// disproved and stays visible.
+pub fn same_cwd(recorded: &str, requested: &str) -> bool {
+    fn canon(path: &str) -> String {
+        let unified = path.replace('\\', "/");
+        let trimmed = unified.trim_end_matches('/');
+        let trimmed = if trimmed.is_empty() && unified.starts_with('/') {
+            "/"
+        } else {
+            trimmed
+        };
+        if cfg!(windows) {
+            trimmed.to_lowercase()
+        } else {
+            trimmed.to_string()
+        }
+    }
+    recorded.is_empty() || canon(recorded) == canon(requested)
+}
+
+fn keep_for_cwd(summary: &SessionSummary, cwd: Option<&str>) -> bool {
+    cwd.is_none_or(|requested| same_cwd(&summary.cwd, requested))
+}
+
 pub fn cwd_encoded_dir(sessions_root: &Path, cwd: &str) -> PathBuf {
     sessions_root.join(encode_cwd_component(cwd))
 }
@@ -136,15 +168,19 @@ fn modified_at(path: &Path) -> u64 {
 }
 
 fn summarize_file(path: &Path) -> Option<SessionSummary> {
-    // One read serves both the header and the message-text digest; reading the
-    // file for the header and re-opening it through `JsonlSession::open` for
-    // the text doubled I/O and parsing across every session in a listing.
-    let content = fs::read_to_string(path).ok()?;
-    let mut lines = content.lines();
-    let first_line = lines.next()?;
-    if let Ok(header) = parse_header(first_line) {
+    // One streamed pass serves both the header and the message-text digest;
+    // reading the file for the header and re-opening it through
+    // `JsonlSession::open` for the text doubled I/O and parsing across every
+    // session in a listing. Only one line is resident at a time, so a listing
+    // never holds a whole transcript besides the digest it returns.
+    let mut reader = BufReader::new(fs::File::open(path).ok()?);
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).ok()? == 0 {
+        return None;
+    }
+    if let Ok(header) = parse_header(first_line.trim_end()) {
         let mut summary = crate::codec::metadata_from_header(&header, path, modified_at(path));
-        let (text, count) = messages_text_from_lines(lines);
+        let (text, count) = messages_text_from_reader(reader).ok()?;
         summary.all_messages_text = text;
         summary.message_count = count;
         return Some(summary);
@@ -247,12 +283,17 @@ fn message_text(message: &serde_json::Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Digest a v4 file's already-read lines without building a full session.
-fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> (String, usize) {
+/// Digest the remaining lines of a v4 file without building a full session.
+fn messages_text_from_reader(mut reader: impl BufRead) -> std::io::Result<(String, usize)> {
     let mut count = 0usize;
-    let mut parts = Vec::new();
-    for line in lines {
-        let line = line.trim();
+    let mut text = String::new();
+    let mut raw = String::new();
+    loop {
+        raw.clear();
+        if reader.read_line(&mut raw)? == 0 {
+            break;
+        }
+        let line = raw.trim();
         // Cheap pre-filter: only message entries can contribute text.
         if line.is_empty() || !line.contains("\"message\"") {
             continue;
@@ -266,11 +307,14 @@ fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> (String
             continue;
         }
         count += 1;
-        if let Some(text) = value.get("message").and_then(message_text) {
-            parts.push(text);
+        if let Some(part) = value.get("message").and_then(message_text) {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&part);
         }
     }
-    (parts.join(" "), count)
+    Ok((text, count))
 }
 
 fn messages_text_from_entries(entries: &[crate::SessionEntry]) -> (String, usize) {
@@ -326,7 +370,9 @@ pub fn discover_sessions(
             let path = entry.path();
             if is_session_jsonl(&path) {
                 if let Some(summary) = summarize_file(&path) {
-                    sessions.push(summary);
+                    if keep_for_cwd(&summary, cwd) {
+                        sessions.push(summary);
+                    }
                 }
             }
         }
@@ -378,7 +424,9 @@ pub fn discover_session_headers(
             let path = entry.path();
             if is_session_jsonl(&path) {
                 if let Some(summary) = summarize_header(&path) {
-                    sessions.push(summary);
+                    if keep_for_cwd(&summary, cwd) {
+                        sessions.push(summary);
+                    }
                 }
             }
         }
@@ -450,6 +498,100 @@ mod tests {
             cwd_encoded_dir(Path::new("/tmp/sessions"), "/tmp/work"),
             Path::new("/tmp/sessions").join("--tmp-work--")
         );
+    }
+
+    fn session_in(root: &Path, cwd: &str, name: &str) -> String {
+        JsonlSession::create(root, cwd, Some(name))
+            .unwrap()
+            .header
+            .id
+    }
+
+    #[test]
+    fn distinct_cwds_that_encode_to_one_directory_stay_separate() {
+        // `/home/u/my-app` and `/home/u/my/app` share `--home-u-my-app--`.
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            encode_cwd_component("/home/u/my-app"),
+            encode_cwd_component("/home/u/my/app")
+        );
+        let dashed = session_in(dir.path(), "/home/u/my-app", "dashed");
+        let nested = session_in(dir.path(), "/home/u/my/app", "nested");
+        let spaced = session_in(dir.path(), "/home/u/my app", "spaced");
+        for (cwd, expected) in [
+            ("/home/u/my-app", &dashed),
+            ("/home/u/my/app", &nested),
+            ("/home/u/my app", &spaced),
+        ] {
+            let full = discover_sessions(dir.path(), Some(cwd)).unwrap();
+            assert_eq!(full.len(), 1, "{cwd}");
+            assert_eq!(&full[0].id, expected, "{cwd}");
+            let headers = discover_session_headers(dir.path(), Some(cwd)).unwrap();
+            assert_eq!(headers.len(), 1, "{cwd}");
+            assert_eq!(&headers[0].id, expected, "{cwd}");
+            assert_eq!(
+                latest_session(dir.path(), Some(cwd)).unwrap().unwrap().id,
+                *expected
+            );
+        }
+        // Without a cwd, everything is still listed.
+        assert_eq!(discover_sessions(dir.path(), None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn colliding_unicode_and_punctuation_cwds_stay_separate() {
+        let dir = tempdir().unwrap();
+        let a = session_in(dir.path(), "/work/café:x", "a");
+        let b = session_in(dir.path(), "/work/café/x", "b");
+        let c = session_in(dir.path(), "/work/cafe\u{301}/x", "c");
+        let only = |cwd: &str| -> Vec<String> {
+            discover_sessions(dir.path(), Some(cwd))
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert_eq!(only("/work/café:x"), vec![a]);
+        assert_eq!(only("/work/café/x"), vec![b]);
+        assert_eq!(only("/work/cafe\u{301}/x"), vec![c]);
+    }
+
+    #[test]
+    fn existing_directories_stay_discoverable_across_cwd_spellings() {
+        let dir = tempdir().unwrap();
+        // The same directory recorded with and without a trailing separator.
+        let plain = session_in(dir.path(), "/tmp/work", "plain");
+        assert!(same_cwd("/tmp/work/", "/tmp/work"));
+        let found = discover_sessions(dir.path(), Some("/tmp/work")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, plain);
+        assert!(same_cwd(r"C:\Users\a", "C:/Users/a"));
+        assert!(same_cwd("/", "/"));
+        assert!(!same_cwd("/a/b-c", "/a/b/c"));
+        // A header with no recorded cwd cannot be disproved, so it is kept.
+        assert!(same_cwd("", "/anything"));
+        assert_eq!(same_cwd(r"C:\Dev\App", "c:/dev/app"), cfg!(windows));
+        // A session filed under the pre-alignment directory name is still read.
+        let legacy_dir = dir.path().join(legacy_encode_cwd_component("/tmp/old"));
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let header = crate::JsonlV4Header {
+            kind: "header".into(),
+            version: 4,
+            id: "legacy-1".into(),
+            created_at: 1,
+            cwd: "/tmp/old".into(),
+            parent_session_id: None,
+            legacy_parent_session_path: None,
+            metadata: None,
+        };
+        std::fs::write(
+            legacy_dir.join("legacy.jsonl"),
+            crate::codec::encode_header(&header),
+        )
+        .unwrap();
+        let found = discover_sessions(dir.path(), Some("/tmp/old")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "legacy-1");
     }
 
     #[test]

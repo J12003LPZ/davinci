@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(10);
+/// Connections served at once. Each gets its own thread, so a stalled or
+/// slow client cannot hold up the others (WOR-94); the cap bounds threads.
+const MAX_CONNECTIONS: usize = 8;
 
 /// Narrow parent-owned native capability carried by the existing worker channel.
 pub trait CoordinatorToolHandler: Send + Sync {
@@ -130,7 +133,8 @@ impl TaskCoordinatorClient {
         let stop = abort.unwrap_or(&default_stop);
         let deadline = Instant::now() + timeout.min(Duration::from_secs(120));
         let mut stream =
-            TcpStream::connect_timeout(&self.address, IO_TIMEOUT).map_err(|_| transport_error())?;
+            TcpStream::connect_timeout(&self.address, connect_budget(deadline, Instant::now()))
+                .map_err(|_| transport_error())?;
         configure(&stream)?;
         write_frame(&mut stream, &request, deadline, stop)?;
         let response: Response = read_frame(&mut stream, deadline, stop)?;
@@ -203,44 +207,69 @@ impl TaskCoordinatorTransport {
         let thread = thread::Builder::new()
             .name("task-coordinator".into())
             .spawn(move || {
-                while !stopping.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((mut stream, peer)) if peer.ip().is_loopback() => {
-                            if configure(&stream).is_err() {
-                                continue;
+                let active = AtomicUsize::new(0);
+                // Scoped so every admitted connection finishes before this
+                // thread exits, which is what Drop waits for.
+                thread::scope(|scope| {
+                    while !stopping.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
+                        if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                            thread::sleep(POLL);
+                            continue;
+                        }
+                        match listener.accept() {
+                            Ok((mut stream, peer)) if peer.ip().is_loopback() => {
+                                if configure(&stream).is_err() {
+                                    continue;
+                                }
+                                active.fetch_add(1, Ordering::SeqCst);
+                                let (active, stopping) = (&active, &stopping);
+                                let (credential, tools, context) = (&credential, &tools, &context);
+                                let (permissions, cwd, handler) = (&permissions, &cwd, &handler);
+                                scope.spawn(move || {
+                                    // Frees the slot even if dispatch panics.
+                                    let _slot = Slot(active);
+                                    let deadline = Instant::now() + IO_TIMEOUT;
+                                    if let Ok(request) =
+                                        read_frame::<Request>(&mut stream, deadline, stopping)
+                                    {
+                                        let received_at = Instant::now();
+                                        // A panicking command answers with an
+                                        // error instead of dropping the client.
+                                        let result = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| {
+                                                dispatch(
+                                                    request,
+                                                    credential,
+                                                    tools,
+                                                    context,
+                                                    permissions,
+                                                    cwd,
+                                                    stopping,
+                                                    handler.as_deref(),
+                                                    received_at,
+                                                )
+                                            }),
+                                        )
+                                        .unwrap_or_else(|_| {
+                                            Err("task coordinator command panicked".into())
+                                        });
+                                        let _ = write_frame(
+                                            &mut stream,
+                                            &Response { result },
+                                            Instant::now() + IO_TIMEOUT,
+                                            stopping,
+                                        );
+                                    }
+                                });
                             }
-                            let deadline = Instant::now() + IO_TIMEOUT;
-                            let Ok(request) =
-                                read_frame::<Request>(&mut stream, deadline, &stopping)
-                            else {
-                                continue;
-                            };
-                            let received_at = Instant::now();
-                            let result = dispatch(
-                                request,
-                                &credential,
-                                &tools,
-                                &context,
-                                &permissions,
-                                &cwd,
-                                &stopping,
-                                handler.as_deref(),
-                                received_at,
-                            );
-                            let _ = write_frame(
-                                &mut stream,
-                                &Response { result },
-                                Instant::now() + IO_TIMEOUT,
-                                &stopping,
-                            );
+                            Ok(_) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(POLL)
+                            }
+                            Err(_) => break,
                         }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(POLL)
-                        }
-                        Err(_) => break,
                     }
-                }
+                });
             })
             .map_err(|_| "could not start task coordinator")?;
         Ok(Self {
@@ -252,6 +281,15 @@ impl TaskCoordinatorTransport {
 
     pub fn client(&self) -> TaskCoordinatorClient {
         self.client.clone()
+    }
+}
+
+/// One admitted connection's place under `MAX_CONNECTIONS`.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -383,6 +421,16 @@ fn dispatch(
     .map_err(|error| error.to_string())
 }
 
+/// Connect timeout bounded by the caller's remaining time, never the fixed
+/// I/O cap alone.  `connect_timeout` rejects zero, so an expired deadline gets
+/// the smallest valid value and fails promptly.
+fn connect_budget(deadline: Instant, now: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(now)
+        .min(IO_TIMEOUT)
+        .max(Duration::from_millis(1))
+}
+
 fn transport_error() -> ToolError {
     ToolError::Failed(
         "task coordinator transport unavailable; command outcome may require reconciliation".into(),
@@ -470,6 +518,40 @@ mod tests {
     use crate::{PermissionMode, PermissionPolicy, PermissionState};
     use serde_json::json;
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
+
+    #[test]
+    fn wor105_connect_budget_never_exceeds_the_requested_deadline() {
+        let now = Instant::now();
+        let short = connect_budget(now + Duration::from_millis(100), now);
+        assert!(short <= Duration::from_millis(100), "{short:?}");
+        assert!(short > Duration::ZERO);
+        assert_eq!(
+            connect_budget(now + Duration::from_secs(60), now),
+            IO_TIMEOUT
+        );
+        // An expired deadline still yields a valid, tiny timeout (zero panics
+        // inside connect_timeout).
+        let expired = connect_budget(now, now + Duration::from_secs(1));
+        assert!(expired > Duration::ZERO && expired <= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn wor105_call_with_short_timeout_returns_within_the_timeout() {
+        // Nothing listens on the bound-then-dropped port, so the connect
+        // fails fast or times out; either way it must respect the budget.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = TaskCoordinatorClient {
+            address,
+            credential: "x".into(),
+        };
+        let started = Instant::now();
+        let result =
+            client.call_with_timeout("task_list", &json!({}), None, Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
 
     #[test]
     fn f03_transport_commits_to_parent_with_bound_worker_identity() {
@@ -869,5 +951,89 @@ mod tests {
         assert!(recorded
             .iter()
             .any(|e| matches!(e, crate::runtime::RuntimeEvent::PermissionDenied { .. })));
+    }
+
+    /// WOR-94: a client that connects and then stalls must not hold up a
+    /// valid request from another client until its read times out.
+    #[test]
+    fn wor94_a_stalled_client_does_not_block_other_clients() {
+        let parent = RuntimeHandle::new(
+            super::super::RunId::new(),
+            AgentId::new(),
+            super::super::RuntimeBus::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let child = register(&parent, dir.path());
+        let server = TaskCoordinatorTransport::bind(
+            &parent,
+            child,
+            Arc::new(PermissionState::new(PermissionPolicy::new(
+                PermissionMode::AlwaysApprove,
+            ))),
+            vec!["task_list".into()],
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let client = server.client();
+        let stalled: Vec<_> = (0..3)
+            .map(|_| {
+                let mut stream = TcpStream::connect(client.address).unwrap();
+                // Half a frame header, then nothing.
+                stream.write_all(&[0, 0]).unwrap();
+                stream
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        assert!(client.call("task_list", &json!({})).is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} behind stalled clients",
+            started.elapsed()
+        );
+        drop(stalled);
+    }
+
+    /// A panicking command answers with an error and frees its connection
+    /// slot, so panics cannot use up the coordinator's capacity.
+    #[test]
+    fn wor94_panicking_commands_do_not_exhaust_connection_slots() {
+        struct Panics;
+        impl CoordinatorToolHandler for Panics {
+            fn handles(&self, tool: &str) -> bool {
+                tool == "boom"
+            }
+            fn execute(&self, _tool: &str, _args: &Value) -> Result<ToolResult, ToolError> {
+                panic!("fixture handler panic");
+            }
+        }
+        let parent = RuntimeHandle::new(
+            super::super::RunId::new(),
+            AgentId::new(),
+            super::super::RuntimeBus::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let child = register(&parent, dir.path());
+        let server = TaskCoordinatorTransport::bind_with_handler(
+            &parent,
+            child,
+            Arc::new(PermissionState::new(PermissionPolicy::new(
+                PermissionMode::AlwaysApprove,
+            ))),
+            vec!["task_list".into(), "boom".into()],
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(Panics)),
+        )
+        .unwrap();
+        let client = server.client();
+        for _ in 0..MAX_CONNECTIONS + 2 {
+            let error = client.call("boom", &json!({})).unwrap_err();
+            assert!(error.to_string().contains("panicked"), "{error}");
+        }
+        let started = Instant::now();
+        assert!(client.call("task_list", &json!({})).is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

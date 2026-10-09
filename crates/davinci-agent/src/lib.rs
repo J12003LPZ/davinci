@@ -879,10 +879,18 @@ impl Agent {
         // One Context VM per conversation. Hosts build a fresh handle for each
         // prompt; the derived state, metrics and diagnostics of the handle it
         // replaces carry over while the bound session is unchanged.
+        // Without a session there is no id to compare (None == None), so the
+        // transcript decides: a VM carries over only while the messages still
+        // extend what it recorded. Otherwise a new, unrelated run on this
+        // Agent would inherit the old checkpoint, sources and notices (WOR-60).
         if let Some(previous) = &self.runtime {
             let session_id = self.session.as_ref().map(|session| &session.header.id);
             if !runtime.context_vm.shares_state_with(&previous.context_vm)
                 && previous.context_vm.bound_session_id().as_ref() == session_id
+                && (session_id.is_some()
+                    || previous
+                        .context_vm
+                        .continues(&runtime::context_vm::events_from_messages(&self.messages)))
             {
                 runtime.context_vm = previous.context_vm.clone();
             }
@@ -2155,6 +2163,12 @@ impl Agent {
         ))
     }
 
+    /// The event list the run loop hands to `append_delta` each round.
+    #[doc(hidden)]
+    pub fn context_vm_events_for_test(&self) -> Vec<runtime::context_vm::ContextEvent> {
+        self.context_vm_events_for_vm()
+    }
+
     #[doc(hidden)]
     pub fn legacy_messages_for_provider_for_test(&self) -> Vec<ChatMessage> {
         self.legacy_messages_for_provider()
@@ -2164,7 +2178,7 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
-        let events = self.context_vm_events_for_runtime();
+        let events = self.context_vm_events_for_vm();
         let selected = self.select_root_context(self.context_window);
         let mut items = Vec::new();
         for file in selected.repository_files {
@@ -2222,7 +2236,10 @@ impl Agent {
                 events
                     .iter()
                     .rev()
-                    .find(|event| event.kind == runtime::context_vm::ContextEventKind::User)
+                    .find(|event| {
+                        event.kind == runtime::context_vm::ContextEventKind::User
+                            && !event.visible_text.trim().is_empty()
+                    })
                     .map(|event| event.visible_text.clone())
             })
             .unwrap_or_else(|| "continue the current task".into());
@@ -2254,6 +2271,9 @@ impl Agent {
         let mut image = runtime
             .context_vm
             .compile(&events, &broker_packet, max_tokens)?;
+        if self.block_images {
+            image.messages = apply_block_images(&image.messages);
+        }
         // The most recent, complete tool exchange remains protocol data. Older
         // exchanges are evidence only. Reserve this suffix before compilation.
         for (index, message) in live.iter().enumerate() {
@@ -2277,17 +2297,23 @@ impl Agent {
     }
 
     fn live_tool_exchange(&self) -> Vec<ChatMessage> {
+        self.live_tool_exchange_start()
+            .map(|start| convert_to_llm_for_provider(&self.messages[start..], self.block_images))
+            .unwrap_or_default()
+    }
+
+    /// Index of the assistant message that opens a complete, well-formed
+    /// trailing tool exchange, if the transcript ends with one.
+    fn live_tool_exchange_start(&self) -> Option<usize> {
         if self.messages.last().is_none_or(|m| m.role != "toolResult") {
-            return Vec::new();
+            return None;
         }
-        let Some(start) = self.messages.iter().rposition(|m| m.role == "assistant") else {
-            return Vec::new();
-        };
+        let start = self.messages.iter().rposition(|m| m.role == "assistant")?;
         let mut calls = std::collections::HashSet::new();
         for content in &self.messages[start].content {
             if let MessageContent::ToolCall { id, .. } = content {
                 if id.is_empty() || !calls.insert(id.as_str()) {
-                    return Vec::new();
+                    return None;
                 }
             }
         }
@@ -2301,9 +2327,9 @@ impl Agent {
             || results.len() != ids.len()
             || results.iter().any(|m| m.role != "toolResult")
         {
-            return Vec::new();
+            return None;
         }
-        convert_to_llm_for_provider(&self.messages[start..], self.block_images)
+        Some(start)
     }
 
     pub fn provider_context_budget(&self) -> provider_budget::ProviderContextBudget {
@@ -2343,6 +2369,18 @@ impl Agent {
             .then(|| self.provider_context_budget().output_limit())
     }
 
+    /// The events every VM recorder (compile, delta, fold) works from. The
+    /// live tool exchange is excluded: it goes to the provider as native
+    /// messages, and recorders that disagreed on it would read the shorter
+    /// list as a diverged history and rebuild (WOR-59).
+    pub(crate) fn context_vm_events_for_vm(&self) -> Vec<runtime::context_vm::ContextEvent> {
+        let mut events = self.context_vm_events_for_runtime();
+        if let Some(start) = self.live_tool_exchange_start() {
+            drop_live_exchange_events(&mut events, &self.messages[start..]);
+        }
+        events
+    }
+
     pub(crate) fn context_vm_events_for_runtime(&self) -> Vec<runtime::context_vm::ContextEvent> {
         if let Some(session) = &self.session {
             runtime::context_vm::events_from_session_branch(
@@ -2375,22 +2413,47 @@ impl Agent {
         }
     }
 
+    /// Newest native Responses record on the active branch, for diagnostics.
     pub fn native_responses_resume_record(
         &self,
     ) -> Option<davinci_ai::NativeResponsesResumeRecord> {
-        let session = self.session.as_ref()?;
-        session.entries.iter().rev().find_map(|entry| {
-            if entry.entry_type != "custom"
-                || entry.custom_type.as_deref()
-                    != Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE)
-            {
-                return None;
-            }
-            entry.extra.get("data").and_then(|value| {
-                serde_json::from_value::<davinci_ai::NativeResponsesResumeRecord>(value.clone())
-                    .ok()
+        self.native_responses_resume_records().next()
+    }
+
+    /// Newest record on the active branch that can continue `provider_messages`.
+    /// A newer record whose projection no longer matches (a rewritten turn, a
+    /// compaction) must not hide an older ancestor that still does.
+    pub fn native_responses_resume_record_for(
+        &self,
+        provider_messages: &[ChatMessage],
+    ) -> Option<davinci_ai::NativeResponsesResumeRecord> {
+        self.native_responses_resume_records()
+            .find(|record| record.matches_provider_prefix(provider_messages))
+    }
+
+    /// Records on the active branch, newest first. Only this branch's ancestry
+    /// can continue the provider-side conversation; a record written on an
+    /// abandoned branch describes turns the request will not contain.
+    fn native_responses_resume_records(
+        &self,
+    ) -> impl Iterator<Item = davinci_ai::NativeResponsesResumeRecord> + '_ {
+        self.session
+            .iter()
+            .flat_map(|session| {
+                davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref())
             })
-        })
+            .rev()
+            .filter(|entry| {
+                entry.entry_type == "custom"
+                    && entry.custom_type.as_deref()
+                        == Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE)
+            })
+            .filter_map(|entry| {
+                entry.extra.get("data").and_then(|value| {
+                    serde_json::from_value::<davinci_ai::NativeResponsesResumeRecord>(value.clone())
+                        .ok()
+                })
+            })
     }
 
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
@@ -3669,11 +3732,17 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
-        let events = self.context_vm_events_for_runtime();
-        let parent = runtime
-            .context_vm
-            .load_state_from_root()
-            .unwrap_or_default();
+        let events = self.context_vm_events_for_vm();
+        // A VM whose recorded events this history no longer extends holds
+        // another history's state; the summarizer must not see it.
+        let parent = if runtime.context_vm.continues(&events) {
+            runtime
+                .context_vm
+                .load_state_from_root()
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let observations = self.provider_observation_scope("compaction");
         let proposal = self.summarizer.as_ref().and_then(|summarizer| {
             let request = runtime::context_vm::fold_request(
@@ -3711,9 +3780,20 @@ impl Agent {
                 observation: Box::new(observation),
             });
         }
-        let root = runtime
+        // The checkpoint entry below is the durable record of this fold. If it
+        // cannot be written, the in-memory VM must not stay a fold ahead of
+        // the session it reloads from (WOR-61).
+        let undo = runtime.context_vm.fold_undo_point();
+        let root = match runtime
             .context_vm
-            .fold_with_proposal(reason, &events, proposal)?;
+            .fold_with_proposal(reason, &events, proposal)
+        {
+            Ok(root) => root,
+            Err(error) => {
+                runtime.context_vm.undo_fold(undo);
+                return Err(error);
+            }
+        };
         let prefix_digest = self
             .prepared_context_image()
             .map(|image| image.prefix_digest.clone())
@@ -3734,9 +3814,14 @@ impl Agent {
                 session.leaf_id.clone(),
                 seq,
             );
-            session
-                .append_entry(entry)
-                .map_err(|error| format!("context checkpoint persistence failed: {error}"))?;
+            if let Err(error) = session.append_entry(entry) {
+                runtime.context_vm.undo_fold(undo);
+                let error = format!("context checkpoint persistence failed: {error}");
+                runtime
+                    .context_vm
+                    .record_failure("fold", format!("{error}; the fold was rolled back"));
+                return Err(error);
+            }
         }
         if reason != runtime::context_vm::FoldReason::Manual {
             runtime.context_vm.push_notice(format!(
@@ -3818,10 +3903,12 @@ impl Agent {
                 estimated_tokens: estimated_before,
             });
         }
+        // Only the active branch's ancestry may seed the next summary; an
+        // abandoned branch's compaction describes a conversation that the
+        // user navigated away from.
         let previous_summary = self.session.as_ref().and_then(|session| {
-            session
-                .entries
-                .iter()
+            davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref())
+                .into_iter()
                 .rev()
                 .find(|entry| entry.entry_type == "compaction")
                 .and_then(|entry| {
@@ -3881,7 +3968,7 @@ impl Agent {
                         serde_json::to_value(usage).unwrap_or_default(),
                     );
                 }
-                let _ = session.append_entry(SessionEntry {
+                let saved = session.append_entry(SessionEntry {
                     id: String::new(),
                     entry_type: "compaction".into(),
                     parent_id: session.leaf_id.clone(),
@@ -3891,6 +3978,16 @@ impl Agent {
                     custom_type: None,
                     extra,
                 });
+                // A checkpoint that never reached the journal must not shorten
+                // live history: a restart would rebuild the uncompacted branch
+                // while this process kept only the summary.
+                if let Err(error) = saved {
+                    result.compacted = false;
+                    result.summary = format!("Compaction not saved: {error}");
+                    result.messages = self.messages.clone();
+                    result.first_kept_entry_id = String::new();
+                    result.tokens_after = result.tokens_before;
+                }
             }
         }
         if result.compacted {
@@ -4509,6 +4606,28 @@ pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     .filter(|message| !is_legacy_verification_notice(message))
 }
 
+/// The live tool exchange reaches the provider as native call/result
+/// messages. Its events must not also be compiled as hot evidence, or the
+/// same output is sent twice and charged twice against the budget (WOR-59).
+/// Events are dropped only when the history's tail is exactly that exchange.
+fn drop_live_exchange_events(
+    events: &mut Vec<runtime::context_vm::ContextEvent>,
+    exchange: &[ChatMessage],
+) {
+    let live = runtime::context_vm::events_from_messages(exchange);
+    let Some(tail) = events.len().checked_sub(live.len()) else {
+        return;
+    };
+    if !live.is_empty()
+        && events[tail..]
+            .iter()
+            .map(|event| &event.content_hash)
+            .eq(live.iter().map(|event| &event.content_hash))
+    {
+        events.truncate(tail);
+    }
+}
+
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {
     davinci_session::build_context_entries(&session.entries, session.leaf_id.as_deref())
         .into_iter()
@@ -4535,24 +4654,19 @@ fn first_kept_entry_id(
     before: &[ChatMessage],
     after: &[ChatMessage],
 ) -> String {
-    let kept = after.len().saturating_sub(1);
-    let first_kept_index = before.len().saturating_sub(kept);
-    let mut message_index = 0usize;
-    for entry in &session.entries {
-        if entry.entry_type == "compaction" {
-            continue;
-        }
-        if entry_to_chat(entry).is_none() {
-            continue;
-        }
-        if message_index == first_kept_index {
-            return entry.id.clone();
-        }
-        message_index += 1;
-    }
-    session
-        .entries
-        .last()
+    // `before` is the active branch's context projection (summary of any
+    // earlier compaction first, then the kept and newer messages), not the
+    // append-only journal. Align against that same projection, from the tail,
+    // because the kept messages are always the most recent ones.
+    let kept = after.len().saturating_sub(1).min(before.len());
+    let context: Vec<&SessionEntry> =
+        davinci_session::build_context_entries(&session.entries, session.leaf_id.as_deref())
+            .into_iter()
+            .filter(|entry| entry_to_chat(entry).is_some())
+            .collect();
+    context
+        .get(context.len().saturating_sub(kept))
+        .or_else(|| context.last())
         .map(|entry| entry.id.clone())
         .unwrap_or_default()
 }

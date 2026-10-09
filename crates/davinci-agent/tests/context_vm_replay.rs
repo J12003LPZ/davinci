@@ -236,6 +236,7 @@ fn reducer_requires_resolvable_provenance_and_preserves_parent_state() {
             content_hash: "user-hash".into(),
             visible_text: "preserve the public API".into(),
             artifact_refs: Vec::new(),
+            images: Vec::new(),
         },
         ContextEvent {
             source_ref: "tool:1".into(),
@@ -245,6 +246,7 @@ fn reducer_requires_resolvable_provenance_and_preserves_parent_state() {
             content_hash: "tool-hash".into(),
             visible_text: "test passed".into(),
             artifact_refs: Vec::new(),
+            images: Vec::new(),
         },
     ];
     let parent =
@@ -307,7 +309,7 @@ fn repeated_delta_and_fold_retain_original_visible_evidence() {
 
     runtime.rebuild_from_events(&initial).unwrap();
     let with_delta = runtime.append_delta(&all).unwrap();
-    assert!(with_delta.deltas.is_empty());
+    assert_eq!(with_delta.deltas.len(), 1);
     assert_eq!(with_delta.updates_since_fold, 1);
     let folded = runtime.fold(FoldReason::Manual, &all).unwrap();
     assert!(folded.deltas.is_empty());
@@ -472,7 +474,7 @@ fn missing_delta_page_replays_from_visible_events_before_projection() {
     ]);
     runtime.rebuild_from_events(&initial).unwrap();
     let root = runtime.append_delta(&all).unwrap();
-    assert!(root.deltas.is_empty());
+    assert_eq!(root.deltas.len(), 1);
 
     let mut broken = root;
     broken.deltas.push(ContextPageRef {
@@ -613,4 +615,60 @@ fn session_sources_stay_on_disk_and_are_checked_against_authoritative_hashes() {
     )
     .unwrap();
     assert!(runtime.retrieve(&request).unwrap_err().contains("identity"));
+}
+
+#[test]
+fn exact_source_retrieval_scans_the_session_file_once_not_per_reference() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = davinci_agent::Agent::new("system");
+    agent.session =
+        Some(davinci_session::JsonlSession::create(directory.path(), "index", None).unwrap());
+    for n in 0..60 {
+        agent.record_custom_message(&serde_json::json!({
+            "customType": "fixture.string",
+            "content": format!("persisted context number {n}"),
+            "display": false,
+        }));
+    }
+    let session = agent.session.as_ref().unwrap();
+    let events = events_from_session_branch(&session.entries, session.leaf_id.as_deref());
+    assert_eq!(events.len(), 60);
+    let runtime = ContextVmRuntime::new(ContextVmConfig::default(), CacheRuntime::default());
+    runtime.bind_session_source(session.path.clone(), session.header.id.clone());
+    runtime
+        .compile(&events, &ContextPacket::empty(), 1_000_000)
+        .unwrap();
+    let retrieve = |event: &ContextEvent| {
+        runtime
+            .retrieve(&RetrieveContextRequest {
+                source_ref: Some(event.source_ref.clone()),
+                ..Default::default()
+            })
+            .map(|result| result.content)
+    };
+
+    // The newest source costs one pass over the file; every older one is then a seek.
+    assert_eq!(
+        retrieve(events.last().unwrap()).unwrap(),
+        events[59].visible_text
+    );
+    let after_first = runtime.metrics().source_lines_scanned;
+    assert!(
+        after_first >= 60,
+        "first lookup indexes the file: {after_first}"
+    );
+    for event in events.iter().rev().chain(events.iter()) {
+        assert_eq!(retrieve(event).unwrap(), event.visible_text);
+    }
+    assert_eq!(runtime.metrics().source_lines_scanned, after_first);
+
+    // Rewriting the file under the index must fail closed, never serve stale offsets.
+    let header = std::fs::read_to_string(&session.path)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    std::fs::write(&session.path, format!("{header}\n")).unwrap();
+    assert!(retrieve(&events[10]).is_err());
 }

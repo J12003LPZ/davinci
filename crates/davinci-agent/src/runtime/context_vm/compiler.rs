@@ -42,7 +42,10 @@ impl ContextCompiler {
         for page in &request.root.deltas {
             let object = self.load_page(page)?;
             let content = object_content(&object)?;
-            let entry = page_entry(page, "delta", content, true);
+            // A delta changes on routine turns; keeping it out of the stable
+            // prefix lets the checkpoint before it stay cached.
+            let mut entry = page_entry(page, "delta", content, true);
+            entry.stable_for_cache = false;
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
             messages.push(ChatMessage::text("custom", entry.content.clone()));
             entries.push(entry);
@@ -96,44 +99,83 @@ impl ContextCompiler {
             entries.push(entry);
         }
 
-        for page in &request.root.episodes {
-            let object = self.load_page(page)?;
-            let content = episode_descriptor(&page.id, &object)?;
-            let entry = page_entry(page, "episode", content, false);
-            if used_tokens.saturating_add(entry.estimated_tokens) > optional_limit {
-                continue;
-            }
-            used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
-            messages.push(ChatMessage::text("custom", entry.content.clone()));
-            entries.push(entry);
-        }
-
-        for item in &request.broker_packet.items {
-            let entry = broker_entry(item);
-            if entry.mandatory {
-                continue;
-            }
-            if used_tokens.saturating_add(entry.estimated_tokens) > optional_limit {
-                continue;
-            }
-            used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
-            messages.push(ChatMessage::text("custom", entry.content.clone()));
-            entries.push(entry);
-        }
-
-        let mut selected_from_tail = Vec::new();
+        // Admission order is not message order (WOR-72). After the required
+        // entries come optional broker items at or above
+        // PRIORITY_OVER_RECENT_TURNS (the living plan), then recent turns,
+        // newest first: the hot set is already capped by the hot window, so
+        // it is the recency reserve. Episode descriptors and the remaining
+        // broker items share what is left. The messages keep their
+        // cache-friendly order: pages, broker, then hot.
         let mut optional_remaining = optional_limit.saturating_sub(used_tokens);
+        let mut broker = request
+            .broker_packet
+            .items
+            .iter()
+            .map(|item| {
+                let entry = broker_entry(item);
+                (!entry.mandatory).then_some((item.priority, entry))
+            })
+            .collect::<Vec<_>>();
+        let mut admitted = vec![false; broker.len()];
+        let mut admit_broker = |high: bool, remaining: &mut u64| {
+            for (slot, candidate) in broker.iter().enumerate() {
+                let Some((priority, entry)) = candidate else {
+                    continue;
+                };
+                if admitted[slot]
+                    || (*priority >= PRIORITY_OVER_RECENT_TURNS) != high
+                    || entry.estimated_tokens > *remaining
+                {
+                    continue;
+                }
+                *remaining -= entry.estimated_tokens;
+                admitted[slot] = true;
+            }
+        };
+        admit_broker(true, &mut optional_remaining);
+        let mut selected_from_tail = Vec::new();
+        let mut hot_tokens = 0u64;
         while let Some(event) = selected_hot.pop() {
             let estimate = event_entry(event).estimated_tokens;
             if required(event) || estimate <= optional_remaining {
                 if !required(event) {
                     optional_remaining -= estimate;
                 }
-                used_tokens = used_tokens.saturating_add(estimate);
+                hot_tokens = hot_tokens.saturating_add(estimate);
                 selected_from_tail.push(event);
             }
         }
         selected_from_tail.reverse();
+
+        for page in &request.root.episodes {
+            // Episodes are optional: a descriptor is never smaller than its empty skeleton,
+            // so when even that cannot fit, skip without touching the object store.
+            if episode_descriptor_floor_tokens(page) > optional_remaining {
+                continue;
+            }
+            let object = self.load_page(page)?;
+            let content = episode_descriptor(&page.id, &object)?;
+            let entry = page_entry(page, "episode", content, false);
+            if entry.estimated_tokens > optional_remaining {
+                continue;
+            }
+            optional_remaining -= entry.estimated_tokens;
+            used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
+            messages.push(ChatMessage::text("custom", entry.content.clone()));
+            entries.push(entry);
+        }
+
+        admit_broker(false, &mut optional_remaining);
+        for (slot, candidate) in broker.iter_mut().enumerate() {
+            let Some((_, entry)) = candidate.take().filter(|_| admitted[slot]) else {
+                continue;
+            };
+            used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
+            messages.push(ChatMessage::text("custom", entry.content.clone()));
+            entries.push(entry);
+        }
+
+        used_tokens = used_tokens.saturating_add(hot_tokens);
         for event in selected_from_tail {
             let mut entry = event_entry(event);
             entry.mandatory |= required(event);
@@ -263,6 +305,12 @@ fn event_message(event: &ContextEvent) -> ChatMessage {
             role,
             wrap_untrusted_data(&event.source_ref, &event.visible_text),
         )
+    } else if !event.images.is_empty() {
+        ChatMessage {
+            role: role.into(),
+            content: event.user_content(),
+            ..Default::default()
+        }
     } else {
         ChatMessage::text(role, &event.visible_text)
     }
@@ -332,6 +380,22 @@ fn episode_descriptor(page_id: &str, object: &ContextObject) -> Result<String, S
     }
 }
 
+/// Lower bound on the estimated tokens `episode_descriptor` can produce for `page`,
+/// computed without loading it: the descriptor with every variable field empty.
+fn episode_descriptor_floor_tokens(page: &ContextPageRef) -> u64 {
+    let skeleton = serde_json::json!({
+        "type": "episode",
+        "title": "",
+        "outcome": "",
+        "source_refs": Vec::<String>::new(),
+        "artifact_refs": Vec::<String>::new(),
+        "recover": episode_recovery_hint(&page.id),
+    })
+    .to_string();
+    let source_ref = format!("context_vm:{}", page.id);
+    estimate_tokens(wrap_untrusted_data(&source_ref, &skeleton).len())
+}
+
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
@@ -361,6 +425,10 @@ fn broker_provenance(item: &ContextItem) -> ProvenanceKind {
         })
         .unwrap_or(ProvenanceKind::RepositoryFact)
 }
+
+/// Optional broker items at or above this priority are admitted before
+/// recent conversation. The living plan uses 500; repository files 100.
+const PRIORITY_OVER_RECENT_TURNS: i32 = 500;
 
 fn estimate_tokens(bytes: usize) -> u64 {
     // Includes custom-message envelope and provider framing.

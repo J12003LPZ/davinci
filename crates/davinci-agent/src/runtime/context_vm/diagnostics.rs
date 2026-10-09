@@ -149,6 +149,13 @@ impl ContextVmRuntime {
             .retrieval_offered = true;
     }
 
+    pub(crate) fn set_retrieval_offered(&self, offered: bool) {
+        self.diagnostics
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retrieval_offered = offered;
+    }
+
     /// True once this VM has folded or paged events out of its image.
     pub fn retrieval_offered(&self) -> bool {
         self.diagnostics

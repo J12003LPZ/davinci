@@ -511,11 +511,11 @@ impl SqliteSessionStore {
     pub fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionSummary>, SessionError> {
         let mut stmt = if cwd.is_some() {
             self.conn.prepare(
-                "SELECT id, created_at, cwd, parent_session_id, metadata FROM sessions WHERE cwd = ?1 ORDER BY created_at DESC",
+                "SELECT id, created_at, cwd, parent_session_id, metadata, MAX(created_at, COALESCE((SELECT timestamp FROM entries WHERE entries.session_id = sessions.id ORDER BY seq DESC LIMIT 1), 0)) AS modified_at FROM sessions WHERE cwd = ?1 ORDER BY modified_at DESC, created_at DESC",
             )
         } else {
             self.conn.prepare(
-                "SELECT id, created_at, cwd, parent_session_id, metadata FROM sessions ORDER BY created_at DESC",
+                "SELECT id, created_at, cwd, parent_session_id, metadata, MAX(created_at, COALESCE((SELECT timestamp FROM entries WHERE entries.session_id = sessions.id ORDER BY seq DESC LIMIT 1), 0)) AS modified_at FROM sessions ORDER BY modified_at DESC, created_at DESC",
             )
         }
         .map_err(|err| SessionError::storage(format!("Unable to list sessions: {err}")))?;
@@ -530,6 +530,15 @@ impl SqliteSessionStore {
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<(String, String)>, SessionError> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The trigram index has no terms shorter than three characters, so a
+        // MATCH for one or two characters silently finds nothing. Scan the
+        // entries instead (case-insensitive for ASCII, like the index).
+        if query.chars().count() < 3 {
+            return self.search_short(query);
+        }
         let escaped = format!("\"{}\"", query.replace('"', "\"\""));
         let mut stmt = self
             .conn
@@ -543,6 +552,36 @@ impl SqliteSessionStore {
             .map_err(|err| SessionError::storage(format!("Unable to prepare FTS query: {err}")))?;
         let rows = stmt
             .query_map([escaped], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| SessionError::storage(format!("Unable to search sessions: {err}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| SessionError::storage(format!("Unable to read search hits: {err}")))
+    }
+
+    fn search_short(&self, query: &str) -> Result<Vec<(String, String)>, SessionError> {
+        let mut pattern = String::with_capacity(query.len() + 2);
+        pattern.push('%');
+        for ch in query.chars() {
+            if matches!(ch, '%' | '_' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        pattern.push('%');
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, payload FROM entries
+                 WHERE payload LIKE ?1 ESCAPE '\\'
+                 ORDER BY timestamp DESC, seq DESC
+                 LIMIT 50",
+            )
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to prepare short search: {err}"))
+            })?;
+        let rows = stmt
+            .query_map([pattern], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|err| SessionError::storage(format!("Unable to search sessions: {err}")))?;
@@ -981,7 +1020,9 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> 
         path: std::path::PathBuf::new(),
         cwd: row.get(2)?,
         created_at: row.get::<_, i64>(1)? as u64,
-        modified_at: row.get::<_, i64>(1)? as u64,
+        // The newest entry's timestamp, so a session that was appended to
+        // sorts above one that was merely created later.
+        modified_at: row.get::<_, i64>(5)?.max(0) as u64,
         name,
         parent_session_id: row.get(3)?,
         source_format: 4,
@@ -1470,5 +1511,96 @@ mod tests {
             tip_changed.message,
             format!("Branch tip {child_id} changed during append")
         );
+    }
+
+    /// WOR-55: listings order by the newest activity, not by creation.
+    #[test]
+    fn listing_orders_by_latest_append_and_reports_modified_at() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut old = JsonlSession::create(dir.path(), "/tmp/w", Some("old")).unwrap();
+        let mut new = JsonlSession::create(dir.path(), "/tmp/w", Some("new")).unwrap();
+        old.header.created_at = 1_000;
+        new.header.created_at = 2_000;
+        store.upsert_session(&old).unwrap();
+        store.upsert_session(&new).unwrap();
+        let ids = |store: &SqliteSessionStore| -> Vec<String> {
+            store
+                .list_sessions(None)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert_eq!(
+            ids(&store),
+            vec![new.header.id.clone(), old.header.id.clone()]
+        );
+        let listed = store.list_sessions(None).unwrap();
+        assert_eq!(
+            listed[0].modified_at, 2_000,
+            "no entries: modified = created"
+        );
+
+        // A later append to the older session moves it to the top.
+        let mut entry = SessionEntry::message("user", serde_json::json!("hello"));
+        entry.id = "e1".into();
+        entry.seq = 1;
+        entry.timestamp = 5_000;
+        store.insert_entry(&old.header.id, &entry).unwrap();
+        assert_eq!(
+            ids(&store),
+            vec![old.header.id.clone(), new.header.id.clone()]
+        );
+        let listed = store.list_sessions(Some("/tmp/w")).unwrap();
+        assert_eq!(listed[0].id, old.header.id);
+        assert_eq!(listed[0].modified_at, 5_000);
+        assert_eq!(listed[0].created_at, 1_000);
+
+        // And another append to the newer one moves it back.
+        let mut entry = SessionEntry::message("user", serde_json::json!("again"));
+        entry.id = "e2".into();
+        entry.seq = 1;
+        entry.timestamp = 9_000;
+        store.insert_entry(&new.header.id, &entry).unwrap();
+        assert_eq!(
+            ids(&store),
+            vec![new.header.id.clone(), old.header.id.clone()]
+        );
+    }
+
+    /// WOR-56: one- and two-character queries cannot use the trigram index.
+    #[test]
+    fn one_and_two_character_searches_fall_back_instead_of_returning_nothing() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/work", Some("short")).unwrap();
+        for text in ["zq marker", "plain 100% sure", "snake_case here", "omega Ω"] {
+            session
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!([{"type":"text","text":text}]),
+                ))
+                .unwrap();
+        }
+        store.import_jsonl(&session).unwrap();
+        assert_eq!(store.search("zq").unwrap().len(), 1, "two characters");
+        assert_eq!(
+            store.search("ZQ").unwrap().len(),
+            1,
+            "ascii case-insensitive"
+        );
+        assert_eq!(store.search("Ω").unwrap().len(), 1, "one character");
+        assert_eq!(store.search("%").unwrap().len(), 1, "wildcards are literal");
+        assert_eq!(
+            store.search("_c").unwrap().len(),
+            1,
+            "underscore is literal"
+        );
+        assert!(store.search("\\").unwrap().is_empty());
+        assert!(store.search("").unwrap().is_empty());
+        assert!(store.search("xx9").unwrap().is_empty());
+        // Three or more characters still use the index.
+        assert_eq!(store.search("marker").unwrap().len(), 1);
     }
 }

@@ -396,6 +396,9 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub context_bar: Option<String>,
+    /// `off` (default), `shadow` or `active`: the Context VM. `DAVINCI_CONTEXT_VM` still wins.
+    #[serde(default, rename = "contextVm", skip_serializing_if = "Option::is_none")]
+    pub context_vm: Option<String>,
     /// The ChatGPT plan usage row for openai-codex models (default on).
     #[serde(default, rename = "planUsage", skip_serializing_if = "Option::is_none")]
     pub plan_usage: Option<bool>,
@@ -1364,6 +1367,19 @@ impl Settings {
         self.auto_verify.unwrap_or(true) && !matches!(environment, Some("0" | "false" | "off"))
     }
 
+    /// The environment variable wins when it names a mode; otherwise the stored
+    /// setting; otherwise off. Unknown values fall back to off, as the env does.
+    pub fn context_vm_mode(
+        &self,
+        environment: Option<&str>,
+    ) -> davinci_agent::runtime::ContextVmMode {
+        use davinci_agent::runtime::ContextVmMode;
+        match environment {
+            Some("off" | "shadow" | "active") => ContextVmMode::from_env_value(environment),
+            _ => ContextVmMode::from_env_value(self.context_vm.as_deref()),
+        }
+    }
+
     pub fn named_file_context_enabled(&self, environment: Option<&str>) -> bool {
         self.named_file_context.unwrap_or(true)
             && !matches!(environment, Some("0" | "false" | "off"))
@@ -1785,6 +1801,12 @@ pub fn to_interactive_config(
             .context_bar
             .clone()
             .unwrap_or_else(|| "compact".into()),
+        context_vm: match settings.context_vm_mode(None) {
+            davinci_agent::runtime::ContextVmMode::Off => "off",
+            davinci_agent::runtime::ContextVmMode::Shadow => "shadow",
+            davinci_agent::runtime::ContextVmMode::Active => "active",
+        }
+        .into(),
         plan_usage: settings.plan_usage.unwrap_or(true),
         design: settings.design_enabled.unwrap_or(false),
         show_hardware_cursor: settings.show_hardware_cursor.unwrap_or(false),
@@ -2099,6 +2121,40 @@ mod tests {
         }
         assert!(defaults.auto_verify_enabled(Some("1")));
         assert!(!settings.auto_verify_enabled(Some("1")));
+    }
+
+    #[test]
+    fn context_vm_setting_parses_defaults_off_and_environment_wins() {
+        use davinci_agent::runtime::ContextVmMode;
+        let settings: super::Settings = serde_json::from_str(r#"{"contextVm":"active"}"#).unwrap();
+        assert_eq!(settings.context_vm_mode(None), ContextVmMode::Active);
+        assert_eq!(settings.context_vm_mode(Some("")), ContextVmMode::Active);
+        assert_eq!(
+            settings.context_vm_mode(Some("garbage")),
+            ContextVmMode::Active
+        );
+        assert_eq!(settings.context_vm_mode(Some("off")), ContextVmMode::Off);
+        assert_eq!(
+            settings.context_vm_mode(Some("shadow")),
+            ContextVmMode::Shadow
+        );
+        let defaults = super::Settings::default();
+        assert_eq!(defaults.context_vm_mode(None), ContextVmMode::Off);
+        assert_eq!(
+            defaults.context_vm_mode(Some("active")),
+            ContextVmMode::Active
+        );
+        let unknown: super::Settings = serde_json::from_str(r#"{"contextVm":"turbo"}"#).unwrap();
+        assert_eq!(unknown.context_vm_mode(None), ContextVmMode::Off);
+        let shown = super::to_interactive_config(&settings, "dark");
+        assert_eq!(shown.context_vm, "active");
+        assert_eq!(
+            super::to_interactive_config(&defaults, "dark").context_vm,
+            "off"
+        );
+        assert!(!serde_json::to_string(&defaults)
+            .unwrap()
+            .contains("contextVm"));
     }
 
     #[test]

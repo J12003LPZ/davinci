@@ -2603,7 +2603,7 @@ pub struct Model {
     /// is visible rather than remembered.
     pub queued: Vec<String>,
     pub query: String,
-    pub transcript: Vec<Entry>,
+    pub transcript: EntryLog,
     /// Rows the loaded extensions have asked for.
     pub extensions: Extensions,
     pub running: bool,
@@ -2804,37 +2804,217 @@ pub struct Model {
     pub facts: Facts,
 }
 
+/// The conversation's entries, with a record of how far back they were last
+/// touched.
+///
+/// Drawing the settled part of a long conversation once and reusing it only
+/// pays if reuse can be decided without looking at every old entry. Looking
+/// at them (formatting each one into a hash, or scanning for the first live
+/// one) cost time in proportion to the session on every frame. So every
+/// mutation records the lowest index it could have changed in `low_water`,
+/// and [`EntryLog::prefix_stamp`] turns that into a stamp that stays the
+/// same exactly while a prefix is unchanged.
+///
+/// Reads go through `Deref<Target = Vec<Entry>>`. The mutators that name an
+/// index record it precisely (`push`, `get_mut`, `last_mut`, `insert`, `pop`,
+/// `truncate`, `remove`, `clear`). Any other mutation reaches the vector
+/// through `DerefMut`, which records index 0: always correct, never faster.
+///
+/// Clones share the entries until one of them is changed.
+#[derive(Default)]
+pub struct EntryLog {
+    entries: std::rc::Rc<Vec<Entry>>,
+    /// One tracker per consumer, so that asking about different prefixes
+    /// (the scan for the first live entry, the settled-rows cache) never
+    /// invalidates one another.
+    marks: [Mark; 2],
+}
+
+/// Which consumer is asking [`EntryLog::prefix_stamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampSlot {
+    /// The scan for the first entry that can still change.
+    LiveScan,
+    /// The cache of rows drawn from the settled entries.
+    SettledRows,
+}
+
+#[derive(Clone, Default)]
+struct Mark {
+    /// Lowest index mutated since this consumer last asked.
+    low_water: std::cell::Cell<usize>,
+    /// Identity of the prefix content as of that ask.
+    stamp: std::cell::Cell<u64>,
+}
+
+static NEXT_PREFIX_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn fresh_stamp() -> u64 {
+    NEXT_PREFIX_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl EntryLog {
+    fn touch(&self, index: usize) {
+        // `Default` leaves `low_water` at 0, which is the safe direction.
+        for mark in &self.marks {
+            mark.low_water.set(mark.low_water.get().min(index));
+        }
+    }
+
+    fn entries_mut(&mut self) -> &mut Vec<Entry> {
+        std::rc::Rc::make_mut(&mut self.entries)
+    }
+
+    /// A stamp that is equal across two calls (and across clones) only if
+    /// `entries[..prefix]` was not mutated in between. Cheap: no entry is read.
+    ///
+    /// Mutations below `prefix` are folded into a fresh stamp and forgotten.
+    /// Mutations at or above it stay recorded for callers asking about a
+    /// longer prefix, so asking about several prefixes in one frame is safe.
+    pub fn prefix_stamp(&self, slot: StampSlot, prefix: usize) -> u64 {
+        let mark = &self.marks[slot as usize];
+        if mark.low_water.get() < prefix || mark.stamp.get() == 0 {
+            mark.stamp.set(fresh_stamp());
+            mark.low_water.set(prefix);
+        }
+        mark.stamp.get()
+    }
+
+    pub fn push(&mut self, entry: Entry) {
+        let at = self.entries.len();
+        self.touch(at);
+        self.entries_mut().push(entry);
+    }
+
+    pub fn insert(&mut self, index: usize, entry: Entry) {
+        self.touch(index);
+        self.entries_mut().insert(index, entry);
+    }
+
+    pub fn remove(&mut self, index: usize) -> Entry {
+        self.touch(index);
+        self.entries_mut().remove(index)
+    }
+
+    pub fn pop(&mut self) -> Option<Entry> {
+        self.touch(self.entries.len().saturating_sub(1));
+        self.entries_mut().pop()
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.touch(len);
+        self.entries_mut().truncate(len);
+    }
+
+    pub fn clear(&mut self) {
+        self.touch(0);
+        self.entries_mut().clear();
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Entry> {
+        if index >= self.entries.len() {
+            return None;
+        }
+        self.touch(index);
+        self.entries_mut().get_mut(index)
+    }
+
+    pub fn last_mut(&mut self) -> Option<&mut Entry> {
+        let last = self.entries.len().checked_sub(1)?;
+        self.get_mut(last)
+    }
+}
+
+impl Clone for EntryLog {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            marks: self.marks.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for EntryLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.entries.fmt(f)
+    }
+}
+
+impl std::ops::Deref for EntryLog {
+    type Target = Vec<Entry>;
+    fn deref(&self) -> &Vec<Entry> {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for EntryLog {
+    fn deref_mut(&mut self) -> &mut Vec<Entry> {
+        self.touch(0);
+        self.entries_mut()
+    }
+}
+
+impl From<Vec<Entry>> for EntryLog {
+    fn from(entries: Vec<Entry>) -> Self {
+        Self {
+            entries: std::rc::Rc::new(entries),
+            marks: Default::default(),
+        }
+    }
+}
+
+impl FromIterator<Entry> for EntryLog {
+    fn from_iter<I: IntoIterator<Item = Entry>>(iter: I) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl<'a> IntoIterator for &'a EntryLog {
+    type Item = &'a Entry;
+    type IntoIter = std::slice::Iter<'a, Entry>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 /// Where the conversation is scrolled to, anchored from the top: `top` is
 /// the first row drawn, and `None` follows the newest. Rows that arrive or
 /// settle below the view (a turn streaming in, a group of calls collapsing
 /// to one line once they finish) leave it where it is.
 ///
-/// The scroll belongs to one conversation at one width. A resize reflows
-/// every row, and a conversation that lost entries, or whose first entry
-/// changed, was cleared, rewound or replaced; any of those drops the scroll
-/// and the view follows the newest again.
+/// The scroll belongs to one conversation at one width and one tool-output
+/// mode. A resize reflows every row, expanding or collapsing tool output
+/// changes how many rows each call takes (including calls above the view),
+/// and a conversation that lost entries, or whose first entry changed, was
+/// cleared, rewound or replaced; any of those drops the scroll and the view
+/// follows the newest again, rather than keeping a row number that now
+/// points at other content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptScroll {
     pub top: Option<usize>,
     pub width: u16,
+    /// `Model::show_tool_output` when the scroll was taken.
+    pub tools_shown: bool,
     pub entries: usize,
     pub first: u64,
 }
 
 impl TranscriptScroll {
-    pub fn at(top: usize, width: u16, transcript: &[Entry]) -> Self {
+    pub fn at(top: usize, width: u16, tools_shown: bool, transcript: &[Entry]) -> Self {
         Self {
             top: Some(top),
             width,
+            tools_shown,
             entries: transcript.len(),
             first: first_entry_print(transcript),
         }
     }
 
     /// The first row to draw, while this scroll still applies.
-    pub fn top_for(self, width: u16, transcript: &[Entry]) -> Option<usize> {
+    pub fn top_for(self, width: u16, tools_shown: bool, transcript: &[Entry]) -> Option<usize> {
         let top = self.top?;
         let same = self.width == width
+            && self.tools_shown == tools_shown
             && transcript.len() >= self.entries
             && first_entry_print(transcript) == self.first;
         same.then_some(top)
@@ -2884,7 +3064,7 @@ impl Model {
             queued: Vec::new(),
             extensions: Extensions::default(),
             query: String::new(),
-            transcript: Vec::new(),
+            transcript: EntryLog::default(),
             running: false,
             exit_armed: false,
             clear_armed: None,

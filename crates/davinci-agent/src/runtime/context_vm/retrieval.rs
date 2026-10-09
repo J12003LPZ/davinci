@@ -1,4 +1,4 @@
-use super::{ContextPageKind, ContextPageRef, ContextVmRuntime};
+use super::ContextVmRuntime;
 use crate::tools::{ToolContext, ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,24 +49,46 @@ fn retrieve_inner(
         return Err("exactly one of page or sourceRef is required".into());
     };
 
-    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
-    if let Some(query) = &request.query {
-        lines.retain(|line| line.contains(query));
-    }
-    let offset = request.offset.min(lines.len());
     let limit = if request.limit == 0 {
         120
     } else {
         request.limit
     };
-    let end = offset.saturating_add(limit).min(lines.len());
-    let truncated = end < lines.len();
+    // A query matches case-insensitively: the model searching for "error"
+    // must find "Error" (WOR-81). The returned lines are exact.
+    let query = request.query.as_deref().map(str::to_lowercase);
+    let (content, next_offset) = page_lines(
+        content.lines().filter(|line| {
+            query
+                .as_deref()
+                .is_none_or(|query| line.to_lowercase().contains(query))
+        }),
+        request.offset,
+        limit,
+    );
     Ok(RetrieveContextResult {
         source,
-        content: lines[offset..end].join("\n"),
-        truncated,
-        next_offset: truncated.then_some(end),
+        content,
+        truncated: next_offset.is_some(),
+        next_offset,
     })
+}
+
+/// Takes one page from a lazy line iterator. It pulls at most `limit + 1`
+/// lines past `offset` (the extra one only proves another page exists), so a
+/// huge source is never copied to serve the first page.
+fn page_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    offset: usize,
+    limit: usize,
+) -> (String, Option<usize>) {
+    let mut page: Vec<&str> = lines.skip(offset).take(limit.saturating_add(1)).collect();
+    let truncated = page.len() > limit;
+    page.truncate(limit);
+    (
+        page.join("\n"),
+        truncated.then(|| offset.saturating_add(limit)),
+    )
 }
 
 pub fn retrieve_context_tool(
@@ -94,16 +116,18 @@ fn retrieve_page(runtime: &ContextVmRuntime, requested: &str) -> Result<(String,
         .strip_prefix("ctx://page/")
         .or_else(|| requested.strip_prefix("context_vm:"))
         .unwrap_or(requested);
+    // Only pages the active root references are this conversation's. Page
+    // IDs are content-addressed and the cache is shared, so a well-formed ID
+    // from another session would otherwise load that session's state.
     let root = runtime.root();
-    let page = root
+    let Some(page) = root
         .checkpoint
         .iter()
         .chain(&root.deltas)
         .chain(&root.episodes)
         .find(|page| page.id == page_id)
         .cloned()
-        .or_else(|| parse_page_ref(page_id));
-    let Some(page) = page else {
+    else {
         return Err("context page unavailable; replay/rebuild required".into());
     };
     let object = runtime
@@ -115,24 +139,31 @@ fn retrieve_page(runtime: &ContextVmRuntime, requested: &str) -> Result<(String,
     Ok((format!("ctx://page/{}", page.id), content))
 }
 
-fn parse_page_ref(id: &str) -> Option<ContextPageRef> {
-    let mut parts = id.splitn(3, ':');
-    let prefix = parts.next()?;
-    let kind = parts.next()?;
-    let hash = parts.next()?;
-    if prefix != "ctx" || hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wor68_first_page_pulls_only_one_line_past_the_limit() {
+        let pulled = std::cell::Cell::new(0usize);
+        let lines =
+            std::iter::repeat_n("line", 1_000_000).inspect(|_| pulled.set(pulled.get() + 1));
+        let (content, next) = page_lines(lines, 0, 1);
+        assert_eq!(content, "line");
+        assert_eq!(next, Some(1));
+        assert!(pulled.get() <= 2, "pulled {} lines", pulled.get());
     }
-    let kind = match kind {
-        "checkpoint" => ContextPageKind::Checkpoint,
-        "delta" => ContextPageKind::Delta,
-        "episode" => ContextPageKind::Episode,
-        _ => return None,
-    };
-    Some(ContextPageRef {
-        id: id.into(),
-        kind,
-        content_hash: hash.into(),
-        estimated_tokens: 0,
-    })
+
+    #[test]
+    fn wor68_paging_matches_the_previous_offset_and_next_offset_semantics() {
+        let text = "a\nb\nc\nd\ne";
+        let page = |offset, limit| page_lines(text.lines(), offset, limit);
+        assert_eq!(page(0, 2), ("a\nb".to_string(), Some(2)));
+        assert_eq!(page(2, 2), ("c\nd".to_string(), Some(4)));
+        assert_eq!(page(4, 2), ("e".to_string(), None));
+        assert_eq!(page(9, 2), (String::new(), None));
+        assert_eq!(page(0, 5), ("a\nb\nc\nd\ne".to_string(), None));
+        let filtered = text.lines().filter(|line| *line != "b");
+        assert_eq!(page_lines(filtered, 1, 2), ("c\nd".to_string(), Some(3)));
+    }
 }
