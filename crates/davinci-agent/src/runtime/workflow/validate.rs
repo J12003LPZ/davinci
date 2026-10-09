@@ -63,6 +63,8 @@ pub enum WorkflowValidationError {
     NoPhases,
     #[error("empty phase id")]
     EmptyPhaseId,
+    #[error("phase id '{0}' has leading or trailing whitespace")]
+    PaddedPhaseId(String),
     #[error("duplicate phase id: {0}")]
     DuplicatePhaseId(String),
     #[error("phase '{phase}' depends on missing phase '{dependency}'")]
@@ -79,6 +81,16 @@ pub enum WorkflowValidationError {
     EmptyPhaseWorkers(String),
     #[error("empty worker id in phase '{0}'")]
     EmptyWorkerId(String),
+    #[error("worker id '{worker}' in phase '{phase}' has leading or trailing whitespace")]
+    PaddedWorkerId { phase: String, worker: String },
+    #[error("worker '{worker}' has unknown isolation mode '{isolation}' (expected 'shared' or 'worktree')")]
+    UnknownIsolation { worker: String, isolation: String },
+    #[error("worker '{worker}' retry_budget {retry_budget} exceeds the maximum of {max}")]
+    InvalidRetryBudget {
+        worker: String,
+        retry_budget: usize,
+        max: usize,
+    },
     #[error("phase '{phase}' has duplicate worker id: {worker}")]
     DuplicateWorkerId { phase: String, worker: String },
     #[error("invalid quorum: required {required} but phase '{phase}' has {workers} workers")]
@@ -178,6 +190,11 @@ pub fn validate_workflow_with_capabilities(
         let trimmed_id = phase.id.trim();
         if trimmed_id.is_empty() {
             return Err(WorkflowValidationError::EmptyPhaseId);
+        }
+        // The scheduler, dependencies and artifacts key on the raw id, so a
+        // padded id would never match the trimmed one validated here.
+        if trimmed_id != phase.id {
+            return Err(WorkflowValidationError::PaddedPhaseId(phase.id.clone()));
         }
         if !phase_ids.insert(trimmed_id.to_string()) {
             return Err(WorkflowValidationError::DuplicatePhaseId(
@@ -281,6 +298,29 @@ pub fn validate_workflow_with_capabilities(
             let wid = worker.id.trim();
             if wid.is_empty() {
                 return Err(WorkflowValidationError::EmptyWorkerId(phase.id.clone()));
+            }
+            if wid != worker.id {
+                return Err(WorkflowValidationError::PaddedWorkerId {
+                    phase: phase.id.clone(),
+                    worker: worker.id.clone(),
+                });
+            }
+            if let Some(isolation) = worker.isolation.as_deref() {
+                if !matches!(isolation, "shared" | "worktree") {
+                    return Err(WorkflowValidationError::UnknownIsolation {
+                        worker: wid.to_string(),
+                        isolation: isolation.to_string(),
+                    });
+                }
+            }
+            if let Some(budget) = worker.retry_budget {
+                if budget > super::limits::MAX_RETRY_BUDGET {
+                    return Err(WorkflowValidationError::InvalidRetryBudget {
+                        worker: wid.to_string(),
+                        retry_budget: budget,
+                        max: super::limits::MAX_RETRY_BUDGET,
+                    });
+                }
             }
             if !worker_ids.insert(wid.to_string()) {
                 return Err(WorkflowValidationError::DuplicateWorkerId {
@@ -599,5 +639,75 @@ mod tests {
         spec.phases[0].workers[0].tools.push("task_get".into());
         let res = validate_workflow(&spec);
         assert!(res.is_ok(), "task_get must be a recognized known tool");
+    }
+    fn fixture() -> WorkflowSpec {
+        serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap()
+    }
+
+    #[test]
+    fn wor112_wor119_a_padded_phase_id_is_rejected() {
+        let mut spec = fixture();
+        spec.phases[0].id = " investigate ".into();
+        assert_eq!(
+            validate_workflow(&spec).unwrap_err(),
+            WorkflowValidationError::PaddedPhaseId(" investigate ".into())
+        );
+    }
+
+    #[test]
+    fn wor112_a_padded_dependency_does_not_resolve() {
+        let mut spec = fixture();
+        spec.phases[1].depends_on = vec![" investigate".into()];
+        assert!(matches!(
+            validate_workflow(&spec).unwrap_err(),
+            WorkflowValidationError::MissingPhaseDependency { .. }
+        ));
+        spec.phases[1].depends_on = vec!["investigate".into()];
+        validate_workflow(&spec).unwrap();
+    }
+
+    #[test]
+    fn wor120_a_padded_worker_id_is_rejected() {
+        let mut spec = fixture();
+        spec.phases[0].workers[0].id = "repo-searcher ".into();
+        assert_eq!(
+            validate_workflow(&spec).unwrap_err(),
+            WorkflowValidationError::PaddedWorkerId {
+                phase: "investigate".into(),
+                worker: "repo-searcher ".into()
+            }
+        );
+    }
+
+    #[test]
+    fn wor113_an_unknown_isolation_mode_is_rejected() {
+        let mut spec = fixture();
+        spec.phases[2].workers[0].isolation = Some("worktre".into());
+        assert_eq!(
+            validate_workflow(&spec).unwrap_err(),
+            WorkflowValidationError::UnknownIsolation {
+                worker: "writer-1".into(),
+                isolation: "worktre".into()
+            }
+        );
+        spec.phases[2].workers[0].isolation = Some("worktree".into());
+        for ok in [None, Some("shared"), Some("worktree")] {
+            spec.phases[0].workers[0].isolation = ok.map(String::from);
+            validate_workflow(&spec).unwrap();
+        }
+    }
+
+    #[test]
+    fn wor126_wor129_retry_budget_is_capped() {
+        let mut spec = fixture();
+        spec.phases[0].workers[0].retry_budget = Some(usize::MAX);
+        assert!(matches!(
+            validate_workflow(&spec).unwrap_err(),
+            WorkflowValidationError::InvalidRetryBudget { .. }
+        ));
+        spec.phases[0].workers[0].retry_budget = Some(super::super::limits::MAX_RETRY_BUDGET + 1);
+        assert!(validate_workflow(&spec).is_err());
+        spec.phases[0].workers[0].retry_budget = Some(super::super::limits::MAX_RETRY_BUDGET);
+        validate_workflow(&spec).unwrap();
     }
 }

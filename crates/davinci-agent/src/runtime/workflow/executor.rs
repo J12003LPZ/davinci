@@ -94,6 +94,67 @@ fn reason_suffix(reasons: &[String]) -> String {
     }
 }
 
+/// Distinct workers of `phase` that left an artifact. Artifacts name their
+/// worker by the spec id in `value.worker`; one from a worker the phase does
+/// not declare, or a second one from the same worker, counts for nothing.
+fn workers_with_artifacts(
+    phase: &WorkflowPhaseSpec,
+    artifacts: &[super::state::WorkflowArtifact],
+) -> usize {
+    phase
+        .workers
+        .iter()
+        .filter(|w| {
+            artifacts
+                .iter()
+                .any(|a| a.value.get("worker").and_then(|v| v.as_str()) == Some(w.id.as_str()))
+        })
+        .count()
+}
+
+/// Whether persisted artifacts already satisfy a phase's join.
+fn phase_satisfied_by(
+    phase: &WorkflowPhaseSpec,
+    artifacts: &[super::state::WorkflowArtifact],
+) -> bool {
+    let done = workers_with_artifacts(phase, artifacts);
+    match phase.join {
+        WorkflowJoin::All => !phase.workers.is_empty() && done == phase.workers.len(),
+        WorkflowJoin::Any => done >= 1,
+        WorkflowJoin::Quorum { required } => done >= required,
+    }
+}
+
+const RETRY_BACKOFF_BASE_MS: u64 = 250;
+const RETRY_BACKOFF_MAX_MS: u64 = 5_000;
+
+/// Pause before retry number `retry` (1-based): exponential from 250 ms,
+/// capped at 5 s, plus up to a quarter of that as jitter so workers that
+/// failed together do not retry together.
+fn retry_backoff(retry: usize) -> std::time::Duration {
+    let exp = RETRY_BACKOFF_BASE_MS.saturating_mul(1u64 << retry.saturating_sub(1).min(16));
+    let base = exp.min(RETRY_BACKOFF_MAX_MS);
+    let jitter_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    std::time::Duration::from_millis(base + jitter_seed % (base / 4 + 1))
+}
+
+/// Sleep for `total`, waking early once any token is cancelled.
+fn sleep_unless_cancelled(total: std::time::Duration, tokens: &[&CancellationToken]) {
+    let end = std::time::Instant::now() + total;
+    while std::time::Instant::now() < end && !tokens.iter().any(|t| t.is_cancelled()) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The prompt for a retry: the original task plus what the last attempt
+/// died of, so the worker can change course instead of repeating itself.
+fn retry_prompt(base: &str, retry: usize, last_error: &str) -> String {
+    format!("{base}\n\n[Retry {retry}: the previous attempt failed with: {last_error}]")
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -217,7 +278,10 @@ impl WorkflowExecutor {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(state) = execs.get_mut(wf_id) {
-            if state.status == WorkflowStatus::Running || state.status == WorkflowStatus::Pending {
+            if !matches!(
+                state.status,
+                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            ) {
                 state.status = WorkflowStatus::Cancelled;
                 state.finished_ms = Some(now_ms());
                 self.runtime.emit_observe(RuntimeEvent::WorkflowEnded {
@@ -413,10 +477,14 @@ impl WorkflowExecutor {
                 let name = spec.name.clone();
                 let outcome = this.run_phases(spec, wf_id, wf_token);
                 if launch.report_to_lead {
-                    this.report_completion(wf_id, &name, &outcome);
+                    if let Err(problem) = this.report_completion(wf_id, &name, &outcome) {
+                        eprintln!(
+                            "[davinci-runtime] workflow {wf_id} completion notice: {problem}"
+                        );
+                    }
                 }
             })
-            .map_err(|e| WorkflowExecutionError::ExecutionError(e.to_string()))?;
+            .map_err(|e| self.abort_unlaunched(&wf_id, &e))?;
 
         Ok(wf_id)
     }
@@ -443,22 +511,7 @@ impl WorkflowExecutor {
 
         for phase in &spec.phases {
             let existing_artifacts = self.store.list_phase_artifacts(wf_id, &phase.id);
-            let is_phase_satisfied = match phase.join {
-                WorkflowJoin::All => {
-                    !phase.workers.is_empty()
-                        && phase.workers.iter().all(|w| {
-                            existing_artifacts.iter().any(|a| {
-                                a.value
-                                    .get("worker")
-                                    .and_then(|v| v.as_str())
-                                    .map(|id| id == w.id)
-                                    .unwrap_or(false)
-                            })
-                        })
-                }
-                WorkflowJoin::Any => !existing_artifacts.is_empty(),
-                WorkflowJoin::Quorum { required } => existing_artifacts.len() >= required,
-            };
+            let is_phase_satisfied = phase_satisfied_by(phase, &existing_artifacts);
 
             if is_phase_satisfied {
                 completed_phases.insert(phase.id.clone());
@@ -682,15 +735,21 @@ impl WorkflowExecutor {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
             let state = execs.get_mut(&wf_id).unwrap();
+            // A cancel that landed after the last phase already ended the run.
+            if matches!(
+                state.status,
+                WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            ) {
+                return Err(WorkflowExecutionError::Cancelled);
+            }
             state.status = WorkflowStatus::Completed;
             state.finished_ms = Some(now_ms());
+            self.runtime.emit_observe(RuntimeEvent::WorkflowEnded {
+                workflow_id: wf_id,
+                success: true,
+            });
             state.clone()
         };
-
-        self.runtime.emit_observe(RuntimeEvent::WorkflowEnded {
-            workflow_id: wf_id,
-            success: true,
-        });
 
         Ok(final_state)
     }
@@ -700,15 +759,34 @@ impl WorkflowExecutor {
             .executions
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        // A run that already ended keeps its status and its one WorkflowEnded.
         if let Some(state) = execs.get_mut(wf_id) {
+            if matches!(
+                state.status,
+                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            ) {
+                return;
+            }
             state.status = WorkflowStatus::Failed;
             state.finished_ms = Some(now_ms());
             state.error = Some(error.to_string());
+            self.runtime.emit_observe(RuntimeEvent::WorkflowEnded {
+                workflow_id: *wf_id,
+                success: false,
+            });
         }
-        self.runtime.emit_observe(RuntimeEvent::WorkflowEnded {
-            workflow_id: *wf_id,
-            success: false,
-        });
+    }
+
+    /// A background run whose thread never started has no executor: fail it
+    /// rather than leave it Running forever.
+    fn abort_unlaunched(
+        &self,
+        wf_id: &WorkflowId,
+        error: &std::io::Error,
+    ) -> WorkflowExecutionError {
+        let message = format!("workflow thread did not start: {error}");
+        self.fail_workflow(wf_id, &message);
+        WorkflowExecutionError::ExecutionError(message)
     }
 
     fn run_workflow_worker(
@@ -775,7 +853,7 @@ impl WorkflowExecutor {
             };
 
             let child_token = agent_token.clone();
-            let req = SubagentRequest {
+            let mut req = SubagentRequest {
                 service_tier: launch.service_tier,
                 progress: Some(reporter.clone()),
                 max_turns: worker.max_turns,
@@ -821,6 +899,7 @@ impl WorkflowExecutor {
             };
 
             let retry_limit = worker.retry_budget.unwrap_or(0);
+            let base_prompt = req.prompt.clone();
             let mut attempt = 0;
             let mut outcome: Result<String, String> = Err("no runner configured".into());
 
@@ -923,6 +1002,14 @@ impl WorkflowExecutor {
                     }
                     break;
                 }
+                if attempt < retry_limit {
+                    let last_error = outcome.as_ref().err().cloned().unwrap_or_default();
+                    sleep_unless_cancelled(
+                        retry_backoff(attempt + 1),
+                        &[phase_token, &agent_token],
+                    );
+                    req.prompt = retry_prompt(&base_prompt, attempt + 1, &last_error);
+                }
                 attempt += 1;
             }
 
@@ -971,12 +1058,15 @@ impl WorkflowExecutor {
         }
     }
 
+    /// Tell the lead a background run ended. The run's own state stays
+    /// readable through `workflow_status`, so a lost notification is returned
+    /// for the caller to report and never fails the run.
     fn report_completion(
         &self,
         id: WorkflowId,
         name: &str,
         outcome: &Result<WorkflowExecutionState, WorkflowExecutionError>,
-    ) {
+    ) -> Result<(), String> {
         self.runtime
             .ensure_lead_registered("", "", std::path::Path::new("."));
         let sender = AgentId::new();
@@ -996,22 +1086,140 @@ impl WorkflowExecutor {
             updated_ms: now_ms(),
             failure_reason: None,
         };
-        let _ = self.runtime.registry.register_agent(record);
-        let content = match outcome { Ok(state) => format!("status: completed\n\nworkflow '{name}' ({id}) {:?}. Use workflow_status for artifacts.", state.status), Err(error) => format!("status: failed\n\nworkflow '{name}' ({id}) failed: {error}") };
-        let _ = self.runtime.mailbox.send(crate::runtime::AgentMessage::new(
+        let mut problems = Vec::new();
+        let registered = self.runtime.registry.register_agent(record);
+        if let Err(error) = &registered {
+            problems.push(format!("sender not registered: {error}"));
+        }
+        let content = match outcome {
+            Ok(state) => format!(
+                "status: completed
+
+workflow '{name}' ({id}) {:?}. Use workflow_status for artifacts.",
+                state.status
+            ),
+            Err(error) => format!(
+                "status: failed
+
+workflow '{name}' ({id}) failed: {error}"
+            ),
+        };
+        if let Err(error) = self.runtime.mailbox.send(crate::runtime::AgentMessage::new(
             self.runtime.run_id,
             sender,
             self.runtime.agent_id,
             content,
-        ));
-        let _ = self.runtime.registry.transition(
-            sender,
-            if outcome.is_ok() {
-                AgentState::Completed
-            } else {
-                AgentState::Failed
-            },
-        );
+        )) {
+            problems.push(format!("not delivered to the lead: {error}"));
+        }
+        if registered.is_ok() {
+            if let Err(error) = self.runtime.registry.transition(
+                sender,
+                if outcome.is_ok() {
+                    AgentState::Completed
+                } else {
+                    AgentState::Failed
+                },
+            ) {
+                problems.push(format!("sender not closed: {error}"));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+
+    /// Register a worker agent and give it a task it owns. On failure the
+    /// worker is not launched; whatever this call registered is closed out.
+    fn admit_worker(
+        &self,
+        aid: AgentId,
+        phase_id: &str,
+        worker: &WorkflowWorkerSpec,
+    ) -> Result<TaskId, WorkflowExecutionError> {
+        let now = now_ms();
+        let record = AgentRecord {
+            id: aid,
+            run_id: self.runtime.run_id,
+            parent: Some(self.runtime.agent_id),
+            kind: AgentKind::Subagent,
+            name: worker.id.clone(),
+            provider: worker
+                .model
+                .as_ref()
+                .and_then(|m| m.split('/').next())
+                .unwrap_or_default()
+                .to_string(),
+            model_id: worker
+                .model
+                .as_ref()
+                .and_then(|m| m.split('/').nth(1))
+                .unwrap_or_default()
+                .to_string(),
+            cwd: std::env::current_dir().unwrap_or_default(),
+            state: AgentState::Running,
+            task_id: None,
+            worktree: None,
+            started_ms: now,
+            updated_ms: now,
+            failure_reason: None,
+        };
+        self.runtime.registry.register_agent(record).map_err(|e| {
+            WorkflowExecutionError::ExecutionError(format!(
+                "could not register worker '{}': {e}",
+                worker.id
+            ))
+        })?;
+
+        let task_rec = crate::runtime::tasks::TaskRecord::new(
+            self.runtime.run_id,
+            format!("{phase_id}:{}", worker.id),
+        )
+        .with_description(worker.prompt.clone());
+        let admitted = self
+            .runtime
+            .task_registry
+            .create_task(task_rec)
+            .map_err(|e| e.to_string())
+            .and_then(|tid| {
+                self.runtime
+                    .task_registry
+                    .assign_task(tid, aid)
+                    .map(|()| tid)
+                    .map_err(|e| {
+                        // Best effort: the assignment error is what gets reported.
+                        let _ = self
+                            .runtime
+                            .task_registry
+                            .fail_task(tid, Some(e.to_string()));
+                        e.to_string()
+                    })
+            });
+        admitted.map_err(|reason| {
+            let message = format!(
+                "could not assign a task to worker '{}': {reason}",
+                worker.id
+            );
+            self.runtime.registry.set_failure_reason(aid, &message);
+            // Cleanup of an agent that never ran; the error below is the report.
+            let _ = self.runtime.registry.transition(aid, AgentState::Failed);
+            WorkflowExecutionError::ExecutionError(message)
+        })
+    }
+
+    /// Close out workers that were admitted but will never launch.
+    fn abandon_admitted(&self, admitted: &[(AgentId, TaskId)], reason: &str) {
+        for (aid, tid) in admitted {
+            self.runtime.registry.set_failure_reason(*aid, reason);
+            // Cleanup after a failed admission; the admission error is the report.
+            let _ = self.runtime.registry.transition(*aid, AgentState::Failed);
+            let _ = self
+                .runtime
+                .task_registry
+                .fail_task(*tid, Some(reason.to_string()));
+        }
     }
 
     fn execute_phase(
@@ -1028,52 +1236,19 @@ impl WorkflowExecutor {
 
         for worker in &phase.workers {
             let aid = AgentId::new();
-            worker_agent_ids.push(aid);
-
-            // Register agent in runtime registry
-            let now = now_ms();
-            let record = AgentRecord {
-                id: aid,
-                run_id: self.runtime.run_id,
-                parent: Some(self.runtime.agent_id),
-                kind: AgentKind::Subagent,
-                name: worker.id.clone(),
-                provider: worker
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.split('/').next())
-                    .unwrap_or_default()
-                    .to_string(),
-                model_id: worker
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.split('/').nth(1))
-                    .unwrap_or_default()
-                    .to_string(),
-                cwd: std::env::current_dir().unwrap_or_default(),
-                state: AgentState::Running,
-                task_id: None,
-                worktree: None,
-                started_ms: now,
-                updated_ms: now,
-                failure_reason: None,
-            };
-            let _ = self.runtime.registry.register_agent(record);
-
-            let task_rec = crate::runtime::tasks::TaskRecord::new(
-                self.runtime.run_id,
-                format!("{}:{}", phase.id, worker.id),
-            )
-            .with_description(worker.prompt.clone());
-
-            let tid = self
-                .runtime
-                .task_registry
-                .create_task(task_rec)
-                .map_err(|e| WorkflowExecutionError::ExecutionError(e.to_string()))?;
-
-            let _ = self.runtime.task_registry.assign_task(tid, aid);
-            worker_tasks.push((aid, tid, worker.clone()));
+            match self.admit_worker(aid, &phase.id, worker) {
+                Ok(tid) => {
+                    worker_agent_ids.push(aid);
+                    worker_tasks.push((aid, tid, worker.clone()));
+                }
+                Err(error) => {
+                    // Nothing has launched yet: close out the workers
+                    // admitted so far instead of leaving them Running.
+                    let admitted: Vec<_> = worker_tasks.iter().map(|(a, t, _)| (*a, *t)).collect();
+                    self.abandon_admitted(&admitted, &error.to_string());
+                    return Err(error);
+                }
+            }
         }
 
         if let Some(state) = self
@@ -2225,5 +2400,304 @@ mod tests {
             1,
             "the overflowed phase ran again"
         );
+    }
+
+    fn phase_spec(join: &str, workers: &[&str]) -> WorkflowSpec {
+        let workers: Vec<_> = workers
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "prompt": "p", "tools": ["read"]}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "name": "resume-test",
+            "max_parallel_agents": 4,
+            "max_total_agents": 8,
+            "phases": [{"id": "work", "join": join, "workers": workers}]
+        }))
+        .unwrap()
+    }
+
+    /// Resume `spec` over `artifacts` already stored for phase `work`, and
+    /// count how many workers had to run.
+    fn resume_runs(spec: WorkflowSpec, artifacts: &[&str]) -> usize {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        let runner = SubagentRunner::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("ran".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let wf_id = WorkflowId::new();
+        for worker in artifacts {
+            executor
+                .store
+                .put_artifact(
+                    wf_id,
+                    "work",
+                    AgentId::new(),
+                    serde_json::json!({"worker": worker, "output": "done"}),
+                    None,
+                )
+                .unwrap();
+        }
+        executor
+            .resume_execution(wf_id, spec, &HashSet::new())
+            .unwrap();
+        runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn wor108_artifacts_the_executor_wrote_satisfy_an_all_phase_on_resume() {
+        // The executor stores `{"worker": <spec id>, ...}` and the store keeps
+        // that field on overflow, so the field resume reads does exist.
+        assert_eq!(resume_runs(phase_spec("all", &["a", "b"]), &["a", "b"]), 0);
+        // An artifact with no worker name cannot be tied to a worker.
+        assert_eq!(resume_runs(phase_spec("all", &["a", "b"]), &["a"]), 2);
+    }
+
+    #[test]
+    fn wor109_wor122_quorum_resume_counts_distinct_workers() {
+        let mut spec = phase_spec("any", &["a", "b", "c"]);
+        spec.phases[0].join = WorkflowJoin::Quorum { required: 2 };
+        assert!(
+            resume_runs(spec.clone(), &["a", "a"]) > 0,
+            "one worker twice is not a quorum"
+        );
+        assert_eq!(resume_runs(spec, &["a", "b"]), 0);
+    }
+
+    #[test]
+    fn wor110_wor123_any_resume_ignores_artifacts_from_undeclared_workers() {
+        let spec = phase_spec("any", &["a", "b"]);
+        assert!(resume_runs(spec.clone(), &["ghost"]) > 0);
+        assert_eq!(resume_runs(spec, &["b"]), 0);
+    }
+
+    fn event_log(
+        runner: Option<SubagentRunner>,
+    ) -> (
+        WorkflowExecutor,
+        tempfile::TempDir,
+        Arc<std::sync::Mutex<Vec<RuntimeEvent>>>,
+    ) {
+        struct Capture(Arc<std::sync::Mutex<Vec<RuntimeEvent>>>);
+        impl crate::runtime::bus::RuntimeSubscriber for Capture {
+            fn on_event(
+                &self,
+                event: &crate::runtime::events::RuntimeEventEnvelope,
+            ) -> crate::runtime::bus::RuntimeDecision {
+                self.0.lock().unwrap().push(event.payload.clone());
+                crate::runtime::bus::RuntimeDecision::Continue
+            }
+        }
+        let bus = crate::runtime::RuntimeBus::default();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        bus.subscribe(Arc::new(Capture(events.clone())));
+        let handle = RuntimeHandle::new(crate::runtime::RunId::new(), AgentId::new(), bus);
+        let tmp = tempdir().unwrap();
+        let store = WorkflowStateStore::with_options(32 * 1024, tmp.path().to_path_buf());
+        let executor = WorkflowExecutor::new(
+            handle,
+            store,
+            runner.or_else(|| Some(SubagentRunner::new(|_| Ok("ok".into())))),
+        );
+        (executor, tmp, events)
+    }
+
+    fn ended_events(events: &Arc<std::sync::Mutex<Vec<RuntimeEvent>>>) -> Vec<bool> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::WorkflowEnded { success, .. } => Some(*success),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wor135_a_cancelled_run_ends_once_and_stays_cancelled() {
+        let (executor, _tmp, events) = event_log(None);
+        let spec = phase_spec("all", &["a"]);
+        let wf_id = WorkflowId::new();
+        executor.init_workflow_state(&spec, wf_id, CancellationToken::new());
+        executor.cancel(&wf_id).unwrap();
+        // The runner reaches its own terminal calls after the cancel.
+        executor.fail_workflow(&wf_id, "late failure");
+        executor.cancel(&wf_id).unwrap();
+        assert_eq!(
+            executor.get_state(&wf_id).unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+        assert_eq!(ended_events(&events), vec![false]);
+    }
+
+    #[test]
+    fn wor135_cancelling_a_paused_run_ends_it() {
+        let (executor, _tmp, events) = event_log(None);
+        let spec = phase_spec("all", &["a"]);
+        let wf_id = WorkflowId::new();
+        executor.init_workflow_state(&spec, wf_id, CancellationToken::new());
+        executor.pause(&wf_id).unwrap();
+        executor.cancel(&wf_id).unwrap();
+        assert_eq!(
+            executor.get_state(&wf_id).unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+        assert_eq!(ended_events(&events), vec![false]);
+    }
+
+    #[test]
+    fn wor134_a_background_run_that_cannot_start_a_thread_ends_failed() {
+        let (executor, _tmp, events) = event_log(None);
+        let spec = phase_spec("all", &["a"]);
+        let wf_id = WorkflowId::new();
+        executor.init_workflow_state(&spec, wf_id, CancellationToken::new());
+        let error = executor.abort_unlaunched(&wf_id, &std::io::Error::other("no threads"));
+        assert!(error.to_string().contains("no threads"), "{error}");
+        let state = executor.get_state(&wf_id).unwrap();
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        assert!(state.error.unwrap().contains("did not start"));
+        assert_eq!(ended_events(&events), vec![false]);
+    }
+
+    #[test]
+    fn wor131_wor139_a_worker_that_cannot_be_registered_gets_no_task() {
+        let (executor, _tmp) = setup_executor(None);
+        let spec = phase_spec("all", &["a"]);
+        let taken = AgentId::new();
+        executor
+            .admit_worker(taken, "work", &spec.phases[0].workers[0])
+            .unwrap();
+        let tasks_before = executor.runtime.task_registry.list_tasks(None).len();
+        let error = executor
+            .admit_worker(taken, "work", &spec.phases[0].workers[0])
+            .unwrap_err();
+        assert!(error.to_string().contains("could not register"), "{error}");
+        assert_eq!(
+            executor.runtime.task_registry.list_tasks(None).len(),
+            tasks_before,
+            "a task was created for an unregistered worker"
+        );
+    }
+
+    /// A task store that accepts creation and refuses the commit that
+    /// assigns an owner.
+    struct RefuseAssignment;
+    impl crate::runtime::task_store::TaskCommitSink for RefuseAssignment {
+        fn commit(
+            &self,
+            changes: Vec<crate::runtime::task_store::TaskChange>,
+        ) -> Result<(), crate::runtime::tasks::TaskError> {
+            if changes
+                .iter()
+                .any(|c| c.record.assigned_to.is_some() && c.prior_revision.is_some())
+            {
+                return Err(crate::runtime::tasks::TaskError::Persistence(
+                    "fixture: journal refused the assignment".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wor130_wor140_a_refused_task_assignment_stops_the_phase_before_launch() {
+        let launched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&launched);
+        let runner = SubagentRunner::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("ran".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut executor = executor;
+        executor.runtime = executor.runtime.clone().with_task_registry(
+            crate::runtime::tasks::TaskRegistry::new().with_commit_sink(Arc::new(RefuseAssignment)),
+        );
+        let error = executor
+            .execute(phase_spec("all", &["a", "b"]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("could not assign a task"),
+            "{error}"
+        );
+        assert_eq!(launched.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let still_running = executor
+            .runtime
+            .registry
+            .get_by_run(&executor.runtime.run_id)
+            .into_iter()
+            .filter(|r| r.kind == AgentKind::Subagent && r.state == AgentState::Running)
+            .count();
+        assert_eq!(still_running, 0, "an unlaunched worker was left Running");
+        let wf = executor.list_workflows().pop().unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Failed);
+    }
+
+    #[test]
+    fn wor128_wor114_a_retry_waits_and_carries_the_last_error() {
+        let calls = Arc::new(std::sync::Mutex::new(
+            Vec::<(std::time::Instant, String)>::new(),
+        ));
+        let log = Arc::clone(&calls);
+        let runner = SubagentRunner::new(move |req| {
+            let mut log = log.lock().unwrap();
+            log.push((std::time::Instant::now(), req.prompt.clone()));
+            if log.len() == 1 {
+                Err("provider overloaded".into())
+            } else {
+                Ok("recovered".into())
+            }
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = phase_spec("all", &["a"]);
+        spec.phases[0].workers[0].retry_budget = Some(2);
+        executor.execute(spec).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1].0.duration_since(calls[0].0) >= std::time::Duration::from_millis(200),
+            "retry fired with no backoff"
+        );
+        assert!(calls[1].1.starts_with("p"), "{}", calls[1].1);
+        assert!(calls[1].1.contains("provider overloaded"), "{}", calls[1].1);
+        assert!(!calls[0].1.contains("Retry"));
+    }
+
+    #[test]
+    fn wor128_backoff_grows_and_is_capped() {
+        let ms = |n| retry_backoff(n).as_millis() as u64;
+        assert!((250..=313).contains(&ms(1)), "{}", ms(1));
+        assert!(ms(2) >= 500);
+        assert!(ms(30) <= RETRY_BACKOFF_MAX_MS + RETRY_BACKOFF_MAX_MS / 4);
+    }
+
+    #[test]
+    fn wor128_a_cancelled_run_does_not_sit_out_the_backoff() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let started = std::time::Instant::now();
+        sleep_unless_cancelled(std::time::Duration::from_secs(5), &[&token]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn wor136_wor143_a_lost_completion_notice_is_reported_not_swallowed() {
+        let (executor, _tmp, _events) = event_log(None);
+        let id = WorkflowId::new();
+        let outcome = Err(WorkflowExecutionError::Cancelled);
+        executor.report_completion(id, "ok", &outcome).unwrap();
+        // The lead has gone; the mailbox refuses mail for a finished agent.
+        let lead = executor.runtime.agent_id;
+        executor
+            .runtime
+            .registry
+            .transition(lead, AgentState::Cancelled)
+            .unwrap();
+        let problem = executor
+            .report_completion(id, "gone", &outcome)
+            .unwrap_err();
+        assert!(problem.contains("not delivered to the lead"), "{problem}");
     }
 }

@@ -214,3 +214,41 @@ fn wor100_corrupt_middle_line_is_still_an_error() {
         .with_receipt_store(&path)
         .is_err());
 }
+
+/// WOR-144: the controller does not launch workers, so it must never answer
+/// Accepted to a retry it cannot carry out. No live state may move to
+/// Starting, and a terminal worker is reported stale.
+#[test]
+fn wor144_retry_is_never_accepted_without_a_launcher() {
+    for state in [
+        AgentState::Starting,
+        AgentState::Running,
+        AgentState::Waiting,
+        AgentState::Idle,
+        AgentState::Stopping,
+        AgentState::Completed,
+        AgentState::Failed,
+        AgentState::Cancelled,
+    ] {
+        let fx = fx(state);
+        let controller = WorkerController::new(fx.registry.clone());
+        let generation = fx.registry.get_generation(&fx.agent);
+        let revision = fx.registry.get_revision(&fx.agent);
+        let receipt = controller.execute_command(
+            command(&fx, WorkerControlAction::Retry { reason: None }),
+            true,
+        );
+        assert_ne!(
+            receipt.status,
+            ControlStatus::Accepted,
+            "{state:?}: {receipt:?}"
+        );
+        assert_eq!(
+            fx.registry.get_generation(&fx.agent),
+            generation,
+            "{state:?}"
+        );
+        assert_eq!(fx.registry.get_revision(&fx.agent), revision, "{state:?}");
+        assert_eq!(fx.registry.get(&fx.agent).unwrap().state, state);
+    }
+}

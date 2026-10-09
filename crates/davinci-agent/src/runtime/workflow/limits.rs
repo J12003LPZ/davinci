@@ -13,6 +13,9 @@
 pub const MAX_CONCURRENT_AGENTS_CAP: usize = 256;
 /// Agents one run may schedule in total (Claude Code: 1,000 per run).
 pub const MAX_TOTAL_AGENTS_CAP: usize = 1_000;
+/// Most retries one worker may declare. Each retry spends tokens and time, so
+/// an unbounded `retry_budget` is a runaway loop waiting for a bad spec.
+pub const MAX_RETRY_BUDGET: usize = 10;
 /// Default concurrency ceiling (Claude Code's default is 16).
 pub const DEFAULT_MAX_CONCURRENT_AGENTS: usize = 16;
 /// Agent count past which a run is flagged as a large workflow when no size
