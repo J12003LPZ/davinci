@@ -435,14 +435,21 @@ impl CallbackServer {
         mut stream: TcpStream,
         read_timeout: Duration,
     ) -> Result<Option<CallbackResponse>, String> {
-        stream
-            .set_read_timeout(Some(read_timeout))
-            .map_err(|err| err.to_string())?;
+        // The timeout bounds the whole request, not each read: a peer trickling
+        // one byte at a time must not hold the login past its deadline.
+        let conn_deadline = std::time::Instant::now() + read_timeout;
         // A request may arrive in several TCP segments; read until the request
         // line is complete (or the buffer fills) instead of trusting one read.
         let mut buf = [0u8; 8192];
         let mut n = 0;
         while n < buf.len() && !buf[..n].contains(&b'\n') {
+            let remaining = conn_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|err| err.to_string())?;
             match stream.read(&mut buf[n..]) {
                 Ok(0) => break,
                 Ok(read) => n += read,
@@ -759,6 +766,31 @@ mod tests {
             .unwrap();
         client.join().unwrap();
         assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn trickling_peer_cannot_outlive_the_login_deadline() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "s").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            // One byte every 100ms, never a newline: each read would succeed
+            // before a per-read timeout fired.
+            for _ in 0..40 {
+                if stream.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = server.accept_until(started + Duration::from_millis(600));
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        client.join().unwrap();
     }
 
     #[test]
