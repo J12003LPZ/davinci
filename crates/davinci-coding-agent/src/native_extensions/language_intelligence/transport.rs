@@ -336,8 +336,8 @@ impl Transport {
         }
     }
 
-    pub fn has_dynamic_diagnostics(&self) -> bool {
-        self.client.has_document_diagnostics()
+    pub fn has_dynamic_diagnostics(&self, language: &str) -> bool {
+        self.client.has_document_diagnostics(language)
     }
 
     pub fn client_status(&self) -> Value {
@@ -362,6 +362,16 @@ impl Transport {
                     .try_wait(),
                 Ok(None)
             )
+    }
+
+    /// Kill the server process and wait until the transport notices.
+    #[cfg(test)]
+    pub fn kill_for_tests(&self) {
+        let _ = self.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn pid(&self) -> u32 {
