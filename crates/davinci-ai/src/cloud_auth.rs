@@ -34,17 +34,52 @@ pub(crate) fn request_auth_headers(
     }
     match model.api.as_str() {
         "bedrock-converse-stream" => {
+            // Ambient AWS credentials (a session token travels in a header)
+            // go only to AWS endpoints, never to a custom base URL.
+            require_host(
+                url,
+                &[".amazonaws.com", ".amazonaws.com.cn"],
+                "Amazon Bedrock",
+            )?;
             let credentials = aws_credentials(&process_env())?.ok_or(
                 "Amazon Bedrock needs AWS_BEARER_TOKEN_BEDROCK, AWS access keys, or an AWS_PROFILE with static keys",
             )?;
             sign_bedrock(&credentials, url, &body.to_string(), SystemTime::now())
         }
         "google-vertex" => {
+            require_host(url, &[".googleapis.com"], "Google Vertex")?;
             let adc = vertex_adc_path(&process_env());
             let token = vertex_access_token(&adc)?;
             Ok(vec![("Authorization".into(), format!("Bearer {token}"))])
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Ambient cloud credentials are attached only for HTTPS requests to the
+/// provider's own domains.
+fn require_host(url: &str, suffixes: &[&str], provider: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|error| format!("{provider} URL: {error}"))?;
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if parsed.scheme() == "https" && suffixes.iter().any(|suffix| host.ends_with(suffix)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{provider} ambient credentials are only sent to its HTTPS endpoints; {host} needs an explicit API key"
+        ))
+    }
+}
+
+/// Token endpoints receive refresh tokens or signed assertions: HTTPS only,
+/// except loopback (local test servers).
+fn require_secure_token_uri(token_uri: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(token_uri)
+        .map_err(|_| "Google credentials have an invalid token_uri".to_string())?;
+    let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    if parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback) {
+        Ok(())
+    } else {
+        Err("Google credentials token_uri must use https".into())
     }
 }
 
@@ -421,6 +456,7 @@ pub(crate) fn service_account_assertion(
 fn exchange_adc(adc: &Value, now: SystemTime) -> Result<(String, Duration), String> {
     let field = |name: &str| adc.get(name).and_then(Value::as_str);
     let token_uri = field("token_uri").unwrap_or(GOOGLE_TOKEN_URL).to_string();
+    require_secure_token_uri(&token_uri)?;
     let form: Vec<(&str, String)> = match field("type") {
         Some("authorized_user") => vec![
             ("grant_type", "refresh_token".into()),
@@ -530,6 +566,30 @@ mod tests {
             authorization,
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
         );
+    }
+
+    #[test]
+    fn ambient_credentials_only_go_to_provider_https_hosts() {
+        let suffixes = [".amazonaws.com", ".amazonaws.com.cn"];
+        assert!(require_host(
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/converse",
+            &suffixes,
+            "Amazon Bedrock"
+        )
+        .is_ok());
+        for url in [
+            "https://proxy.example.com/model/x/converse",
+            "https://amazonaws.com.attacker.test/model/x/converse",
+            "http://bedrock-runtime.us-east-1.amazonaws.com/model/x/converse",
+        ] {
+            assert!(
+                require_host(url, &suffixes, "Amazon Bedrock").is_err(),
+                "{url}"
+            );
+        }
+        assert!(require_secure_token_uri("https://oauth2.googleapis.com/token").is_ok());
+        assert!(require_secure_token_uri("http://127.0.0.1:9/token").is_ok());
+        assert!(require_secure_token_uri("http://tokens.example.com/token").is_err());
     }
 
     #[test]
