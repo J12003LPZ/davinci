@@ -217,6 +217,15 @@ impl AgentMailbox {
         self
     }
 
+    /// Forget a message ID that was claimed but never queued.
+    fn release_message_id(&self, id: &Uuid) {
+        let mut seen = match self.seen_message_ids.write() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        seen.remove(id);
+    }
+
     /// Send a message to an agent. Rejects messages to terminal agents or duplicates.
     /// Wakes up idle agents to `Running`.
     pub fn send(&self, message: AgentMessage) -> Result<(), MailboxError> {
@@ -236,11 +245,13 @@ impl AgentMailbox {
             }
         }
 
-        // 2. Validate recipient state
+        // 2. Validate recipient state.  Rejections before the message is
+        // queued release the ID so a retry is not reported as a duplicate.
         let (should_wake, gen) = if let Some(registry) = &self.registry {
-            let record = registry
-                .get(&message.to)
-                .ok_or(MailboxError::AgentNotFound(message.to))?;
+            let Some(record) = registry.get(&message.to) else {
+                self.release_message_id(&message.id);
+                return Err(MailboxError::AgentNotFound(message.to));
+            };
 
             if matches!(
                 record.state,
@@ -259,6 +270,7 @@ impl AgentMailbox {
                         },
                     );
                 }
+                self.release_message_id(&message.id);
                 return Err(MailboxError::TerminalAgent {
                     agent_id: message.to,
                     state: record.state,
@@ -299,6 +311,8 @@ impl AgentMailbox {
                         },
                     );
                 }
+                drop(queues);
+                self.release_message_id(&message.id);
                 return Err(MailboxError::QueueFull(message.to));
             }
             if let Ok(mut receipts) = self.steering_receipts.write() {
@@ -325,9 +339,7 @@ impl AgentMailbox {
             if let Some(registry) = &self.registry {
                 if let Err(error) = self.wake(registry, message.to) {
                     self.withdraw(&message.to, &message.id, "wake_failed");
-                    if let Ok(mut seen) = self.seen_message_ids.write() {
-                        seen.remove(&message.id);
-                    }
+                    self.release_message_id(&message.id);
                     return Err(MailboxError::WakeError(message.to, error));
                 }
             }
@@ -379,6 +391,13 @@ impl AgentMailbox {
             return Err(MailboxError::MessageTooLarge(text.len()));
         }
 
+        // A stable ID names one logical steering message: a repeat call after
+        // a lost response returns the original receipt instead of queueing
+        // the instruction a second time.  Rejected receipts stay retryable.
+        if let Some(existing) = self.live_steering_receipt(&message_id, &to) {
+            return Ok(existing);
+        }
+
         let run_id = if let Some(reg) = &self.registry {
             let record = reg.get(&to).ok_or(MailboxError::AgentNotFound(to))?;
             if matches!(
@@ -428,6 +447,13 @@ impl AgentMailbox {
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A concurrent call with the same ID may have been accepted since the
+        // early check. Its receipt is written before its message is queued
+        // and outlives delivery, so checking it under the lifecycle lock
+        // catches the duplicate even if a drain already took the message.
+        if let Some(existing) = self.live_steering_receipt(&message_id, &to) {
+            return Ok(existing);
+        }
         let receipt = SteeringReceipt {
             message_id: msg_id,
             agent_id: to,
@@ -467,15 +493,30 @@ impl AgentMailbox {
         }
         self.notify_waiters();
 
+        // Same contract as `send`: a failed wake withdraws the message, so an
+        // error always means nothing was accepted (WOR-88, WOR-91).
         if let Some(registry) = &self.registry {
-            if let Some(record) = registry.get(&to) {
-                if record.state == AgentState::Idle {
-                    let _ = registry.transition(to, AgentState::Running);
+            if registry
+                .get(&to)
+                .is_some_and(|record| record.state == AgentState::Idle)
+            {
+                if let Err(error) = self.wake(registry, to) {
+                    self.withdraw(&to, &msg_id, "wake_failed");
+                    return Err(MailboxError::WakeError(to, error));
                 }
             }
         }
 
         Ok(receipt)
+    }
+
+    /// Stored non-rejected steering receipt for `message_id` addressed to `to`.
+    fn live_steering_receipt(&self, message_id: &Uuid, to: &AgentId) -> Option<SteeringReceipt> {
+        let receipts = self.steering_receipts.read().ok()?;
+        receipts
+            .get(message_id)
+            .filter(|r| r.agent_id == *to && r.state != "rejected")
+            .cloned()
     }
 
     /// Mark a steering message as applied for an agent and generation (idempotent/exactly-once).
@@ -656,7 +697,9 @@ impl AgentMailbox {
     ///
     /// Undelivered queued messages remain in the recipient's mailbox.
     pub fn rehydrate_from_events(&self, events: &[RuntimeEventEnvelope]) {
+        // Event order is the enqueue order: keep it, never re-sort by clock.
         let mut unread_messages: HashMap<Uuid, AgentMessage> = HashMap::new();
+        let mut queue_order: Vec<Uuid> = Vec::new();
         let mut seen = match self.seen_message_ids.write() {
             Ok(s) => s,
             Err(e) => e.into_inner(),
@@ -671,7 +714,9 @@ impl AgentMailbox {
                 } => {
                     seen.insert(*message_id);
                     if let Some(msg) = message {
-                        unread_messages.insert(*message_id, msg.clone());
+                        if unread_messages.insert(*message_id, msg.clone()).is_none() {
+                            queue_order.push(*message_id);
+                        }
                     }
                 }
                 RuntimeEvent::AgentMessageDelivered { message_id, .. } => {
@@ -686,15 +731,17 @@ impl AgentMailbox {
             Err(e) => e.into_inner(),
         };
 
-        let mut remaining: Vec<AgentMessage> = unread_messages.into_values().collect();
-        remaining.sort_by(|a, b| {
-            a.sent_at_ms
-                .cmp(&b.sent_at_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        for msg in remaining {
-            queues.entry(msg.to).or_default().push_back(msg);
+        for id in queue_order {
+            let Some(msg) = unread_messages.remove(&id) else {
+                continue;
+            };
+            let queue = queues.entry(msg.to).or_default();
+            // Replaying a stream that is already reflected in memory must not
+            // queue the same message twice.
+            if queue.iter().any(|queued| queued.id == msg.id) {
+                continue;
+            }
+            queue.push_back(msg);
         }
         drop(queues);
         self.notify_waiters();
@@ -1302,5 +1349,94 @@ mod tests {
         mailbox.send(message.clone()).unwrap();
         assert_eq!(mailbox.pending_count(&agent), 1);
         assert_eq!(registry.get(&agent).unwrap().state, AgentState::Running);
+    }
+
+    /// WOR-88: a failed wake withdraws the steering message, rejects its
+    /// receipt and reports the failure instead of dropping it silently.
+    #[test]
+    fn wor88_failed_wake_rolls_back_steering() {
+        let registry = RuntimeRegistry::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, RunId::new(), AgentState::Idle))
+            .unwrap();
+        let mailbox = AgentMailbox::new().with_registry(registry.clone());
+        let id = Uuid::new_v4();
+        FAIL_WAKE.with(|fail| fail.set(true));
+        let result = mailbox.send_steer_with_id(id, agent, 1, "steer".into(), false);
+        FAIL_WAKE.with(|fail| fail.set(false));
+        assert!(
+            matches!(result, Err(MailboxError::WakeError(..))),
+            "{result:?}"
+        );
+        assert_eq!(mailbox.pending_count(&agent), 0);
+        let receipt = mailbox.get_steering_receipt(&id).unwrap();
+        assert_eq!(receipt.state, "rejected");
+        assert_eq!(receipt.reason.as_deref(), Some("wake_failed"));
+        assert_eq!(registry.get(&agent).unwrap().state, AgentState::Idle);
+
+        // The rejected ID may be steered again once the worker can wake.
+        let retry = mailbox
+            .send_steer_with_id(id, agent, 1, "steer".into(), false)
+            .unwrap();
+        assert_eq!(retry.state, "queued");
+        assert_eq!(registry.get(&agent).unwrap().state, AgentState::Running);
+    }
+
+    /// Losing the wake race to another waker is success, not a failure.
+    #[test]
+    fn wor88_wake_of_an_already_running_worker_succeeds() {
+        let registry = RuntimeRegistry::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, RunId::new(), AgentState::Running))
+            .unwrap();
+        let mailbox = AgentMailbox::new().with_registry(registry.clone());
+        assert!(registry.transition(agent, AgentState::Running).is_err());
+        assert_eq!(mailbox.wake(&registry, agent), Ok(()));
+    }
+
+    #[test]
+    fn wor88_idle_recipient_is_woken_by_steering() {
+        let registry = RuntimeRegistry::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, RunId::new(), AgentState::Idle))
+            .unwrap();
+        let mailbox = AgentMailbox::new().with_registry(registry.clone());
+        let receipt = mailbox.send_steer(agent, 1, "steer".into(), false).unwrap();
+        assert_eq!(registry.get(&agent).unwrap().state, AgentState::Running);
+        assert_eq!(receipt.state, "queued");
+    }
+
+    /// WOR-87: concurrent steers with one ID queue it once, even when a drain
+    /// delivers the first copy before the others are checked.
+    #[test]
+    fn wor87_concurrent_same_id_steers_queue_once_despite_a_racing_drain() {
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::new().with_registry(registry.clone());
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, RunId::new(), AgentState::Running))
+            .unwrap();
+        for _ in 0..200 {
+            let id = Uuid::new_v4();
+            let drained = drain_while(&mailbox, agent, || {
+                let senders: Vec<_> = (0..4)
+                    .map(|_| {
+                        let mailbox = mailbox.clone();
+                        std::thread::spawn(move || {
+                            mailbox
+                                .send_steer_with_id(id, agent, 1, "once".into(), false)
+                                .unwrap()
+                        })
+                    })
+                    .collect();
+                for sender in senders {
+                    sender.join().unwrap();
+                }
+            });
+            assert_eq!(drained.iter().filter(|m| m.id == id).count(), 1);
+        }
     }
 }
