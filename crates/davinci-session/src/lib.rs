@@ -202,10 +202,14 @@ impl JsonlSession {
                     session.records.push(record);
                 }
                 Ok(
-                    SessionMutation::Lane { .. }
-                    | SessionMutation::FactName { .. }
-                    | SessionMutation::FactLabel { .. },
-                ) => {}
+                    SessionMutation::Lane { seq, .. }
+                    | SessionMutation::FactName { seq, .. }
+                    | SessionMutation::FactLabel { seq, .. },
+                ) => {
+                    // Repository-written lane and fact mutations share the
+                    // sequence; skipping them would reuse their seq on append.
+                    session.max_seq = session.max_seq.max(seq);
+                }
                 Err(_) if index == last_index && !terminated => break,
                 Err(err) => {
                     return Err(SessionError::invalid_entry(format!(
@@ -346,23 +350,59 @@ impl JsonlSession {
         Ok(self.leaf_id.clone().unwrap_or_default())
     }
 
+    /// Fork the root-to-`entry_id` ancestry into a new session. Entries keep
+    /// their IDs, as in the TS `createBranchedSession`, so references such as
+    /// a compaction's `firstKeptEntryId` still resolve; entries on sibling
+    /// branches are not copied.
     pub fn fork(&self, entry_id: &str, sessions_root: &Path) -> Result<Self, SessionError> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == entry_id)
-            .ok_or_else(|| SessionError::not_found(format!("Entry {entry_id} not found")))?;
+        let path = self.ancestry(entry_id)?;
         let mut forked = Self::create(sessions_root, &self.header.cwd, None)?;
         forked.prepare_first_write()?;
         forked.header.parent_session_id = Some(self.header.id.clone());
         forked.rewrite_header()?;
-        for entry in self.entries.iter().take(index + 1) {
+        for entry in path {
             let mut clone = entry.clone();
-            clone.id = Uuid::new_v4().to_string();
             clone.parent_id = forked.leaf_id.clone();
             forked.append_entry(clone)?;
         }
         Ok(forked)
+    }
+
+    /// Entries from the root to `entry_id`, oldest first.
+    fn ancestry(&self, entry_id: &str) -> Result<Vec<&SessionEntry>, SessionError> {
+        let by_id: std::collections::HashMap<_, _> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect();
+        let mut path = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut current = by_id.get(entry_id).copied();
+        if current.is_none() {
+            return Err(SessionError::not_found(format!(
+                "Entry {entry_id} not found"
+            )));
+        }
+        while let Some(entry) = current {
+            if !seen.insert(entry.id.as_str()) {
+                return Err(SessionError::invalid_entry(format!(
+                    "Session branch contains a cycle at {}",
+                    entry.id
+                )));
+            }
+            path.push(entry);
+            current = match entry.parent_id.as_deref() {
+                Some(parent) => Some(by_id.get(parent).copied().ok_or_else(|| {
+                    SessionError::invalid_entry(format!(
+                        "Entry {} references missing parent {parent}",
+                        entry.id
+                    ))
+                })?),
+                None => None,
+            };
+        }
+        path.reverse();
+        Ok(path)
     }
 
     pub fn clone_session(&self, sessions_root: &Path) -> Result<Self, SessionError> {

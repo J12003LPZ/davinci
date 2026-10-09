@@ -288,9 +288,86 @@ impl AssistantMessageEvent {
             Self::Error { error, .. } => error,
         }
     }
+
+    fn partial_mut(&mut self) -> Option<&mut Arc<AssistantMessage>> {
+        match self {
+            Self::Start { partial }
+            | Self::TextStart { partial, .. }
+            | Self::TextDelta { partial, .. }
+            | Self::TextEnd { partial, .. }
+            | Self::ThinkingStart { partial, .. }
+            | Self::ThinkingDelta { partial, .. }
+            | Self::ThinkingEnd { partial, .. }
+            | Self::ToolcallStart { partial, .. }
+            | Self::ToolcallDelta { partial, .. }
+            | Self::ToolcallEnd { partial, .. } => Some(partial),
+            Self::Done { .. } | Self::Error { .. } => None,
+        }
+    }
+}
+
+/// Keeps the event history of a running stream from retaining every
+/// cumulative snapshot. Once a newer snapshot appears, events already
+/// delivered live drop theirs for the stream's first (near-empty) snapshot;
+/// `finish` then points every event at one copy of the final message. Each
+/// event is rewritten at most twice, so retention stays linear.
+#[derive(Default)]
+pub(crate) struct PartialRetention {
+    placeholder: Option<Arc<AssistantMessage>>,
+    latest: Option<Arc<AssistantMessage>>,
+    compacted: usize,
+}
+
+impl PartialRetention {
+    pub(crate) fn compact(&mut self, events: &mut [AssistantMessageEvent]) {
+        let Some(latest) = events
+            .iter_mut()
+            .rev()
+            .find_map(|event| event.partial_mut().map(|partial| Arc::clone(partial)))
+        else {
+            return;
+        };
+        if self
+            .latest
+            .as_ref()
+            .is_some_and(|known| Arc::ptr_eq(known, &latest))
+        {
+            return;
+        }
+        self.latest = Some(Arc::clone(&latest));
+        let mut first_latest = None;
+        for (offset, event) in events[self.compacted..].iter_mut().enumerate() {
+            let Some(partial) = event.partial_mut() else {
+                continue;
+            };
+            let placeholder = self.placeholder.get_or_insert_with(|| Arc::clone(partial));
+            if Arc::ptr_eq(partial, &latest) {
+                first_latest.get_or_insert(self.compacted + offset);
+            } else if !Arc::ptr_eq(partial, placeholder) {
+                *partial = Arc::clone(placeholder);
+            }
+        }
+        if let Some(index) = first_latest {
+            self.compacted = index;
+        }
+    }
+
+    pub(crate) fn finish(events: &mut [AssistantMessageEvent], message: &AssistantMessage) {
+        let shared = Arc::new(message.clone());
+        for partial in events
+            .iter_mut()
+            .filter_map(AssistantMessageEvent::partial_mut)
+        {
+            *partial = Arc::clone(&shared);
+        }
+    }
 }
 
 pub type StreamEvent = AssistantMessageEvent;
+
+/// Total bytes one provider stream may deliver. One frame is separately
+/// capped by `stream_reader::MAX_FRAME_BYTES`.
+const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ProviderCompletionEnvelope {
@@ -400,15 +477,20 @@ fn read_provider_stream(
     let mut aborted = false;
     let mut read_error: Option<String> = None;
 
-    let feed = |data: &Value,
-                decoder: &mut dyn crate::stream_decoder::StreamDecoder,
-                events: &mut Vec<AssistantMessageEvent>,
-                on_event: &mut dyn FnMut(&AssistantMessageEvent)| {
+    // Raw frames are only needed to assemble native Responses output.
+    let keep_raw_events = native_responses_api(model);
+    let mut stream_bytes = 0usize;
+    let mut retention = PartialRetention::default();
+    let mut feed = |data: &Value,
+                    decoder: &mut dyn crate::stream_decoder::StreamDecoder,
+                    events: &mut Vec<AssistantMessageEvent>,
+                    on_event: &mut dyn FnMut(&AssistantMessageEvent)| {
         let start = events.len();
         decoder.feed(data, events);
         for event in &events[start..] {
             on_event(event);
         }
+        retention.compact(events);
     };
 
     loop {
@@ -426,6 +508,11 @@ fn read_provider_stream(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        stream_bytes = stream_bytes.saturating_add(line.len());
+        if stream_bytes > MAX_STREAM_BYTES {
+            read_error = Some("provider stream exceeds 256 MiB".into());
+            break;
+        }
         if frames == 0 {
             if raw.len().saturating_add(line.len()) > crate::stream_reader::MAX_FRAME_BYTES {
                 read_error = Some("non-streaming provider response exceeds 16 MiB".into());
@@ -443,7 +530,9 @@ fn read_provider_stream(
                     crate::trace::describe_event(&frame.data)
                 ));
             }
-            raw_events.push(frame.data.clone());
+            if keep_raw_events {
+                raw_events.push(frame.data.clone());
+            }
             feed(&frame.data, decoder, &mut events, on_event);
             if decoder.is_done() {
                 break;
@@ -465,7 +554,9 @@ fn read_provider_stream(
         if let Some(frame) = framer.flush() {
             frames += 1;
             raw.clear();
-            raw_events.push(frame.data.clone());
+            if keep_raw_events {
+                raw_events.push(frame.data.clone());
+            }
             feed(&frame.data, decoder, &mut events, on_event);
         }
     }
@@ -507,6 +598,7 @@ fn read_provider_stream(
         };
         on_event(&event);
         events.push(event);
+        PartialRetention::finish(&mut events, &message);
         return Ok((message, events, None));
     }
 
@@ -526,6 +618,7 @@ fn read_provider_stream(
     for event in &events[start..] {
         on_event(event);
     }
+    PartialRetention::finish(&mut events, &message);
     let native = if native_responses_api(model)
         && message.stop_reason != Some(StopReason::Error)
         && message.stop_reason != Some(StopReason::Aborted)
@@ -3435,6 +3528,63 @@ mod tests {
             headers: Default::default(),
             source: "test".into(),
         }
+    }
+
+    #[test]
+    fn stream_event_history_does_not_retain_cumulative_snapshots() {
+        let chunk = "x".repeat(4096);
+        let mut rest = String::new();
+        for _ in 0..64 {
+            rest.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{chunk}\"}}}}]}}\n\n"
+            ));
+        }
+        rest.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let (base, release, server) = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
+            rest.leak(),
+            Duration::from_secs(5),
+        );
+        let _ = release.send(());
+        let model = loopback_model(&base);
+        let mut live_partial_lengths = Vec::new();
+        let (message, events) = live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions::default(),
+            &mut |event| {
+                if let AssistantMessageEvent::TextDelta { partial, .. } = event {
+                    live_partial_lengths.push(serde_json::to_string(partial).unwrap().len());
+                }
+            },
+        )
+        .expect("stream");
+        server.join().unwrap();
+        let final_len = serde_json::to_string(&message).unwrap().len();
+        assert!(final_len > 64 * 4096);
+        // Live callbacks still saw growing snapshots.
+        assert!(live_partial_lengths.last() > live_partial_lengths.first());
+
+        let mut distinct: Vec<*const AssistantMessage> = Vec::new();
+        let mut retained = 0usize;
+        for event in &events {
+            if let Some(partial) = event.clone().partial_mut() {
+                let pointer = Arc::as_ptr(partial);
+                if !distinct.contains(&pointer) {
+                    distinct.push(pointer);
+                    retained += serde_json::to_string(partial.as_ref()).unwrap().len();
+                }
+            }
+        }
+        assert!(
+            retained <= 2 * final_len,
+            "retained {retained} bytes of snapshots for a {final_len}-byte message"
+        );
     }
 
     #[test]
