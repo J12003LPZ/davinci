@@ -84,11 +84,16 @@ impl ItemSelectList {
     }
 
     pub fn set_filter(&mut self, filter: &str) {
-        let needle = filter.to_ascii_lowercase();
+        // Unicode-aware, and against what the row shows (label) as well as
+        // what it selects (value).
+        let needle = filter.to_lowercase();
         self.filtered_items = self
             .items
             .iter()
-            .filter(|item| item.value.to_ascii_lowercase().starts_with(&needle))
+            .filter(|item| {
+                item.label.to_lowercase().starts_with(&needle)
+                    || item.value.to_lowercase().starts_with(&needle)
+            })
             .cloned()
             .collect();
         self.selected_index = 0;
@@ -305,6 +310,42 @@ impl Component for ItemSelectList {
 mod tests {
     use super::*;
     use crate::ansi::visible_width;
+
+    #[test]
+    fn filter_is_unicode_aware_and_matches_the_visible_label() {
+        let items = vec![
+            SelectItem {
+                value: "café".into(),
+                label: "café".into(),
+                description: None,
+            },
+            SelectItem {
+                value: "npm run build".into(),
+                label: "Build project".into(),
+                description: None,
+            },
+        ];
+        let mut list = ItemSelectList::new(
+            items,
+            5,
+            SelectListTheme::identity(),
+            SelectListLayoutOptions::default(),
+        );
+        list.set_filter("CAFÉ");
+        assert_eq!(list.selected_item().map(|i| i.value.as_str()), Some("café"));
+        list.set_filter("Build");
+        assert_eq!(
+            list.selected_item().map(|i| i.value.as_str()),
+            Some("npm run build")
+        );
+        list.set_filter("npm");
+        assert_eq!(
+            list.selected_item().map(|i| i.value.as_str()),
+            Some("npm run build")
+        );
+        list.set_filter("zzz");
+        assert!(list.selected_item().is_none());
+    }
 
     fn visible_index_of(line: &str, text: &str) -> usize {
         let index = line.find(text).expect(text);

@@ -61,11 +61,32 @@ impl LoginDialog {
         }
     }
 
+    /// An OSC 8 hyperlink. Control characters in either part could end the
+    /// sequence early and inject others, so they are dropped, and only web
+    /// URLs become links; anything else renders as plain text.
     pub fn osc8(url: &str, text: &str) -> String {
-        format!("\x1b]8;;{url}\x07{text}\x1b]8;;\x07")
+        let clean = |value: &str| {
+            value
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .collect::<String>()
+        };
+        let (url, text) = (clean(url), clean(text));
+        if url.starts_with("https://") || url.starts_with("http://") {
+            format!("\x1b]8;;{url}\x07{text}\x1b]8;;\x07")
+        } else {
+            text
+        }
+    }
+
+    /// Leaves any manual-input prompt, so Enter cannot submit stale input.
+    fn end_manual_input(&mut self) {
+        self.input_enabled = false;
+        self.input.clear();
     }
 
     pub fn show_auth(&mut self, url: &str, instructions: Option<&str>) {
+        self.end_manual_input();
         self.lines.clear();
         self.lines.push(Self::osc8(url, url));
         self.lines.push(Self::osc8(url, Self::click_hint()));
@@ -76,6 +97,7 @@ impl LoginDialog {
     }
 
     pub fn show_device_code(&mut self, info: &DeviceCodeInfo) {
+        self.end_manual_input();
         self.lines.clear();
         self.lines
             .push(Self::osc8(&info.verification_uri, &info.verification_uri));
@@ -103,6 +125,7 @@ impl LoginDialog {
     }
 
     pub fn show_details(&mut self, lines: &[String]) {
+        self.end_manual_input();
         self.lines.clear();
         self.lines.extend(lines.iter().cloned());
     }
@@ -145,9 +168,11 @@ impl LoginDialog {
         }
         match data {
             "\r" | "\n" => {
-                let value = self.input.clone();
+                // The submitted text can be a secret (API key, token); it is
+                // handed to the caller and never kept in the visible transcript.
+                let value = std::mem::take(&mut self.input);
                 self.input_enabled = false;
-                self.lines.push(format!("> {value}"));
+                self.lines.push("> (submitted)".to_string());
                 LoginDialogAction::Submit(value)
             }
             "\x7f" | "\x08" => {
@@ -204,6 +229,48 @@ impl Component for LoginDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leaving_manual_input_disables_stale_submission() {
+        let mut dialog = LoginDialog::new("provider", None, None);
+        dialog.show_manual_input("Paste code");
+        dialog.input = "stale".into();
+        dialog.show_details(&["Details".into()]);
+        assert!(!dialog.input_enabled);
+        assert_eq!(dialog.handle_key("\r"), LoginDialogAction::None);
+
+        dialog.show_manual_input("Paste code");
+        dialog.show_device_code(&DeviceCodeInfo {
+            user_code: "ABCD".into(),
+            verification_uri: "https://example.test/device".into(),
+        });
+        assert!(!dialog.input_enabled);
+    }
+
+    #[test]
+    fn submitted_secrets_never_enter_the_transcript() {
+        let mut dialog = LoginDialog::new("provider", None, None);
+        dialog.show_manual_input("Paste API key");
+        for ch in "sk-secret-value".chars() {
+            dialog.handle_key(&ch.to_string());
+        }
+        assert_eq!(
+            dialog.handle_key("\r"),
+            LoginDialogAction::Submit("sk-secret-value".into())
+        );
+        assert!(dialog.lines.iter().all(|line| !line.contains("sk-secret")));
+        assert!(dialog.input.is_empty());
+    }
+
+    #[test]
+    fn hyperlinks_cannot_inject_terminal_sequences() {
+        let link = LoginDialog::osc8("https://example.test/\x07\x1b]0;spoof\x07", "Log\x1bin");
+        assert_eq!(link.matches('\x07').count(), 2, "{link:?}");
+        assert!(!link.contains("\x1b]0;"), "{link:?}");
+        assert_eq!(LoginDialog::osc8("javascript:alert(1)", "text"), "text");
+        let ok = LoginDialog::osc8("https://example.test/", "Login");
+        assert!(ok.starts_with("\x1b]8;;https://example.test/\x07"));
+    }
 
     #[test]
     fn login_dialog_wraps_long_unicode_content_to_the_requested_width() {

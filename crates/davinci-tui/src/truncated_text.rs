@@ -26,16 +26,17 @@ impl Component for TruncatedText {
         for _ in 0..self.padding_y {
             result.push(empty_line.clone());
         }
-        let available_width = width
-            .saturating_sub(self.padding_x.saturating_mul(2))
-            .max(1);
+        // Padding never takes more than the viewport: keep one content cell
+        // when it fits, and shrink the side padding when it does not.
+        let padding_x = self.padding_x.min(width.saturating_sub(1) / 2);
+        let available_width = width.saturating_sub(padding_x.saturating_mul(2)).max(1);
         let single_line = self
             .text
             .split_once('\n')
             .map_or(self.text.as_str(), |(first, _)| first);
         let display = truncate_to_width(single_line, available_width, "...", false);
-        let left = " ".repeat(self.padding_x);
-        let right = " ".repeat(self.padding_x);
+        let left = " ".repeat(padding_x);
+        let right = " ".repeat(padding_x);
         let line_with_padding = format!("{left}{display}{right}");
         let padding_needed = width.saturating_sub(visible_width(&line_with_padding));
         result.push(format!("{line_with_padding}{}", " ".repeat(padding_needed)));
@@ -52,6 +53,17 @@ impl Component for TruncatedText {
 mod tests {
     use super::*;
     use crate::ansi::visible_width;
+
+    #[test]
+    fn narrow_viewports_never_exceed_the_requested_width() {
+        for width in 0..8 {
+            for line in TruncatedText::new("Hello", 3, 1).render(width) {
+                assert!(visible_width(&line) <= width.max(1), "{width}: {line:?}");
+            }
+        }
+        let rendered = TruncatedText::new("Hello", 1, 0).render(1);
+        assert_eq!(visible_width(&rendered[0]), 1);
+    }
 
     fn strip_ansi(line: &str) -> String {
         line.replace('\u{1b}', "")
