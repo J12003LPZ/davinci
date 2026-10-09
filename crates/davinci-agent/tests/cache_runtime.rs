@@ -625,7 +625,9 @@ fn wor101_leader_cancellation_does_not_cancel_followers() {
         let flight = flight.clone();
         std::thread::spawn(move || flight.run("shared", Duration::from_secs(5), None, || Ok(0_u64)))
     };
-    std::thread::sleep(Duration::from_millis(50));
+    // The leader is parked until `finish_tx`, so a long pause only gives the
+    // follower ample time to join the flight; it never races the leader.
+    std::thread::sleep(Duration::from_millis(300));
     cancel.cancel();
     finish_tx.send(()).unwrap();
     assert!(matches!(leader.join().unwrap(), Err(CacheError::Cancelled)));
@@ -694,7 +696,9 @@ fn wor101_cache_leader_cancellation_still_serves_followers() {
             )
         })
     };
-    std::thread::sleep(Duration::from_millis(50));
+    // The leader is parked until `finish_tx`, so a long pause only gives the
+    // follower ample time to join the flight; it never races the leader.
+    std::thread::sleep(Duration::from_millis(300));
     cancel.cancel();
     finish_tx.send(()).unwrap();
     assert!(matches!(leader.join().unwrap(), Err(CacheError::Cancelled)));

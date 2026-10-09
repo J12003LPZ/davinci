@@ -293,3 +293,40 @@ fn worker_receipt_store_replays_after_controller_restart() {
     assert_eq!(second, first);
     assert_eq!(restarted.receipt_for(&first.command_id), Some(first));
 }
+
+/// An in-flight control record means the outcome is unknown: the adapter
+/// must ask for recovery instead of journaling the command as succeeded.
+#[test]
+fn in_flight_worker_receipt_requires_recovery() {
+    let fixture = Fixture::new();
+    let agent = fixture.running_worker();
+    let path = fixture._temp.path().join("control-receipts.jsonl");
+    let controller = WorkerController::new(fixture.registry.clone())
+        .with_receipt_store(&path)
+        .unwrap();
+    let command = WorkerControlCommand {
+        id: Uuid::new_v4(),
+        root_run_id: fixture.run_id,
+        agent_id: agent,
+        generation: fixture.registry.get_generation(&agent),
+        task_id: None,
+        expected_revision: fixture.registry.get_revision(&agent),
+        action: WorkerControlAction::Stop { reason: None },
+    };
+    controller.execute_command(command.clone(), true);
+    // Keep only the in-flight record, as a crash between acting and
+    // recording the outcome would.
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{}\n", text.lines().next().unwrap())).unwrap();
+    let restarted = WorkerController::new(fixture.registry.clone())
+        .with_receipt_store(&path)
+        .unwrap();
+    assert!(restarted.receipt_for(&command.id).unwrap().is_in_flight());
+    let result = fixture
+        .adapter
+        .execute_worker_control(&restarted, None, command, true);
+    assert!(
+        matches!(result, Err(ControlOperationError::RecoveryRequired)),
+        "{result:?}"
+    );
+}

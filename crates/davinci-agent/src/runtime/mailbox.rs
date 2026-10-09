@@ -391,9 +391,19 @@ impl AgentMailbox {
             return Err(MailboxError::MessageTooLarge(text.len()));
         }
 
+        // Everything below, rejections included, runs under the lifecycle
+        // lock, so no call can overwrite the receipt of a concurrent call
+        // with the same ID that was accepted meanwhile.
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // A stable ID names one logical steering message: a repeat call after
         // a lost response returns the original receipt instead of queueing
         // the instruction a second time.  Rejected receipts stay retryable.
+        // The receipt is written before its message is queued and outlives
+        // delivery, so this holds even if a drain already took the message.
         if let Some(existing) = self.live_steering_receipt(&message_id, &to) {
             return Ok(existing);
         }
@@ -443,17 +453,6 @@ impl AgentMailbox {
         msg.id = message_id;
         let msg_id = message_id;
 
-        let _lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A concurrent call with the same ID may have been accepted since the
-        // early check. Its receipt is written before its message is queued
-        // and outlives delivery, so checking it under the lifecycle lock
-        // catches the duplicate even if a drain already took the message.
-        if let Some(existing) = self.live_steering_receipt(&message_id, &to) {
-            return Ok(existing);
-        }
         let receipt = SteeringReceipt {
             message_id: msg_id,
             agent_id: to,

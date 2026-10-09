@@ -226,22 +226,33 @@ impl TaskCoordinatorTransport {
                                 let (credential, tools, context) = (&credential, &tools, &context);
                                 let (permissions, cwd, handler) = (&permissions, &cwd, &handler);
                                 scope.spawn(move || {
+                                    // Frees the slot even if dispatch panics.
+                                    let _slot = Slot(active);
                                     let deadline = Instant::now() + IO_TIMEOUT;
                                     if let Ok(request) =
                                         read_frame::<Request>(&mut stream, deadline, stopping)
                                     {
                                         let received_at = Instant::now();
-                                        let result = dispatch(
-                                            request,
-                                            credential,
-                                            tools,
-                                            context,
-                                            permissions,
-                                            cwd,
-                                            stopping,
-                                            handler.as_deref(),
-                                            received_at,
-                                        );
+                                        // A panicking command answers with an
+                                        // error instead of dropping the client.
+                                        let result = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| {
+                                                dispatch(
+                                                    request,
+                                                    credential,
+                                                    tools,
+                                                    context,
+                                                    permissions,
+                                                    cwd,
+                                                    stopping,
+                                                    handler.as_deref(),
+                                                    received_at,
+                                                )
+                                            }),
+                                        )
+                                        .unwrap_or_else(|_| {
+                                            Err("task coordinator command panicked".into())
+                                        });
                                         let _ = write_frame(
                                             &mut stream,
                                             &Response { result },
@@ -249,7 +260,6 @@ impl TaskCoordinatorTransport {
                                             stopping,
                                         );
                                     }
-                                    active.fetch_sub(1, Ordering::SeqCst);
                                 });
                             }
                             Ok(_) => {}
@@ -271,6 +281,15 @@ impl TaskCoordinatorTransport {
 
     pub fn client(&self) -> TaskCoordinatorClient {
         self.client.clone()
+    }
+}
+
+/// One admitted connection's place under `MAX_CONNECTIONS`.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -974,5 +993,47 @@ mod tests {
             started.elapsed()
         );
         drop(stalled);
+    }
+
+    /// A panicking command answers with an error and frees its connection
+    /// slot, so panics cannot use up the coordinator's capacity.
+    #[test]
+    fn wor94_panicking_commands_do_not_exhaust_connection_slots() {
+        struct Panics;
+        impl CoordinatorToolHandler for Panics {
+            fn handles(&self, tool: &str) -> bool {
+                tool == "boom"
+            }
+            fn execute(&self, _tool: &str, _args: &Value) -> Result<ToolResult, ToolError> {
+                panic!("fixture handler panic");
+            }
+        }
+        let parent = RuntimeHandle::new(
+            super::super::RunId::new(),
+            AgentId::new(),
+            super::super::RuntimeBus::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let child = register(&parent, dir.path());
+        let server = TaskCoordinatorTransport::bind_with_handler(
+            &parent,
+            child,
+            Arc::new(PermissionState::new(PermissionPolicy::new(
+                PermissionMode::AlwaysApprove,
+            ))),
+            vec!["task_list".into(), "boom".into()],
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(Panics)),
+        )
+        .unwrap();
+        let client = server.client();
+        for _ in 0..MAX_CONNECTIONS + 2 {
+            let error = client.call("boom", &json!({})).unwrap_err();
+            assert!(error.to_string().contains("panicked"), "{error}");
+        }
+        let started = Instant::now();
+        assert!(client.call("task_list", &json!({})).is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

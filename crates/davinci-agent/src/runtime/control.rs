@@ -272,6 +272,17 @@ pub struct WorkerControlReceipt {
     pub reason: Option<String>,
 }
 
+/// Reason on the record a command writes before it acts (WOR-99).
+const IN_FLIGHT_REASON: &str = "control_in_flight";
+
+impl WorkerControlReceipt {
+    /// True for the record written before the command acted: the command
+    /// is still running, or a crash left its outcome unknown.
+    pub fn is_in_flight(&self) -> bool {
+        self.status == ControlStatus::Unknown && self.reason.as_deref() == Some(IN_FLIGHT_REASON)
+    }
+}
+
 /// Host-owned process lease capturing OS handle and process tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessLease {
@@ -537,22 +548,10 @@ impl WorkerController {
             command_digest: digest.to_string(),
             receipt: receipt.clone(),
         };
-        let encoded = match serde_json::to_vec(&frame) {
-            Ok(encoded) => encoded,
-            Err(_) => return false,
-        };
-        let mut file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.as_ref())
-        {
-            Ok(file) => file,
-            Err(_) => return false,
-        };
-        if file.write_all(&encoded).is_err() || file.write_all(b"\n").is_err() {
+        let Ok(encoded) = serde_json::to_vec(&frame) else {
             return false;
-        }
-        file.sync_data().is_ok()
+        };
+        super::append_log::append_record(path.as_ref(), &encoded).is_ok()
     }
 
     pub fn register_lease(&self, lease: ProcessLease) {
@@ -669,6 +668,18 @@ impl WorkerController {
         // before it did anything can be retried under the same ID.
         let mut claim = CommandClaim::new(&self.seen_commands, cmd.id);
         if !claim.acquired() {
+            // The other call may have written its in-flight record since the
+            // check above; answer with it when it has.
+            if let Some((prior_digest, prior)) = self
+                .command_receipts
+                .read()
+                .ok()
+                .and_then(|receipts| receipts.get(&cmd.id).cloned())
+            {
+                if prior_digest == digest {
+                    return prior;
+                }
+            }
             return WorkerControlReceipt {
                 command_id: cmd.id,
                 task_id: cmd.task_id,
@@ -771,7 +782,7 @@ impl WorkerController {
             generation: cmd.generation,
             action: action_name.clone(),
             status: ControlStatus::Unknown,
-            reason: Some("control_in_flight".to_string()),
+            reason: Some(IN_FLIGHT_REASON.to_string()),
         };
         if !self.remember_receipt(&cmd, &digest, &in_flight) {
             return WorkerControlReceipt {

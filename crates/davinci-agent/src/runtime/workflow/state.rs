@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
@@ -167,8 +167,11 @@ impl WorkflowStateStore {
         // Same lock order as `put_artifact` and the readers: index, then artifacts.
         let mut index = write_lock(&self.phase_index);
         let mut arts = write_lock(&self.artifacts);
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(artifact) = serde_json::from_str::<WorkflowArtifact>(&line) else {
+        // Split on raw bytes: a line torn inside a multi-byte character is
+        // not UTF-8, and must be skipped like any other torn line rather
+        // than end the read and hide every artifact after it.
+        for line in BufReader::new(file).split(b'\n').map_while(Result::ok) {
+            let Ok(artifact) = serde_json::from_slice::<WorkflowArtifact>(&line) else {
                 continue;
             };
             if artifact.workflow_id != workflow_id || arts.contains_key(&artifact.id) {
@@ -205,26 +208,9 @@ impl WorkflowStateStore {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(io)?;
         }
-        let mut line = serde_json::to_vec(artifact)
+        let record = serde_json::to_vec(artifact)
             .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
-        line.push(b'\n');
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(io)?;
-        // After a torn tail, start on a fresh line so this record stays whole.
-        if file.metadata().map_err(io)?.len() > 0 {
-            let mut last = [0u8; 1];
-            file.seek(SeekFrom::End(-1)).map_err(io)?;
-            file.read_exact(&mut last).map_err(io)?;
-            if last[0] != b'\n' {
-                line.insert(0, b'\n');
-            }
-        }
-        file.write_all(&line).map_err(io)?;
-        file.sync_data().map_err(io)
+        crate::runtime::append_log::append_record(&path, &record).map_err(io)
     }
 
     /// Store an artifact produced by a worker.
@@ -256,12 +242,17 @@ impl WorkflowStateStore {
                 write_atomic(&file_path, serialized.as_bytes())
                     .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
 
-                let reference = serde_json::json!({
+                let mut reference = serde_json::json!({
                     "$overflow_ref": id.to_string(),
                     "phase": phase_id,
                     "byte_size": byte_size,
                     "file": file_path.to_string_lossy(),
                 });
+                // Resume matches a phase's artifacts to its workers by this
+                // field, so the reference keeps it.
+                if let Some(worker) = value.get("worker") {
+                    reference["worker"] = worker.clone();
+                }
                 (
                     reference,
                     true,
@@ -592,5 +583,36 @@ mod tests {
             store.get_full_value(&artifact.id),
             Err(WorkflowStateError::IoError(_))
         ));
+    }
+
+    /// A crash can cut a line inside a multi-byte character. That line is
+    /// skipped like any torn line, and artifacts appended after it still load.
+    #[test]
+    fn wor104_torn_multibyte_line_does_not_hide_later_artifacts() {
+        let tmp = tempdir().unwrap();
+        let wf_id = WorkflowId::new();
+        let store = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let kept = store
+            .put_artifact(
+                wf_id,
+                "p",
+                AgentId::new(),
+                serde_json::json!("caf\u{e9}"),
+                None,
+            )
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.manifest_path(wf_id))
+            .unwrap();
+        file.write_all(b"{\"value\":\"caf\xc3").unwrap();
+        drop(file);
+
+        let recovered = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let next = recovered
+            .put_artifact(wf_id, "p", AgentId::new(), serde_json::json!(2), None)
+            .unwrap();
+        let reopened = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        assert_eq!(reopened.list_phase_artifacts(wf_id, "p"), [kept, next]);
     }
 }

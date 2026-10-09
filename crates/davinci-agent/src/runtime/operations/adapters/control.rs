@@ -219,6 +219,14 @@ impl ControlOperationAdapter {
             return Ok(receipt);
         }
         if admitted.attempt.state() != OperationState::Succeeded {
+            // An in-flight record proves the command started, not that it
+            // finished: it is still running or a crash lost its outcome.
+            if controller
+                .receipt_for(&command.id)
+                .is_some_and(|receipt| receipt.is_in_flight())
+            {
+                return Err(ControlOperationError::RecoveryRequired);
+            }
             if let Some(worker) = controller.receipt_for(&command.id) {
                 let steering = match &command.action {
                     WorkerControlAction::Steer { .. } => {
