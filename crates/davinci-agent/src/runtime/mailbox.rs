@@ -129,6 +129,11 @@ pub struct AgentMailbox {
     seq: Arc<AtomicU64>,
     /// Bumped and broadcast on every enqueue so idle agents can block.
     signal: Arc<(Mutex<u64>, Condvar)>,
+    /// Held by `send`, `send_steer_with_id` and `drain` across a message's
+    /// queue change, receipt change and bus event, so a message is announced
+    /// queued before it is delivered, delivered before it can be applied, and
+    /// a receipt never moves backwards (WOR-86, WOR-89).
+    lifecycle: Arc<Mutex<()>>,
 }
 
 impl AgentMailbox {
@@ -184,6 +189,7 @@ impl AgentMailbox {
             bus: None,
             seq: Arc::new(AtomicU64::new(0)),
             signal: Arc::new((Mutex::new(0), Condvar::new())),
+            lifecycle: Arc::new(Mutex::new(())),
         }
     }
 
@@ -197,6 +203,7 @@ impl AgentMailbox {
             bus: Some(bus),
             seq: Arc::new(AtomicU64::new(0)),
             signal: Arc::new((Mutex::new(0), Condvar::new())),
+            lifecycle: Arc::new(Mutex::new(())),
         }
     }
 
@@ -266,6 +273,11 @@ impl AgentMailbox {
             (false, 1)
         };
 
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // 3. Persist undelivered message to mailbox queue before acknowledging
         {
             let mut queues = self
@@ -289,30 +301,34 @@ impl AgentMailbox {
                 }
                 return Err(MailboxError::QueueFull(message.to));
             }
+            if let Ok(mut receipts) = self.steering_receipts.write() {
+                receipts.insert(
+                    message.id,
+                    SteeringReceipt {
+                        message_id: message.id,
+                        agent_id: message.to,
+                        generation: gen,
+                        state: "queued".to_string(),
+                        applies_after_boundary: true,
+                        reason: None,
+                    },
+                );
+            }
             q.push_back(message.clone());
         }
         self.notify_waiters();
 
-        // Record initial steering receipt as queued
-        if let Ok(mut receipts) = self.steering_receipts.write() {
-            receipts.insert(
-                message.id,
-                SteeringReceipt {
-                    message_id: message.id,
-                    agent_id: message.to,
-                    generation: gen,
-                    state: "queued".to_string(),
-                    applies_after_boundary: true,
-                    reason: None,
-                },
-            );
-        }
-
-        // 4. Wake up recipient if idle
+        // 4. Wake up recipient if idle. A failed wake withdraws the message
+        // and frees its ID, so an error always means nothing was accepted and
+        // the caller may retry (WOR-91).
         if should_wake {
             if let Some(registry) = &self.registry {
-                if let Err(e) = registry.transition(message.to, AgentState::Running) {
-                    return Err(MailboxError::WakeError(message.to, e.to_string()));
+                if let Err(error) = self.wake(registry, message.to) {
+                    self.withdraw(&message.to, &message.id, "wake_failed");
+                    if let Ok(mut seen) = self.seen_message_ids.write() {
+                        seen.remove(&message.id);
+                    }
+                    return Err(MailboxError::WakeError(message.to, error));
                 }
             }
         }
@@ -408,6 +424,19 @@ impl AgentMailbox {
         msg.id = message_id;
         let msg_id = message_id;
 
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let receipt = SteeringReceipt {
+            message_id: msg_id,
+            agent_id: to,
+            generation,
+            state: "queued".to_string(),
+            applies_after_boundary: !redirect,
+            reason: None,
+        };
+
         // Check queue capacity
         {
             let mut queues = self
@@ -429,22 +458,14 @@ impl AgentMailbox {
                 }
                 return Err(MailboxError::QueueFull(to));
             }
+            // The receipt exists before the message can be drained, so a
+            // drain always finds it and it never regresses to queued (WOR-86).
+            if let Ok(mut receipts) = self.steering_receipts.write() {
+                receipts.insert(msg_id, receipt.clone());
+            }
             q.push_back(msg.clone());
         }
         self.notify_waiters();
-
-        let receipt = SteeringReceipt {
-            message_id: msg_id,
-            agent_id: to,
-            generation,
-            state: "queued".to_string(),
-            applies_after_boundary: !redirect,
-            reason: None,
-        };
-
-        if let Ok(mut receipts) = self.steering_receipts.write() {
-            receipts.insert(msg_id, receipt.clone());
-        }
 
         if let Some(registry) = &self.registry {
             if let Some(record) = registry.get(&to) {
@@ -467,17 +488,23 @@ impl AgentMailbox {
             }
         }
 
+        // Only a delivered message can be applied: a queued one has not
+        // reached the worker and a rejected one never will (WOR-89).
+        let Ok(mut receipts) = self.steering_receipts.write() else {
+            return false;
+        };
+        let receipt = receipts.get_mut(message_id);
+        if receipt.as_ref().is_some_and(|r| r.state != "delivered") {
+            return false;
+        }
         if let Ok(mut applied) = self.applied_messages.write() {
             let set = applied.entry(*agent_id).or_default();
             if !set.insert(*message_id) {
                 return false;
             }
         }
-
-        if let Ok(mut receipts) = self.steering_receipts.write() {
-            if let Some(r) = receipts.get_mut(message_id) {
-                r.state = "applied".to_string();
-            }
+        if let Some(r) = receipt {
+            r.state = "applied".to_string();
         }
 
         true
@@ -514,12 +541,46 @@ impl AgentMailbox {
         }
     }
 
+    /// Wake an idle recipient. Losing the race to another waker is success.
+    fn wake(&self, registry: &RuntimeRegistry, to: AgentId) -> Result<(), String> {
+        #[cfg(test)]
+        if tests::FAIL_WAKE.with(|fail| fail.get()) {
+            return Err("injected wake failure".into());
+        }
+        match registry.transition(to, AgentState::Running) {
+            Ok(()) => Ok(()),
+            Err(_)
+                if registry
+                    .get(&to)
+                    .is_some_and(|r| r.state == AgentState::Running) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Remove a still-queued message and reject its receipt. The caller holds
+    /// the lifecycle lock, so the message cannot have been drained meanwhile.
+    fn withdraw(&self, to: &AgentId, message_id: &Uuid, reason: &str) {
+        if let Ok(mut queues) = self.queues.write() {
+            if let Some(queue) = queues.get_mut(to) {
+                queue.retain(|message| &message.id != message_id);
+            }
+        }
+        self.mark_rejected(message_id, reason);
+    }
+
     /// Drain up to `limit` messages for the given agent ID.
     pub fn drain(&self, agent_id: AgentId, limit: usize) -> Vec<AgentMessage> {
         if limit == 0 {
             return Vec::new();
         }
 
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let drained: Vec<AgentMessage> = {
             let Ok(mut queues) = self.queues.write() else {
                 return Vec::new();
@@ -538,18 +599,8 @@ impl AgentMailbox {
             }
         };
 
-        // Transition queued receipts to delivered
-        if let Ok(mut receipts) = self.steering_receipts.write() {
-            for msg in &drained {
-                if let Some(r) = receipts.get_mut(&msg.id) {
-                    if r.state == "queued" {
-                        r.state = "delivered".to_string();
-                    }
-                }
-            }
-        }
-
-        // Emit delivery events for all drained messages
+        // Announce delivery before the receipts say delivered, so no caller
+        // can apply a message whose delivery event has not been emitted.
         if let Some(bus) = &self.bus {
             for msg in &drained {
                 let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -565,6 +616,17 @@ impl AgentMailbox {
                     },
                 );
                 bus.emit_observe(envelope);
+            }
+        }
+
+        // Transition queued receipts to delivered
+        if let Ok(mut receipts) = self.steering_receipts.write() {
+            for msg in &drained {
+                if let Some(r) = receipts.get_mut(&msg.id) {
+                    if r.state == "queued" {
+                        r.state = "delivered".to_string();
+                    }
+                }
             }
         }
 
@@ -666,6 +728,12 @@ mod tests {
             updated_ms: now,
             failure_reason: None,
         }
+    }
+
+    thread_local! {
+        /// Makes `wake` fail on this thread, standing in for a recipient whose
+        /// state changed between validation and wake.
+        pub(super) static FAIL_WAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     struct EventCapture {
@@ -1076,5 +1144,163 @@ mod tests {
             MailboxWait::TimedOut
         );
         assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+    }
+
+    /// Drains every message sent while `send` runs, from a thread that polls
+    /// as fast as it can so it interleaves with each send.
+    fn drain_while(
+        mailbox: &AgentMailbox,
+        agent: AgentId,
+        send: impl FnOnce(),
+    ) -> Vec<AgentMessage> {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drainer = {
+            let mailbox = mailbox.clone();
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut drained = Vec::new();
+                loop {
+                    let finished = done.load(Ordering::SeqCst);
+                    drained.extend(mailbox.drain(agent, 64));
+                    if finished && mailbox.pending_count(&agent) == 0 {
+                        return drained;
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        send();
+        done.store(true, Ordering::SeqCst);
+        drainer.join().unwrap()
+    }
+
+    /// WOR-86: a drain racing a send must never leave a delivered message's
+    /// receipt at `queued`.
+    #[test]
+    fn wor86_receipt_never_regresses_to_queued_after_a_racing_drain() {
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::new().with_registry(registry.clone());
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        for _ in 0..5 {
+            let drained = drain_while(&mailbox, agent, || {
+                for i in 0..600 {
+                    if i % 2 == 0 {
+                        mailbox
+                            .send_steer(agent, 1, format!("steer {i}"), false)
+                            .unwrap();
+                    } else {
+                        mailbox
+                            .send(AgentMessage::new(
+                                run,
+                                AgentId::new(),
+                                agent,
+                                format!("m {i}"),
+                            ))
+                            .unwrap();
+                    }
+                }
+            });
+            assert_eq!(drained.len(), 600);
+            for message in drained {
+                let receipt = mailbox.get_steering_receipt(&message.id).unwrap();
+                assert_eq!(receipt.state, "delivered", "{receipt:?}");
+            }
+        }
+    }
+
+    /// WOR-89: delivery is announced after queueing and before a message can
+    /// be applied, so a replayed log never resurrects a delivered message.
+    #[test]
+    fn wor89_message_events_are_queued_then_delivered_then_applied() {
+        let bus = RuntimeBus::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        bus.subscribe(Arc::new(EventCapture {
+            events: Arc::clone(&events),
+        }));
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+
+        let early = AgentMessage::new(run, AgentId::new(), agent, "not yet delivered");
+        mailbox.send(early.clone()).unwrap();
+        assert!(!mailbox.mark_applied(&agent, 1, &early.id));
+        assert_eq!(
+            mailbox.get_steering_receipt(&early.id).unwrap().state,
+            "queued"
+        );
+        assert_eq!(mailbox.drain(agent, 1).len(), 1);
+        assert!(mailbox.mark_applied(&agent, 1, &early.id));
+
+        drain_while(&mailbox, agent, || {
+            for i in 0..600 {
+                mailbox
+                    .send(AgentMessage::new(
+                        run,
+                        AgentId::new(),
+                        agent,
+                        format!("m {i}"),
+                    ))
+                    .unwrap();
+            }
+        });
+        let events = events.lock().unwrap().clone();
+        let mut queued = HashSet::new();
+        for event in &events {
+            match event {
+                RuntimeEvent::AgentMessageQueued { message_id, .. } => {
+                    queued.insert(*message_id);
+                }
+                RuntimeEvent::AgentMessageDelivered { message_id, .. } => {
+                    assert!(queued.contains(message_id), "delivered before queued");
+                }
+                _ => {}
+            }
+        }
+        let envelopes: Vec<_> = events
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                RuntimeEventEnvelope::new(i as u64 + 1, run, None, None, None, payload)
+            })
+            .collect();
+        let replayed = AgentMailbox::new();
+        replayed.rehydrate_from_events(&envelopes);
+        assert_eq!(replayed.pending_count(&agent), 0);
+    }
+
+    /// WOR-91: a failed wake withdraws the message, so an error never hides
+    /// an accepted message and the same ID can be sent again.
+    #[test]
+    fn wor91_failed_wake_withdraws_the_message_and_allows_a_retry() {
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::new().with_registry(registry.clone());
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Idle))
+            .unwrap();
+        let message = AgentMessage::new(run, AgentId::new(), agent, "wake up");
+
+        FAIL_WAKE.with(|fail| fail.set(true));
+        let error = mailbox.send(message.clone()).unwrap_err();
+        FAIL_WAKE.with(|fail| fail.set(false));
+        assert!(matches!(error, MailboxError::WakeError(..)), "{error:?}");
+        assert_eq!(mailbox.pending_count(&agent), 0);
+        let receipt = mailbox.get_steering_receipt(&message.id).unwrap();
+        assert_eq!(receipt.state, "rejected");
+        assert_eq!(receipt.reason.as_deref(), Some("wake_failed"));
+        assert_eq!(registry.get(&agent).unwrap().state, AgentState::Idle);
+
+        mailbox.send(message.clone()).unwrap();
+        assert_eq!(mailbox.pending_count(&agent), 1);
+        assert_eq!(registry.get(&agent).unwrap().state, AgentState::Running);
     }
 }
