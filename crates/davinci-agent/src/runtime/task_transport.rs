@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(10);
+/// Connections served at once. Each gets its own thread, so a stalled or
+/// slow client cannot hold up the others (WOR-94); the cap bounds threads.
+const MAX_CONNECTIONS: usize = 8;
 
 /// Narrow parent-owned native capability carried by the existing worker channel.
 pub trait CoordinatorToolHandler: Send + Sync {
@@ -203,44 +206,59 @@ impl TaskCoordinatorTransport {
         let thread = thread::Builder::new()
             .name("task-coordinator".into())
             .spawn(move || {
-                while !stopping.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((mut stream, peer)) if peer.ip().is_loopback() => {
-                            if configure(&stream).is_err() {
-                                continue;
+                let active = AtomicUsize::new(0);
+                // Scoped so every admitted connection finishes before this
+                // thread exits, which is what Drop waits for.
+                thread::scope(|scope| {
+                    while !stopping.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
+                        if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                            thread::sleep(POLL);
+                            continue;
+                        }
+                        match listener.accept() {
+                            Ok((mut stream, peer)) if peer.ip().is_loopback() => {
+                                if configure(&stream).is_err() {
+                                    continue;
+                                }
+                                active.fetch_add(1, Ordering::SeqCst);
+                                let (active, stopping) = (&active, &stopping);
+                                let (credential, tools, context) = (&credential, &tools, &context);
+                                let (permissions, cwd, handler) = (&permissions, &cwd, &handler);
+                                scope.spawn(move || {
+                                    let deadline = Instant::now() + IO_TIMEOUT;
+                                    if let Ok(request) =
+                                        read_frame::<Request>(&mut stream, deadline, stopping)
+                                    {
+                                        let received_at = Instant::now();
+                                        let result = dispatch(
+                                            request,
+                                            credential,
+                                            tools,
+                                            context,
+                                            permissions,
+                                            cwd,
+                                            stopping,
+                                            handler.as_deref(),
+                                            received_at,
+                                        );
+                                        let _ = write_frame(
+                                            &mut stream,
+                                            &Response { result },
+                                            Instant::now() + IO_TIMEOUT,
+                                            stopping,
+                                        );
+                                    }
+                                    active.fetch_sub(1, Ordering::SeqCst);
+                                });
                             }
-                            let deadline = Instant::now() + IO_TIMEOUT;
-                            let Ok(request) =
-                                read_frame::<Request>(&mut stream, deadline, &stopping)
-                            else {
-                                continue;
-                            };
-                            let received_at = Instant::now();
-                            let result = dispatch(
-                                request,
-                                &credential,
-                                &tools,
-                                &context,
-                                &permissions,
-                                &cwd,
-                                &stopping,
-                                handler.as_deref(),
-                                received_at,
-                            );
-                            let _ = write_frame(
-                                &mut stream,
-                                &Response { result },
-                                Instant::now() + IO_TIMEOUT,
-                                &stopping,
-                            );
+                            Ok(_) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(POLL)
+                            }
+                            Err(_) => break,
                         }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(POLL)
-                        }
-                        Err(_) => break,
                     }
-                }
+                });
             })
             .map_err(|_| "could not start task coordinator")?;
         Ok(Self {
@@ -869,5 +887,47 @@ mod tests {
         assert!(recorded
             .iter()
             .any(|e| matches!(e, crate::runtime::RuntimeEvent::PermissionDenied { .. })));
+    }
+
+    /// WOR-94: a client that connects and then stalls must not hold up a
+    /// valid request from another client until its read times out.
+    #[test]
+    fn wor94_a_stalled_client_does_not_block_other_clients() {
+        let parent = RuntimeHandle::new(
+            super::super::RunId::new(),
+            AgentId::new(),
+            super::super::RuntimeBus::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let child = register(&parent, dir.path());
+        let server = TaskCoordinatorTransport::bind(
+            &parent,
+            child,
+            Arc::new(PermissionState::new(PermissionPolicy::new(
+                PermissionMode::AlwaysApprove,
+            ))),
+            vec!["task_list".into()],
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let client = server.client();
+        let stalled: Vec<_> = (0..3)
+            .map(|_| {
+                let mut stream = TcpStream::connect(client.address).unwrap();
+                // Half a frame header, then nothing.
+                stream.write_all(&[0, 0]).unwrap();
+                stream
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        assert!(client.call("task_list", &json!({})).is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} behind stalled clients",
+            started.elapsed()
+        );
+        drop(stalled);
     }
 }
