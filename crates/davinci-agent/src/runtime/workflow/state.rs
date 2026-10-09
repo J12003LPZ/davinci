@@ -5,10 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -49,7 +50,40 @@ pub struct WorkflowArtifact {
     pub byte_size: usize,
     #[serde(default)]
     pub overflow_path: Option<PathBuf>,
+    /// SHA-256 of the overflow file contents, checked on every full read.
+    #[serde(default)]
+    pub overflow_sha256: Option<String>,
     pub created_ms: i64,
+}
+
+fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
+}
+
+/// Write `contents` so that `path` is either absent or complete: stage in a
+/// sibling temp file, flush it to disk, then rename into place.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 impl WorkflowArtifact {
@@ -120,24 +154,19 @@ impl WorkflowStateStore {
     /// Read a workflow's manifest into memory once. A line that does not
     /// parse is skipped: only a crash mid-append leaves one, and only last.
     fn ensure_loaded(&self, workflow_id: WorkflowId) {
-        if self
-            .loaded
-            .read()
-            .is_ok_and(|loaded| loaded.contains(&workflow_id))
-        {
+        if read_lock(&self.loaded).contains(&workflow_id) {
             return;
         }
-        let Ok(mut loaded) = self.loaded.write() else {
-            return;
-        };
+        let mut loaded = write_lock(&self.loaded);
         if !loaded.insert(workflow_id) {
             return;
         }
         let Ok(file) = std::fs::File::open(self.manifest_path(workflow_id)) else {
             return;
         };
-        let mut arts = self.artifacts.write().unwrap_or_else(|e| e.into_inner());
-        let mut index = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+        // Same lock order as `put_artifact` and the readers: index, then artifacts.
+        let mut index = write_lock(&self.phase_index);
+        let mut arts = write_lock(&self.artifacts);
         for line in BufReader::new(file).lines().map_while(Result::ok) {
             let Ok(artifact) = serde_json::from_str::<WorkflowArtifact>(&line) else {
                 continue;
@@ -215,27 +244,33 @@ impl WorkflowStateStore {
         let id = Uuid::now_v7();
         let now = now_ms();
 
-        let (stored_value, is_overflow, overflow_path) = if byte_size > self.max_inline_bytes {
-            // Write overflow artifact to disk
-            let wf_dir = self.overflow_dir.join(workflow_id.to_string());
-            if !wf_dir.exists() {
-                std::fs::create_dir_all(&wf_dir)
+        let (stored_value, is_overflow, overflow_path, overflow_sha256) =
+            if byte_size > self.max_inline_bytes {
+                // Write overflow artifact to disk
+                let wf_dir = self.overflow_dir.join(workflow_id.to_string());
+                if !wf_dir.exists() {
+                    std::fs::create_dir_all(&wf_dir)
+                        .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
+                }
+                let file_path = wf_dir.join(format!("{id}.json"));
+                write_atomic(&file_path, serialized.as_bytes())
                     .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
-            }
-            let file_path = wf_dir.join(format!("{id}.json"));
-            std::fs::write(&file_path, &serialized)
-                .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
 
-            let reference = serde_json::json!({
-                "$overflow_ref": id.to_string(),
-                "phase": phase_id,
-                "byte_size": byte_size,
-                "file": file_path.to_string_lossy(),
-            });
-            (reference, true, Some(file_path))
-        } else {
-            (value, false, None)
-        };
+                let reference = serde_json::json!({
+                    "$overflow_ref": id.to_string(),
+                    "phase": phase_id,
+                    "byte_size": byte_size,
+                    "file": file_path.to_string_lossy(),
+                });
+                (
+                    reference,
+                    true,
+                    Some(file_path),
+                    Some(sha256_hex(serialized.as_bytes())),
+                )
+            } else {
+                (value, false, None, None)
+            };
 
         let artifact = WorkflowArtifact {
             id,
@@ -247,6 +282,7 @@ impl WorkflowStateStore {
             is_overflow,
             byte_size,
             overflow_path,
+            overflow_sha256,
             created_ms: now,
         };
 
@@ -257,13 +293,13 @@ impl WorkflowStateStore {
             return Err(error);
         }
 
+        // Both maps change under both locks, in the same order readers use,
+        // and a poisoned lock is recovered rather than panicking between the
+        // two inserts and leaving an artifact the phase listing cannot see.
         {
-            let mut arts = self.artifacts.write().unwrap();
+            let mut index = write_lock(&self.phase_index);
+            let mut arts = write_lock(&self.artifacts);
             arts.insert(id, artifact.clone());
-        }
-
-        {
-            let mut index = self.phase_index.write().unwrap();
             index
                 .entry((workflow_id, phase_id.to_string()))
                 .or_default()
@@ -275,11 +311,11 @@ impl WorkflowStateStore {
 
     /// Get an artifact by ID.
     pub fn get_artifact(&self, id: &Uuid) -> Option<WorkflowArtifact> {
-        if let Some(artifact) = self.artifacts.read().unwrap().get(id) {
+        if let Some(artifact) = read_lock(&self.artifacts).get(id) {
             return Some(artifact.clone());
         }
         self.load_all();
-        self.artifacts.read().unwrap().get(id).cloned()
+        read_lock(&self.artifacts).get(id).cloned()
     }
 
     /// Retrieve the full artifact content even if stored in overflow.
@@ -290,9 +326,16 @@ impl WorkflowStateStore {
 
         if artifact.is_overflow {
             if let Some(path) = &artifact.overflow_path {
-                let content = std::fs::read_to_string(path)
-                    .map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
-                let val: Value = serde_json::from_str(&content)
+                let bytes =
+                    std::fs::read(path).map_err(|e| WorkflowStateError::IoError(e.to_string()))?;
+                if let Some(expected) = &artifact.overflow_sha256 {
+                    if &sha256_hex(&bytes) != expected {
+                        return Err(WorkflowStateError::IoError(format!(
+                            "overflow artifact {id} failed checksum verification"
+                        )));
+                    }
+                }
+                let val: Value = serde_json::from_slice(&bytes)
                     .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
                 Ok(val)
             } else {
@@ -310,8 +353,8 @@ impl WorkflowStateStore {
         phase_id: &str,
     ) -> Vec<WorkflowArtifact> {
         self.ensure_loaded(workflow_id);
-        let index = self.phase_index.read().unwrap();
-        let arts = self.artifacts.read().unwrap();
+        let index = read_lock(&self.phase_index);
+        let arts = read_lock(&self.artifacts);
         if let Some(ids) = index.get(&(workflow_id, phase_id.to_string())) {
             ids.iter().filter_map(|id| arts.get(id).cloned()).collect()
         } else {
@@ -482,5 +525,72 @@ mod tests {
             .unwrap();
         let again = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
         assert_eq!(again.list_phase_artifacts(wf_id, "p"), [kept, next]);
+    }
+
+    #[test]
+    fn wor102_poisoned_phase_index_does_not_orphan_artifact() {
+        let tmp = tempdir().unwrap();
+        let store = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let index = Arc::clone(&store.phase_index);
+        let _ = std::thread::spawn(move || {
+            let _guard = index.write().unwrap();
+            panic!("poison the phase index");
+        })
+        .join();
+        assert!(store.phase_index.is_poisoned());
+
+        let wf_id = WorkflowId::new();
+        let artifact = store
+            .put_artifact(
+                wf_id,
+                "p",
+                AgentId::new(),
+                serde_json::json!({"a": 1}),
+                None,
+            )
+            .expect("poisoned lock must not abort the insert");
+        let listed = store.list_phase_artifacts(wf_id, "p");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, artifact.id);
+        assert!(store.get_artifact(&artifact.id).is_some());
+    }
+
+    #[test]
+    fn wor103_overflow_write_leaves_only_the_final_file() {
+        let tmp = tempdir().unwrap();
+        let store = WorkflowStateStore::with_options(16, tmp.path().to_path_buf());
+        let wf_id = WorkflowId::new();
+        let val = serde_json::json!({"data": "y".repeat(256)});
+        let artifact = store
+            .put_artifact(wf_id, "p", AgentId::new(), val.clone(), None)
+            .unwrap();
+        let dir = artifact.overflow_path.as_ref().unwrap().parent().unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != MANIFEST_FILE)
+            .collect();
+        assert_eq!(names, vec![format!("{}.json", artifact.id)]);
+        assert_eq!(store.get_full_value(&artifact.id).unwrap(), val);
+    }
+
+    #[test]
+    fn wor103_tampered_overflow_file_is_rejected_on_read() {
+        let tmp = tempdir().unwrap();
+        let store = WorkflowStateStore::with_options(16, tmp.path().to_path_buf());
+        let val = serde_json::json!({"data": "y".repeat(256)});
+        let artifact = store
+            .put_artifact(WorkflowId::new(), "p", AgentId::new(), val, None)
+            .unwrap();
+        // Still valid JSON, but not what was written.
+        std::fs::write(
+            artifact.overflow_path.as_ref().unwrap(),
+            br#"{"data":"other"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.get_full_value(&artifact.id),
+            Err(WorkflowStateError::IoError(_))
+        ));
     }
 }
