@@ -1150,7 +1150,12 @@ mod tests {
             crate::stream::request_url(&model, &gateway),
             "https://gateway.ai.cloudflare.com/v1/acct1/gw1/anthropic/v1/messages"
         );
-        assert!(gateway.headers.keys().all(|name| is_url_var_header(name)));
+        // Only the gateway token travels as a real header; IDs stay URL-only.
+        assert!(gateway
+            .headers
+            .keys()
+            .all(|name| is_url_var_header(name) || name == "cf-aig-authorization"));
+        assert!(workers.headers.keys().all(|name| is_url_var_header(name)));
     }
 
     #[test]
