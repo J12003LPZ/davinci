@@ -613,10 +613,14 @@ impl SqliteSessionStore {
         session_id: &str,
         lease: &WriterLease,
     ) -> Result<(), SessionError> {
+        // Expire the row instead of deleting it: the fence is the session's
+        // lease generation and must survive release, or the next acquire
+        // restarts at 1 and a stale handle with the same owner id matches it.
         self.conn
             .execute(
-                "DELETE FROM writer_leases WHERE session_id = ?1 AND owner_id = ?2 AND fence = ?3",
-                params![session_id, lease.owner_id, lease.fence],
+                "UPDATE writer_leases SET expires_at_ms = ?4
+                 WHERE session_id = ?1 AND owner_id = ?2 AND fence = ?3",
+                params![session_id, lease.owner_id, lease.fence, i64::MIN],
             )
             .map_err(|err| {
                 SessionError::storage(format!("Unable to release writer lease: {err}"))

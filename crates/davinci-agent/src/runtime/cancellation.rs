@@ -13,6 +13,10 @@ const PRUNE_FLOOR: usize = 32;
 /// Inner state tracked for a cancellation token node.
 pub struct CancellationInner {
     pub inner: Arc<AtomicBool>,
+    /// Once-only guard for callbacks and child propagation. Kept apart from
+    /// `inner` because `as_atomic_bool` hands that flag out writable: a raw
+    /// store must not consume the cleanup that a later `cancel()` owes.
+    propagated: Arc<AtomicBool>,
     pub children: ChildList,
     pub callbacks: CallbackList,
 }
@@ -23,6 +27,7 @@ pub struct CancellationInner {
 #[derive(Clone)]
 pub struct CancellationToken {
     inner: Arc<AtomicBool>,
+    propagated: Arc<AtomicBool>,
     children: ChildList,
     callbacks: CallbackList,
     node: Arc<CancellationInner>,
@@ -46,15 +51,18 @@ impl CancellationToken {
     /// Create a new, independent root cancellation token.
     pub fn new() -> Self {
         let inner = Arc::new(AtomicBool::new(false));
+        let propagated = Arc::new(AtomicBool::new(false));
         let children = Arc::new(Mutex::new(Vec::new()));
         let callbacks = Arc::new(Mutex::new(Vec::new()));
         let node = Arc::new(CancellationInner {
             inner: inner.clone(),
+            propagated: propagated.clone(),
             children: children.clone(),
             callbacks: callbacks.clone(),
         });
         Self {
             inner,
+            propagated,
             children,
             callbacks,
             node,
@@ -67,14 +75,18 @@ impl CancellationToken {
     }
 
     /// Exposes an `Arc<AtomicBool>` view suitable for APIs expecting a raw flag (e.g. `davinci-ai`).
+    ///
+    /// Storing `true` here makes the token read as cancelled but runs no
+    /// cleanup; a later `cancel()` still fires callbacks and reaches children.
     pub fn as_atomic_bool(&self) -> Arc<AtomicBool> {
         self.inner.clone()
     }
 
     /// Cancel this token and propagate downward to all attached child tokens and callbacks.
     pub fn cancel(&self) {
-        if self.inner.swap(true, Ordering::SeqCst) {
-            // Already cancelled
+        self.inner.store(true, Ordering::SeqCst);
+        if self.propagated.swap(true, Ordering::SeqCst) {
+            // Already propagated
             return;
         }
 
@@ -97,6 +109,7 @@ impl CancellationToken {
         for child_node in children {
             let child_token = CancellationToken {
                 inner: child_node.inner.clone(),
+                propagated: child_node.propagated.clone(),
                 children: child_node.children.clone(),
                 callbacks: child_node.callbacks.clone(),
                 node: child_node,
@@ -232,6 +245,45 @@ mod tests {
         );
         parent.cancel();
         assert!(live.iter().all(CancellationToken::is_cancelled));
+    }
+
+    #[test]
+    fn raw_abort_flag_still_lets_cancel_reach_children_and_callbacks() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        let grandchild = child.child_token();
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        parent.on_cancel(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // tool_durability_failure and every `abort_signal` holder can store
+        // into this flag before the runtime's own cleanup runs.
+        parent.as_atomic_bool().store(true, Ordering::SeqCst);
+        assert!(parent.is_cancelled());
+        assert!(!child.is_cancelled(), "a raw store is not propagation");
+
+        parent.cancel();
+        parent.cancel();
+
+        assert!(child.is_cancelled() && grandchild.is_cancelled());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn raw_abort_flag_runs_late_callbacks_once() {
+        let token = CancellationToken::new();
+        token.as_atomic_bool().store(true, Ordering::SeqCst);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = count.clone();
+        token.on_cancel(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 1, "runs at registration");
+        token.cancel();
+        assert_eq!(count.load(Ordering::SeqCst), 1, "not run again by cancel");
+        assert!(token.child_token().is_cancelled());
     }
 
     #[test]

@@ -379,7 +379,24 @@ impl Inner {
             });
             return;
         }
-        if server.disabled || server.execution == Some(davinci_mcp::McpExecutionPolicy::Disabled) {
+        // Route on the resolved policy, never the raw field: an omitted
+        // `execution` on a local command means Sandboxed, and an invalid
+        // transport/policy pair must be refused before anything is spawned.
+        let policy = match server.execution_policy() {
+            Ok(policy) => policy,
+            Err(err) => {
+                self.rows.push(McpServerRow {
+                    name: name.to_string(),
+                    transport: transport_label.into(),
+                    status: "error".into(),
+                    tools: 0,
+                    error: Some(err.to_string()),
+                    skipped: Vec::new(),
+                });
+                return;
+            }
+        };
+        if policy == davinci_mcp::McpExecutionPolicy::Disabled {
             self.rows.push(McpServerRow {
                 name: name.to_string(),
                 transport: transport_label.into(),
@@ -390,9 +407,7 @@ impl Inner {
             });
             return;
         }
-        if server.execution == Some(davinci_mcp::McpExecutionPolicy::Sandboxed)
-            && server.command.is_some()
-        {
+        if policy == davinci_mcp::McpExecutionPolicy::Sandboxed {
             let Some((host, sandbox)) = executor else {
                 self.rows.push(McpServerRow {
                     name: name.to_string(),
