@@ -368,9 +368,22 @@ impl RuntimeRegistry {
 
     /// Rehydrate the registry from a slice of historical runtime event envelopes.
     ///
+    /// The event stream is authoritative: the replayed state replaces whatever
+    /// the registry held before, so agents absent from the history do not
+    /// survive as ghosts.
+    ///
     /// Rules:
-    /// - Agents recorded via `AgentStarted` are inserted.
-    /// - `AgentStateChanged` updates the state.
+    /// - Agents recorded via `AgentStarted` are inserted at generation 1,
+    ///   revision 1, mirroring `register_agent`.
+    /// - `AgentStateChanged` updates the state and advances the revision,
+    ///   mirroring `transition`.
+    /// - A `retry` control acknowledged as applied advances the generation
+    ///   past the generation it was issued against and advances the revision,
+    ///   mirroring `advance_generation_and_revision` in the controller.
+    ///   Rejected and stale acks applied nothing and are skipped. An `unknown`
+    ///   ack (receipt persistence failed) may hide an applied retry, so it is
+    ///   counted: over-advancing only makes old controls stale (fail closed),
+    ///   under-advancing would accept them.
     /// - Terminal states (`Completed`, `Failed`, `Cancelled`) stay terminal.
     /// - Non-terminal states (`Starting`, `Running`, `Waiting`, `Idle`, `Stopping`)
     ///   at the end of the log represent agents that were active when the process died;
@@ -379,34 +392,57 @@ impl RuntimeRegistry {
         &self,
         events: &[RuntimeEventEnvelope],
     ) -> Result<(), RegistryError> {
-        let mut map = self
-            .records
-            .write()
-            .map_err(|_| RegistryError::InvalidTransition {
-                agent_id: AgentId::new(),
-                from: AgentState::Starting,
-                to: AgentState::Failed,
-            })?;
+        let poisoned = || RegistryError::InvalidTransition {
+            agent_id: AgentId::new(),
+            from: AgentState::Starting,
+            to: AgentState::Failed,
+        };
+
+        let mut records: HashMap<AgentId, AgentRecord> = HashMap::new();
+        let mut generations: HashMap<AgentId, u64> = HashMap::new();
+        let mut revisions: HashMap<AgentId, u64> = HashMap::new();
+        let mut activity: HashMap<AgentId, i64> = HashMap::new();
+        let mut max_seq = 0;
 
         for envelope in events {
+            max_seq = max_seq.max(envelope.sequence);
             match &envelope.payload {
                 RuntimeEvent::AgentStarted { record } => {
-                    map.insert(record.id, record.clone());
+                    records.insert(record.id, record.clone());
+                    generations.insert(record.id, 1);
+                    revisions.insert(record.id, 1);
+                    activity.insert(record.id, record.started_ms);
                 }
                 RuntimeEvent::AgentStateChanged { to, .. } => {
                     if let Some(agent_id) = envelope.agent_id {
-                        if let Some(rec) = map.get_mut(&agent_id) {
+                        if let Some(rec) = records.get_mut(&agent_id) {
                             rec.state = *to;
                             rec.updated_ms = envelope.timestamp_ms;
+                            *revisions.entry(agent_id).or_insert(1) += 1;
+                            activity.insert(agent_id, envelope.timestamp_ms);
                         }
                     }
+                }
+                RuntimeEvent::WorkerControlAcknowledged {
+                    agent_id,
+                    generation,
+                    action,
+                    status,
+                    ..
+                } if action == "retry"
+                    && matches!(status.as_str(), "accepted" | "unknown")
+                    && records.contains_key(agent_id) =>
+                {
+                    let current = generations.entry(*agent_id).or_insert(1);
+                    *current = (*current).max(generation.saturating_add(1));
+                    *revisions.entry(*agent_id).or_insert(1) += 1;
                 }
                 _ => {}
             }
         }
 
         let now = Self::now_ms();
-        for rec in map.values_mut() {
+        for rec in records.values_mut() {
             if !matches!(
                 rec.state,
                 AgentState::Completed | AgentState::Failed | AgentState::Cancelled
@@ -417,6 +453,21 @@ impl RuntimeRegistry {
                 rec.updated_ms = now;
             }
         }
+        let tool_counts: HashMap<AgentId, u64> = records.keys().map(|id| (*id, 0)).collect();
+
+        // Take every lock before replacing anything so a poisoned lock leaves
+        // the previous state intact instead of a half-replaced registry.
+        let mut records_guard = self.records.write().map_err(|_| poisoned())?;
+        let mut generations_guard = self.generations.write().map_err(|_| poisoned())?;
+        let mut revisions_guard = self.revisions.write().map_err(|_| poisoned())?;
+        let mut activity_guard = self.last_activity_ms.write().map_err(|_| poisoned())?;
+        let mut tools_guard = self.tool_counts.write().map_err(|_| poisoned())?;
+        *records_guard = records;
+        *generations_guard = generations;
+        *revisions_guard = revisions;
+        *activity_guard = activity;
+        *tools_guard = tool_counts;
+        self.seq.fetch_max(max_seq, Ordering::SeqCst);
 
         Ok(())
     }
