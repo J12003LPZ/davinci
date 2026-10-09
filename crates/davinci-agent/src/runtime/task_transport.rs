@@ -133,7 +133,8 @@ impl TaskCoordinatorClient {
         let stop = abort.unwrap_or(&default_stop);
         let deadline = Instant::now() + timeout.min(Duration::from_secs(120));
         let mut stream =
-            TcpStream::connect_timeout(&self.address, IO_TIMEOUT).map_err(|_| transport_error())?;
+            TcpStream::connect_timeout(&self.address, connect_budget(deadline, Instant::now()))
+                .map_err(|_| transport_error())?;
         configure(&stream)?;
         write_frame(&mut stream, &request, deadline, stop)?;
         let response: Response = read_frame(&mut stream, deadline, stop)?;
@@ -401,6 +402,16 @@ fn dispatch(
     .map_err(|error| error.to_string())
 }
 
+/// Connect timeout bounded by the caller's remaining time, never the fixed
+/// I/O cap alone.  `connect_timeout` rejects zero, so an expired deadline gets
+/// the smallest valid value and fails promptly.
+fn connect_budget(deadline: Instant, now: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(now)
+        .min(IO_TIMEOUT)
+        .max(Duration::from_millis(1))
+}
+
 fn transport_error() -> ToolError {
     ToolError::Failed(
         "task coordinator transport unavailable; command outcome may require reconciliation".into(),
@@ -488,6 +499,40 @@ mod tests {
     use crate::{PermissionMode, PermissionPolicy, PermissionState};
     use serde_json::json;
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
+
+    #[test]
+    fn wor105_connect_budget_never_exceeds_the_requested_deadline() {
+        let now = Instant::now();
+        let short = connect_budget(now + Duration::from_millis(100), now);
+        assert!(short <= Duration::from_millis(100), "{short:?}");
+        assert!(short > Duration::ZERO);
+        assert_eq!(
+            connect_budget(now + Duration::from_secs(60), now),
+            IO_TIMEOUT
+        );
+        // An expired deadline still yields a valid, tiny timeout (zero panics
+        // inside connect_timeout).
+        let expired = connect_budget(now, now + Duration::from_secs(1));
+        assert!(expired > Duration::ZERO && expired <= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn wor105_call_with_short_timeout_returns_within_the_timeout() {
+        // Nothing listens on the bound-then-dropped port, so the connect
+        // fails fast or times out; either way it must respect the budget.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = TaskCoordinatorClient {
+            address,
+            credential: "x".into(),
+        };
+        let started = Instant::now();
+        let result =
+            client.call_with_timeout("task_list", &json!({}), None, Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
 
     #[test]
     fn f03_transport_commits_to_parent_with_bound_worker_identity() {
