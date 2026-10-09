@@ -32,7 +32,15 @@ pub(super) fn collect(root: &Path, paths: &[String]) -> Vec<ModuleAlias> {
         let Ok(body) = scanner::read_bounded(root, Path::new(path), 128 * 1024) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<Value>(&body) else {
+        // tsconfig/jsconfig are JSONC (comments, trailing commas); manifests are strict.
+        let parsed = if path.ends_with("package.json") {
+            serde_json::from_str::<Value>(&body)
+        } else {
+            crate::native_extensions::build_intelligence::runners::tsconfig::parse_jsonc::<Value>(
+                &body,
+            )
+        };
+        let Ok(value) = parsed else {
             continue;
         };
         let parent = Path::new(path).parent().unwrap_or(Path::new(""));

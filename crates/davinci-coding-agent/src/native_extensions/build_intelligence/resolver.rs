@@ -88,12 +88,9 @@ impl BuildResolver {
         let is_monorepo = !workspace_patterns.is_empty();
 
         if is_monorepo {
-            for pattern in &workspace_patterns {
-                let matched_dirs = self.match_workspace_glob(pattern);
-                for dir in matched_dirs {
-                    if let Some(pkg) = self.load_package_from_dir(&dir, &pm_str) {
-                        packages.push(pkg);
-                    }
+            for dir in self.match_workspace_patterns(&workspace_patterns) {
+                if let Some(pkg) = self.load_package_from_dir(&dir, &pm_str) {
+                    packages.push(pkg);
                 }
             }
         }
@@ -667,18 +664,23 @@ impl BuildResolver {
                 })
             }
             _ => {
-                // pnpm workspace or standard package manager runner
+                // `argv` is arguments only; `raw_command` renders program + argv.
+                let program = pm.as_str().to_string();
+                let argv = pm
+                    .run_script_argv(task_target, &effective_packages)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} has no workspace-targeted run command for the selected packages",
+                            pm.as_str()
+                        )
+                    })?;
+                let raw_cmd = std::iter::once(program.clone())
+                    .chain(argv.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 if pm == PackageManager::Pnpm && !effective_packages.is_empty() {
-                    let mut argv = vec!["pnpm".to_string()];
-                    for pkg in &effective_packages {
-                        argv.push(format!("--filter={pkg}..."));
-                    }
-                    argv.push("run".to_string());
-                    argv.push(task_target.to_string());
-                    let raw_cmd = argv.join(" ");
-
                     Ok(BuildCommandResult {
-                        program: "pnpm".to_string(),
+                        program,
                         argv,
                         cwd: ".".to_string(),
                         runner: "pnpm".to_string(),
@@ -691,9 +693,6 @@ impl BuildResolver {
                         supports_cache: true,
                     })
                 } else {
-                    let program = pm.as_str().to_string();
-                    let argv = pm.run_script_argv(task_target);
-                    let raw_cmd = argv.join(" ");
 
                     Ok(BuildCommandResult {
                         program,
@@ -770,37 +769,93 @@ impl BuildResolver {
         })
     }
 
-    fn match_workspace_glob(&self, glob: &str) -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        let normalized = glob.replace('\\', "/");
-        let parts: Vec<&str> = normalized.split('/').collect();
+    /// Directories holding a `package.json` that match the workspace
+    /// patterns: `*`, `**`, `{a,b}` and `!`-prefixed exclusions are honored.
+    /// The walk is bounded, and directories whose canonical path leaves the
+    /// repository (symlinks) are neither matched nor entered.
+    fn match_workspace_patterns(&self, patterns: &[String]) -> Vec<PathBuf> {
+        use globset::{GlobBuilder, GlobSetBuilder};
+        const MAX_DEPTH: usize = 6;
+        const MAX_DIRS: usize = 10_000;
 
-        if parts.is_empty() {
-            return dirs;
+        let mut include = GlobSetBuilder::new();
+        let mut exclude = GlobSetBuilder::new();
+        let mut any_include = false;
+        for pattern in patterns {
+            let normalized = pattern.replace('\\', "/");
+            let clean = |text: &str| {
+                text.trim_start_matches("./")
+                    .trim_end_matches('/')
+                    .to_string()
+            };
+            let (negated, body) = match normalized.strip_prefix('!') {
+                Some(rest) => (true, clean(rest)),
+                None => (false, clean(&normalized)),
+            };
+            if body.is_empty() {
+                continue;
+            }
+            let Ok(glob) = GlobBuilder::new(&body).literal_separator(true).build() else {
+                continue;
+            };
+            if negated {
+                exclude.add(glob);
+            } else {
+                include.add(glob);
+                any_include = true;
+            }
+        }
+        let (Ok(include), Ok(exclude)) = (include.build(), exclude.build()) else {
+            return Vec::new();
+        };
+        if !any_include {
+            return Vec::new();
         }
 
-        // Handle standard patterns like "packages/*", "apps/*", "libs/*"
-        if parts.len() == 2 && parts[1] == "*" {
-            let base_dir = self.root.join(parts[0]);
-            if base_dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&base_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() && path.join("package.json").is_file() {
-                            dirs.push(path);
-                        }
-                    }
+        let canonical_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let mut dirs = Vec::new();
+        let mut stack = vec![(self.root.clone(), 0usize)];
+        let mut visited = 0usize;
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                visited += 1;
+                if visited > MAX_DIRS {
+                    return dirs;
+                }
+                let inside = path
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical.starts_with(&canonical_root));
+                if !inside {
+                    continue;
+                }
+                let Ok(relative) = path.strip_prefix(&self.root) else {
+                    continue;
+                };
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if include.is_match(&relative)
+                    && !exclude.is_match(&relative)
+                    && path.join("package.json").is_file()
+                {
+                    dirs.push(path.clone());
+                }
+                if depth + 1 < MAX_DEPTH {
+                    stack.push((path, depth + 1));
                 }
             }
-        } else {
-            // Direct path
-            let dir = self.root.join(&normalized);
-            if dir.is_dir() && dir.join("package.json").is_file() {
-                dirs.push(dir);
-            }
         }
-
         dirs.sort();
+        dirs.dedup();
         dirs
     }
 
