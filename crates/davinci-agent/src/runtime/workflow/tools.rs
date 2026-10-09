@@ -10,8 +10,6 @@ use super::executor::WorkflowStatus;
 use super::spec::{WorkflowLaunch, WorkflowSpec};
 use super::validate::validate_workflow_with_capabilities;
 use crate::runtime::ids::WorkflowId;
-use crate::runtime::workflow::WorkflowExecutor;
-use crate::runtime::workflow::WorkflowStateStore;
 use crate::tools::{AgentTool, ToolContext, ToolError, ToolResult};
 
 pub fn workflow_tool_specs() -> Vec<AgentTool> {
@@ -217,13 +215,7 @@ pub fn workflow_run_tool_with_parent(
         saved_path_info = Some(path.display().to_string());
     }
 
-    let executor = match &runtime.workflow_executor {
-        Some(exec) => exec.clone(),
-        None => {
-            let store = WorkflowStateStore::new();
-            std::sync::Arc::new(WorkflowExecutor::new(runtime.clone(), store, None))
-        }
-    };
+    let executor = runtime.workflow_executor_or_local();
 
     if background && launch.report_to_lead {
         let wf_id = executor
@@ -300,8 +292,8 @@ pub fn workflow_status_tool(input: &Value, context: &ToolContext) -> Result<Tool
         .as_ref()
         .ok_or_else(|| ToolError::Failed("Runtime subsystem not initialized".into()))?;
 
-    let executor = match &runtime.workflow_executor {
-        Some(exec) => exec.clone(),
+    let executor = match runtime.active_workflow_executor() {
+        Some(exec) => exec,
         None => {
             return Ok(ToolResult {
                 content: serde_json::to_string_pretty(&serde_json::json!([])).unwrap(),
@@ -366,6 +358,7 @@ pub fn workflow_status_tool(input: &Value, context: &ToolContext) -> Result<Tool
 mod tests {
     use super::*;
     use crate::runtime::workflow::spec::VALID_3_PHASE_WORKFLOW_JSON;
+    use crate::runtime::workflow::{WorkflowExecutor, WorkflowStateStore};
     use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
 
     fn setup_context(trusted: bool) -> (ToolContext, tempfile::TempDir) {
@@ -489,5 +482,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("max_cost_usd"));
+    }
+
+    // WOR-151: a run started through the on-demand executor (no host
+    // executor attached) stays visible to workflow_status on the same runtime.
+    #[test]
+    fn fallback_executor_runs_are_visible_to_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+            .with_project_trusted(true)
+            .with_worktree_manager(super::super::test_worktree_manager(dir.path()));
+        assert!(runtime.workflow_executor.is_none());
+        let context = ToolContext {
+            runtime: Some(runtime),
+            ..Default::default()
+        };
+        let spec: Value = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        let res = workflow_run_tool_with_parent(
+            dir.path(),
+            &serde_json::json!({"spec": spec, "background": true}),
+            &context,
+            WorkflowLaunch {
+                report_to_lead: true,
+                ..WorkflowLaunch::default()
+            },
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&res.content).unwrap();
+        let wf_id = parsed["workflow_id"].as_str().unwrap().to_string();
+
+        let status = workflow_status_tool(&serde_json::json!({ "workflow_id": wf_id }), &context)
+            .expect("workflow started by the fallback executor is queryable");
+        assert!(status.content.contains(&wf_id));
+        let list = workflow_status_tool(&serde_json::json!({}), &context).unwrap();
+        assert!(list.content.contains(&wf_id));
+
+        // A later per-turn handle of the same conversation keeps the runs.
+        let next_turn = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+            .with_session_state_from(context.runtime.as_ref().unwrap());
+        assert!(next_turn
+            .active_workflow_executor()
+            .and_then(|executor| executor.get_state(&wf_id.parse().unwrap()))
+            .is_some());
     }
 }

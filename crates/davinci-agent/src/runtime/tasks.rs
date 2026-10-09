@@ -256,6 +256,8 @@ pub enum TaskError {
     DuplicateTask(TaskId),
     #[error("task not found: {0}")]
     TaskNotFound(TaskId),
+    #[error("agent is not registered: {0}")]
+    UnknownAgent(AgentId),
     #[error("self-dependency is not allowed: {0}")]
     SelfDependency(TaskId),
     #[error("unknown dependency: {0}")]
@@ -413,6 +415,70 @@ fn collect_downstream_dependents(tasks: &HashMap<TaskId, TaskRecord>, root: Task
         }
     }
     dependents
+}
+
+/// Refuse to hand a task to an executor unless its dependencies are complete
+/// and no blocker (decision prerequisite, rewind, ...) is outstanding.
+fn ensure_runnable(
+    task: &TaskRecord,
+    tasks: &HashMap<TaskId, TaskRecord>,
+    lineage: Option<&TaskLineage>,
+) -> Result<(), TaskError> {
+    match initial_task_state(task, tasks, lineage)? {
+        TaskState::Ready => Ok(()),
+        TaskState::Pending => Err(TaskError::DependencyNotCompleted(task.id)),
+        state => Err(TaskError::InvalidTransition {
+            task_id: task.id,
+            from: state,
+            to: TaskState::Running,
+        }),
+    }
+}
+
+/// Re-derive readiness downstream of `root` after `root` changed state.
+///
+/// Running and terminal dependents keep their state. Waiting dependents
+/// (Pending, Ready, Blocked) take the state their dependencies and blockers
+/// now imply, so a decision blocker is never bypassed and a recovered
+/// dependency releases the dependents its failure blocked. A task advances
+/// its revision at most once per mutation (`advanced`), as the journal
+/// requires one revision step per committed change.
+fn cascade_readiness(
+    tasks: &mut HashMap<TaskId, TaskRecord>,
+    root: TaskId,
+    advanced: &mut HashSet<TaskId>,
+    committed_at: i64,
+    lineage: Option<&TaskLineage>,
+) -> Result<(), TaskError> {
+    let mut queue = VecDeque::from([root]);
+    while let Some(changed) = queue.pop_front() {
+        let mut dependents: Vec<TaskId> = tasks
+            .values()
+            .filter(|task| task.dependencies.contains(&changed))
+            .map(|task| task.id)
+            .collect();
+        dependents.sort();
+        for id in dependents {
+            let dependent = &tasks[&id];
+            if !matches!(
+                dependent.state,
+                TaskState::Pending | TaskState::Ready | TaskState::Blocked
+            ) {
+                continue;
+            }
+            let target = initial_task_state(dependent, tasks, lineage)?;
+            if target == dependent.state {
+                continue;
+            }
+            let dependent = tasks.get_mut(&id).ok_or(TaskError::TaskNotFound(id))?;
+            if advanced.insert(id) {
+                dependent.advance_revision(committed_at)?;
+            }
+            dependent.state = target;
+            queue.push_back(id);
+        }
+    }
+    Ok(())
 }
 
 /// Expected ownership supplied by a trusted host adapter, never model identity fields.
@@ -1004,6 +1070,20 @@ impl TaskRegistry {
             if task.revision != expected_revision {
                 return Err(TaskError::RevisionConflict(task_id));
             }
+            // Only work that did not finish can be retried. Retrying a Pending,
+            // Ready or Running task would start a second attempt beside a live
+            // owner; a Completed or Cancelled task is final.
+            if !matches!(task.state, TaskState::Failed | TaskState::Blocked) {
+                return Err(TaskError::InvalidTransition {
+                    task_id,
+                    from: task.state,
+                    to: if new_agent_id.is_some() {
+                        TaskState::Running
+                    } else {
+                        TaskState::Ready
+                    },
+                });
+            }
             task.attempt = task.attempt.saturating_add(1);
             task.owner_generation = task
                 .owner_generation
@@ -1011,14 +1091,30 @@ impl TaskRegistry {
                 .ok_or(TaskError::RevisionOverflow(task_id))?;
             task.advance_revision(committed_at)?;
             task.assigned_to = new_agent_id;
-            task.state = if new_agent_id.is_some() {
-                TaskState::Running
-            } else {
-                TaskState::Ready
-            };
             task.result = None;
             task.evidence_refs.clear();
-            let response = task.clone();
+            // A retry restarts the attempt; it never waives prerequisites.
+            let snapshot = task.clone();
+            let lineage = self.lineage.as_deref();
+            let state = if new_agent_id.is_some() {
+                ensure_runnable(&snapshot, &candidate, lineage)?;
+                TaskState::Running
+            } else {
+                initial_task_state(&snapshot, &candidate, lineage)?
+            };
+            candidate
+                .get_mut(&task_id)
+                .ok_or(TaskError::TaskNotFound(task_id))?
+                .state = state;
+            let mut advanced = HashSet::from([task_id]);
+            cascade_readiness(
+                &mut candidate,
+                task_id,
+                &mut advanced,
+                committed_at,
+                lineage,
+            )?;
+            let response = candidate[&task_id].clone();
             self.persist_operation(&stored, &candidate, None)?;
             *stored = candidate;
             response
@@ -1039,7 +1135,23 @@ impl TaskRegistry {
         Ok(response)
     }
 
-    /// Assign a task to an agent.
+    /// Assign a task to an agent that exists in `agents`. Host code must use
+    /// this rather than `assign_task`, which trusts the caller's ID and would
+    /// persist a Running task owned by a worker that does not exist.
+    pub fn assign_task_to_registered(
+        &self,
+        task_id: TaskId,
+        agent_id: AgentId,
+        agents: &super::registry::RuntimeRegistry,
+    ) -> Result<(), TaskError> {
+        if agents.get(&agent_id).is_none() {
+            return Err(TaskError::UnknownAgent(agent_id));
+        }
+        self.assign_task(task_id, agent_id)
+    }
+
+    /// Assign a task to an agent. The caller guarantees `agent_id` is a live
+    /// agent; see `assign_task_to_registered` for the checked form.
     pub fn assign_task(&self, task_id: TaskId, agent_id: AgentId) -> Result<(), TaskError> {
         let committed_at = (self.clock)();
         let (run_id, previous_agent) = {
@@ -1062,6 +1174,12 @@ impl TaskRegistry {
                     task_id,
                     state: task.state,
                 });
+            }
+            // Ownership of a running task may move; anything else must be
+            // runnable now, or the assignee could execute ahead of its
+            // dependencies or an unresolved decision.
+            if task.state != TaskState::Running {
+                ensure_runnable(task, &stored, self.lineage.as_deref())?;
             }
 
             let prev = task.assigned_to;
@@ -1227,34 +1345,23 @@ impl TaskRegistry {
             task.state = TaskState::Completed;
             task.result = result;
 
+            // Evidence the evaluation relied on must land with the completion;
+            // a full evidence list rejects the whole (still uncommitted) clone.
             for dim in &evaluation.dimensions {
                 if let Some(ev_id) = dim.evidence_id {
-                    let _ = task.attach_evidence(ev_id);
+                    task.attach_evidence(ev_id)?;
                 }
             }
             task.clone()
         };
 
-        let all_keys: Vec<TaskId> = tasks.keys().cloned().collect();
-        for dep_key in all_keys {
-            if let Some(dependent) = tasks.get(&dep_key) {
-                if dependent.state == TaskState::Pending
-                    && dependent.dependencies.contains(&task_id)
-                {
-                    let all_deps_completed = dependent.dependencies.iter().all(|dep_id| {
-                        tasks
-                            .get(dep_id)
-                            .is_some_and(|d| d.state == TaskState::Completed)
-                    });
-                    if all_deps_completed {
-                        if let Some(dep_mut) = tasks.get_mut(&dep_key) {
-                            dep_mut.state = TaskState::Ready;
-                            let _ = dep_mut.advance_revision(committed_at);
-                        }
-                    }
-                }
-            }
-        }
+        cascade_readiness(
+            &mut tasks,
+            task_id,
+            &mut HashSet::from([task_id]),
+            committed_at,
+            self.lineage.as_deref(),
+        )?;
 
         self.persist_candidate(&stored, &tasks)?;
         *stored = tasks;
@@ -1453,6 +1560,21 @@ impl TaskRegistry {
             if let Some(owner) = owner {
                 owner.validate(task, self.lineage.as_deref())?;
             }
+            // The decision callback ran without the lock; re-validate the
+            // lifecycle so completion can never resurrect a terminal task.
+            if task.state.is_terminal() {
+                return Err(TaskError::TerminalTask {
+                    task_id,
+                    state: task.state,
+                });
+            }
+            if !is_valid_task_transition(task.state, TaskState::Completed) {
+                return Err(TaskError::InvalidTransition {
+                    task_id,
+                    from: task.state,
+                    to: TaskState::Completed,
+                });
+            }
             if !task.decision_prerequisites.is_empty() && !task.blocked_reasons.is_empty() {
                 return Err(TaskError::CompletionRefused(
                     "decision prerequisites are unresolved".into(),
@@ -1462,28 +1584,16 @@ impl TaskRegistry {
             task.state = TaskState::Completed;
             task.result = result;
 
-            // Cascade: any Pending dependent whose dependencies are ALL completed transitions to Ready
-            let all_keys: Vec<TaskId> = tasks.keys().cloned().collect();
-            for dep_key in all_keys {
-                if let Some(dependent) = tasks.get(&dep_key) {
-                    if dependent.state == TaskState::Pending
-                        && dependent.dependencies.contains(&task_id)
-                    {
-                        let all_deps_done = dependent.dependencies.iter().all(|d| {
-                            tasks
-                                .get(d)
-                                .map(|t| t.state == TaskState::Completed)
-                                .unwrap_or(false)
-                        });
-                        if all_deps_done {
-                            if let Some(dep_mut) = tasks.get_mut(&dep_key) {
-                                dep_mut.advance_revision(now)?;
-                                dep_mut.state = TaskState::Ready;
-                            }
-                        }
-                    }
-                }
-            }
+            // Cascade: waiting dependents re-derive readiness from their
+            // dependencies and blockers, so a decision blocker holds.
+            let mut advanced = HashSet::from([task_id]);
+            cascade_readiness(
+                &mut tasks,
+                task_id,
+                &mut advanced,
+                now,
+                self.lineage.as_deref(),
+            )?;
             let response = tasks[&task_id].clone();
             let receipt = operation.map(|(operation_id, request)| TaskOperationReceipt {
                 operation_id,
@@ -1884,6 +1994,7 @@ impl TaskRegistry {
         task.advance_revision(committed_at)?;
 
         let updated_record = task.clone();
+        self.persist_candidate(&stored, &next)?;
         *stored = next;
         Ok((updated_record, stale_tasks, stale_evidence))
     }
@@ -1905,14 +2016,15 @@ impl TaskRegistry {
             return Err(TaskError::TaskNotFound(task_id));
         }
 
+        let mut next = stored.clone();
         let mut affected_tasks = vec![task_id];
-        affected_tasks.extend(collect_downstream_dependents(&stored, task_id));
+        affected_tasks.extend(collect_downstream_dependents(&next, task_id));
 
         let mut stale_evidence = Vec::new();
         let mut stale_tasks = Vec::new();
 
         for tid in affected_tasks {
-            if let Some(t) = stored.get_mut(&tid) {
+            if let Some(t) = next.get_mut(&tid) {
                 stale_evidence.extend(t.evidence_refs.iter().copied());
                 if tid != task_id {
                     stale_tasks.push(tid);
@@ -1922,18 +2034,20 @@ impl TaskRegistry {
                             code: "code_rewound".into(),
                             message: format!("Code was rewound to checkpoint {checkpoint_id}"),
                         });
-                        let _ = t.advance_revision(committed_at);
+                        t.advance_revision(committed_at)?;
                     }
                 } else {
                     t.blocked_reasons.push(BlockReason {
                         code: "code_rewound".into(),
                         message: format!("Code was rewound to checkpoint {checkpoint_id}"),
                     });
-                    let _ = t.advance_revision(committed_at);
+                    t.advance_revision(committed_at)?;
                 }
             }
         }
 
+        self.persist_candidate(&stored, &next)?;
+        *stored = next;
         Ok((stale_tasks, stale_evidence))
     }
 
@@ -4102,5 +4216,566 @@ mod tests {
         let dec = plan.structured_decisions.get("dec_1").unwrap();
         assert_eq!(dec.state, crate::decisions::DecisionState::AnsweredByUser);
         assert!(dec.answer.is_some());
+    }
+
+    fn wor_manifest() -> SourceManifest {
+        SourceManifest {
+            entries: Vec::new(),
+            dependency_lock_hashes: Default::default(),
+            toolchain_fingerprint: None,
+            command_profile: None,
+            digest: "digest".into(),
+            complete_coverage: true,
+            scanned_at_ms: 0,
+        }
+    }
+
+    fn wor_evaluation(task: &TaskRecord, evidence: Vec<EvidenceId>) -> CompletionEvaluation {
+        use crate::runtime::completion::{DimensionCheck, DimensionKind};
+        use crate::runtime::evidence::DimensionState;
+        CompletionEvaluation {
+            task_id: task.id,
+            contract_digest: task.contract_digest.clone(),
+            evaluated_revision: task.revision,
+            evaluated_attempt: task.attempt,
+            allowed: true,
+            dimensions: evidence
+                .into_iter()
+                .map(|id| DimensionCheck {
+                    dimension: DimensionKind::Build,
+                    requirement_id: None,
+                    required: true,
+                    state: DimensionState::PassedCurrent,
+                    evidence_id: Some(id),
+                    details: None,
+                })
+                .collect(),
+            remaining_gaps: Vec::new(),
+            source_fingerprint: "digest".into(),
+            evaluated_at_ms: 0,
+        }
+    }
+
+    // WOR-153: completion must not succeed while evaluation evidence is dropped.
+    #[test]
+    fn wor153_completion_rejects_when_evidence_list_is_full() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let mut record = TaskRecord::new(run, "full evidence");
+        record.evidence_refs = (0..128).map(|_| EvidenceId::new()).collect();
+        let id = registry.create_task(record).unwrap();
+        let task = registry.get_task(&id).unwrap();
+        let evaluation = wor_evaluation(&task, vec![EvidenceId::new()]);
+
+        let err = registry
+            .complete_verified_task(id, &evaluation, &wor_manifest(), None)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            TaskError::MetadataTooLarge {
+                field: "evidence_refs",
+                ..
+            }
+        ));
+        assert_eq!(registry.get_task(&id).unwrap(), task, "nothing may commit");
+    }
+
+    #[test]
+    fn wor153_completion_attaches_evaluation_evidence() {
+        let registry = TaskRegistry::new();
+        let id = registry
+            .create_task(TaskRecord::new(RunId::new(), "evidence"))
+            .unwrap();
+        let task = registry.get_task(&id).unwrap();
+        let ev = EvidenceId::new();
+        let done = registry
+            .complete_verified_task(id, &wor_evaluation(&task, vec![ev]), &wor_manifest(), None)
+            .unwrap();
+        assert_eq!(done.state, TaskState::Completed);
+        assert_eq!(done.evidence_refs, vec![ev]);
+    }
+
+    // WOR-160: a revision overflow on a dependent must fail the whole commit.
+    #[test]
+    fn wor160_verified_completion_fails_atomically_on_dependent_overflow() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let prereq = registry
+            .create_task(TaskRecord::new(run, "prereq"))
+            .unwrap();
+        let mut dependent = TaskRecord::new(run, "dependent").with_dependencies(vec![prereq]);
+        // Creating a dependent advances its revision once; leave exactly one
+        // step of headroom so promotion is the operation that overflows.
+        dependent.revision = u64::MAX - 1;
+        let dependent = registry.create_task(dependent).unwrap();
+        assert_eq!(registry.get_task(&dependent).unwrap().revision, u64::MAX);
+        assert_eq!(
+            registry.get_task(&dependent).unwrap().state,
+            TaskState::Pending
+        );
+        let before_prereq = registry.get_task(&prereq).unwrap();
+        let before_dependent = registry.get_task(&dependent).unwrap();
+
+        let err = registry
+            .complete_verified_task(
+                prereq,
+                &wor_evaluation(&before_prereq, Vec::new()),
+                &wor_manifest(),
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(err, TaskError::RevisionOverflow(dependent));
+        assert_eq!(registry.get_task(&prereq).unwrap(), before_prereq);
+        assert_eq!(registry.get_task(&dependent).unwrap(), before_dependent);
+    }
+
+    // WOR-156: only failed or blocked work is retryable.
+    #[test]
+    fn wor156_retry_rejects_live_and_final_states() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let agent = AgentId::new();
+        let pending_dep = registry.create_task(TaskRecord::new(run, "dep")).unwrap();
+        let running = registry
+            .create_task(TaskRecord::new(run, "running"))
+            .unwrap();
+        registry.assign_task(running, agent).unwrap();
+        let done = registry.create_task(TaskRecord::new(run, "done")).unwrap();
+        registry.complete_task(done, None).unwrap();
+        let cancelled = registry
+            .create_task(TaskRecord::new(run, "cancelled"))
+            .unwrap();
+        registry.cancel_task(cancelled).unwrap();
+        let cases = [
+            pending_dep,
+            registry
+                .create_task(TaskRecord::new(run, "pending").with_dependencies(vec![pending_dep]))
+                .unwrap(),
+            running,
+            done,
+            cancelled,
+        ];
+        for id in cases {
+            let before = registry.get_task(&id).unwrap();
+            let err = registry
+                .retry_task(id, run, before.revision, Some(AgentId::new()))
+                .unwrap_err();
+            assert!(
+                matches!(err, TaskError::InvalidTransition { from, .. } if from == before.state),
+                "{:?}: {err:?}",
+                before.state
+            );
+            assert_eq!(registry.get_task(&id).unwrap(), before, "must not mutate");
+        }
+
+        let failed = registry
+            .create_task(TaskRecord::new(run, "failed"))
+            .unwrap();
+        registry.fail_task(failed, Some("boom".into())).unwrap();
+        let rev = registry.get_task(&failed).unwrap().revision;
+        let retried = registry.retry_task(failed, run, rev, None).unwrap();
+        assert_eq!(retried.state, TaskState::Ready);
+        assert_eq!(retried.attempt, 1);
+    }
+
+    // WOR-161: checked assignment refuses an agent that is not registered.
+    #[test]
+    fn wor161_assign_to_registered_requires_known_agent() {
+        use crate::runtime::events::{AgentKind, AgentRecord, AgentState};
+        let tasks = TaskRegistry::new();
+        let agents = crate::runtime::registry::RuntimeRegistry::new();
+        let run = RunId::new();
+        let id = tasks.create_task(TaskRecord::new(run, "assign")).unwrap();
+        let ghost = AgentId::new();
+
+        let err = tasks
+            .assign_task_to_registered(id, ghost, &agents)
+            .unwrap_err();
+        assert_eq!(err, TaskError::UnknownAgent(ghost));
+        let untouched = tasks.get_task(&id).unwrap();
+        assert_eq!(untouched.state, TaskState::Ready);
+        assert!(untouched.assigned_to.is_none());
+
+        let real = AgentId::new();
+        agents
+            .register_agent(AgentRecord {
+                id: real,
+                run_id: run,
+                parent: None,
+                kind: AgentKind::Main,
+                name: "worker".into(),
+                provider: "p".into(),
+                model_id: "m".into(),
+                cwd: std::path::PathBuf::new(),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 0,
+                updated_ms: 0,
+                failure_reason: None,
+            })
+            .unwrap();
+        tasks.assign_task_to_registered(id, real, &agents).unwrap();
+        let assigned = tasks.get_task(&id).unwrap();
+        assert_eq!(assigned.state, TaskState::Running);
+        assert_eq!(assigned.assigned_to, Some(real));
+    }
+
+    // WOR-163: the shared cascade promotes exactly the fully-satisfied
+    // dependents and leaves unrelated Pending tasks untouched.
+    #[test]
+    fn wor163_cascade_promotes_only_fully_satisfied_dependents() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let a = registry.create_task(TaskRecord::new(run, "a")).unwrap();
+        let b = registry.create_task(TaskRecord::new(run, "b")).unwrap();
+        let only_a = registry
+            .create_task(TaskRecord::new(run, "only a").with_dependencies(vec![a]))
+            .unwrap();
+        let a_and_b = registry
+            .create_task(TaskRecord::new(run, "a and b").with_dependencies(vec![a, b]))
+            .unwrap();
+        let bystanders: Vec<_> = (0..500)
+            .map(|_| {
+                registry
+                    .create_task(TaskRecord::new(run, "bystander").with_dependencies(vec![b]))
+                    .unwrap()
+            })
+            .collect();
+
+        let revision = |id| registry.get_task(&id).unwrap().revision;
+        let (only_a_rev, bystander_rev) = (revision(only_a), revision(bystanders[0]));
+
+        registry.complete_task(a, None).unwrap();
+        let state = |id| registry.get_task(&id).unwrap().state;
+        assert_eq!(state(only_a), TaskState::Ready);
+        assert_eq!(state(a_and_b), TaskState::Pending);
+        assert!(bystanders.iter().all(|id| state(*id) == TaskState::Pending));
+        assert_eq!(revision(only_a), only_a_rev + 1);
+        assert_eq!(revision(bystanders[0]), bystander_rev);
+
+        registry.complete_task(b, None).unwrap();
+        assert_eq!(state(a_and_b), TaskState::Ready);
+        assert!(bystanders.iter().all(|id| state(*id) == TaskState::Ready));
+    }
+
+    fn state_of(registry: &TaskRegistry, id: TaskId) -> TaskState {
+        registry.get_task(&id).unwrap().state
+    }
+
+    // WOR-149: a rewind on a durable registry reaches the journal, so a
+    // restart does not restore the pre-rewind completed state.
+    #[test]
+    fn wor149_task_rewind_survives_journal_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let run = RunId::new();
+        let (root, dependent, rewound) = {
+            let registry = TaskRegistry::open_durable(&path, run).unwrap();
+            let root = registry.create_task(TaskRecord::new(run, "root")).unwrap();
+            let dependent = registry
+                .create_task(TaskRecord::new(run, "dependent").with_dependencies(vec![root]))
+                .unwrap();
+            registry.complete_task(root, Some("done".into())).unwrap();
+            registry
+                .complete_task(dependent, Some("done".into()))
+                .unwrap();
+            let (rewound, stale, _) = registry.rewind_task_state(root, "cp1").unwrap();
+            assert_eq!(stale, vec![dependent]);
+            (root, dependent, rewound)
+        };
+        let reopened = TaskRegistry::open_durable(&path, run).unwrap();
+        assert_eq!(reopened.get_task(&root).unwrap(), rewound);
+        assert_eq!(state_of(&reopened, root), TaskState::Ready);
+        assert_eq!(reopened.get_task(&root).unwrap().attempt, 1);
+        let dependent = reopened.get_task(&dependent).unwrap();
+        assert_eq!(dependent.state, TaskState::Blocked);
+        assert!(dependent
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason.code == "dependency_rewound"));
+    }
+
+    // WOR-150: code-rewind invalidation reaches the journal, so dependents
+    // stay blocked after a restart instead of reappearing completed.
+    #[test]
+    fn wor150_code_rewind_invalidation_survives_journal_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let run = RunId::new();
+        let (root, dependent, expected) = {
+            let registry = TaskRegistry::open_durable(&path, run).unwrap();
+            let root = registry.create_task(TaskRecord::new(run, "root")).unwrap();
+            let dependent = registry
+                .create_task(TaskRecord::new(run, "dependent").with_dependencies(vec![root]))
+                .unwrap();
+            registry.complete_task(root, None).unwrap();
+            registry.complete_task(dependent, None).unwrap();
+            let (stale, _) = registry.invalidate_for_code_rewind(root, "cp1").unwrap();
+            assert_eq!(stale, vec![dependent]);
+            (root, dependent, registry.list_tasks(None))
+        };
+        let reopened = TaskRegistry::open_durable(&path, run).unwrap();
+        let mut restored = reopened.list_tasks(None);
+        let mut expected = expected;
+        restored.sort_by_key(|task| task.id);
+        expected.sort_by_key(|task| task.id);
+        assert_eq!(restored, expected);
+        assert_eq!(state_of(&reopened, dependent), TaskState::Blocked);
+        assert!(reopened
+            .get_task(&root)
+            .unwrap()
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason.code == "code_rewound"));
+    }
+
+    // WOR-150: an overflowing revision rolls the whole invalidation back
+    // instead of committing a partial projection.
+    #[test]
+    fn wor150_code_rewind_invalidation_is_atomic() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let root = registry.create_task(TaskRecord::new(run, "root")).unwrap();
+        let dependent = registry
+            .create_task(TaskRecord::new(run, "dependent").with_dependencies(vec![root]))
+            .unwrap();
+        registry.complete_task(root, None).unwrap();
+        registry.complete_task(dependent, None).unwrap();
+        registry
+            .tasks
+            .write()
+            .unwrap()
+            .get_mut(&dependent)
+            .unwrap()
+            .revision = u64::MAX;
+        let before = registry.tasks.read().unwrap().clone();
+        assert_eq!(
+            registry.invalidate_for_code_rewind(root, "cp1"),
+            Err(TaskError::RevisionOverflow(dependent))
+        );
+        assert_eq!(*registry.tasks.read().unwrap(), before);
+    }
+
+    // WOR-154: assignment never hands out work whose prerequisites are open.
+    #[test]
+    fn wor154_assign_rejects_pending_and_blocked_tasks() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let upstream = registry
+            .create_task(TaskRecord::new(run, "upstream"))
+            .unwrap();
+        let pending = registry
+            .create_task(TaskRecord::new(run, "pending").with_dependencies(vec![upstream]))
+            .unwrap();
+        let gated = registry
+            .create_task(
+                TaskRecord::new(run, "gated")
+                    .with_decision_prerequisites(vec![DecisionPrerequisiteRef::new("dec", 1)]),
+            )
+            .unwrap();
+        assert_eq!(state_of(&registry, gated), TaskState::Blocked);
+        let before = registry.tasks.read().unwrap().clone();
+
+        assert_eq!(
+            registry.assign_task(pending, AgentId::new()),
+            Err(TaskError::DependencyNotCompleted(pending))
+        );
+        assert_eq!(
+            registry.assign_task(gated, AgentId::new()),
+            Err(TaskError::InvalidTransition {
+                task_id: gated,
+                from: TaskState::Blocked,
+                to: TaskState::Running,
+            })
+        );
+        assert_eq!(*registry.tasks.read().unwrap(), before);
+
+        // Ready work and ownership moves of running work still assign.
+        let agent = AgentId::new();
+        registry.assign_task(upstream, agent).unwrap();
+        assert_eq!(state_of(&registry, upstream), TaskState::Running);
+        registry.assign_task(upstream, AgentId::new()).unwrap();
+        assert_eq!(state_of(&registry, upstream), TaskState::Running);
+    }
+
+    // WOR-155: retrying a blocked task re-derives its state from its
+    // prerequisites instead of forcing it Ready or Running.
+    #[test]
+    fn wor155_retry_keeps_blocked_task_blocked_while_dependency_failed() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let upstream = registry
+            .create_task(TaskRecord::new(run, "upstream"))
+            .unwrap();
+        let dependent = registry
+            .create_task(TaskRecord::new(run, "dependent").with_dependencies(vec![upstream]))
+            .unwrap();
+        registry.fail_task(upstream, Some("boom".into())).unwrap();
+        let blocked = registry.get_task(&dependent).unwrap();
+        assert_eq!(blocked.state, TaskState::Blocked);
+
+        let before = registry.tasks.read().unwrap().clone();
+        assert_eq!(
+            registry.retry_task(dependent, run, blocked.revision, Some(AgentId::new())),
+            Err(TaskError::InvalidTransition {
+                task_id: dependent,
+                from: TaskState::Blocked,
+                to: TaskState::Running,
+            })
+        );
+        assert_eq!(*registry.tasks.read().unwrap(), before);
+
+        let retried = registry
+            .retry_task(dependent, run, blocked.revision, None)
+            .unwrap();
+        assert_eq!(retried.state, TaskState::Blocked);
+        assert_eq!(retried.attempt, 1);
+        assert!(registry.get_ready_tasks(Some(run)).is_empty());
+
+        // A decision-gated task stays blocked through a retry too.
+        let gated = registry
+            .create_task(
+                TaskRecord::new(run, "gated")
+                    .with_decision_prerequisites(vec![DecisionPrerequisiteRef::new("dec", 1)]),
+            )
+            .unwrap();
+        let revision = registry.get_task(&gated).unwrap().revision;
+        assert_eq!(
+            registry
+                .retry_task(gated, run, revision, None)
+                .unwrap()
+                .state,
+            TaskState::Blocked
+        );
+    }
+
+    // WOR-157: retrying a failed task releases the dependents its failure
+    // blocked, so completing the retry makes them runnable. Durable, with a
+    // diamond, so every task advances exactly one revision per commit.
+    #[test]
+    fn wor157_retry_cascades_readiness_to_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let run = RunId::new();
+        let (a, b, c, d, expected) = {
+            let registry = TaskRegistry::open_durable(&path, run).unwrap();
+            let a = registry.create_task(TaskRecord::new(run, "a")).unwrap();
+            let b = registry
+                .create_task(TaskRecord::new(run, "b").with_dependencies(vec![a]))
+                .unwrap();
+            let c = registry
+                .create_task(TaskRecord::new(run, "c").with_dependencies(vec![a]))
+                .unwrap();
+            let d = registry
+                .create_task(TaskRecord::new(run, "d").with_dependencies(vec![b, c]))
+                .unwrap();
+            registry.fail_task(a, Some("flaky".into())).unwrap();
+            for id in [b, c, d] {
+                assert_eq!(state_of(&registry, id), TaskState::Blocked);
+            }
+            let failed = registry.get_task(&a).unwrap();
+            let retried = registry.retry_task(a, run, failed.revision, None).unwrap();
+            assert_eq!(retried.state, TaskState::Ready);
+            for id in [b, c, d] {
+                assert_eq!(state_of(&registry, id), TaskState::Pending);
+            }
+            registry.complete_task(a, Some("ok".into())).unwrap();
+            assert_eq!(state_of(&registry, b), TaskState::Ready);
+            assert_eq!(state_of(&registry, c), TaskState::Ready);
+            assert_eq!(state_of(&registry, d), TaskState::Pending);
+            registry.complete_task(b, None).unwrap();
+            registry.complete_task(c, None).unwrap();
+            assert_eq!(state_of(&registry, d), TaskState::Ready);
+            (a, b, c, d, registry.list_tasks(None))
+        };
+        let reopened = TaskRegistry::open_durable(&path, run).unwrap();
+        let mut restored = reopened.list_tasks(None);
+        let mut expected = expected;
+        restored.sort_by_key(|task| task.id);
+        expected.sort_by_key(|task| task.id);
+        assert_eq!(restored, expected);
+        assert_eq!(state_of(&reopened, a), TaskState::Completed);
+        assert_eq!(state_of(&reopened, b), TaskState::Completed);
+        assert_eq!(state_of(&reopened, c), TaskState::Completed);
+        assert_eq!(state_of(&reopened, d), TaskState::Ready);
+    }
+
+    // WOR-158: completion re-validates the lifecycle after the decision
+    // callback, even when a state change left the revision untouched.
+    #[test]
+    fn wor158_completion_rechecks_state_after_decision_callback() {
+        struct TerminateWithoutRevision(TaskRegistry);
+        impl RuntimeSubscriber for TerminateWithoutRevision {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                if let RuntimeEvent::TaskCompletionRequested { task_id, .. } = event.payload {
+                    self.0
+                        .tasks
+                        .write()
+                        .unwrap()
+                        .get_mut(&task_id)
+                        .unwrap()
+                        .state = TaskState::Cancelled;
+                }
+                RuntimeDecision::Continue
+            }
+        }
+        let bus = RuntimeBus::new();
+        let registry = TaskRegistry::with_bus(bus.clone());
+        bus.subscribe(Arc::new(TerminateWithoutRevision(registry.clone())));
+        let id = registry
+            .create_task(TaskRecord::new(RunId::new(), "terminated in hook"))
+            .unwrap();
+        assert_eq!(
+            registry.complete_task(id, Some("late".into())),
+            Err(TaskError::TerminalTask {
+                task_id: id,
+                state: TaskState::Cancelled,
+            })
+        );
+        let task = registry.get_task(&id).unwrap();
+        assert_eq!(task.state, TaskState::Cancelled);
+        assert_eq!(task.result, None);
+    }
+
+    // WOR-159: the completion cascade honours a dependent's blockers; a
+    // pending task with a decision blocker becomes Blocked, never Ready.
+    #[test]
+    fn wor159_completion_cascade_respects_decision_blockers() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let upstream = registry
+            .create_task(TaskRecord::new(run, "upstream"))
+            .unwrap();
+        let dependent = registry
+            .create_task(TaskRecord::new(run, "dependent").with_dependencies(vec![upstream]))
+            .unwrap();
+        let free = registry
+            .create_task(TaskRecord::new(run, "free").with_dependencies(vec![upstream]))
+            .unwrap();
+        registry
+            .tasks
+            .write()
+            .unwrap()
+            .get_mut(&dependent)
+            .unwrap()
+            .blocked_reasons
+            .push(BlockReason {
+                code: "unresolved_decision".into(),
+                message: "Decision dec is open".into(),
+            });
+        assert_eq!(state_of(&registry, dependent), TaskState::Pending);
+
+        registry.complete_task(upstream, None).unwrap();
+        assert_eq!(state_of(&registry, dependent), TaskState::Blocked);
+        assert_eq!(state_of(&registry, free), TaskState::Ready);
+        let ready: Vec<_> = registry
+            .get_ready_tasks(Some(run))
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        assert_eq!(ready, vec![free]);
     }
 }

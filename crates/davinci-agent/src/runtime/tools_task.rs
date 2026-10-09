@@ -110,7 +110,11 @@ pub fn task_tool_specs() -> Vec<AgentTool> {
                         "description": "Optional filter by assigned Agent ID (UUID)."
                     },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Position-based paging; can skip or repeat tasks if tasks change between pages. Prefer 'after'." },
+                    "after": {
+                        "type": "string",
+                        "description": "Cursor: the 'next_cursor' of the previous page. Returns tasks after that task ID, stable under concurrent changes. Cannot be combined with a non-zero offset."
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -554,7 +558,7 @@ pub fn task_list_tool(input: &Value, context: &ToolContext) -> Result<ToolResult
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "status" | "public_status" | "assigned_to" | "limit" | "offset"
+            "status" | "public_status" | "assigned_to" | "limit" | "offset" | "after"
         )
     }) {
         return Err(ToolError::Failed("Unknown task list field".into()));
@@ -574,6 +578,26 @@ pub fn task_list_tool(input: &Value, context: &ToolContext) -> Result<ToolResult
     let offset = page_number("offset", 0)?;
     if !(1..=100).contains(&limit) {
         return Err(ToolError::Failed("limit must be between 1 and 100".into()));
+    }
+    // Keyset cursor: tasks are ordered by ID, so "everything after this ID"
+    // cannot skip or repeat a task when others change state between pages.
+    let after = input
+        .get("after")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| ToolError::Failed("Invalid after cursor".into()))
+                .and_then(|s| {
+                    TaskId::from_str(s.trim())
+                        .map(|id| id.to_string())
+                        .map_err(|e| ToolError::Failed(format!("Invalid after cursor: {e}")))
+                })
+        })
+        .transpose()?;
+    if after.is_some() && offset != 0 {
+        return Err(ToolError::Failed(
+            "after cannot be combined with a non-zero offset".into(),
+        ));
     }
     let runtime = task_runtime(context)?;
 
@@ -652,19 +676,27 @@ pub fn task_list_tool(input: &Value, context: &ToolContext) -> Result<ToolResult
         })
         .collect();
     let total = filtered.len();
-    let page: Vec<Value> = filtered
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|task| task_summary(&task))
-        .collect();
+    let remaining: Vec<_> = match &after {
+        Some(cursor) => filtered
+            .into_iter()
+            .filter(|t| t.id.to_string().as_str() > cursor.as_str())
+            .collect(),
+        None => filtered.into_iter().skip(offset).collect(),
+    };
+    let more = remaining.len() > limit;
+    let page_tasks: Vec<_> = remaining.into_iter().take(limit).collect();
+    let next_cursor = more
+        .then(|| page_tasks.last().map(|t| t.id.to_string()))
+        .flatten();
+    let page: Vec<Value> = page_tasks.iter().map(task_summary).collect();
 
     let count = page.len();
     let details = json!({
         "count": count,
         "tasks": page,
         "total": total,
-        "next_offset": if offset < total && count < total - offset { Some(offset + count) } else { None },
+        "next_offset": if after.is_none() && more { Some(offset + count) } else { None },
+        "next_cursor": next_cursor,
     });
 
     Ok(ToolResult {
@@ -824,6 +856,77 @@ mod tests {
             json!({"status":"typo"}),
             json!({"assigned_to":false}),
             json!({"actor":"ignored"}),
+        ] {
+            assert!(task_list_tool(&input, &context).is_err(), "{input}");
+        }
+    }
+
+    // WOR-162: offset paging skipped tasks when a filtered task changed state
+    // between pages; the keyset cursor must not.
+    #[test]
+    fn wor162_cursor_paging_survives_state_change_between_pages() {
+        let context = make_test_context(RunId::new(), AgentId::new());
+        let rt = context.runtime.as_ref().unwrap();
+        let ids: Vec<_> = (0..5)
+            .map(|_| {
+                rt.task_registry
+                    .create_task(TaskRecord::new(rt.run_id, "page"))
+                    .unwrap()
+            })
+            .collect();
+        let ids_of = |page: &Value| -> Vec<String> {
+            page["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["task_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let first = task_list_tool(&json!({"status":"ready","limit":2}), &context)
+            .unwrap()
+            .details
+            .unwrap();
+        let mut seen = ids_of(&first);
+        assert_eq!(seen.len(), 2);
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+        assert_eq!(cursor, seen[1]);
+
+        // A task from page 1 leaves the "ready" filter before page 2 is fetched.
+        let moved = seen[0].parse::<TaskId>().unwrap();
+        rt.task_registry.assign_task(moved, rt.agent_id).unwrap();
+
+        let mut next = Some(cursor);
+        while let Some(cursor) = next {
+            let page = task_list_tool(
+                &json!({"status":"ready","limit":2,"after":cursor}),
+                &context,
+            )
+            .unwrap()
+            .details
+            .unwrap();
+            seen.extend(ids_of(&page));
+            next = page["next_cursor"].as_str().map(str::to_string);
+        }
+        let mut expected: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        expected.sort();
+        let mut got = seen.clone();
+        got.sort();
+        got.dedup();
+        assert_eq!(got, expected, "cursor paging skipped or repeated a task");
+        assert_eq!(seen.len(), 5, "no task may repeat");
+
+        // Last page carries no cursor; cursor and non-zero offset are exclusive.
+        let tail = task_list_tool(&json!({"after": expected.last().unwrap()}), &context)
+            .unwrap()
+            .details
+            .unwrap();
+        assert_eq!(tail["count"], 0);
+        assert!(tail["next_cursor"].is_null());
+        for input in [
+            json!({"after":"not-a-task-id"}),
+            json!({"after":false}),
+            json!({"after": expected[0], "offset": 1}),
         ] {
             assert!(task_list_tool(&input, &context).is_err(), "{input}");
         }

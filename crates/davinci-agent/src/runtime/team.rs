@@ -871,4 +871,28 @@ mod tests {
         assert_eq!(exit, TeammateExit::Stopped);
         assert_eq!(turns, 1);
     }
+
+    /// WOR-147: a teammate whose record vanished (registry replayed from a
+    /// history without it) runs no further turn.
+    #[test]
+    fn wor147_teammate_without_a_record_runs_no_new_turn() {
+        let (lead, worker) = team_pair();
+        let mate = worker.agent_id;
+        let mut prompts = Vec::new();
+        let exit = run_teammate_loop(
+            &worker,
+            "first task",
+            std::time::Duration::from_secs(5),
+            |prompt| {
+                prompts.push(prompt.to_string());
+                if prompts.len() == 1 {
+                    lead.send_message(mate, "second task").unwrap();
+                    lead.registry.rehydrate_from_events(&[]).unwrap();
+                }
+                Ok("ok".into())
+            },
+        );
+        assert_eq!(prompts, vec!["first task".to_string()]);
+        assert!(matches!(exit, TeammateExit::Failed(_)), "{exit:?}");
+    }
 }

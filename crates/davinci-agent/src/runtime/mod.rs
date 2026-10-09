@@ -157,6 +157,9 @@ pub struct RuntimeHandle {
     pub team: TeamRoster,
     pub worktree_manager: Option<WorktreeManager>,
     pub workflow_executor: Option<Arc<WorkflowExecutor>>,
+    /// Executor created on demand when no host executor is attached. Shared
+    /// by every clone of this handle so the runs it starts stay queryable.
+    local_workflow_executor: Arc<std::sync::OnceLock<Arc<WorkflowExecutor>>>,
     pub operations: Option<operations::ToolOperationRuntime>,
     pub capability_registry: RuntimeCapabilityRegistry,
     pub project_trusted: bool,
@@ -274,6 +277,7 @@ impl RuntimeHandle {
             team: TeamRoster::default(),
             worktree_manager: None,
             workflow_executor: None,
+            local_workflow_executor: Arc::default(),
             operations: None,
             capability_registry: RuntimeCapabilityRegistry::with_builtins(),
             project_trusted: false,
@@ -349,6 +353,35 @@ impl RuntimeHandle {
         self
     }
 
+    /// The executor workflow tools run through: the attached one, else a
+    /// local one created once and shared by every clone of this handle, so
+    /// `workflow_status` sees the runs `workflow_run` started.
+    pub fn workflow_executor_or_local(&self) -> Arc<WorkflowExecutor> {
+        if let Some(executor) = &self.workflow_executor {
+            return executor.clone();
+        }
+        self.local_workflow_executor
+            .get_or_init(|| {
+                // The executor keeps a runtime clone; give it its own empty
+                // slot so the executor does not own itself through it.
+                let mut runtime = self.clone();
+                runtime.local_workflow_executor = Arc::default();
+                Arc::new(WorkflowExecutor::new(
+                    runtime,
+                    workflow::WorkflowStateStore::new(),
+                    None,
+                ))
+            })
+            .clone()
+    }
+
+    /// The executor whose runs this handle can query, if one exists yet.
+    pub fn active_workflow_executor(&self) -> Option<Arc<WorkflowExecutor>> {
+        self.workflow_executor
+            .clone()
+            .or_else(|| self.local_workflow_executor.get().cloned())
+    }
+
     pub fn with_operation_runtime(mut self, operations: operations::ToolOperationRuntime) -> Self {
         self.operations = Some(operations);
         self
@@ -410,6 +443,7 @@ impl RuntimeHandle {
         if previous.workflow_executor.is_some() {
             self.workflow_executor = previous.workflow_executor.clone();
         }
+        self.local_workflow_executor = previous.local_workflow_executor.clone();
         self.task_registry = previous.task_registry.clone();
         self.operations = previous.operations.clone();
         self.progress_watchdog = previous.progress_watchdog.clone();

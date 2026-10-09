@@ -502,11 +502,12 @@ impl WorkflowExecutor {
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
 
         let this = self.clone();
+        let worker_token = wf_token.clone();
         std::thread::Builder::new()
             .name(format!("wf-{wf_id}"))
             .spawn(move || {
                 let name = spec.name.clone();
-                let outcome = this.run_phases(spec, wf_id, wf_token);
+                let outcome = this.run_phases(spec, wf_id, worker_token);
                 if launch.report_to_lead {
                     if let Err(problem) = this.report_completion(wf_id, &name, &outcome) {
                         eprintln!(
@@ -990,6 +991,19 @@ impl WorkflowExecutor {
         error: &std::io::Error,
     ) -> WorkflowExecutionError {
         let message = format!("workflow thread did not start: {error}");
+        // No worker will ever observe this token or read this launch.
+        if let Some(token) = self
+            .tokens
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(wf_id)
+        {
+            token.cancel();
+        }
+        self.launches
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(wf_id);
         self.fail_workflow(wf_id, &message);
         WorkflowExecutionError::ExecutionError(message)
     }
@@ -1391,7 +1405,7 @@ workflow '{name}' ({id}) failed: {error}"
             .and_then(|tid| {
                 self.runtime
                     .task_registry
-                    .assign_task(tid, aid)
+                    .assign_task_to_registered(tid, aid, &self.runtime.registry)
                     .map(|()| tid)
                     .map_err(|e| {
                         // Best effort: the assignment error is what gets reported.
@@ -1923,6 +1937,62 @@ mod tests {
         let unknown = WorkflowId::new();
         assert!(executor.get_state(&unknown).is_none());
         let _ = executor.cancel(&unknown);
+    }
+
+    // WOR-152: a run whose worker thread cannot start must not stay Running.
+    #[test]
+    fn wor152_failed_background_start_marks_workflow_failed_and_cleans_up() {
+        let (executor, _tmp) = setup_executor(None);
+        let spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        let wf_id = WorkflowId::new();
+        let token = executor.runtime.team.session_token().child_token();
+        executor
+            .launches
+            .write()
+            .unwrap()
+            .insert(wf_id, WorkflowLaunch::default());
+        executor.init_workflow_state(&spec, wf_id, token.clone());
+        assert_eq!(
+            executor.get_state(&wf_id).unwrap().status,
+            WorkflowStatus::Running
+        );
+
+        let err = executor.abort_unlaunched(&wf_id, &std::io::Error::other("out of threads"));
+
+        assert!(err.to_string().contains("out of threads"));
+        let state = executor.get_state(&wf_id).unwrap();
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        assert!(state.finished_ms.is_some());
+        assert!(state.error.unwrap().contains("out of threads"));
+        assert!(token.is_cancelled());
+        assert!(!executor.tokens.read().unwrap().contains_key(&wf_id));
+        assert!(!executor.launches.read().unwrap().contains_key(&wf_id));
+    }
+
+    // WOR-161: a worker must be registered before a task is assigned to it.
+    #[test]
+    fn wor161_workflow_assignment_requires_registered_agent() {
+        let (executor, _tmp) = setup_executor(None);
+        let task = executor
+            .runtime
+            .task_registry
+            .create_task(crate::runtime::tasks::TaskRecord::new(
+                executor.runtime.run_id,
+                "orphan",
+            ))
+            .unwrap();
+        let err = executor
+            .runtime
+            .task_registry
+            .assign_task_to_registered(task, AgentId::new(), &executor.runtime.registry)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::runtime::tasks::TaskError::UnknownAgent(_)
+        ));
+        let after = executor.runtime.task_registry.get_task(&task).unwrap();
+        assert_eq!(after.state, crate::runtime::tasks::TaskState::Ready);
+        assert!(after.assigned_to.is_none());
     }
 
     #[test]

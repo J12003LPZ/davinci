@@ -892,7 +892,7 @@ impl WorkerController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::events::AgentRecord;
+    use crate::runtime::events::{AgentRecord, RuntimeEventEnvelope};
 
     fn sample_record(id: AgentId, run_id: RunId, state: AgentState) -> AgentRecord {
         AgentRecord {
@@ -1310,5 +1310,129 @@ mod tests {
             );
         }
         writer.join().unwrap();
+    }
+
+    struct EnvelopeLog(std::sync::Mutex<Vec<RuntimeEventEnvelope>>);
+
+    impl crate::runtime::bus::RuntimeSubscriber for EnvelopeLog {
+        fn on_event(&self, event: &RuntimeEventEnvelope) -> crate::runtime::bus::RuntimeDecision {
+            self.0.lock().unwrap().push(event.clone());
+            crate::runtime::bus::RuntimeDecision::Continue
+        }
+    }
+
+    fn recorded_registry() -> (RuntimeRegistry, std::sync::Arc<EnvelopeLog>) {
+        let bus = crate::runtime::bus::RuntimeBus::default();
+        let log = std::sync::Arc::new(EnvelopeLog(std::sync::Mutex::new(Vec::new())));
+        bus.subscribe(log.clone());
+        (RuntimeRegistry::with_bus(bus), log)
+    }
+
+    fn retry(controller: &WorkerController, run_id: RunId, agent_id: AgentId) -> ControlStatus {
+        let snapshot = controller.build_snapshot(&agent_id).expect("snapshot");
+        controller
+            .execute_command(
+                WorkerControlCommand {
+                    id: Uuid::new_v4(),
+                    root_run_id: run_id,
+                    agent_id,
+                    generation: snapshot.generation,
+                    task_id: None,
+                    expected_revision: snapshot.revision,
+                    action: WorkerControlAction::Retry { reason: None },
+                },
+                true,
+            )
+            .status
+    }
+
+    /// The registry side of an applied retry, as the controller performs it.
+    fn applied_retry(registry: &RuntimeRegistry, agent_id: AgentId) {
+        let generation = registry.get_generation(&agent_id);
+        registry.advance_generation_and_revision(&agent_id);
+        registry.emit_control_ack(
+            Uuid::new_v4(),
+            None,
+            agent_id,
+            generation,
+            "retry".into(),
+            ControlStatus::Accepted.as_str().into(),
+            None,
+        );
+    }
+
+    // WOR-145: generation and revision survive a replay, so a control built
+    // against a pre-restart generation stays stale after restart.
+    #[test]
+    fn wor145_replay_restores_generation_and_revision() {
+        let (registry, log) = recorded_registry();
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        let mut record = sample_record(agent_id, run_id, AgentState::Starting);
+        record.kind = AgentKind::Teammate;
+        registry.register_agent(record).unwrap();
+        registry.transition(agent_id, AgentState::Running).unwrap();
+        let controller = WorkerController::new(registry.clone());
+        let before_retries = controller.build_snapshot(&agent_id).unwrap();
+        // A refused retry is acknowledged but applies nothing; replay must
+        // not count it.
+        assert_eq!(
+            retry(&controller, run_id, agent_id),
+            ControlStatus::Rejected
+        );
+        assert_eq!(registry.get_generation(&agent_id), 1);
+        applied_retry(&registry, agent_id);
+        applied_retry(&registry, agent_id);
+        registry.transition(agent_id, AgentState::Waiting).unwrap();
+        let live_generation = registry.get_generation(&agent_id);
+        let live_revision = registry.get_revision(&agent_id);
+        assert_eq!(live_generation, 3);
+        assert!(live_revision > 1);
+
+        let restored = RuntimeRegistry::new();
+        restored
+            .rehydrate_from_events(&log.0.lock().unwrap())
+            .unwrap();
+        assert_eq!(restored.get_generation(&agent_id), live_generation);
+        assert_eq!(restored.get_revision(&agent_id), live_revision);
+
+        // A command issued against the first generation is still stale.
+        assert!(!control_current(
+            restored.get_revision(&agent_id),
+            before_retries.revision,
+            restored.get_generation(&agent_id),
+            before_retries.generation,
+            true,
+        ));
+    }
+
+    // WOR-146: replay replaces the registry; agents absent from the
+    // authoritative history do not survive as ghosts.
+    #[test]
+    fn wor146_replay_drops_agents_absent_from_history() {
+        let ghost = AgentId::new();
+        let registry = RuntimeRegistry::new();
+        registry
+            .register_agent(sample_record(ghost, RunId::new(), AgentState::Starting))
+            .unwrap();
+        registry.advance_generation(&ghost);
+
+        let (source, log) = recorded_registry();
+        let run_id = RunId::new();
+        let kept = AgentId::new();
+        source
+            .register_agent(sample_record(kept, run_id, AgentState::Starting))
+            .unwrap();
+        source.transition(kept, AgentState::Running).unwrap();
+        source.transition(kept, AgentState::Completed).unwrap();
+
+        registry
+            .rehydrate_from_events(&log.0.lock().unwrap())
+            .unwrap();
+        let ids: Vec<_> = registry.snapshot().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![kept]);
+        assert!(registry.get(&ghost).is_none());
+        assert_eq!(registry.get_generation(&ghost), 1);
+        assert_eq!(registry.get_revision(&kept), 3);
     }
 }
