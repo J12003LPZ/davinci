@@ -426,24 +426,41 @@ impl WorkerController {
             .map(|(_, receipt)| receipt.clone())
     }
 
+    /// Make `receipt` the command's durable receipt, then its in-memory one.
+    /// Memory never runs ahead of the ledger: a receipt that failed to reach
+    /// disk is not remembered, so memory and a restarted controller agree
+    /// (WOR-99).
     fn remember_receipt(
         &self,
         command: &WorkerControlCommand,
-        digest: String,
-        receipt: WorkerControlReceipt,
+        digest: &str,
+        receipt: &WorkerControlReceipt,
     ) -> bool {
-        if let Ok(mut receipts) = self.command_receipts.write() {
-            receipts.insert(command.id, (digest.clone(), receipt.clone()));
-        } else {
+        if !self.append_receipt(command, digest, receipt) {
             return false;
         }
+        match self.command_receipts.write() {
+            Ok(mut receipts) => {
+                receipts.insert(command.id, (digest.to_string(), receipt.clone()));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn append_receipt(
+        &self,
+        command: &WorkerControlCommand,
+        digest: &str,
+        receipt: &WorkerControlReceipt,
+    ) -> bool {
         let Some(path) = &self.receipt_path else {
             return true;
         };
         let frame = ControlReceiptFrame {
             command_id: command.id,
-            command_digest: digest,
-            receipt,
+            command_digest: digest.to_string(),
+            receipt: receipt.clone(),
         };
         let encoded = match serde_json::to_vec(&frame) {
             Ok(encoded) => encoded,
@@ -486,9 +503,7 @@ impl WorkerController {
 
     /// Build a consistent snapshot of a single worker.
     pub fn build_snapshot(&self, agent_id: &AgentId) -> Option<WorkerSnapshot> {
-        let record = self.registry.get(agent_id)?;
-        let generation = self.registry.get_generation(agent_id);
-        let revision = self.registry.get_revision(agent_id);
+        let (record, generation, revision) = self.registry.versioned(agent_id)?;
         let last_activity_ms = self.registry.get_last_activity(agent_id);
         let tool_count = self.registry.get_tool_count(agent_id);
 
@@ -607,21 +622,23 @@ impl WorkerController {
             };
         }
 
-        // 3. Look up target worker
-        let record = match self.registry.get(&cmd.agent_id) {
-            Some(r) => r,
-            None => {
-                return WorkerControlReceipt {
-                    command_id: cmd.id,
-                    task_id: cmd.task_id,
-                    agent_id: cmd.agent_id,
-                    generation: cmd.generation,
-                    action: action_name,
-                    status: ControlStatus::Rejected,
-                    reason: Some("agent_not_found".to_string()),
-                };
-            }
-        };
+        // 3. Look up target worker. State, generation and revision come from
+        // one consistent read, so the checks below judge a single version.
+        let (record, actual_generation, actual_revision) =
+            match self.registry.versioned(&cmd.agent_id) {
+                Some(versioned) => versioned,
+                None => {
+                    return WorkerControlReceipt {
+                        command_id: cmd.id,
+                        task_id: cmd.task_id,
+                        agent_id: cmd.agent_id,
+                        generation: cmd.generation,
+                        action: action_name,
+                        status: ControlStatus::Rejected,
+                        reason: Some("agent_not_found".to_string()),
+                    };
+                }
+            };
 
         // 4. Verify run affinity
         if record.run_id != cmd.root_run_id {
@@ -653,8 +670,6 @@ impl WorkerController {
         }
 
         // 6. Verify revision and generation freshness
-        let actual_revision = self.registry.get_revision(&cmd.agent_id);
-        let actual_generation = self.registry.get_generation(&cmd.agent_id);
         if !control_current(
             actual_revision,
             cmd.expected_revision,
@@ -673,7 +688,32 @@ impl WorkerController {
             };
         }
 
-        // 7. Apply action
+        // 7. Write ahead. The command is recorded as in flight before it acts,
+        // so a crash or a failed final write can never let a retry of the
+        // same ID act twice: after a restart the ledger still rejects it and
+        // reports the outcome as unknown. If even this record cannot be
+        // written, nothing has happened yet and the ID stays free for a retry.
+        let in_flight = WorkerControlReceipt {
+            command_id: cmd.id,
+            task_id: cmd.task_id,
+            agent_id: cmd.agent_id,
+            generation: cmd.generation,
+            action: action_name.clone(),
+            status: ControlStatus::Unknown,
+            reason: Some("control_in_flight".to_string()),
+        };
+        if !self.remember_receipt(&cmd, &digest, &in_flight) {
+            if let Ok(mut seen) = self.seen_commands.write() {
+                seen.remove(&cmd.id);
+            }
+            return WorkerControlReceipt {
+                status: ControlStatus::Rejected,
+                reason: Some("control_receipt_persistence_failed".to_string()),
+                ..in_flight
+            };
+        }
+
+        // 8. Apply action
         let (status, reason) = match &cmd.action {
             WorkerControlAction::Inspect => (ControlStatus::Accepted, None),
             WorkerControlAction::Steer { .. } => (ControlStatus::Accepted, None),
@@ -691,8 +731,7 @@ impl WorkerController {
                 (ControlStatus::Stopping, reason.clone())
             }
             WorkerControlAction::Retry { reason } => {
-                self.registry.advance_generation(&cmd.agent_id);
-                self.registry.advance_revision(&cmd.agent_id);
+                self.registry.advance_generation_and_revision(&cmd.agent_id);
                 let _ = self.registry.transition(cmd.agent_id, AgentState::Starting);
                 (ControlStatus::Accepted, reason.clone())
             }
@@ -708,7 +747,9 @@ impl WorkerController {
             status,
             reason,
         };
-        if !self.remember_receipt(&cmd, digest, receipt.clone()) {
+        if !self.remember_receipt(&cmd, &digest, &receipt) {
+            // The action ran but its outcome is not durable; the in-flight
+            // record stands, and the caller is told the outcome is unknown.
             receipt.status = ControlStatus::Unknown;
             receipt.reason = Some("control_receipt_persistence_failed".to_string());
         }
@@ -1023,5 +1064,130 @@ mod tests {
         assert!(!control_current(5, 5, 2, 1, true));
         // matching generation and revision -> allowed
         assert!(control_current(5, 5, 2, 2, true));
+    }
+
+    fn stop_command(
+        run_id: RunId,
+        agent_id: AgentId,
+        registry: &RuntimeRegistry,
+    ) -> WorkerControlCommand {
+        WorkerControlCommand {
+            id: Uuid::new_v4(),
+            root_run_id: run_id,
+            agent_id,
+            generation: registry.get_generation(&agent_id),
+            task_id: None,
+            expected_revision: registry.get_revision(&agent_id),
+            action: WorkerControlAction::Stop { reason: None },
+        }
+    }
+
+    /// WOR-99: when the receipt ledger cannot be written, the command must
+    /// not act, and the same ID must stay usable once the ledger recovers.
+    #[test]
+    fn wor99_unwritable_ledger_rejects_the_command_before_it_acts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("control.jsonl");
+        let registry = RuntimeRegistry::new();
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        registry
+            .register_agent(sample_record(agent_id, run_id, AgentState::Running))
+            .unwrap();
+        let controller = WorkerController::new(registry.clone())
+            .with_receipt_store(&ledger)
+            .unwrap();
+        // A directory where the ledger file belongs makes every append fail.
+        std::fs::create_dir(&ledger).unwrap();
+
+        let cmd = stop_command(run_id, agent_id, &registry);
+        let receipt = controller.execute_command(cmd.clone(), true);
+        assert_eq!(receipt.status, ControlStatus::Rejected);
+        assert_eq!(
+            receipt.reason.as_deref(),
+            Some("control_receipt_persistence_failed")
+        );
+        assert_eq!(registry.get(&agent_id).unwrap().state, AgentState::Running);
+        assert!(controller.receipt_for(&cmd.id).is_none());
+
+        std::fs::remove_dir(&ledger).unwrap();
+        let receipt = controller.execute_command(cmd, true);
+        assert_eq!(receipt.status, ControlStatus::Stopping);
+        assert_eq!(registry.get(&agent_id).unwrap().state, AgentState::Stopping);
+    }
+
+    /// WOR-99: a crash after the command acted but before its outcome was
+    /// written must not let a restarted controller run it again.
+    #[test]
+    fn wor99_restart_after_an_unrecorded_outcome_never_repeats_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("control.jsonl");
+        let registry = RuntimeRegistry::new();
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        registry
+            .register_agent(sample_record(agent_id, run_id, AgentState::Running))
+            .unwrap();
+        let controller = WorkerController::new(registry.clone())
+            .with_receipt_store(&ledger)
+            .unwrap();
+        let cmd = stop_command(run_id, agent_id, &registry);
+        assert_eq!(
+            controller.execute_command(cmd.clone(), true).status,
+            ControlStatus::Stopping
+        );
+
+        // The ledger holds the in-flight record, then the outcome. Drop the
+        // outcome, as a crash between acting and recording it would.
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        let frames: Vec<&str> = text.lines().collect();
+        assert_eq!(frames.len(), 2, "{text}");
+        std::fs::write(&ledger, format!("{}\n", frames[0])).unwrap();
+
+        let restarted = WorkerController::new(registry.clone())
+            .with_receipt_store(&ledger)
+            .unwrap();
+        let retry = restarted.execute_command(cmd.clone(), true);
+        assert_eq!(retry.status, ControlStatus::Rejected);
+        assert_eq!(retry.reason.as_deref(), Some("duplicate_command"));
+        let known = restarted.receipt_for(&cmd.id).unwrap();
+        assert_eq!(known.status, ControlStatus::Unknown);
+        assert_eq!(known.reason.as_deref(), Some("control_in_flight"));
+    }
+
+    /// WOR-106: a snapshot's state and revision come from one version, even
+    /// while the worker keeps changing state.
+    #[test]
+    fn wor106_snapshot_state_and_revision_are_one_version() {
+        let registry = RuntimeRegistry::new();
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        // Registered Running at revision 1; each transition adds one, so
+        // Running always pairs with an odd revision and Waiting with an even.
+        registry
+            .register_agent(sample_record(agent_id, run_id, AgentState::Running))
+            .unwrap();
+        let controller = WorkerController::new(registry.clone());
+        let writer = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    registry.transition(agent_id, AgentState::Waiting).unwrap();
+                    registry.transition(agent_id, AgentState::Running).unwrap();
+                }
+            })
+        };
+        while !writer.is_finished() {
+            let snapshot = controller.build_snapshot(&agent_id).unwrap();
+            let odd = snapshot.revision % 2 == 1;
+            assert_eq!(
+                odd,
+                snapshot.state == AgentState::Running,
+                "{:?} at revision {}",
+                snapshot.state,
+                snapshot.revision
+            );
+        }
+        writer.join().unwrap();
     }
 }
