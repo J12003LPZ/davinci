@@ -561,6 +561,15 @@ fn read_provider_stream(
         }
     }
 
+    if !aborted && read_error.is_none() {
+        // A frame that failed to parse may have carried content or tool-call
+        // bytes; a terminal event after the hole must not make the turn
+        // look complete.
+        if let Some(reason) = framer.malformed() {
+            read_error = Some(format!("Provider stream contained a {reason}"));
+        }
+    }
+
     if frames == 0 && !aborted {
         if let Some(err) = read_error {
             return Err(err);
@@ -2839,13 +2848,97 @@ fn usage_from_google_metadata(model: &Model, metadata: &Value) -> Usage {
     computed
 }
 
+/// Every text part of a non-streaming reply, in order. Each wire format is
+/// read whole: a reply with several text parts must not lose all but the first.
+fn response_text_parts(value: &Value) -> Vec<String> {
+    let mut parts = Vec::new();
+    fn push(parts: &mut Vec<String>, text: &str) {
+        if !text.is_empty() {
+            parts.push(text.to_string());
+        }
+    }
+    match value.pointer("/choices/0/message/content") {
+        Some(Value::String(text)) => push(&mut parts, text),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    push(&mut parts, text);
+                }
+            }
+        }
+        _ => {}
+    }
+    if parts.is_empty() {
+        if let Some(blocks) = value.get("content").and_then(Value::as_array) {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str).unwrap_or("text") == "text" {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        push(&mut parts, text);
+                    }
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        if let Some(items) = value
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+        {
+            for item in items {
+                if item.get("thought").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    push(&mut parts, text);
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        if let Some(text) = value.pointer("/output_text").and_then(Value::as_str) {
+            push(&mut parts, text);
+        }
+    }
+    parts
+}
+
+/// Whether a non-streaming reply stopped because it ran out of output tokens.
+fn response_hit_token_limit(value: &Value) -> bool {
+    let reason = |pointer: &str| value.pointer(pointer).and_then(Value::as_str);
+    matches!(reason("/choices/0/finish_reason"), Some("length"))
+        || matches!(reason("/stop_reason"), Some("max_tokens"))
+        || matches!(reason("/stopReason"), Some("max_tokens"))
+        || matches!(
+            reason("/candidates/0/finishReason"),
+            Some("MAX_TOKENS" | "max_tokens")
+        )
+}
+
 pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(_) if raw.lines().any(|line| line.starts_with("data:")) => {
             return fixture_complete(model, &[], raw);
         }
-        Err(_) => Value::Null,
+        Err(_) if raw.trim().is_empty() => Value::Null,
+        Err(err) => {
+            // An HTML error page or truncated JSON behind an HTTP 200 is a
+            // failed exchange, not assistant text. Report only its size: the
+            // body may carry user content or provider prompt fragments.
+            return AssistantMessage {
+                extra: Default::default(),
+                id: Uuid::new_v4().to_string(),
+                role: "assistant".into(),
+                content: Vec::new(),
+                model: format!("{}/{}", model.provider, model.id),
+                usage: None,
+                stop_reason: Some(StopReason::Error),
+                error_message: Some(format!(
+                    "provider returned a malformed response body ({} bytes): {err}",
+                    raw.len()
+                )),
+            };
+        }
     };
     let mut content = Vec::new();
     let response = value.get("response").unwrap_or(&value);
@@ -2862,25 +2955,11 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
         );
         return decoder.finish(&mut events);
     }
-    if content.is_empty() {
-        if let Some(text) = value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .or_else(|| value.pointer("/content/0/text").and_then(Value::as_str))
-            .or_else(|| {
-                value
-                    .pointer("/candidates/0/content/parts/0/text")
-                    .and_then(Value::as_str)
-            })
-            .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
-        {
-            if !text.is_empty() {
-                content.push(ContentBlock::Text {
-                    text: text.to_string(),
-                });
-            }
-        }
-    }
+    content.extend(
+        response_text_parts(&value)
+            .into_iter()
+            .map(|text| ContentBlock::Text { text }),
+    );
     if let Some(calls) = value
         .pointer("/choices/0/message/tool_calls")
         .and_then(Value::as_array)
@@ -3004,6 +3083,8 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
         .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
     {
         Some(StopReason::ToolUse)
+    } else if response_hit_token_limit(&value) {
+        Some(StopReason::Length)
     } else {
         Some(StopReason::Stop)
     };
@@ -3830,6 +3911,111 @@ mod tests {
                 "provider socket survived completion (cancel={cancel})"
             );
         }
+    }
+
+    #[test]
+    fn a_malformed_sse_frame_fails_the_turn_even_with_a_terminal_event() {
+        let (base, _release, server) = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            Duration::from_secs(5),
+        );
+        let model = loopback_model(&base);
+        let (message, events) = live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions::default(),
+            &mut |_| {},
+        )
+        .expect("stream");
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert!(message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.contains("malformed SSE frame")));
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error {
+                reason: StopReason::Error,
+                ..
+            })
+        ));
+        let _ = server.join();
+    }
+
+    #[test]
+    fn malformed_ok_body_is_an_error_not_assistant_text() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("model");
+        for body in [
+            "<html>502 Bad Gateway</html>",
+            r#"{"choices":[{"message":{"con"#,
+        ] {
+            let parsed = parse_provider_response(&model, body);
+            assert_eq!(parsed.stop_reason, Some(StopReason::Error), "{body}");
+            assert!(parsed.content.is_empty());
+            let message = parsed.error_message.expect("error message");
+            assert!(message.contains("malformed response body"), "{message}");
+            assert!(!message.contains("Bad Gateway"), "body leaked: {message}");
+        }
+    }
+
+    #[test]
+    fn non_streaming_reply_keeps_every_text_part() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("model");
+        let parsed = parse_provider_response(
+            &model,
+            r#"{"content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}"#,
+        );
+        let texts: Vec<_> = parsed
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["one", "two"]);
+        let gemini = parse_provider_response(
+            &model,
+            r#"{"candidates":[{"content":{"parts":[{"text":"a"},{"text":"b"}]}}]}"#,
+        );
+        assert_eq!(gemini.content.len(), 2);
+        let chat = parse_provider_response(
+            &model,
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"x"},{"type":"text","text":"y"}]}}]}"#,
+        );
+        assert_eq!(chat.content.len(), 2);
+    }
+
+    #[test]
+    fn non_streaming_token_limit_is_not_reported_complete() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("model");
+        for body in [
+            r#"{"choices":[{"message":{"content":"cut"},"finish_reason":"length"}]}"#,
+            r#"{"content":[{"type":"text","text":"cut"}],"stop_reason":"max_tokens"}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}]}"#,
+            r#"{"output":{"message":{"content":[{"text":"cut"}]}},"stopReason":"max_tokens"}"#,
+        ] {
+            let parsed = parse_provider_response(&model, body);
+            assert_eq!(parsed.stop_reason, Some(StopReason::Length), "{body}");
+        }
+        let done = parse_provider_response(
+            &model,
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        );
+        assert_eq!(done.stop_reason, Some(StopReason::Stop));
     }
 
     #[test]

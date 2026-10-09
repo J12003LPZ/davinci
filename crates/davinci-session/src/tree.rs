@@ -148,6 +148,9 @@ pub fn branch_entries<'a>(
     path
 }
 
+/// Deepest nesting `build_session_tree` produces; see the comment in its body.
+pub const MAX_TREE_DEPTH: usize = 128;
+
 pub fn build_session_tree(entries: &[SessionEntry]) -> Value {
     let labels = resolved_labels(entries);
     let mut nodes: HashMap<String, Value> = HashMap::new();
@@ -190,29 +193,48 @@ pub fn build_session_tree(entries: &[SessionEntry]) -> Value {
                 .unwrap_or(0)
         });
     }
-    fn assemble(
-        id: &str,
-        nodes: &HashMap<String, Value>,
-        child_ids: &HashMap<String, Vec<String>>,
-    ) -> Value {
-        let mut node = nodes.get(id).cloned().unwrap_or(Value::Null);
-        let children = child_ids
-            .get(id)
-            .into_iter()
-            .flatten()
-            .map(|child| assemble(child, nodes, child_ids))
-            .collect::<Vec<_>>();
+    // Walk and assemble iteratively: a valid history can be tens of thousands
+    // of entries deep, and one native stack frame per level aborts the process.
+    // Nesting is capped at `MAX_TREE_DEPTH`; entries below the cap are listed
+    // flat under their depth-cap ancestor (marked `"flattened": true`) so no
+    // entry is lost and the resulting `Value` stays safe to serialize and drop.
+    let mut order: Vec<(String, Option<String>)> = Vec::with_capacity(nodes.len());
+    let mut stack: Vec<(String, Option<String>, usize)> =
+        roots.iter().rev().map(|id| (id.clone(), None, 1)).collect();
+    while let Some((id, parent, depth)) = stack.pop() {
+        if let Some(children) = child_ids.get(&id) {
+            let (child_parent, child_depth) = match depth {
+                d if d < MAX_TREE_DEPTH => (Some(id.clone()), d + 1),
+                MAX_TREE_DEPTH => (Some(id.clone()), MAX_TREE_DEPTH + 1),
+                d => (parent.clone(), d),
+            };
+            for child in children.iter().rev() {
+                stack.push((child.clone(), child_parent.clone(), child_depth));
+            }
+        }
+        if depth > MAX_TREE_DEPTH {
+            if let Some(object) = nodes.get_mut(&id).and_then(Value::as_object_mut) {
+                object.insert("flattened".into(), Value::Bool(true));
+            }
+        }
+        order.push((id, parent));
+    }
+    let mut built: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut tree = Vec::new();
+    for (id, parent) in order.into_iter().rev() {
+        let mut node = nodes.remove(&id).unwrap_or(Value::Null);
+        let mut children = built.remove(&id).unwrap_or_default();
+        children.reverse();
         if let Some(object) = node.as_object_mut() {
             object.insert("children".into(), Value::Array(children));
         }
-        node
+        match parent {
+            Some(parent) => built.entry(parent).or_default().push(node),
+            None => tree.push(node),
+        }
     }
-    Value::Array(
-        roots
-            .iter()
-            .map(|id| assemble(id, &nodes, &child_ids))
-            .collect(),
-    )
+    tree.reverse();
+    Value::Array(tree)
 }
 
 pub fn fork_user_messages(entries: &[SessionEntry]) -> Vec<Value> {

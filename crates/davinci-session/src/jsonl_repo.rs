@@ -402,7 +402,7 @@ pub struct JsonlStoredSession {
 
 impl JsonlStoredSession {
     pub fn load(path: &Path) -> Result<Self, SessionError> {
-        let content = fs::read_to_string(path).map_err(|err| {
+        let (content, torn_utf8_tail) = crate::read_session_text(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 SessionError::not_found(format!("Session not found: {}", path.display()))
             } else {
@@ -452,7 +452,17 @@ impl JsonlStoredSession {
                 Err(err) => return Err(invalid_file(path, index + 1, err)),
             }
         }
-        if !content.ends_with('\n') {
+        if torn_utf8_tail {
+            // `content` is the complete-record prefix; drop the torn bytes.
+            publish_atomically(path, |temp_path| {
+                fs::write(temp_path, &content).map_err(|write_err| {
+                    SessionError::storage(format!(
+                        "Failed to stage torn-tail repair {}: {write_err}",
+                        path.display()
+                    ))
+                })
+            })?;
+        } else if !content.ends_with('\n') {
             let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
                 SessionError::storage(format!(
                     "Failed to repair unterminated session tail {}: {err}",
