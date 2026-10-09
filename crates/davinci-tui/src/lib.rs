@@ -148,7 +148,10 @@ pub use oauth_selector::{
     format_auth_selector_provider_type, AuthSelectorMode, AuthSelectorProvider, OAuthSelector,
     OAuthSelectorAction,
 };
-pub use open_browser::{copy_text, open_browser, open_browser_argv, open_browser_dry_run};
+pub use open_browser::{
+    copy_text, open_browser, open_browser_argv, open_browser_dry_run, try_copy_text,
+    try_open_browser,
+};
 pub use osc::{
     detect_terminal_background_from_env, detect_terminal_theme_for_auto, drain_osc_tty,
     parse_osc11_background_color, parse_terminal_color_scheme_report,

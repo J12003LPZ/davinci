@@ -8,6 +8,12 @@ use davinci_ai::MessageContent;
 use crate::image_convert::resize_image_in_process;
 
 const IMAGE_TYPE_SNIFF_BYTES: usize = 4100;
+/// Largest single `@file` attachment read into memory.
+const MAX_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest text attachment placed into the prompt.
+const MAX_TEXT_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
+/// Total bytes read across all `@file` attachments in one invocation.
+const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const NARROW_NO_BREAK_SPACE: char = '\u{202F}';
 
@@ -298,6 +304,7 @@ pub fn process_file_arguments(
 ) -> Result<ProcessedFiles, String> {
     let mut text = String::new();
     let mut images = Vec::new();
+    let mut total_bytes = 0u64;
     for file_arg in file_args {
         let absolute = resolve_read_path(file_arg, cwd);
         if !absolute.exists() {
@@ -308,8 +315,34 @@ pub fn process_file_arguments(
         if metadata.len() == 0 {
             continue;
         }
-        let bytes = std::fs::read(&absolute)
-            .map_err(|err| format!("Error: Could not read file {}: {err}", absolute.display()))?;
+        // Refuse before allocating, and read through a hard cap in case the
+        // file grows after the size check.
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if metadata.len() > MAX_ATTACHMENT_BYTES || total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(format!(
+                "Error: File too large to attach: {} ({} bytes; limit {} per file, {} in total)",
+                absolute.display(),
+                metadata.len(),
+                MAX_ATTACHMENT_BYTES,
+                MAX_TOTAL_ATTACHMENT_BYTES
+            ));
+        }
+        let mut bytes = Vec::new();
+        {
+            use std::io::Read;
+            std::fs::File::open(&absolute)
+                .and_then(|file| file.take(MAX_ATTACHMENT_BYTES + 1).read_to_end(&mut bytes))
+                .map_err(|err| {
+                    format!("Error: Could not read file {}: {err}", absolute.display())
+                })?;
+        }
+        if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "Error: File too large to attach: {} (over {} bytes)",
+                absolute.display(),
+                MAX_ATTACHMENT_BYTES
+            ));
+        }
         let sniff_len = bytes.len().min(IMAGE_TYPE_SNIFF_BYTES);
         if let Some(mime) = detect_supported_image_mime_type(&bytes[..sniff_len]) {
             match process_image(&bytes, mime, auto_resize_images) {
@@ -333,6 +366,14 @@ pub fn process_file_arguments(
                 }
             }
         } else {
+            if bytes.len() > MAX_TEXT_ATTACHMENT_BYTES {
+                return Err(format!(
+                    "Error: Text file too large for the prompt: {} ({} bytes; limit {})",
+                    absolute.display(),
+                    bytes.len(),
+                    MAX_TEXT_ATTACHMENT_BYTES
+                ));
+            }
             let content = strip_bom(std::str::from_utf8(&bytes).map_err(|err| {
                 format!("Error: Could not read file {}: {err}", absolute.display())
             })?);
@@ -398,6 +439,32 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn oversized_attachments_are_refused_before_they_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("huge.log");
+        // Sparse: sets the length without writing 40 MiB.
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_ATTACHMENT_BYTES + 8 * 1024 * 1024)
+            .unwrap();
+        let err =
+            process_file_arguments(&[big.display().to_string()], dir.path(), true).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+
+        let text = dir.path().join("big.txt");
+        fs::write(&text, vec![b'a'; MAX_TEXT_ATTACHMENT_BYTES + 1]).unwrap();
+        let err =
+            process_file_arguments(&[text.display().to_string()], dir.path(), true).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+
+        let small = dir.path().join("ok.txt");
+        fs::write(&small, "hello").unwrap();
+        let processed =
+            process_file_arguments(&[small.display().to_string()], dir.path(), true).unwrap();
+        assert!(processed.text.contains("hello"));
+    }
 
     fn tiny_png() -> Vec<u8> {
         let image = image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0]));

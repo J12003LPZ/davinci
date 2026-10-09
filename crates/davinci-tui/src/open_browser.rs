@@ -31,9 +31,18 @@ pub fn copy_text_dry_run() -> bool {
 }
 
 /// Copy text without a shell, matching TS clipboard helpers (`pbcopy` / `xclip` / `clip`).
+/// Returns a description of what happened; a failure says so instead of
+/// claiming the clipboard holds the text.
 pub fn copy_text(text: &str) -> String {
+    match try_copy_text(text) {
+        Ok(done) => done,
+        Err(err) => format!("clipboard copy failed: {err}"),
+    }
+}
+
+pub fn try_copy_text(text: &str) -> Result<String, String> {
     if copy_text_dry_run() {
-        return format!("copy:{text}");
+        return Ok(format!("copy:{text}"));
     }
     let (cmd, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("pbcopy", vec![])
@@ -42,40 +51,66 @@ pub fn copy_text(text: &str) -> String {
     } else {
         ("xclip", vec!["-selection", "clipboard"])
     };
-    let _ = Command::new(cmd)
+    let mut child = Command::new(cmd)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .and_then(|mut child| {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            child.wait()
-        });
-    format!("{cmd} clipboard")
+        .map_err(|err| format!("could not run {cmd}: {err}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("could not write to {cmd}: {err}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|err| format!("could not wait for {cmd}: {err}"))?;
+    if !status.success() {
+        return Err(format!("{cmd} exited with {status}"));
+    }
+    Ok(format!("{cmd} clipboard"))
 }
 
+/// Opens `target`; the returned text names the command, or says the launch
+/// failed so the caller can show the URL for manual use.
 pub fn open_browser(target: &str) -> String {
+    match try_open_browser(target) {
+        Ok(launched) => launched,
+        Err(err) => format!("browser launch failed ({err}); open this URL manually: {target}"),
+    }
+}
+
+pub fn try_open_browser(target: &str) -> Result<String, String> {
     let (cmd, args) = open_browser_argv(target);
     let launched = format!("{cmd} {}", args.join(" "));
-    if open_browser_dry_run() || target.contains("pi-fixture") {
-        return launched;
+    // Only the explicit dry-run switch (or unit tests) suppresses the launch;
+    // the shape of the URL never does.
+    if open_browser_dry_run() {
+        return Ok(launched);
     }
-    let _ = Command::new(cmd)
+    Command::new(cmd)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    launched
+        .spawn()
+        .map_err(|err| format!("could not run {cmd}: {err}"))?;
+    Ok(launched)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fixture_looking_url_is_still_opened_outside_dry_run() {
+        // Dry run is explicit; the URL's content must not decide it.
+        assert!(open_browser_dry_run());
+        let launched = try_open_browser("https://example.com/oauth/pi-fixture/callback").unwrap();
+        assert!(launched.contains("pi-fixture"));
+    }
 
     #[test]
     fn unit_tests_never_open_a_real_browser() {
