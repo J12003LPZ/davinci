@@ -179,6 +179,9 @@ pub struct WorkflowExecutor {
     agent_tokens: Arc<RwLock<HashMap<AgentId, CancellationToken>>>,
     /// How long a phase that joined early waits for its other workers.
     join_grace: std::time::Duration,
+    /// Serializes resumes, so two of the same workflow cannot both pass the
+    /// "not running" check or spend one rerun approval twice.
+    resume_gate: Arc<std::sync::Mutex<()>>,
 }
 
 impl WorkflowExecutor {
@@ -198,6 +201,7 @@ impl WorkflowExecutor {
             progress: Arc::new(RwLock::new(HashMap::new())),
             agent_tokens: Arc::new(RwLock::new(HashMap::new())),
             join_grace: DEFAULT_JOIN_GRACE,
+            resume_gate: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -553,6 +557,22 @@ impl WorkflowExecutor {
         launch: WorkflowLaunch,
         validated_mutation_fingerprints: &HashSet<String>,
     ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
+        // Held until the resumed run is registered: a second resume then
+        // sees it running, and cannot spend the same approvals.
+        let gate = self
+            .resume_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A run still live in this process keeps its token and state; a
+        // resume over it would orphan it beyond the reach of cancel.
+        if let Some(state) = self.get_state(&wf_id) {
+            if matches!(
+                state.status,
+                WorkflowStatus::Pending | WorkflowStatus::Running | WorkflowStatus::Paused
+            ) {
+                return Err(WorkflowExecutionError::InvalidState(state.status));
+            }
+        }
         let recorded = self
             .store
             .authority(wf_id)
@@ -564,7 +584,16 @@ impl WorkflowExecutor {
             &[],
             &self.runtime.capability_registry,
         )?;
-        let wf_token = self.runtime.cancellation_token.child_token();
+        if spec.max_cost_usd.is_some() {
+            return Err(WorkflowExecutionError::ExecutionError(
+                "max_cost_usd is not enforced yet; remove it from the spec".into(),
+            ));
+        }
+        let wf_token = launch
+            .turn_token
+            .as_ref()
+            .unwrap_or(&self.runtime.cancellation_token)
+            .child_token();
 
         let mut completed_phases = HashSet::new();
         let mut phase_states = HashMap::new();
@@ -662,6 +691,7 @@ impl WorkflowExecutor {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(wf_id, launch);
+        drop(gate);
 
         self.runtime
             .emit_observe(RuntimeEvent::WorkflowStarted { workflow_id: wf_id });
@@ -769,7 +799,11 @@ impl WorkflowExecutor {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 })
-                .map_err(|e| WorkflowExecutionError::ExecutionError(e.to_string()))?;
+                .map_err(|e| {
+                    let error = format!("workflow deadline could not start: {e}");
+                    self.fail_workflow(&wf_id, &error);
+                    WorkflowExecutionError::ExecutionError(error)
+                })?;
         }
         // Every phase whose dependencies are met runs at once, and a phase
         // starts as soon as its own dependencies finish, not when the whole
@@ -862,12 +896,13 @@ impl WorkflowExecutor {
         });
 
         match first_failure {
+            // A cancel or deadline explains whatever the phases reported.
+            _ if wf_token.is_cancelled() => {
+                return Err(self.cancelled_error(&wf_id, &spec, started));
+            }
             Some((_, Err(error))) => {
                 self.fail_workflow(&wf_id, &error.to_string());
                 return Err(error);
-            }
-            _ if wf_token.is_cancelled() => {
-                return Err(self.cancelled_error(&wf_id, &spec, started));
             }
             Some((phase, Ok(_))) => {
                 let reasons = self
@@ -972,7 +1007,7 @@ impl WorkflowExecutor {
         let launch = self
             .launches
             .read()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(wf_id)
             .cloned()
             .unwrap_or_default();
@@ -1392,6 +1427,17 @@ workflow '{name}' ({id}) failed: {error}"
         }
     }
 
+    /// Close out a worker its phase stopped waiting for, once it really
+    /// ends. Its result is discarded; nothing is left to report it to.
+    fn settle_straggler(&self, aid: AgentId, tid: TaskId, worker_id: &str) {
+        let _ = self.runtime.registry.transition(aid, AgentState::Cancelled);
+        if let Err(error) = self.runtime.task_registry.cancel_task(tid) {
+            eprintln!(
+                "[davinci-runtime] workflow worker {worker_id} ended after its phase; task not recorded: {error}"
+            );
+        }
+    }
+
     fn set_phase_status(&self, wf_id: &WorkflowId, phase_id: &str, status: PhaseStatus) {
         let mut execs = self
             .executions
@@ -1444,7 +1490,7 @@ workflow '{name}' ({id}) failed: {error}"
         if let Some(state) = self
             .executions
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get_mut(wf_id)
             .and_then(|s| s.phases.get_mut(&phase.id))
         {
@@ -1462,6 +1508,23 @@ workflow '{name}' ({id}) failed: {error}"
             .iter()
             .map(|(aid, tid, worker)| (*aid, *tid, worker.id.clone()))
             .collect();
+        // A worker that can write is never left behind: the phase waits for
+        // it however long it takes, as before.
+        let may_mutate: HashMap<AgentId, bool> = worker_tasks
+            .iter()
+            .map(|(aid, _, worker)| {
+                (
+                    *aid,
+                    crate::subagent::tools_may_mutate(
+                        &worker.tools,
+                        &self.runtime.capability_registry,
+                    ),
+                )
+            })
+            .collect();
+        // Set once the phase stops listening; a worker that finishes after
+        // that settles its own agent and task.
+        let abandoned = Arc::new(std::sync::Mutex::new(false));
         let queue = Arc::new(std::sync::Mutex::new(worker_tasks.into_iter()));
         let artifact_context: Arc<str> = artifact_context.into();
         let phase_spec = Arc::new(phase.clone());
@@ -1477,8 +1540,12 @@ workflow '{name}' ({id}) failed: {error}"
             let (wf_id, tx) = (*wf_id, tx.clone());
             let (queue, phase, context) =
                 (queue.clone(), phase_spec.clone(), artifact_context.clone());
-            let (phase_token, successes, slots) =
-                (phase_token.clone(), successes.clone(), slots.clone());
+            let (phase_token, successes, slots, abandoned) = (
+                phase_token.clone(),
+                successes.clone(),
+                slots.clone(),
+                abandoned.clone(),
+            );
             let worker_loop = move || {
                 // Reports the exit even when this thread panics.
                 let _exit = ExitSignal(tx.clone());
@@ -1505,7 +1572,6 @@ workflow '{name}' ({id}) failed: {error}"
                         }))
                         .unwrap_or_else(|_| Err("workflow worker panicked".into()))
                     };
-                    drop(slot);
                     if result.is_ok() {
                         let done = successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let joined_early = match phase.join {
@@ -1517,7 +1583,16 @@ workflow '{name}' ({id}) failed: {error}"
                             phase_token.cancel();
                         }
                     }
-                    let _ = tx.send(WorkerEvent::Finished(aid, result));
+                    // Freed only after a met join has cancelled the phase, so
+                    // a worker waiting for this slot cannot start past it.
+                    drop(slot);
+                    let gone = abandoned.lock().unwrap_or_else(PoisonError::into_inner);
+                    if *gone {
+                        drop(gone);
+                        this.settle_straggler(aid, tid, &worker.id);
+                    } else {
+                        let _ = tx.send(WorkerEvent::Finished(aid, result));
+                    }
                 }
             };
             match std::thread::Builder::new()
@@ -1544,6 +1619,12 @@ workflow '{name}' ({id}) failed: {error}"
             let wait = match cancelled_at {
                 Some(at) => match self.join_grace.checked_sub(at.elapsed()) {
                     Some(left) => left.min(JOIN_POLL),
+                    None if started
+                        .iter()
+                        .any(|aid| !results.contains_key(aid) && may_mutate[aid]) =>
+                    {
+                        JOIN_POLL
+                    }
                     None => break,
                 },
                 None => JOIN_POLL,
@@ -1560,7 +1641,23 @@ workflow '{name}' ({id}) failed: {error}"
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        let abandoned = exited < spawned;
+        let left_behind = exited < spawned;
+        if left_behind {
+            // Workers send while holding this lock, so every result sent
+            // before it was set is already queued.
+            *abandoned.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    WorkerEvent::Started(aid) => {
+                        started.insert(aid);
+                    }
+                    WorkerEvent::Finished(aid, result) => {
+                        results.insert(aid, result);
+                    }
+                    WorkerEvent::Exited => {}
+                }
+            }
+        }
         let joined_early = match phase.join {
             WorkflowJoin::Any => successes.load(std::sync::atomic::Ordering::SeqCst) > 0,
             WorkflowJoin::Quorum { required } => {
@@ -1570,14 +1667,22 @@ workflow '{name}' ({id}) failed: {error}"
         };
         let mut journal_errors = Vec::new();
         for (aid, tid, worker_id) in roster {
+            if left_behind && started.contains(&aid) && !results.contains_key(&aid) {
+                // Still running: it stays Stopping, not terminal, until its
+                // thread ends and settles it (`settle_straggler`).
+                let error = "still running when the phase ended; its result is discarded";
+                let _ = self.runtime.registry.transition(aid, AgentState::Stopping);
+                self.runtime.registry.set_failure_reason(aid, error);
+                failure_reasons.push(format!("{worker_id}: {error}"));
+                failed_workers.push(aid);
+                continue;
+            }
             let outcome = results.remove(&aid).unwrap_or_else(|| {
                 Err(if !started.contains(&aid) {
                     match &spawn_error {
                         Some(error) => format!("not started: no worker thread ({error})"),
                         None => "cancelled before it started".to_string(),
                     }
-                } else if abandoned {
-                    "still running when the phase ended; its result is discarded".to_string()
                 } else {
                     "workflow worker thread panicked".to_string()
                 })
@@ -1738,15 +1843,20 @@ fn resume_launch(
     mut launch: WorkflowLaunch,
     recorded: Option<&super::state::WorkflowAuthority>,
 ) -> WorkflowLaunch {
+    // No record: launched before authority was recorded.
     let Some(recorded) = recorded else {
         return launch;
     };
-    if recorded.parent_permission_mode.is_none() && recorded.parent_tools.is_empty() {
-        return launch;
-    }
     if launch.parent_permission_mode.is_none() && launch.parent_tools.is_empty() {
         launch.parent_permission_mode = recorded.parent_permission_mode;
         launch.parent_tools = recorded.parent_tools.clone();
+        return launch;
+    }
+    if recorded.parent_permission_mode.is_none() && recorded.parent_tools.is_empty() {
+        // The launch named no ceiling, so its workers ran read-only within
+        // their own tools. The caller's tools still bound them; the mode
+        // cannot rise above ReadOnly.
+        launch.parent_permission_mode = Some(crate::PermissionMode::ReadOnly);
         return launch;
     }
     // Lower is narrower. No mode at all runs workers read-only, so it sits
@@ -1765,6 +1875,12 @@ fn resume_launch(
     launch
         .parent_tools
         .retain(|tool| recorded.parent_tools.contains(tool));
+    // No mode with no tools means "each worker's own tools", which would
+    // widen an intersection that came out empty. ReadOnly runs workers the
+    // same way a missing mode does, and keeps an empty list empty.
+    if launch.parent_permission_mode.is_none() {
+        launch.parent_permission_mode = Some(crate::PermissionMode::ReadOnly);
+    }
     launch
 }
 
@@ -3147,23 +3263,47 @@ mod tests {
         );
     }
 
-    /// WOR-138: once an Any join is met, a worker that ignores cancellation
-    /// no longer holds the phase open past the grace period.
-    #[test]
-    fn wor138_an_early_join_does_not_wait_for_a_stuck_worker() {
+    /// A runner for WOR-138: `a` succeeds once `b` is running, `b` ignores
+    /// its cancellation until released.
+    fn stuck_worker_runner() -> (SubagentRunner, std::sync::mpsc::Sender<()>) {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let b_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = SubagentRunner::new(move |req| {
             if req.instance_name.as_deref() == Some("a") {
+                let start = std::time::Instant::now();
+                while !b_started.load(std::sync::atomic::Ordering::SeqCst) {
+                    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 return Ok("fast".into());
             }
-            // Ignores its cancellation token entirely.
+            b_started.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = release_rx
                 .lock()
                 .unwrap()
                 .recv_timeout(std::time::Duration::from_secs(30));
             Ok("late".into())
         });
+        (runner, release_tx)
+    }
+
+    fn agent_named(executor: &WorkflowExecutor, name: &str) -> AgentRecord {
+        executor
+            .runtime
+            .registry
+            .get_by_run(&executor.runtime.run_id)
+            .into_iter()
+            .find(|r| r.name == name)
+            .unwrap()
+    }
+
+    /// WOR-138: once an Any join is met, a read-only worker that ignores
+    /// cancellation no longer holds the phase open past the grace period.
+    /// It shows Stopping while it still runs, and Cancelled once it ends.
+    #[test]
+    fn wor138_an_early_join_does_not_wait_for_a_stuck_worker() {
+        let (runner, release) = stuck_worker_runner();
         let (mut executor, _tmp) = setup_executor(Some(runner));
         executor.join_grace = std::time::Duration::from_millis(200);
         let mut spec = two_worker_phase(None, &["read"]);
@@ -3177,18 +3317,183 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the phase waited for the stuck worker")
             .unwrap();
-        let _ = release_tx.send(());
         assert_eq!(state.status, WorkflowStatus::Completed);
-        let wf_id = state.id;
-        assert_eq!(executor.store.list_phase_artifacts(wf_id, "p").len(), 1);
-        let stuck = executor
-            .runtime
-            .registry
-            .get_by_run(&executor.runtime.run_id)
-            .into_iter()
-            .find(|r| r.name == "b")
+        assert_eq!(executor.store.list_phase_artifacts(state.id, "p").len(), 1);
+        assert_eq!(agent_named(&executor, "b").state, AgentState::Stopping);
+
+        release.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while agent_named(&executor, "b").state != AgentState::Cancelled {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(executor.store.list_phase_artifacts(state.id, "p").len(), 1);
+    }
+
+    /// WOR-138 review: a worker that can write is never left behind; the
+    /// phase waits for it to stop, however long that takes.
+    #[test]
+    fn wor138_a_stuck_writer_is_waited_for() {
+        let (runner, release) = stuck_worker_runner();
+        let (mut executor, _tmp) = setup_executor(Some(runner));
+        executor.join_grace = std::time::Duration::from_millis(100);
+        // Only `b` writes, in its own worktree as a parallel writer must.
+        let mut spec = two_worker_phase(None, &["read"]);
+        spec.phases[0].workers[1].tools.push("write".into());
+        spec.phases[0].workers[1].isolation = Some("worktree".into());
+        spec.phases[0].join = WorkflowJoin::Any;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let exec = executor.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(exec.execute(spec));
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(600))
+                .is_err(),
+            "the phase moved on while a writer was still running"
+        );
+        release.send(()).unwrap();
+        let state = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
             .unwrap();
-        assert_eq!(stuck.state, AgentState::Cancelled);
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        // It finished on its own terms, so its result counts.
+        assert_eq!(agent_named(&executor, "b").state, AgentState::Completed);
+        assert_eq!(executor.store.list_phase_artifacts(state.id, "p").len(), 2);
+    }
+
+    /// WOR-117 review: a launch with no ceiling ran its workers read-only.
+    /// A resume cannot raise that, whatever authority its caller passes.
+    #[test]
+    fn wor117_a_default_launch_cannot_be_widened_on_resume() {
+        let (runner, calls, failing) = calls_by_worker();
+        failing.lock().unwrap().insert("a".into());
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = two_worker_phase(None, &["read", "write"]);
+        spec.phases[0].workers.truncate(1);
+        assert!(executor.execute(spec.clone()).is_err());
+        let wf_id = executor.list_workflows()[0].id;
+        failing.lock().unwrap().clear();
+        let fp = executor
+            .mutation_fingerprint(wf_id, "p", &spec.phases[0].workers[0])
+            .unwrap();
+        let wider = WorkflowLaunch {
+            parent_permission_mode: Some(crate::PermissionMode::AlwaysApprove),
+            parent_tools: vec!["read".into(), "write".into()],
+            ..WorkflowLaunch::default()
+        };
+        let result =
+            executor.resume_execution_with(wf_id, spec, wider, &[fp].into_iter().collect());
+        assert!(
+            matches!(result, Err(WorkflowExecutionError::Validation(_))),
+            "{result:?}"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// WOR-117 review: narrowing never produces "no mode, no tools", which
+    /// would mean each worker's own tools.
+    #[test]
+    fn wor117_an_empty_intersection_stays_empty() {
+        let recorded = super::super::state::WorkflowAuthority {
+            parent_permission_mode: None,
+            parent_tools: vec!["read".into()],
+        };
+        let narrowed = resume_launch(
+            WorkflowLaunch {
+                parent_tools: vec!["grep".into()],
+                ..WorkflowLaunch::default()
+            },
+            Some(&recorded),
+        );
+        assert_eq!(
+            narrowed.parent_permission_mode,
+            Some(crate::PermissionMode::ReadOnly)
+        );
+        assert!(narrowed.parent_tools.is_empty());
+
+        let unbounded = super::super::state::WorkflowAuthority::default();
+        let capped = resume_launch(
+            WorkflowLaunch {
+                parent_permission_mode: Some(crate::PermissionMode::AlwaysApprove),
+                parent_tools: vec!["read".into()],
+                ..WorkflowLaunch::default()
+            },
+            Some(&unbounded),
+        );
+        assert_eq!(
+            capped.parent_permission_mode,
+            Some(crate::PermissionMode::ReadOnly)
+        );
+    }
+
+    /// WOR-125 review: two resumes racing with one approval run the
+    /// mutating worker once.
+    #[test]
+    fn wor125_concurrent_resumes_spend_one_approval_once() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = runs.clone();
+        let runner = SubagentRunner::new(move |_| {
+            r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Err("still failing".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = two_worker_phase(None, &["read", "write"]);
+        spec.phases[0].workers.truncate(1);
+        let wf_id = WorkflowId::new();
+        let fp = executor
+            .mutation_fingerprint(wf_id, "p", &spec.phases[0].workers[0])
+            .unwrap();
+        let approvals: HashSet<String> = [fp].into_iter().collect();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let (executor, spec, approvals, barrier) = (
+                    executor.clone(),
+                    spec.clone(),
+                    approvals.clone(),
+                    barrier.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    executor.resume_execution(wf_id, spec, &approvals)
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().unwrap().is_err());
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// WOR-124 review: a workflow still running in this process cannot be
+    /// resumed over; cancel keeps reaching the original run.
+    #[test]
+    fn wor124_a_live_workflow_cannot_be_resumed_over() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let mut spec = two_worker_phase(None, &["read"]);
+        spec.phases[0].workers.truncate(1);
+        let id = executor.execute_background(spec.clone()).unwrap();
+        assert_eq!(
+            wait_for_status(&executor, &id, |s| *s == WorkflowStatus::Running),
+            WorkflowStatus::Running
+        );
+        assert!(matches!(
+            executor.resume_execution(id, spec, &HashSet::new()),
+            Err(WorkflowExecutionError::InvalidState(
+                WorkflowStatus::Running
+            ))
+        ));
+        executor.cancel(&id).unwrap();
+        assert_eq!(
+            wait_for_status(&executor, &id, |s| *s == WorkflowStatus::Cancelled),
+            WorkflowStatus::Cancelled
+        );
     }
 
     fn phase_spec(join: &str, workers: &[&str]) -> WorkflowSpec {
