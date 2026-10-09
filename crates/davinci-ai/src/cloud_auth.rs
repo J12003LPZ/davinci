@@ -641,12 +641,57 @@ mod tests {
         assert_eq!(profile_credentials(ini, "role"), None);
     }
 
+    /// A fresh RSA key pair (PKCS#8 PEM, PKCS#1 public DER) from the
+    /// `openssl` CLI, so no private key is committed. `None` without openssl.
+    fn throwaway_rsa_key() -> Option<(String, Vec<u8>)> {
+        let dir = tempfile::tempdir().ok()?;
+        let key = dir.path().join("key.pem");
+        let public = dir.path().join("pub.der");
+        let run = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new("openssl")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let generated = run(&[
+            "genpkey".as_ref(),
+            "-algorithm".as_ref(),
+            "RSA".as_ref(),
+            "-pkeyopt".as_ref(),
+            "rsa_keygen_bits:2048".as_ref(),
+            "-out".as_ref(),
+            key.as_os_str(),
+        ]) && run(&[
+            "rsa".as_ref(),
+            "-in".as_ref(),
+            key.as_os_str(),
+            "-RSAPublicKey_out".as_ref(),
+            "-outform".as_ref(),
+            "DER".as_ref(),
+            "-out".as_ref(),
+            public.as_os_str(),
+        ]);
+        if !generated {
+            return None;
+        }
+        Some((
+            std::fs::read_to_string(&key).ok()?,
+            std::fs::read(&public).ok()?,
+        ))
+    }
+
     #[test]
     fn service_account_assertion_is_a_verifiable_rs256_jwt() {
+        let Some((private_key, public_der)) = throwaway_rsa_key() else {
+            eprintln!("skipping: openssl is not available to generate a test key");
+            return;
+        };
         let adc = serde_json::json!({
             "type": "service_account",
             "client_email": "svc@project.iam.gserviceaccount.com",
-            "private_key": include_str!("../tests/fixtures/vertex-test-service-account-key.pem"),
+            "private_key": private_key,
         });
         let jwt = service_account_assertion(&adc, GOOGLE_TOKEN_URL, UNIX_EPOCH).unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
@@ -659,7 +704,7 @@ mod tests {
         assert_eq!(claims["aud"], GOOGLE_TOKEN_URL);
         let public = ring::signature::UnparsedPublicKey::new(
             &ring::signature::RSA_PKCS1_2048_8192_SHA256,
-            include_bytes!("../tests/fixtures/vertex-test-service-account-pub.der").as_slice(),
+            public_der.as_slice(),
         );
         public
             .verify(
