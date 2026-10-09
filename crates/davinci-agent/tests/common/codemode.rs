@@ -393,6 +393,41 @@ fn staged_codemode_registers_on_each_turn_runtime_that_has_a_journal() {
 }
 
 #[test]
+fn clearing_codemode_unregisters_it_and_allows_reenable_on_the_same_runtime() {
+    let (mut agent, workspace, _journal) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    agent.stage_read_only_codemode(Arc::new(ReadOnlyFixtureHost));
+    agent.activate_staged_codemode().unwrap();
+    assert!(agent.tools.iter().any(|name| name == "codemode"));
+
+    agent.clear_codemode();
+    let runtime = agent.runtime.as_ref().unwrap();
+    assert!(runtime.capability_registry.get("codemode").is_none());
+    assert!(!agent.tools.iter().any(|name| name == "codemode"));
+    assert!(!agent
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .is_visible("codemode"));
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.stage_read_only_codemode(Arc::new(CountedReadOnlyFixtureHost(calls.clone())));
+    agent.activate_staged_codemode().unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "reenabled".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    assert_eq!(messages[0].is_error, Some(false), "{messages:?}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
 fn codemode_parent_uses_real_dispatch_and_authoritative_child_evidence() {
     let (mut agent, workspace, journal) = configured_agent();
     agent.set_permission_mode(crate::PermissionMode::ReadOnly);
@@ -1077,7 +1112,54 @@ fn queued_codemode_child_cancels_before_active_child_returns() {
         .unwrap()
         .cancellation_token
         .is_cancelled());
-    assert_eq!(broker.children().len(), 1);
+    // Both admitted requests leave evidence, including the one never dispatched.
+    let children = broker.children();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[1].request_id, 2);
+    assert!(matches!(children[1].status, CodeModeChildStatus::Cancelled));
+}
+
+#[test]
+fn child_ordinals_follow_request_ids_not_arrival_order() {
+    use crate::codemode::*;
+    let (agent, _workspace, _) = configured_agent();
+    let broker = AgentCodeModeBroker::new(agent.clone(), broker_context(&agent), None).unwrap();
+    for request_id in [2, 1] {
+        broker
+            .call(CodeModeCall {
+                request_id,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+            .unwrap();
+    }
+    let children = broker.children();
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| (child.request_id, child.ordinal))
+            .collect::<Vec<_>>(),
+        [(1, 1), (2, 2)]
+    );
+}
+
+#[test]
+fn host_catalog_bootstrap_does_not_spend_guest_metadata_budget() {
+    use crate::codemode::*;
+    let (agent, _workspace, _) = configured_agent();
+    let mut context = broker_context(&agent);
+    context.limits.metadata_calls = 1;
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    for _ in 0..3 {
+        assert!(broker.catalog(1024).unwrap().contains(&"read".to_string()));
+    }
+    let query = || ToolQuery {
+        query: String::new(),
+        limit: 20,
+        cursor: None,
+    };
+    assert!(broker.search(query()).is_ok());
+    assert_eq!(broker.search(query()).unwrap_err().code, "LIMIT_EXCEEDED");
 }
 
 #[test]

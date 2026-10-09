@@ -180,35 +180,91 @@ fn watch_host(
 }
 
 const MAX_CALLBACK_WORKERS: usize = 16;
+/// Callback threads still blocked in a child after their run ended. They are
+/// detached, so this bounds the leak instead of letting them hold run slots.
+const MAX_STRANDED_CALLBACK_WORKERS: usize = 64;
 static ACTIVE_CALLBACK_WORKERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static STRANDED_CALLBACK_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-struct CallbackWorkerPermit;
+#[derive(Clone, Copy, PartialEq)]
+enum SlotState {
+    /// Counted in `ACTIVE_CALLBACK_WORKERS` for a running run.
+    Active,
+    /// The run ended while this worker was inside a child call.
+    Stranded,
+    Released,
+}
 
-impl CallbackWorkerPermit {
-    fn try_acquire() -> Option<Self> {
+/// One callback worker's share of the process-wide capacity. A run's slots
+/// are returned when the run ends, not when its threads exit: a worker stuck
+/// in a non-cooperative callback moves to the bounded stranded pool instead
+/// of keeping later runs from starting.
+struct CallbackWorkerSlot {
+    state: Mutex<SlotState>,
+    busy: std::sync::atomic::AtomicBool,
+}
+
+impl CallbackWorkerSlot {
+    fn try_acquire() -> Result<Arc<Self>, CodeModeError> {
         use std::sync::atomic::Ordering;
-        let mut current = ACTIVE_CALLBACK_WORKERS.load(Ordering::SeqCst);
-        loop {
-            if current >= MAX_CALLBACK_WORKERS {
-                return None;
-            }
-            match ACTIVE_CALLBACK_WORKERS.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return Some(Self),
-                Err(actual) => current = actual,
-            }
+        if STRANDED_CALLBACK_WORKERS.load(Ordering::SeqCst) >= MAX_STRANDED_CALLBACK_WORKERS {
+            return Err(CodeModeError::new(
+                "UNAVAILABLE",
+                "Codemode callback workers are stuck in earlier runs",
+            ));
         }
+        ACTIVE_CALLBACK_WORKERS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                (current < MAX_CALLBACK_WORKERS).then_some(current + 1)
+            })
+            .map_err(|_| {
+                CodeModeError::new("UNAVAILABLE", "Codemode callback worker capacity exhausted")
+            })?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(SlotState::Active),
+            busy: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    /// The run is over: return its capacity now.
+    fn end_run(&self) {
+        use std::sync::atomic::Ordering;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if *state == SlotState::Active {
+            ACTIVE_CALLBACK_WORKERS.fetch_sub(1, Ordering::SeqCst);
+            *state = if self.busy.load(Ordering::SeqCst) {
+                STRANDED_CALLBACK_WORKERS.fetch_add(1, Ordering::SeqCst);
+                SlotState::Stranded
+            } else {
+                SlotState::Released
+            };
+        }
+    }
+
+    /// The worker thread is exiting (or never started).
+    fn exit(&self) {
+        use std::sync::atomic::Ordering;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        match *state {
+            SlotState::Active => {
+                ACTIVE_CALLBACK_WORKERS.fetch_sub(1, Ordering::SeqCst);
+            }
+            SlotState::Stranded => {
+                STRANDED_CALLBACK_WORKERS.fetch_sub(1, Ordering::SeqCst);
+            }
+            SlotState::Released => {}
+        }
+        *state = SlotState::Released;
     }
 }
 
-impl Drop for CallbackWorkerPermit {
+struct WorkerExit(Arc<CallbackWorkerSlot>);
+
+impl Drop for WorkerExit {
     fn drop(&mut self) {
-        ACTIVE_CALLBACK_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.exit();
     }
 }
 
@@ -231,6 +287,7 @@ struct BrokerReply {
 struct CallbackLaneGuard {
     closed: Arc<std::sync::atomic::AtomicBool>,
     cancellation: davinci_agent::runtime::CancellationToken,
+    slots: Vec<Arc<CallbackWorkerSlot>>,
 }
 
 impl Drop for CallbackLaneGuard {
@@ -238,14 +295,19 @@ impl Drop for CallbackLaneGuard {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         // An in-flight child observes the run token through the broker.
         self.cancellation.cancel();
+        for slot in &self.slots {
+            slot.end_run();
+        }
     }
 }
 
-/// Task sender, reply receiver and the lane's shared `closed` flag.
+/// Task sender, reply receiver, the lane's shared `closed` flag and the run's
+/// worker slots.
 type CallbackLane = (
     mpsc::SyncSender<BrokerTask>,
     mpsc::Receiver<BrokerReply>,
     Arc<std::sync::atomic::AtomicBool>,
+    Vec<Arc<CallbackWorkerSlot>>,
 );
 
 fn start_broker_workers(
@@ -254,26 +316,33 @@ fn start_broker_workers(
     pending_limit: usize,
 ) -> Result<CallbackLane, CodeModeError> {
     let worker_count = requested_workers.clamp(1, 4);
-    let mut permits = Vec::with_capacity(worker_count);
+    let mut slots = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
-        permits.push(CallbackWorkerPermit::try_acquire().ok_or_else(|| {
-            CodeModeError::new("UNAVAILABLE", "Codemode callback worker capacity exhausted")
-        })?);
+        match CallbackWorkerSlot::try_acquire() {
+            Ok(slot) => slots.push(slot),
+            Err(error) => {
+                for slot in &slots {
+                    slot.exit();
+                }
+                return Err(error);
+            }
+        }
     }
 
     let (task_sender, task_receiver) = mpsc::sync_channel::<BrokerTask>(pending_limit.clamp(1, 64));
     let task_receiver = Arc::new(Mutex::new(task_receiver));
     let (reply_sender, reply_receiver) = mpsc::channel();
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for (index, permit) in permits.into_iter().enumerate() {
+    for (index, slot) in slots.iter().enumerate() {
         let tasks = task_receiver.clone();
         let replies = reply_sender.clone();
         let broker = broker.clone();
         let worker_closed = closed.clone();
-        std::thread::Builder::new()
+        let slot = slot.clone();
+        let spawned = std::thread::Builder::new()
             .name(format!("davinci-codemode-callback-{index}"))
             .spawn(move || {
-                let _permit = permit;
+                let _exit = WorkerExit(slot.clone());
                 loop {
                     let task = {
                         let receiver = tasks.lock().unwrap_or_else(|error| error.into_inner());
@@ -282,11 +351,22 @@ fn start_broker_workers(
                             Err(_) => break,
                         }
                     };
+                    // Mark busy before checking `closed`: the lane guard sets
+                    // `closed` before reading `busy`, so one of them sees the other.
+                    slot.busy.store(true, std::sync::atomic::Ordering::SeqCst);
                     // Remaining queued tasks are discarded with the last receiver.
                     if worker_closed.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
-                    let result = broker.call(task.call);
+                    // A panicking callback must still answer its request, or
+                    // the parent waits for it until the host deadline.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        broker.call(task.call)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(CodeModeError::new("TOOL_FAILED", "child callback panicked"))
+                    });
+                    slot.busy.store(false, std::sync::atomic::Ordering::SeqCst);
                     if replies
                         .send(BrokerReply {
                             request_id: task.request_id,
@@ -297,14 +377,22 @@ fn start_broker_workers(
                         break;
                     }
                 }
-            })
-            .map_err(|_| {
-                closed.store(true, std::sync::atomic::Ordering::SeqCst);
-                CodeModeError::new("UNAVAILABLE", "unable to start Codemode callback worker")
-            })?;
+            });
+        if spawned.is_err() {
+            closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Started workers exit when the task sender drops; give back the
+            // slots of the ones that never started.
+            for slot in &slots[index..] {
+                slot.exit();
+            }
+            return Err(CodeModeError::new(
+                "UNAVAILABLE",
+                "unable to start Codemode callback worker",
+            ));
+        }
     }
     drop(reply_sender);
-    Ok((task_sender, reply_receiver, closed))
+    Ok((task_sender, reply_receiver, closed, slots))
 }
 
 fn write_broker_reply(
@@ -426,38 +514,12 @@ impl NodeCodeModeHost {
                 "run cancelled before launch",
             ));
         }
-        let mut tools = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = broker.search(ToolQuery {
-                query: String::new(),
-                limit: 20,
-                cursor: cursor.clone(),
-            })?;
-            if tools.len() + page.tools.len() > 1024 {
-                return Err(CodeModeError::new(
-                    "LIMIT_EXCEEDED",
-                    "capability catalog limit",
-                ));
-            }
-            tools.extend(
-                page.tools
-                    .into_iter()
-                    .map(|tool| json!({"name":tool.canonical_name})),
-            );
-            match page.cursor {
-                Some(next) if Some(&next) != cursor.as_ref() && tools.len() < 1024 => {
-                    cursor = Some(next)
-                }
-                None => break,
-                _ => {
-                    return Err(CodeModeError::new(
-                        "PROTOCOL_ERROR",
-                        "invalid catalog cursor",
-                    ))
-                }
-            }
-        }
+        // Privileged bootstrap: the guest's metadata budget stays its own.
+        let tools: Vec<Value> = broker
+            .catalog(1024)?
+            .into_iter()
+            .map(|name| json!({"name":name}))
+            .collect();
         let private_cwd = tempfile::tempdir()
             .map_err(|_| CodeModeError::new("UNAVAILABLE", "private host directory unavailable"))?;
         let mut child = OwnedChild(
@@ -478,11 +540,12 @@ impl NodeCodeModeHost {
             .ok_or_else(|| CodeModeError::new("SANDBOX_FAILED", "missing host output"))?;
         let child = Arc::new(Mutex::new(child));
         let limits = context.limits_for_request(request)?;
-        let (broker_tasks, broker_replies, closed) =
+        let (broker_tasks, broker_replies, closed, slots) =
             start_broker_workers(broker.clone(), limits.parallelism, limits.pending_calls)?;
         let lane = CallbackLaneGuard {
             closed,
             cancellation: context.cancellation.clone(),
+            slots,
         };
         let watchdog = watch_host(
             child.clone(),
@@ -869,7 +932,7 @@ mod tests {
     #[test]
     fn closed_lane_never_dispatches_queued_children() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (tasks, replies, closed) =
+        let (tasks, replies, closed, slots) =
             start_broker_workers(Arc::new(CountingBroker(calls.clone())), 1, 8).unwrap();
         for request_id in 1..=6 {
             tasks
@@ -892,6 +955,7 @@ mod tests {
         drop(CallbackLaneGuard {
             closed,
             cancellation: cancellation.clone(),
+            slots,
         });
         drop(tasks);
         assert!(cancellation.is_cancelled());
@@ -902,5 +966,85 @@ mod tests {
             1,
             "queued children were dispatched after the run closed"
         );
+    }
+
+    fn task(request_id: u32) -> BrokerTask {
+        BrokerTask {
+            request_id: request_id.to_string(),
+            call: CodeModeCall {
+                request_id,
+                tool: "read".into(),
+                args: json!({}),
+            },
+        }
+    }
+
+    struct PanickingBroker;
+    impl CodeModeBroker for PanickingBroker {
+        fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+            unreachable!()
+        }
+        fn describe(&self, _: &str) -> Result<Value, CodeModeError> {
+            unreachable!()
+        }
+        fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+            panic!("fixture callback panic")
+        }
+    }
+
+    #[test]
+    fn a_panicking_callback_still_answers_its_request() {
+        let (tasks, replies, closed, slots) =
+            start_broker_workers(Arc::new(PanickingBroker), 1, 8).unwrap();
+        tasks.try_send(task(1)).unwrap();
+        tasks.try_send(task(2)).unwrap();
+        for expected in ["1", "2"] {
+            let reply = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(reply.request_id, expected);
+            assert_eq!(reply.result.unwrap_err().code, "TOOL_FAILED");
+        }
+        drop(CallbackLaneGuard {
+            closed,
+            cancellation: Default::default(),
+            slots,
+        });
+    }
+
+    struct BlockedBroker(Mutex<mpsc::Receiver<()>>, mpsc::Sender<()>);
+    impl CodeModeBroker for BlockedBroker {
+        fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+            unreachable!()
+        }
+        fn describe(&self, _: &str) -> Result<Value, CodeModeError> {
+            unreachable!()
+        }
+        fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+            // Ignores cancellation until the test releases it.
+            self.1.send(()).unwrap();
+            let _ = self.0.lock().unwrap().recv();
+            Err(CodeModeError::new("TOOL_FAILED", "released"))
+        }
+    }
+
+    #[test]
+    fn a_stuck_callback_returns_its_run_slot_when_the_run_ends() {
+        let (release, blocked) = mpsc::channel();
+        let (entered_tx, entered) = mpsc::channel();
+        let broker = Arc::new(BlockedBroker(Mutex::new(blocked), entered_tx));
+        let (tasks, replies, closed, slots) = start_broker_workers(broker, 1, 8).unwrap();
+        tasks.try_send(task(1)).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let slot = slots[0].clone();
+        drop(CallbackLaneGuard {
+            closed,
+            cancellation: Default::default(),
+            slots,
+        });
+        drop(tasks);
+        // The run is over: its slot no longer counts against later runs.
+        assert!(*slot.state.lock().unwrap() == SlotState::Stranded);
+        release.send(()).unwrap();
+        while replies.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        assert!(*slot.state.lock().unwrap() == SlotState::Released);
     }
 }
