@@ -30,7 +30,7 @@
       {
         "id": "correction",
         "role": "user",
-        "text": "Correction: implement the new API and preserve authentication"
+        "text": "Correction: implement the new API. Preserve authentication."
       },
       {
         "id": "edit",
@@ -103,7 +103,7 @@
             "provenance_kind": "user_decision"
           },
           "replacement": {
-            "value": "Correction: implement the new API and preserve authentication",
+            "value": "Correction: implement the new API. Preserve authentication.",
             "source_refs": [
               "fixture:correction"
             ],
@@ -175,7 +175,7 @@
       ]
     },
     "resident": [
-      "Correction: implement the new API and preserve authentication",
+      "Correction: implement the new API. Preserve authentication.",
       "preserve authentication",
       "test passed: response and authentication"
     ],

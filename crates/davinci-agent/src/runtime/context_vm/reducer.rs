@@ -209,6 +209,19 @@ fn validate_value(
     events: &HashMap<&str, &ContextEvent>,
     parent: &ParentSources,
 ) -> Option<StateValue<String>> {
+    validate_cited_value(value, events, parent, true)
+}
+
+/// `grounded` is false only for the evidence of a supersede, whose grounded
+/// replacement already carries the user's words. That evidence records why a
+/// value retired rather than quoting the user, so it is kept out of later
+/// grounding text.
+fn validate_cited_value(
+    value: ProposedStateValue,
+    events: &HashMap<&str, &ContextEvent>,
+    parent: &ParentSources,
+    grounded: bool,
+) -> Option<StateValue<String>> {
     if value.value.trim().is_empty()
         || value.value.len() > 1024
         || value.source_refs.is_empty()
@@ -219,7 +232,7 @@ fn validate_value(
     // A matching source type is not enough for authority: the summarizer
     // could pin any claim to a real user message. User and policy values
     // must be grounded in the text they cite (WOR-62).
-    if is_user_authority(&value) && !grounded_in_sources(&value, events, parent) {
+    if grounded && is_user_authority(&value) && !grounded_in_sources(&value, events, parent) {
         return None;
     }
     let mut sources = Vec::new();
@@ -291,15 +304,25 @@ type ParentSources = HashMap<String, (ProvenanceKind, String)>;
 
 fn parent_provenance(parent: &CheckpointState) -> ParentSources {
     let mut result: ParentSources = HashMap::new();
+    // Retirement evidence may be an ungrounded description, so it lends its
+    // refs' provenance kind but never its text as grounding for a new value.
+    let evidence: HashSet<*const StateValue<String>> = parent
+        .retired
+        .iter()
+        .map(|retired| &retired.evidence as *const _)
+        .collect();
     for value in all_values(parent) {
+        let grounding = !evidence.contains(&(value as *const _));
         for provenance in &value.provenance {
             for source_ref in &provenance.source_refs {
                 let (kind, text) = result
                     .entry(source_ref.clone())
                     .or_insert_with(|| (provenance.kind, String::new()));
                 *kind = provenance.kind;
-                text.push('\n');
-                text.push_str(&value.value);
+                if grounding {
+                    text.push('\n');
+                    text.push_str(&value.value);
+                }
             }
         }
     }
@@ -537,7 +560,14 @@ fn apply_transition(
     if !new_authority {
         return;
     }
-    let Some(evidence) = validate_value(transition.evidence, events, parent) else {
+    // A reject or resolve stands on its evidence alone (and a resolved goal
+    // stores it as completed work), so that evidence must quote the user. A
+    // supersede is justified by its replacement, which is grounded below, so
+    // its evidence may describe the change ("latest user correction").
+    let evidence_grounded = transition.replacement.is_none();
+    let Some(evidence) =
+        validate_cited_value(transition.evidence, events, parent, evidence_grounded)
+    else {
         return;
     };
     let replacement = match transition.replacement {

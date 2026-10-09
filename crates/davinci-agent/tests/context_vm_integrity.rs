@@ -263,6 +263,71 @@ fn wor62_values_citing_folded_sources_are_grounded_in_parent_state() {
     assert_eq!(values, ["keep public API stable"]);
 }
 
+fn superseded_old_api() -> (
+    Vec<ContextEvent>,
+    davinci_agent::runtime::context_vm::CheckpointState,
+) {
+    let events = vec![
+        event("user:1", 1, ContextEventKind::User, "use the old API"),
+        event(
+            "user:2",
+            2,
+            ContextEventKind::User,
+            "Correction: use the new API.",
+        ),
+    ];
+    let parent = ContextStateReducer::deterministic_delta(&Default::default(), &events[..1])
+        .checkpoint_patch;
+    let proposal = CheckpointProposal {
+        transitions: vec![StateTransition {
+            slot: StateSlot::Goal,
+            kind: TransitionKind::Supersede,
+            previous: "use the old API".into(),
+            evidence: user_value("latest user correction", "user:2"),
+            replacement: Some(user_value("Correction: use the new API.", "user:2")),
+        }],
+        ..CheckpointProposal::default()
+    };
+    let state = ContextStateReducer::validate_proposal(&parent, &events, proposal);
+    (events, state)
+}
+
+/// A supersede is justified by its grounded replacement, so its evidence may
+/// describe the change instead of quoting the user.
+#[test]
+fn wor62_supersede_evidence_may_describe_the_change() {
+    let (_, state) = superseded_old_api();
+    let goals = state
+        .goals
+        .iter()
+        .map(|goal| goal.value.as_str())
+        .collect::<Vec<_>>();
+    assert!(!goals.contains(&"use the old API"), "{goals:?}");
+    assert!(goals.contains(&"Correction: use the new API."), "{goals:?}");
+    assert_eq!(state.retired.len(), 1);
+}
+
+/// That descriptive evidence is never grounding text for a later fold.
+#[test]
+fn wor62_supersede_evidence_never_grounds_a_later_value() {
+    let (_, parent) = superseded_old_api();
+    let current = vec![event("user:3", 3, ContextEventKind::User, "continue")];
+    let proposal = CheckpointProposal {
+        constraints: vec![
+            user_value("latest user correction", "user:2"),
+            user_value("Correction: use the new API.", "user:2"),
+        ],
+        ..CheckpointProposal::default()
+    };
+    let state = ContextStateReducer::validate_proposal(&parent, &current, proposal);
+    let values = state
+        .constraints
+        .iter()
+        .map(|value| value.value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["Correction: use the new API."]);
+}
+
 fn append_user(session: &mut davinci_session::JsonlSession, text: &str) {
     let seq = session.entries.len() as u64 + 1;
     session
