@@ -447,6 +447,16 @@ fn test_cache_runtime_caching_and_telemetry() {
     let hits2 = status2["telemetry"]["hits"].as_u64().unwrap();
     assert_eq!(requests2, 2);
     assert_eq!(hits2, 1);
+
+    // Editing the workspace invalidates the cached report.
+    ws.write_file(
+        "src/cached.ts",
+        "export const CACHED = true;\nexport const MORE = 1;\n",
+    );
+    impact.execute_tool("impact_analyze", &args).unwrap();
+    let status3 = impact.status();
+    assert_eq!(status3["telemetry"]["hits"].as_u64().unwrap(), 1);
+    assert_eq!(status3["telemetry"]["misses"].as_u64().unwrap(), 2);
 }
 
 // ----------------------------------------------------------------------------

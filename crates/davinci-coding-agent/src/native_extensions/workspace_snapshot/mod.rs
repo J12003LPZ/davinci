@@ -189,6 +189,11 @@ impl WorkspaceSnapshot {
             .map_err(|error| format!("workspace_checkpoint: invalid arguments: {error}"))?;
         let paths = self.request_paths(&request.paths, request.path.as_deref())?;
         self.authorize("workspace_checkpoint", args, cwd, None)?;
+        if let Some(pending) = self.pending_restore(cwd)? {
+            // Capturing a half-restored tree would checkpoint a state that
+            // never existed.
+            return Err(pending_restore_error(&pending));
+        }
         let transaction_id =
             self.validate_transaction(cwd, request.transaction_id.as_deref(), context)?;
         let entries = self.capture_paths(cwd, &paths, context)?;
@@ -244,13 +249,22 @@ impl WorkspaceSnapshot {
             changes.push(compare_entry(expected, actual));
         }
         self.bump_diffs();
-        Ok(json!({
+        let mut result = json!({
             "schemaVersion": SCHEMA_VERSION,
             "checkpointId": checkpoint.id,
             "changes": changes,
             "partial": false,
             "complete": true
-        }))
+        });
+        if let Some(pending) = self.pending_restore(cwd)? {
+            result["pendingRestore"] = json!({
+                "checkpointId": pending.checkpoint_id,
+                "paths": pending.paths,
+                "startedAtMs": pending.started_at_ms,
+            });
+            result["warnings"] = json!([pending_restore_error(&pending)]);
+        }
+        Ok(result)
     }
 
     fn restore(
@@ -263,6 +277,14 @@ impl WorkspaceSnapshot {
             .map_err(|error| format!("workspace_restore: invalid arguments: {error}"))?;
         let checkpoint = self.load_record(cwd, &request.checkpoint_id)?;
         self.authorize("workspace_restore", args, cwd, None)?;
+        if let Some(pending) = self.pending_restore(cwd)? {
+            // Re-running the interrupted restore is idempotent: entries it
+            // already restored compare unchanged. Any other restore would
+            // overwrite the journal and lose track of the partial one.
+            if pending.checkpoint_id != checkpoint.id {
+                return Err(pending_restore_error(&pending));
+            }
+        }
         self.verify_checkpoint_workspace(cwd, &checkpoint)?;
         for entry in &checkpoint.entries {
             self.authorize("workspace_restore", args, cwd, Some(&entry.path))?;
@@ -323,6 +345,9 @@ impl WorkspaceSnapshot {
             .map(|change| change.path.clone())
             .collect::<Vec<_>>();
         if restore_paths.is_empty() {
+            // Everything already matches: an interrupted run of this
+            // restore (the only journal allowed past the check above) is done.
+            self.remove_journal(cwd)?;
             self.bump_restores();
             return Ok(json!({
                 "schemaVersion": SCHEMA_VERSION,
@@ -611,6 +636,21 @@ impl WorkspaceSnapshot {
         atomic_write(&cwd.join(JOURNAL_FILE), &bytes)
     }
 
+    /// The journal of a restore that started but never verified, if any.
+    /// An unreadable journal fails closed rather than being ignored.
+    fn pending_restore(&self, cwd: &Path) -> Result<Option<RestoreJournal>, String> {
+        let bytes = match fs::read(cwd.join(JOURNAL_FILE)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read restore journal: {error}")),
+        };
+        serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            format!(
+                "restore journal {JOURNAL_FILE} is unreadable; inspect the workspace and remove it once it is consistent"
+            )
+        })
+    }
+
     fn remove_journal(&self, cwd: &Path) -> Result<(), String> {
         match fs::remove_file(cwd.join(JOURNAL_FILE)) {
             Ok(()) => Ok(()),
@@ -628,8 +668,6 @@ impl WorkspaceSnapshot {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("create restore parent: {error}"))?;
         }
-        let temp = target.with_extension(format!("davinci-restore-{}", std::process::id()));
-        let _ = fs::remove_file(&temp);
         match &entry.kind {
             SnapshotEntryKind::Missing => {
                 remove_path(&target)?;
@@ -639,18 +677,27 @@ impl WorkspaceSnapshot {
                     .bytes
                     .as_deref()
                     .ok_or_else(|| format!("checkpoint file bytes missing for {}", entry.path))?;
-                let mut file = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&temp)
-                    .map_err(|error| format!("create restore file: {error}"))?;
-                file.write_all(bytes)
-                    .map_err(|error| format!("write restore file: {error}"))?;
-                file.sync_all()
-                    .map_err(|error| format!("sync restore file: {error}"))?;
-                remove_path(&target)?;
-                fs::rename(&temp, &target)
-                    .map_err(|error| format!("publish restore file: {error}"))?;
+                let (temp, mut file) = create_restore_temp(&target)?;
+                let staged = file
+                    .write_all(bytes)
+                    .map_err(|error| format!("write restore file: {error}"))
+                    .and_then(|()| {
+                        file.sync_all()
+                            .map_err(|error| format!("sync restore file: {error}"))
+                    })
+                    .and_then(|()| {
+                        drop(file);
+                        remove_path(&target)
+                    })
+                    .and_then(|()| {
+                        fs::rename(&temp, &target)
+                            .map_err(|error| format!("publish restore file: {error}"))
+                    });
+                if let Err(error) = staged {
+                    // Only the file this call created is removed.
+                    let _ = fs::remove_file(&temp);
+                    return Err(error);
+                }
                 set_mode(&target, entry.mode);
             }
             SnapshotEntryKind::Symlink { target: link } => {
@@ -1080,4 +1127,71 @@ fn append_identity_file(material: &mut Vec<u8>, label: &str, path: &Path) {
         value.extend_from_slice(b"missing");
     }
     append_identity_field(material, label, &value);
+}
+
+fn pending_restore_error(pending: &RestoreJournal) -> String {
+    format!(
+        "an interrupted workspace_restore of checkpoint {} is pending for {} path(s) ({}); rerun workspace_restore with that checkpoint to finish it before other snapshot changes",
+        pending.checkpoint_id,
+        pending.paths.len(),
+        pending
+            .paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// A staging file next to `target` that did not exist before: created with
+/// `create_new` under a fresh name, so no existing workspace file is ever
+/// replaced or deleted while staging.
+fn create_restore_temp(target: &Path) -> Result<(PathBuf, fs::File), String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = target
+        .parent()
+        .ok_or_else(|| "restore target has no parent directory".to_string())?;
+    let stem = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for _ in 0..16 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".{stem}.davinci-restore-{}-{nonce:x}-{sequence}",
+            std::process::id()
+        ));
+        match OpenOptions::new().create_new(true).write(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create restore file: {error}")),
+        }
+    }
+    Err("create restore file: no unused staging name".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_staging_never_touches_existing_sibling_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.txt");
+        // The name the old implementation deleted before staging.
+        let old_style = target.with_extension(format!("davinci-restore-{}", std::process::id()));
+        fs::write(&old_style, "user data").unwrap();
+
+        let (first, _) = create_restore_temp(&target).unwrap();
+        let (second, _) = create_restore_temp(&target).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, old_style);
+        assert_eq!(fs::read_to_string(&old_style).unwrap(), "user data");
+        assert_eq!(first.parent(), target.parent());
+    }
 }

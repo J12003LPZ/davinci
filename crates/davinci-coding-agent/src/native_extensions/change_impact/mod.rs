@@ -18,9 +18,7 @@ use crate::native_extensions::{
     repo_intelligence::RepoIntelligence, test_impact::TestImpact,
 };
 use davinci_agent::{
-    runtime::cache::{
-        digest, CacheDependency, CacheKey, CacheNamespace, CachePolicy, CacheRequest, CacheRuntime,
-    },
+    runtime::cache::{digest, CacheKey, CacheNamespace, CachePolicy, CacheRequest, CacheRuntime},
     ToolError, ToolResult,
 };
 use serde_json::{json, Value};
@@ -155,18 +153,27 @@ impl ChangeImpact {
         let parsed: tools::ImpactAnalyzeArgs = serde_json::from_value(args.clone())
             .map_err(|e| ToolError::Failed(format!("Invalid arguments for impact_analyze: {e}")))?;
 
-        // Check cache
+        // A report depends on the whole workspace (imports, dependents,
+        // tests), so it is cached only under the current workspace
+        // fingerprint: any edit, addition or removal misses.
         let args_str = serde_json::to_string(args).unwrap_or_default();
-        let initial_key = CacheKey::new(
-            CacheNamespace::Test,
-            format!("impact_analyze:{args_str}"),
-            1,
-            "sha256",
-            Vec::new(),
-        );
-        let req = CacheRequest::new(initial_key, CachePolicy::MemoryOnly);
+        let req = workspace_fingerprint(&self.root).map(|fingerprint| {
+            CacheRequest::new(
+                CacheKey::new(
+                    CacheNamespace::Test,
+                    format!("impact_analyze:{args_str}:{fingerprint}"),
+                    1,
+                    "sha256",
+                    Vec::new(),
+                ),
+                CachePolicy::MemoryOnly,
+            )
+        });
 
-        if let Ok(Some(cached_val)) = self.cache.get::<Value>(&req, || Ok(())) {
+        if let Some(Ok(Some(cached_val))) = req
+            .as_ref()
+            .map(|req| self.cache.get::<Value>(req, || Ok(())))
+        {
             let mut telem = self.telemetry.lock().unwrap();
             telem.hits += 1;
             let val = (*cached_val).clone();
@@ -206,21 +213,9 @@ impl ChangeImpact {
         let json_val = serde_json::to_value(&report)
             .map_err(|e| ToolError::Failed(format!("Failed to serialize report: {e}")))?;
 
-        // Cache report with Source content dependencies
-        let mut dependencies = Vec::new();
-        for f in &report.files {
-            dependencies.push(CacheDependency::ContentHash(digest(f.as_bytes())));
+        if let Some(req) = &req {
+            let _ = self.cache.put(req, json_val.clone(), || Ok(()));
         }
-        let dep_key = CacheKey::new(
-            CacheNamespace::Test,
-            format!("impact_analyze:{args_str}"),
-            1,
-            "sha256",
-            dependencies,
-        );
-        let dep_req = CacheRequest::new(dep_key, CachePolicy::MemoryOnly);
-        let _ = self.cache.put(&dep_req, json_val.clone(), || Ok(()));
-        let _ = self.cache.put(&req, json_val.clone(), || Ok(()));
 
         Ok(ToolResult {
             content: serde_json::to_string_pretty(&json_val).unwrap_or_default(),
@@ -245,4 +240,43 @@ impl ChangeImpact {
             }
         })
     }
+}
+
+/// Identity of the workspace's current contents: every non-ignored file's
+/// path, size and modification time. `None` (no caching) when the tree is
+/// too large to walk cheaply or cannot be read.
+fn workspace_fingerprint(root: &std::path::Path) -> Option<String> {
+    const MAX_FILES: usize = 50_000;
+    let mut entries = Vec::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build()
+    {
+        let entry = entry.ok()?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let metadata = entry.metadata().ok()?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        entries.push(format!(
+            "{}\0{}\0{modified}",
+            entry
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(entry.path())
+                .display(),
+            metadata.len()
+        ));
+        if entries.len() > MAX_FILES {
+            return None;
+        }
+    }
+    entries.sort();
+    Some(digest(entries.join("\n").as_bytes()))
 }
