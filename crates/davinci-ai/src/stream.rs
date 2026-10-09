@@ -741,12 +741,15 @@ pub fn live_complete_with(
     }
     let url = request_url_checked(model, auth)?;
     crate::provider_observation::validate_request(model, auth, &options, body, &url)?;
-    let headers = crate::merge_provider_attribution_headers(
+    let mut headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
         &collect_request_headers(model, auth, &options),
     );
+    headers.extend(crate::cloud_auth::request_auth_headers(
+        model, auth, &url, body,
+    )?);
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let (text, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
@@ -934,7 +937,8 @@ fn live_complete_streaming_with_sink_envelope_inner(
             tools.len()
         ));
     }
-    if incremental {
+    // pi-messages always streams and has no `stream` field.
+    if incremental && model.api != "pi-messages" {
         if let Value::Object(map) = &mut body {
             map.insert("stream".into(), Value::Bool(true));
             // TS asks completions endpoints for a trailing usage chunk.
@@ -1025,12 +1029,15 @@ fn live_complete_streaming_with_sink_envelope_inner(
         }
     }
     let url = request_url_checked(model, auth)?;
-    let headers = crate::merge_provider_attribution_headers(
+    let mut headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
         &collect_request_headers(model, auth, options),
     );
+    headers.extend(crate::cloud_auth::request_auth_headers(
+        model, auth, &url, body,
+    )?);
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd =
         model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model);
@@ -1420,10 +1427,13 @@ pub fn request_body_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Value {
+    if model.api == "pi-messages" {
+        // Its own `{ model, context, options }` envelope; none of the
+        // per-provider body adjustments below apply.
+        return pi_messages_body(model, messages, system, tools, options);
+    }
     let mut body = match model.api.as_str() {
-        "anthropic-messages" | "pi-messages" => {
-            anthropic_body(model, messages, system, tools, options)
-        }
+        "anthropic-messages" => anthropic_body(model, messages, system, tools, options),
         "google-generative-ai" | "google-vertex" => {
             google_body(model, messages, system, tools, options)
         }
@@ -2024,7 +2034,7 @@ pub fn live_stream(
     if let Some(key) = &auth.api_key {
         if model.api == "google-generative-ai" {
             request = request.set("x-goog-api-key", key);
-        } else if model.api == "anthropic-messages" || model.api == "pi-messages" {
+        } else if model.api == "anthropic-messages" {
             request = request
                 .set("x-api-key", key)
                 .set("anthropic-version", "2023-06-01");
@@ -2250,7 +2260,8 @@ pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
         .unwrap_or_else(|| "https://api.openai.com/v1".into());
     let base = base.trim_end_matches('/');
     match model.api.as_str() {
-        "anthropic-messages" | "pi-messages" => format!("{base}/v1/messages"),
+        "anthropic-messages" => format!("{base}/v1/messages"),
+        "pi-messages" => format!("{base}/messages"),
         "google-generative-ai" => format!("{base}/models/{}:generateContent", model.id),
         "google-vertex" => vertex_url(
             model,
@@ -2263,7 +2274,12 @@ pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
             format!("{base}/responses")
         }
         "mistral-conversations" => format!("{base}/v1/conversations"),
-        "bedrock-converse-stream" => format!("{base}/model/{}/converse", model.id),
+        // Model IDs and inference-profile ARNs carry ':' and '/': one path
+        // segment, percent-encoded (SigV4 signs the encoded form).
+        "bedrock-converse-stream" => format!(
+            "{base}/model/{}/converse",
+            url::form_urlencoded::byte_serialize(model.id.as_bytes()).collect::<String>()
+        ),
         _ => format!("{base}/chat/completions"),
     }
 }
@@ -2499,6 +2515,56 @@ fn apply_openai_thinking(body: &mut Value, model: &Model, options: &StreamOption
     if budget > 0 {
         body[field] = Value::from(budget);
     }
+}
+
+/// TS `pi-messages` request: `{ model, context, options }` posted to
+/// `<baseUrl>/messages`, where `context` is pi's own message shape.
+fn pi_messages_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+) -> Value {
+    let mut context = serde_json::json!({ "messages": messages });
+    if let Some(system) = system.filter(|system| !system.is_empty()) {
+        context["systemPrompt"] = Value::String(system.into());
+    }
+    if !tools.is_empty() {
+        context["tools"] = tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect();
+    }
+    let mut request_options = serde_json::Map::new();
+    request_options.insert(
+        "maxTokens".into(),
+        Value::from(options.max_tokens.unwrap_or(model.max_tokens)),
+    );
+    if let Some(level) = options
+        .thinking_level
+        .and_then(crate::thinking::clamp_reasoning)
+        .and_then(|level| serde_json::to_value(level).ok())
+    {
+        request_options.insert("reasoning".into(), level);
+    }
+    if let Some(retention) = &options.cache_retention {
+        request_options.insert("cacheRetention".into(), Value::String(retention.clone()));
+    }
+    if let Some(session_id) = &options.session_id {
+        request_options.insert("sessionId".into(), Value::String(session_id.clone()));
+    }
+    serde_json::json!({
+        "model": model.id,
+        "context": context,
+        "options": request_options,
+    })
 }
 
 fn anthropic_body(
@@ -3306,6 +3372,69 @@ mod tests {
             "{url}"
         );
         assert!(vertex_url(&model, None, None).is_err());
+    }
+
+    #[test]
+    fn pi_messages_uses_its_gateway_wire_protocol() {
+        let mut model = load_builtin_models().into_iter().next().unwrap();
+        model.api = "pi-messages".into();
+        model.provider = "radius".into();
+        model.id = "audit-radius".into();
+        model.base_url = Some("https://radius.pi.dev/v1".into());
+        let auth = ResolvedAuth {
+            api_key: Some("tok".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        assert_eq!(
+            request_url(&model, &auth),
+            "https://radius.pi.dev/v1/messages"
+        );
+        let tool = ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            constrained_sampling: None,
+        };
+        let body = request_body(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            Some("system"),
+            &[tool],
+        );
+        assert_eq!(body["model"], "audit-radius");
+        assert_eq!(body["context"]["systemPrompt"], "system");
+        assert_eq!(body["context"]["messages"][0]["role"], "user");
+        assert_eq!(body["context"]["tools"][0]["name"], "read");
+        assert!(body["options"]["maxTokens"].is_u64());
+        assert!(body.get("stream").is_none() && body.get("messages").is_none());
+        assert!(crate::stream_decoder::supports_incremental_stream(&model));
+        let headers = collect_request_headers(&model, &auth, &StreamOptions::default());
+        assert!(headers.iter().any(
+            |(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer tok"
+        ));
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-api-key")));
+    }
+
+    #[test]
+    fn bedrock_url_encodes_the_model_id_segment() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "bedrock-converse-stream")
+            .unwrap();
+        model.id = "us.anthropic.claude-v2:1".into();
+        model.base_url = Some("https://bedrock-runtime.us-east-1.amazonaws.com".into());
+        let auth = ResolvedAuth {
+            api_key: None,
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        assert_eq!(
+            request_url(&model, &auth),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-v2%3A1/converse"
+        );
     }
 
     #[test]

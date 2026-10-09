@@ -560,6 +560,16 @@ pub fn resolve_provider_auth(
     }
     if include_env {
         if provider == "amazon-bedrock" {
+            if let Some(token) = lookup_env("AWS_BEARER_TOKEN_BEDROCK", env) {
+                let mut headers = HashMap::new();
+                headers.insert("Authorization".into(), format!("Bearer {token}"));
+                return Some(ResolvedAuth {
+                    api_key: None,
+                    headers,
+                    source: "AWS_BEARER_TOKEN_BEDROCK".into(),
+                });
+            }
+            // Static keys are SigV4-signed per request (`cloud_auth`).
             if let Some(source) = bedrock_ambient_source(env) {
                 return Some(ResolvedAuth {
                     api_key: None,
@@ -652,7 +662,8 @@ pub fn vertex_ambient_auth(
         .and_then(|cred| cred.env.get("GOOGLE_APPLICATION_CREDENTIALS").cloned())
         .or_else(|| lookup_env("GOOGLE_APPLICATION_CREDENTIALS", env))
         .unwrap_or_else(default_vertex_adc_path);
-    if !Path::new(&expand_home(&adc_path)).is_file() {
+    // Only ADC kinds `cloud_auth` can exchange for an access token count.
+    if !crate::cloud_auth::supported_adc(Path::new(&expand_home(&adc_path))) {
         return None;
     }
     let project = credential
@@ -702,14 +713,26 @@ pub fn cloudflare_auth(
             .or_else(|| lookup_env("CLOUDFLARE_GATEWAY_ID", env))
             .filter(|value| !value.is_empty())?;
     }
+    let source = if credential.is_some() {
+        "stored credential".into()
+    } else {
+        "CLOUDFLARE_API_KEY".into()
+    };
+    if require_gateway {
+        // The gateway token has its own header; `Authorization` is the
+        // upstream provider's slot and may be forwarded upstream.
+        let mut headers = HashMap::new();
+        headers.insert("cf-aig-authorization".into(), format!("Bearer {api_key}"));
+        return Some(ResolvedAuth {
+            api_key: None,
+            headers,
+            source,
+        });
+    }
     Some(ResolvedAuth {
         api_key: Some(api_key),
         headers: HashMap::new(),
-        source: if credential.is_some() {
-            "stored credential".into()
-        } else {
-            "CLOUDFLARE_API_KEY".into()
-        },
+        source,
     })
 }
 
@@ -726,34 +749,45 @@ fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
-/// TS `amazon-bedrock` ambient resolve sources (no network).
+/// Ambient Bedrock credentials that can authenticate a request (no network):
+/// the bearer token, or static keys (environment, or an `AWS_PROFILE` with
+/// keys in the shared credentials file) that `cloud_auth` SigV4-signs.
+/// Role-based sources (ECS task role, web identity) would need an STS
+/// exchange, so they do not make the provider usable.
 pub fn bedrock_ambient_source(env: &HashMap<String, String>) -> Option<String> {
     if lookup_env("AWS_BEARER_TOKEN_BEDROCK", env).is_some() {
         return Some("AWS_BEARER_TOKEN_BEDROCK".into());
-    }
-    if lookup_env("AWS_PROFILE", env).is_some() {
-        return Some("AWS_PROFILE".into());
     }
     if lookup_env("AWS_ACCESS_KEY_ID", env).is_some()
         && lookup_env("AWS_SECRET_ACCESS_KEY", env).is_some()
     {
         return Some("AWS access keys".into());
     }
-    if lookup_env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", env).is_some()
-        || lookup_env("AWS_CONTAINER_CREDENTIALS_FULL_URI", env).is_some()
+    if lookup_env("AWS_PROFILE", env).is_some()
+        && crate::cloud_auth::aws_credentials(env)
+            .ok()
+            .flatten()
+            .is_some()
     {
-        return Some("ECS task role".into());
-    }
-    if lookup_env("AWS_WEB_IDENTITY_TOKEN_FILE", env).is_some() {
-        return Some("web identity token".into());
+        return Some("AWS_PROFILE".into());
     }
     None
 }
 
-const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
+pub(crate) const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
 const COPILOT_EDITOR_VERSION: &str = "vscode/1.107.0";
 const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
 const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
+
+/// Editor identity headers GitHub expects on Copilot token and API calls.
+pub(crate) fn copilot_headers() -> [(&'static str, &'static str); 4] {
+    [
+        ("user-agent", COPILOT_USER_AGENT),
+        ("editor-version", COPILOT_EDITOR_VERSION),
+        ("editor-plugin-version", COPILOT_PLUGIN_VERSION),
+        ("copilot-integration-id", COPILOT_INTEGRATION_ID),
+    ]
+}
 const COPILOT_API_VERSION: &str = "2026-06-01";
 const COPILOT_DEFAULT_BASE: &str = "https://api.individual.githubcopilot.com";
 
@@ -1197,5 +1231,83 @@ mod tests {
         );
         std::env::remove_var("PI_COPILOT_MODELS_URL");
         assert_eq!(ids, vec!["gpt-4.1".to_string()]);
+    }
+
+    #[test]
+    fn bedrock_bearer_token_reaches_request_headers_and_role_sources_do_not_count() {
+        let storage = AuthStorage::in_memory();
+        let mut env = HashMap::new();
+        env.insert("AWS_BEARER_TOKEN_BEDROCK".into(), "bedrock-token".into());
+        let resolved = resolve_provider_auth("amazon-bedrock", &storage, &env, true).unwrap();
+        assert_eq!(
+            resolved.headers.get("Authorization").map(String::as_str),
+            Some("Bearer bedrock-token")
+        );
+
+        // No signing material: an ECS role or web identity is not usable.
+        for (name, value) in [
+            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/creds"),
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/token"),
+        ] {
+            let env = HashMap::from([(name.to_string(), value.to_string())]);
+            assert!(resolve_provider_auth("amazon-bedrock", &storage, &env, true).is_none());
+        }
+        let keys = HashMap::from([
+            ("AWS_ACCESS_KEY_ID".to_string(), "AKID".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+        ]);
+        assert!(resolve_provider_auth("amazon-bedrock", &storage, &keys, true).is_some());
+    }
+
+    #[test]
+    fn cloudflare_gateway_token_uses_the_gateway_header() {
+        let env = HashMap::from([
+            ("CLOUDFLARE_API_KEY".to_string(), "audit-token".to_string()),
+            ("CLOUDFLARE_ACCOUNT_ID".to_string(), "acct".to_string()),
+            ("CLOUDFLARE_GATEWAY_ID".to_string(), "gw".to_string()),
+        ]);
+        let gateway = cloudflare_auth("cloudflare-ai-gateway", None, &env).unwrap();
+        assert_eq!(gateway.api_key, None);
+        assert_eq!(
+            gateway
+                .headers
+                .get("cf-aig-authorization")
+                .map(String::as_str),
+            Some("Bearer audit-token")
+        );
+        assert!(!gateway
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization")));
+        // Workers AI itself takes the token as the ordinary bearer key.
+        let workers = cloudflare_auth("cloudflare-workers-ai", None, &env).unwrap();
+        assert_eq!(workers.api_key.as_deref(), Some("audit-token"));
+    }
+
+    #[test]
+    fn vertex_adc_counts_only_when_it_can_become_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let adc = dir.path().join("adc.json");
+        let env = |path: &Path| {
+            HashMap::from([
+                (
+                    "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                    path.display().to_string(),
+                ),
+                ("GOOGLE_CLOUD_PROJECT".to_string(), "p".to_string()),
+                (
+                    "GOOGLE_CLOUD_LOCATION".to_string(),
+                    "us-central1".to_string(),
+                ),
+            ])
+        };
+        std::fs::write(&adc, r#"{"type":"external_account"}"#).unwrap();
+        assert!(vertex_ambient_auth(None, &env(&adc)).is_none());
+        std::fs::write(
+            &adc,
+            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#,
+        )
+        .unwrap();
+        assert!(vertex_ambient_auth(None, &env(&adc)).is_some());
     }
 }

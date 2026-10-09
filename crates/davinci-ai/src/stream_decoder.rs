@@ -54,6 +54,9 @@ pub fn decoder_for(model: &Model) -> Option<Box<dyn StreamDecoder>> {
         "anthropic-messages" => Some(Box::new(
             crate::stream_decoder_anthropic::AnthropicDecoder::new(model),
         )),
+        "pi-messages" => Some(Box::new(crate::stream_decoder_pi::PiMessagesDecoder::new(
+            model,
+        ))),
         _ => None,
     }
 }
@@ -67,6 +70,7 @@ pub fn supports_incremental_stream(model: &Model) -> bool {
             | "openai-codex-responses"
             | "openai-completions"
             | "anthropic-messages"
+            | "pi-messages"
     )
 }
 

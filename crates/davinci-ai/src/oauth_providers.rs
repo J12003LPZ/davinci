@@ -378,6 +378,10 @@ pub fn token_exchange_request(
                 redirect_uri: RADIUS_REDIRECT.into(),
             })
         }
+        // Device-code providers redeem the device code, never an auth code.
+        other if crate::device_login::is_device_code_provider(other) => {
+            crate::device_login::device_token_request(other, code)
+        }
         other => authorize_request(other, &generate_pkce(&[0u8; 32]), state.unwrap_or("pi")).map(
             |auth| TokenExchangeRequest {
                 url: auth.token_url,
@@ -451,6 +455,11 @@ pub fn refresh_oauth_token(provider: &str, refresh: &str) -> Result<OauthTokens,
             refresh: Some(refresh.to_string()),
             expires: Some(crate::models_store::now_ms().saturating_add(3_600_000)),
         });
+    }
+    if provider == "github-copilot" {
+        // The stored refresh credential is the GitHub token; renewing means
+        // trading it for a new Copilot token.
+        return crate::device_login::copilot_token(refresh);
     }
     let request = token_refresh_request(provider, refresh)
         .ok_or_else(|| format!("OAuth refresh is not configured for {provider}"))?;
