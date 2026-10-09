@@ -7,6 +7,9 @@ type CancellationCallback = Box<dyn Fn() + Send + Sync + 'static>;
 type ChildList = Arc<Mutex<Vec<Weak<CancellationInner>>>>;
 type CallbackList = Arc<Mutex<Vec<CancellationCallback>>>;
 
+/// Child-list length at which `child_token` starts pruning expired registrations.
+const PRUNE_FLOOR: usize = 32;
+
 /// Inner state tracked for a cancellation token node.
 pub struct CancellationInner {
     pub inner: Arc<AtomicBool>,
@@ -111,6 +114,13 @@ impl CancellationToken {
             child.cancel();
         } else {
             let mut guard = self.children.lock().unwrap_or_else(|e| e.into_inner());
+            // Prune expired registrations whenever the list length hits a power of two
+            // (>= PRUNE_FLOOR). Amortized O(1) per child, and the list stays within
+            // 2x the live children plus PRUNE_FLOOR without waiting for root cancel.
+            let len = guard.len();
+            if len >= PRUNE_FLOOR && len.is_power_of_two() {
+                guard.retain(|w| w.strong_count() > 0);
+            }
             guard.push(Arc::downgrade(&child.node));
         }
         child
@@ -183,6 +193,46 @@ impl CancellationToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_finished_child_registrations_remain_bounded() {
+        let parent = CancellationToken::new();
+        for _ in 0..10_000 {
+            let child = parent.child_token();
+            child.cancel();
+            drop(child);
+        }
+        let registered = parent.children.lock().unwrap();
+        let live = registered
+            .iter()
+            .filter(|child| child.strong_count() > 0)
+            .count();
+        assert_eq!(live, 0);
+        assert!(
+            registered.len() <= 128,
+            "{} expired child registrations remain with no live children",
+            registered.len()
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_live_children_cancellable() {
+        let parent = CancellationToken::new();
+        let mut live = Vec::new();
+        for i in 0..1_000 {
+            let child = parent.child_token();
+            if i % 10 == 0 {
+                live.push(child);
+            }
+        }
+        assert_eq!(live.len(), 100);
+        assert!(
+            parent.children.lock().unwrap().len() <= 2 * live.len() + 2 * PRUNE_FLOOR,
+            "registrations must stay within a small multiple of live children"
+        );
+        parent.cancel();
+        assert!(live.iter().all(CancellationToken::is_cancelled));
+    }
 
     #[test]
     fn f03_job_binding_is_bounded_and_does_not_retain_book() {

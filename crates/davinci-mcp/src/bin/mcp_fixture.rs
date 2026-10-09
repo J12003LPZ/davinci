@@ -13,7 +13,9 @@
 //! `--rpc-error` answers `tools/call` without `text` with `-32602`,
 //! `--paged` splits both lists over two `nextCursor` pages and lists a
 //! tool whose name is not an identifier,
-//! `--list-error` answers `tools/list` with `-32603`.
+//! `--list-error` answers `tools/list` with `-32603`,
+//! `--batch` wraps every reply in a JSON-RPC batch with a notification and a
+//! server ping ahead of it.
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -29,6 +31,7 @@ struct Flags {
     rpc_error: bool,
     paged: bool,
     list_error: bool,
+    batch: bool,
 }
 
 fn main() {
@@ -45,6 +48,7 @@ fn main() {
         rpc_error: has("--rpc-error"),
         paged: has("--paged"),
         list_error: has("--list-error"),
+        batch: has("--batch"),
     };
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -142,7 +146,13 @@ fn main() {
             ),
             _ => ok(&id, json!({})),
         };
-        let _ = writeln!(stdout, "{reply}");
+        if flags.batch {
+            let note = json!({"jsonrpc":"2.0","method":"notifications/message","params":{"level":"debug","data":"batch"}});
+            let ping = json!({"jsonrpc":"2.0","id":"server-ping","method":"ping"});
+            let _ = writeln!(stdout, "{}", json!([note, ping, reply]));
+        } else {
+            let _ = writeln!(stdout, "{reply}");
+        }
         let _ = stdout.flush();
         if flags.chatty && method == "initialize" {
             for i in 0..10_000 {

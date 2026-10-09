@@ -175,20 +175,23 @@ impl HttpTransport {
                 let Ok(value) = serde_json::from_str::<Value>(&event) else {
                     continue;
                 };
-                if let (Some(id), Some(method)) = (
-                    value.get("id").cloned(),
-                    value.get("method").and_then(Value::as_str),
-                ) {
-                    self.answer_server_request(id, method)?;
-                    continue;
-                }
-                match want {
-                    Some(id) if value.get("id") == Some(id) => {
-                        validate_response(&value, id)?;
-                        return Ok(value);
+                // A 2025-03-26 server may send a JSON-RPC batch as one event.
+                for message in flatten_batch(value) {
+                    if let (Some(id), Some(method)) = (
+                        message.get("id").cloned(),
+                        message.get("method").and_then(Value::as_str),
+                    ) {
+                        self.answer_server_request(id, method)?;
+                        continue;
                     }
-                    Some(_) => {}
-                    None => last = Some(value),
+                    match want {
+                        Some(id) if message.get("id") == Some(id) => {
+                            validate_response(&message, id)?;
+                            return Ok(message);
+                        }
+                        Some(_) => {}
+                        None => last = Some(message),
+                    }
                 }
                 continue;
             }
@@ -202,13 +205,15 @@ impl HttpTransport {
         if !data.is_empty() {
             let value: Value = serde_json::from_str(&data)
                 .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
-            if let Some(id) = want {
-                if value.get("id") == Some(id) {
-                    validate_response(&value, id)?;
-                    return Ok(value);
+            for message in flatten_batch(value) {
+                if let Some(id) = want {
+                    if message.get("method").is_none() && message.get("id") == Some(id) {
+                        validate_response(&message, id)?;
+                        return Ok(message);
+                    }
+                } else {
+                    last = Some(message);
                 }
-            } else {
-                last = Some(value);
             }
         }
         match want {
@@ -322,6 +327,16 @@ fn read_response_body(reader: impl Read, limit: usize) -> Result<String> {
     Ok(text)
 }
 
+/// The messages of one decoded frame: a JSON-RPC batch (allowed by the
+/// 2025-03-26 transport spec) yields its members, anything else yields itself.
+/// The caller still applies envelope validation to each member.
+pub(crate) fn flatten_batch(value: Value) -> impl Iterator<Item = Value> {
+    match value {
+        Value::Array(items) => items.into_iter(),
+        other => vec![other].into_iter(),
+    }
+}
+
 fn validate_response(value: &Value, wanted: &Value) -> Result<()> {
     let valid = !wanted.is_null()
         && value.get("id") == Some(wanted)
@@ -372,26 +387,44 @@ pub fn parse_http_body(content_type: &str, text: &str, want: Option<&Value>) -> 
         return Ok(Value::Null);
     }
     if !content_type.contains("text/event-stream") {
-        let value =
+        let value: Value =
             serde_json::from_str(text).map_err(|err| Error::Transport(format!("json: {err}")))?;
-        if let Some(id) = want {
+        let Some(id) = want else {
+            return Ok(value);
+        };
+        if !value.is_array() {
             validate_response(&value, id)?;
+            return Ok(value);
         }
-        return Ok(value);
+        // A batch: the reply is the member answering `id`; the rest are
+        // notifications or server requests we cannot answer after the fact.
+        let reply = flatten_batch(value)
+            .find(|message| message.get("method").is_none() && message.get("id") == Some(id));
+        return match reply {
+            Some(message) => {
+                validate_response(&message, id)?;
+                Ok(message)
+            }
+            None => Err(Error::Protocol(
+                "invalid or uncorrelated MCP response envelope".into(),
+            )),
+        };
     }
     let mut last = None;
     for data in sse_events(text) {
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
-        match want {
-            Some(id) => {
-                if value.get("method").is_none() && value.get("id") == Some(id) {
-                    validate_response(&value, id)?;
-                    return Ok(value);
+        for message in flatten_batch(value) {
+            match want {
+                Some(id) => {
+                    if message.get("method").is_none() && message.get("id") == Some(id) {
+                        validate_response(&message, id)?;
+                        return Ok(message);
+                    }
                 }
+                None => last = Some(message),
             }
-            None => last = Some(value),
         }
     }
     match want {
@@ -500,6 +533,35 @@ mod tests {
         let result = transport.call("tools/call", serde_json::json!({})).unwrap();
         assert_eq!(result["ok"], true);
         assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_sse_batch_returns_the_correlated_reply() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_test_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            write!(
+                stream,
+                "data: [{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}},\
+                 {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"ok\":true}}}}]\n\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let mut transport =
+            HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+        transport.set_call_timeout(Duration::from_secs(5));
+        let result = transport.call("tools/call", serde_json::json!({})).unwrap();
+        assert_eq!(result["ok"], true);
         server.join().unwrap();
     }
 

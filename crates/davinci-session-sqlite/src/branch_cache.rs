@@ -150,15 +150,26 @@ pub fn read_cached_branch_ids(
     session_id: &str,
     branch_id: &str,
 ) -> Result<Vec<String>, SessionError> {
+    read_cached_branch_ids_through(conn, session_id, branch_id, i64::MAX)
+}
+
+/// Entries of `branch_id` up to and including `through_seq`: the path to a
+/// leaf, not the whole branch that happens to contain it.
+pub fn read_cached_branch_ids_through(
+    conn: &Connection,
+    session_id: &str,
+    branch_id: &str,
+    through_seq: i64,
+) -> Result<Vec<String>, SessionError> {
     let mut stmt = conn
         .prepare(
             "SELECT entry_id FROM branch_entries
-             WHERE session_id = ?1 AND branch_id = ?2
+             WHERE session_id = ?1 AND branch_id = ?2 AND entry_seq <= ?3
              ORDER BY entry_seq",
         )
         .map_err(|err| SessionError::storage(format!("Unable to query cached branch: {err}")))?;
     let rows = stmt
-        .query_map(params![session_id, branch_id], |row| {
+        .query_map(params![session_id, branch_id, through_seq], |row| {
             row.get::<_, String>(0)
         })
         .map_err(|err| SessionError::storage(format!("Unable to read cached branch: {err}")))?;
@@ -171,13 +182,24 @@ pub fn branch_id_for_entry(
     session_id: &str,
     entry_id: &str,
 ) -> Result<Option<String>, SessionError> {
+    Ok(branch_position_for_entry(conn, session_id, entry_id)?.map(|(branch_id, _)| branch_id))
+}
+
+/// A branch containing `entry_id` and the entry's sequence in it. Every branch
+/// holding the entry shares the same prefix through it, so the pair identifies
+/// the root-to-entry path without picking up later descendants.
+pub fn branch_position_for_entry(
+    conn: &Connection,
+    session_id: &str,
+    entry_id: &str,
+) -> Result<Option<(String, i64)>, SessionError> {
     conn.query_row(
-        "SELECT branch_id FROM branch_entries
+        "SELECT branch_id, entry_seq FROM branch_entries
          WHERE session_id = ?1 AND entry_id = ?2
          ORDER BY branch_id
          LIMIT 1",
         params![session_id, entry_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
     .map_err(|err| SessionError::storage(format!("Unable to read cached branch id: {err}")))

@@ -12,7 +12,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub use branch_cache::{
-    append_entry_to_branch_cache, branch_id_for_entry, delete_branch_cache, read_cached_branch_ids,
+    append_entry_to_branch_cache, branch_id_for_entry, branch_position_for_entry,
+    delete_branch_cache, read_cached_branch_ids, read_cached_branch_ids_through,
     rebuild_branch_cache,
 };
 
@@ -497,12 +498,14 @@ impl SqliteSessionStore {
         session_id: &str,
         leaf_id: &str,
     ) -> Result<Vec<String>, SessionError> {
-        let Some(branch_id) = branch_id_for_entry(&self.conn, session_id, leaf_id)? else {
+        let Some((branch_id, leaf_seq)) =
+            branch_position_for_entry(&self.conn, session_id, leaf_id)?
+        else {
             return Err(SessionError::invalid_entry(format!(
                 "Branch cache has no branch containing parent entry {leaf_id}"
             )));
         };
-        read_cached_branch_ids(&self.conn, session_id, &branch_id)
+        read_cached_branch_ids_through(&self.conn, session_id, &branch_id, leaf_seq)
     }
 
     pub fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionSummary>, SessionError> {

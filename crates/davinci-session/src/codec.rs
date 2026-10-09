@@ -158,8 +158,9 @@ fn parse_fact(
     let seq = require_sequence(value.get("seq")).unwrap_or(seq);
     match value.get("fact").and_then(Value::as_str) {
         Some("name") => {
+            // The encoder writes a cleared name as an explicit null; absent means clear too.
             if let Some(name) = value.get("name") {
-                if !name.is_string() {
+                if !name.is_string() && !name.is_null() {
                     return Err(JsonlDecodeError::schema("has invalid name"));
                 }
             }
@@ -173,7 +174,7 @@ fn parse_fact(
         }
         Some("label") => {
             if let Some(label) = value.get("label") {
-                if !label.is_string() {
+                if !label.is_string() && !label.is_null() {
                     return Err(JsonlDecodeError::schema("has invalid label"));
                 }
             }

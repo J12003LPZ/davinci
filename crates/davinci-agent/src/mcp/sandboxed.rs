@@ -336,6 +336,15 @@ fn decode_response(response: Value, expected_id: u64) -> Result<Value> {
     if response.get("id").and_then(Value::as_u64) != Some(expected_id) {
         return Err(Error::Protocol("MCP response id mismatch".into()));
     }
+    // Same envelope contract as the native stdio and HTTP transports.
+    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || response.get("method").is_some()
+        || response.get("result").is_some() == response.get("error").is_some()
+    {
+        return Err(Error::Protocol(format!(
+            "invalid MCP response envelope `{response}`"
+        )));
+    }
     if let Some(error) = response.get("error") {
         let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32603);
         let message = error
@@ -419,6 +428,39 @@ fn resolve_program(command: &str, cwd: &Path) -> std::result::Result<PathBuf, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_supervised_mcp_rejects_response_without_jsonrpc_version() {
+        let mut state = State::default();
+        state.receive_stdout(b"{\"id\":7,\"result\":{\"ok\":true}}\n");
+        let response = state.responses.remove(&7).unwrap();
+        let decoded = decode_response(response, 7);
+        assert!(
+            matches!(decoded, Err(Error::Protocol(_))),
+            "invalid envelope reached the consumer: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn supervised_mcp_rejects_every_malformed_envelope_but_keeps_null_results() {
+        for bad in [
+            json!({"jsonrpc":"1.0","id":7,"result":{}}),
+            json!({"id":7,"result":{}}),
+            json!({"jsonrpc":"2.0","id":7}),
+            json!({"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-1,"message":"x"}}),
+            json!({"jsonrpc":"2.0","id":7,"method":"ping","result":{}}),
+        ] {
+            let decoded = decode_response(bad.clone(), 7);
+            assert!(
+                matches!(decoded, Err(Error::Protocol(_))),
+                "{bad}: {decoded:?}"
+            );
+        }
+        assert_eq!(
+            decode_response(json!({"jsonrpc":"2.0","id":7,"result":null}), 7).unwrap(),
+            Value::Null
+        );
+    }
 
     fn sandbox(allow: &[&str]) -> SandboxSpec {
         use davinci_protocol::{

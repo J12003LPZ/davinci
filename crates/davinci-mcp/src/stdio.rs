@@ -143,25 +143,40 @@ impl StdioTransport {
                         break;
                     }
                 };
-                let Ok(Value::Object(message)) = serde_json::from_str::<Value>(line.trim()) else {
+                let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
                     continue;
                 };
-                if let Some(method) = message.get("method").and_then(Value::as_str) {
-                    if let Some(id) = message.get("id").cloned() {
-                        let reply = server_request_reply(id, method);
-                        if let Err(error) = write_shared_line(&response_writer, &reply) {
-                            let _ = sender.send(Err(error));
-                            break;
+                // A line is one message or, per 2025-03-26, a JSON-RPC batch.
+                let mut stop = false;
+                for message in crate::http::flatten_batch(frame) {
+                    let Value::Object(message) = message else {
+                        continue;
+                    };
+                    if let Some(method) = message.get("method").and_then(Value::as_str) {
+                        if let Some(id) = message.get("id").cloned() {
+                            let reply = server_request_reply(id, method);
+                            if let Err(error) = write_shared_line(&response_writer, &reply) {
+                                let _ = sender.send(Err(error));
+                                stop = true;
+                                break;
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    if message.get("id").is_none()
+                        || (!message.contains_key("result") && !message.contains_key("error"))
+                    {
+                        continue;
+                    }
+                    let Ok(reply) = serde_json::to_string(&message) else {
+                        continue;
+                    };
+                    if sender.send(Ok(reply)).is_err() {
+                        stop = true;
+                        break;
+                    }
                 }
-                if message.get("id").is_none()
-                    || (!message.contains_key("result") && !message.contains_key("error"))
-                {
-                    continue;
-                }
-                if sender.send(Ok(line)).is_err() {
+                if stop {
                     break;
                 }
             }
