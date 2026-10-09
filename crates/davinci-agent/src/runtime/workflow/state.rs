@@ -5,7 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
@@ -66,7 +67,13 @@ impl WorkflowArtifact {
 
 type PhaseArtifactMap = HashMap<(WorkflowId, String), Vec<Uuid>>;
 
-/// Thread-safe in-memory and disk-overflow artifact store.
+/// Per-workflow append-only record of every artifact's metadata (and inline
+/// value), so a new store over the same directory can resume the workflow.
+const MANIFEST_FILE: &str = "artifacts.jsonl";
+
+/// Thread-safe artifact store. Large values overflow to their own file, and
+/// every artifact is recorded in its workflow's manifest before it is
+/// visible, so artifacts survive a restart (WOR-104).
 #[derive(Debug, Clone)]
 pub struct WorkflowStateStore {
     max_inline_bytes: usize,
@@ -74,6 +81,8 @@ pub struct WorkflowStateStore {
     artifacts: Arc<RwLock<HashMap<Uuid, WorkflowArtifact>>>,
     // (workflow_id, phase_id) -> list of artifact ids
     phase_index: Arc<RwLock<PhaseArtifactMap>>,
+    /// Workflows whose manifest has been read into memory.
+    loaded: Arc<RwLock<HashSet<WorkflowId>>>,
 }
 
 impl Default for WorkflowStateStore {
@@ -98,7 +107,95 @@ impl WorkflowStateStore {
             overflow_dir,
             artifacts: Arc::new(RwLock::new(HashMap::new())),
             phase_index: Arc::new(RwLock::new(HashMap::new())),
+            loaded: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    fn manifest_path(&self, workflow_id: WorkflowId) -> PathBuf {
+        self.overflow_dir
+            .join(workflow_id.to_string())
+            .join(MANIFEST_FILE)
+    }
+
+    /// Read a workflow's manifest into memory once. A line that does not
+    /// parse is skipped: only a crash mid-append leaves one, and only last.
+    fn ensure_loaded(&self, workflow_id: WorkflowId) {
+        if self
+            .loaded
+            .read()
+            .is_ok_and(|loaded| loaded.contains(&workflow_id))
+        {
+            return;
+        }
+        let Ok(mut loaded) = self.loaded.write() else {
+            return;
+        };
+        if !loaded.insert(workflow_id) {
+            return;
+        }
+        let Ok(file) = std::fs::File::open(self.manifest_path(workflow_id)) else {
+            return;
+        };
+        let mut arts = self.artifacts.write().unwrap_or_else(|e| e.into_inner());
+        let mut index = self.phase_index.write().unwrap_or_else(|e| e.into_inner());
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(artifact) = serde_json::from_str::<WorkflowArtifact>(&line) else {
+                continue;
+            };
+            if artifact.workflow_id != workflow_id || arts.contains_key(&artifact.id) {
+                continue;
+            }
+            index
+                .entry((workflow_id, artifact.phase_id.clone()))
+                .or_default()
+                .push(artifact.id);
+            arts.insert(artifact.id, artifact);
+        }
+    }
+
+    /// Load every workflow manifest under the store directory, for a lookup
+    /// by artifact ID alone.
+    fn load_all(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.overflow_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<WorkflowId>().ok())
+            {
+                self.ensure_loaded(id);
+            }
+        }
+    }
+
+    fn append_manifest(&self, artifact: &WorkflowArtifact) -> Result<(), WorkflowStateError> {
+        let io = |e: std::io::Error| WorkflowStateError::IoError(e.to_string());
+        let path = self.manifest_path(artifact.workflow_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io)?;
+        }
+        let mut line = serde_json::to_vec(artifact)
+            .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
+        line.push(b'\n');
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(io)?;
+        // After a torn tail, start on a fresh line so this record stays whole.
+        if file.metadata().map_err(io)?.len() > 0 {
+            let mut last = [0u8; 1];
+            file.seek(SeekFrom::End(-1)).map_err(io)?;
+            file.read_exact(&mut last).map_err(io)?;
+            if last[0] != b'\n' {
+                line.insert(0, b'\n');
+            }
+        }
+        file.write_all(&line).map_err(io)?;
+        file.sync_data().map_err(io)
     }
 
     /// Store an artifact produced by a worker.
@@ -110,6 +207,8 @@ impl WorkflowStateStore {
         value: Value,
         schema: Option<Value>,
     ) -> Result<WorkflowArtifact, WorkflowStateError> {
+        // Earlier artifacts of this workflow keep their place ahead of it.
+        self.ensure_loaded(workflow_id);
         let serialized = serde_json::to_string(&value)
             .map_err(|e| WorkflowStateError::SerializationError(e.to_string()))?;
         let byte_size = serialized.len();
@@ -151,6 +250,13 @@ impl WorkflowStateStore {
             created_ms: now,
         };
 
+        if let Err(error) = self.append_manifest(&artifact) {
+            if let Some(path) = &artifact.overflow_path {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
+        }
+
         {
             let mut arts = self.artifacts.write().unwrap();
             arts.insert(id, artifact.clone());
@@ -169,8 +275,11 @@ impl WorkflowStateStore {
 
     /// Get an artifact by ID.
     pub fn get_artifact(&self, id: &Uuid) -> Option<WorkflowArtifact> {
-        let arts = self.artifacts.read().unwrap();
-        arts.get(id).cloned()
+        if let Some(artifact) = self.artifacts.read().unwrap().get(id) {
+            return Some(artifact.clone());
+        }
+        self.load_all();
+        self.artifacts.read().unwrap().get(id).cloned()
     }
 
     /// Retrieve the full artifact content even if stored in overflow.
@@ -200,6 +309,7 @@ impl WorkflowStateStore {
         workflow_id: WorkflowId,
         phase_id: &str,
     ) -> Vec<WorkflowArtifact> {
+        self.ensure_loaded(workflow_id);
         let index = self.phase_index.read().unwrap();
         let arts = self.artifacts.read().unwrap();
         if let Some(ids) = index.get(&(workflow_id, phase_id.to_string())) {
@@ -294,5 +404,83 @@ mod tests {
         let full_val = store.get_full_value(&artifact.id).unwrap();
         assert_eq!(full_val["status"], "ok");
         assert_eq!(full_val["large_data"].as_str().unwrap().len(), 1024 * 1024);
+    }
+
+    /// WOR-104: a new store over the same directory finds the artifacts of an
+    /// earlier process, inline and overflow, in their original order.
+    #[test]
+    fn wor104_artifacts_survive_a_restart() {
+        let tmp = tempdir().unwrap();
+        let wf_id = WorkflowId::new();
+        let worker = AgentId::new();
+        let (small, large) = {
+            let store = WorkflowStateStore::with_options(64, tmp.path().to_path_buf());
+            let small = store
+                .put_artifact(wf_id, "plan", worker, serde_json::json!({"step": 1}), None)
+                .unwrap();
+            let large = store
+                .put_artifact(
+                    wf_id,
+                    "plan",
+                    worker,
+                    serde_json::json!({"blob": "y".repeat(500)}),
+                    None,
+                )
+                .unwrap();
+            assert!(large.is_overflow);
+            (small, large)
+        };
+
+        let restarted = WorkflowStateStore::with_options(64, tmp.path().to_path_buf());
+        let ids: Vec<_> = restarted
+            .list_phase_artifacts(wf_id, "plan")
+            .into_iter()
+            .map(|artifact| artifact.id)
+            .collect();
+        assert_eq!(ids, [small.id, large.id]);
+        assert_eq!(
+            restarted.get_full_value(&large.id).unwrap()["blob"],
+            "y".repeat(500)
+        );
+
+        // A lookup by ID alone finds it too, and new artifacts go after.
+        let by_id = WorkflowStateStore::with_options(64, tmp.path().to_path_buf());
+        assert_eq!(by_id.get_artifact(&small.id).unwrap(), small);
+        let next = by_id
+            .put_artifact(wf_id, "plan", worker, serde_json::json!({"step": 2}), None)
+            .unwrap();
+        let ids: Vec<_> = by_id
+            .list_phase_artifacts(wf_id, "plan")
+            .into_iter()
+            .map(|artifact| artifact.id)
+            .collect();
+        assert_eq!(ids, [small.id, large.id, next.id]);
+    }
+
+    /// A crash mid-append leaves a torn last line; the rest still loads.
+    #[test]
+    fn wor104_torn_manifest_tail_is_skipped() {
+        let tmp = tempdir().unwrap();
+        let wf_id = WorkflowId::new();
+        let store = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        let kept = store
+            .put_artifact(wf_id, "p", AgentId::new(), serde_json::json!(1), None)
+            .unwrap();
+        let manifest = store.manifest_path(wf_id);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&manifest)
+            .unwrap();
+        file.write_all(b"{\"id\":\"trunc").unwrap();
+        drop(file);
+        let restarted = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        assert_eq!(restarted.list_phase_artifacts(wf_id, "p"), [kept.clone()]);
+
+        // The next append starts a fresh line instead of joining the torn one.
+        let next = restarted
+            .put_artifact(wf_id, "p", AgentId::new(), serde_json::json!(2), None)
+            .unwrap();
+        let again = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
+        assert_eq!(again.list_phase_artifacts(wf_id, "p"), [kept, next]);
     }
 }
