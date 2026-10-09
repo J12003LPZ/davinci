@@ -300,3 +300,128 @@ fn repo_intelligence_symlink_source_and_ignore_never_escape() {
     assert!(manager.refresh().unwrap().files.is_empty());
     assert!(manager.validate_path("escape.ts").is_err());
 }
+
+fn dependency_targets(manager: &RepoIntelligence, path: &str) -> Vec<String> {
+    let deps = manager
+        .query("file_dependencies", &json!({ "path": path }))
+        .unwrap();
+    deps["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["target"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn repo_intelligence_package_exports_conditions_subpaths_and_tsconfig_extends() {
+    let repo = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let write = |path: &str, body: &str| {
+        let path = repo.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    };
+    write(
+        "packages/core/package.json",
+        r#"{"name":"@app/core","exports":{
+            ".":{"types":"./dist/index.d.ts","import":"./src/index.ts","require":"./dist/index.cjs"},
+            "./utils":"./src/utils.ts",
+            "./features/*":{"default":"./src/features/*.ts"},
+            "./private/*":null
+        }}"#,
+    );
+    write("packages/core/src/index.ts", "export function core() {}");
+    write("packages/core/src/utils.ts", "export function util() {}");
+    write(
+        "packages/core/src/features/flag.ts",
+        "export const flag = 1;",
+    );
+    write(
+        "packages/conditions/package.json",
+        r#"{"name":"cond","exports":{"import":"./lib/main.ts","types":"./lib/main.d.ts"}}"#,
+    );
+    write("packages/conditions/lib/main.ts", "export const main = 1;");
+    write(
+        "tsconfig.base.json",
+        r##"{"compilerOptions":{"baseUrl":".","paths":{"#shared/*":["shared/*"]}}}"##,
+    );
+    write("shared/log.ts", "export function log() {}");
+    write(
+        "apps/web/tsconfig.json",
+        r#"{"extends":"../../tsconfig.base","compilerOptions":{"strict":true}}"#,
+    );
+    // A cycle in `extends` must terminate.
+    write(
+        "apps/loop/tsconfig.json",
+        r#"{"extends":"./tsconfig.json"}"#,
+    );
+    write("apps/loop/a.ts", "import '#shared/log';");
+    write(
+        "apps/web/src/a.ts",
+        "import '@app/core'; import '@app/core/utils'; import '@app/core/features/flag'; \
+         import 'cond'; import '#shared/log';",
+    );
+
+    let manager = RepoIntelligence::new(repo.path(), cache.path(), Default::default());
+    let targets = dependency_targets(&manager, "apps/web/src/a.ts");
+    for expected in [
+        "packages/core/src/index.ts",
+        "packages/core/src/utils.ts",
+        "packages/core/src/features/flag.ts",
+        "packages/conditions/lib/main.ts",
+        "shared/log.ts",
+    ] {
+        assert!(
+            targets.iter().any(|t| t == expected),
+            "{expected}: {targets:?}"
+        );
+    }
+    assert!(dependency_targets(&manager, "apps/loop/a.ts").is_empty());
+}
+
+#[test]
+fn repo_intelligence_export_star_barrels_resolve_calls() {
+    let repo = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("core.ts"), "export function helper() {}").unwrap();
+    fs::write(
+        repo.path().join("other.ts"),
+        "export function unrelated() {}",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("index.ts"),
+        "export * from './other'; export * from './core';",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("use.ts"),
+        "import {helper} from './index'; export function run() { helper(); }",
+    )
+    .unwrap();
+    let manager = RepoIntelligence::new(repo.path(), cache.path(), Default::default());
+    let index = manager.refresh().unwrap();
+    let symbol = index.files["use.ts"]
+        .symbols
+        .iter()
+        .find(|s| s.name == "run")
+        .unwrap();
+    let result = manager
+        .query("symbol_relationships", &json!({"symbolId":symbol.id}))
+        .unwrap();
+    let calls: Vec<_> = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["kind"] == "calls")
+        .collect();
+    assert_eq!(calls.len(), 1, "{result}");
+    assert_eq!(calls[0]["resolved"], true, "{result}");
+    let helper = index.files["core.ts"]
+        .symbols
+        .iter()
+        .find(|s| s.name == "helper")
+        .unwrap();
+    assert_eq!(calls[0]["target_symbol"], helper.id.as_str(), "{result}");
+}

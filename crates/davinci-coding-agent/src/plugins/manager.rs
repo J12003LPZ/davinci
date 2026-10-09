@@ -464,6 +464,9 @@ fn edit_servers(
     path: &Path,
     edit: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<(), String>,
 ) -> Result<(), String> {
+    // Held across read, modify and write so concurrent edits (another
+    // toggle, or a registry install) are not lost.
+    let _lock = store::lock_registry(path)?;
     let body = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let mut doc: Value =
         serde_json::from_str(&body).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -560,6 +563,42 @@ mod tests {
             body: String::new(),
             base_dir: path.parent().unwrap().to_path_buf(),
         }
+    }
+
+    #[test]
+    fn concurrent_mcp_json_edits_are_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{"base":{"command":"x"}}}"#).unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for round in 0..5 {
+                        let name = format!("s{index}-{round}");
+                        if index % 2 == 0 {
+                            super::super::discover::add_server(
+                                &path,
+                                &name,
+                                serde_json::json!({"command":"x"}),
+                            )
+                            .unwrap();
+                        } else {
+                            edit_servers(&path, |servers| {
+                                servers.insert(name, serde_json::json!({"command":"x"}));
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["mcpServers"].as_object().unwrap().len(), 41);
     }
 
     #[test]

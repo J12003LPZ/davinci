@@ -245,7 +245,8 @@ fn import_bindings(node: Node<'_>, source: &str) -> BTreeMap<String, String> {
                 }
                 continue;
             }
-            "namespace_import" => {
+            // `export * as ns from` binds `ns`; a bare `export *` binds nothing.
+            "namespace_import" | "namespace_export" => {
                 let mut cursor = item.walk();
                 if let Some(name) = item
                     .named_children(&mut cursor)

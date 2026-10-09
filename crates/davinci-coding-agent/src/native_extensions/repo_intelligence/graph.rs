@@ -175,14 +175,37 @@ fn exported_symbol<'a>(
         .imports
         .iter()
         .filter(|import| import.reexport && import.bindings.contains_key(name));
-    let import = matches.next()?;
-    if matches.next().is_some() {
+    if let Some(import) = matches.next() {
+        if matches.next().is_some() {
+            return None;
+        }
+        return exported_symbol(
+            index,
+            &resolve(index, path, &import.specifier)?,
+            &import.bindings[name],
+            seen,
+        );
+    }
+    // `export * from` forwards every named export except `default`; a name
+    // reachable through more than one barrel is ambiguous, as in ECMAScript.
+    if name == "default" {
         return None;
     }
-    exported_symbol(
-        index,
-        &resolve(index, path, &import.specifier)?,
-        &import.bindings[name],
-        seen,
-    )
+    let mut found: Option<&Symbol> = None;
+    for import in file
+        .imports
+        .iter()
+        .filter(|import| import.reexport && import.bindings.is_empty())
+    {
+        let Some(target) = resolve(index, path, &import.specifier) else {
+            continue;
+        };
+        if let Some(symbol) = exported_symbol(index, &target, name, seen) {
+            if found.is_some_and(|existing| existing.id != symbol.id) {
+                return None;
+            }
+            found = Some(symbol);
+        }
+    }
+    found
 }

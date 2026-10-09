@@ -69,7 +69,7 @@ impl Plugin {
 
 pub fn read_manifest(root: &Path) -> Option<Value> {
     MANIFEST_PATHS.iter().find_map(|rel| {
-        let body = fs::read_to_string(root.join(rel)).ok()?;
+        let body = fs::read_to_string(resolve_inside(root, rel)?).ok()?;
         serde_json::from_str(&body).ok()
     })
 }
@@ -105,7 +105,7 @@ pub fn load_plugin(root: &Path) -> Result<Plugin, String> {
     };
 
     for dir in component_paths(&root, &manifest, "skills", "skills", &mut plugin.warnings) {
-        collect_skill_files(&dir, &mut plugin.skill_files);
+        collect_skill_files(&root, &dir, &mut plugin.skill_files);
     }
     for path in component_paths(
         &root,
@@ -114,10 +114,10 @@ pub fn load_plugin(root: &Path) -> Result<Plugin, String> {
         "commands",
         &mut plugin.warnings,
     ) {
-        collect_markdown(&path, 3, &mut plugin.command_files);
+        collect_markdown(&root, &path, 3, &mut plugin.command_files);
     }
     for path in component_paths(&root, &manifest, "agents", "agents", &mut plugin.warnings) {
-        collect_markdown(&path, 2, &mut plugin.agent_files);
+        collect_markdown(&root, &path, 2, &mut plugin.agent_files);
     }
     dedupe(&mut plugin.skill_files);
     dedupe(&mut plugin.command_files);
@@ -134,10 +134,12 @@ pub fn load_plugin(root: &Path) -> Result<Plugin, String> {
             }
         }
     }
-    let default_hooks = root.join("hooks").join("hooks.json");
     // `manifest_paths` drops an explicit `hooks/hooks.json`, so the default
-    // file is never read twice.
-    if default_hooks.is_file() {
+    // file is never read twice. A default that resolves outside the plugin
+    // (a symlink) is ignored like any other escaping path.
+    if let Some(default_hooks) =
+        resolve_inside(&root, "hooks/hooks.json").filter(|path| path.is_file())
+    {
         push_json_file(&default_hooks, &mut hook_docs, &mut plugin.warnings);
     }
     for doc in &hook_docs {
@@ -156,8 +158,7 @@ pub fn load_plugin(root: &Path) -> Result<Plugin, String> {
             }
         }
     }
-    let default_mcp = root.join(".mcp.json");
-    if default_mcp.is_file() {
+    if let Some(default_mcp) = resolve_inside(&root, ".mcp.json").filter(|path| path.is_file()) {
         push_json_file(&default_mcp, &mut mcp_docs, &mut plugin.warnings);
     }
     for doc in mcp_docs {
@@ -182,8 +183,7 @@ fn component_paths(
     warnings: &mut Vec<String>,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let default = root.join(default_dir);
-    if default.exists() {
+    if let Some(default) = resolve_inside(root, default_dir) {
         out.push(default);
     }
     if let Some(value) = manifest.get(key) {
@@ -247,16 +247,28 @@ pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
     Ok(resolved)
 }
 
-fn collect_skill_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// True when `path` resolves (through any symlinks) to a file inside `root`.
+fn file_inside(root: &Path, path: &Path) -> bool {
+    path.is_file()
+        && canonical(path).is_ok_and(|resolved| {
+            canonical(root).is_ok_and(|canonical_root| resolved.starts_with(canonical_root))
+        })
+}
+
+fn collect_skill_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     if dir.is_file() {
-        if dir.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        if dir.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+            && file_inside(root, dir)
+        {
             out.push(dir.to_path_buf());
         }
         return;
     }
     let direct = dir.join("SKILL.md");
     if direct.is_file() {
-        out.push(direct);
+        if file_inside(root, &direct) {
+            out.push(direct);
+        }
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -265,15 +277,15 @@ fn collect_skill_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut found: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path().join("SKILL.md"))
-        .filter(|path| path.is_file())
+        .filter(|path| file_inside(root, path))
         .collect();
     found.sort();
     out.extend(found);
 }
 
-fn collect_markdown(path: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn collect_markdown(root: &Path, path: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if path.is_file() {
-        if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("md") && file_inside(root, path) {
             out.push(path.to_path_buf());
         }
         return;
@@ -284,6 +296,7 @@ fn collect_markdown(path: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         .flatten()
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
+        .filter(|path| file_inside(root, path))
         .filter(|path| {
             path.extension().and_then(|ext| ext.to_str()) == Some("md")
                 && !path
@@ -399,6 +412,58 @@ mod tests {
         let plugin = load_plugin(&root).unwrap();
         assert!(plugin.skill_files.is_empty());
         assert_eq!(plugin.warnings.len(), 3, "{:?}", plugin.warnings);
+    }
+
+    /// Creates a symlink, or returns false where the platform refuses
+    /// (Windows without Developer Mode).
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> bool {
+        let (target, link) = (target.as_ref(), link.as_ref());
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let made = if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+        made.is_ok()
+    }
+
+    #[test]
+    fn default_components_that_symlink_outside_the_root_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        write(&outside.join("skills/leak/SKILL.md"), "secret");
+        write(&outside.join("SKILL.md"), "secret");
+        write(&outside.join("cmd.md"), "secret");
+        write(
+            &outside.join("hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+        );
+        write(
+            &outside.join("mcp.json"),
+            r#"{"mcpServers":{"x":{"command":"x"}}}"#,
+        );
+        let root = dir.path().join("p");
+        fs::create_dir_all(root.join("hooks")).unwrap();
+        fs::create_dir_all(root.join("skills")).unwrap();
+        fs::create_dir_all(root.join("commands")).unwrap();
+        let linked = symlink(outside.join("skills"), root.join("agents"))
+            && symlink(&outside, root.join("skills/linked"))
+            && symlink(outside.join("cmd.md"), root.join("commands/linked.md"))
+            && symlink(outside.join("hooks.json"), root.join("hooks/hooks.json"))
+            && symlink(outside.join("mcp.json"), root.join(".mcp.json"));
+        if !linked {
+            eprintln!("skipping: symlinks are not available");
+            return;
+        }
+
+        let plugin = load_plugin(&root).unwrap();
+        assert!(plugin.skill_files.is_empty(), "{:?}", plugin.skill_files);
+        assert!(plugin.command_files.is_empty());
+        assert!(plugin.agent_files.is_empty());
+        assert!(plugin.hooks.is_empty());
+        assert!(plugin.mcp_servers.is_empty());
     }
 
     #[test]
