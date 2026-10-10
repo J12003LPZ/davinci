@@ -21,7 +21,7 @@ pub(super) fn quoted_assignments(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*[\s"']*[:=]\s*(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$))"#,
+            r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*[\s"']*[:=]\s*(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$))"#,
         )
         .expect("fixed quoted credential assignment pattern")
     });
@@ -38,9 +38,12 @@ pub(super) fn quoted_assignments(input: &str) -> String {
 }
 
 /// Replace every line from a `BEGIN ... PRIVATE KEY` marker through its `END`
-/// marker, or through the end of the text when the block is unterminated.
-/// Line count and terminators are preserved so line-addressed reads of the
-/// masked text still line up with the source.
+/// marker. Line count and terminators are preserved so line-addressed reads
+/// of the masked text still line up with the source.
+///
+/// A block without `END` (or a PuTTY body) continues only while lines look
+/// like key material: base64, an armor header, blank. The first other line
+/// ends it, so a planted marker cannot hide the code after it from a review.
 pub(super) fn private_key_blocks(input: &str) -> String {
     static MARKER: OnceLock<Regex> = OnceLock::new();
     let marker = MARKER.get_or_init(|| {
@@ -69,6 +72,11 @@ pub(super) fn private_key_blocks(input: &str) -> String {
         let putty_header = putty
             .captures(content)
             .map(|count| count[1].parse().unwrap_or(usize::MAX));
+        let key_material = key_material_line(content) || last.is_some() || putty_header.is_some();
+        if !key_material {
+            in_block = false;
+            putty_lines = 0;
+        }
         if in_block || last.is_some() || putty_lines > 0 || putty_header.is_some() {
             out.push_str(PRIVATE_KEY_MARKER);
             out.push_str(&line[content.len()..]);
@@ -88,14 +96,42 @@ pub(super) fn private_key_blocks(input: &str) -> String {
     out
 }
 
+/// A line that can belong to a key body: base64 (also when quoted, escaped or
+/// concatenated in source), a PEM/PGP/SSH2 armor header, or blank.
+fn key_material_line(content: &str) -> bool {
+    static HEADER: OnceLock<Regex> = OnceLock::new();
+    let header = HEADER.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(?:proc-type|dek-info|comment|version|hash|charset|subject|x-[a-z0-9-]+):",
+        )
+        .expect("fixed armor header pattern")
+    });
+    let mut line = content.trim().trim_start_matches(['"', '\'', '`', '+']);
+    loop {
+        let before = line.len();
+        line = line.trim_end_matches(['"', '\'', '`', ',', '+', ';', '\\', ' ', '\t']);
+        line = line.strip_suffix("\\n").unwrap_or(line);
+        line = line.strip_suffix("\\r").unwrap_or(line);
+        if line.len() == before {
+            break;
+        }
+    }
+    line.is_empty()
+        || header.is_match(line)
+        || line.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        })
+}
+
 /// Mask the password in `scheme://user:password@host` for any URL scheme:
 /// database, cache and broker URLs carry credentials the same way HTTP does.
-/// Passwords often hold an unencoded `@`, `/` or quote, so the mask runs to
-/// the last `@` of the whitespace-delimited token rather than the first.
+/// The mask runs to the last `@` of the authority, so a password holding an
+/// unencoded `@` or quote is covered, but stops at `/`, `?` or `#`: an `@` in
+/// a path or query (`https://host:8443/u?email=a@b`) is not userinfo.
 pub(super) fn url_credentials(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@]*:\S*@")
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@]*:[^\s/?#@]*@(?:[^\s/?#@]*@)*")
             .expect("fixed URL credential pattern")
     });
     pattern.replace_all(input, "$1[REDACTED]@").into_owned()
@@ -241,7 +277,6 @@ mod tests {
             "https://user:fixture-sensitive@example.invalid",
             // Unencoded `@` and `/` in the password.
             "postgres://admin:fixture@sensitive@db.internal/app",
-            "postgres://admin:fixture/sensitive@db.internal/app",
             "postgres://admin:fixture'sensitive\"x@db.internal/app",
             "postgres://o'neil:fixture-sensitive@db.internal/app",
             "postgres://\"admin\":fixture-sensitive@db.internal/app",
@@ -256,5 +291,60 @@ mod tests {
             url_credentials("postgres://db.internal:5432/app"),
             "postgres://db.internal:5432/app"
         );
+        // An `@` in a path, query or fragment is not userinfo: host, port and
+        // the code after them stay visible.
+        for visible in [
+            "https://api.host:8443/users?email=a@b.com",
+            "http://localhost:4873/@scope/pkg",
+            "u=\"http://x:1/\";var e=\"@\";run(e)",
+            "https://host:443#frag@x",
+        ] {
+            assert_eq!(url_credentials(visible), visible);
+        }
+    }
+
+    #[test]
+    fn a_planted_or_unterminated_marker_hides_only_key_material() {
+        // A BEGIN line with no END, then ordinary code: the code is visible.
+        let planted = format!(
+            "// -----BEGIN PRIVATE KEY-----\n{BODY}\nfn backdoor() {{ run(\"x\"); }}\nlet visible = 1;\n"
+        );
+        let output = private_key_blocks(&planted);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(
+            output.contains("fn backdoor()") && output.contains("let visible"),
+            "{output}"
+        );
+
+        // An oversized PuTTY count ends at the first non-key line.
+        let putty = format!("Private-Lines: 99999999999999999999\n{BODY}\nfn backdoor() {{}}\n");
+        let output = private_key_blocks(&putty);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(output.contains("fn backdoor()"), "{output}");
+
+        // Key bodies embedded in source keep masking across string syntax,
+        // armor headers and blank lines.
+        let embedded = format!(
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\n\"{BODY}\\n\" +\n  '{BODY}',\n{BODY}\\\nvisible();\n"
+        );
+        let output = private_key_blocks(&embedded);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(output.contains("visible();"), "{output}");
+    }
+
+    #[test]
+    fn triple_quoted_secrets_are_masked_with_their_lines() {
+        for input in [
+            "password = \"\"\"\nfixture-line-one\nfixture-line-two\n\"\"\"\nvisible = 1\n",
+            "secret = '''fixture-line-one\nfixture-line-two'''\nvisible = 1\n",
+            "api_key = \"\"\"fixture-unterminated\nfixture-line-two\n",
+        ] {
+            let output = whole_text(input);
+            assert!(!output.contains("fixture"), "{output:?}");
+            assert_eq!(output.lines().count(), input.lines().count(), "{output:?}");
+            if input.contains("visible") {
+                assert!(output.contains("visible = 1"), "{output:?}");
+            }
+        }
     }
 }

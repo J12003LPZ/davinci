@@ -4,19 +4,23 @@ use std::sync::OnceLock;
 
 pub fn text(input: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| [
-        r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*[\s\"']*[:=][\s\"']*(?:(?:basic|bearer|digest|token)\s+)?[^\s\"',;}]+"#,
-        r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/=._~-]{8,}",
-        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
-        r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+",
-        r"\bnpm_[A-Za-z0-9]{20,}",
-        r"\bglpat-[A-Za-z0-9_-]{20,}",
-        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
-    ].into_iter().map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern")).collect());
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/=._~-]{8,}",
+            r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+            r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+",
+            r"\bnpm_[A-Za-z0-9]{20,}",
+            r"\bglpat-[A-Za-z0-9_-]{20,}",
+            r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        ]
+        .into_iter()
+        .map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern"))
+        .collect()
+    });
     super::super::credential_redaction::whole_text(input)
         .lines()
         .map(|line| {
-            let mut line = super::redact_evidence(line);
+            let mut line = key_assignments(&super::redact_evidence(line));
             for pattern in patterns {
                 line = pattern.replace_all(&line, "[REDACTED]").into_owned();
             }
@@ -27,6 +31,32 @@ pub fn text(input: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `key = value`, `key: value`, `key := value` for credential-named keys.
+/// The value may not start with `=` or `>`: `token == expected` and
+/// `token => ...` are comparisons and arrows a security review needs to see,
+/// not assignments. A purely numeric value of a token key is a count
+/// (`max_tokens=100`), not a credential.
+fn key_assignments(line: &str) -> String {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)([a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*)[\s"']*(?::=|[:=])[\s"']*(?:(?:basic|bearer|digest|token)\s+)?([^\s"',;}=>][^\s"',;}]*)"#,
+        )
+        .expect("fixed credential assignment pattern")
+    });
+    pattern
+        .replace_all(line, |captures: &regex::Captures<'_>| {
+            let count = captures[1].to_ascii_lowercase().contains("token")
+                && captures[2].bytes().all(|byte| byte.is_ascii_digit());
+            if count {
+                captures[0].to_string()
+            } else {
+                "[REDACTED]".to_string()
+            }
+        })
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -126,6 +156,28 @@ mod tests {
         // No value-shape allowlist: any token-named assignment is masked,
         // including tokenizer code. Mentions without an assignment stay.
         assert_eq!(text("let token = lexer.next();"), "let [REDACTED];");
+        // Comparisons, arrows and counts are code a review must see.
+        for code in [
+            "if token == expected_token {",
+            "if password == input {",
+            "assert!(token != stored);",
+            "Some(token) => token,",
+            "max_tokens=100",
+            "let max_tokens: 4096,",
+        ] {
+            assert_eq!(text(code), code);
+        }
+        for secret in [
+            "password := fixture-sensitive",
+            "token := fixture-sensitive",
+            "api_token=12345abc",
+        ] {
+            let output = text(secret);
+            assert!(
+                !output.contains("fixture-sensitive") && !output.contains("12345abc"),
+                "{secret} -> {output}"
+            );
+        }
         for prose in [
             "the token expires after an hour",
             "Repeated grep call blocked by token governor; change the query",
