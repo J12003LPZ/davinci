@@ -165,7 +165,10 @@ impl ContextStateReducer {
                 ContextEventKind::ToolResult
                     if contains_verification_marker(&event.visible_text) =>
                 {
-                    push_unique(
+                    // A repeated result is a fresh confirmation: it moves to
+                    // the recent end, so `keep_recent` keeps what was
+                    // confirmed last rather than what was seen first.
+                    push_refreshed(
                         &mut state.verification,
                         StateValue {
                             value: excerpt(&event.visible_text),
@@ -638,11 +641,48 @@ fn keep_recent(values: &mut Vec<StateValue<String>>, limit: usize) {
     }
 }
 
+/// Provenance kept per value: the first observation and the most recent
+/// ones, so repeated confirmations cannot grow a value without bound.
+const MAX_PROVENANCE_PER_VALUE: usize = 8;
+
+/// Add `value`, or, when the same text is already there, add the new
+/// observation's provenance to it. Dropping that provenance lost the newer
+/// evidence, and transitions that require it.
 fn push_unique(values: &mut Vec<StateValue<String>>, value: StateValue<String>) {
-    if values.iter().any(|existing| existing.value == value.value) {
-        return;
+    match values
+        .iter_mut()
+        .find(|existing| existing.value == value.value)
+    {
+        Some(existing) => merge_provenance(&mut existing.provenance, value.provenance),
+        None => values.push(value),
+    }
+}
+
+/// Like `push_unique`, but a repeated value moves to the end.
+fn push_refreshed(values: &mut Vec<StateValue<String>>, mut value: StateValue<String>) {
+    if let Some(index) = values
+        .iter()
+        .position(|existing| existing.value == value.value)
+    {
+        let mut existing = values.remove(index);
+        merge_provenance(
+            &mut existing.provenance,
+            std::mem::take(&mut value.provenance),
+        );
+        value = existing;
     }
     values.push(value);
+}
+
+fn merge_provenance(provenance: &mut Vec<ProvenanceRef>, newer: Vec<ProvenanceRef>) {
+    for reference in newer {
+        if !provenance.contains(&reference) {
+            provenance.push(reference);
+        }
+    }
+    if provenance.len() > MAX_PROVENANCE_PER_VALUE {
+        provenance.drain(1..provenance.len() - (MAX_PROVENANCE_PER_VALUE - 1));
+    }
 }
 
 fn merge_values(
@@ -668,4 +708,94 @@ fn contains_verification_marker(text: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use crate::runtime::context_vm::events_from_messages;
+    use davinci_ai::ChatMessage;
+
+    fn sources(value: &StateValue<String>) -> Vec<String> {
+        value
+            .provenance
+            .iter()
+            .flat_map(|reference| reference.source_refs.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_repeated_observation_keeps_its_newer_provenance() {
+        let mut events = events_from_messages(&[
+            ChatMessage::text("user", "ship it"),
+            ChatMessage::text("user", "ship it"),
+        ]);
+        for (index, event) in events.iter_mut().enumerate() {
+            event.source_ref = format!("session:goal-{index}");
+        }
+        let mut verification = events[0].clone();
+        verification.kind = ContextEventKind::ToolResult;
+        verification.visible_text = "all tests passed".into();
+        let mut later = verification.clone();
+        verification.source_ref = "session:run-1".into();
+        later.source_ref = "session:run-2".into();
+        later.seq += 10;
+        later.content_hash = "later".into();
+        events.push(verification);
+        events.push(later);
+        let state = ContextStateReducer::deterministic_delta(&CheckpointState::default(), &events)
+            .checkpoint_patch;
+        assert_eq!(state.goals.len(), 1);
+        assert_eq!(
+            sources(&state.goals[0]),
+            ["session:goal-0", "session:goal-1"]
+        );
+        assert_eq!(state.verification.len(), 1);
+        assert_eq!(
+            sources(&state.verification[0]),
+            ["session:run-1", "session:run-2"]
+        );
+    }
+
+    #[test]
+    fn provenance_per_value_is_bounded_keeping_first_and_latest() {
+        let mut values = Vec::new();
+        for n in 0..50 {
+            push_unique(
+                &mut values,
+                StateValue {
+                    value: "same".to_string(),
+                    provenance: vec![ProvenanceRef {
+                        kind: ProvenanceKind::UserDecision,
+                        source_refs: vec![format!("session:{n}")],
+                        content_hash: format!("{n}"),
+                    }],
+                },
+            );
+        }
+        let refs = sources(&values[0]);
+        assert_eq!(refs.len(), MAX_PROVENANCE_PER_VALUE);
+        assert_eq!(refs.first().map(String::as_str), Some("session:0"));
+        assert_eq!(refs.last().map(String::as_str), Some("session:49"));
+    }
+
+    #[test]
+    fn a_reconfirmed_verification_survives_the_recent_window() {
+        let value = |text: &str, source: &str| StateValue {
+            value: text.to_string(),
+            provenance: vec![ProvenanceRef {
+                kind: ProvenanceKind::ToolEvidence,
+                source_refs: vec![source.to_string()],
+                content_hash: source.to_string(),
+            }],
+        };
+        let mut values = Vec::new();
+        push_refreshed(&mut values, value("old pass", "a"));
+        for n in 0..FALLBACK_VERIFICATION_LIMIT {
+            push_refreshed(&mut values, value(&format!("other {n}"), &format!("o{n}")));
+        }
+        push_refreshed(&mut values, value("old pass", "b"));
+        keep_recent(&mut values, FALLBACK_VERIFICATION_LIMIT);
+        assert_eq!(values.last().unwrap().value, "old pass");
+    }
 }

@@ -2,9 +2,67 @@ use super::{events::event_from_session_entry, ContextVmRuntime};
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::PathBuf,
 };
+
+/// The largest session record a source lookup buffers. `read_until` holds a
+/// newline-free record whole, so a corrupt or enormous line could allocate
+/// its full size even when the caller wants one small excerpt.
+pub(crate) const MAX_SOURCE_RECORD_BYTES: usize = 16 * 1024 * 1024;
+/// The largest header line accepted. Real headers are a few hundred bytes.
+const MAX_HEADER_BYTES: usize = 256 * 1024;
+
+/// One record read with a ceiling.
+enum Record {
+    /// A complete line in the buffer; the value is its length on disk.
+    Line(u64),
+    /// A complete line past the ceiling, skipped without being kept. The
+    /// buffer holds its first `max` bytes; the value is its length on disk.
+    Oversized(u64),
+    /// End of file, or a final line with no newline yet.
+    End,
+}
+
+fn read_record(
+    reader: &mut impl BufRead,
+    max: usize,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Record> {
+    line.clear();
+    let read = reader
+        .by_ref()
+        .take(max as u64 + 1)
+        .read_until(b'\n', line)? as u64;
+    if line.last() == Some(&b'\n') {
+        return Ok(Record::Line(read));
+    }
+    if line.len() <= max {
+        return Ok(Record::End);
+    }
+    let mut consumed = read;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(Record::End);
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => {
+                reader.consume(index + 1);
+                return Ok(Record::Oversized(consumed + index as u64 + 1));
+            }
+            None => {
+                let len = available.len();
+                consumed += len as u64;
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+fn oversized(id: &str) -> String {
+    format!("context source {id} exceeds {MAX_SOURCE_RECORD_BYTES} bytes")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionSource {
@@ -100,14 +158,15 @@ impl ContextVmRuntime {
         }
         let mut file = File::open(&binding.path).map_err(|_| "context session unavailable")?;
         let mut reader = BufReader::new(&mut file);
-        let mut header = String::new();
-        let header_len = reader
-            .read_line(&mut header)
-            .map_err(|_| "context session read failed")? as u64;
-        if header_len == 0 {
-            return Err("context session header missing".into());
-        }
-        let header = davinci_session::parse_header(header.trim_end())
+        let mut header = Vec::new();
+        let header_len = match read_record(&mut reader, MAX_HEADER_BYTES, &mut header)
+            .map_err(|_| "context session read failed")?
+        {
+            Record::Line(len) => len,
+            Record::Oversized(_) => return Err("invalid context session header".into()),
+            Record::End => return Err("context session header missing".into()),
+        };
+        let header = davinci_session::parse_header(String::from_utf8_lossy(&header).trim_end())
             .map_err(|_| "invalid context session header")?;
         if header.id != binding.id {
             return Err("context session identity changed".into());
@@ -124,7 +183,7 @@ impl ContextVmRuntime {
         let mut rebuilt = false;
         loop {
             if let Some(&offset) = index.offsets.get(id) {
-                match read_entry_at(&mut reader, offset, id) {
+                match read_entry_at(&mut reader, offset, id)? {
                     Some(entry) => {
                         let event = event_from_session_entry(&entry)
                             .ok_or("context source has no visible content")?;
@@ -164,17 +223,31 @@ impl ContextVmRuntime {
         let mut line = Vec::new();
         let mut scanned = 0u64;
         let mut found = false;
+        let wanted = format!("\"id\":\"{id}\"");
         loop {
-            line.clear();
-            let read = reader
-                .read_until(b'\n', &mut line)
-                .map_err(|_| "context session read failed")?;
-            if read == 0 || line.last() != Some(&b'\n') {
-                break;
-            }
+            let read = match read_record(reader, MAX_SOURCE_RECORD_BYTES, &mut line)
+                .map_err(|_| "context session read failed")?
+            {
+                Record::End => break,
+                Record::Line(read) => read,
+                Record::Oversized(read) => {
+                    scanned += 1;
+                    position += read;
+                    index.scanned_to = position;
+                    // Its id sits near the start; if this is the record asked
+                    // for, say so rather than "unavailable".
+                    if line
+                        .windows(wanted.len())
+                        .any(|window| window == wanted.as_bytes())
+                    {
+                        return Err(oversized(id));
+                    }
+                    continue;
+                }
+            };
             scanned += 1;
             let start = position;
-            position += read as u64;
+            position += read;
             index.scanned_to = position;
             let text = String::from_utf8_lossy(&line);
             let Ok(davinci_session::SessionMutation::Entry { entry, .. }) =
@@ -199,16 +272,58 @@ impl ContextVmRuntime {
     }
 }
 
+/// The entry at `offset` when it is `id`. `Ok(None)` means the offset is
+/// stale; a record past the ceiling is an error, never buffered.
 fn read_entry_at(
     reader: &mut BufReader<&mut File>,
     offset: u64,
     id: &str,
-) -> Option<davinci_session::SessionEntry> {
-    reader.seek(SeekFrom::Start(offset)).ok()?;
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    match davinci_session::parse_mutation(line.trim_end()) {
-        Ok(davinci_session::SessionMutation::Entry { entry, .. }) if entry.id == id => Some(entry),
-        _ => None,
+) -> Result<Option<davinci_session::SessionEntry>, String> {
+    if reader.seek(SeekFrom::Start(offset)).is_err() {
+        return Ok(None);
+    }
+    let mut line = Vec::new();
+    match read_record(reader, MAX_SOURCE_RECORD_BYTES, &mut line) {
+        Ok(Record::Line(_)) => {}
+        Ok(Record::Oversized(_)) => return Err(oversized(id)),
+        Ok(Record::End) | Err(_) => return Ok(None),
+    }
+    Ok(
+        match davinci_session::parse_mutation(String::from_utf8_lossy(&line).trim_end()) {
+            Ok(davinci_session::SessionMutation::Entry { entry, .. }) if entry.id == id => {
+                Some(entry)
+            }
+            _ => None,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_past_the_ceiling_are_skipped_whole_and_reading_resumes() {
+        let data = format!("ok\n{}\nnext\npartial", "x".repeat(100));
+        let mut reader = BufReader::with_capacity(8, data.as_bytes());
+        let mut line = Vec::new();
+        assert!(matches!(
+            read_record(&mut reader, 10, &mut line).unwrap(),
+            Record::Line(3)
+        ));
+        assert!(matches!(
+            read_record(&mut reader, 10, &mut line).unwrap(),
+            Record::Oversized(101)
+        ));
+        assert!(line.len() <= 11, "{} bytes kept", line.len());
+        assert!(matches!(
+            read_record(&mut reader, 10, &mut line).unwrap(),
+            Record::Line(5)
+        ));
+        assert_eq!(line, b"next\n");
+        assert!(matches!(
+            read_record(&mut reader, 10, &mut line).unwrap(),
+            Record::End
+        ));
     }
 }
