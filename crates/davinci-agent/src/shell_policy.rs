@@ -346,7 +346,8 @@ pub fn split_shell_segments_with_diagnostic(command: &str) -> (Vec<String>, bool
                 subshell_depth = subshell_depth.saturating_sub(1);
                 current.push(ch);
             }
-            ';' | '\n' if subshell_depth == 0 => {
+            // PowerShell ends a statement at a lone CR as well as at LF.
+            ';' | '\n' | '\r' if subshell_depth == 0 => {
                 let seg = current.trim().to_string();
                 if !seg.is_empty() {
                     segments.push(seg);
@@ -449,12 +450,15 @@ pub(crate) fn literal_shell_words(command: &str) -> Option<Vec<String>> {
                 started = true;
             }
             '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | ';' | '|' | '&' => return None,
-            ch if ch.is_whitespace() => {
+            ' ' | '\t' => {
                 if started {
                     words.push(std::mem::take(&mut word));
                     started = false;
                 }
             }
+            // A line break or other unusual whitespace outside quotes can end
+            // a statement in one shell and only separate words in another.
+            ch if ch.is_whitespace() || ch.is_control() => return None,
             _ => {
                 word.push(ch);
                 started = true;
@@ -474,6 +478,57 @@ pub(crate) fn literal_shell_words(command: &str) -> Option<Vec<String>> {
 fn selects_long_option(arg: &str, option: &str) -> bool {
     let flag = arg.split('=').next().unwrap_or(arg);
     flag.starts_with("--") && flag.len() > 2 && option.starts_with(flag)
+}
+
+/// `cargo tree` and `cargo metadata` ask rustc for target information, so an
+/// option that changes the compiler (`--config build.rustc=...`), enables
+/// unstable behavior (`-Z`) or points at another manifest runs a program the
+/// policy never saw. Only options that shape the query are read-only.
+fn cargo_query_is_read_only(args: &[String]) -> bool {
+    const OPTIONS: &[&str] = &[
+        "-p",
+        "--package",
+        "--workspace",
+        "--exclude",
+        "--all-features",
+        "--no-default-features",
+        "-F",
+        "--features",
+        "--target",
+        "--all-targets",
+        "-e",
+        "--edges",
+        "-i",
+        "--invert",
+        "--prefix",
+        "--no-dedupe",
+        "-d",
+        "--duplicates",
+        "--charset",
+        "-f",
+        "--format",
+        "--depth",
+        "--prune",
+        "--format-version",
+        "--no-deps",
+        "--filter-platform",
+        "-q",
+        "--quiet",
+        "-v",
+        "-vv",
+        "--verbose",
+        "--color",
+        "--offline",
+        "--frozen",
+        "--locked",
+    ];
+    matches!(args.first().map(String::as_str), Some("tree" | "metadata"))
+        && args[1..].iter().all(|arg| {
+            !arg.starts_with('-') || {
+                let flag = arg.split('=').next().unwrap_or(arg);
+                OPTIONS.contains(&flag)
+            }
+        })
 }
 
 fn git_is_read_only(words: &[String]) -> bool {
@@ -612,10 +667,11 @@ fn read_arguments_are_safe(segment: &str) -> bool {
             })
         }
         "node" | "rustc" => args.len() == 1 && args[0] == "--version",
+        "cargo" | "cargo.exe" => cargo_query_is_read_only(args),
         "cat" | "head" | "tail" | "grep" | "ls" | "dir" | "pwd" | "echo" | "wc" | "diff"
-        | "stat" | "which" | "where" | "where.exe" | "type" | "jq" | "cargo" | "npm"
-        | "get-content" | "get-childitem" | "get-item" | "get-location" | "get-process"
-        | "get-command" | "select-string" => true,
+        | "stat" | "which" | "where" | "where.exe" | "type" | "jq" | "npm" | "get-content"
+        | "get-childitem" | "get-item" | "get-location" | "get-process" | "get-command"
+        | "select-string" => true,
         _ => false,
     }
 }
@@ -1049,6 +1105,83 @@ mod tests {
 
         let (_, unclosed3) = split_shell_segments_with_diagnostic("echo 'unclosed");
         assert!(unclosed3);
+
+        // PowerShell runs the statement after a lone CR.
+        let (segs4, unclosed4) = split_shell_segments_with_diagnostic("cat a\rStart-Process b");
+        assert!(!unclosed4);
+        assert_eq!(segs4, vec!["cat a", "Start-Process b"]);
+        let (segs5, _) = split_shell_segments_with_diagnostic("echo 'a\rb'");
+        assert_eq!(segs5, vec!["echo 'a\rb'"]);
+    }
+
+    #[test]
+    fn security_unusual_whitespace_never_reads_as_one_command() {
+        for command in [
+            "cat README.md\rStart-Process notepad.exe",
+            "Get-Content README.md\rRemove-Item src",
+            "cat README.md\u{b}Start-Process notepad.exe",
+            "cat README.md\u{c}Start-Process notepad.exe",
+            "cat README.md\u{85}Start-Process notepad.exe",
+            "cat README.md\u{2028}Start-Process notepad.exe",
+        ] {
+            for profile in [
+                ShellPolicyProfile::ReadOnly,
+                ShellPolicyProfile::ReadAndTest,
+            ] {
+                assert_ne!(
+                    evaluate(profile, command),
+                    ShellCommandDecision::Allowed,
+                    "{profile:?} allowed {command:?}"
+                );
+            }
+            assert!(!analyze_command(command).is_read_only, "{command:?}");
+        }
+        assert_eq!(
+            literal_shell_words("cat\ta  b"),
+            Some(vec!["cat".into(), "a".into(), "b".into()])
+        );
+        assert_eq!(
+            literal_shell_words("cat 'a\rb'"),
+            Some(vec!["cat".into(), "a\rb".into()])
+        );
+    }
+
+    #[test]
+    fn security_cargo_queries_reject_compiler_and_manifest_overrides() {
+        for command in [
+            "cargo tree --config 'build.rustc=\"fixture\"'",
+            "cargo tree --config=build.rustc-wrapper=fixture",
+            "cargo metadata --config build.rustc=fixture",
+            "cargo tree -Zunstable-options",
+            "cargo tree -Z unstable-options",
+            "cargo metadata --manifest-path ../other/Cargo.toml",
+            "cargo tree -C ../other",
+            "cargo tree --target-dir out",
+        ] {
+            for profile in [
+                ShellPolicyProfile::ReadOnly,
+                ShellPolicyProfile::ReadAndTest,
+            ] {
+                assert_ne!(
+                    evaluate(profile, command),
+                    ShellCommandDecision::Allowed,
+                    "{profile:?} allowed {command}"
+                );
+            }
+        }
+        for command in [
+            "cargo tree",
+            "cargo tree -p davinci-agent --depth 1 -e normal",
+            "cargo tree --invert serde --offline",
+            "cargo metadata --format-version 1 --no-deps",
+            "cargo metadata --format-version=1 --locked",
+        ] {
+            assert_eq!(
+                evaluate(ShellPolicyProfile::ReadOnly, command),
+                ShellCommandDecision::Allowed,
+                "{command}"
+            );
+        }
     }
 
     #[test]

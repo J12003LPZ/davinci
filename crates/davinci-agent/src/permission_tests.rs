@@ -190,6 +190,33 @@ fn auto_escalates_external_destructive_and_sensitive_actions() {
 }
 
 #[test]
+fn auto_treats_a_lone_carriage_return_as_a_statement_separator() {
+    // PowerShell runs the statement after a lone CR. A read command must not
+    // carry an unreviewed second statement as if it were arguments.
+    let p = policy(PermissionMode::Auto);
+    for tool in ["powershell", "bash"] {
+        assert_eq!(
+            verdict(&p, tool, json!({"command":"git status"})),
+            PermissionVerdict::Allow,
+            "{tool} control"
+        );
+        for command in [
+            "git status\rStart-Process notepad.exe",
+            "git status\rRemove-Item src",
+            "git status\u{b}Start-Process notepad.exe",
+            "git status\u{c}Start-Process notepad.exe",
+            "git status\u{85}Start-Process notepad.exe",
+            "git status\u{2028}Start-Process notepad.exe",
+        ] {
+            assert!(
+                is_ask(&verdict(&p, tool, json!({"command":command}))),
+                "Auto allowed {tool}: {command:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
     // Auto may edit build.rs or a test and then run it. Without isolation
     // that chain is arbitrary code execution, so every code-running check asks.

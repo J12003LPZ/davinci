@@ -364,6 +364,14 @@ pub(super) fn routine_local_shell(
     {
         return false;
     }
+    // Line breaks are statement separators below. Any other control or
+    // unusual whitespace may separate statements in a shell this check does
+    // not model, so it is never routine.
+    if literal.chars().any(|ch| {
+        (ch.is_whitespace() || ch.is_control()) && !matches!(ch, ' ' | '\t' | '\n' | '\r')
+    }) {
+        return false;
+    }
     // The shared splitter drops empty segments; approval must not silently
     // turn a malformed chain into a list of individually safe commands.
     let chain = literal
