@@ -24,7 +24,9 @@
 //! their description to one line. Skills never carry a problem badge.
 
 use super::sheet::{hint, Composer, SheetChrome};
-use crate::davinci::model::{ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, Model};
+use crate::davinci::model::{
+    ExtensionEntry, ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, Model,
+};
 use crate::davinci::theme::{State, Theme};
 use crate::davinci::ui::{
     self, clip_ellipsis, pad, span, truncate_run, wrap, SELECTION_BAR, UNSELECTED_BAR,
@@ -69,7 +71,7 @@ fn view_count(sheet: &ExtensionsSheet, view: ExtensionView) -> Option<usize> {
 /// `n/total` for the open list, so a long registry says where you are.
 fn position(sheet: &ExtensionsSheet) -> Option<String> {
     let (index, total) = match sheet.view {
-        ExtensionView::Installed => (sheet.index(), sheet.current_rows().len()),
+        ExtensionView::Installed => (sheet.index(), sheet.entries(sheet.tab).len()),
         ExtensionView::Discover => (sheet.discover.index(), sheet.discover.results.len()),
         ExtensionView::Marketplaces => (sheet.marketplace_index(), sheet.marketplaces.len()),
     };
@@ -269,7 +271,26 @@ fn header(model: &Model, sheet: &ExtensionsSheet) -> Vec<Line<'static>> {
         rows.push(Line::default());
     }
     match sheet.view {
-        ExtensionView::Installed => {}
+        ExtensionView::Installed => {
+            if sheet.filtering || !sheet.filter.is_empty() {
+                let mut inner = vec![span("⌕ ", th.primary)];
+                if sheet.filter.is_empty() {
+                    inner.push(span("Filter by name or description", th.muted));
+                } else {
+                    inner.push(span(sheet.filter.clone(), th.text));
+                }
+                if sheet.filtering {
+                    inner.push(span("▏", th.primary));
+                }
+                let hits = sheet.matching(sheet.tab).len();
+                let right = vec![span(
+                    format!("{hits} of {}", sheet.current_rows().len()),
+                    th.muted,
+                )];
+                rows.extend(boxed(model, inner, right));
+                rows.push(Line::default());
+            }
+        }
         ExtensionView::Discover => {
             let discover = &sheet.discover;
             let mut inner = vec![span("⌕ ", th.primary)];
@@ -499,6 +520,71 @@ fn card(
     rows
 }
 
+/// A group heading: `▸ ecc@ecc · 293 skills`, and while it is folded a muted
+/// line of what is inside, so a closed group still says what it holds.
+fn group_heading(
+    model: &Model,
+    sheet: &ExtensionsSheet,
+    entry: &ExtensionEntry,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let ExtensionEntry::Group {
+        name,
+        shown,
+        total,
+        open,
+    } = entry
+    else {
+        return Vec::new();
+    };
+    let th = &model.theme;
+    let cc = th.cc();
+    let width = width_of(model);
+    let noun = match sheet.tab {
+        ExtensionTab::Plugins => "plugin",
+        ExtensionTab::Skills => "skill",
+        ExtensionTab::Mcp => "server",
+    };
+    let count = if shown == total {
+        format!("{total} {noun}{}", if *total == 1 { "" } else { "s" })
+    } else {
+        format!("{shown} of {total} {noun}s")
+    };
+    let mut line = vec![
+        span(
+            if selected {
+                SELECTION_BAR
+            } else {
+                UNSELECTED_BAR
+            },
+            if selected { cc.permission } else { cc.inactive },
+        ),
+        span(if *open { "▾" } else { "▸" }, th.primary),
+        pad(1, None),
+    ];
+    line.extend(title_spans(name, selected, th));
+    line.push(span(format!(" · {count}"), th.muted));
+    let mut rows = vec![fit(line, width)];
+    if !open {
+        let preview: Vec<&str> = sheet
+            .current_rows()
+            .iter()
+            .filter(|row| if row.group.is_empty() { "Other" } else { &row.group } == name)
+            .map(|row| row.title.as_str())
+            .collect();
+        let body = width.saturating_sub(INDENT);
+        rows.push(fit(
+            vec![
+                pad(INDENT.min(width), None),
+                span(clip_ellipsis(&preview.join(", "), body), th.muted),
+            ],
+            width,
+        ));
+    }
+    rows.push(Line::default());
+    rows
+}
+
 fn installed_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'static>>) {
     let th = &model.theme;
     let items = sheet.current_rows();
@@ -506,13 +592,30 @@ fn installed_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'
         rows.extend(indented(model, empty_text(sheet.tab), th.muted));
         return;
     }
+    let entries = sheet.entries(sheet.tab);
+    if entries.is_empty() {
+        rows.extend(indented(
+            model,
+            &format!("Nothing matches \"{}\".", sheet.filter.trim()),
+            th.muted,
+        ));
+        return;
+    }
     let selected = sheet.index();
-    for (i, item) in items.iter().enumerate() {
-        let confirm = (i == selected)
-            .then(|| sheet.armed_here())
-            .flatten()
-            .map(|action| confirm_warning(sheet.tab, action, item));
-        rows.extend(card(model, item, Kind::Installed, i == selected, confirm));
+    for (i, entry) in entries.iter().enumerate() {
+        match entry {
+            ExtensionEntry::Group { .. } => {
+                rows.extend(group_heading(model, sheet, entry, i == selected));
+            }
+            ExtensionEntry::Row(at) => {
+                let item = &items[*at];
+                let confirm = (i == selected)
+                    .then(|| sheet.armed_here())
+                    .flatten()
+                    .map(|action| confirm_warning(sheet.tab, action, item));
+                rows.extend(card(model, item, Kind::Installed, i == selected, confirm));
+            }
+        }
     }
 }
 
@@ -623,6 +726,26 @@ pub fn row_hints(item: Option<&ExtensionRow>, armed: Option<&str>) -> Vec<&'stat
     out
 }
 
+fn installed_hints(sheet: &ExtensionsSheet) -> Vec<&'static str> {
+    if sheet.filtering {
+        return vec!["type to filter", "↑↓ move", "enter keep", "esc clear"];
+    }
+    if let Some(ExtensionEntry::Group { open, .. }) = sheet.current_entry() {
+        return vec![
+            "←→ view",
+            "↑↓ move",
+            if open { "enter fold" } else { "enter unfold" },
+            "/ filter",
+        ];
+    }
+    let armed = sheet.armed_here();
+    let mut out = row_hints(sheet.current(), armed);
+    if armed.is_none() {
+        out.push("/ filter");
+    }
+    out
+}
+
 fn discover_hints(sheet: &ExtensionsSheet) -> Vec<&'static str> {
     if sheet.discover.armed_here() {
         return vec!["enter install", "esc cancel"];
@@ -663,7 +786,7 @@ pub fn chrome(model: &Model) -> SheetChrome {
     let (header, hints) = match &model.extension_manager {
         Some(sheet) => {
             let hints = match sheet.view {
-                ExtensionView::Installed => row_hints(sheet.current(), sheet.armed_here()),
+                ExtensionView::Installed => installed_hints(sheet),
                 ExtensionView::Discover => discover_hints(sheet),
                 ExtensionView::Marketplaces => marketplace_hints(sheet),
             };

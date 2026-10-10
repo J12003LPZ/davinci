@@ -320,3 +320,87 @@ line three of the detail"
         );
     }
 }
+
+fn skill_sheet() -> ExtensionsSheet {
+    let skill = |title: String, group: &str, status: &str| ExtensionRow {
+        key: format!("{group}/{title}"),
+        title,
+        status: status.into(),
+        detail: "does a thing".into(),
+        group: group.into(),
+        ..ExtensionRow::default()
+    };
+    let mut rows = vec![
+        skill("mine-a".into(), "Your skills", "user"),
+        skill("mine-b".into(), "Your skills", "user"),
+    ];
+    rows.extend((0..293).map(|n| skill(format!("ecc-skill-{n:03}"), "ecc@ecc", "plugin")));
+    rows.extend((0..15).map(|n| skill(format!("sp-{n:02}"), "superpowers", "plugin")));
+    ExtensionsSheet {
+        tab: ExtensionTab::Skills,
+        skills: rows,
+        ..ExtensionsSheet::default()
+    }
+}
+
+#[test]
+fn skills_are_filed_under_their_source_and_big_plugins_start_folded() {
+    let text = draw(&model(100, 60, skill_sheet())).join("\n");
+    assert!(
+        text.contains("Skills (310)") || text.contains("Installed (310)"),
+        "{text}"
+    );
+    assert!(text.contains("▾ Your skills · 2 skills"), "{text}");
+    assert!(text.contains("mine-a"), "{text}");
+    assert!(text.contains("▸ ecc@ecc · 293 skills"), "{text}");
+    assert!(text.contains("▸ superpowers · 15 skills"), "{text}");
+    // A folded group says what is inside, in one clipped line.
+    assert!(text.contains("ecc-skill-000, ecc-skill-001"), "{text}");
+    // 308 plugin cards would bury the screen; only the two of the open group show.
+    assert_eq!(text.matches("does a thing").count(), 2, "{text}");
+}
+
+#[test]
+fn a_selected_group_heading_stays_on_screen_on_a_short_terminal() {
+    let mut sheet = skill_sheet();
+    sheet.selected[1] = 3; // Your skills, mine-a, mine-b, then the ecc@ecc heading
+    let rows = draw(&model(100, 24, sheet));
+    let text = rows.join("\n");
+    assert!(
+        rows.iter().any(|row| row.starts_with("❯ ▸ ecc@ecc")),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_filter_opens_every_group_it_matches_and_counts_them() {
+    let mut sheet = skill_sheet();
+    sheet.filter = "sp-0".into();
+    let text = draw(&model(100, 40, sheet)).join("\n");
+    assert!(text.contains("10 of 310"), "{text}");
+    assert!(text.contains("▾ superpowers · 10 of 15 skills"), "{text}");
+    assert!(!text.contains("ecc@ecc"), "{text}");
+    let mut none = skill_sheet();
+    none.filter = "zzzz".into();
+    let text = draw(&model(100, 40, none)).join("\n");
+    assert!(text.contains("Nothing matches \"zzzz\"."), "{text}");
+}
+
+#[test]
+fn grouped_rows_are_never_wider_than_the_terminal() {
+    for width in [0u16, 1, 10, 20, 40, 80, 140] {
+        for height in [3u16, 8, 24, 60] {
+            let mut filtered = skill_sheet();
+            filtered.filter = "e".into();
+            filtered.filtering = true;
+            for sheet in [skill_sheet(), filtered] {
+                for row in app::compose(&model(width, height, sheet), height) {
+                    assert!(
+                        ui::run_width(&row.spans) <= width,
+                        "{width}x{height}: {row}"
+                    );
+                }
+            }
+        }
+    }
+}
