@@ -79,7 +79,7 @@ pub use compaction::{
 pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
     load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
-    ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
+    ContextFile, ContextPriority, RootContextAccount, SelectedRootContext, INSTRUCTION_FILE,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
@@ -2180,17 +2180,11 @@ impl Agent {
         };
         let events = self.context_vm_events_for_vm();
         let selected = self.select_root_context(self.context_window);
+        // Repository instructions (AGENTS.md) are not items here:
+        // `provider_system_prompt` already carries them, mandatory and in the
+        // cached prefix. A copy in the image sent every one twice and, at
+        // optional priority, could be paged out from under the system copy.
         let mut items = Vec::new();
-        for file in selected.repository_files {
-            items.push(runtime::ContextItem {
-                source: format!("file::{}", file.path.display()),
-                content: file.body.clone(),
-                estimated_tokens: (file.body.len() as u64).div_ceil(4),
-                priority: 100,
-                stable_for_cache: true,
-                provenance: serde_json::json!({"provenance_kind":"repository_fact"}),
-            });
-        }
         for (index, message) in selected.ephemeral_messages.iter().enumerate() {
             let content = davinci_ai::content_text(&message.content);
             items.push(runtime::ContextItem {
@@ -2570,7 +2564,24 @@ impl Agent {
         }
     }
 
+    /// The active VM's request on the same four-bytes-a-token scale as the
+    /// other modes. The admission budget ([`Self::provider_context_budget`])
+    /// and the image's own `estimated_tokens` are byte ceilings; summed here
+    /// they showed an empty session as thousands of tokens and `/context`
+    /// filed the excess under Messages.
     fn context_vm_estimated_provider_tokens(&self, image: &runtime::ContextImage) -> u64 {
+        estimate_context_tokens(&image.messages)
+            .saturating_add((self.provider_system_prompt().len() as u64).div_ceil(4))
+            .saturating_add(self.estimated_tool_schema_tokens())
+    }
+
+    /// The active VM's request on the admission scale: the image's byte
+    /// ceiling plus the budget's system and tool ceilings. Folds are decided
+    /// on this scale. Admission caps the image at
+    /// [`provider_budget::ProviderContextBudget::working_set_budget`] in bytes,
+    /// so the estimate above never passes about a quarter of the window and
+    /// would never reach a fold threshold.
+    pub(crate) fn context_vm_admission_tokens(&self, image: &runtime::ContextImage) -> u64 {
         let budget = self.provider_context_budget();
         image
             .estimated_tokens

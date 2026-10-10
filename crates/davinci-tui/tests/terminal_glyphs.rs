@@ -213,7 +213,7 @@ fn context_grid_and_legend_stay_on_screen_with_many_agents() {
         let heading = at("Context Usage");
         assert!(heading.is_some(), "{width}x{height}:\n{}", text.join("\n"));
         assert!(at("Free space").is_some(), "{width}x{height}");
-        let cell = |c: Option<char>| c.is_some_and(|c| "■▪□▒".contains(c));
+        let cell = |c: Option<char>| c.is_some_and(|c| "■▲♦●▼█□▒".contains(c));
         let grid_rows = text
             .iter()
             .filter(|row| {
@@ -222,7 +222,7 @@ fn context_grid_and_legend_stay_on_screen_with_many_agents() {
             })
             .count();
         assert_eq!(grid_rows, 10, "{width}x{height}");
-        assert!(at("72 more").is_some(), "{width}x{height}");
+        assert!(at("75 more").is_some(), "{width}x{height}");
     }
 }
 

@@ -206,22 +206,24 @@ impl RootContextAccount {
     }
 }
 
+/// The repository instruction file davinci reads. `CLAUDE.md` is Claude
+/// Code's: its rules name Claude Code's own tools and rituals, and a large one
+/// cost every request thousands of tokens davinci could not act on.
+pub const INSTRUCTION_FILE: &str = "AGENTS.md";
+
 pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
     if !enabled {
         return Vec::new();
     }
-    let mut files = Vec::new();
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        let path = cwd.join(name);
-        if let Ok(body) = fs::read_to_string(&path) {
-            files.push(ContextFile {
-                path,
-                name: name.to_string(),
-                body,
-            });
-        }
-    }
-    files
+    let path = cwd.join(INSTRUCTION_FILE);
+    fs::read_to_string(&path)
+        .map(|body| ContextFile {
+            path,
+            name: INSTRUCTION_FILE.to_string(),
+            body,
+        })
+        .into_iter()
+        .collect()
 }
 
 pub fn load_context_files_for_targets(
@@ -262,22 +264,20 @@ pub fn load_context_files_for_targets(
             .collect::<Vec<_>>();
         ancestors.reverse();
         for directory in ancestors {
-            for name in ["AGENTS.md", "CLAUDE.md"] {
-                let path = directory.join(name);
-                if !path.is_file() {
-                    continue;
-                }
-                let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                if !seen.insert(identity) {
-                    continue;
-                }
-                if let Ok(body) = fs::read_to_string(&path) {
-                    files.push(ContextFile {
-                        path,
-                        name: name.to_string(),
-                        body,
-                    });
-                }
+            let path = directory.join(INSTRUCTION_FILE);
+            if !path.is_file() {
+                continue;
+            }
+            let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !seen.insert(identity) {
+                continue;
+            }
+            if let Ok(body) = fs::read_to_string(&path) {
+                files.push(ContextFile {
+                    path,
+                    name: INSTRUCTION_FILE.to_string(),
+                    body,
+                });
             }
         }
     }
@@ -363,6 +363,25 @@ mod tests {
         );
         assert!(prompt.contains("src/AGENTS.md"));
         assert!(!prompt.contains("/checkout"));
+    }
+
+    #[test]
+    fn only_agents_md_is_read_at_the_root_and_beside_targets() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("AGENTS.md"), "davinci rules").unwrap();
+        fs::write(root.path().join("CLAUDE.md"), "claude code rules").unwrap();
+        fs::write(root.path().join("src/CLAUDE.md"), "nested claude rules").unwrap();
+        fs::write(root.path().join("src/file.rs"), "").unwrap();
+
+        let files =
+            load_context_files_for_targets(root.path(), true, &[PathBuf::from("src/file.rs")]);
+        let bodies: Vec<&str> = files.iter().map(|file| file.body.as_str()).collect();
+        assert_eq!(bodies, ["davinci rules"]);
+
+        // A directory with CLAUDE.md alone gives davinci no instructions.
+        fs::remove_file(root.path().join("AGENTS.md")).unwrap();
+        assert!(load_context_files(root.path(), true).is_empty());
     }
 
     #[test]

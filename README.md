@@ -590,7 +590,7 @@ davinci --approve
 davinci --no-approve
 ~~~
 
-AGENTS.md and CLAUDE.md can be loaded as repository context. Disable context-file discovery with:
+AGENTS.md is loaded as repository context, from the working directory and, for nested files, each directory between it and the file being edited. CLAUDE.md is not read: it holds Claude Code's instructions. Disable context-file discovery with:
 
 ~~~bash
 davinci --no-context-files

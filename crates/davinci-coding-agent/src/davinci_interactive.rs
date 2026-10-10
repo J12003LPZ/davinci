@@ -10281,6 +10281,16 @@ fn open_agents_sheet(agent: &Agent, model: &mut Model) {
     model.agents = Some(davinci_tui::davinci::model::AgentsSheet {
         agents,
         selected_index: 0,
+        profiles: agent
+            .agent_profiles
+            .iter()
+            .map(
+                |(name, description)| davinci_tui::davinci::model::AgentProfileRow {
+                    name: name.clone(),
+                    description: description.clone(),
+                },
+            )
+            .collect(),
     });
     open_sheet(model, Screen::Agents);
 }
@@ -10445,6 +10455,9 @@ fn push_context_usage(agent: &Agent, model: &mut Model) {
     }
     let view = crate::davinci_surfaces::context_usage_view(&agent.context_usage());
     model.transcript.push(Entry::ContextUsage(view));
+    // The block is taller than a short screen. Following the newest row would
+    // open it on its last section; read it from "Context Usage" down.
+    davinci_tui::davinci::app::scroll_transcript_to_entry(model, model.transcript.len() - 1);
 }
 
 fn apply_context_inspector_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {

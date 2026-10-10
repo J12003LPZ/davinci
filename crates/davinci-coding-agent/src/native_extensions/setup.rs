@@ -27,7 +27,7 @@ pub const IGNORED_STATE: &[&str] = &[".davinci/vector-memory/", ".davinci/graph/
 const REINDEX_BATCHES: usize = 40;
 /// How long `/setup` waits for a freshly started `ollama serve` to answer.
 const SERVE_WAIT: Duration = Duration::from_secs(8);
-const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+const INSTRUCTION_FILES: &[&str] = &[davinci_agent::INSTRUCTION_FILE];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -682,7 +682,7 @@ pub fn instructions_step(cwd: &Path) -> Step {
             ID,
             TITLE,
             StepState::Action,
-            "no AGENTS.md or CLAUDE.md for this workspace".into(),
+            "no AGENTS.md for this workspace".into(),
         )
         .with_action("run /init to write AGENTS.md"),
     }

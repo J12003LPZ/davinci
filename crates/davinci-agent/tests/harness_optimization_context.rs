@@ -83,10 +83,18 @@ fn active_context_vm_reuses_repository_and_ephemeral_context_items() {
     agent.set_context_vm_mode(ContextVmMode::Active);
 
     let image = agent.context_vm_image().unwrap();
-    assert!(image
+    // Repository instructions go to the provider once, in the system prompt.
+    // The image once carried a second copy: every request paid for it twice.
+    assert!(agent
+        .provider_system_prompt()
+        .contains("repository authority"));
+    assert!(!image
         .entries
         .iter()
         .any(|entry| entry.source_ref == "file::AGENTS.md"));
+    assert!(!image.messages.iter().any(|message| {
+        davinci_ai::content_text(&message.content).contains("repository authority")
+    }));
     assert!(image
         .entries
         .iter()

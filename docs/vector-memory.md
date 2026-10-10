@@ -73,7 +73,7 @@ something before it works, fixes what it can, and lists the rest:
 | Project trust | Reports when project settings, hooks, skills or MCP servers are ignored because the project is not trusted. | Review them, then run `/setup trust`. Restart to load them. |
 | Plugin hooks | Lists enabled plugins whose hooks wait for approval. | `/plugins approve <name>`. |
 | Language servers | Detects Rust, TypeScript/JavaScript and Python projects and looks for their servers on `PATH` or in `node_modules/.bin`. | Install the server it names. Davinci never installs one. |
-| Project instructions | Looks for `AGENTS.md` or `CLAUDE.md`. | `/init`. |
+| Project instructions | Looks for `AGENTS.md` (`CLAUDE.md` is not read). | `/init`. |
 
 `/setup check` reports without changing anything. The model pull continues
 after the command returns, so run `/setup` again to follow it. Trust is never
