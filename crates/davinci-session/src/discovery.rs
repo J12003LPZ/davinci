@@ -439,12 +439,14 @@ fn is_session_file(entry: &fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|kind| kind.is_file()) && is_session_jsonl(&entry.path())
 }
 
-/// Every directory a session for `cwd` may live in. Besides the current and
-/// legacy encodings, `JsonlSessionRepo` (sessions created with an explicit
-/// id) strips every leading separator rather than one, which differs for UNC
+/// Every directory a session for `cwd` may live in: the current encoding
+/// (where every session is now written), the pre-alignment Rust encoding,
+/// and the name `JsonlSessionRepo` used in older builds for sessions created
+/// with an explicit id. That name strips every leading separator rather
+/// than one, which differs for UNC
 /// (`\\server\share`) and `//host` paths. Headers are still matched
 /// against `cwd`, so an extra root never admits another directory's session.
-fn cwd_scan_roots(session_dir: &Path, cwd: &str) -> Vec<PathBuf> {
+pub(crate) fn cwd_scan_roots(session_dir: &Path, cwd: &str) -> Vec<PathBuf> {
     let mut roots = vec![cwd_encoded_dir(session_dir, cwd)];
     for candidate in [
         session_dir.join(legacy_encode_cwd_component(cwd)),
@@ -625,6 +627,56 @@ mod tests {
         }
         // A session from another cwd sharing a directory name stays hidden.
         assert!(resolve_session_ref(dir.path(), Some(r"\\other\share\proj"), "explicit2").is_err());
+    }
+
+    #[test]
+    fn explicit_id_sessions_use_the_discovery_directory_and_still_see_legacy_ones() {
+        let dir = tempdir().unwrap();
+        let repo = crate::JsonlSessionRepo::new(dir.path());
+        let cwd = r"\\server\share\proj";
+        let create = |id: &str| {
+            repo.create(crate::JsonlCreateOptions {
+                id: Some(id.into()),
+                cwd: cwd.into(),
+                parent_session_id: None,
+                metadata: None,
+            })
+        };
+        // One encoder for new sessions: the name discovery derives.
+        let created = create("fresh").unwrap();
+        assert_eq!(
+            created.info.path.parent().unwrap(),
+            cwd_encoded_dir(dir.path(), cwd)
+        );
+
+        // A session an older build wrote under the repo's legacy name.
+        let legacy = dir
+            .path()
+            .join(crate::jsonl_repo::jsonl_session_directory_name(cwd));
+        assert_ne!(legacy, cwd_encoded_dir(dir.path(), cwd));
+        fs::create_dir_all(&legacy).unwrap();
+        let moved = legacy.join(
+            created
+                .info
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace("fresh", "old"),
+        );
+        fs::write(
+            &moved,
+            fs::read_to_string(&created.info.path)
+                .unwrap()
+                .replace("\"fresh\"", "\"old\""),
+        )
+        .unwrap();
+        // Its id cannot be created again, and listing by cwd finds it.
+        assert!(create("old").is_err());
+        let listed = repo.list(Some(cwd)).unwrap();
+        assert!(listed.iter().any(|info| info.id == "old"), "{listed:?}");
+        assert!(listed.iter().any(|info| info.id == "fresh"), "{listed:?}");
     }
 
     #[test]

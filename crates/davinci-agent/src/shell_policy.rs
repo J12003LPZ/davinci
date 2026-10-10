@@ -183,7 +183,6 @@ const READ_PATTERNS: &[&str] = &[
     r"(?i)^\s*awk\b",
     r"(?i)^\s*node\s+--version\b",
     r"(?i)^\s*rustc\s+--version\b",
-    r"(?i)^\s*cargo\s+(tree|metadata)\b",
     r"(?i)^\s*git(?:\.exe)?(?:\s+-{1,2}\S+(?:\s+[^-\s]\S*)?)*\s+(status|log|diff|show|blame|branch|remote|ls-files|ls-tree|rev-parse|describe|shortlog)\b",
     r"(?i)^\s*npm\s+(ls|list|view|info|explain)\b",
     r"(?i)^\s*Get-(Content|ChildItem|Item|Location|Process|Command)\b",
@@ -480,64 +479,18 @@ fn selects_long_option(arg: &str, option: &str) -> bool {
     flag.starts_with("--") && flag.len() > 2 && option.starts_with(flag)
 }
 
-/// `cargo tree` and `cargo metadata` ask rustc for target information, so an
-/// option that changes the compiler (`--config build.rustc=...`), enables
-/// unstable behavior (`-Z`) or points at another manifest runs a program the
-/// policy never saw. Only options that shape the query are read-only.
-fn cargo_query_is_read_only(args: &[String]) -> bool {
-    const OPTIONS: &[&str] = &[
-        "-p",
-        "--package",
-        "--workspace",
-        "--exclude",
-        "--all-features",
-        "--no-default-features",
-        "-F",
-        "--features",
-        "--target",
-        "--all-targets",
-        "-e",
-        "--edges",
-        "-i",
-        "--invert",
-        "--prefix",
-        "--no-dedupe",
-        "-d",
-        "--duplicates",
-        "--charset",
-        "-f",
-        "--format",
-        "--depth",
-        "--prune",
-        "--format-version",
-        "--no-deps",
-        "--filter-platform",
-        "-q",
-        "--quiet",
-        "-v",
-        "-vv",
-        "--verbose",
-        "--color",
-        "--offline",
-        "--frozen",
-        "--locked",
-    ];
-    matches!(args.first().map(String::as_str), Some("tree" | "metadata"))
-        && args[1..].iter().all(|arg| {
-            !arg.starts_with('-') || {
-                let flag = arg.split('=').next().unwrap_or(arg);
-                OPTIONS.contains(&flag)
-            }
-        })
-}
-
 /// Words of a segment for a read-only check only: output and input
 /// redirections are removed, every `$VAR`, `${...}`, `$(...)` and backtick
-/// span becomes the placeholder `X`, and brace characters are dropped. The
-/// result can only be judged by an allowlist (an expansion never turns into a
-/// literal read-only verb); anything still unmodelled, such as a nested
-/// substitution or a subshell, makes the lexer refuse it.
+/// span becomes a placeholder, and brace characters are dropped. Anything
+/// still unmodelled, such as a nested substitution or a subshell, makes the
+/// lexer refuse it.
+///
+/// An expansion can carry an option (`OPT=--output=~/.bashrc` in
+/// `git log $OPT`, or `BASE=--output=x` in `git diff "$BASE"...HEAD`), so a
+/// placeholder anywhere before `--` refuses the segment; only operands after
+/// `--` (`git diff -- "$FILE"`) may be expansions.
 fn literal_words_with_placeholders(segment: &str) -> Option<Vec<String>> {
+    const PLACEHOLDER: &str = "__shell_expansion__";
     static REDIRECT: OnceLock<regex::Regex> = OnceLock::new();
     static EXPANSION: OnceLock<regex::Regex> = OnceLock::new();
     let redirect = REDIRECT.get_or_init(|| {
@@ -549,8 +502,16 @@ fn literal_words_with_placeholders(segment: &str) -> Option<Vec<String>> {
             .expect("fixed expansion pattern")
     });
     let without_redirects = redirect.replace_all(segment, " ");
-    let placeheld = expansion.replace_all(&without_redirects, "X");
-    literal_shell_words(&placeheld.replace(['{', '}'], ""))
+    let placeheld = expansion.replace_all(&without_redirects, PLACEHOLDER);
+    let words = literal_shell_words(&placeheld.replace(['{', '}'], ""))?;
+    let options_end = words
+        .iter()
+        .position(|word| word == "--")
+        .unwrap_or(words.len());
+    (!words[..options_end]
+        .iter()
+        .any(|word| word.contains(PLACEHOLDER)))
+    .then_some(words)
 }
 
 fn git_is_read_only(words: &[String]) -> bool {
@@ -689,7 +650,6 @@ fn read_arguments_are_safe(segment: &str) -> bool {
             })
         }
         "node" | "rustc" => args.len() == 1 && args[0] == "--version",
-        "cargo" | "cargo.exe" => cargo_query_is_read_only(args),
         "cat" | "head" | "tail" | "grep" | "ls" | "dir" | "pwd" | "echo" | "wc" | "diff"
         | "stat" | "which" | "where" | "where.exe" | "type" | "jq" | "npm" | "get-content"
         | "get-childitem" | "get-item" | "get-location" | "get-process" | "get-command"
@@ -1218,8 +1178,9 @@ mod tests {
         for command in [
             "git status 2>/dev/null",
             "git log > log.txt",
-            "git diff \"$BASE\"...HEAD",
             "git show HEAD:{a,b}",
+            "git diff -- \"$FILE\"",
+            "git log -- $(cat paths.txt)",
         ] {
             assert!(
                 !analyze_command(command)
@@ -1250,6 +1211,12 @@ mod tests {
             "git log `git push`",
             "git $(echo $(echo push))",
             "git (push)",
+            // An expansion before `--` may carry an option such as
+            // `--output=<file>` or `--ext-diff`.
+            "git log $OPT",
+            "git diff \"$BASE\"...HEAD",
+            "git show `echo --textconv` HEAD",
+            "git -C $DIR status",
         ] {
             assert_ne!(
                 evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
@@ -1260,16 +1227,21 @@ mod tests {
     }
 
     #[test]
-    fn security_cargo_queries_reject_compiler_and_manifest_overrides() {
+    fn security_cargo_queries_are_never_read_only() {
+        // Even with no arguments, the repository chooses what cargo runs:
+        // `.cargo/config.toml` can set `build.rustc-wrapper`, which tree and
+        // metadata invoke for target information, and `rust-toolchain.toml`
+        // can point at another toolchain. No argument allowlist can make
+        // these read-only in an untrusted checkout.
         for command in [
+            "cargo tree",
+            "cargo tree -p davinci-agent --depth 1 -e normal",
+            "cargo tree --invert serde --offline",
+            "cargo metadata --format-version 1 --no-deps",
+            "cargo metadata --format-version=1 --locked",
             "cargo tree --config 'build.rustc=\"fixture\"'",
-            "cargo tree --config=build.rustc-wrapper=fixture",
-            "cargo metadata --config build.rustc=fixture",
-            "cargo tree -Zunstable-options",
-            "cargo tree -Z unstable-options",
             "cargo metadata --manifest-path ../other/Cargo.toml",
-            "cargo tree -C ../other",
-            "cargo tree --target-dir out",
+            "cargo.exe tree",
         ] {
             for profile in [
                 ShellPolicyProfile::ReadOnly,
@@ -1281,19 +1253,6 @@ mod tests {
                     "{profile:?} allowed {command}"
                 );
             }
-        }
-        for command in [
-            "cargo tree",
-            "cargo tree -p davinci-agent --depth 1 -e normal",
-            "cargo tree --invert serde --offline",
-            "cargo metadata --format-version 1 --no-deps",
-            "cargo metadata --format-version=1 --locked",
-        ] {
-            assert_eq!(
-                evaluate(ShellPolicyProfile::ReadOnly, command),
-                ShellCommandDecision::Allowed,
-                "{command}"
-            );
         }
     }
 

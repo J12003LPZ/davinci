@@ -42,7 +42,10 @@ pub fn validate_session_id(id: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// TS `jsonlSessionDirectoryName` (not the coding-agent `--` path encoder).
+/// TS `jsonlSessionDirectoryName`. Strips every leading separator, so it
+/// differs from [`crate::encode_cwd_component`] for UNC (`\\server\share`)
+/// and `//host` paths. Sessions are now written under the discovery name;
+/// this one is still read so sessions created by older builds stay found.
 pub fn jsonl_session_directory_name(cwd: &str) -> String {
     let stripped = cwd.trim_start_matches(['/', '\\']);
     format!("--{}--", stripped.replace(['/', '\\', ':'], "-"))
@@ -53,8 +56,7 @@ pub fn session_file_name(created_at_ms: u64, id: &str) -> String {
 }
 
 pub fn expected_session_path(root: &Path, cwd: &str, created_at_ms: u64, id: &str) -> PathBuf {
-    root.join(jsonl_session_directory_name(cwd))
-        .join(session_file_name(created_at_ms, id))
+    crate::discovery::cwd_encoded_dir(root, cwd).join(session_file_name(created_at_ms, id))
 }
 
 fn utc_iso_dashed(ms: u64) -> String {
@@ -171,7 +173,7 @@ impl JsonlSessionRepo {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         validate_session_id(&id)?;
         let cwd = options.cwd;
-        let dir = self.sessions_root.join(jsonl_session_directory_name(&cwd));
+        let dir = crate::discovery::cwd_encoded_dir(&self.sessions_root, &cwd);
         let _naming = self.lock_names(&dir)?;
         if self.session_id_exists(&id, &cwd)? {
             return Err(SessionError::already_exists(format!(
@@ -234,7 +236,7 @@ impl JsonlSessionRepo {
     pub fn list(&self, cwd: Option<&str>) -> Result<Vec<JsonlSessionInfo>, SessionError> {
         let mut listed = Vec::new();
         let directories = if let Some(cwd) = cwd {
-            vec![self.sessions_root.join(jsonl_session_directory_name(cwd))]
+            crate::discovery::cwd_scan_roots(&self.sessions_root, cwd)
         } else {
             crate::discovery::session_subdirectories(&self.sessions_root).unwrap_or_default()
         };
@@ -289,7 +291,7 @@ impl JsonlSessionRepo {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         validate_session_id(&id)?;
         let mutations = source.session.state().create_fork_mutations(options)?;
-        let dir = self.sessions_root.join(jsonl_session_directory_name(cwd));
+        let dir = crate::discovery::cwd_encoded_dir(&self.sessions_root, cwd);
         let _naming = self.lock_names(&dir)?;
         if self.session_id_exists(&id, cwd)? {
             return Err(SessionError::already_exists(format!(
@@ -340,23 +342,29 @@ impl JsonlSessionRepo {
     }
 
     fn session_id_exists(&self, id: &str, cwd: &str) -> Result<bool, SessionError> {
-        let directory = self.sessions_root.join(jsonl_session_directory_name(cwd));
-        if !directory.exists() {
-            return Ok(false);
-        }
+        // Every directory this cwd's sessions may live in, including names
+        // written by older builds, so an id is never created twice.
         let suffix = format!("_{id}.jsonl");
-        let entries = fs::read_dir(&directory).map_err(|err| {
-            SessionError::storage(format!(
-                "Failed to list sessions directory {}: {err}",
-                directory.display()
-            ))
-        })?;
-        Ok(entries.flatten().any(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.ends_with(&suffix))
-        }))
+        for directory in crate::discovery::cwd_scan_roots(&self.sessions_root, cwd) {
+            if !directory.exists() {
+                continue;
+            }
+            let entries = fs::read_dir(&directory).map_err(|err| {
+                SessionError::storage(format!(
+                    "Failed to list sessions directory {}: {err}",
+                    directory.display()
+                ))
+            })?;
+            if entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(&suffix))
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

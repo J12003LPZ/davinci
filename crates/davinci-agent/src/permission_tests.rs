@@ -223,7 +223,14 @@ fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
     let p = policy(PermissionMode::Auto);
     let mut isolated = p.clone();
     isolated.execution_isolated = true;
-    for command in ["cargo build --offline", "cargo clippy --offline"] {
+    // `cargo tree` and `cargo metadata` run the repository's configured
+    // rustc wrapper (and toolchain) for target information.
+    for command in [
+        "cargo build --offline",
+        "cargo clippy --offline",
+        "cargo tree --offline",
+        "cargo metadata --offline",
+    ] {
         assert!(
             is_ask(&verdict(&p, "bash", json!({"command":command}))),
             "unconfined Auto allowed {command}"
@@ -244,12 +251,7 @@ fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
             "isolated Auto asked for {command}"
         );
     }
-    for command in [
-        "cargo fmt --check",
-        "cargo tree --offline",
-        "cargo metadata --offline",
-        "git status",
-    ] {
+    for command in ["cargo fmt --check", "git status"] {
         assert_eq!(
             verdict(&p, "bash", json!({"command":command})),
             PermissionVerdict::Allow,

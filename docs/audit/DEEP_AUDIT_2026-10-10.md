@@ -66,8 +66,8 @@ More gaps were found while fixing, all in the redaction helpers and all closed i
 | Triple-quoted secrets | Masked with their lines | `c9375201` |
 | Lossy UTF-8 corrupted real MCP replies | A non-UTF-8 reply becomes a -32700 error for its id | `55c11f30` |
 | Extension writes under `--no-session` | Not changed: print mode turns `failures` into the reply, so every answer would become an error; not persisting is the `--no-session` contract | none |
-| `cargo tree` still reads project `.cargo/config.toml` (`build.rustc-wrapper`) | Open: needs filesystem awareness the string policy lacks; predates this PR | follow-up |
-| Two cwd encoders remain | Open, low: `JsonlSessionRepo::list` has no production caller | follow-up |
+| `cargo tree` still reads project `.cargo/config.toml` (`build.rustc-wrapper`) | Fixed in round 3: `cargo tree`/`metadata` are no longer read-only in any profile. The repository picks what they run (`.cargo/config.toml` rustc wrapper, `rust-toolchain.toml` toolchain), so no argument allowlist is sound; Auto outside a sandbox now asks | round 3 |
+| Two cwd encoders remain | Fixed in round 3: sessions are written under the discovery name; the legacy repo name is still scanned for listing and id collisions | round 3 |
 | Whole-file masking per `sec_source_read` | Fixed in round 2 (below) | round 2 |
 
 Second review of #172 and #173 (ten findings, all fixed in round 2):
@@ -86,6 +86,13 @@ Second review of #172 and #173 (ten findings, all fixed in round 2):
 | Each `sec_source_read` re-masked the whole file | Masked text cached per (side, path) on the snapshot, never serialized, empty on clone |
 
 Known residuals: an unquoted 40+ character base64-only token with a digit, `+`, `/` or `=` inside a planted block (such as a long dot-free path) is still masked as key text; a key body line with none of those characters (about one line in a million) is not masked.
+
+Round 3 (automated security review of the round 2 commits):
+
+| Item | Resolution |
+|---|---|
+| Narrowing the git fallback let `git $SUB origin` and `git "$(echo push)"` through writer roles | A git segment the lexer refuses is a mutation unless `git_is_read_only` proves it a read after redirections are dropped and expansions become placeholders |
+| An expansion could carry an option (`git log $OPT` with `--output=<file>`) | A placeholder before `--` refuses the segment; `git diff "$BASE"...HEAD` is therefore no longer allowed for writer roles, `git diff -- "$FILE"` is |
 
 ## Confirmed findings
 
