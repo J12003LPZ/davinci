@@ -144,6 +144,35 @@ impl HttpTransport {
         Ok(())
     }
 
+    /// One SSE event: answer server-initiated requests, return the wanted
+    /// response when it is here, and remember the last message otherwise.
+    fn handle_sse_event(
+        &self,
+        value: Value,
+        want: Option<&Value>,
+        last: &mut Option<Value>,
+    ) -> Result<Option<Value>> {
+        // A 2025-03-26 server may send a JSON-RPC batch as one event.
+        for message in flatten_batch(value) {
+            if let (Some(id), Some(method)) = (
+                message.get("id").cloned(),
+                message.get("method").and_then(Value::as_str),
+            ) {
+                self.answer_server_request(id, method)?;
+                continue;
+            }
+            match want {
+                Some(id) if message.get("id") == Some(id) => {
+                    validate_response(&message, id)?;
+                    return Ok(Some(message));
+                }
+                Some(_) => {}
+                None => *last = Some(message),
+            }
+        }
+        Ok(None)
+    }
+
     fn read_sse_response(&self, reader: impl Read, want: Option<&Value>) -> Result<Value> {
         // Bound the underlying stream before read_line so one unterminated
         // SSE line cannot allocate past the response cap before we inspect it.
@@ -175,23 +204,8 @@ impl HttpTransport {
                 let Ok(value) = serde_json::from_str::<Value>(&event) else {
                     continue;
                 };
-                // A 2025-03-26 server may send a JSON-RPC batch as one event.
-                for message in flatten_batch(value) {
-                    if let (Some(id), Some(method)) = (
-                        message.get("id").cloned(),
-                        message.get("method").and_then(Value::as_str),
-                    ) {
-                        self.answer_server_request(id, method)?;
-                        continue;
-                    }
-                    match want {
-                        Some(id) if message.get("id") == Some(id) => {
-                            validate_response(&message, id)?;
-                            return Ok(message);
-                        }
-                        Some(_) => {}
-                        None => last = Some(message),
-                    }
+                if let Some(message) = self.handle_sse_event(value, want, &mut last)? {
+                    return Ok(message);
                 }
                 continue;
             }
@@ -202,18 +216,13 @@ impl HttpTransport {
                 data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
             }
         }
+        // A final event the server did not end with a blank line is still an
+        // event: it gets the same handling, including server-initiated requests.
         if !data.is_empty() {
             let value: Value = serde_json::from_str(&data)
                 .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
-            for message in flatten_batch(value) {
-                if let Some(id) = want {
-                    if message.get("method").is_none() && message.get("id") == Some(id) {
-                        validate_response(&message, id)?;
-                        return Ok(message);
-                    }
-                } else {
-                    last = Some(message);
-                }
+            if let Some(message) = self.handle_sse_event(value, want, &mut last)? {
+                return Ok(message);
             }
         }
         match want {
@@ -603,6 +612,42 @@ mod tests {
             HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
         let result = transport.call("tools/call", serde_json::json!({})).unwrap();
         assert_eq!(result["ok"], true);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unterminated_final_sse_ping_is_still_answered() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_test_request(&mut first);
+            write!(
+                first,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            // No blank line: the stream just ends after the final frame.
+            write!(
+                first,
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":\"s9\",\"method\":\"ping\"}}"
+            )
+            .unwrap();
+            first.flush().unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let request = read_test_request(&mut second);
+            assert!(request.contains("\"id\":\"s9\""), "{request}");
+            assert!(request.contains("\"result\":{}"), "{request}");
+            write!(second, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+            second.flush().unwrap();
+        });
+        let mut transport =
+            HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+        // Our own reply never arrives, so the call fails, but the ping was answered.
+        assert!(transport.call("tools/call", serde_json::json!({})).is_err());
         server.join().unwrap();
     }
 

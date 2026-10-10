@@ -82,8 +82,11 @@ fn has_windows_drive_prefix(path: &str) -> bool {
 
 /// Normalizes path strings: rejects absolute paths, path traversal (`..`), and symlink escapes.
 pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<PathBuf, String> {
-    let trimmed = raw_path.trim();
-    if trimmed.is_empty() {
+    // Not trimmed: surrounding spaces are part of a filename. Components made
+    // only of dots and spaces are refused below because Windows folds `.. `
+    // into `..`.
+    let trimmed = raw_path;
+    if trimmed.trim().is_empty() {
         return Err("Empty file path in patch".into());
     }
     // Reject absolute paths across platforms (Unix leading '/', Windows drive prefix 'C:', UNC '\\')
@@ -112,6 +115,14 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
     }
     for comp in p.components() {
         match comp {
+            std::path::Component::Normal(name)
+                if name
+                    .to_string_lossy()
+                    .trim_end_matches(['.', ' '])
+                    .is_empty() =>
+            {
+                return Err(format!("Directory traversal `..` rejected: {raw_path}"));
+            }
             std::path::Component::ParentDir => {
                 return Err(format!("Directory traversal `..` rejected: {raw_path}"));
             }
@@ -176,10 +187,13 @@ fn is_end_patch_line(line: &str) -> bool {
 }
 
 fn parse_file_path(line: &str, marker: &str) -> Result<String, String> {
+    // Only the single separator after the colon is syntax. Spaces beyond it
+    // belong to the filename: ` report.txt` and `report.txt` are two files.
     let path = line
         .strip_prefix(marker)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
+        .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+        .map(|rest| rest.trim_end_matches(['\r', '\n']))
+        .filter(|path| !path.trim().is_empty())
         .ok_or_else(|| format!("Malformed patch: {marker} requires a file path"))?;
     Ok(path.to_string())
 }
@@ -984,5 +998,67 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&file_a).unwrap(), "let bar = 1;");
         assert_eq!(fs::read_to_string(&file_b).unwrap(), "let bar = bar + 1;");
+    }
+
+    #[test]
+    fn filenames_keep_surrounding_spaces() {
+        assert_eq!(
+            parse_file_path("*** Update File:  report.txt", "*** Update File:").unwrap(),
+            " report.txt"
+        );
+        assert_eq!(
+            parse_file_path("*** Update File: report.txt ", "*** Update File:").unwrap(),
+            "report.txt "
+        );
+        assert_eq!(
+            parse_file_path("*** Add File:x.txt", "*** Add File:").unwrap(),
+            "x.txt"
+        );
+        assert!(parse_file_path("*** Add File:   ", "*** Add File:").is_err());
+        assert!(parse_file_path("*** Add File:", "*** Add File:").is_err());
+    }
+
+    #[test]
+    fn a_patch_for_a_space_prefixed_name_touches_only_that_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("report.txt"),
+            "plain
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(" report.txt"),
+            "spaced
+",
+        )
+        .unwrap();
+        let patch = "*** Begin Patch
+*** Update File:  report.txt
+@@
+-spaced
++edited
+*** End Patch";
+        execute_apply_patch(dir.path(), patch).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("report.txt")).unwrap(),
+            "plain
+"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(" report.txt")).unwrap(),
+            "edited
+"
+        );
+    }
+
+    #[test]
+    fn dot_and_space_components_cannot_smuggle_traversal() {
+        let dir = tempdir().unwrap();
+        for raw in ["foo/.. /x", "foo/../x", ".. /x", "a/ . /x", "... /x"] {
+            assert!(sanitize_relative_path(dir.path(), raw).is_err(), "{raw}");
+        }
+        assert!(sanitize_relative_path(dir.path(), " ok/file.txt").is_ok());
+        assert!(sanitize_relative_path(dir.path(), "dir/.hidden").is_ok());
     }
 }

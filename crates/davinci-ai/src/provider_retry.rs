@@ -154,7 +154,28 @@ fn parse_http_date_ms(value: &str) -> Option<i64> {
     let hour: i64 = time.next()?.parse().ok()?;
     let min: i64 = time.next()?.parse().ok()?;
     let sec: i64 = time.next()?.parse().ok()?;
+    // IMF-fixdate is always GMT, and nothing may follow it.
+    if parts.next()? != "GMT" || parts.next().is_some() || time.next().is_some() {
+        return None;
+    }
+    if !(1970..=9999).contains(&year)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&min)
+        || !(0..60).contains(&sec)
+    {
+        return None;
+    }
     Some(ymd_hms_to_unix_ms(year, month, day, hour, min, sec))
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 fn month_num(name: &str) -> Option<i64> {
@@ -549,5 +570,30 @@ mod tests {
         let error = provider_error_from_ureq(error);
         assert_eq!(error.phase, RequestPhase::Connect);
         assert!(is_retryable_provider_error(&error));
+    }
+
+    #[test]
+    fn http_dates_are_validated_not_normalized() {
+        // 2026-01-02 03:04:05 GMT
+        assert_eq!(
+            parse_http_date_ms("Fri, 02 Jan 2026 03:04:05 GMT"),
+            Some(1_767_323_045_000)
+        );
+        for bad in [
+            "Fri, 32 Jan 2026 25:99:99 GMT",
+            "Fri, 31 Apr 2026 00:00:00 GMT",
+            "Fri, 29 Feb 2026 00:00:00 GMT",
+            "Fri, 00 Jan 2026 00:00:00 GMT",
+            "Fri, 02 Jan 2026 24:00:00 GMT",
+            "Fri, 02 Jan 2026 03:60:00 GMT",
+            "Fri, 02 Jan 2026 03:04:05 PST",
+            "Fri, 02 Jan 2026 03:04:05",
+            "Fri, 02 Jan 2026 03:04:05 GMT extra",
+            "Fri, 02 Jan 1969 03:04:05 GMT",
+        ] {
+            assert_eq!(parse_http_date_ms(bad), None, "{bad}");
+        }
+        assert!(parse_http_date_ms("Sun, 29 Feb 2032 00:00:00 GMT").is_some());
+        assert!(parse_http_date_ms("Fri, 29 Feb 2100 00:00:00 GMT").is_none());
     }
 }

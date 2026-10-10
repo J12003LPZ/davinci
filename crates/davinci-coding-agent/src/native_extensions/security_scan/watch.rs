@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Changed paths whose bytes are hashed into the working-tree digest.
+const MAX_HASHED_PATHS: usize = 2_000;
 const MAX_REPORTED: usize = 5;
 const MAX_FIELD_CHARS: usize = 300;
 const MAX_INJECT_CHARS: usize = 3_000;
@@ -45,6 +47,8 @@ struct State {
     notices: Vec<String>,
     injection: Option<String>,
     usage: crate::native_extensions::background_usage::Counter,
+    /// The `/status` line; per watch, so sessions in one process stay apart.
+    status_line: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,13 +118,17 @@ pub(super) fn working_tree_digest(root: &Path) -> Option<String> {
         let Ok(path) = std::str::from_utf8(&entry[3..]) else {
             continue;
         };
-        if hashed >= 2_000 || super::snapshot::relative_scope(path).is_err() {
+        if super::snapshot::relative_scope(path).is_err() {
             continue;
         }
-        hashed += 1;
         let full = root.join(path);
+        // Past the content budget a path still contributes its size and
+        // mtime, so an edit that leaves Git's status line unchanged moves
+        // the digest anyway.
+        let over_budget = hashed >= MAX_HASHED_PATHS;
+        hashed += 1;
         if let Ok(meta) = std::fs::symlink_metadata(&full) {
-            if meta.is_file() && meta.len() <= 8 * 1024 * 1024 {
+            if !over_budget && meta.is_file() && meta.len() <= 8 * 1024 * 1024 {
                 if let Ok(bytes) = std::fs::read(&full) {
                     material.extend_from_slice(super::sha256_hex(&bytes).as_bytes());
                 }
@@ -212,17 +220,7 @@ fn injection_block(scan_id: &str, findings: &[WatchFinding]) -> String {
     block
 }
 
-static STATUS_LINE: Mutex<Option<String>> = Mutex::new(None);
-
-/// One line for `/status`: whether the session watch is on, and its last result.
-pub fn status_line() -> Option<String> {
-    STATUS_LINE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-fn publish(state: &State, running: bool) {
+fn publish(state: &mut State, running: bool) {
     let line = if !state.enabled {
         format!(
             "security watch: off ({})",
@@ -246,7 +244,7 @@ fn publish(state: &State, running: bool) {
             if running { " · reviewing" } else { "" }
         )
     };
-    *STATUS_LINE.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
+    state.status_line = Some(line);
 }
 
 impl SecurityWatch {
@@ -260,7 +258,7 @@ impl SecurityWatch {
             .or_else(|| (!config.enabled).then(|| "disabled by securityScan.watch.enabled".into()));
         state.enabled = state.disabled_reason.is_none();
         state.min_interval_ms = config.min_interval_ms;
-        publish(&state, false);
+        publish(&mut state, false);
     }
 
     pub fn running(&self) -> bool {
@@ -351,11 +349,22 @@ impl SecurityWatch {
                 Some(error) => Err(error),
                 None => Ok(complete),
             });
-        })?;
+        });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                // Nothing reviewed this state; let the next turn try again.
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_digest = None;
+                return Err(error);
+            }
+        };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.running = Some(handle);
         state.result = result;
-        publish(&state, true);
+        publish(&mut state, true);
         Ok(true)
     }
 
@@ -419,6 +428,10 @@ impl SecurityWatch {
                     Some(Err(error)) => bounded(&error),
                     _ => "review ended without a result".into(),
                 };
+                // This working-tree state was never successfully reviewed:
+                // forget it so the next due turn retries instead of skipping
+                // it as already watched.
+                state.last_digest = None;
                 state.last_outcome = Some(json!({
                     "scanId": scan_id,
                     "status": if handle.status().status == super::types::RunStatus::Cancelled { "cancelled" } else { "failed" },
@@ -426,7 +439,7 @@ impl SecurityWatch {
                 }));
             }
         }
-        publish(&state, false);
+        publish(&mut state, false);
     }
 
     pub fn take_notices(&self) -> Vec<String> {
@@ -461,6 +474,7 @@ impl SecurityWatch {
             "lastStartedMs": state.last_started_ms,
             "last": state.last_outcome,
             "pendingNotice": !state.notices.is_empty(),
+            "statusLine": state.status_line,
         })
     }
 }
@@ -644,7 +658,7 @@ mod tests {
         });
         assert!(!watch.due(now_ms()));
         assert_eq!(watch.status()["enabled"], false);
-        assert!(status_line().is_some());
+        assert!(watch.status()["statusLine"].is_string());
         watch.configure(&WatchConfig {
             enabled: true,
             ..Default::default()
@@ -654,5 +668,79 @@ mod tests {
             environment_block().is_none(),
             "only the environment can still disable it"
         );
+    }
+
+    #[test]
+    fn each_watch_reports_its_own_status_line() {
+        let on = SecurityWatch::default();
+        let off = SecurityWatch::default();
+        on.configure_with(
+            &WatchConfig {
+                enabled: true,
+                min_interval_ms: 0,
+            },
+            None,
+        );
+        off.configure_with(
+            &WatchConfig {
+                enabled: true,
+                min_interval_ms: 0,
+            },
+            Some("blocked here".into()),
+        );
+        assert!(on.status()["statusLine"]
+            .as_str()
+            .unwrap()
+            .starts_with("security watch: on"));
+        assert!(off.status()["statusLine"]
+            .as_str()
+            .unwrap()
+            .contains("off (blocked here)"));
+    }
+
+    #[test]
+    fn digest_moves_when_a_path_past_the_hash_budget_is_edited() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("d")).unwrap();
+        std::fs::write(repo.path().join("seed.txt"), "seed").unwrap();
+        super::super::git::fixture_commit(repo.path());
+        let count = MAX_HASHED_PATHS + 1;
+        for index in 0..count {
+            std::fs::write(repo.path().join("d").join(format!("f{index:05}.txt")), "a").unwrap();
+        }
+        let before = working_tree_digest(repo.path()).unwrap();
+        let last = repo.path().join("d").join(format!("f{:05}.txt", count - 1));
+        std::fs::write(&last, "changed content").unwrap();
+        let after = working_tree_digest(repo.path()).unwrap();
+        assert_ne!(
+            before, after,
+            "an edit past the budget must change the digest"
+        );
+    }
+
+    #[test]
+    fn a_failed_review_is_retried_for_the_same_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("fixture.rs"), "fn original() {}\n").unwrap();
+        super::super::git::fixture_commit(repo.path());
+        std::fs::write(repo.path().join("fixture.rs"), "fn fixture() {}\n").unwrap();
+        let config = watch_config();
+        let watch = SecurityWatch::default();
+        watch.configure_with(&config.watch, None);
+        watch.set_usage(crate::native_extensions::background_usage::Counter::default());
+        let failing = SecurityWorkerRunner::new(|_| Err("provider down".to_string()));
+        assert!(watch
+            .dispatch(repo.path(), &failing, &config, false)
+            .unwrap());
+        wait(&watch);
+        watch.poll(&config);
+        assert_eq!(watch.status()["last"]["status"], "failed");
+        // Same tree, no edits: the failed state must be reviewed again.
+        assert!(watch
+            .dispatch(repo.path(), &failing, &config, false)
+            .unwrap());
+        wait(&watch);
+        watch.poll(&config);
+        assert_eq!(watch.status()["reviews"], 2);
     }
 }

@@ -74,6 +74,16 @@ fn is_manifest_file(file_name: &str) -> bool {
     )
 }
 
+/// The lines a unified diff adds, without the `+++` file header. Removing a
+/// dangerous call is not introducing one, so only added lines are judged.
+fn added_text(patch: &str) -> String {
+    patch
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn assess_change_risk(mutation: &GraphMutation) -> RiskAssessment {
     if mutation.files.is_empty() && mutation.patch_chunks.is_empty() {
         return RiskAssessment {
@@ -194,7 +204,7 @@ pub fn assess_change_risk(mutation: &GraphMutation) -> RiskAssessment {
         if is_doc_path(&chunk.file) {
             continue;
         }
-        let lower = chunk.patch.to_ascii_lowercase();
+        let lower = added_text(&chunk.patch).to_ascii_lowercase();
 
         if (lower.contains("command::new(")
             || lower.contains("process::command")
@@ -381,5 +391,55 @@ mod tests {
         ] {
             assert!(is_doc_path(path), "{path} is documentation");
         }
+    }
+
+    #[test]
+    fn removing_dangerous_code_is_not_new_danger() {
+        let removal = GraphMutation {
+            files: vec![ChangedFile::modified("crates/ui/src/runner.rs")],
+            patch_chunks: vec![PatchChunk {
+                file: "crates/ui/src/runner.rs".into(),
+                patch: "--- a/crates/ui/src/runner.rs
++++ b/crates/ui/src/runner.rs
+@@ -1,3 +1,2 @@
+ fn run() {
+-    std::process::Command::new(\"sh\").status();
+-    let api_key = read();
+ }
+"
+                .into(),
+            }],
+        };
+        let assessment = assess_change_risk(&removal);
+        assert_eq!(assessment.level, ChangeRisk::Low);
+        assert!(assessment.reasons.is_empty());
+
+        let addition = GraphMutation {
+            files: vec![ChangedFile::modified("crates/ui/src/runner.rs")],
+            patch_chunks: vec![PatchChunk {
+                file: "crates/ui/src/runner.rs".into(),
+                patch: "--- a/crates/ui/src/runner.rs
++++ b/crates/ui/src/runner.rs
+@@ -1,2 +1,3 @@
+ fn run() {
++    std::process::Command::new(\"sh\").status();
+ }
+"
+                .into(),
+            }],
+        };
+        assert_eq!(assess_change_risk(&addition).level, ChangeRisk::High);
+    }
+
+    #[test]
+    fn a_header_alone_with_a_dangerous_path_is_not_an_added_line() {
+        assert_eq!(
+            added_text(
+                "+++ b/process.rs
+ context
++real"
+            ),
+            "+real"
+        );
     }
 }
