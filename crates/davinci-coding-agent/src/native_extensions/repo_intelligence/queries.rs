@@ -418,3 +418,60 @@ impl RepoIntelligence {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod degree_tests {
+    use super::*;
+    use std::{sync::Arc, time::Instant};
+
+    #[test]
+    fn repo_map_ten_thousand_module_chain_matches_reference_degrees() {
+        let mut index = RepoIndex::empty("fixture".into(), "fixture".into());
+        for n in 0..10_000 {
+            let path = format!("m{n:05}.ts");
+            let source = if n < 9_999 {
+                format!("import './m{:05}'; export const value = {n};", n + 1)
+            } else {
+                "export const value = 9999;".into()
+            };
+            index.files.insert(
+                path.clone(),
+                Arc::new(super::super::parse_source(&path, &source).unwrap()),
+            );
+        }
+        let started = Instant::now();
+        let result = repo_map(&index, ".", 1, 10_000);
+        let map_elapsed = started.elapsed();
+        let edges = graph::dependencies(&index);
+        let started = Instant::now();
+        // Independent reference: the old per-file edge scan, for comparison.
+        let reference: BTreeMap<_, _> = index
+            .files
+            .keys()
+            .map(|path| {
+                let count = edges
+                    .iter()
+                    .filter(|edge| edge.from == *path || edge.to.as_ref() == Some(path))
+                    .count();
+                (path.as_str(), count)
+            })
+            .collect();
+        let scan_elapsed = started.elapsed();
+        assert_eq!(result["total"], 10_000);
+        assert_eq!(reference["m00000.ts"], 1);
+        assert_eq!(reference["m09999.ts"], 1);
+        assert_eq!(reference["m05000.ts"], 2);
+        for row in result["results"].as_array().unwrap() {
+            assert_eq!(
+                row["connections"].as_u64().unwrap() as usize,
+                reference[row["path"].as_str().unwrap()]
+            );
+        }
+        eprintln!(
+            "WOR-258 files=10000 edges={} repo_map_ms={} former_degree_scan_ms={}",
+            edges.len(),
+            map_elapsed.as_millis(),
+            scan_elapsed.as_millis()
+        );
+    }
+}

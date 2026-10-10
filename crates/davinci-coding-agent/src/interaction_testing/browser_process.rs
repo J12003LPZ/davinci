@@ -755,6 +755,78 @@ mod tests {
     }
 
     #[test]
+    fn stalling_browser_child() {
+        if std::env::var_os("DAVINCI_STALLED_BROWSER_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn stalled_cancel_acknowledgment_preserves_the_original_request_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::spawn(
+                &SupervisorCommand {
+                    executable: executable.clone(),
+                    argv: vec![
+                        "--exact".into(),
+                        "interaction_testing::browser_process::tests::helper_entry".into(),
+                        "--nocapture".into(),
+                    ],
+                },
+                ProcessConfig {
+                    executable,
+                    argv: vec![
+                        "--exact".into(),
+                        "interaction_testing::browser_process::tests::stalling_browser_child"
+                            .into(),
+                        "--nocapture".into(),
+                    ],
+                    cwd: directory.path().to_path_buf(),
+                    environment: BTreeMap::from([(
+                        "DAVINCI_STALLED_BROWSER_CHILD".into(),
+                        "1".into(),
+                    )]),
+                    sandbox: None,
+                    background: true,
+                    service: true,
+                    operation: None,
+                },
+                Arc::new(|_| {}),
+            )
+            .unwrap(),
+        );
+        let bridge = BrowserProcess {
+            supervisor,
+            state: Arc::new((Mutex::new(State::default()), Condvar::new())),
+            writer: Mutex::new(()),
+            directory: directory.path().to_path_buf(),
+        };
+        let abort = AtomicBool::new(false);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(40));
+                abort.store(true, Ordering::SeqCst);
+            });
+            let result = bridge.request_with_abort(
+                json!({"op":"fixture"}),
+                Duration::from_millis(100),
+                Some(&abort),
+            );
+            assert_eq!(result, Err("browser cancellation unconfirmed".into()));
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!bridge.is_healthy());
+        assert!(bridge.supervisor.wait(Duration::from_secs(3)).is_some());
+    }
+
+    #[test]
     #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
     fn supervised_chromium_actions_retention_and_cleanup() {
         use std::io::{Read, Write};

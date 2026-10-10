@@ -65,9 +65,9 @@ impl CodeModeBroker for Catalog {
 fn native_truncated_output_is_partial_not_completed() {
     let outcome = fixture_host().execute(
         &CodeModeRequest {
-            code: "return 'abcdefghijklmnopqrstuvwxyz'".into(),
-            timeout_ms: Some(1000),
-            max_output_bytes: Some(8),
+            code: "return 'x'.repeat(8192)".into(),
+            timeout_ms: Some(5000),
+            max_output_bytes: Some(4096),
         },
         &fixture_context("truncated-fixture"),
         std::sync::Arc::new(Catalog {
@@ -75,6 +75,9 @@ fn native_truncated_output_is_partial_not_completed() {
         }),
     );
     assert!(!outcome.output_complete, "{outcome:?}");
+    assert!(outcome.script_completed, "{outcome:?}");
+    assert!(!outcome.output_text.is_empty(), "{outcome:?}");
+    assert!(outcome.output_text.len() <= 4096, "{outcome:?}");
     assert!(
         matches!(outcome.status, CodeModeStatus::Partial),
         "{outcome:?}"

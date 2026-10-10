@@ -667,6 +667,84 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_reports_a_real_cache_cleanup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cache = store::plugins_dir(&agent).join("cache/fixture");
+        // A damaged cache path which is a file cannot be removed as a directory.
+        write(&cache, "retained fixture data");
+        store::update(&agent, |registry| {
+            registry.plugins.insert(
+                "fixture@local".into(),
+                store::InstalledPlugin {
+                    origin: Origin::Davinci,
+                    install_path: Some(cache.clone()),
+                    version: None,
+                    enabled: true,
+                    hooks_approved: None,
+                    installed_at: 0,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let result = uninstall(&agent, "fixture@local").unwrap();
+        assert!(result.contains("files could not be deleted"), "{result}");
+        assert!(result.contains(&cache.display().to_string()), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(cache).unwrap(),
+            "retained fixture data"
+        );
+        assert!(!store::load(&agent)
+            .unwrap()
+            .plugins
+            .contains_key("fixture@local"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uninstall_reports_an_undeletable_cache_directory() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cache = store::plugins_dir(&agent).join("cache/locked");
+        let sentinel = cache.join("held.txt");
+        write(&sentinel, "retained fixture data");
+        store::update(&agent, |registry| {
+            registry.plugins.insert(
+                "locked@local".into(),
+                store::InstalledPlugin {
+                    origin: Origin::Davinci,
+                    install_path: Some(cache.clone()),
+                    version: None,
+                    enabled: true,
+                    hooks_approved: None,
+                    installed_at: 0,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&sentinel)
+            .unwrap();
+        let result = uninstall(&agent, "locked@local").unwrap();
+        drop(held);
+        assert!(result.contains("files could not be deleted"), "{result}");
+        assert!(result.contains(&cache.display().to_string()), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(sentinel).unwrap(),
+            "retained fixture data"
+        );
+        assert!(!store::load(&agent)
+            .unwrap()
+            .plugins
+            .contains_key("locked@local"));
+    }
+
+    #[test]
     fn audit_failed_refresh_and_publication_preserve_the_installation() {
         let dir = tempfile::tempdir().unwrap();
         let _homes = FakeHomes::new(dir.path());

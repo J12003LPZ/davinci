@@ -149,7 +149,10 @@ fn uncommitted_edits_are_the_default_change_set() {
     let ws = Workspace::new();
     ws.write("src/a.ts", "export const a = 1;\n");
     ws.write("src/b.ts", "export const b = 1;\n");
+    ws.write("src/staged.ts", "export const staged = 1;\n");
     ws.commit();
+    ws.write("src/staged.ts", "export const staged = 2;\n");
+    ws.git(&["add", "src/staged.ts"]);
     ws.write("src/a.ts", "export const a = 2;\n");
     ws.write("src/new.ts", "export const fresh = 1;\n");
     let report = ws.analyze(json!({})).unwrap();
@@ -164,6 +167,11 @@ fn uncommitted_edits_are_the_default_change_set() {
         report.files
     );
     assert!(!report.files.contains(&"src/b.ts".to_string()));
+    assert!(
+        report.files.contains(&"src/staged.ts".to_string()),
+        "{:?}",
+        report.files
+    );
 }
 
 #[test]
