@@ -5,7 +5,8 @@ use std::sync::OnceLock;
 pub fn text(input: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| [
-        r#"(?i)(?:api[_-]?key|client[_-]?secret|access[_-]?token|password|secret|authorization)[\s\"']*[:=][\s\"']*[^\s\"',;}]+"#,
+        r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key)[a-z0-9_.-]*[\s\"']*[:=][\s\"']*(?:(?:basic|bearer|digest|token)\s+)?[^\s\"',;}]+"#,
+        r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/=._~-]{8,}",
         r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
         r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+",
         r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
@@ -36,6 +37,12 @@ mod tests {
             "api_key = 'fixture-sensitive'",
             "{\"client_secret\": \"fixture-sensitive\"}",
             "https://user:fixture-sensitive@example.invalid",
+            "Authorization: Basic Zml4dHVyZS1zZW5zaXRpdmU6eA==",
+            "{\"Authorization\": \"Basic Zml4dHVyZS1zZW5zaXRpdmU6eA==\"}",
+            "curl -H 'Authorization: Bearer fixture-sensitive' x",
+            "AWS_SECRET_ACCESS_KEY=fixture-sensitive",
+            "export aws_secret_access_key = \"fixture-sensitive\"",
+            "db.password: fixture-sensitive",
         ] {
             assert!(!text(secret).contains("fixture-sensitive"));
         }

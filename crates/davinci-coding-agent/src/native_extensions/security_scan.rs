@@ -253,6 +253,33 @@ pub struct SecurityArtifactStore {
     root: PathBuf,
 }
 
+/// Create `path` as a real directory. A symlink there, whether planted before
+/// or swapped in during creation, is refused so artifacts and the permission
+/// change cannot land outside the artifact directory.
+fn create_real_dir(path: &Path) -> std::io::Result<()> {
+    let refuse = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a plain directory", path.display()),
+        )
+    };
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return Err(refuse()),
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
+        _ => Err(refuse()),
+    }
+}
+
 fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -274,7 +301,8 @@ fn prune_scan_reports(root: &Path, keep: usize) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
-    let mut entries = entries
+    let now = std::time::SystemTime::now();
+    let entries = entries
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| {
@@ -282,14 +310,51 @@ fn prune_scan_reports(root: &Path, keep: usize) {
                 .metadata()
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            (modified, entry.path())
+            let path = entry.path();
+            let active = scan_is_active(&path, modified, now);
+            (modified, path, active)
         })
         .collect::<Vec<_>>();
-    entries.sort_by_key(|(modified, _)| *modified);
-    let remove = entries.len().saturating_sub(keep);
-    for (_, path) in entries.into_iter().take(remove) {
+    for path in scans_to_prune(entries, keep) {
         let _ = fs::remove_dir_all(path);
     }
+}
+
+/// Everything beyond the `keep` newest scans, except scans still in flight.
+fn scans_to_prune(
+    mut entries: Vec<(std::time::SystemTime, PathBuf, bool)>,
+    keep: usize,
+) -> Vec<PathBuf> {
+    entries.sort_by_key(|(modified, _, _)| *modified);
+    let remove = entries.len().saturating_sub(keep);
+    entries
+        .into_iter()
+        .take(remove)
+        .filter(|(_, _, active)| !active)
+        .map(|(_, path, _)| path)
+        .collect()
+}
+
+/// A scan still in flight (manifest says started or draft) and touched
+/// recently keeps its artifacts however many newer scans pile up. A scan that
+/// went quiet for a day is abandoned and prunes like any other.
+const ACTIVE_SCAN_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn scan_is_active(dir: &Path, modified: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    let in_flight = fs::read(dir.join("scan-manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|status| matches!(status.as_str(), "started" | "draft"));
+    in_flight
+        && now
+            .duration_since(modified)
+            .map_or(true, |age| age < ACTIVE_SCAN_GRACE)
 }
 
 impl SecurityArtifactStore {
@@ -302,7 +367,9 @@ impl SecurityArtifactStore {
         let reports = agent_dir.join("security-scans");
         let repo_root = reports.join(repo_id);
         let root = repo_root.join(scan_id);
-        fs::create_dir_all(&root).map_err(|err| ToolError::Failed(err.to_string()))?;
+        for dir in [&reports, &repo_root, &root] {
+            create_real_dir(dir).map_err(|err| ToolError::Failed(err.to_string()))?;
+        }
         ensure_private_dir(&reports).map_err(|err| ToolError::Failed(err.to_string()))?;
         ensure_private_dir(&repo_root).map_err(|err| ToolError::Failed(err.to_string()))?;
         ensure_private_dir(&root).map_err(|err| ToolError::Failed(err.to_string()))?;
@@ -1714,11 +1781,22 @@ fn read_scan_file(
 }
 
 fn read_scan_file_at_path(path: &Path, config: &SecurityScanConfig) -> Result<Vec<u8>, ToolError> {
-    let metadata = fs::metadata(path).map_err(|err| ToolError::Failed(err.to_string()))?;
-    if metadata.len() > config.max_file_bytes {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    if !metadata.is_file() || metadata.len() > config.max_file_bytes {
         return Err(ToolError::Failed("file exceeds scan limit".into()));
     }
-    let bytes = fs::read(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    // Bound the read itself: the file may grow after the size check.
+    let mut bytes = Vec::new();
+    file.take(config.max_file_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    if bytes.len() as u64 > config.max_file_bytes {
+        return Err(ToolError::Failed("file exceeds scan limit".into()));
+    }
     if bytes.contains(&0) {
         return Err(ToolError::Failed("binary file".into()));
     }
@@ -1864,6 +1942,17 @@ fn safe_join(root: &Path, relative: &Path) -> Result<PathBuf, ToolError> {
         .map_err(|err| ToolError::Failed(err.to_string()))?;
     if !canonical_parent.starts_with(&canonical_root) {
         return Err(ToolError::Failed("scope escapes repository".into()));
+    }
+    // The parent can be inside while the final component is a symlink out.
+    match joined.canonicalize() {
+        Ok(target) if !target.starts_with(&canonical_root) => {
+            return Err(ToolError::Failed("scope escapes repository".into()));
+        }
+        Ok(_) => {}
+        Err(_) if fs::symlink_metadata(&joined).is_ok() => {
+            return Err(ToolError::Failed("scope escapes repository".into()));
+        }
+        Err(_) => {}
     }
     Ok(joined)
 }
@@ -2652,5 +2741,169 @@ mod tests {
                 diff: None,
             })
             .is_err());
+    }
+
+    /// Symlink creation needs a privilege on some Windows setups; a test that
+    /// cannot create one has nothing to prove and returns early.
+    fn try_symlink(target: &Path, link: &Path, dir: bool) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = dir;
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            if dir {
+                std::os::windows::fs::symlink_dir(target, link).is_ok()
+            } else {
+                std::os::windows::fs::symlink_file(target, link).is_ok()
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_store_refuses_symlinked_directories() {
+        let agent = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        if !try_symlink(outside.path(), &agent.path().join("security-scans"), true) {
+            return;
+        }
+        assert!(SecurityArtifactStore::new(agent.path(), "repo-1", "scan-1").is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        let agent = tempdir().unwrap();
+        fs::create_dir_all(agent.path().join("security-scans")).unwrap();
+        assert!(try_symlink(
+            outside.path(),
+            &agent.path().join("security-scans").join("repo-2"),
+            true
+        ));
+        assert!(SecurityArtifactStore::new(agent.path(), "repo-2", "scan-1").is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        let agent = tempdir().unwrap();
+        let store = SecurityArtifactStore::new(agent.path(), "repo-3", "scan-1").unwrap();
+        assert!(store.root().is_dir());
+        assert!(SecurityArtifactStore::new(agent.path(), "repo-3", "scan-1").is_ok());
+    }
+
+    #[test]
+    fn safe_join_rejects_a_final_component_symlinked_outside() {
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+        fs::write(repo.path().join("inside.txt"), "inside").unwrap();
+        assert!(safe_join(repo.path(), Path::new("inside.txt")).is_ok());
+        assert!(safe_join(repo.path(), Path::new("missing.txt")).is_ok());
+        if !try_symlink(
+            &outside.path().join("secret.txt"),
+            &repo.path().join("link.txt"),
+            false,
+        ) {
+            return;
+        }
+        let config = SecurityScanConfig::default();
+        assert!(safe_join(repo.path(), Path::new("link.txt")).is_err());
+        assert!(read_scan_file(repo.path(), Path::new("link.txt"), &config).is_err());
+        assert!(try_symlink(outside.path(), &repo.path().join("dir"), true));
+        assert!(safe_join(repo.path(), Path::new("dir")).is_err());
+        assert!(try_symlink(
+            &repo.path().join("gone"),
+            &repo.path().join("dangling"),
+            false
+        ));
+        assert!(safe_join(repo.path(), Path::new("dangling")).is_err());
+    }
+
+    #[test]
+    fn scan_read_is_bounded_even_if_the_file_outgrows_the_check() {
+        let repo = tempdir().unwrap();
+        let config = SecurityScanConfig {
+            max_file_bytes: 16,
+            ..SecurityScanConfig::default()
+        };
+        fs::write(repo.path().join("ok.txt"), [b'a'; 16]).unwrap();
+        fs::write(repo.path().join("big.txt"), [b'a'; 17]).unwrap();
+        assert_eq!(
+            read_scan_file(repo.path(), Path::new("ok.txt"), &config)
+                .unwrap()
+                .len(),
+            16
+        );
+        assert!(read_scan_file(repo.path(), Path::new("big.txt"), &config).is_err());
+        assert!(read_scan_file_at_path(repo.path(), &config).is_err());
+    }
+
+    fn scan_dir(root: &Path, name: &str, status: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("scan-manifest.json"),
+            format!("{{\"status\":\"{status}\"}}"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn at(secs_ago: u64, now: std::time::SystemTime) -> std::time::SystemTime {
+        now - std::time::Duration::from_secs(secs_ago)
+    }
+
+    #[test]
+    fn an_in_flight_scan_is_active_until_it_goes_quiet_for_a_day() {
+        let root = tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let day = 24 * 60 * 60;
+        for status in ["started", "draft"] {
+            let dir = scan_dir(root.path(), status, status);
+            assert!(scan_is_active(&dir, at(60, now), now));
+            assert!(!scan_is_active(&dir, at(2 * day, now), now));
+        }
+        for status in ["completed", "cancelled"] {
+            let dir = scan_dir(root.path(), status, status);
+            assert!(!scan_is_active(&dir, at(60, now), now));
+        }
+        let no_manifest = root.path().join("none");
+        fs::create_dir_all(&no_manifest).unwrap();
+        assert!(!scan_is_active(&no_manifest, at(60, now), now));
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_never_an_active_scan() {
+        let now = std::time::SystemTime::now();
+        let entry =
+            |name: &str, ago: u64, active: bool| (at(ago, now), PathBuf::from(name), active);
+        let doomed = scans_to_prune(
+            vec![
+                entry("new-2", 20, false),
+                entry("active-oldest", 3000, true),
+                entry("done-a", 2000, false),
+                entry("new-1", 30, false),
+                entry("done-b", 1000, false),
+            ],
+            2,
+        );
+        assert_eq!(
+            doomed,
+            vec![PathBuf::from("done-a"), PathBuf::from("done-b")]
+        );
+        assert!(scans_to_prune(vec![entry("only", 1, false)], 10).is_empty());
+    }
+
+    #[test]
+    fn prune_scan_reports_spares_a_running_scan_on_disk() {
+        let root = tempdir().unwrap();
+        let running = scan_dir(root.path(), "running", "started");
+        for index in 0..4 {
+            scan_dir(root.path(), &format!("done-{index}"), "completed");
+        }
+        // Fresh directories share an mtime window; only the running one is protected.
+        prune_scan_reports(root.path(), 1);
+        assert!(running.exists(), "running scan must survive pruning");
+        let remaining = fs::read_dir(root.path()).unwrap().count();
+        assert!(
+            (1..=2).contains(&remaining),
+            "kept newest or running, got {remaining}"
+        );
     }
 }

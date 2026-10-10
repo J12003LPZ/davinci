@@ -7,6 +7,8 @@ pub enum MouseKind {
     Drag,
     ScrollUp,
     ScrollDown,
+    ScrollLeft,
+    ScrollRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,10 @@ pub fn parse_mouse_sgr(input: &str) -> Option<MouseEvent> {
         (MouseKind::ScrollUp, MouseButton::Wheel)
     } else if code == 65 {
         (MouseKind::ScrollDown, MouseButton::Wheel)
+    } else if code == 66 {
+        (MouseKind::ScrollLeft, MouseButton::Wheel)
+    } else if code == 67 {
+        (MouseKind::ScrollRight, MouseButton::Wheel)
     } else if code & 32 != 0 {
         (
             MouseKind::Drag,
@@ -107,5 +113,23 @@ mod tests {
         assert_eq!(up.kind, MouseKind::Up);
         let scroll = parse_mouse_sgr("\x1b[<64;1;1M").unwrap();
         assert_eq!(scroll.kind, MouseKind::ScrollUp);
+    }
+
+    #[test]
+    fn horizontal_wheel_is_a_scroll_not_a_click() {
+        let left = parse_mouse_sgr("\x1b[<66;10;5M").unwrap();
+        assert_eq!(
+            (left.kind, left.button),
+            (MouseKind::ScrollLeft, MouseButton::Wheel)
+        );
+        let right = parse_mouse_sgr("\x1b[<67;10;5M").unwrap();
+        assert_eq!(
+            (right.kind, right.button),
+            (MouseKind::ScrollRight, MouseButton::Wheel)
+        );
+        let shifted = parse_mouse_sgr("\x1b[<70;10;5M").unwrap();
+        assert!(shifted.shift);
+        assert_eq!(shifted.kind, MouseKind::ScrollLeft);
+        assert_eq!((left.x, left.y), (9, 4));
     }
 }

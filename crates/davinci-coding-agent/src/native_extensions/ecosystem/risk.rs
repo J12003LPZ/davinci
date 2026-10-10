@@ -29,13 +29,27 @@ pub struct RiskAssessment {
     pub reasons: Vec<RiskReason>,
 }
 
+/// Prose that is documentation wherever it lives.
+const PROSE_EXTENSIONS: &[&str] = &["md", "mdx", "txt", "rst", "adoc"];
+/// Static assets that are documentation only inside a `docs` directory.
+const DOC_ASSET_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "csv"];
+
+/// Documentation is judged by what the file is, not only where it sits: a
+/// script or source file under `docs/` still runs, so it is not exempt.
 fn is_doc_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".md")
-        || lower.ends_with(".txt")
-        || lower.ends_with(".rst")
-        || lower.starts_with("docs/")
-        || lower.contains("/docs/")
+    let lower = path.to_ascii_lowercase().replace('\\', "/");
+    let Some((_, extension)) = lower
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+    else {
+        return false;
+    };
+    if PROSE_EXTENSIONS.contains(&extension) {
+        return true;
+    }
+    DOC_ASSET_EXTENSIONS.contains(&extension)
+        && (lower.starts_with("docs/") || lower.contains("/docs/"))
 }
 
 fn is_manifest_file(file_name: &str) -> bool {
@@ -327,5 +341,43 @@ mod tests {
         let a5 = assess_change_risk(&m5);
         assert_eq!(a5.level, ChangeRisk::High);
         assert_eq!(a5.reasons[0].surface, "filesystem_traversal");
+    }
+
+    #[test]
+    fn executable_code_under_docs_is_not_documentation() {
+        for path in [
+            "docs/scripts/auth.rs",
+            "docs/tools/run.sh",
+            "docs/examples/spawn.py",
+            "site/docs/build.js",
+            "DOCS\\scripts\\deploy.ps1",
+        ] {
+            assert!(!is_doc_path(path), "{path} must not be exempt");
+        }
+        let mutation = GraphMutation {
+            files: vec![ChangedFile::modified("docs/scripts/auth.rs")],
+            patch_chunks: vec![PatchChunk {
+                file: "docs/scripts/helper.rs".into(),
+                patch: "+ std::process::Command::new(\"sh\").status();".into(),
+            }],
+        };
+        let assessment = assess_change_risk(&mutation);
+        assert_eq!(assessment.level, ChangeRisk::High);
+        let surfaces: Vec<_> = assessment.reasons.iter().map(|r| r.surface).collect();
+        assert!(surfaces.contains(&"authentication_authorization"));
+        assert!(surfaces.contains(&"process_execution"));
+    }
+
+    #[test]
+    fn real_documentation_stays_exempt() {
+        for path in [
+            "docs/architecture/token_auth.md",
+            "docs/img/auth-flow.png",
+            "README.md",
+            "notes/auth.txt",
+            "docs\\guide\\auth.rst",
+        ] {
+            assert!(is_doc_path(path), "{path} is documentation");
+        }
     }
 }
