@@ -2934,7 +2934,7 @@ pub(crate) mod tests {
 
     #[test]
     fn private_keys_and_url_passwords_do_not_survive_memory_extraction() {
-        let body = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+        let body = "MIIEfixture0FIXTURE1fixture2FIXTURE3fixture4FIXTURE5abcd";
         let content = format!(
             "Remember the deploy key:
 -----BEGIN OPENSSH PRIVATE KEY-----

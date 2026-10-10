@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn source_reads_never_return_private_key_body_lines() {
-        let body = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+        let body = "MIIEfixture0FIXTURE1fixture2FIXTURE3fixture4FIXTURE5abcd";
         let text = format!(
             "fn before() {{}}\nconst KEY: &str = \"\\\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n{body}\n-----END RSA PRIVATE KEY-----\";\nfn after() {{}}\n"
         );

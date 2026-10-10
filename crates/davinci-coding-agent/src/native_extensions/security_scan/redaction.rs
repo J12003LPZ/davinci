@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn private_key_bodies_url_passwords_and_named_tokens_are_redacted() {
-        let body = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+        let body = "MIIEfixture0FIXTURE1fixture2FIXTURE3fixture4FIXTURE5abcd";
         let pem = format!(
             "const KEY: &str = \"\\\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n{body}\n-----END RSA PRIVATE KEY-----\";\nfn after() {{}}"
         );

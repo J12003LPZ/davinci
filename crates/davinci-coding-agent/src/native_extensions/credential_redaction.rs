@@ -77,7 +77,11 @@ pub(super) fn private_key_blocks(input: &str) -> String {
         let inside = in_block || putty_lines > 0;
         let whole =
             last.is_some() || putty_header.is_some() || (inside && key_material_line(content));
-        let partial = inside && !whole && base64_run().is_match(content);
+        let partial = inside
+            && !whole
+            && base64_run()
+                .find_iter(content)
+                .any(|run| key_like(run.as_str()));
         if inside && !whole && !partial {
             in_block = false;
             putty_lines = 0;
@@ -86,7 +90,15 @@ pub(super) fn private_key_blocks(input: &str) -> String {
             out.push_str(PRIVATE_KEY_MARKER);
             out.push_str(&line[content.len()..]);
         } else if partial {
-            out.push_str(&base64_run().replace_all(content, PRIVATE_KEY_MARKER));
+            out.push_str(
+                &base64_run().replace_all(content, |run: &regex::Captures<'_>| {
+                    if key_like(&run[0]) {
+                        PRIVATE_KEY_MARKER.to_string()
+                    } else {
+                        run[0].to_string()
+                    }
+                }),
+            );
             out.push_str(&line[content.len()..]);
         } else {
             out.push_str(line);
@@ -110,6 +122,15 @@ fn base64_run() -> &'static Regex {
     RUN.get_or_init(|| Regex::new(r"[A-Za-z0-9+/]{16,}={0,2}").expect("fixed base64 run pattern"))
 }
 
+/// Base64 key text, not a word. A 64-character body line without a digit,
+/// `+`, `/` or `=` occurs about once in a million; identifiers and keywords
+/// (`import os`, `executeMaliciousPayload`) almost always lack them, so a
+/// planted marker cannot pass ordinary code off as key material.
+fn key_like(text: &str) -> bool {
+    text.bytes()
+        .any(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'/' | b'='))
+}
+
 /// A line that can belong to a key body: base64, also when quoted, escaped,
 /// concatenated or split into several string fragments on the line
 /// (`"MIIE" "abcd" +`); a PEM/PGP/SSH2 armor header; or blank.
@@ -126,20 +147,17 @@ fn key_material_line(content: &str) -> bool {
         return true;
     }
     // String syntax anywhere on the line is not key text; what remains must
-    // be base64.
-    trimmed
+    // be empty (blank or punctuation only) or base64 that looks like a key.
+    let text: String = trimmed
         .replace("\\n", "")
         .replace("\\r", "")
-        .bytes()
-        .filter(|byte| {
-            !matches!(
-                byte,
-                b'"' | b'\'' | b'`' | b' ' | b'\t' | b',' | b';' | b'\\'
-            )
-        })
-        .all(|byte| {
+        .chars()
+        .filter(|ch| !matches!(ch, '"' | '\'' | '`' | ' ' | '\t' | ',' | ';' | '\\'))
+        .collect();
+    text.is_empty()
+        || (text.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
-        })
+        }) && key_like(&text))
 }
 
 /// Mask the password in `scheme://user:password@host` for any URL scheme:
@@ -152,11 +170,10 @@ fn key_material_line(content: &str) -> bool {
 /// keeps its host. Scanning continues after each URL, so a second URL in the
 /// same token is still masked.
 ///
-/// One forward pass: the cursor only advances, and each URL looks at most
-/// `MAX_AUTHORITY` bytes ahead, so hostile input (a long token of repeated
-/// `a://u:`) costs linear time and no recursion.
+/// One forward pass with no recursion: the cursor only advances, and the next
+/// `@`, delimiter and whitespace are each found once and reused until passed,
+/// so hostile input (a long token of repeated `a://u:`) costs linear time.
 pub(super) fn url_credentials(input: &str) -> String {
-    const MAX_AUTHORITY: usize = 2048;
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
         Regex::new(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]*:").expect("fixed URL credential pattern")
@@ -176,6 +193,7 @@ pub(super) fn url_credentials(input: &str) -> String {
     }
     let mut next_at = None;
     let mut next_space = None;
+    let mut next_delimiter = None;
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0;
     while let Some(found) = pattern.find_at(input, cursor) {
@@ -183,15 +201,22 @@ pub(super) fn url_credentials(input: &str) -> String {
         let space = next_from(input, rest_start, &mut next_space, |s| {
             s.find(char::is_whitespace)
         });
-        let mut rest_end = space.min(rest_start + MAX_AUTHORITY);
-        while !input.is_char_boundary(rest_end) {
-            rest_end -= 1;
-        }
+        // No length cap: a password longer than any window would leak.
+        let rest_end = space;
         let rest = &input[rest_start..rest_end];
-        let delimiter = rest.find(['/', '?', '#']);
-        let first_at = Some(next_from(input, rest_start, &mut next_at, |s| s.find('@')))
-            .filter(|at| *at < rest_end)
-            .map(|at| at - rest_start);
+        let find_delimiter: fn(&str) -> Option<usize> = |s| s.find(['/', '?', '#']);
+        let relative = |at: usize| {
+            Some(at)
+                .filter(|at| *at < rest_end)
+                .map(|at| at - rest_start)
+        };
+        let delimiter = relative(next_from(
+            input,
+            rest_start,
+            &mut next_delimiter,
+            find_delimiter,
+        ));
+        let first_at = relative(next_from(input, rest_start, &mut next_at, |s| s.find('@')));
         let port = delimiter.is_some_and(|end| {
             end > 0
                 && first_at.is_none_or(|at| end < at)
@@ -199,9 +224,13 @@ pub(super) fn url_credentials(input: &str) -> String {
         });
         match first_at {
             Some(first_at) if !port => {
-                let authority_end = rest[first_at..]
-                    .find(['/', '?', '#'])
-                    .map_or(rest.len(), |offset| first_at + offset);
+                let authority_end = relative(next_from(
+                    input,
+                    rest_start + first_at,
+                    &mut next_delimiter,
+                    find_delimiter,
+                ))
+                .unwrap_or(rest.len());
                 let last_at = rest[..authority_end].rfind('@').unwrap_or(first_at);
                 let scheme_end = input[found.start()..].find("://").map_or(0, |at| at + 3);
                 out.push_str(&input[cursor..found.start() + scheme_end]);
@@ -224,7 +253,7 @@ pub(super) fn url_credentials(input: &str) -> String {
 mod tests {
     use super::*;
 
-    const BODY: &str = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+    const BODY: &str = "MIIEfixture0FIXTURE1fixture2FIXTURE3fixture4FIXTURE5abcd";
 
     #[test]
     fn private_key_blocks_mask_every_line_and_keep_line_numbers() {
@@ -412,6 +441,29 @@ mod tests {
     }
 
     #[test]
+    fn a_planted_marker_cannot_pass_code_off_as_key_text() {
+        let planted = format!(
+            "-----BEGIN PRIVATE KEY-----\n{BODY}\nrun(executeMaliciousPayload); // {BODY}\nimport os\nexecuteMaliciousPayload\nvisible();\n"
+        );
+        let output = private_key_blocks(&planted);
+        // Key text is masked, the identifier on the same line is not, and
+        // letters-only code ends the block.
+        assert!(!output.contains(BODY), "{output}");
+        assert!(output.contains("run(executeMaliciousPayload);"), "{output}");
+        assert!(output.contains("import os"), "{output}");
+        assert!(output.contains("executeMaliciousPayload\n"), "{output}");
+        assert!(output.contains("visible();"), "{output}");
+    }
+
+    #[test]
+    fn long_url_passwords_are_masked_whole() {
+        let password = "p4ss/".repeat(1_000);
+        let url = format!("postgres://admin:{password}@db.internal/app");
+        let output = url_credentials(&url);
+        assert_eq!(output, "postgres://[REDACTED]@db.internal/app");
+    }
+
+    #[test]
     fn url_scan_is_linear_and_never_recurses_on_hostile_tokens() {
         // 200k repeated scheme prefixes in one token: the old recursive scan
         // overflowed the stack and rescanned the token for every prefix.
@@ -452,10 +504,10 @@ mod tests {
         assert!(output.contains("fn backdoor()"), "{output}");
 
         // A body split into short string fragments on one line is key text.
-        let fragments = "-----BEGIN PRIVATE KEY-----\n\"MIIEfix\" \"tureFIX\" \"TUREabc\" +\n-----END PRIVATE KEY-----\nvisible();\n";
+        let fragments = "-----BEGIN PRIVATE KEY-----\n\"MIIEfix0\" \"tureFIX1\" \"TUREabc2\" +\n-----END PRIVATE KEY-----\nvisible();\n";
         let output = private_key_blocks(fragments);
         assert!(
-            !output.contains("MIIEfix") && !output.contains("TUREabc"),
+            !output.contains("MIIEfix0") && !output.contains("TUREabc2"),
             "{output}"
         );
         assert!(output.contains("visible();"), "{output}");
