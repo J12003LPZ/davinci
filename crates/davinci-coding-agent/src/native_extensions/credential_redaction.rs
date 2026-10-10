@@ -24,27 +24,30 @@ pub(super) fn quoted_assignments(input: &str) -> String {
 /// Line count and terminators are preserved so line-addressed reads of the
 /// masked text still line up with the source.
 pub(super) fn private_key_blocks(input: &str) -> String {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    let marker = MARKER.get_or_init(|| {
+        Regex::new(r"(?i)-----\s*(BEGIN|END)\b[A-Z0-9 ]*PRIVATE KEY")
+            .expect("fixed private key marker pattern")
+    });
     let mut out = String::with_capacity(input.len());
     let mut in_block = false;
     for line in input.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        let upper = content.to_ascii_uppercase();
-        let key_line = upper.contains("PRIVATE KEY");
-        let begin = key_line && upper.contains("BEGIN");
-        let end = key_line && upper.contains("END");
-        if in_block || begin {
+        // Only a real armor marker opens or closes a block; the last one on
+        // the line decides, so a one-line key (escaped newlines in a string)
+        // opens and closes here and other text on the line changes nothing.
+        let last = marker
+            .captures_iter(content)
+            .last()
+            .map(|captures| captures[1].eq_ignore_ascii_case("BEGIN"));
+        if in_block || last.is_some() {
             out.push_str(PRIVATE_KEY_MARKER);
             out.push_str(&line[content.len()..]);
-            // A one-line block (escaped newlines in a string) opens and
-            // closes here; END before BEGIN on one line does not close it.
-            let closes_here = end
-                && upper
-                    .rfind("END")
-                    .zip(upper.find("BEGIN"))
-                    .is_none_or(|(end_at, begin_at)| end_at > begin_at);
-            in_block = if in_block { !end } else { !closes_here };
         } else {
             out.push_str(line);
+        }
+        if let Some(opens) = last {
+            in_block = opens;
         }
     }
     out
@@ -101,6 +104,26 @@ mod tests {
 
         let prose = "// rotate the private key yearly\nvisible\n";
         assert_eq!(private_key_blocks(prose), prose);
+        let prose = "// BEGIN by loading the private key, END by dropping it\nvisible\n";
+        assert_eq!(private_key_blocks(prose), prose);
+    }
+
+    #[test]
+    fn text_around_a_begin_marker_never_closes_the_block() {
+        // "END" in other text on the BEGIN line (APPENDED, ENDPOINT, pem_end)
+        // must not end the block before the body.
+        for begin in [
+            "-----BEGIN RSA PRIVATE KEY----- // appended by vendor",
+            "let pem_end = \"-----BEGIN PRIVATE KEY-----\\",
+            "-----BEGIN EC PRIVATE KEY----- endpoint key",
+            "-----END PRIVATE KEY----- -----BEGIN PRIVATE KEY-----",
+            "-----begin openssh private key-----",
+        ] {
+            let input = format!("{begin}\n{BODY}\n{BODY}\n-----END PRIVATE KEY-----\nvisible\n");
+            let output = private_key_blocks(&input);
+            assert!(!output.contains(BODY), "{begin}: {output}");
+            assert!(output.ends_with("visible\n"), "{begin}: {output}");
+        }
     }
 
     #[test]
