@@ -1767,6 +1767,9 @@ mod tests {
                     Err(error) => panic!("{error}"),
                 }
             };
+            // Windows inherits the listener's nonblocking mode on accept.
+            // Request fragments may arrive after accept even on localhost.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
