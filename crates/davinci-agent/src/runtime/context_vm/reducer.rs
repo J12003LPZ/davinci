@@ -4,7 +4,7 @@ use super::{
     CheckpointState, ContextEvent, ContextEventKind, ProvenanceRef, StateDelta, StateValue,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedStateValue {
@@ -268,6 +268,15 @@ pub fn render_ledger(state: &CheckpointState) -> String {
         ));
     }
     out
+}
+
+/// Every source the state cites, retired values included: the refs the
+/// ledger tells the model it can retrieve.
+pub fn cited_source_refs(state: &CheckpointState) -> BTreeSet<String> {
+    all_values(state)
+        .flat_map(|value| &value.provenance)
+        .flat_map(|provenance| provenance.source_refs.iter().cloned())
+        .collect()
 }
 
 pub fn parse_checkpoint_proposal(text: &str) -> Result<CheckpointProposal, String> {

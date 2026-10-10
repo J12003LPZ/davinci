@@ -22,8 +22,9 @@ pub(crate) use fold::fold_request;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
 pub use metrics::ContextVmMetrics;
 pub use reducer::{
-    parse_checkpoint_proposal, render_ledger, CheckpointProposal, ContextStateReducer,
-    ProposedStateValue, RetiredState, StateSlot, StateTransition, TransitionKind,
+    cited_source_refs, parse_checkpoint_proposal, render_ledger, CheckpointProposal,
+    ContextStateReducer, ProposedStateValue, RetiredState, StateSlot, StateTransition,
+    TransitionKind,
 };
 pub use retrieval::{retrieve_context_tool, RetrieveContextRequest, RetrieveContextResult};
 pub use shadow::{compare_shadow_views, ShadowComparison};
@@ -68,6 +69,7 @@ pub(crate) struct FoldUndo {
     state: ContextVmState,
     events: Vec<ContextEvent>,
     source_contents: HashMap<String, String>,
+    retained_sources: HashMap<String, String>,
     pinned: HashMap<String, ContextObject>,
     retrieval_offered: bool,
     folds: u64,
@@ -82,6 +84,9 @@ pub struct ContextVmRuntime {
     pub(crate) state: Arc<RwLock<ContextVmState>>,
     pub(crate) events: Arc<RwLock<Vec<ContextEvent>>>,
     pub(crate) source_contents: Arc<RwLock<HashMap<String, String>>>,
+    /// Text of sources the state still cites that a rewritten sessionless
+    /// transcript no longer holds; see [`Self::rebase`].
+    retained_sources: Arc<RwLock<HashMap<String, String>>>,
     session_source: Arc<RwLock<Option<sources::SessionSource>>>,
     source_index: Arc<std::sync::Mutex<sources::SourceIndex>>,
     metrics: Arc<RwLock<ContextVmMetrics>>,
@@ -106,6 +111,7 @@ impl ContextVmRuntime {
             state: Arc::new(RwLock::new(ContextVmState::default())),
             events: Arc::new(RwLock::new(Vec::new())),
             source_contents: Arc::new(RwLock::new(HashMap::new())),
+            retained_sources: Arc::default(),
             session_source: Arc::new(RwLock::new(None)),
             source_index: Arc::default(),
             metrics,
@@ -222,6 +228,11 @@ impl ContextVmRuntime {
 
     fn rebuild_inner(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
         self.record_events(events);
+        // A state rebuilt from `events` cites only `events`.
+        self.retained_sources
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         let parent = CheckpointState::default();
         let delta = ContextStateReducer::deterministic_delta(&parent, events);
         let checkpoint = self.save_page(&ContextObject::Checkpoint(delta.checkpoint_patch))?;
@@ -518,21 +529,63 @@ impl ContextVmRuntime {
     /// a compacted transcript without a session, whose events are numbered
     /// by position and so look like another conversation. The state already
     /// covers every event in `events`; later events extend it as usual.
+    /// Sources the state or its episodes cite keep their exact text, since
+    /// no transcript or session holds it any more. On error the root and the
+    /// recorded sources are unchanged (a failed page write still asks for a
+    /// rebuild, from the transcript the caller keeps).
     pub fn rebase(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
+        // A rebuild from the rewritten history would start the state over
+        // from the summary alone.
         if self
             .state
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .needs_rebuild
         {
-            return self.rebuild_from_events(events);
+            return Err("context state needs a rebuild before it can be rebased".into());
         }
+        let old = self.root();
         let mut state = self.load_state_from_root()?;
+        let mut cited = cited_source_refs(&state);
+        for page in &old.episodes {
+            if let ContextObject::Episode(episode) =
+                self.store.load(page).map_err(|error| error.to_string())?
+            {
+                cited.extend(episode.source_refs);
+            }
+        }
+        let retained = {
+            let contents = self
+                .source_contents
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            let retained = self
+                .retained_sources
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            cited
+                .into_iter()
+                .filter(|source_ref| {
+                    !source_ref.starts_with("session:")
+                        && !events.iter().any(|event| &event.source_ref == source_ref)
+                })
+                .filter_map(|source_ref| {
+                    let text = contents
+                        .get(&source_ref)
+                        .or_else(|| retained.get(&source_ref))?
+                        .clone();
+                    Some((source_ref, text))
+                })
+                .collect::<HashMap<_, _>>()
+        };
         let through = events.iter().map(|event| event.seq).max().unwrap_or(0);
         state.through_seq = through;
         let checkpoint = self.save_page(&ContextObject::Checkpoint(state))?;
         self.record_events(events);
-        let old = self.root();
+        *self
+            .retained_sources
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = retained;
         let root = ContextRoot {
             epoch: old.epoch.saturating_add(1),
             cache_namespace: String::new(),
@@ -567,6 +620,11 @@ impl ContextVmRuntime {
                 .read()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone(),
+            retained_sources: self
+                .retained_sources
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
             pinned: self.store.pinned_pages(),
             retrieval_offered: self.retrieval_offered(),
             folds: metrics.folds,
@@ -588,6 +646,10 @@ impl ContextVmRuntime {
             .source_contents
             .write()
             .unwrap_or_else(|error| error.into_inner()) = undo.source_contents;
+        *self
+            .retained_sources
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = undo.retained_sources;
         self.store.restore_pinned_pages(undo.pinned);
         self.set_retrieval_offered(undo.retrieval_offered);
         self.bump_metrics(|metrics| {

@@ -21,18 +21,33 @@ with its deterministic ledger at no provider cost.
 Compaction starts when `calibrated_context_tokens()` passes the compaction
 threshold: the provider-reported size of the last request (input of every
 kind plus the reply) and the four-bytes-a-token estimate of messages added
-since, as Codex measures it; the plain estimate when no report applies. A
-provider that refuses the input as too long gets one compaction and the same
-request again per run.
+since, as Codex measures it. A system prompt, tool catalog or other context
+outside the messages that changed since the report adds the estimate of its
+change; a report from another provider or model is not used. The plain
+estimate applies when no report does. A provider that refuses the input as
+too long gets one compaction and the same request again per run.
 
 A compaction folds the ledger (one summarizer request over the events no fold
 has seen, or the deterministic state when that fails), renders it with every
 value's source refs and the superseded values, and keeps it with the most
 recent `keep_recent_tokens` of messages verbatim. It is persisted as an
 ordinary `compaction` entry, so reload, branching and native replay follow
-the off-mode paths. Without a session, where events are numbered by position,
-the VM is rebased onto the compacted transcript. A compaction or branch
-summary is never read as a user requirement.
+the off-mode paths. A compaction or branch summary is never read as a user
+requirement.
+
+The replacement must estimate under the compaction threshold beside the
+system prompt, tool schemas and other context outside the messages. When the
+recent messages do not fit beside the ledger, the cut moves to a later turn
+boundary (never onto a tool result); when even the newest turn does not fit,
+nothing is compacted and the transcript is unchanged.
+
+Without a session, where events are numbered by position, the VM is rebased
+onto the compacted transcript before that transcript replaces the live one;
+a rebase that fails leaves the transcript as it was. The rebase keeps the
+exact text of every `transient:` source the ledger or its episodes still cite,
+so `retrieve_context` with those refs keeps working after any number of
+compactions. With a session, cited `session:` sources are read from the JSONL,
+which compaction does not shorten.
 
 The compaction request is not a prefix-sharing request: the host summarizer
 is a separate completion, and the one recorded ChatGPT-route probe of a

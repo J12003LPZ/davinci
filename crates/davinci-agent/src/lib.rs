@@ -2538,15 +2538,21 @@ impl Agent {
                     .unwrap_or_else(|| compaction::estimate_tokens(message))
             })
             .sum::<u64>()
-            + estimate_context_tokens(
-                &self
-                    .select_root_context(self.context_window)
-                    .ephemeral_messages,
-            )
-            + self
-                .plan_provider_context()
-                .map(|text| (text.len() as u64).div_ceil(4))
-                .unwrap_or(0)
+            + self.estimated_request_overhead_tokens()
+    }
+
+    /// The part of [`Self::estimated_context_tokens`] outside `messages`:
+    /// system prompt, tool schemas, ephemeral and plan context, completion
+    /// overlays.
+    fn estimated_request_overhead_tokens(&self) -> u64 {
+        estimate_context_tokens(
+            &self
+                .select_root_context(self.context_window)
+                .ephemeral_messages,
+        ) + self
+            .plan_provider_context()
+            .map(|text| (text.len() as u64).div_ceil(4))
+            .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
             + self.estimated_tool_schema_tokens()
             + self
@@ -2605,21 +2611,36 @@ impl Agent {
             reply_index: self.messages.len().saturating_sub(1),
             reply: reply.clone(),
             tokens,
+            model: self.provider_model_key(),
+            overhead_tokens: self.estimated_request_overhead_tokens(),
         });
+    }
+
+    fn provider_model_key(&self) -> String {
+        format!("{}/{}", self.provider, self.model_id)
     }
 
     /// The next request's size in provider tokens where the provider has
     /// measured most of it: the last reported count (input of every kind
     /// plus the reply) and the four-bytes-a-token estimate of the messages
-    /// added since. Without a report, or once the history before that reply
-    /// was rewritten, the estimate of the whole request. Codex measures its
-    /// auto-compaction the same way.
+    /// added since. A system prompt, tool catalog or other context outside
+    /// the messages that changed since counts by the estimate of its change.
+    /// Without a report, once the history before that reply was rewritten,
+    /// or on another model (another tokenizer), the estimate of the whole
+    /// request. Codex also starts from the last reported count.
     pub fn calibrated_context_tokens(&self) -> u64 {
         match &self.last_provider_context {
-            Some(observed) if self.messages.get(observed.reply_index) == Some(&observed.reply) => {
-                observed.tokens.saturating_add(estimate_context_tokens(
-                    &self.messages[observed.reply_index + 1..],
-                ))
+            Some(observed)
+                if self.messages.get(observed.reply_index) == Some(&observed.reply)
+                    && observed.model == self.provider_model_key() =>
+            {
+                observed
+                    .tokens
+                    .saturating_add(estimate_context_tokens(
+                        &self.messages[observed.reply_index + 1..],
+                    ))
+                    .saturating_add(self.estimated_request_overhead_tokens())
+                    .saturating_sub(observed.overhead_tokens)
             }
             _ => self.estimated_context_tokens(),
         }
@@ -3936,11 +3957,24 @@ impl Agent {
                     .load_state_from_root()
             });
         match state {
-            Ok(state) => compact_messages_with_summary(
-                &self.messages,
-                self.compaction.keep_recent_tokens,
-                &runtime::context_vm::render_ledger(&state),
-            ),
+            Ok(state) => {
+                // The replacement must land under the threshold that
+                // triggered it, beside everything sent outside `messages`.
+                let threshold = compaction_threshold(
+                    self.context_window,
+                    &CompactionSettings {
+                        enabled: true,
+                        ..self.compaction
+                    },
+                )
+                .unwrap_or(self.context_window);
+                compact_messages_with_summary(
+                    &self.messages,
+                    self.compaction.keep_recent_tokens,
+                    &runtime::context_vm::render_ledger(&state),
+                    threshold.saturating_sub(self.estimated_request_overhead_tokens()),
+                )
+            }
             Err(error) => CompactionResult {
                 summary: error,
                 messages: self.messages.clone(),
@@ -4003,7 +4037,7 @@ impl Agent {
                 estimated_tokens: estimated_before,
             });
         }
-        let mut result = if self.context_vm_mode() == ContextVmMode::Hybrid {
+        let result = if self.context_vm_mode() == ContextVmMode::Hybrid {
             self.hybrid_compaction(custom_instructions, estimated_before)
         } else {
             // Only the active branch's ancestry may seed the next summary; an
@@ -4055,62 +4089,7 @@ impl Agent {
             );
             result
         };
-        if result.compacted {
-            if let Some(session) = &mut self.session {
-                let first_kept = first_kept_entry_id(session, &self.messages, &result.messages);
-                result.first_kept_entry_id = first_kept.clone();
-                let mut extra = serde_json::Map::new();
-                extra.insert("summary".into(), serde_json::json!(result.summary));
-                extra.insert("firstKeptEntryId".into(), serde_json::json!(first_kept));
-                extra.insert(
-                    "details".into(),
-                    serde_json::to_value(&result.details).unwrap_or_default(),
-                );
-                extra.insert("fromHook".into(), serde_json::json!(false));
-                if let Some(usage) = &result.usage {
-                    extra.insert(
-                        "usage".into(),
-                        serde_json::to_value(usage).unwrap_or_default(),
-                    );
-                }
-                let saved = session.append_entry(SessionEntry {
-                    id: String::new(),
-                    entry_type: "compaction".into(),
-                    parent_id: session.leaf_id.clone(),
-                    seq: 0,
-                    timestamp: 0,
-                    message: None,
-                    custom_type: None,
-                    extra,
-                });
-                // A checkpoint that never reached the journal must not shorten
-                // live history: a restart would rebuild the uncompacted branch
-                // while this process kept only the summary.
-                if let Err(error) = saved {
-                    result.compacted = false;
-                    result.summary = format!("Compaction not saved: {error}");
-                    result.messages = self.messages.clone();
-                    result.first_kept_entry_id = String::new();
-                    result.tokens_after = result.tokens_before;
-                }
-            }
-        }
-        if result.compacted {
-            let previous_len = self.messages.len();
-            self.messages = result.messages.clone();
-            self.reindex_completion_context_after_compaction(previous_len);
-            self.last_provider_context = None;
-            if self.context_vm_mode() == ContextVmMode::Hybrid && self.session.is_none() {
-                // Without a session, events are numbered by position: carry
-                // the ledger over to the compacted transcript explicitly.
-                let events = self.context_vm_events_for_vm();
-                if let Some(runtime) = &self.runtime {
-                    if let Err(error) = runtime.context_vm.rebase(&events) {
-                        runtime.context_vm.record_failure("rebase", error);
-                    }
-                }
-            }
-        }
+        let result = self.commit_compaction(result);
         let estimated_after = self.estimated_context_tokens();
         if let Some(runtime) = &self.runtime {
             runtime.emit_observe(crate::RuntimeEvent::PostCompact {
@@ -4119,6 +4098,76 @@ impl Agent {
             });
         }
         self.is_compacting = false;
+        result
+    }
+
+    /// Make a prepared compaction the live history: persist it with a
+    /// session, or carry the hybrid ledger over without one. When either
+    /// fails the result reports not compacted and the history is unchanged.
+    fn commit_compaction(&mut self, mut result: CompactionResult) -> CompactionResult {
+        if !result.compacted {
+            return result;
+        }
+        if let Some(session) = &mut self.session {
+            let first_kept = first_kept_entry_id(session, &self.messages, &result.messages);
+            result.first_kept_entry_id = first_kept.clone();
+            let mut extra = serde_json::Map::new();
+            extra.insert("summary".into(), serde_json::json!(result.summary));
+            extra.insert("firstKeptEntryId".into(), serde_json::json!(first_kept));
+            extra.insert(
+                "details".into(),
+                serde_json::to_value(&result.details).unwrap_or_default(),
+            );
+            extra.insert("fromHook".into(), serde_json::json!(false));
+            if let Some(usage) = &result.usage {
+                extra.insert(
+                    "usage".into(),
+                    serde_json::to_value(usage).unwrap_or_default(),
+                );
+            }
+            let saved = session.append_entry(SessionEntry {
+                id: String::new(),
+                entry_type: "compaction".into(),
+                parent_id: session.leaf_id.clone(),
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: None,
+                extra,
+            });
+            // A checkpoint that never reached the journal must not shorten
+            // live history: a restart would rebuild the uncompacted branch
+            // while this process kept only the summary.
+            if let Err(error) = saved {
+                result.compacted = false;
+                result.summary = format!("Compaction not saved: {error}");
+                result.messages = self.messages.clone();
+                result.first_kept_entry_id = String::new();
+                result.tokens_after = result.tokens_before;
+                return result;
+            }
+        }
+        let previous_len = self.messages.len();
+        let previous = std::mem::replace(&mut self.messages, result.messages.clone());
+        if self.context_vm_mode() == ContextVmMode::Hybrid && self.session.is_none() {
+            // Without a session, events are numbered by position: carry the
+            // ledger over to the compacted transcript explicitly. A ledger
+            // that cannot follow keeps the transcript it describes.
+            let events = self.context_vm_events_for_vm();
+            if let Some(runtime) = &self.runtime {
+                if let Err(error) = runtime.context_vm.rebase(&events) {
+                    runtime.context_vm.record_failure("rebase", error.clone());
+                    self.messages = previous;
+                    result.compacted = false;
+                    result.summary = format!("Compaction not applied: {error}");
+                    result.messages = self.messages.clone();
+                    result.tokens_after = result.tokens_before;
+                    return result;
+                }
+            }
+        }
+        self.reindex_completion_context_after_compaction(previous_len);
+        self.last_provider_context = None;
         result
     }
 
@@ -4697,12 +4746,15 @@ pub(crate) fn custom_message_from_session_entry(entry: &SessionEntry) -> Option<
 
 /// The context size the provider reported for a request, and the reply that
 /// request produced. While that reply is still at `reply_index`, the history
-/// before it is what the count covers.
+/// before it is what the count covers; `overhead_tokens` estimates the rest
+/// of that request, for adjusting the count when it changes.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProviderContextObservation {
     reply_index: usize,
     reply: ChatMessage,
     tokens: u64,
+    model: String,
+    overhead_tokens: u64,
 }
 
 pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {

@@ -396,37 +396,73 @@ pub fn compact_messages_with_options(
 /// of messages, kept verbatim, without asking a summarizer: the caller
 /// already holds the summary (the Context VM task ledger). Messages dropped
 /// from a turn the cut splits are covered by that summary like the rest.
+/// The replacement must estimate at most `max_tokens`: when the recent
+/// messages do not fit beside the summary the cut moves to a later turn
+/// boundary, and when even the newest one does not, nothing is compacted.
 pub fn compact_messages_with_summary(
     messages: &[ChatMessage],
     keep_recent_tokens: u64,
     summary: &str,
+    max_tokens: u64,
 ) -> CompactionResult {
     if messages.len() < 2 {
         return empty_result(messages);
     }
-    let mut cut_index = find_cut_point(messages, keep_recent_tokens).first_kept_index;
-    if cut_index == 0 {
-        cut_index = messages.len().saturating_sub(1);
+    let first = find_cut_point(messages, keep_recent_tokens).first_kept_index;
+    let cuts = (1..messages.len())
+        .filter(|index| is_cut_point_message(&messages[*index]))
+        .collect::<Vec<_>>();
+    // Everything fits the recent budget: summarize all but the newest turn.
+    let cuts = match first {
+        0 => cuts.last().map_or(&[][..], std::slice::from_ref),
+        first => &cuts[cuts.partition_point(|cut| *cut < first)..],
+    };
+    let mut kept = vec![0u64; messages.len() + 1];
+    for index in (0..messages.len()).rev() {
+        kept[index] = kept[index + 1] + estimate_tokens(&messages[index]);
     }
-    if cut_index == 0 {
+    let tokens_before = kept[0];
+    let mut smallest = None;
+    for &cut in cuts {
+        let details = compute_file_lists(&extract_file_ops(&messages[..cut]));
+        let mut summary = summary.to_string();
+        summary.push_str(&format_file_operations(
+            &details.read_files,
+            &details.modified_files,
+        ));
+        let summary_message = compaction_context_message(&summary);
+        let tokens_after = estimate_tokens(&summary_message) + kept[cut];
+        smallest = Some(tokens_after);
+        if tokens_after > max_tokens {
+            continue;
+        }
+        let mut compacted = vec![summary_message];
+        compacted.extend(messages[cut..].iter().cloned());
+        return CompactionResult {
+            tokens_before,
+            tokens_after,
+            summary,
+            messages: compacted,
+            compacted: true,
+            details,
+            first_kept_entry_id: String::new(),
+            usage: None,
+        };
+    }
+    let Some(smallest) = smallest else {
         return empty_result(messages);
-    }
-    let details = compute_file_lists(&extract_file_ops(&messages[..cut_index]));
-    let mut summary = summary.to_string();
-    summary.push_str(&format_file_operations(
-        &details.read_files,
-        &details.modified_files,
-    ));
-    let mut compacted = vec![compaction_context_message(&summary)];
-    compacted.extend(messages[cut_index..].iter().cloned());
+    };
     CompactionResult {
-        tokens_before: estimate_context_tokens(messages),
-        tokens_after: estimate_context_tokens(&compacted),
-        summary,
-        messages: compacted,
-        compacted: true,
-        details,
+        summary: format!(
+            "Compaction result does not fit: the summary and the newest turn need \
+             {smallest} tokens, {max_tokens} allowed"
+        ),
+        messages: messages.to_vec(),
+        compacted: false,
+        details: CompactionDetails::default(),
         first_kept_entry_id: String::new(),
+        tokens_before,
+        tokens_after: tokens_before,
         usage: None,
     }
 }
@@ -1066,6 +1102,30 @@ mod tests {
         };
         assert!(!should_compact(25, 100, &percent_threshold));
         assert!(should_compact(26, 100, &percent_threshold));
+    }
+
+    #[test]
+    fn summary_compaction_moves_the_cut_to_a_turn_boundary_that_fits() {
+        let messages = vec![
+            ChatMessage::text("user", "a".repeat(8_000)),
+            ChatMessage::text("assistant", "ok"),
+            ChatMessage::text("user", "b".repeat(400)),
+            ChatMessage::text("assistant", "calling"),
+            ChatMessage::tool_result("c1", "read", "c".repeat(3_200), false),
+            ChatMessage::text("assistant", "done"),
+            ChatMessage::text("user", "next"),
+        ];
+        let roomy = compact_messages_with_summary(&messages, 900, "ledger", 10_000);
+        assert!(roomy.compacted);
+        assert_eq!(content_text(&roomy.messages[1].content), "b".repeat(400));
+        // The recent messages do not fit: the cut skips the tool result.
+        let tight = compact_messages_with_summary(&messages, 900, "ledger", 300);
+        assert!(tight.compacted, "{}", tight.summary);
+        assert!(tight.tokens_after <= 300);
+        assert_eq!(content_text(&tight.messages[1].content), "done");
+        let none = compact_messages_with_summary(&messages, 900, "ledger", 1);
+        assert!(!none.compacted);
+        assert_eq!(none.messages, messages);
     }
 
     #[test]
