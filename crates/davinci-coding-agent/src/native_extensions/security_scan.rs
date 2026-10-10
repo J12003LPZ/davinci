@@ -63,7 +63,6 @@ pub use incremental::{
 };
 
 pub use config::ScanConfig;
-pub use watch::status_line as watch_status_line;
 
 #[derive(Debug, Clone)]
 pub struct SecurityVerifyRequest<'a> {
@@ -1543,7 +1542,17 @@ impl SecurityScanController {
                 .as_ref()
                 .and_then(|changes| changes.get(&key))
                 .is_some_and(|change| change.deleted);
-            if marked_deleted || fs::symlink_metadata(&full).is_err() {
+            let metadata = fs::symlink_metadata(&full);
+            // Only a path that is really gone counts as deleted. Permission
+            // denied or any other failure means the file exists but could not
+            // be inspected, which is incomplete coverage, never a pass.
+            if let Err(error) = &metadata {
+                if !marked_deleted && !path_is_gone(error) {
+                    unscanned.push(format!("{key}: unreadable ({error})"));
+                    continue;
+                }
+            }
+            if marked_deleted || metadata.is_err() {
                 deleted += 1;
                 continue;
             }
@@ -1551,7 +1560,7 @@ impl SecurityScanController {
                 uninspected.push(format!("{key}: excluded by scan policy"));
                 continue;
             }
-            match fs::symlink_metadata(&full) {
+            match metadata {
                 Ok(meta) if meta.is_file() => {}
                 _ => {
                     unscanned.push(format!("{key}: not a regular file"));
@@ -1931,6 +1940,11 @@ pub fn normalize_relative_path(path: &Path) -> Result<PathBuf, String> {
         return Err("empty security scope".into());
     }
     Ok(normalized)
+}
+
+/// True when the error means the path does not exist.
+fn path_is_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
 }
 
 fn safe_join(root: &Path, relative: &Path) -> Result<PathBuf, ToolError> {
@@ -2918,5 +2932,32 @@ mod tests {
             (1..=2).contains(&remaining),
             "kept newest or running, got {remaining}"
         );
+    }
+
+    #[test]
+    fn only_not_found_counts_as_deleted() {
+        use std::io::{Error, ErrorKind};
+        assert!(path_is_gone(&Error::from(ErrorKind::NotFound)));
+        assert!(!path_is_gone(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!path_is_gone(&Error::from(ErrorKind::Other)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_reports_an_unreadable_changed_file_not_a_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempdir().unwrap();
+        let locked = repo.path().join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("a.txt"), "x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok(); // running as root ignores modes
+        let result = fs::symlink_metadata(locked.join("a.txt"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return;
+        }
+        let error = result.unwrap_err();
+        assert!(!path_is_gone(&error), "{error:?} must not read as deleted");
     }
 }

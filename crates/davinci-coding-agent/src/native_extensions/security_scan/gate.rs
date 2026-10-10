@@ -157,10 +157,54 @@ fn hunk_start() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@").unwrap())
 }
 
+/// Decode a path Git wrapped in double quotes (tabs, quotes, backslashes and,
+/// unless `core.quotePath=false`, every non-ASCII byte as `\NNN` octal).
+/// Returns `None` when `path` is not a quoted path.
+fn unquote_git_path(path: &str) -> Option<String> {
+    let inner = path.strip_prefix('"')?.strip_suffix('"')?;
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            out.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let escaped = *bytes.get(index)?;
+        index += 1;
+        match escaped {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'"' | b'\\' => out.push(escaped),
+            b'0'..=b'3' => {
+                let digits = bytes.get(index..index + 2)?;
+                if !digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+                    return None;
+                }
+                let value = (escaped - b'0') as u32 * 64
+                    + (digits[0] - b'0') as u32 * 8
+                    + (digits[1] - b'0') as u32;
+                out.push(u8::try_from(value).ok()?);
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
 fn strip_side(path: &str, side: &str) -> String {
     let path = path.trim_end_matches('\t').trim();
+    let path = unquote_git_path(path).unwrap_or_else(|| path.to_string());
     path.strip_prefix(side)
-        .unwrap_or(path)
+        .unwrap_or(&path)
         .replace('\\', "/")
         .trim_start_matches("./")
         .to_string()
@@ -309,5 +353,45 @@ mod tests {
         assert!(!parsed["src/a.rs"].deleted);
         assert!(parsed["gone.rs"].deleted);
         assert_eq!(parsed["big.rs"].added, None);
+    }
+
+    #[test]
+    fn git_quoted_paths_map_to_the_real_filename() {
+        assert_eq!(
+            unquote_git_path(r#""b/caf\303\251.rs""#).as_deref(),
+            Some("b/café.rs")
+        );
+        assert_eq!(
+            unquote_git_path(r#""b/tab\there \"q\" back\\slash""#).as_deref(),
+            Some("b/tab\there \"q\" back\\slash")
+        );
+        assert_eq!(unquote_git_path("b/plain.rs"), None);
+        assert_eq!(unquote_git_path(r#""b/bad\9""#), None);
+        let diff = "diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n--- \"a/caf\\303\\251.rs\"\n+++ \"b/caf\\303\\251.rs\"\n@@ -1,1 +1,2 @@\n fn a() {}\n+fn b() {}\n";
+        let changes = parse_diff(diff);
+        let change = changes.get("café.rs").expect("keyed by the real path");
+        assert_eq!(change.added, Some(BTreeSet::from([2])));
+    }
+
+    #[test]
+    fn git_emits_quoted_paths_that_parse_back() {
+        let repo = tempfile::tempdir().unwrap();
+        let name = "café\tx.rs";
+        if std::fs::write(repo.path().join(name), "a\n").is_err() {
+            return; // filesystem refuses tabs in names (Windows)
+        }
+        super::super::git::fixture_commit(repo.path());
+        std::fs::write(repo.path().join(name), "a\nb\n").unwrap();
+        let output = std::process::Command::new("git")
+            .args(["diff"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let diff = String::from_utf8_lossy(&output.stdout).into_owned();
+        let changes = parse_diff(&diff);
+        assert_eq!(
+            changes.get(name).and_then(|c| c.added.clone()),
+            Some(BTreeSet::from([2]))
+        );
     }
 }
