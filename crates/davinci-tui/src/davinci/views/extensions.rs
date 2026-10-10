@@ -466,9 +466,17 @@ fn card(
             .map(|text| fit(vec![lead(), span(text, ink)], width))
             .collect()
     };
+    // The question comes first, directly under the name: a tall card can
+    // scroll, and the prompt must never be the part that is off screen.
+    if let Some(warning) = confirm.as_ref() {
+        rows.extend(indent_rows(warning, th.warning, usize::MAX));
+    }
+    // A pending confirmation shows everything it asks you to trust or delete:
+    // nothing above it, and none of it, is clipped.
+    let limit = |n: usize| if confirm.is_some() { usize::MAX } else { n };
     let first = item.detail.lines().next().unwrap_or("");
     if selected {
-        rows.extend(indent_rows(&item.detail, th.text, 2));
+        rows.extend(indent_rows(&item.detail, th.text, limit(2)));
     } else if !first.is_empty() {
         rows.push(fit(
             vec![lead(), span(clip_ellipsis(first, body), th.muted)],
@@ -478,7 +486,7 @@ fn card(
     if let Some(note) = item.note.as_deref().filter(|n| !n.is_empty()) {
         let ink = note_color(item, th);
         if selected {
-            rows.extend(indent_rows(note, ink, 3));
+            rows.extend(indent_rows(note, ink, limit(3)));
         } else if problem.is_some() {
             let first = note.lines().next().unwrap_or("");
             rows.push(fit(
@@ -486,9 +494,6 @@ fn card(
                 width,
             ));
         }
-    }
-    if let Some(warning) = confirm {
-        rows.extend(indent_rows(&warning, th.warning, 3));
     }
     rows.push(Line::default());
     rows
@@ -568,7 +573,7 @@ fn marketplace_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line
 fn confirm_warning(tab: ExtensionTab, action: &str, item: &ExtensionRow) -> String {
     if action == "approve" {
         return format!(
-            "Press y to let the hooks of {} (listed above) run shell commands on this machine. \
+            "Press y to let the hooks of {} (listed below) run shell commands on this machine. \
              Any other key cancels.",
             item.title
         );

@@ -269,3 +269,54 @@ fn skills_never_show_a_problem() {
         );
     }
 }
+
+#[test]
+fn an_armed_hook_approval_shows_every_line_it_asks_you_to_trust() {
+    let hooks: Vec<String> = (0..8)
+        .map(|n| format!("PreToolUse hook {n}: sh -c run-{n}"))
+        .collect();
+    let sheet = ExtensionsSheet {
+        tab: ExtensionTab::Plugins,
+        plugins: vec![ExtensionRow {
+            key: "p@m".into(),
+            title: "p@m".into(),
+            status: "enabled".into(),
+            state: State::Attention,
+            detail: "line one of the detail
+line two
+line three of the detail"
+                .into(),
+            note: Some(hooks.join(
+                "
+",
+            )),
+            can_approve: true,
+            ..ExtensionRow::default()
+        }],
+        armed: Some(("p@m".into(), "approve")),
+        ..ExtensionsSheet::default()
+    };
+    for width in [40u16, 100] {
+        let text = draw(&model(width, 60, sheet.clone())).join(
+            "
+",
+        );
+        for n in 0..8 {
+            assert!(
+                text.contains(&format!("run-{n}")),
+                "{width}: hook {n}:
+{text}"
+            );
+        }
+        assert!(
+            text.contains("line three"),
+            "{width}:
+{text}"
+        );
+        assert!(
+            text.contains("Any other key"),
+            "{width}:
+{text}"
+        );
+    }
+}
