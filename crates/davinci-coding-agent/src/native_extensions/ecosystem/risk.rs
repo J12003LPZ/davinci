@@ -77,11 +77,21 @@ fn is_manifest_file(file_name: &str) -> bool {
 /// The lines a unified diff adds, without the `+++` file header. Removing a
 /// dangerous call is not introducing one, so only added lines are judged.
 fn added_text(patch: &str) -> String {
-    patch
-        .lines()
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // The `+++ path` header only exists before a hunk. Inside a hunk, a line
+    // starting `+++` is an added line whose content starts with `++`.
+    let mut in_hunk = false;
+    let mut added = Vec::new();
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        }
+        if line.starts_with('+') && (in_hunk || !line.starts_with("+++")) {
+            added.push(line);
+        }
+    }
+    added.join("\n")
 }
 
 pub fn assess_change_risk(mutation: &GraphMutation) -> RiskAssessment {
@@ -429,6 +439,19 @@ mod tests {
             }],
         };
         assert_eq!(assess_change_risk(&addition).level, ChangeRisk::High);
+    }
+
+    #[test]
+    fn an_added_line_that_starts_with_plus_plus_is_still_judged() {
+        let mutation = GraphMutation {
+            files: vec![ChangedFile::modified("crates/ui/src/runner.rs")],
+            patch_chunks: vec![PatchChunk {
+                file: "crates/ui/src/runner.rs".into(),
+                patch: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,2 @@\n fn run() {\n+++ std::process::Command::new(\"sh\").status();\n"
+                    .into(),
+            }],
+        };
+        assert_eq!(assess_change_risk(&mutation).level, ChangeRisk::High);
     }
 
     #[test]

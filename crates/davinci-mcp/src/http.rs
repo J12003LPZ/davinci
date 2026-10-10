@@ -100,13 +100,32 @@ impl HttpTransport {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let value = if content_type.contains("text/event-stream") {
+        let value = if is_event_stream(&content_type) {
             self.read_sse_response(response.into_reader(), want)?
         } else {
             let text = read_response_body(response.into_reader(), MAX_BODY_BYTES)?;
+            self.answer_batched_server_requests(&text)?;
             parse_http_body(&content_type, &text, want)?
         };
         Ok(Reply { session_id, value })
+    }
+
+    /// A JSON batch can carry server-initiated requests next to our reply.
+    /// They are answered like the ones that arrive over SSE; a body that is
+    /// not a batch is left to `parse_http_body`.
+    fn answer_batched_server_requests(&self, text: &str) -> Result<()> {
+        let Ok(Value::Array(members)) = serde_json::from_str::<Value>(text) else {
+            return Ok(());
+        };
+        for message in members {
+            if let (Some(id), Some(method)) = (
+                message.get("id").cloned(),
+                message.get("method").and_then(Value::as_str),
+            ) {
+                self.answer_server_request(id, method)?;
+            }
+        }
+        Ok(())
     }
 
     fn send_post(&self, body: &Value) -> Result<ureq::Response> {
@@ -316,11 +335,22 @@ impl Drop for HttpTransport {
         for (key, value) in &self.headers {
             request = request.set(key, value);
         }
+        // Same negotiated version as every other request of the session.
+        if let Some(version) = &self.protocol_version {
+            request = request.set(VERSION_HEADER, version);
+        }
         let _ = request.call();
     }
 }
 
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Media types compare case-insensitively (`Text/Event-Stream; charset=utf-8`).
+fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream")
+}
 
 fn read_response_body(reader: impl Read, limit: usize) -> Result<String> {
     let mut text = String::new();
@@ -395,7 +425,7 @@ pub fn parse_http_body(content_type: &str, text: &str, want: Option<&Value>) -> 
     if text.trim().is_empty() {
         return Ok(Value::Null);
     }
-    if !content_type.contains("text/event-stream") {
+    if !is_event_stream(content_type) {
         let value: Value =
             serde_json::from_str(text).map_err(|err| Error::Transport(format!("json: {err}")))?;
         let Some(id) = want else {
@@ -649,6 +679,80 @@ mod tests {
         // Our own reply never arrives, so the call fails, but the ping was answered.
         assert!(transport.call("tools/call", serde_json::json!({})).is_err());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn session_delete_carries_the_negotiated_protocol_version() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_test_request(&mut stream).to_ascii_lowercase();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request
+        });
+        let mut transport =
+            HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+        transport.session_id = Some("sess-1".into());
+        transport.protocol_version = Some("2025-06-18".into());
+        drop(transport);
+        let request = server.join().unwrap();
+        assert!(request.starts_with("delete /mcp"), "{request}");
+        assert!(request.contains("mcp-session-id: sess-1"), "{request}");
+        assert!(
+            request.contains("mcp-protocol-version: 2025-06-18"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn event_stream_content_type_matches_case_insensitively() {
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("Text/Event-Stream; charset=utf-8"));
+        assert!(!is_event_stream("application/json"));
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":1}}\n\n";
+        let value = parse_http_body("Text/Event-Stream", body, Some(&json!(3))).unwrap();
+        assert_eq!(value["result"]["ok"], 1);
+    }
+
+    #[test]
+    fn server_ping_inside_a_json_batch_is_answered() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_test_request(&mut first);
+            let body = "[{\"jsonrpc\":\"2.0\",\"id\":\"b1\",\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}]";
+            write!(
+                first,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            first.flush().unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().unwrap();
+            let request = read_test_request(&mut second);
+            write!(
+                second,
+                "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request
+        });
+        let mut transport =
+            HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+        let result = transport.call("tools/call", json!({})).unwrap();
+        assert_eq!(result["ok"], true);
+        let request = server.join().unwrap();
+        assert!(request.contains("\"id\":\"b1\""), "{request}");
+        assert!(request.contains("\"result\":{}"), "{request}");
     }
 
     #[test]

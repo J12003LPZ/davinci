@@ -51,6 +51,120 @@ pub const INHERITED_ENV: &[&str] = if cfg!(windows) {
 /// How many trailing stderr lines a transport error quotes.
 const STDERR_QUOTE_LINES: usize = 5;
 
+const SENSITIVE_KEYS: [&str; 10] = [
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "credential",
+];
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.trim_matches(|c: char| c == '"' || c == '\'' || c == '-' || c == '{' || c == ',');
+    let lower = key.to_ascii_lowercase();
+    SENSITIVE_KEYS.iter().any(|needle| lower.contains(needle))
+        || lower.contains("private_key")
+        || lower == "auth"
+}
+
+/// A token that is a credential on its face: well-known prefixes, JWTs, AWS
+/// access key ids.
+fn looks_like_secret(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+    let prefixed = [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xoxb-",
+        "xoxa-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+    ];
+    prefixed.iter().any(|prefix| token.starts_with(prefix))
+        || (token.starts_with("eyJ") && token.matches('.').count() == 2)
+        || ((token.starts_with("AKIA") || token.starts_with("ASIA"))
+            && token.len() == 20
+            && token.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// Replace the password inside `scheme://user:password@host/...`.
+fn redact_url_userinfo(token: &str) -> Option<String> {
+    let (scheme, rest) = token.split_once("://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, host) = rest[..authority_end].rsplit_once('@')?;
+    userinfo
+        .contains(':')
+        .then(|| format!("{scheme}://[REDACTED]@{host}{}", &rest[authority_end..]))
+}
+
+/// One stderr line made safe to quote in an error: terminal controls and
+/// bidirectional overrides dropped, credential-shaped values masked. A server
+/// that fails loudly may have printed its own environment.
+fn sanitize_stderr_line(line: &str) -> String {
+    let clean: String = line
+        .chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    // Tokens still owed a redaction after a sensitive key or a scheme word.
+    let mut owed = 0usize;
+    for token in clean.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        let lower = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if owed > 0 {
+            if matches!(lower, "basic" | "bearer" | "digest" | "token") {
+                out.push(token.to_string());
+            } else {
+                out.push("[REDACTED]".into());
+                owed -= 1;
+            }
+            continue;
+        }
+        if matches!(lower, "basic" | "bearer") {
+            out.push(token.to_string());
+            owed = 1;
+            continue;
+        }
+        if let Some(redacted) = redact_url_userinfo(token) {
+            out.push(redacted);
+            continue;
+        }
+        if let Some(index) = token.find(['=', ':']).filter(|index| *index > 0) {
+            let (key, value) = (&token[..index], &token[index + 1..]);
+            if is_sensitive_key(key) {
+                let value = value.trim_matches(|c: char| c == '"' || c == '\'' || c == ',');
+                if value.is_empty() {
+                    out.push(token.to_string());
+                    owed = 1;
+                } else {
+                    out.push(format!("{key}{}[REDACTED]", &token[index..=index]));
+                }
+                continue;
+            }
+        }
+        if looks_like_secret(token) {
+            out.push("[REDACTED]".into());
+            continue;
+        }
+        out.push(token.to_string());
+    }
+    out.join(" ")
+}
+
 /// How long a closed-stdout error waits for the stderr thread to finish
 /// draining, so the child's last words make it into the message.
 const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
@@ -214,9 +328,9 @@ impl StdioTransport {
     /// The last few non-empty stderr lines, ready to append to an error.
     fn stderr_excerpt(&self) -> String {
         let tail = self.stderr_tail();
-        let lines: Vec<&str> = tail
+        let lines: Vec<String> = tail
             .lines()
-            .map(str::trim)
+            .map(sanitize_stderr_line)
             .filter(|line| !line.is_empty())
             .collect();
         if lines.is_empty() {
@@ -581,6 +695,72 @@ pub fn resolve_command_in(command: &str, dirs: &[PathBuf], exts: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_stderr_masks_credentials_and_strips_terminal_controls() {
+        let masked = [
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG",
+            "password: hunter2hunter2",
+            "Authorization: Basic ZHVtbXk6c2VjcmV0",
+            "curl -H 'Authorization: Bearer abc.def.ghi'",
+            "{\"api_key\": \"fixture-sensitive\"}",
+            "token=ghp_0123456789abcdef0123456789abcdef0123",
+            "connect https://user:fixture-sensitive@db.example/x failed",
+            "key sk-ant-fixture-sensitive was rejected",
+            "jwt eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl bad",
+            "id AKIAABCDEFGHIJKLMNOP bad",
+        ];
+        for line in masked {
+            let clean = sanitize_stderr_line(line);
+            for leaked in [
+                "wJalrXUtnFEMI",
+                "hunter2",
+                "ZHVtbXk6",
+                "abc.def.ghi",
+                "fixture-sensitive",
+                "ghp_0123",
+                "c2lnbmF0",
+                "AKIAABCDEFGHIJKLMNOP",
+            ] {
+                assert!(
+                    !clean.contains(leaked),
+                    "{line:?} leaked {leaked:?}: {clean}"
+                );
+            }
+            assert!(clean.contains("[REDACTED]"), "{line:?} -> {clean}");
+        }
+        let clean = sanitize_stderr_line("\u{1b}]52;c;AAAA\u{7}ok\u{202e}evil\u{1b}[31m red");
+        assert!(
+            !clean.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+            "{clean:?}"
+        );
+        assert!(clean.contains("ok"));
+    }
+
+    #[test]
+    fn ordinary_stderr_is_left_alone() {
+        for line in [
+            "hanging on purpose",
+            "cancelled request 7: timed out after 3s",
+            "listening on 127.0.0.1:8080",
+            "error: tokens used 5",
+            "loading config from /home/me/.config/server.json",
+        ] {
+            let clean = sanitize_stderr_line(line);
+            assert!(
+                !clean.contains("[REDACTED]") || line.contains("tokens"),
+                "{line}: {clean}"
+            );
+        }
+        assert_eq!(
+            sanitize_stderr_line("hanging on purpose"),
+            "hanging on purpose"
+        );
+        assert_eq!(
+            sanitize_stderr_line("listening on 127.0.0.1:8080"),
+            "listening on 127.0.0.1:8080"
+        );
+    }
 
     /// Writer whose first write blocks until released, recording every line.
     struct GatedPipe {
