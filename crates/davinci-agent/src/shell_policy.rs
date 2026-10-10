@@ -531,6 +531,28 @@ fn cargo_query_is_read_only(args: &[String]) -> bool {
         })
 }
 
+/// Words of a segment for a read-only check only: output and input
+/// redirections are removed, every `$VAR`, `${...}`, `$(...)` and backtick
+/// span becomes the placeholder `X`, and brace characters are dropped. The
+/// result can only be judged by an allowlist (an expansion never turns into a
+/// literal read-only verb); anything still unmodelled, such as a nested
+/// substitution or a subshell, makes the lexer refuse it.
+fn literal_words_with_placeholders(segment: &str) -> Option<Vec<String>> {
+    static REDIRECT: OnceLock<regex::Regex> = OnceLock::new();
+    static EXPANSION: OnceLock<regex::Regex> = OnceLock::new();
+    let redirect = REDIRECT.get_or_init(|| {
+        regex::Regex::new(r"(?:^|[ \t])\d*(?:>>?|<)(?:&\d+|[ \t]*[^\s;|&<>]+)")
+            .expect("fixed redirection pattern")
+    });
+    let expansion = EXPANSION.get_or_init(|| {
+        regex::Regex::new(r"\$\([^()]*\)|`[^`]*`|\$\{[^{}]*\}|\$[A-Za-z0-9_@*#?!$-]+")
+            .expect("fixed expansion pattern")
+    });
+    let without_redirects = redirect.replace_all(segment, " ");
+    let placeheld = expansion.replace_all(&without_redirects, "X");
+    literal_shell_words(&placeheld.replace(['{', '}'], ""))
+}
+
 fn git_is_read_only(words: &[String]) -> bool {
     let mut args = &words[1..];
     while let Some(flag) = args.first() {
@@ -800,20 +822,20 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
         };
         let unsafe_git = match literal_shell_words(&without_stderr_join) {
             Some(words) => is_git(&words[0]) && !git_is_read_only(&words),
-            // Unusual whitespace or a control character can split words in one
-            // shell and not another, so the git mutation pattern (which looks
-            // for `git <space> push`) may not see the command: treat any git
-            // segment written that way as a mutation. Ordinary shell syntax
-            // the lexer refuses (`$VAR`, `2>/dev/null`) is left to that
-            // pattern, as before, so read-only git keeps working.
+            // A git segment the literal lexer refuses fails closed: it is a
+            // mutation unless `git_is_read_only` can still prove it read-only
+            // once redirections are dropped and each expansion is a fixed
+            // placeholder word. The verb is then always a literal, so
+            // `git $SUB origin` or `git "$(echo push)"` stays a mutation,
+            // while `git status 2>/dev/null` or `git diff "$BASE"...HEAD`
+            // remains a read.
             None => {
                 without_stderr_join
-                    .chars()
-                    .any(|ch| (ch.is_whitespace() || ch.is_control()) && !matches!(ch, ' ' | '\t'))
-                    && without_stderr_join
-                        .split(|ch: char| ch.is_whitespace() || ch.is_control())
-                        .find(|word| !word.is_empty())
-                        .is_some_and(|program| is_git(program.trim_matches(['"', '\''])))
+                    .split(|ch: char| ch.is_whitespace() || ch.is_control())
+                    .find(|word| !word.is_empty())
+                    .is_some_and(|program| is_git(program.trim_matches(['"', '\''])))
+                    && !literal_words_with_placeholders(&without_stderr_join)
+                        .is_some_and(|words| is_git(&words[0]) && git_is_read_only(&words))
             }
         };
         if git_mutation_regex().is_match(segment) || unsafe_git {
@@ -1212,14 +1234,29 @@ mod tests {
                 "{command:?}"
             );
         }
-        // Mutations behind the same syntax are still caught by the pattern.
-        assert_ne!(
-            evaluate(
-                ShellPolicyProfile::WriteNoGitMutation,
-                "git push \"$REMOTE\" main"
-            ),
-            ShellCommandDecision::Allowed
-        );
+        // A verb, option or operand the policy cannot read as a literal is a
+        // mutation: an expansion never stands in for a read-only verb.
+        for command in [
+            "git push \"$REMOTE\" main",
+            "git $SUB origin main",
+            "git \"$(echo push)\" origin",
+            "git `echo push` origin",
+            "git ${SUB} origin",
+            "git {push,status} origin",
+            "git -c \"$X\" log",
+            "git branch $NAME",
+            "git branch \"$NAME\" 2>/dev/null",
+            "git log $(git push)",
+            "git log `git push`",
+            "git $(echo $(echo push))",
+            "git (push)",
+        ] {
+            assert_ne!(
+                evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
+                ShellCommandDecision::Allowed,
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
