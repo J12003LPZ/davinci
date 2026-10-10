@@ -366,6 +366,10 @@ impl SecurityArtifactStore {
         let reports = agent_dir.join("security-scans");
         let repo_root = reports.join(repo_id);
         let root = repo_root.join(scan_id);
+        // The agent dir itself is trusted configuration and may not exist yet
+        // (fresh checkout, CI temp dir). Only the directories below it are
+        // created symlink-safe.
+        fs::create_dir_all(agent_dir).map_err(|err| ToolError::Failed(err.to_string()))?;
         for dir in [&reports, &repo_root, &root] {
             create_real_dir(dir).map_err(|err| ToolError::Failed(err.to_string()))?;
         }
@@ -2799,6 +2803,15 @@ mod tests {
         let store = SecurityArtifactStore::new(agent.path(), "repo-3", "scan-1").unwrap();
         assert!(store.root().is_dir());
         assert!(SecurityArtifactStore::new(agent.path(), "repo-3", "scan-1").is_ok());
+    }
+
+    #[test]
+    fn artifact_store_creates_a_missing_agent_dir() {
+        let base = tempdir().unwrap();
+        let agent = base.path().join("not").join("yet").join("created");
+        assert!(!agent.exists());
+        let store = SecurityArtifactStore::new(&agent, "repo-1", "scan-1").unwrap();
+        assert!(store.root().is_dir());
     }
 
     #[test]
