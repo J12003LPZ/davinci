@@ -110,8 +110,9 @@ fn base64_run() -> &'static Regex {
     RUN.get_or_init(|| Regex::new(r"[A-Za-z0-9+/]{16,}={0,2}").expect("fixed base64 run pattern"))
 }
 
-/// A line that can belong to a key body: base64 (also when quoted, escaped or
-/// concatenated in source), a PEM/PGP/SSH2 armor header, or blank.
+/// A line that can belong to a key body: base64, also when quoted, escaped,
+/// concatenated or split into several string fragments on the line
+/// (`"MIIE" "abcd" +`); a PEM/PGP/SSH2 armor header; or blank.
 fn key_material_line(content: &str) -> bool {
     static HEADER: OnceLock<Regex> = OnceLock::new();
     let header = HEADER.get_or_init(|| {
@@ -120,19 +121,23 @@ fn key_material_line(content: &str) -> bool {
         )
         .expect("fixed armor header pattern")
     });
-    let mut line = content.trim().trim_start_matches(['"', '\'', '`', '+']);
-    loop {
-        let before = line.len();
-        line = line.trim_end_matches(['"', '\'', '`', ',', '+', ';', '\\', ' ', '\t']);
-        line = line.strip_suffix("\\n").unwrap_or(line);
-        line = line.strip_suffix("\\r").unwrap_or(line);
-        if line.len() == before {
-            break;
-        }
+    let trimmed = content.trim();
+    if header.is_match(trimmed.trim_start_matches(['"', '\'', '`'])) {
+        return true;
     }
-    line.is_empty()
-        || header.is_match(line)
-        || line.bytes().all(|byte| {
+    // String syntax anywhere on the line is not key text; what remains must
+    // be base64.
+    trimmed
+        .replace("\\n", "")
+        .replace("\\r", "")
+        .bytes()
+        .filter(|byte| {
+            !matches!(
+                byte,
+                b'"' | b'\'' | b'`' | b' ' | b'\t' | b',' | b';' | b'\\'
+            )
+        })
+        .all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
         })
 }
@@ -144,36 +149,75 @@ fn key_material_line(content: &str) -> bool {
 /// password runs from `user:` to the last `@` before the first `/`, `?` or
 /// `#` that follows the first `@`. `host:8443/...` (digits, then a delimiter,
 /// before any `@`) is a port, not userinfo: `https://h:8443/u?email=a@b`
-/// keeps its host. The rest of the token is scanned again, so a second URL
-/// in it is still masked.
+/// keeps its host. Scanning continues after each URL, so a second URL in the
+/// same token is still masked.
+///
+/// One forward pass: the cursor only advances, and each URL looks at most
+/// `MAX_AUTHORITY` bytes ahead, so hostile input (a long token of repeated
+/// `a://u:`) costs linear time and no recursion.
 pub(super) fn url_credentials(input: &str) -> String {
+    const MAX_AUTHORITY: usize = 2048;
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/:@]*):(\S*)")
-            .expect("fixed URL credential pattern")
+        Regex::new(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]*:").expect("fixed URL credential pattern")
     });
-    pattern
-        .replace_all(input, |captures: &regex::Captures<'_>| {
-            let (scheme, user, rest) = (&captures[1], &captures[2], &captures[3]);
-            let delimiter = rest.find(['/', '?', '#']);
-            let first_at = rest.find('@');
-            let port = delimiter.is_some_and(|end| {
-                end > 0
-                    && first_at.is_none_or(|at| end < at)
-                    && rest[..end].bytes().all(|byte| byte.is_ascii_digit())
-            });
-            match first_at {
-                Some(first_at) if !port => {
-                    let authority_end = rest[first_at..]
-                        .find(['/', '?', '#'])
-                        .map_or(rest.len(), |offset| first_at + offset);
-                    let last_at = rest[..authority_end].rfind('@').unwrap_or(first_at);
-                    format!("{scheme}[REDACTED]{}", url_credentials(&rest[last_at..]))
-                }
-                _ => format!("{scheme}{user}:{}", url_credentials(rest)),
+    // Next `@` and next whitespace at or after a position, found once and
+    // reused until the cursor passes them, so no byte is searched twice.
+    fn next_from(
+        input: &str,
+        from: usize,
+        cached: &mut Option<usize>,
+        find: fn(&str) -> Option<usize>,
+    ) -> usize {
+        if cached.is_none_or(|at| at < from) {
+            *cached = Some(find(&input[from..]).map_or(input.len(), |offset| from + offset));
+        }
+        cached.unwrap_or(input.len())
+    }
+    let mut next_at = None;
+    let mut next_space = None;
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(found) = pattern.find_at(input, cursor) {
+        let rest_start = found.end();
+        let space = next_from(input, rest_start, &mut next_space, |s| {
+            s.find(char::is_whitespace)
+        });
+        let mut rest_end = space.min(rest_start + MAX_AUTHORITY);
+        while !input.is_char_boundary(rest_end) {
+            rest_end -= 1;
+        }
+        let rest = &input[rest_start..rest_end];
+        let delimiter = rest.find(['/', '?', '#']);
+        let first_at = Some(next_from(input, rest_start, &mut next_at, |s| s.find('@')))
+            .filter(|at| *at < rest_end)
+            .map(|at| at - rest_start);
+        let port = delimiter.is_some_and(|end| {
+            end > 0
+                && first_at.is_none_or(|at| end < at)
+                && rest[..end].bytes().all(|byte| byte.is_ascii_digit())
+        });
+        match first_at {
+            Some(first_at) if !port => {
+                let authority_end = rest[first_at..]
+                    .find(['/', '?', '#'])
+                    .map_or(rest.len(), |offset| first_at + offset);
+                let last_at = rest[..authority_end].rfind('@').unwrap_or(first_at);
+                let scheme_end = input[found.start()..].find("://").map_or(0, |at| at + 3);
+                out.push_str(&input[cursor..found.start() + scheme_end]);
+                out.push_str("[REDACTED]");
+                // Resume at the `@`: the host and anything after it are kept
+                // and scanned for further URLs.
+                cursor = rest_start + last_at;
             }
-        })
-        .into_owned()
+            _ => {
+                out.push_str(&input[cursor..rest_start]);
+                cursor = rest_start;
+            }
+        }
+    }
+    out.push_str(&input[cursor..]);
+    out
 }
 
 #[cfg(test)]
@@ -368,6 +412,27 @@ mod tests {
     }
 
     #[test]
+    fn url_scan_is_linear_and_never_recurses_on_hostile_tokens() {
+        // 200k repeated scheme prefixes in one token: the old recursive scan
+        // overflowed the stack and rescanned the token for every prefix.
+        let hostile = "a://u:".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert_eq!(url_credentials(&hostile), hostile);
+        let with_at = format!("{}@host", "a://u:p".repeat(50_000));
+        let output = url_credentials(&with_at);
+        assert!(
+            output.ends_with("@host"),
+            "{}",
+            &output[output.len() - 40..]
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn a_planted_or_unterminated_marker_hides_only_key_material() {
         // A BEGIN line with no END, then ordinary code: the code is visible.
         let planted = format!(
@@ -386,6 +451,15 @@ mod tests {
         assert!(!output.contains(BODY), "{output}");
         assert!(output.contains("fn backdoor()"), "{output}");
 
+        // A body split into short string fragments on one line is key text.
+        let fragments = "-----BEGIN PRIVATE KEY-----\n\"MIIEfix\" \"tureFIX\" \"TUREabc\" +\n-----END PRIVATE KEY-----\nvisible();\n";
+        let output = private_key_blocks(fragments);
+        assert!(
+            !output.contains("MIIEfix") && !output.contains("TUREabc"),
+            "{output}"
+        );
+        assert!(output.contains("visible();"), "{output}");
+
         // Key bodies built up in code keep the block open; only the base64 is
         // masked, so the surrounding code (and padded code) stays readable.
         let built = format!(
@@ -393,10 +467,9 @@ mod tests {
         );
         let output = private_key_blocks(&built);
         assert!(!output.contains(BODY), "{output}");
-        assert!(
-            output.contains("pem += ") && output.contains("sb.append("),
-            "{output}"
-        );
+        // `pem += "..."` is all key text once string syntax is ignored, so the
+        // whole line is masked; a call around the body keeps its code visible.
+        assert!(output.contains("sb.append("), "{output}");
         assert!(
             output.contains("exec(evil);") && output.contains("visible();"),
             "{output}"
