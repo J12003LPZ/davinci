@@ -30,7 +30,7 @@ pub struct RiskAssessment {
 }
 
 /// Prose that is documentation wherever it lives.
-const PROSE_EXTENSIONS: &[&str] = &["md", "mdx", "txt", "rst", "adoc"];
+const PROSE_EXTENSIONS: &[&str] = &["md", "txt", "rst"];
 /// Static assets that are documentation only inside a `docs` directory.
 const DOC_ASSET_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "csv"];
 
@@ -348,6 +348,8 @@ mod tests {
         for path in [
             "docs/scripts/auth.rs",
             "docs/tools/run.sh",
+            "docs/page.mdx",
+            "src/auth.mdx",
             "docs/examples/spawn.py",
             "site/docs/build.js",
             "DOCS\\scripts\\deploy.ps1",
