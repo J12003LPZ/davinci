@@ -2,6 +2,7 @@
 //!
 //! Flags select a misbehaviour the client must survive:
 //! `--log-stdout` prints a plain log line before every reply,
+//! `--legacy-log` prints a log line that is not UTF-8 (cp1252) before every reply,
 //! `--sampling` sends a notification and a `sampling/createMessage` request
 //! (with the caller's own id) before answering `tools/call` and echoes the
 //! error code the client refused it with,
@@ -22,6 +23,7 @@ use std::io::{self, BufRead, Write};
 
 struct Flags {
     log_stdout: bool,
+    legacy_log: bool,
     sampling: bool,
     ping: bool,
     chatty: bool,
@@ -39,6 +41,7 @@ fn main() {
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
     let flags = Flags {
         log_stdout: has("--log-stdout"),
+        legacy_log: has("--legacy-log"),
         sampling: has("--sampling"),
         ping: has("--ping"),
         chatty: has("--chatty"),
@@ -67,6 +70,10 @@ fn main() {
         }
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        if flags.legacy_log {
+            let _ = stdout.write_all(b"log: caf\xe9 ready\n");
+            let _ = stdout.flush();
+        }
         if flags.log_stdout {
             let _ = writeln!(
                 stdout,

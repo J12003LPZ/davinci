@@ -487,9 +487,13 @@ fn read_stdout_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<
             bytes.pop();
         }
     }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    // Servers often log in a legacy code page. A line that is not UTF-8 is
+    // not a JSON-RPC frame; decode it lossily so the parser skips it like any
+    // other stray log line instead of ending the transport.
+    Ok(Some(match String::from_utf8(bytes) {
+        Ok(line) => line,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }))
 }
 
 fn timeout_message(timeout: Duration) -> String {
@@ -741,6 +745,19 @@ mod tests {
             Some("last".into())
         );
         assert_eq!(read_stdout_line(&mut reader, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn non_utf8_stdout_line_is_text_not_a_transport_error() {
+        let mut reader = std::io::Cursor::new(b"log: caf\xe9 ready\r\n{\"id\":1}\n".to_vec());
+        assert_eq!(
+            read_stdout_line(&mut reader, 64).unwrap(),
+            Some("log: caf\u{fffd} ready".into())
+        );
+        assert_eq!(
+            read_stdout_line(&mut reader, 64).unwrap(),
+            Some("{\"id\":1}".into())
+        );
     }
 
     #[test]

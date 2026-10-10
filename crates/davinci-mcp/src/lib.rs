@@ -660,6 +660,16 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_stdout_log_lines_do_not_end_the_transport() {
+        let mut client = fixture_client(&["--legacy-log"]);
+        assert_eq!(client.tools[0].name, "echo");
+        for text in ["first", "second"] {
+            let ok = client.call_tool("echo", json!({ "text": text })).unwrap();
+            assert_eq!(ok.text(), text);
+        }
+    }
+
+    #[test]
     fn server_requests_are_refused_and_notifications_ignored() {
         let mut client = fixture_client(&["--sampling"]);
         // The fixture sends a notification and a `sampling/createMessage`
