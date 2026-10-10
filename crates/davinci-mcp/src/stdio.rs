@@ -297,7 +297,11 @@ impl StdioTransport {
             let Ok(Value::Object(message)) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            if message.get("id") != Some(id) {
+            // An error whose id could not be read (`null`, JSON-RPC's parse
+            // error) belongs to the one call in flight: calls are sequential.
+            let unreadable_id =
+                message.get("id") == Some(&Value::Null) && message.contains_key("error");
+            if message.get("id") != Some(id) && !unreadable_id {
                 continue;
             }
             let has_result = message.contains_key("result");
@@ -487,9 +491,56 @@ fn read_stdout_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<
             bytes.pop();
         }
     }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    Ok(Some(match String::from_utf8(bytes) {
+        Ok(line) => line,
+        Err(error) => invalid_utf8_line(&String::from_utf8_lossy(error.as_bytes())),
+    }))
+}
+
+/// Servers often log in a legacy code page, so a line that is not UTF-8 must
+/// not end the transport.
+/// - A notification (a log line) is dropped.
+/// - A server request is kept as decoded, so it is still answered (`ping`
+///   succeeds, anything else is refused) and the server does not wait on it;
+///   its params are never acted on.
+/// - A reply is never delivered with replacement characters (the agent would
+///   act on corrupted content): it becomes a JSON-RPC error for its id. When
+///   the invalid bytes were in the id itself, the error carries a `null` id,
+///   which fails the call in flight at once instead of at its timeout.
+fn invalid_utf8_line(lossy: &str) -> String {
+    let as_error = |message: &Value| -> Option<Value> {
+        let message = message.as_object()?;
+        if message.contains_key("method") {
+            return message
+                .contains_key("id")
+                .then(|| Value::Object(message.clone()));
+        }
+        let id = message.get("id")?;
+        let id = if id.as_str().is_some_and(|id| id.contains('\u{fffd}')) {
+            Value::Null
+        } else {
+            id.clone()
+        };
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32700, "message": "MCP server reply was not valid UTF-8"},
+        }))
+    };
+    match serde_json::from_str::<Value>(lossy.trim()) {
+        Ok(Value::Array(messages)) => {
+            let errors: Vec<_> = messages.iter().filter_map(as_error).collect();
+            if errors.is_empty() {
+                String::new()
+            } else {
+                Value::Array(errors).to_string()
+            }
+        }
+        Ok(message) => as_error(&message)
+            .map(|error| error.to_string())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
 }
 
 fn timeout_message(timeout: Duration) -> String {
@@ -741,6 +792,44 @@ mod tests {
             Some("last".into())
         );
         assert_eq!(read_stdout_line(&mut reader, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn non_utf8_stdout_line_is_skipped_not_a_transport_error() {
+        let mut reader = std::io::Cursor::new(b"log: caf\xe9 ready\r\n{\"id\":1}\n".to_vec());
+        assert_eq!(
+            read_stdout_line(&mut reader, 64).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            read_stdout_line(&mut reader, 64).unwrap(),
+            Some("{\"id\":1}".into())
+        );
+    }
+
+    #[test]
+    fn a_reply_with_invalid_utf8_becomes_an_error_never_corrupted_content() {
+        let mut reader = std::io::Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"text\":\"caf\xe9.txt\"}}\n\
+              [{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":\"caf\xe9\"},{\"jsonrpc\":\"2.0\",\"method\":\"note\"}]\n\
+              {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":\"caf\xe9\"}\n"
+                .to_vec(),
+        );
+        let single: Value =
+            serde_json::from_str(&read_stdout_line(&mut reader, 4096).unwrap().unwrap()).unwrap();
+        assert_eq!(single["id"], 7);
+        assert_eq!(single["error"]["code"], -32700);
+        assert!(single.get("result").is_none());
+        let batch: Value =
+            serde_json::from_str(&read_stdout_line(&mut reader, 4096).unwrap().unwrap()).unwrap();
+        assert_eq!(batch.as_array().unwrap().len(), 1);
+        assert_eq!(batch[0]["id"], 8);
+        assert_eq!(batch[0]["error"]["code"], -32700);
+        // A notification with invalid bytes is noise, not a failed call.
+        assert_eq!(
+            read_stdout_line(&mut reader, 4096).unwrap(),
+            Some(String::new())
+        );
     }
 
     #[test]

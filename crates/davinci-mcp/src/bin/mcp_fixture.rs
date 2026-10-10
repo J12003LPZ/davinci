@@ -2,6 +2,11 @@
 //!
 //! Flags select a misbehaviour the client must survive:
 //! `--log-stdout` prints a plain log line before every reply,
+//! `--legacy-log` prints a log line that is not UTF-8 (cp1252) before every reply,
+//! `--legacy-reply` answers `tools/call` with text `corrupt` with a reply that
+//! is not UTF-8, with text `corrupt-id` with a reply whose id is not UTF-8,
+//! and with text `corrupt-ping` sends a ping whose params are not UTF-8 and
+//! reports the code the client answered it with,
 //! `--sampling` sends a notification and a `sampling/createMessage` request
 //! (with the caller's own id) before answering `tools/call` and echoes the
 //! error code the client refused it with,
@@ -22,6 +27,8 @@ use std::io::{self, BufRead, Write};
 
 struct Flags {
     log_stdout: bool,
+    legacy_log: bool,
+    legacy_reply: bool,
     sampling: bool,
     ping: bool,
     chatty: bool,
@@ -39,6 +46,8 @@ fn main() {
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
     let flags = Flags {
         log_stdout: has("--log-stdout"),
+        legacy_log: has("--legacy-log"),
+        legacy_reply: has("--legacy-reply"),
         sampling: has("--sampling"),
         ping: has("--ping"),
         chatty: has("--chatty"),
@@ -67,6 +76,10 @@ fn main() {
         }
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        if flags.legacy_log {
+            let _ = stdout.write_all(b"log: caf\xe9 ready\n");
+            let _ = stdout.flush();
+        }
         if flags.log_stdout {
             let _ = writeln!(
                 stdout,
@@ -109,6 +122,50 @@ fn main() {
             "tools/call" if flags.die => {
                 eprintln!("fatal: boom");
                 std::process::exit(1);
+            }
+            "tools/call"
+                if flags.legacy_reply
+                    && msg
+                        .pointer("/params/arguments/text")
+                        .and_then(Value::as_str)
+                        == Some("corrupt-id") =>
+            {
+                let _ = stdout.write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":\"r\xe9\",\"result\":{\"content\":[]}}\n",
+                );
+                let _ = stdout.flush();
+                continue;
+            }
+            "tools/call"
+                if flags.legacy_reply
+                    && msg
+                        .pointer("/params/arguments/text")
+                        .and_then(Value::as_str)
+                        == Some("corrupt-ping") =>
+            {
+                let code = ping_with(&mut stdout, &mut lines, true);
+                ok(
+                    &id,
+                    json!({ "content": [{ "type": "text", "text": format!("pinged:{code}") }] }),
+                )
+            }
+            "tools/call"
+                if flags.legacy_reply
+                    && msg
+                        .pointer("/params/arguments/text")
+                        .and_then(Value::as_str)
+                        == Some("corrupt") =>
+            {
+                // A reply whose text holds one raw cp1252 byte (0xE9).
+                let mut bytes = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"caf"#
+                )
+                .into_bytes();
+                bytes.push(0xe9);
+                bytes.extend_from_slice(b"\"}]}}\n");
+                let _ = stdout.write_all(&bytes);
+                let _ = stdout.flush();
+                continue;
             }
             "tools/call" if flags.malformed_reply => json!({
                 "jsonrpc": "2.0",
@@ -252,9 +309,26 @@ fn sample(stdout: &mut io::Stdout, lines: &mut io::Lines<io::StdinLock<'_>>, id:
 
 /// Send a basic MCP ping and return 0 when the client answers with a result.
 fn ping(stdout: &mut io::Stdout, lines: &mut io::Lines<io::StdinLock<'_>>) -> i64 {
+    ping_with(stdout, lines, false)
+}
+
+/// Send a server ping (with one raw cp1252 byte in its params when
+/// `legacy_params`) and return the error code of the client's answer, 0 for
+/// a result, -1 when stdin closed first.
+fn ping_with(
+    stdout: &mut io::Stdout,
+    lines: &mut io::Lines<io::StdinLock<'_>>,
+    legacy_params: bool,
+) -> i64 {
     let id = json!("server-ping");
-    let request = json!({ "jsonrpc": "2.0", "id": id, "method": "ping" });
-    let _ = writeln!(stdout, "{request}");
+    if legacy_params {
+        let _ = stdout.write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\",\"params\":{\"note\":\"caf\xe9\"}}\n",
+        );
+    } else {
+        let request = json!({ "jsonrpc": "2.0", "id": id, "method": "ping" });
+        let _ = writeln!(stdout, "{request}");
+    }
     let _ = stdout.flush();
     for line in lines.by_ref() {
         let Ok(line) = line else { break };

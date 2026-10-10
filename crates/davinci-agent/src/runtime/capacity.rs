@@ -198,6 +198,11 @@ pub struct WorkerSlotCapacity {
 
 struct WorkerCounts {
     active: usize,
+    /// The limit each running permit was admitted under, as limit -> count.
+    /// A caller asking for limit 1 (a serial barrier) must also keep later
+    /// callers with a larger limit out while it runs, so admission respects
+    /// the smallest limit held, not only the caller's own.
+    held_limits: std::collections::BTreeMap<usize, usize>,
     waiters: VecDeque<Weak<()>>,
 }
 
@@ -212,6 +217,7 @@ impl WorkerSlotCapacity {
         Self {
             active: Mutex::new(WorkerCounts {
                 active: 0,
+                held_limits: std::collections::BTreeMap::new(),
                 waiters: VecDeque::new(),
             }),
             changed: Condvar::new(),
@@ -237,7 +243,12 @@ impl WorkerSlotCapacity {
                 self.changed.notify_all();
                 return None;
             }
-            if active.active < max_concurrency
+            let ceiling = active
+                .held_limits
+                .keys()
+                .next()
+                .map_or(max_concurrency, |held| max_concurrency.min(*held));
+            if active.active < ceiling
                 && active
                     .waiters
                     .front()
@@ -245,8 +256,12 @@ impl WorkerSlotCapacity {
             {
                 active.waiters.pop_front();
                 active.active += 1;
+                *active.held_limits.entry(max_concurrency).or_default() += 1;
                 self.changed.notify_all();
-                return Some(WorkerSlotPermit { pool: self });
+                return Some(WorkerSlotPermit {
+                    pool: self,
+                    limit: max_concurrency,
+                });
             }
             let (next_active, _timeout) = self
                 .changed
@@ -263,12 +278,19 @@ impl WorkerSlotCapacity {
 
 pub struct WorkerSlotPermit<'a> {
     pool: &'a WorkerSlotCapacity,
+    limit: usize,
 }
 
 impl Drop for WorkerSlotPermit<'_> {
     fn drop(&mut self) {
         let mut active = self.pool.active.lock().unwrap_or_else(|e| e.into_inner());
         active.active = active.active.saturating_sub(1);
+        if let Some(count) = active.held_limits.get_mut(&self.limit) {
+            *count -= 1;
+            if *count == 0 {
+                active.held_limits.remove(&self.limit);
+            }
+        }
         self.pool.changed.notify_all();
     }
 }
@@ -276,6 +298,38 @@ impl Drop for WorkerSlotPermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Try to acquire with `limit` for `wait`, reporting whether it got in.
+    fn admitted_within(pool: &WorkerSlotCapacity, limit: usize, wait: Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        pool.acquire(limit, || std::time::Instant::now() >= deadline)
+            .is_some()
+    }
+
+    #[test]
+    fn a_serial_holder_keeps_parallel_callers_out_and_vice_versa() {
+        let pool = WorkerSlotCapacity::new();
+        let short = Duration::from_millis(100);
+
+        // A serial (limit 1) child is running: a parallel-safe caller with a
+        // larger limit must wait for it, not join it.
+        let serial = pool.acquire(1, || false).unwrap();
+        assert!(!admitted_within(&pool, 4, short));
+        assert_eq!(pool.active_count(), 1);
+        drop(serial);
+        assert!(admitted_within(&pool, 4, short));
+
+        // Parallel-safe children share; a serial caller waits for all of them.
+        let first = pool.acquire(4, || false).unwrap();
+        let second = pool.acquire(4, || false).unwrap();
+        assert_eq!(pool.active_count(), 2);
+        assert!(!admitted_within(&pool, 1, short));
+        drop(first);
+        assert!(!admitted_within(&pool, 1, short));
+        drop(second);
+        assert!(admitted_within(&pool, 1, short));
+        assert_eq!(pool.active_count(), 0);
+    }
 
     #[test]
     fn harness_worker_waiters_are_fifo_and_zero_capacity_refuses() {

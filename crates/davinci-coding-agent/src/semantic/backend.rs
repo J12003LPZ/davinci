@@ -775,7 +775,30 @@ fn read_frames(mut stdout: ChildStdout, sender: mpsc::SyncSender<Result<Value, S
                     match parser.next_frame() {
                         Ok(Some(frame)) => match serde_json::from_str::<Value>(&frame) {
                             Ok(message) => {
-                                if sender.send(Ok(message)).is_err() {
+                                // The reader must never stop draining stdout:
+                                // a single-threaded server blocked on a full
+                                // pipe stops reading stdin, and our next write
+                                // then blocks forever. Notifications (progress,
+                                // diagnostics) get no reply and are dropped
+                                // here, so they cannot fill the queue. A server
+                                // request is only ever refused, so it is
+                                // dropped when the queue is full. Responses to
+                                // our own requests (at most one in flight) and
+                                // transport errors still wait for room.
+                                let delivered = if message.get("method").is_none() {
+                                    sender.send(Ok(message)).is_ok()
+                                } else if message
+                                    .get("id")
+                                    .is_some_and(|id| id.is_number() || id.is_string())
+                                {
+                                    !matches!(
+                                        sender.try_send(Ok(message)),
+                                        Err(mpsc::TrySendError::Disconnected(_))
+                                    )
+                                } else {
+                                    true
+                                };
+                                if !delivered {
                                     return;
                                 }
                             }
@@ -1085,7 +1108,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    #[ignore = "subprocess fixture; invoked by incoming_frames_apply_backpressure"]
+    #[ignore = "subprocess fixture; invoked by an_idle_consumer_drains_and_queues_no_notifications"]
     fn resource_fixture_lsp() {
         if !Path::new("resource-lsp-enabled").is_file() {
             return;
@@ -1103,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_frames_apply_backpressure() {
+    fn an_idle_consumer_drains_and_queues_no_notifications() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("resource-lsp-enabled"), "fixture").unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1123,21 +1146,105 @@ mod tests {
         let stdout = child.stdout.take().unwrap();
         drain_stderr(child.stderr.take());
         let connection = LspConnection::new(child, stdin, stdout);
-        // Confirm frames are flowing before checking that an idle consumer
-        // prevents the producer from buffering its entire output.
-        connection
-            .incoming
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // 256 notifications of 16 KiB with nobody receiving: the reader must
+        // drain them all (a blocked reader deadlocks a single-threaded
+        // server) and queue none of them (memory stays bounded).
+        let deadline = Instant::now() + Duration::from_secs(10);
         let finished = dir.path().join("resource-lsp-finished");
         while !finished.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        let unbounded = finished.exists();
+        assert!(finished.exists(), "the reader stopped draining stdout");
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(
+                connection.incoming.try_recv(),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) | Ok(Err(_))
+            ),
+            "notifications were queued"
+        );
         drop(connection);
-        assert!(!unbounded, "idle consumer allowed every frame to be queued");
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture; invoked by a_notification_flood_never_deadlocks_a_large_write"]
+    fn flood_fixture_lsp() {
+        if !Path::new("flood-lsp-enabled").is_file() {
+            return;
+        }
+        // A single-threaded server: it writes a flood of notifications, and
+        // only then reads its stdin and answers.
+        let mut output = std::io::stdout().lock();
+        output.write_all(b"\r\n").unwrap();
+        let frame = lsp_frame(
+            &json!({"jsonrpc":"2.0", "method":"$/progress", "params":{"text":"x".repeat(16384)}})
+                .to_string(),
+        );
+        for _ in 0..64 {
+            output.write_all(&frame).unwrap();
+        }
+        output.flush().unwrap();
+        let mut input = std::io::stdin().lock();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if input.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length:") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        input.read_exact(&mut body).unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        output
+            .write_all(&lsp_frame(
+                &json!({"jsonrpc":"2.0","id":request["id"],"result":"ok"}).to_string(),
+            ))
+            .unwrap();
+        output.flush().unwrap();
+    }
+
+    #[test]
+    fn a_notification_flood_never_deadlocks_a_large_write() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("flood-lsp-enabled"), "fixture").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "semantic::backend::tests::flood_fixture_lsp",
+                "--ignored",
+                "--nocapture",
+            ])
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        drain_stderr(child.stderr.take());
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let mut connection = LspConnection::new(child, stdin, stdout);
+            // Let the flood fill the stdout pipe before the large write.
+            thread::sleep(Duration::from_millis(200));
+            let result = connection.request(
+                "custom/large",
+                json!({"text": "y".repeat(2 * 1024 * 1024)}),
+                Duration::from_secs(20),
+            );
+            let _ = done.send(result);
+        });
+        let result = finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a large write deadlocked against a notification flood");
+        assert_eq!(result.unwrap(), json!("ok"));
     }
 
     #[test]

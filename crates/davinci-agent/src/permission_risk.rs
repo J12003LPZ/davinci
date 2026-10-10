@@ -305,11 +305,17 @@ fn ordinary_file_targets(
 /// proc macros and tests. Approval-free in Auto only inside an OS sandbox.
 pub(super) fn shell_executes_project_code(command: &str) -> bool {
     let (segments, _) = crate::shell_policy::split_shell_segments_with_diagnostic(command);
+    // Every cargo subcommand runs what the checkout chooses, not only the
+    // build commands: `.cargo/config.toml` can alias `fmt` (an external
+    // subcommand, so an alias shadows it) and set a rustc wrapper, and
+    // `rust-toolchain.toml` picks the toolchain binaries.
     segments.iter().any(|segment| {
-        let mut words = segment.split_whitespace();
-        let program = words.next().unwrap_or_default().to_ascii_lowercase();
+        let program = segment
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         matches!(program.as_str(), "cargo" | "cargo.exe")
-            && matches!(words.next(), Some("test" | "check" | "build" | "clippy"))
     })
 }
 
@@ -364,6 +370,14 @@ pub(super) fn routine_local_shell(
     {
         return false;
     }
+    // Line breaks are statement separators below. Any other control or
+    // unusual whitespace may separate statements in a shell this check does
+    // not model, so it is never routine.
+    if literal.chars().any(|ch| {
+        (ch.is_whitespace() || ch.is_control()) && !matches!(ch, ' ' | '\t' | '\n' | '\r')
+    }) {
+        return false;
+    }
     // The shared splitter drops empty segments; approval must not silently
     // turn a malformed chain into a list of individually safe commands.
     let chain = literal
@@ -410,7 +424,7 @@ pub(super) fn routine_local_shell(
             "cargo" => {
                 matches!(
                     rest.first(),
-                    Some(&"test" | &"check" | &"build" | &"clippy" | &"tree" | &"metadata")
+                    Some(&"test" | &"check" | &"build" | &"clippy")
                 ) && rest
                     .iter()
                     .any(|arg| matches!(*arg, "--offline" | "--frozen"))

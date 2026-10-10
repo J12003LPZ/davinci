@@ -183,7 +183,6 @@ const READ_PATTERNS: &[&str] = &[
     r"(?i)^\s*awk\b",
     r"(?i)^\s*node\s+--version\b",
     r"(?i)^\s*rustc\s+--version\b",
-    r"(?i)^\s*cargo\s+(tree|metadata)\b",
     r"(?i)^\s*git(?:\.exe)?(?:\s+-{1,2}\S+(?:\s+[^-\s]\S*)?)*\s+(status|log|diff|show|blame|branch|remote|ls-files|ls-tree|rev-parse|describe|shortlog)\b",
     r"(?i)^\s*npm\s+(ls|list|view|info|explain)\b",
     r"(?i)^\s*Get-(Content|ChildItem|Item|Location|Process|Command)\b",
@@ -346,7 +345,8 @@ pub fn split_shell_segments_with_diagnostic(command: &str) -> (Vec<String>, bool
                 subshell_depth = subshell_depth.saturating_sub(1);
                 current.push(ch);
             }
-            ';' | '\n' if subshell_depth == 0 => {
+            // PowerShell ends a statement at a lone CR as well as at LF.
+            ';' | '\n' | '\r' if subshell_depth == 0 => {
                 let seg = current.trim().to_string();
                 if !seg.is_empty() {
                     segments.push(seg);
@@ -449,12 +449,15 @@ pub(crate) fn literal_shell_words(command: &str) -> Option<Vec<String>> {
                 started = true;
             }
             '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | ';' | '|' | '&' => return None,
-            ch if ch.is_whitespace() => {
+            ' ' | '\t' => {
                 if started {
                     words.push(std::mem::take(&mut word));
                     started = false;
                 }
             }
+            // A line break or other unusual whitespace outside quotes can end
+            // a statement in one shell and only separate words in another.
+            ch if ch.is_whitespace() || ch.is_control() => return None,
             _ => {
                 word.push(ch);
                 started = true;
@@ -476,7 +479,95 @@ fn selects_long_option(arg: &str, option: &str) -> bool {
     flag.starts_with("--") && flag.len() > 2 && option.starts_with(flag)
 }
 
+/// Words of a segment for a read-only check only. Command substitution
+/// (`$(...)`, backticks, `<(...)`) runs a program wherever it appears, even
+/// in a redirect target or after `--`, so it refuses the segment outright.
+/// Otherwise redirections with a literal target are removed, each `$VAR` or
+/// `${VAR}` becomes a placeholder, and a brace group that expands to several
+/// words (`{a,b}`, `{1..3}`) becomes a glob character, so the glob rules in
+/// [`git_is_read_only`] apply to it. A literal brace group (`@{u}`,
+/// `HEAD^{commit}`) keeps a marker in place of its braces.
+///
+/// A variable can carry an option (`OPT=--output=~/.bashrc` in
+/// `git log $OPT`, or `BASE=--output=x` in `git diff "$BASE"...HEAD`), so a
+/// placeholder anywhere before `--` refuses the segment; only operands after
+/// `--` (`git diff -- "$FILE"`) may be variables.
+fn literal_words_with_placeholders(segment: &str) -> Option<Vec<String>> {
+    const PLACEHOLDER: &str = "__shell_expansion__";
+    static REDIRECT: OnceLock<regex::Regex> = OnceLock::new();
+    static VARIABLE: OnceLock<regex::Regex> = OnceLock::new();
+    static BRACES: OnceLock<regex::Regex> = OnceLock::new();
+    if segment.contains("$(")
+        || segment.contains('`')
+        || segment.contains("<(")
+        || segment.contains(">(")
+    {
+        return None;
+    }
+    let redirect = REDIRECT.get_or_init(|| {
+        regex::Regex::new(r#"(?:^|[ \t])\d*(?:>>?|<)(?:&\d+|[ \t]*[^\s;|&<>$`()"']+)"#)
+            .expect("fixed redirection pattern")
+    });
+    let variable = VARIABLE.get_or_init(|| {
+        regex::Regex::new(r"\$\{[^{}]*\}|\$[A-Za-z0-9_@*#?!$-]+").expect("fixed variable pattern")
+    });
+    let braces = BRACES
+        .get_or_init(|| regex::Regex::new(r"\{([^{}]*)\}").expect("fixed brace group pattern"));
+    let without_redirects = redirect.replace_all(segment, " ");
+    let placeheld = variable.replace_all(&without_redirects, PLACEHOLDER);
+    let unbraced = braces.replace_all(&placeheld, |group: &regex::Captures<'_>| {
+        if group[1].contains(',') || group[1].contains("..") {
+            "*".to_string()
+        } else {
+            format!("%{}%", &group[1])
+        }
+    });
+    let words = literal_shell_words(&unbraced)?;
+    let options_end = words
+        .iter()
+        .position(|word| word == "--")
+        .unwrap_or(words.len());
+    (!words[..options_end]
+        .iter()
+        .any(|word| word.contains(PLACEHOLDER)))
+    .then_some(words)
+}
+
+/// A shell word that expands to file names (a glob) or, in PowerShell,
+/// splats an array of arguments (`@opts`). Quotes are already gone, so a
+/// quoted glob counts too (fail closed).
+fn word_expands(word: &str) -> bool {
+    word.contains(['*', '?', '['])
+        || word
+            .strip_prefix('@')
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+}
+
+/// Whether shell expansion of an operand could produce an option. An
+/// expanded file name starts with the text before the first glob character,
+/// so `src/*` and `--grep=fix*` cannot become a different option, while `*`,
+/// `-*` and `--out*` can match a repository file named `--output=x`.
+fn word_may_expand_to_option(word: &str) -> bool {
+    if !word_expands(word) {
+        return false;
+    }
+    match word.find(['*', '?', '[']) {
+        Some(at) => {
+            let prefix = &word[..at];
+            word.starts_with('@')
+                || prefix.is_empty()
+                || (prefix.starts_with('-') && !prefix.contains('='))
+        }
+        None => true,
+    }
+}
+
 fn git_is_read_only(words: &[String]) -> bool {
+    let options_end = words
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(words.len());
     let mut args = &words[1..];
     while let Some(flag) = args.first() {
         if matches!(flag.as_str(), "-C" | "--git-dir" | "--work-tree") {
@@ -499,6 +590,19 @@ fn git_is_read_only(words: &[String]) -> bool {
     let Some((verb, args)) = args.split_first() else {
         return false;
     };
+    // A word the shell expands before the verb can shift which word git
+    // reads as the verb (`git -C * log` with a repository file named
+    // `push`); a glob verb is never a read-only name. After the verb, an
+    // expansion is only refused where it can become an option (a file
+    // named `--output=x` matched by `*`). Operands after `--` are safe.
+    let verb_at = words.len() - args.len() - 1;
+    if words[1..=verb_at].iter().any(|word| word_expands(word))
+        || words[verb_at + 1..options_end.max(verb_at + 1)]
+            .iter()
+            .any(|word| word_may_expand_to_option(word))
+    {
+        return false;
+    }
     if args.iter().any(|arg| {
         ["--output", "--ext-diff", "--textconv", "--show-signature"]
             .iter()
@@ -613,9 +717,9 @@ fn read_arguments_are_safe(segment: &str) -> bool {
         }
         "node" | "rustc" => args.len() == 1 && args[0] == "--version",
         "cat" | "head" | "tail" | "grep" | "ls" | "dir" | "pwd" | "echo" | "wc" | "diff"
-        | "stat" | "which" | "where" | "where.exe" | "type" | "jq" | "cargo" | "npm"
-        | "get-content" | "get-childitem" | "get-item" | "get-location" | "get-process"
-        | "get-command" | "select-string" => true,
+        | "stat" | "which" | "where" | "where.exe" | "type" | "jq" | "npm" | "get-content"
+        | "get-childitem" | "get-item" | "get-location" | "get-process" | "get-command"
+        | "select-string" => true,
         _ => false,
     }
 }
@@ -731,17 +835,35 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
                 format!("matches package modification pattern in segment `{segment}`"),
             ));
         }
-        let unsafe_git = literal_shell_words(&without_stderr_join).is_some_and(|words| {
+        let is_git = |program: &str| {
             matches!(
-                words[0]
+                program
                     .rsplit(['/', '\\'])
                     .next()
                     .unwrap_or("")
                     .to_ascii_lowercase()
                     .as_str(),
                 "git" | "git.exe"
-            ) && !git_is_read_only(&words)
-        });
+            )
+        };
+        let unsafe_git = match literal_shell_words(&without_stderr_join) {
+            Some(words) => is_git(&words[0]) && !git_is_read_only(&words),
+            // A git segment the literal lexer refuses fails closed: it is a
+            // mutation unless `git_is_read_only` can still prove it read-only
+            // once redirections are dropped and each expansion is a fixed
+            // placeholder word. The verb is then always a literal, so
+            // `git $SUB origin` or `git "$(echo push)"` stays a mutation,
+            // while `git status 2>/dev/null` or `git diff "$BASE"...HEAD`
+            // remains a read.
+            None => {
+                without_stderr_join
+                    .split(|ch: char| ch.is_whitespace() || ch.is_control())
+                    .find(|word| !word.is_empty())
+                    .is_some_and(|program| is_git(program.trim_matches(['"', '\''])))
+                    && !literal_words_with_placeholders(&without_stderr_join)
+                        .is_some_and(|words| is_git(&words[0]) && git_is_read_only(&words))
+            }
+        };
         if git_mutation_regex().is_match(segment) || unsafe_git {
             risks.push((
                 ShellRiskCategory::GitMutation,
@@ -1049,6 +1171,178 @@ mod tests {
 
         let (_, unclosed3) = split_shell_segments_with_diagnostic("echo 'unclosed");
         assert!(unclosed3);
+
+        // PowerShell runs the statement after a lone CR.
+        let (segs4, unclosed4) = split_shell_segments_with_diagnostic("cat a\rStart-Process b");
+        assert!(!unclosed4);
+        assert_eq!(segs4, vec!["cat a", "Start-Process b"]);
+        let (segs5, _) = split_shell_segments_with_diagnostic("echo 'a\rb'");
+        assert_eq!(segs5, vec!["echo 'a\rb'"]);
+    }
+
+    #[test]
+    fn security_unusual_whitespace_never_reads_as_one_command() {
+        for command in [
+            "cat README.md\rStart-Process notepad.exe",
+            "Get-Content README.md\rRemove-Item src",
+            "cat README.md\u{b}Start-Process notepad.exe",
+            "cat README.md\u{c}Start-Process notepad.exe",
+            "cat README.md\u{85}Start-Process notepad.exe",
+            "cat README.md\u{2028}Start-Process notepad.exe",
+        ] {
+            for profile in [
+                ShellPolicyProfile::ReadOnly,
+                ShellPolicyProfile::ReadAndTest,
+            ] {
+                assert_ne!(
+                    evaluate(profile, command),
+                    ShellCommandDecision::Allowed,
+                    "{profile:?} allowed {command:?}"
+                );
+            }
+            assert!(!analyze_command(command).is_read_only, "{command:?}");
+        }
+        assert_eq!(
+            literal_shell_words("cat\ta  b"),
+            Some(vec!["cat".into(), "a".into(), "b".into()])
+        );
+        assert_eq!(
+            literal_shell_words("cat 'a\rb'"),
+            Some(vec!["cat".into(), "a\rb".into()])
+        );
+    }
+
+    #[test]
+    fn security_git_with_unusual_whitespace_is_still_a_git_mutation() {
+        for command in [
+            "git\u{b}-c\u{b}core.pager=fixture\u{b}log",
+            "git\u{c}push origin main",
+            "\"git\" log\u{85}--output=x",
+        ] {
+            let report = analyze_command(command);
+            assert!(
+                report
+                    .risks
+                    .iter()
+                    .any(|(category, _)| *category == ShellRiskCategory::GitMutation),
+                "{command:?}: {:?}",
+                report.risks
+            );
+            assert_ne!(
+                evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
+                ShellCommandDecision::Allowed,
+                "{command:?}"
+            );
+        }
+        // Non-git segments the lexer refuses are not mislabeled as git.
+        assert!(!analyze_command("echo\u{b}hi")
+            .risks
+            .iter()
+            .any(|(category, _)| *category == ShellRiskCategory::GitMutation));
+        // Read-only git with ordinary shell syntax the lexer refuses stays
+        // allowed for writer roles.
+        for command in [
+            "git status 2>/dev/null",
+            "git log > log.txt",
+            "git show HEAD:{a,b}",
+            "git diff -- \"$FILE\"",
+            "git show HEAD^{commit}",
+            "git log -- *",
+            "git log src/*",
+            "git log --grep=fix*",
+            "git show @",
+            "git log @{u}..HEAD",
+        ] {
+            assert!(
+                !analyze_command(command)
+                    .risks
+                    .iter()
+                    .any(|(category, _)| *category == ShellRiskCategory::GitMutation),
+                "{command:?}"
+            );
+            assert_eq!(
+                evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
+                ShellCommandDecision::Allowed,
+                "{command:?}"
+            );
+        }
+        // A verb, option or operand the policy cannot read as a literal is a
+        // mutation: an expansion never stands in for a read-only verb.
+        for command in [
+            "git push \"$REMOTE\" main",
+            "git $SUB origin main",
+            "git \"$(echo push)\" origin",
+            "git `echo push` origin",
+            "git ${SUB} origin",
+            "git {push,status} origin",
+            "git -c \"$X\" log",
+            "git branch $NAME",
+            "git branch \"$NAME\" 2>/dev/null",
+            "git log $(git push)",
+            "git log `git push`",
+            "git $(echo $(echo push))",
+            "git (push)",
+            // An expansion before `--` may carry an option such as
+            // `--output=<file>` or `--ext-diff`.
+            "git log $OPT",
+            "git diff \"$BASE\"...HEAD",
+            "git show `echo --textconv` HEAD",
+            "git -C $DIR status",
+            // A glob or splat can expand to a repository file named like an
+            // option (`--output=x`, `--ext-diff`) or to another verb.
+            "git log *",
+            "git diff -*",
+            "git log --out*",
+            "git show ?",
+            "git -C * log",
+            "git log @opts",
+            "git log '*'",
+            // Brace expansion and command substitution, wherever they sit.
+            "git -C {.,push,origin} status",
+            "git log {,--output=/x}",
+            "git log {-p,--ext-diff}",
+            "git status 2>$(git${IFS}push)",
+            "git log -- $(\"git\" push)",
+            "git log -- $(cat paths.txt)",
+            "git diff <(git push)",
+            "git -C x{,y} log",
+        ] {
+            assert_ne!(
+                evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
+                ShellCommandDecision::Allowed,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_cargo_queries_are_never_read_only() {
+        // Even with no arguments, the repository chooses what cargo runs:
+        // `.cargo/config.toml` can set `build.rustc-wrapper`, which tree and
+        // metadata invoke for target information, and `rust-toolchain.toml`
+        // can point at another toolchain. No argument allowlist can make
+        // these read-only in an untrusted checkout.
+        for command in [
+            "cargo tree",
+            "cargo tree -p davinci-agent --depth 1 -e normal",
+            "cargo tree --invert serde --offline",
+            "cargo metadata --format-version 1 --no-deps",
+            "cargo metadata --format-version=1 --locked",
+            "cargo tree --config 'build.rustc=\"fixture\"'",
+            "cargo metadata --manifest-path ../other/Cargo.toml",
+            "cargo.exe tree",
+        ] {
+            for profile in [
+                ShellPolicyProfile::ReadOnly,
+                ShellPolicyProfile::ReadAndTest,
+            ] {
+                assert_ne!(
+                    evaluate(profile, command),
+                    ShellCommandDecision::Allowed,
+                    "{profile:?} allowed {command}"
+                );
+            }
+        }
     }
 
     #[test]

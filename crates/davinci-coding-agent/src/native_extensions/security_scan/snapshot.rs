@@ -94,6 +94,27 @@ pub struct Snapshot {
     pub supporting_base_files: BTreeMap<String, SourceFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supporting_skipped: Vec<SkippedFile>,
+    #[serde(skip)]
+    pub masked: MaskedTexts,
+}
+
+/// Credential-masked file text per (side, path), computed once. A scan reads
+/// one file in many 200-line windows, and masking is a pass over the whole
+/// file (a window can start inside a key or a multi-line quoted secret).
+/// Never persisted, and a clone starts empty.
+#[derive(Default)]
+pub struct MaskedTexts(std::sync::Mutex<BTreeMap<(String, String), std::sync::Arc<str>>>);
+
+impl Clone for MaskedTexts {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for MaskedTexts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MaskedTexts")
+    }
 }
 
 const MAX_PATH_COMPONENT: usize = 255;
@@ -184,10 +205,15 @@ pub(super) fn denied(path: &Path) -> bool {
                 "credentials.json",
                 "auth.json",
                 "id_rsa",
+                "id_dsa",
+                "id_ecdsa",
+                "id_ecdsa_sk",
                 "id_ed25519",
+                "id_ed25519_sk",
             ]
             .contains(&part.as_str())
             || part.ends_with(".pem")
+            || part.ends_with(".ppk")
             || part.ends_with(".p12")
             || part.ends_with(".pfx")
             || part.ends_with(".key")
@@ -467,6 +493,27 @@ impl Snapshot {
         self.read_side(path, start, end, "current")
     }
 
+    /// The file's text with every whole-text credential mask applied; the
+    /// line count matches the source. Cached per (side, path).
+    pub fn masked_text(&self, path: &str, side: &str) -> Result<std::sync::Arc<str>, String> {
+        let file = self.file(path, side)?;
+        let key = (side.to_string(), path.to_string());
+        let lock = || {
+            self.masked
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some(text) = lock().get(&key) {
+            return Ok(text.clone());
+        }
+        // Masked outside the lock, so workers reading other files never wait.
+        let text: std::sync::Arc<str> =
+            super::super::credential_redaction::whole_text(&file.text).into();
+        lock().insert(key, text.clone());
+        Ok(text)
+    }
+
     pub fn file(&self, path: &str, side: &str) -> Result<&SourceFile, String> {
         if ["index-base", "index-ours", "index-theirs"].contains(&side) {
             return self
@@ -700,6 +747,49 @@ pub(crate) fn open_confined(_: &Path, _: &Path) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masked_text_is_computed_once_per_file_and_never_cloned() {
+        let text = "password = \"fixture first\nfixture second\"\nvisible\n".to_string();
+        let snapshot = Snapshot {
+            files: [(
+                "cfg.py".to_string(),
+                SourceFile {
+                    hash: String::new(),
+                    text,
+                },
+            )]
+            .into(),
+            ..Snapshot::default()
+        };
+        let first = snapshot.masked_text("cfg.py", "current").unwrap();
+        let second = snapshot.masked_text("cfg.py", "current").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(!first.contains("fixture") && first.contains("visible"));
+        assert_eq!(snapshot.masked.0.lock().unwrap().len(), 1);
+        assert!(snapshot.clone().masked.0.lock().unwrap().is_empty());
+        assert!(snapshot.masked_text("missing.py", "current").is_err());
+    }
+
+    #[test]
+    fn every_openssh_and_putty_private_key_name_is_withheld() {
+        for path in [
+            "id_rsa",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ecdsa_sk",
+            "id_ed25519",
+            "id_ed25519_sk",
+            "deploy/ID_ECDSA",
+            "keys/server.ppk",
+            "certs/tls.pem",
+        ] {
+            assert!(denied(Path::new(path)), "{path}");
+        }
+        for path in ["id_ecdsa.pub", "src/identity.rs", "docs/id_rsa.md"] {
+            assert!(!denied(Path::new(path)), "{path}");
+        }
+    }
 
     #[test]
     fn security_scoped_snapshot_captures_support_without_expanding_targets() {

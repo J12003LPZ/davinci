@@ -3,19 +3,30 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 pub fn text(input: &str) -> String {
+    premasked_text(&super::super::credential_redaction::whole_text(input))
+}
+
+/// [`text`] for input the whole-text masks already ran over (a window of
+/// `Snapshot::masked_text`): only the per-line token masks run.
+pub fn premasked_text(input: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| [
-        r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key)[a-z0-9_.-]*[\s\"']*[:=][\s\"']*(?:(?:basic|bearer|digest|token)\s+)?[^\s\"',;}]+"#,
-        r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/=._~-]{8,}",
-        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
-        r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+",
-        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
-        r"https?://[^\s/:@]+:[^\s/@]+@",
-    ].into_iter().map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern")).collect());
-    super::super::credential_redaction::quoted_assignments(input)
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/=._~-]{8,}",
+            r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+            r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+",
+            r"\bnpm_[A-Za-z0-9]{20,}",
+            r"\bglpat-[A-Za-z0-9_-]{20,}",
+            r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        ]
+        .into_iter()
+        .map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern"))
+        .collect()
+    });
+    input
         .lines()
         .map(|line| {
-            let mut line = super::redact_evidence(line);
+            let mut line = key_assignments(&super::redact_evidence_tokens(line));
             for pattern in patterns {
                 line = pattern.replace_all(&line, "[REDACTED]").into_owned();
             }
@@ -26,6 +37,55 @@ pub fn text(input: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `key = value`, `key: value`, `key := value` for credential-named keys.
+/// The value may not start with `=` or `>`: `token == expected` and
+/// `token => ...` are comparisons and arrows a security review needs to see,
+/// not assignments. A purely numeric value of a token key is a count
+/// (`max_tokens=100`), not a credential.
+fn key_assignments(line: &str) -> String {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(&format!(
+            r#"(?i)([a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*)[\s"']*{}[\s"']*(?:(?:basic|bearer|digest|token)\s+)?([^\s"',;}}=>][^\s"',;}}]*)"#,
+            super::super::credential_redaction::ASSIGNMENT_SEPARATOR
+        ))
+        .expect("fixed credential assignment pattern")
+    });
+    static CALL: OnceLock<Regex> = OnceLock::new();
+    let call = CALL.get_or_init(|| {
+        Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|::)[A-Za-z_][A-Za-z0-9_]*)*\(")
+            .expect("fixed call pattern")
+    });
+    pattern
+        .replace_all(line, |captures: &regex::Captures<'_>| {
+            // `max_tokens`, `token_limit`: a count. `TOKEN=123456` may be an
+            // OTP or PIN, so a bare numeric token stays masked.
+            let key = captures[1].to_ascii_lowercase();
+            let value = &captures[2];
+            let count = key.contains("token")
+                && [
+                    "tokens", "max", "min", "limit", "budget", "count", "num", "len",
+                ]
+                .iter()
+                .any(|word| key.contains(word))
+                && value.bytes().all(|byte| byte.is_ascii_digit());
+            // A call is code a security review must see (`let token =
+            // Command::new(cmd).spawn()`, `secret = eval(blob)`): a path, `(`,
+            // and its `)` later on the line. `TOKEN=fixture(sensitive` has
+            // no closing paren and stays masked.
+            let code = call.find(value).is_some_and(|open| {
+                let after = captures.get(2).map_or(line.len(), |m| m.start()) + open.end();
+                line[after..].contains(')')
+            });
+            if count || code {
+                captures[0].to_string()
+            } else {
+                "[REDACTED]".to_string()
+            }
+        })
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -74,5 +134,117 @@ mod tests {
         }
         assert!(!text("\u{1b}]52;clipboard\u{7}\u{202e}").contains(['\u{1b}', '\u{7}', '\u{202e}']));
         assert!(text("fn allowed() { validate_owner(); }").contains("validate_owner"));
+    }
+
+    #[test]
+    fn private_key_bodies_url_passwords_and_named_tokens_are_redacted() {
+        let body = "MIIEfixture0FIXTURE1fixture2FIXTURE3fixture4FIXTURE5abcd";
+        let pem = format!(
+            "const KEY: &str = \"\\\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n{body}\n-----END RSA PRIVATE KEY-----\";\nfn after() {{}}"
+        );
+        let output = text(&pem);
+        assert!(!output.contains(body), "{output}");
+        assert_eq!(output.lines().count(), pem.lines().count());
+        assert!(output.contains("fn after()"), "{output}");
+
+        let npm = concat!("npm", "_fixtureTOKENfixtureTOKENfixture");
+        let gitlab = concat!("gl", "pat-fixtureTOKENfixtureTOKEN");
+        for secret in [
+            "DATABASE_URL=postgres://admin:fixture-sensitive@db.internal/app".to_string(),
+            "redis://:fixture-sensitive@cache:6379".to_string(),
+            "export NPM_TOKEN=fixture-sensitive".to_string(),
+            "GITLAB_TOKEN: fixture-sensitive".to_string(),
+            "auth_token = fixture-sensitive".to_string(),
+            format!("//registry.npmjs.org/:_authToken={npm}"),
+            format!("see {npm}"),
+            format!("see {gitlab}"),
+        ] {
+            let output = text(&secret);
+            assert!(
+                !output.contains("fixture-sensitive") && !output.contains("fixtureTOKENfixture"),
+                "{secret} -> {output}"
+            );
+        }
+        assert!(text("postgres://db.internal/app").contains("db.internal"));
+        for secret in [
+            "TOKEN=fixture-sensitive",
+            "authtoken: fixture-sensitive",
+            "NPMTOKEN=fixture-sensitive",
+            "bot_token = \"fixture.sensitive.value\"",
+            "DISCORD_TOKEN=fixture.sensitive.value",
+            // Credential-named keys are masked whatever the value contains.
+            "API_TOKEN=fixture(sensitive",
+            "SLACK_TOKEN=fixture<sensitive>",
+            "auth_token: [fixture-sensitive]",
+            "TOKEN=fixture(sensitive",
+            "token=fixture(sensitive",
+        ] {
+            let output = text(secret);
+            assert!(!output.contains("sensitive"), "{secret} -> {output}");
+        }
+        // A call is code a review must see, whatever the variable is named.
+        for code in [
+            "let token = lexer.next();",
+            "let token = std::process::Command::new(cmd).spawn();",
+            "secret = eval(base64.b64decode(blob))",
+            "let password = Command::new(\"sh\").arg(x);",
+        ] {
+            assert_eq!(text(code), code);
+        }
+        // An unclosed paren is not a call: still a credential value.
+        assert!(!text("let token = abc(def").contains("abc(def"));
+        // A bare identifier or literal value stays masked.
+        assert_eq!(text("let token = other_value;"), "let [REDACTED];");
+        // Comparisons, arrows and counts are code a review must see.
+        for code in [
+            "if token == expected_token {",
+            "if password == input {",
+            "assert!(token != stored);",
+            "Some(token) => token,",
+            "max_tokens=100",
+            "let max_tokens: 4096,",
+        ] {
+            assert_eq!(text(code), code);
+        }
+        for secret in [
+            "password := fixture-sensitive",
+            "token := fixture-sensitive",
+            "api_token=12345abc",
+            "TOKEN=12345678",
+            "otp_token: 12345678",
+        ] {
+            let output = text(secret);
+            assert!(
+                !output.contains("fixture-sensitive")
+                    && !output.contains("12345abc")
+                    && !output.contains("12345678"),
+                "{secret} -> {output}"
+            );
+        }
+        // Typed and Go assignments: the type sat between the key and the
+        // quote, so only `key: Type` was masked and the value leaked.
+        for secret in [
+            "password: str = \"fixture sensitive phrase\"",
+            "let password: &str = \"fixture sensitive phrase\";",
+            "password := \"fixture sensitive phrase\"",
+            "const apiKey = `fixture sensitive phrase`;",
+            "let otp_token: u32 = 12345678;",
+        ] {
+            let output = text(secret);
+            assert!(
+                !output.contains("sensitive") && !output.contains("12345678"),
+                "{secret} -> {output}"
+            );
+        }
+        assert_eq!(
+            text("let max_tokens: usize = 4096;"),
+            "let max_tokens: usize = 4096;"
+        );
+        for prose in [
+            "the token expires after an hour",
+            "Repeated grep call blocked by token governor; change the query",
+        ] {
+            assert_eq!(text(prose), prose);
+        }
     }
 }

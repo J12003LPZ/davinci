@@ -660,6 +660,43 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_stdout_log_lines_do_not_end_the_transport() {
+        let mut client = fixture_client(&["--legacy-log"]);
+        assert_eq!(client.tools[0].name, "echo");
+        for text in ["first", "second"] {
+            let ok = client.call_tool("echo", json!({ "text": text })).unwrap();
+            assert_eq!(ok.text(), text);
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_reply_fails_its_call_without_corrupting_or_ending_the_transport() {
+        let mut client = fixture_client(&["--legacy-reply"]);
+        let error = client
+            .call_tool("echo", json!({"text": "corrupt"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        let ok = client.call_tool("echo", json!({"text": "next"})).unwrap();
+        assert_eq!(ok.text(), "next");
+
+        // Invalid bytes in the reply's id: the call fails at once (no wait
+        // for the call timeout), and the transport keeps working.
+        let started = std::time::Instant::now();
+        let error = client
+            .call_tool("echo", json!({"text": "corrupt-id"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A server request with invalid bytes is still answered, not dropped.
+        let ok = client
+            .call_tool("echo", json!({"text": "corrupt-ping"}))
+            .unwrap();
+        assert_eq!(ok.text(), "pinged:0");
+    }
+
+    #[test]
     fn server_requests_are_refused_and_notifications_ignored() {
         let mut client = fixture_client(&["--sampling"]);
         // The fixture sends a notification and a `sampling/createMessage`

@@ -190,13 +190,48 @@ fn auto_escalates_external_destructive_and_sensitive_actions() {
 }
 
 #[test]
+fn auto_treats_a_lone_carriage_return_as_a_statement_separator() {
+    // PowerShell runs the statement after a lone CR. A read command must not
+    // carry an unreviewed second statement as if it were arguments.
+    let p = policy(PermissionMode::Auto);
+    for tool in ["powershell", "bash"] {
+        assert_eq!(
+            verdict(&p, tool, json!({"command":"git status"})),
+            PermissionVerdict::Allow,
+            "{tool} control"
+        );
+        for command in [
+            "git status\rStart-Process notepad.exe",
+            "git status\rRemove-Item src",
+            "git status\u{b}Start-Process notepad.exe",
+            "git status\u{c}Start-Process notepad.exe",
+            "git status\u{85}Start-Process notepad.exe",
+            "git status\u{2028}Start-Process notepad.exe",
+        ] {
+            assert!(
+                is_ask(&verdict(&p, tool, json!({"command":command}))),
+                "Auto allowed {tool}: {command:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
     // Auto may edit build.rs or a test and then run it. Without isolation
     // that chain is arbitrary code execution, so every code-running check asks.
     let p = policy(PermissionMode::Auto);
     let mut isolated = p.clone();
     isolated.execution_isolated = true;
-    for command in ["cargo build --offline", "cargo clippy --offline"] {
+    // Every cargo subcommand runs what the checkout configures: `tree` and
+    // `metadata` invoke the rustc wrapper, `fmt` can be shadowed by an
+    // `[alias]`, and `rust-toolchain.toml` picks the toolchain.
+    for command in [
+        "cargo build --offline",
+        "cargo clippy --offline",
+        "cargo tree --offline",
+        "cargo metadata --offline",
+    ] {
         assert!(
             is_ask(&verdict(&p, "bash", json!({"command":command}))),
             "unconfined Auto allowed {command}"
@@ -205,6 +240,7 @@ fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
     for command in [
         "cargo test --offline",
         "cargo check --offline",
+        "cargo fmt --check",
         "git status && cargo test --offline",
     ] {
         assert!(
@@ -217,18 +253,10 @@ fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
             "isolated Auto asked for {command}"
         );
     }
-    for command in [
-        "cargo fmt --check",
-        "cargo tree --offline",
-        "cargo metadata --offline",
-        "git status",
-    ] {
-        assert_eq!(
-            verdict(&p, "bash", json!({"command":command})),
-            PermissionVerdict::Allow,
-            "{command}"
-        );
-    }
+    assert_eq!(
+        verdict(&p, "bash", json!({"command":"git status"})),
+        PermissionVerdict::Allow
+    );
     assert_eq!(
         verdict(&p, "write", json!({"path":"build.rs"})),
         PermissionVerdict::Allow

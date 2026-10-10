@@ -11148,6 +11148,20 @@ fn session_call_note(call: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Record a session call that did not persist, so the caller reports it
+/// instead of the extension's write silently disappearing.
+fn report_session_call(
+    ui: &mut SessionCallUi,
+    failures: &mut Vec<(usize, String)>,
+    index: usize,
+    result: Result<(), String>,
+) {
+    if let Err(error) = result {
+        ui.status(&error);
+        failures.push((index, error));
+    }
+}
+
 fn apply_session_calls(
     parsed: Option<&Args>,
     agent: &mut Agent,
@@ -11200,35 +11214,51 @@ fn apply_session_calls(
                     let data = call.get("data").cloned().unwrap_or(serde_json::Value::Null);
                     let mut extra = serde_json::Map::new();
                     extra.insert("data".into(), data);
-                    let _ = store.append_entry(SessionEntry {
-                        id: String::new(),
-                        entry_type: "custom".into(),
-                        parent_id: None,
-                        seq: 0,
-                        timestamp: now_ms(),
-                        message: None,
-                        custom_type: Some(custom_type.to_string()),
-                        extra,
-                    });
+                    let result = store
+                        .append_entry(SessionEntry {
+                            id: String::new(),
+                            entry_type: "custom".into(),
+                            parent_id: None,
+                            seq: 0,
+                            timestamp: now_ms(),
+                            message: None,
+                            custom_type: Some(custom_type.to_string()),
+                            extra,
+                        })
+                        .map_err(|error| format!("Extension appendEntry failed: {error}"));
+                    report_session_call(&mut ui, &mut failures, index, result);
                 }
             }
             Some("setLabel") => {
                 if let Some(store) = agent.session.as_mut() {
-                    let id = call
+                    // A missing target would label entry "" rather than fail.
+                    let result = match call
                         .get("entryId")
                         .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    let label = call.get("label").and_then(|value| value.as_str());
-                    let _ = store.append_entry(SessionEntry::label_change(id, label));
+                        .filter(|id| !id.is_empty())
+                    {
+                        Some(id) => {
+                            let label = call.get("label").and_then(|value| value.as_str());
+                            store
+                                .append_entry(SessionEntry::label_change(id, label))
+                                .map_err(|error| format!("Extension setLabel failed: {error}"))
+                        }
+                        None => Err("Extension setLabel requires an entryId".to_string()),
+                    };
+                    report_session_call(&mut ui, &mut failures, index, result);
                 }
             }
             Some("setSessionName") => {
                 if let Some(store) = agent.session.as_mut() {
-                    let name = call
-                        .get("name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    let _ = store.set_name(name);
+                    // An explicit "" clears the name; a missing field is an
+                    // error, not a request to clear it.
+                    let result = match call.get("name").and_then(|value| value.as_str()) {
+                        Some(name) => store
+                            .set_name(name)
+                            .map_err(|error| format!("Extension setSessionName failed: {error}")),
+                        None => Err("Extension setSessionName requires a name".to_string()),
+                    };
+                    report_session_call(&mut ui, &mut failures, index, result);
                 }
             }
             Some("exec") => {
