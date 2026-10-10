@@ -71,9 +71,19 @@ pub fn execute(snapshot: &Snapshot, name: &str, args: Value) -> Result<Value, St
                     &input.snapshot_side,
                 )?
             };
-            let text = super::redaction::text(&raw);
+            // A window can start inside a private key, after its BEGIN line.
+            // Mask key blocks against the whole file, then take the same lines.
+            let file = snapshot.file(&input.path, &input.snapshot_side)?;
+            let masked = super::super::credential_redaction::private_key_blocks(&file.text);
+            let window = masked
+                .lines()
+                .skip(input.start_line - 1)
+                .take(input.end_line + 1 - input.start_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = super::redaction::text(&window);
             Ok(
-                json!({"snapshotId":snapshot.id, "path": input.path, "contentHash": snapshot.file(&input.path, &input.snapshot_side)?.hash,"snapshotSide":input.snapshot_side,
+                json!({"snapshotId":snapshot.id, "path": input.path, "contentHash": file.hash,"snapshotSide":input.snapshot_side,
                 "startLine":input.start_line,"endLine":input.end_line,"redacted":text != raw,"text":text,
                 "scope":if snapshot.is_target(&input.path,&input.snapshot_side) {"target"} else {"supporting"}}),
             )
@@ -202,5 +212,45 @@ mod tests {
         let entries = listed["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["path"], "src.rs");
+    }
+
+    #[test]
+    fn source_reads_never_return_private_key_body_lines() {
+        let body = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+        let text = format!(
+            "fn before() {{}}\nconst KEY: &str = \"\\\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n{body}\n-----END RSA PRIVATE KEY-----\";\nfn after() {{}}\n"
+        );
+        let snapshot = Snapshot {
+            id: "fixture".into(),
+            files: [(
+                "key.rs".into(),
+                super::super::snapshot::SourceFile {
+                    hash: super::super::sha256_hex(text.as_bytes()),
+                    text: text.clone(),
+                },
+            )]
+            .into(),
+            ..Snapshot::default()
+        };
+        // Whole file, a window starting inside the body, and a single body line.
+        for (start, end) in [(1, 7), (4, 5), (5, 5), (4, 7)] {
+            let read = execute(
+                &snapshot,
+                "sec_source_read",
+                json!({"path":"key.rs","startLine":start,"endLine":end}),
+            )
+            .unwrap();
+            let returned = read["text"].as_str().unwrap();
+            assert!(!returned.contains(body), "{start}-{end}: {returned}");
+            assert_eq!(returned.lines().count(), end + 1 - start, "{returned}");
+            assert_eq!(read["redacted"], true);
+        }
+        let tail = execute(
+            &snapshot,
+            "sec_source_read",
+            json!({"path":"key.rs","startLine":7,"endLine":7}),
+        )
+        .unwrap();
+        assert_eq!(tail["text"], "fn after() {}");
     }
 }

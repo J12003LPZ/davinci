@@ -5,27 +5,31 @@ use std::sync::OnceLock;
 pub fn text(input: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| [
-        r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key)[a-z0-9_.-]*[\s\"']*[:=][\s\"']*(?:(?:basic|bearer|digest|token)\s+)?[^\s\"',;}]+"#,
+        r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|[_.-]token)[a-z0-9_.-]*[\s\"']*[:=][\s\"']*(?:(?:basic|bearer|digest|token)\s+)?[^\s\"',;}]+"#,
         r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/=._~-]{8,}",
         r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
         r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+",
+        r"\bnpm_[A-Za-z0-9]{20,}",
+        r"\bglpat-[A-Za-z0-9_-]{20,}",
         r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
-        r"https?://[^\s/:@]+:[^\s/@]+@",
     ].into_iter().map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern")).collect());
-    super::super::credential_redaction::quoted_assignments(input)
-        .lines()
-        .map(|line| {
-            let mut line = super::redact_evidence(line);
-            for pattern in patterns {
-                line = pattern.replace_all(&line, "[REDACTED]").into_owned();
-            }
-            line.chars()
-                .filter(|c| !c.is_control() || *c == '\t')
-                .filter(|c| !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    use super::super::credential_redaction as shared;
+    shared::url_credentials(&shared::quoted_assignments(&shared::private_key_blocks(
+        input,
+    )))
+    .lines()
+    .map(|line| {
+        let mut line = super::redact_evidence(line);
+        for pattern in patterns {
+            line = pattern.replace_all(&line, "[REDACTED]").into_owned();
+        }
+        line.chars()
+            .filter(|c| !c.is_control() || *c == '\t')
+            .filter(|c| !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+            .collect::<String>()
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 #[cfg(test)]
@@ -74,5 +78,42 @@ mod tests {
         }
         assert!(!text("\u{1b}]52;clipboard\u{7}\u{202e}").contains(['\u{1b}', '\u{7}', '\u{202e}']));
         assert!(text("fn allowed() { validate_owner(); }").contains("validate_owner"));
+    }
+
+    #[test]
+    fn private_key_bodies_url_passwords_and_named_tokens_are_redacted() {
+        let body = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+        let pem = format!(
+            "const KEY: &str = \"\\\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n{body}\n-----END RSA PRIVATE KEY-----\";\nfn after() {{}}"
+        );
+        let output = text(&pem);
+        assert!(!output.contains(body), "{output}");
+        assert_eq!(output.lines().count(), pem.lines().count());
+        assert!(output.contains("fn after()"), "{output}");
+
+        let npm = concat!("npm", "_fixtureTOKENfixtureTOKENfixture");
+        let gitlab = concat!("gl", "pat-fixtureTOKENfixtureTOKEN");
+        for secret in [
+            "DATABASE_URL=postgres://admin:fixture-sensitive@db.internal/app".to_string(),
+            "redis://:fixture-sensitive@cache:6379".to_string(),
+            "export NPM_TOKEN=fixture-sensitive".to_string(),
+            "GITLAB_TOKEN: fixture-sensitive".to_string(),
+            "auth_token = fixture-sensitive".to_string(),
+            format!("//registry.npmjs.org/:_authToken={npm}"),
+            format!("see {npm}"),
+            format!("see {gitlab}"),
+        ] {
+            let output = text(&secret);
+            assert!(
+                !output.contains("fixture-sensitive") && !output.contains("fixtureTOKENfixture"),
+                "{secret} -> {output}"
+            );
+        }
+        assert!(text("postgres://db.internal/app").contains("db.internal"));
+        // Tokenizer code is not a credential assignment.
+        assert_eq!(
+            text("let tokens: Vec<Token> = lex(src);"),
+            "let tokens: Vec<Token> = lex(src);"
+        );
     }
 }

@@ -184,10 +184,15 @@ pub(super) fn denied(path: &Path) -> bool {
                 "credentials.json",
                 "auth.json",
                 "id_rsa",
+                "id_dsa",
+                "id_ecdsa",
+                "id_ecdsa_sk",
                 "id_ed25519",
+                "id_ed25519_sk",
             ]
             .contains(&part.as_str())
             || part.ends_with(".pem")
+            || part.ends_with(".ppk")
             || part.ends_with(".p12")
             || part.ends_with(".pfx")
             || part.ends_with(".key")
@@ -700,6 +705,26 @@ pub(crate) fn open_confined(_: &Path, _: &Path) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_openssh_and_putty_private_key_name_is_withheld() {
+        for path in [
+            "id_rsa",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ecdsa_sk",
+            "id_ed25519",
+            "id_ed25519_sk",
+            "deploy/ID_ECDSA",
+            "keys/server.ppk",
+            "certs/tls.pem",
+        ] {
+            assert!(denied(Path::new(path)), "{path}");
+        }
+        for path in ["id_ecdsa.pub", "src/identity.rs", "docs/id_rsa.md"] {
+            assert!(!denied(Path::new(path)), "{path}");
+        }
+    }
 
     #[test]
     fn security_scoped_snapshot_captures_support_without_expanding_targets() {

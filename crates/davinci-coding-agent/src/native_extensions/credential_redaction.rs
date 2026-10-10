@@ -1,8 +1,13 @@
-//! Mask quoted assignments before token-based redactors can remove their delimiters.
+//! Credential masks shared by Security Scan and memory redaction. These run on
+//! whole text: a quoted value or a private key can span several lines, and a
+//! per-line pass would leave the lines between its delimiters visible.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
+pub(super) const PRIVATE_KEY_MARKER: &str = "[REDACTED PRIVATE KEY MATERIAL]";
+
+/// Mask quoted assignments before token-based redactors can remove their delimiters.
 pub(super) fn quoted_assignments(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
@@ -12,4 +17,109 @@ pub(super) fn quoted_assignments(input: &str) -> String {
         .expect("fixed quoted credential assignment pattern")
     });
     pattern.replace_all(input, "[REDACTED]").into_owned()
+}
+
+/// Replace every line from a `BEGIN ... PRIVATE KEY` marker through its `END`
+/// marker, or through the end of the text when the block is unterminated.
+/// Line count and terminators are preserved so line-addressed reads of the
+/// masked text still line up with the source.
+pub(super) fn private_key_blocks(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_block = false;
+    for line in input.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let upper = content.to_ascii_uppercase();
+        let key_line = upper.contains("PRIVATE KEY");
+        let begin = key_line && upper.contains("BEGIN");
+        let end = key_line && upper.contains("END");
+        if in_block || begin {
+            out.push_str(PRIVATE_KEY_MARKER);
+            out.push_str(&line[content.len()..]);
+            // A one-line block (escaped newlines in a string) opens and
+            // closes here; END before BEGIN on one line does not close it.
+            let closes_here = end
+                && upper
+                    .rfind("END")
+                    .zip(upper.find("BEGIN"))
+                    .is_none_or(|(end_at, begin_at)| end_at > begin_at);
+            in_block = if in_block { !end } else { !closes_here };
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Mask the password in `scheme://user:password@host` for any URL scheme:
+/// database, cache and broker URLs carry credentials the same way HTTP does.
+pub(super) fn url_credentials(input: &str) -> String {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@]*:[^\s/@]+@")
+            .expect("fixed URL credential pattern")
+    });
+    pattern.replace_all(input, "$1[REDACTED]@").into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BODY: &str = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+
+    #[test]
+    fn private_key_blocks_mask_every_line_and_keep_line_numbers() {
+        for kind in [
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+        ] {
+            let input = format!(
+                "before\r\nconst KEY: &str = \"\\\n-----BEGIN {kind}-----\n{BODY}\n{BODY}\n-----END {kind}-----\";\nafter\n"
+            );
+            let output = private_key_blocks(&input);
+            assert!(!output.contains(BODY), "{kind}: {output}");
+            assert_eq!(output.lines().count(), input.lines().count(), "{kind}");
+            assert!(output.starts_with("before\r\n"), "{output}");
+            assert!(output.ends_with("after\n"), "{output}");
+        }
+    }
+
+    #[test]
+    fn private_key_blocks_fail_closed_and_handle_one_line_keys() {
+        let unterminated = format!("-----BEGIN PRIVATE KEY-----\n{BODY}\n{BODY}");
+        assert!(!private_key_blocks(&unterminated).contains(BODY));
+
+        let one_line = format!(
+            "let key = \"-----BEGIN PRIVATE KEY-----\\n{BODY}\\n-----END PRIVATE KEY-----\";\nvisible\n"
+        );
+        let output = private_key_blocks(&one_line);
+        assert!(!output.contains(BODY));
+        assert!(output.ends_with("visible\n"), "{output}");
+
+        let prose = "// rotate the private key yearly\nvisible\n";
+        assert_eq!(private_key_blocks(prose), prose);
+    }
+
+    #[test]
+    fn url_credentials_cover_every_scheme_and_keep_the_host() {
+        for url in [
+            "postgres://admin:fixture-sensitive@db.internal/app",
+            "mysql://root:fixture-sensitive@127.0.0.1:3306/db",
+            "mongodb+srv://u:fixture-sensitive@cluster.example/db",
+            "redis://:fixture-sensitive@cache:6379/0",
+            "amqp://guest:fixture-sensitive@broker//",
+            "https://user:fixture-sensitive@example.invalid",
+        ] {
+            let output = url_credentials(url);
+            assert!(!output.contains("fixture-sensitive"), "{output}");
+            assert!(output.contains("[REDACTED]@"), "{output}");
+        }
+        assert_eq!(
+            url_credentials("postgres://db.internal:5432/app"),
+            "postgres://db.internal:5432/app"
+        );
+    }
 }

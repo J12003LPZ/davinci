@@ -474,7 +474,10 @@ fn normalize_path(path: &str) -> String {
 }
 
 pub fn redact_secrets(input: &str) -> String {
-    let mut output = super::credential_redaction::quoted_assignments(input);
+    use super::credential_redaction as shared;
+    let mut output = shared::url_credentials(&shared::quoted_assignments(
+        &shared::private_key_blocks(input),
+    ));
     let patterns = [
         ("sk-", "sk-[REDACTED]"),
         ("ghp_", "ghp_[REDACTED]"),
@@ -2930,6 +2933,38 @@ pub(crate) mod tests {
             .collect::<String>();
         assert!(!text.contains("first second third"), "{text}");
         assert!(text.contains("configuration remains visible"), "{text}");
+    }
+
+    #[test]
+    fn private_keys_and_url_passwords_do_not_survive_memory_extraction() {
+        let body = "MIIEfixtureFIXTUREfixtureFIXTUREfixtureFIXTUREabcd";
+        let content = format!(
+            "Remember the deploy key:
+-----BEGIN OPENSSH PRIVATE KEY-----
+{body}
+{body}
+-----END OPENSSH PRIVATE KEY-----
+and the database postgres://admin:fixture-sensitive@db.internal/app stays configured."
+        );
+        let redacted = redact_secrets(&content);
+        assert!(!redacted.contains(body), "{redacted}");
+        assert!(!redacted.contains("fixture-sensitive"), "{redacted}");
+        assert!(redacted.contains("db.internal"), "{redacted}");
+        let chunks = extract_chunks(
+            &[MemoryMessage {
+                role: "user".into(),
+                content,
+            }],
+            4096,
+        );
+        let text = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        assert!(
+            !text.contains(body) && !text.contains("fixture-sensitive"),
+            "{text}"
+        );
     }
 
     #[test]
