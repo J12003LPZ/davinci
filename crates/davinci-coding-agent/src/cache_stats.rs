@@ -39,6 +39,9 @@ pub struct AssistantUsage {
     /// The provider sent a numeric `cacheRead`. A missing field is unknown:
     /// reading it as 0 would claim a cache miss the provider never reported.
     pub cache_read_reported: bool,
+    /// A numeric write count is known, including zero; the normalized
+    /// placeholder carries `cacheWriteUnreported` when the provider omitted it.
+    pub cache_write_reported: bool,
 }
 
 /// What the provider itself said about the prompt cache for one response.
@@ -94,7 +97,9 @@ fn detect_miss(
         return None;
     }
     // Unknown usage is not evidence of a miss.
-    if message.cache_observation() == ProviderCacheObservation::Unknown {
+    if message.cache_observation() == ProviderCacheObservation::Unknown
+        || !message.cache_write_reported
+    {
         return None;
     }
     if message.cache_read + message.cache_write == 0 && !prev.reported_cache {
@@ -129,7 +134,7 @@ fn detect_miss(
 
 fn as_previous_request(message: &AssistantUsage, reported_cache: bool) -> Option<PreviousRequest> {
     let prompt_tokens = message.input + message.cache_read + message.cache_write;
-    if prompt_tokens == 0 || !message.usage_reported {
+    if prompt_tokens == 0 || !message.usage_reported || !message.cache_write_reported {
         return None;
     }
     Some(PreviousRequest {
@@ -234,6 +239,14 @@ pub fn assistant_usage_from_value(message: &Value, fallback_timestamp: u64) -> A
             .and_then(|value| value.get("cacheRead"))
             .and_then(Value::as_u64)
             .is_some(),
+        cache_write_reported: usage
+            .and_then(|value| value.get("cacheWrite"))
+            .and_then(Value::as_u64)
+            .is_some()
+            && usage
+                .and_then(|value| value.get("cacheWriteUnreported"))
+                .and_then(Value::as_bool)
+                != Some(true),
         input: usage_u64(usage, "input"),
         cache_read: usage_u64(usage, "cacheRead"),
         cache_write: usage_u64(usage, "cacheWrite"),
@@ -684,5 +697,24 @@ mod tests {
         // An explicit zero is a report, and is distinguishable from unknown.
         let zero = entry_with_usage(Some(usage(100, 0, 0)), 1);
         assert_eq!(observe(&zero), ProviderCacheObservation::NoReadReported);
+    }
+
+    #[test]
+    fn wor37_missing_writes_cannot_produce_a_miss_estimate() {
+        for raw in [
+            serde_json::json!({"input":120000,"cacheRead":0}),
+            serde_json::json!({"input":120000,"cacheRead":0,"cacheWrite":0,"cacheWriteUnreported":true}),
+        ] {
+            let unknown = entry_with_usage(Some(raw.clone()), 20000);
+            assert!(
+                misses(&[entry_with_usage(Some(usage(1000, 100000, 0)), 0), unknown]).is_empty()
+            );
+            // Unknown writes must not become the baseline for a later estimate either.
+            assert!(misses(&[
+                entry_with_usage(Some(raw), 0),
+                entry_with_usage(Some(usage(120000, 0, 0)), 20000)
+            ])
+            .is_empty());
+        }
     }
 }

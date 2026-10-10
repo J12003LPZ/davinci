@@ -952,16 +952,8 @@ impl NativeExtensionHost {
             }
             "cache-status" => {
                 let stats = self.cache.stats();
-                let (writes_reported, writes_unreported) =
-                    self.cache.provider_cache_write_coverage();
-                // A provider that omits the count leaves the total unknown,
-                // which must not read as zero writes.
-                let write_status = match (writes_reported, writes_unreported) {
-                    (0, 0) => "none",
-                    (_, 0) => "reported",
-                    (0, _) => "unreported",
-                    _ => "partial",
-                };
+                let write_status = stats.provider.cache_write_status();
+                let writes_unreported = stats.provider.cache_write_unreported_requests;
                 let raw_input = stats
                     .provider
                     .input_tokens
@@ -986,6 +978,7 @@ impl NativeExtensionHost {
                             Value::from(stats.provider.cache_write_tokens)
                         },
                         "cacheWriteStatus":write_status,
+                        "cacheWriteReportedRequests":stats.provider.cache_write_reported_requests,
                         "cacheWriteUnreportedRequests":writes_unreported,
                         "rawInputTokens":raw_input,
                         "cacheReadRatio":if raw_input > 0 {

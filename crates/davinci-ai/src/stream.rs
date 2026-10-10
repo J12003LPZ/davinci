@@ -2936,6 +2936,7 @@ pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
             )
         };
     let mut computed = crate::calculate_usage(model, input, output, cache_read, cache_write);
+    computed.cache_write_unreported = crate::stream_decoder::cache_write_unreported(usage);
     if let Some(total) = get("total_tokens").or_else(|| get("totalTokens")) {
         computed.total_tokens = total;
     }
@@ -2950,6 +2951,8 @@ fn usage_from_google_metadata(model: &Model, metadata: &Value) -> Usage {
     let input = get("promptTokenCount").unwrap_or(0).saturating_sub(cached);
     let output = get("candidatesTokenCount").unwrap_or(0);
     let mut computed = crate::calculate_usage(model, input, output, cached, 0);
+    // Google reports cached reads, but no cache-creation token count.
+    computed.cache_write_unreported = true;
     if let Some(total) = get("totalTokenCount") {
         computed.total_tokens = total;
     }
@@ -5130,6 +5133,49 @@ mod tests {
             },
         );
         assert_eq!(none["system"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wor37_generic_usage_distinguishes_unknown_writes_from_zero() {
+        let model = load_builtin_models().into_iter().next().unwrap();
+        for field in ["cache_creation_input_tokens", "cacheWriteInputTokens"] {
+            let mut raw = serde_json::json!({"input_tokens":100,"output_tokens":2});
+            assert!(usage_from_value(&model, &raw).cache_write_unreported);
+            raw[field] = serde_json::json!(0);
+            assert!(!usage_from_value(&model, &raw).cache_write_unreported);
+            raw[field] = serde_json::json!(7);
+            assert_eq!(usage_from_value(&model, &raw).cache_write, 7);
+        }
+        for field in ["prompt_tokens_details", "input_tokens_details"] {
+            let mut raw = serde_json::json!({"input_tokens":100,"output_tokens":2});
+            raw[field] = serde_json::json!({"cache_write_tokens":null});
+            assert!(usage_from_value(&model, &raw).cache_write_unreported);
+            raw[field]["cache_write_tokens"] = serde_json::json!(0);
+            assert!(!usage_from_value(&model, &raw).cache_write_unreported);
+        }
+    }
+
+    #[test]
+    fn wor37_non_streaming_and_google_writes_remain_unknown() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .unwrap();
+        let reply = r#"{"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":2}}"#;
+        assert!(
+            parse_provider_response(&model, reply)
+                .usage
+                .unwrap()
+                .cache_write_unreported
+        );
+        let google = usage_from_google_metadata(
+            &model,
+            &serde_json::json!({
+                "promptTokenCount":100,"cachedContentTokenCount":80,"candidatesTokenCount":2
+            }),
+        );
+        assert!(google.cache_write_unreported);
+        assert_eq!(google.cache_read, 80);
     }
 
     #[test]

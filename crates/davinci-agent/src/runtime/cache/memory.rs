@@ -45,11 +45,6 @@ struct State {
     bytes: usize,
     sequence: u64,
     stats: CacheStats,
-    /// Provider requests whose usage carried a cache-write count, and those
-    /// whose usage omitted it. `stats.provider.cache_write_tokens` sums only
-    /// the former.
-    cache_write_reported: u64,
-    cache_write_unreported: u64,
     revoked: HashSet<String>,
     revocation_capacity_reached: bool,
 }
@@ -535,10 +530,12 @@ impl CacheRuntime {
         match write {
             Some(write) => {
                 provider.cache_write_tokens = provider.cache_write_tokens.saturating_add(write);
-                state.cache_write_reported = state.cache_write_reported.saturating_add(1);
+                provider.cache_write_reported_requests =
+                    provider.cache_write_reported_requests.saturating_add(1);
             }
             None => {
-                state.cache_write_unreported = state.cache_write_unreported.saturating_add(1);
+                provider.cache_write_unreported_requests =
+                    provider.cache_write_unreported_requests.saturating_add(1);
             }
         }
     }
@@ -546,7 +543,10 @@ impl CacheRuntime {
     /// `(reported, unreported)` provider request counts for cache writes.
     pub fn provider_cache_write_coverage(&self) -> (u64, u64) {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        (state.cache_write_reported, state.cache_write_unreported)
+        (
+            state.stats.provider.cache_write_reported_requests,
+            state.stats.provider.cache_write_unreported_requests,
+        )
     }
 
     pub fn record_provider_cost(&self, cost_usd: f64) {

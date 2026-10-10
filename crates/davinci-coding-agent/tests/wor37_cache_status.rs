@@ -8,7 +8,19 @@ fn status(record: impl FnOnce(&NativeExtensionHost)) -> serde_json::Value {
     let mut host =
         NativeExtensionHost::new_with_agent_dir("wor37", root.path(), Some(state.path()));
     record(&host);
-    host.command("cache-status", "").unwrap().unwrap()["provider"].clone()
+    let status = host.command("cache-status", "").unwrap().unwrap();
+    for key in [
+        "cacheWriteTokens",
+        "cacheWriteStatus",
+        "cacheWriteReportedRequests",
+        "cacheWriteUnreportedRequests",
+    ] {
+        assert_eq!(
+            status["provider"][key], status["summary"]["provider"][key],
+            "{key}"
+        );
+    }
+    status["provider"].clone()
 }
 
 #[test]
