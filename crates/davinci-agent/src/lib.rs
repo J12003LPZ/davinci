@@ -2581,6 +2581,20 @@ impl Agent {
             .saturating_add(self.estimated_tool_schema_tokens())
     }
 
+    /// The active VM's request on the admission scale: the image's byte
+    /// ceiling plus the budget's system and tool ceilings. Folds are decided
+    /// on this scale. Admission caps the image at
+    /// [`provider_budget::ProviderContextBudget::working_set_budget`] in bytes,
+    /// so the estimate above never passes about a quarter of the window and
+    /// would never reach a fold threshold.
+    pub(crate) fn context_vm_admission_tokens(&self, image: &runtime::ContextImage) -> u64 {
+        let budget = self.provider_context_budget();
+        image
+            .estimated_tokens
+            .saturating_add(budget.system)
+            .saturating_add(budget.tools)
+    }
+
     /// Set once per request configuration using the actual tool catalog.
     /// `None` restores the builtin/MCP estimate.
     pub fn set_provider_context_overhead_tokens(&mut self, tokens: Option<u64>) {

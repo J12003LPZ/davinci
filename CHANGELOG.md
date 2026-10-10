@@ -10,9 +10,9 @@
 
 ### Fixed
 - The working line ("Levitating…") sits one row above the context bar instead of touching it.
-- `/context` gives every category its own glyph and hue (`■ ▲ ♦ ● ▼ █`), so system prompt and system tools no longer look alike, in any theme and on a palette with no colour. It opens on its "Context Usage" heading instead of its last section. MCP tools are one row per server (`github (41 tools)`), and long sections fold after five rows.
+- `/context` gives every category its own glyph and hue (`■ ▲ ♦ ● ▼ █`), so system prompt and system tools no longer look alike, in any theme and on a palette with no colour. It opens on its "Context Usage" heading instead of its last section; output that arrives while you read waits below until you scroll back down. A partly used cell keeps its category's colour on 256-colour and basic terminals. MCP tools are one row per server (`github (41 tools)`), and long sections fold after five rows.
 - `/agents` lists the defined agent profiles under the live workers. With no worker running it used to show only "No workers active".
-- A fresh session no longer gains thousands of phantom tokens, filed under Messages, the first time `/context` runs. The active context VM summed byte ceilings (system prompt and tool schemas) as tokens; it now counts on the same four-bytes-a-token scale as the other modes.
+- A fresh session no longer gains thousands of phantom tokens, filed under Messages, the first time `/context` runs. The active context VM summed byte ceilings (system prompt and tool schemas) as tokens; it now counts on the same four-bytes-a-token scale as the other modes. Automatic folds are still decided on the admission budget's scale, so a long active-VM session keeps folding instead of paging old turns out with no summary.
 - `↑` keeps walking back through history after a recalled `/command`. The recalled text no longer opens the completion list, which took the next `↑`.
 - Design runs no longer need `--root-budget`. Each operation gets a subscription-only ledger of its own (12 requests and 15 minutes for a generation). A host-provided root budget still wins.
 - Design requests renew the ChatGPT login when it nears expiry, use SSE as subscription admission requires, and give the model the exact binding schema.

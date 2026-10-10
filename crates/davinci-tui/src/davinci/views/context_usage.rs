@@ -122,9 +122,24 @@ pub const fn kind_glyph(kind: ContextKind) -> &'static str {
 fn cell_span(cc: &Cc, cell: Cell) -> Span<'static> {
     match cell {
         Cell::Full(kind) => span(kind_glyph(kind), kind_color(cc, kind)),
-        Cell::Partial(kind) => span(kind_glyph(kind), mix(kind_color(cc, kind), cc.subtle, 0.55)),
+        Cell::Partial(kind) => partial_span(cc, kind),
         Cell::Free => span(FREE, cc.subtle),
         Cell::Buffer => span(BUFFER, cc.inactive),
+    }
+}
+
+/// A partly used cell: its category's glyph in a dimmer ink. `mix` only blends
+/// two RGB inks and otherwise returns one of them whole, which on a 256-colour
+/// or basic palette would draw every partial cell in `subtle` grey. There the
+/// category's own ink is kept and the terminal's faint attribute dims it.
+fn partial_span(cc: &Cc, kind: ContextKind) -> Span<'static> {
+    let ink = kind_color(cc, kind);
+    match (ink, cc.subtle) {
+        (Color::Rgb(..), Color::Rgb(..)) => span(kind_glyph(kind), mix(ink, cc.subtle, 0.55)),
+        _ => Span::styled(
+            kind_glyph(kind),
+            Style::default().fg(ink).add_modifier(Modifier::DIM),
+        ),
     }
 }
 
@@ -558,6 +573,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_partial_cell_keeps_its_category_and_differs_from_a_full_one() {
+        use crate::davinci::theme::ColorDepth;
+        for depth in [
+            ColorDepth::TrueColor,
+            ColorDepth::Ansi256,
+            ColorDepth::Basic,
+        ] {
+            for name in ["dark", "light", "vox"] {
+                let cc = Theme::da_vinci(depth, false).with_name(name).cc();
+                let partials: Vec<Style> = CATEGORIES
+                    .iter()
+                    .map(|kind| cell_span(&cc, Cell::Partial(*kind)).style)
+                    .collect();
+                for (index, kind) in CATEGORIES.iter().enumerate() {
+                    let full = cell_span(&cc, Cell::Full(*kind));
+                    let partial = cell_span(&cc, Cell::Partial(*kind));
+                    assert_eq!(partial.content, full.content, "{depth:?} {name} {kind:?}");
+                    assert_ne!(partial.style, full.style, "{depth:?} {name} {kind:?}");
+                    assert_ne!(
+                        partial.style.fg,
+                        Some(cc.subtle),
+                        "{depth:?} {name}: a partial {kind:?} lost its ink"
+                    );
+                    for other in &partials[index + 1..] {
+                        assert_ne!(&partial.style, other, "{depth:?} {name} {kind:?}");
+                    }
+                }
+            }
+        }
+        // With no colour at all a partial cell is still drawn faint.
+        let cc = Theme::da_vinci(ColorDepth::TrueColor, true).cc();
+        let partial = cell_span(&cc, Cell::Partial(ContextKind::Messages));
+        let full = cell_span(&cc, Cell::Full(ContextKind::Messages));
+        assert_ne!(partial.style, full.style);
     }
 
     #[test]

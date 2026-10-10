@@ -4464,4 +4464,24 @@ mod scroll_to_entry_tests {
         m.submit();
         assert!(m.transcript_scroll.get().top.is_none());
     }
+
+    /// `/context` during a run reads like a manual scroll up: output that
+    /// streams in below leaves the heading on top, and scrolling back to the
+    /// newest follows the run again.
+    #[test]
+    fn output_after_the_block_waits_until_the_reader_scrolls_back_down() {
+        let mut m = chat(24, 6);
+        {
+            let last = m.transcript.len() - 1;
+            scroll_transcript_to_entry(&mut m, last)
+        };
+        for n in 0..6 {
+            m.transcript.push(Entry::user(&format!("streamed {n}")));
+        }
+        assert!(rows(&m)[0].contains("Context Usage"));
+        let bar = transcript_scrollbar(&m).expect("overflowing transcript");
+        set_transcript_offset(&mut m, &bar, 0);
+        assert!(m.transcript_scroll.get().top.is_none());
+        assert!(rows(&m).iter().any(|row| row.contains("streamed 5")));
+    }
 }
