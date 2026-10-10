@@ -450,7 +450,23 @@ fn command_panel_frame(
         model.width,
     )));
     rows.push(blank());
-    rows.extend(ui::window(content, rows_room, anchor, th));
+    // The extension manager keeps its tab bar and search box on screen while
+    // the list under them scrolls.
+    let pinned = match model.screen {
+        Screen::Extensions => extensions::pinned_rows(model),
+        _ => 0,
+    };
+    if pinned > 0 && rows_room > pinned + 2 && content.len() > pinned {
+        rows.extend(content[..pinned].iter().cloned());
+        rows.extend(ui::window(
+            content[pinned..].to_vec(),
+            rows_room - pinned,
+            anchor.saturating_sub(pinned),
+            th,
+        ));
+    } else {
+        rows.extend(ui::window(content, rows_room, anchor, th));
+    }
     rows.extend(notices);
     if safety > 0 {
         rows.push(chrome::status(model));
@@ -715,6 +731,7 @@ fn panel(
     });
     let pinned = match model.screen {
         Screen::Settings => settings::PINNED_DETAIL_ROWS,
+        Screen::Extensions => extensions::pinned_rows(model),
         _ => 0,
     };
     if pinned > 0 && room > pinned && rows.len() > pinned {
