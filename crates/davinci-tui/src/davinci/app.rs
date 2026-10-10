@@ -731,7 +731,6 @@ fn panel(
     });
     let pinned = match model.screen {
         Screen::Settings => settings::PINNED_DETAIL_ROWS,
-        Screen::Extensions => extensions::pinned_rows(model),
         _ => 0,
     };
     if pinned > 0 && room > pinned && rows.len() > pinned {
