@@ -45,13 +45,50 @@ pub struct NamespaceStats {
     pub negative_hits: u64,
     pub miss_reasons: BTreeMap<LocalMissReason, u64>,
 }
-#[derive(Debug, Default, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default, Clone)]
 pub struct ProviderCacheStats {
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub cache_write_reported_requests: u64,
+    pub cache_write_unreported_requests: u64,
     pub total_cost_usd: f64,
+}
+
+impl ProviderCacheStats {
+    pub fn cache_write_status(&self) -> &'static str {
+        match (
+            self.cache_write_reported_requests,
+            self.cache_write_unreported_requests,
+        ) {
+            (0, 0) => "none",
+            (_, 0) => "reported",
+            (0, _) => "unreported",
+            _ => "partial",
+        }
+    }
+}
+
+impl Serialize for ProviderCacheStats {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ProviderCacheStats", 7)?;
+        state.serialize_field("inputTokens", &self.input_tokens)?;
+        state.serialize_field("cacheReadTokens", &self.cache_read_tokens)?;
+        let writes = (self.cache_write_status() != "unreported").then_some(self.cache_write_tokens);
+        state.serialize_field("cacheWriteTokens", &writes)?;
+        state.serialize_field("cacheWriteStatus", self.cache_write_status())?;
+        state.serialize_field(
+            "cacheWriteReportedRequests",
+            &self.cache_write_reported_requests,
+        )?;
+        state.serialize_field(
+            "cacheWriteUnreportedRequests",
+            &self.cache_write_unreported_requests,
+        )?;
+        state.serialize_field("totalCostUsd", &self.total_cost_usd)?;
+        state.end()
+    }
 }
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
