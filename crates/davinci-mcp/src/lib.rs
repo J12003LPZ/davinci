@@ -35,6 +35,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many `nextCursor` pages a list may span before we stop believing it.
 const MAX_LIST_PAGES: usize = 100;
+/// How many items, and encoded bytes of them, a whole list may hold. Real
+/// servers list tens of tools; these only stop a runaway or hostile one.
+const MAX_LIST_ITEMS: usize = 10_000;
+const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -122,7 +126,8 @@ pub struct Client {
     pub initialize: InitializeResult,
     pub tools: Vec<ToolSpec>,
     /// Tool names the server listed that are not `[A-Za-z0-9_-]+` and so
-    /// cannot become `mcp__<server>__<tool>`; `/mcp` names them.
+    /// cannot become `mcp__<server>__<tool>`, or that repeat an earlier
+    /// tool's name; `/mcp` names them.
     pub skipped: Vec<String>,
     pub resources: Vec<Resource>,
     child: Option<Arc<Mutex<Option<Child>>>>,
@@ -331,16 +336,41 @@ fn named(method: &str, err: Error) -> Error {
 /// Every item of a paginated list, following `nextCursor` until the server
 /// stops sending one.
 fn list_pages(rpc: &mut Rpc, method: &str, key: &str) -> Result<Vec<Value>> {
+    collect_pages(method, key, |params| rpc.call(method, params))
+}
+
+/// The paging loop behind [`list_pages`]. Each page is already bounded by the
+/// transport's line cap, but a server could still send 100 maximal pages, so
+/// the whole list is bounded too: by item count and by encoded bytes.
+fn collect_pages(
+    method: &str,
+    key: &str,
+    mut call: impl FnMut(Value) -> Result<Value>,
+) -> Result<Vec<Value>> {
     let mut items = Vec::new();
+    let mut bytes = 0usize;
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_LIST_PAGES {
         let params = match &cursor {
             Some(cursor) => json!({ "cursor": cursor }),
             None => json!({}),
         };
-        let page = rpc.call(method, params)?;
-        if let Some(list) = page.get(key).and_then(Value::as_array) {
-            items.extend(list.iter().cloned());
+        let mut page = call(params)?;
+        if let Some(Value::Array(list)) = page.get_mut(key).map(Value::take) {
+            for item in list {
+                bytes = bytes.saturating_add(serde_json::to_vec(&item).map_or(0, |v| v.len()));
+                if items.len() >= MAX_LIST_ITEMS {
+                    return Err(Error::Protocol(format!(
+                        "{method}: more than {MAX_LIST_ITEMS} items"
+                    )));
+                }
+                if bytes > MAX_LIST_BYTES {
+                    return Err(Error::Protocol(format!(
+                        "{method}: list exceeds {MAX_LIST_BYTES} bytes"
+                    )));
+                }
+                items.push(item);
+            }
         }
         let next = page
             .get("nextCursor")
@@ -358,18 +388,21 @@ fn list_pages(rpc: &mut Rpc, method: &str, key: &str) -> Result<Vec<Value>> {
 }
 
 /// Tools whose names can become agent tools, and the names of those that
-/// cannot.
+/// cannot. A name listed twice keeps its first definition: routing is by
+/// name, so a second schema under the same name could never be dispatched
+/// to and would only disagree with the one that is.
 fn parse_tools(items: Vec<Value>) -> (Vec<ToolSpec>, Vec<String>) {
     let mut tools = Vec::new();
     let mut skipped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for item in items {
         let Ok(tool) = serde_json::from_value::<ToolSpec>(item) else {
             continue;
         };
-        if is_ident(&tool.name) {
-            tools.push(tool.normalize());
-        } else {
+        if !is_ident(&tool.name) || !seen.insert(tool.name.clone()) {
             skipped.push(tool.name);
+        } else {
+            tools.push(tool.normalize());
         }
     }
     (tools, skipped)
@@ -704,6 +737,54 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("fatal: boom"), "{text}");
+    }
+
+    #[test]
+    fn duplicate_tool_names_keep_the_first_schema() {
+        let (tools, skipped) = parse_tools(vec![
+            json!({"name": "dup", "inputSchema": {"type": "object", "title": "first"}}),
+            json!({"name": "dup", "inputSchema": {"type": "object", "title": "second"}}),
+            json!({"name": "other"}),
+        ]);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, ["dup", "other"]);
+        assert_eq!(tools[0].input_schema["title"], "first");
+        assert_eq!(skipped, ["dup"]);
+    }
+
+    #[test]
+    fn list_discovery_is_bounded_in_items_and_bytes() {
+        // Many items across pages: stops at the item cap, not the page cap.
+        let mut page = 0;
+        let err = collect_pages("tools/list", "tools", |_| {
+            page += 1;
+            let tools: Vec<Value> = (0..1_000)
+                .map(|i| json!({"name": format!("t{i}")}))
+                .collect();
+            Ok(json!({"tools": tools, "nextCursor": format!("c{page}")}))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("items"), "{err}");
+        assert!(page <= MAX_LIST_ITEMS / 1_000 + 1, "{page} pages read");
+        // Few, huge items: stops at the byte cap.
+        let big = "x".repeat(1024 * 1024);
+        let mut pages = 0;
+        let err = collect_pages("tools/list", "tools", |_| {
+            pages += 1;
+            Ok(json!({"tools": [{"name": "t", "description": big}], "nextCursor": format!("c{pages}")}))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("bytes"), "{err}");
+        assert!(
+            pages <= MAX_LIST_BYTES / (1024 * 1024) + 1,
+            "{pages} pages read"
+        );
+        // A normal list is untouched.
+        let items = collect_pages("tools/list", "tools", |_| {
+            Ok(json!({"tools": [{"name": "a"}]}))
+        })
+        .unwrap();
+        assert_eq!(items.len(), 1);
     }
 
     #[test]

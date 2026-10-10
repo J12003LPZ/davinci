@@ -50,7 +50,18 @@ pub struct ContextVmState {
     pub last_fold_tokens: Option<(u64, u64)>,
     pub last_prefix_digest: Option<String>,
     pub stable_context_digest: Option<String>,
+    /// Set when a page write failed after the new events were recorded. The
+    /// recorded events then run ahead of the root's state, and a later call
+    /// with the same events would see no divergence and reuse stale state;
+    /// this forces the next call to rebuild from its events instead.
+    pub needs_rebuild: bool,
 }
+
+/// Folded episodes the root keeps. Each fold adds one, so a long session
+/// would otherwise grow the root, and every compile's walk of it, forever.
+/// Dropped episodes lose only their fold summary; the events they cite stay
+/// retrievable from the session by `source_ref`.
+pub const MAX_ROOT_EPISODES: usize = 32;
 
 /// VM state from before a fold; see `ContextVmRuntime::fold_undo_point`.
 pub(crate) struct FoldUndo {
@@ -195,6 +206,9 @@ impl ContextVmRuntime {
             metrics.rebuild_attempts = metrics.rebuild_attempts.saturating_add(1)
         });
         let result = self.rebuild_inner(events);
+        if result.is_err() {
+            self.mark_needs_rebuild();
+        }
         self.bump_metrics(|metrics| {
             if result.is_ok() {
                 metrics.rebuilds = metrics.rebuilds.saturating_add(1);
@@ -210,10 +224,7 @@ impl ContextVmRuntime {
         self.record_events(events);
         let parent = CheckpointState::default();
         let delta = ContextStateReducer::deterministic_delta(&parent, events);
-        let checkpoint = self
-            .store
-            .save(&ContextObject::Checkpoint(delta.checkpoint_patch))
-            .map_err(|error| error.to_string())?;
+        let checkpoint = self.save_page(&ContextObject::Checkpoint(delta.checkpoint_patch))?;
         let previous = self.root();
         let root = ContextRoot {
             epoch: previous
@@ -229,7 +240,26 @@ impl ContextVmRuntime {
         };
         let last_source_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
         self.install_root(root.clone(), last_source_seq);
+        self.state
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .needs_rebuild = false;
         Ok(root)
+    }
+
+    fn mark_needs_rebuild(&self) {
+        self.state
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .needs_rebuild = true;
+    }
+
+    /// Save a page; a failure marks the VM for rebuild (see `needs_rebuild`).
+    fn save_page(&self, object: &ContextObject) -> Result<ContextPageRef, String> {
+        self.store.save(object).map_err(|error| {
+            self.mark_needs_rebuild();
+            error.to_string()
+        })
     }
 
     pub fn compile(
@@ -345,10 +375,7 @@ impl ContextVmRuntime {
         // turn must not rewrite it. The newest delta carries the full state
         // (see load_state_from_root) and replaces the previous one; a fold
         // later merges it into a new checkpoint.
-        let page = self
-            .store
-            .save(&ContextObject::Delta(delta.clone()))
-            .map_err(|error| error.to_string())?;
+        let page = self.save_page(&ContextObject::Delta(delta.clone()))?;
         let mut root = self.root();
         root.deltas = vec![page];
         root.updates_since_fold = root.updates_since_fold.saturating_add(1);
@@ -389,10 +416,7 @@ impl ContextVmRuntime {
         let state = proposal
             .map(|p| ContextStateReducer::validate_proposal(&fallback, events, p))
             .unwrap_or(fallback);
-        let checkpoint = self
-            .store
-            .save(&ContextObject::Checkpoint(state.clone()))
-            .map_err(|error| error.to_string())?;
+        let checkpoint = self.save_page(&ContextObject::Checkpoint(state.clone()))?;
         let old = self.root();
         let mut episodes = old.episodes;
         if !events.is_empty() {
@@ -422,12 +446,12 @@ impl ContextVmRuntime {
                         refs
                     }),
             };
-            let page = self
-                .store
-                .save(&ContextObject::Episode(episode))
-                .map_err(|error| error.to_string())?;
+            let page = self.save_page(&ContextObject::Episode(episode))?;
             if !episodes.iter().any(|existing| existing.id == page.id) {
                 episodes.push(page);
+            }
+            if episodes.len() > MAX_ROOT_EPISODES {
+                episodes.drain(..episodes.len() - MAX_ROOT_EPISODES);
             }
         }
         let root = ContextRoot {
@@ -608,15 +632,24 @@ impl ContextVmRuntime {
         Ok(state)
     }
 
+    /// Remember `events` as the conversation so far. True when they do not
+    /// extend what was recorded, or when an earlier page write failed, so
+    /// the caller must rebuild rather than trust the current root.
     fn record_events(&self, events: &[ContextEvent]) -> bool {
+        let stale = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .needs_rebuild;
         let mut old = self.events.write().unwrap_or_else(|e| e.into_inner());
-        let diverged = !old.is_empty()
-            && (events.len() < old.len()
-                || old.iter().zip(events).any(|(a, b)| {
-                    a.source_ref != b.source_ref
-                        || a.content_hash != b.content_hash
-                        || a.seq != b.seq
-                }));
+        let diverged = stale
+            || !old.is_empty()
+                && (events.len() < old.len()
+                    || old.iter().zip(events).any(|(a, b)| {
+                        a.source_ref != b.source_ref
+                            || a.content_hash != b.content_hash
+                            || a.seq != b.seq
+                    }));
         *old = events
             .iter()
             .map(|event| ContextEvent {
@@ -755,4 +788,124 @@ fn stable_context_digest(image: &ContextImage) -> String {
         .collect::<Vec<_>>();
     stable.sort();
     digest(stable.join("\n").as_bytes())
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use davinci_ai::ChatMessage;
+    use std::sync::atomic::Ordering;
+
+    fn vm() -> ContextVmRuntime {
+        ContextVmRuntime::new(ContextVmConfig::default(), Default::default())
+    }
+
+    fn goals(vm: &ContextVmRuntime) -> Vec<String> {
+        vm.load_state_from_root()
+            .unwrap()
+            .goals
+            .into_iter()
+            .map(|goal| goal.value)
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_page_write_forces_the_next_compile_to_rebuild() {
+        let first = vec![ChatMessage::text("user", "build the parser")];
+        let mut second = first.clone();
+        second.push(ChatMessage::text(
+            "user",
+            "never touch the production database",
+        ));
+        let (early, late) = (events_from_messages(&first), events_from_messages(&second));
+        let vm = vm();
+        vm.append_delta(&early).unwrap();
+        vm.store.fail_saves.store(true, Ordering::SeqCst);
+        assert!(vm.append_delta(&late).is_err());
+        vm.store.fail_saves.store(false, Ordering::SeqCst);
+        // Same events as the failed call: without the flag this looked like
+        // an unchanged conversation and compiled the stale root.
+        vm.compile(&late, &ContextPacket::empty(), 100_000).unwrap();
+        assert!(
+            goals(&vm)
+                .iter()
+                .any(|goal| goal.contains("production database")),
+            "{:?}",
+            goals(&vm)
+        );
+        assert!(!vm.state.read().unwrap().needs_rebuild);
+    }
+
+    #[test]
+    fn a_failed_fold_also_marks_the_root_for_rebuild() {
+        let messages = vec![
+            ChatMessage::text("user", "first"),
+            ChatMessage::text("user", "second"),
+        ];
+        let events = events_from_messages(&messages);
+        let vm = vm();
+        vm.append_delta(&events[..1]).unwrap();
+        vm.store.fail_saves.store(true, Ordering::SeqCst);
+        assert!(vm.fold(FoldReason::Manual, &events).is_err());
+        assert!(vm.state.read().unwrap().needs_rebuild);
+        vm.store.fail_saves.store(false, Ordering::SeqCst);
+        vm.append_delta(&events).unwrap();
+        assert_eq!(goals(&vm), ["first", "second"]);
+    }
+
+    #[test]
+    fn folded_episodes_are_capped() {
+        let vm = vm();
+        let mut messages = Vec::new();
+        for turn in 0..(MAX_ROOT_EPISODES + 10) {
+            messages.push(ChatMessage::text("user", format!("turn {turn}")));
+            vm.fold(FoldReason::Manual, &events_from_messages(&messages))
+                .unwrap();
+        }
+        let root = vm.root();
+        assert_eq!(root.episodes.len(), MAX_ROOT_EPISODES);
+        // The newest fold is the one kept last.
+        let newest = vm.store.load(root.episodes.last().unwrap()).unwrap();
+        let ContextObject::Episode(episode) = newest else {
+            panic!("not an episode");
+        };
+        let last_ref = events_from_messages(&messages)
+            .last()
+            .unwrap()
+            .source_ref
+            .clone();
+        assert!(episode.source_refs.contains(&last_ref));
+    }
+
+    #[test]
+    fn an_oversized_session_record_fails_retrieval_without_being_buffered() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = davinci_session::JsonlSessionRepo::new(dir.path());
+        let session = repo
+            .create(davinci_session::JsonlCreateOptions {
+                id: Some("bound".into()),
+                cwd: "/fixture".into(),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .unwrap();
+        let mut line =
+            br#"{"kind":"entry","type":"custom","id":"big","customType":"x","data":""#.to_vec();
+        line.resize(line.len() + sources::MAX_SOURCE_RECORD_BYTES + 1, b'a');
+        line.extend_from_slice(b"\"}\n");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session.info.path)
+            .unwrap()
+            .write_all(&line)
+            .unwrap();
+        let vm = vm();
+        vm.bind_session_source(session.info.path.clone(), "bound".into());
+        let mut event = events_from_messages(&[ChatMessage::text("user", "x")]).remove(0);
+        event.source_ref = "session:big".into();
+        *vm.events.write().unwrap() = vec![event];
+        let error = vm.source_content("session:big").unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
+    }
 }

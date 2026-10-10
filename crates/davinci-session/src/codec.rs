@@ -108,6 +108,7 @@ pub fn metadata_from_header(
             4
         },
         all_messages_text: String::new(),
+        messages_text_bytes: 0,
         message_count: 0,
     }
 }

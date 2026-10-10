@@ -26,6 +26,9 @@ pub struct ContextObjectStore {
     /// size-limited, evicting, failing disk), so a reference this process
     /// handed out must stay loadable without it.
     pinned: Arc<RwLock<HashMap<String, ContextObject>>>,
+    /// Test seam: make every `save` fail, to exercise persistence failures.
+    #[cfg(test)]
+    pub(crate) fail_saves: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ContextObjectStore {
@@ -44,6 +47,8 @@ impl ContextObjectStore {
             cache,
             metrics,
             pinned: Arc::default(),
+            #[cfg(test)]
+            fail_saves: Arc::default(),
         }
     }
 
@@ -52,6 +57,12 @@ impl ContextObjectStore {
     }
 
     pub fn save(&self, object: &ContextObject) -> Result<ContextPageRef, CacheError> {
+        #[cfg(test)]
+        if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(CacheError::Compute(
+                "injected context page write failure".into(),
+            ));
+        }
         let bytes = serde_json::to_vec(object).map_err(|error| {
             CacheError::Compute(format!("context object encode failed: {error}"))
         })?;

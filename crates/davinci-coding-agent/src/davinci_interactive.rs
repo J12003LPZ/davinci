@@ -6968,7 +6968,7 @@ fn open_resume_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
                 tokens: format!(
                     "~{}",
                     davinci_tui::davinci::views::chrome::thousands(
-                        (summary.all_messages_text.len() / 4) as u64
+                        (summary.messages_text_bytes / 4) as u64
                     )
                 ),
                 model: String::new(),

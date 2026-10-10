@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::bounded::{read_line_capped, Line, MAX_HEADER_LINE_BYTES};
 use crate::codec::parse_header;
 use crate::errors::SessionError;
 use crate::JsonlSession;
@@ -18,7 +19,14 @@ pub struct SessionSummary {
     pub parent_session_id: Option<String>,
     pub source_format: u8,
     /// Concatenated user/assistant text matching TS `SessionInfo.allMessagesText`.
+    /// Bounded: past [`DIGEST_HEAD_BYTES`] + [`DIGEST_TAIL_BYTES`] the middle
+    /// is replaced by ` … `, so a listing of many long sessions holds a
+    /// fixed amount of text per session, keeping the opening turns and the
+    /// latest ones.
     pub all_messages_text: String,
+    /// Byte length of the full digest before it was bounded, for estimates
+    /// such as a session's token count.
+    pub messages_text_bytes: usize,
     /// How many message entries the file holds — the turn count a listing
     /// shows without re-reading the file.
     pub message_count: usize,
@@ -174,20 +182,25 @@ fn summarize_file(path: &Path) -> Option<SessionSummary> {
     // session in a listing. Only one line is resident at a time, so a listing
     // never holds a whole transcript besides the digest it returns.
     let mut reader = BufReader::new(fs::File::open(path).ok()?);
-    let mut first_line = String::new();
-    if reader.read_line(&mut first_line).ok()? == 0 {
+    let mut first_line = Vec::new();
+    // A header too long to be one is not a session, and must not be
+    // buffered whole (or handed to the full legacy loader) to find that out.
+    if read_line_capped(&mut reader, MAX_HEADER_LINE_BYTES, &mut first_line).ok()? != Line::Complete
+    {
         return None;
     }
+    let first_line = String::from_utf8(first_line).ok()?;
     if let Ok(header) = parse_header(first_line.trim_end()) {
         let mut summary = crate::codec::metadata_from_header(&header, path, modified_at(path));
-        let (text, count) = messages_text_from_reader(reader).ok()?;
+        let (text, count, bytes) = messages_text_from_reader(reader).ok()?;
         summary.all_messages_text = text;
+        summary.messages_text_bytes = bytes;
         summary.message_count = count;
         return Some(summary);
     }
     // Legacy v3 file: a full open performs the migration.
     let session = JsonlSession::open(path).ok()?;
-    let (legacy_text, legacy_count) = messages_text_from_entries(&session.entries);
+    let (legacy_text, legacy_count, legacy_bytes) = messages_text_from_entries(&session.entries);
     Some(SessionSummary {
         id: session.header.id,
         path: path.to_path_buf(),
@@ -204,15 +217,13 @@ fn summarize_file(path: &Path) -> Option<SessionSummary> {
         parent_session_id: session.header.parent_session_id,
         source_format: 3,
         all_messages_text: legacy_text,
+        messages_text_bytes: legacy_bytes,
         message_count: legacy_count,
     })
 }
 
 fn summarize_header(path: &Path) -> Option<SessionSummary> {
-    let file = fs::File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut first_line = String::new();
-    reader.read_line(&mut first_line).ok()?;
+    let first_line = crate::bounded::read_header_line(path)?;
     if let Ok(header) = parse_header(first_line.trim_end()) {
         return Some(crate::codec::metadata_from_header(
             &header,
@@ -239,6 +250,7 @@ fn summarize_header(path: &Path) -> Option<SessionSummary> {
         parent_session_id: session.header.parent_session_id,
         source_format: 3,
         all_messages_text: String::new(),
+        messages_text_bytes: 0,
         message_count: 0,
     })
 }
@@ -283,17 +295,97 @@ fn message_text(message: &serde_json::Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Digest the remaining lines of a v4 file without building a full session.
-fn messages_text_from_reader(mut reader: impl BufRead) -> std::io::Result<(String, usize)> {
-    let mut count = 0usize;
-    let mut text = String::new();
-    let mut raw = String::new();
-    loop {
-        raw.clear();
-        if reader.read_line(&mut raw)? == 0 {
-            break;
+/// Bytes of a session's message text kept from its start, and from its end.
+pub const DIGEST_HEAD_BYTES: usize = 32 * 1024;
+pub const DIGEST_TAIL_BYTES: usize = 32 * 1024;
+/// A record longer than this is skipped by the digest rather than buffered.
+/// Message text that large is tool output pasted as a turn, not prose a
+/// picker needs to search.
+const MAX_DIGEST_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The space-joined message text of one session, bounded to its head and
+/// tail as it streams, so memory stays flat whatever the transcript's size.
+#[derive(Default)]
+struct Digest {
+    text: String,
+    /// Where the head ends once the middle has been dropped.
+    head_end: Option<usize>,
+    bytes: usize,
+}
+
+impl Digest {
+    fn push(&mut self, part: &str) {
+        if self.bytes > 0 {
+            self.text.push(' ');
+            self.bytes += 1;
         }
-        let line = raw.trim();
+        self.text.push_str(part);
+        self.bytes += part.len();
+        // Compacting only once the slack reaches a whole tail keeps the
+        // copying amortized; `finish` trims the remainder.
+        if self.text.len() > DIGEST_HEAD_BYTES + 2 * DIGEST_TAIL_BYTES {
+            self.compact();
+        }
+    }
+
+    fn compact(&mut self) {
+        let head_end = *self
+            .head_end
+            .get_or_insert_with(|| floor_char_boundary(&self.text, DIGEST_HEAD_BYTES));
+        let tail_start = ceil_char_boundary(
+            &self.text,
+            self.text.len().saturating_sub(DIGEST_TAIL_BYTES),
+        )
+        .max(head_end);
+        self.text.replace_range(head_end..tail_start, "");
+    }
+
+    fn finish(mut self) -> (String, usize) {
+        if self.head_end.is_some() || self.text.len() > DIGEST_HEAD_BYTES + DIGEST_TAIL_BYTES {
+            self.compact();
+        }
+        let mut text = self.text;
+        if let Some(head_end) = self.head_end {
+            text.insert_str(head_end, " … ");
+        }
+        (text, self.bytes)
+    }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Digest the remaining lines of a v4 file without building a full session.
+/// Returns the bounded text, the message count, and the unbounded text size.
+fn messages_text_from_reader(mut reader: impl BufRead) -> std::io::Result<(String, usize, usize)> {
+    let mut count = 0usize;
+    let mut digest = Digest::default();
+    let mut raw = Vec::new();
+    loop {
+        match read_line_capped(&mut reader, MAX_DIGEST_LINE_BYTES, &mut raw)? {
+            Line::Eof => break,
+            Line::TooLong => {
+                crate::bounded::skip_line(&mut reader)?;
+                continue;
+            }
+            Line::Complete => {}
+        }
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        let line = line.trim();
         // Cheap pre-filter: only message entries can contribute text.
         if line.is_empty() || !line.contains("\"message\"") {
             continue;
@@ -308,28 +400,43 @@ fn messages_text_from_reader(mut reader: impl BufRead) -> std::io::Result<(Strin
         }
         count += 1;
         if let Some(part) = value.get("message").and_then(message_text) {
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(&part);
+            digest.push(&part);
         }
     }
-    Ok((text, count))
+    let (text, bytes) = digest.finish();
+    Ok((text, count, bytes))
 }
 
-fn messages_text_from_entries(entries: &[crate::SessionEntry]) -> (String, usize) {
+fn messages_text_from_entries(entries: &[crate::SessionEntry]) -> (String, usize, usize) {
     let mut count = 0usize;
-    let mut parts = Vec::new();
+    let mut digest = Digest::default();
     for entry in entries {
         if entry.entry_type != "message" {
             continue;
         }
         count += 1;
         if let Some(text) = entry.message.as_ref().and_then(message_text) {
-            parts.push(text);
+            digest.push(&text);
         }
     }
-    (parts.join(" "), count)
+    let (text, bytes) = digest.finish();
+    (text, count, bytes)
+}
+
+/// Session directories directly under `root`. Symlinks are never followed:
+/// a link planted in the sessions root must not pull another directory's
+/// JSONL files into a listing.
+pub(crate) fn session_subdirectories(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect())
+}
+
+/// Whether a directory entry is a regular session file (not a symlink).
+fn is_session_file(entry: &fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|kind| kind.is_file()) && is_session_jsonl(&entry.path())
 }
 
 pub fn discover_sessions(
@@ -349,13 +456,9 @@ pub fn discover_sessions(
             vec![primary, legacy]
         }
     } else {
-        let mut roots: Vec<PathBuf> = fs::read_dir(session_dir)
-            .map_err(|err| {
-                SessionError::storage(format!("Unable to list session directory: {err}"))
-            })?
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| path.is_dir())
-            .collect();
+        let mut roots = session_subdirectories(session_dir).map_err(|err| {
+            SessionError::storage(format!("Unable to list session directory: {err}"))
+        })?;
         roots.push(session_dir.to_path_buf());
         roots
     };
@@ -368,7 +471,7 @@ pub fn discover_sessions(
         })?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if is_session_jsonl(&path) {
+            if is_session_file(&entry) {
                 if let Some(summary) = summarize_file(&path) {
                     if keep_for_cwd(&summary, cwd) {
                         sessions.push(summary);
@@ -401,13 +504,9 @@ pub fn discover_session_headers(
             vec![primary, legacy]
         }
     } else {
-        let mut roots: Vec<PathBuf> = fs::read_dir(session_dir)
-            .map_err(|err| {
-                SessionError::storage(format!("Unable to list session directory: {err}"))
-            })?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir())
-            .collect();
+        let mut roots = session_subdirectories(session_dir).map_err(|err| {
+            SessionError::storage(format!("Unable to list session directory: {err}"))
+        })?;
         roots.push(session_dir.to_path_buf());
         roots
     };
@@ -422,7 +521,7 @@ pub fn discover_session_headers(
             .flatten()
         {
             let path = entry.path();
-            if is_session_jsonl(&path) {
+            if is_session_file(&entry) {
                 if let Some(summary) = summarize_header(&path) {
                     if keep_for_cwd(&summary, cwd) {
                         sessions.push(summary);
@@ -480,6 +579,7 @@ pub fn resolve_session_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -644,6 +744,89 @@ mod tests {
         assert_eq!(headers[0].path, session.path);
         assert!(headers[0].all_messages_text.is_empty());
         assert_eq!(headers[0].message_count, 0);
+    }
+
+    #[test]
+    fn digest_keeps_head_and_tail_of_a_long_session_within_its_bound() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/work", Some("long")).unwrap();
+        let turns = 400;
+        let mut full = Vec::new();
+        for turn in 0..turns {
+            let text = format!("turn-{turn:04} {}", "word ".repeat(100));
+            full.push(text.clone());
+            session
+                .append_entry(crate::SessionEntry::message(
+                    "user",
+                    serde_json::json!([{"type": "text", "text": text}]),
+                ))
+                .unwrap();
+        }
+        let full = full.join(" ");
+        assert!(full.len() > 3 * (DIGEST_HEAD_BYTES + DIGEST_TAIL_BYTES));
+        let found = discover_sessions(dir.path(), None).unwrap();
+        let summary = &found[0];
+        assert_eq!(summary.message_count, turns);
+        assert_eq!(summary.messages_text_bytes, full.len());
+        let text = &summary.all_messages_text;
+        assert!(text.len() <= DIGEST_HEAD_BYTES + DIGEST_TAIL_BYTES + " … ".len());
+        assert!(text.starts_with("turn-0000 "), "{}", &text[..40]);
+        assert!(text.ends_with(&full[full.len() - 1000..]));
+        assert!(text.contains(" … "));
+        // A short session is untouched.
+        let digest = {
+            let mut digest = Digest::default();
+            digest.push("a");
+            digest.push("b");
+            digest.finish()
+        };
+        assert_eq!(digest, ("a b".to_string(), 3));
+    }
+
+    #[test]
+    fn digest_bounds_hold_across_multibyte_text() {
+        let mut digest = Digest::default();
+        for _ in 0..50_000 {
+            digest.push("é漢");
+        }
+        let (text, bytes) = digest.finish();
+        assert_eq!(bytes, 50_000 * "é漢".len() + 49_999);
+        assert!(text.len() <= DIGEST_HEAD_BYTES + DIGEST_TAIL_BYTES + " … ".len());
+    }
+
+    #[test]
+    fn discovery_skips_oversized_headers_and_records() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/work", Some("ok")).unwrap();
+        session
+            .append_entry(crate::SessionEntry::message(
+                "user",
+                serde_json::json!([{"type": "text", "text": "kept"}]),
+            ))
+            .unwrap();
+        // A record far past the per-line cap, then one more normal message.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session.path)
+            .unwrap()
+            .write_all(&vec![b'z'; MAX_DIGEST_LINE_BYTES + 1])
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session.path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        let sub = session.path.parent().unwrap();
+        std::fs::write(
+            sub.join("huge-header.jsonl"),
+            vec![b'{'; MAX_HEADER_LINE_BYTES * 2],
+        )
+        .unwrap();
+        let found = discover_sessions(dir.path(), None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].all_messages_text, "kept");
+        assert_eq!(discover_session_headers(dir.path(), None).unwrap().len(), 1);
     }
 
     #[test]

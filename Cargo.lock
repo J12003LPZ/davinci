@@ -666,6 +666,7 @@ name = "davinci-session-sqlite"
 version = "1.1.6"
 dependencies = [
  "davinci-session",
+ "davinci-sys",
  "rusqlite",
  "serde",
  "serde_json",

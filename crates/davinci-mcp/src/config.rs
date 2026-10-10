@@ -115,12 +115,15 @@ pub fn expand_env(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Strin
     out
 }
 
+/// A missing file is an empty configuration. Any other read failure
+/// (permissions, a directory in its place) is an error: `Path::exists`
+/// reports those as "missing" too, which silently disabled every server.
 pub fn load_path(path: &Path) -> Result<File> {
-    if !path.exists() {
-        return Ok(File::default());
+    match std::fs::read_to_string(path) {
+        Ok(body) => parse(&body),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(File::default()),
+        Err(err) => Err(Error::Protocol(format!("{}: {err}", path.display()))),
     }
-    let body = std::fs::read_to_string(path)?;
-    parse(&body)
 }
 
 pub fn parse(body: &str) -> Result<File> {
@@ -141,6 +144,21 @@ pub fn merge(user: File, project: File) -> File {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_config_is_empty_but_unreadable_config_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_path(&dir.path().join("absent.json"))
+            .unwrap()
+            .mcp_servers
+            .is_empty());
+        // A directory where the file should be cannot be read on any OS;
+        // `exists()` called it present-but-fine before and empty after.
+        let blocked = dir.path().join("mcp.json");
+        std::fs::create_dir(&blocked).unwrap();
+        let err = load_path(&blocked).unwrap_err();
+        assert!(err.to_string().contains("mcp.json"), "{err}");
+    }
 
     #[test]
     fn a_stdio_and_http_server_parse() {

@@ -83,27 +83,42 @@ impl State {
             let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                 continue;
             };
-            let Some(object) = value.as_object() else {
-                continue;
+            // A JSON-RPC batch is an array of messages; each member is routed
+            // as if it had arrived on its own line.
+            let messages = match value {
+                Value::Array(members) => members,
+                other => vec![other],
             };
-            if object.get("method").and_then(Value::as_str).is_some() {
-                if object.get("id").is_some() {
-                    self.queue_server_request(value, line.len());
-                    if self.failure.is_some() {
-                        self.stdout = Vec::new();
-                        return;
-                    }
+            for message in messages {
+                self.receive_message(message);
+                if self.failure.is_some() {
+                    self.stdout = Vec::new();
+                    return;
                 }
-                continue;
             }
-            let Some(id) = object.get("id").and_then(Value::as_u64) else {
-                continue;
-            };
-            if self.awaiting == Some(id)
-                && (object.contains_key("result") || object.contains_key("error"))
-            {
-                self.responses.entry(id).or_insert(value);
+        }
+    }
+
+    fn receive_message(&mut self, value: Value) {
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        if object.get("method").and_then(Value::as_str).is_some() {
+            if object.get("id").is_some() {
+                // Charged at its own encoded size, never a share of the line:
+                // padding a batch with tiny members must not shrink the bill.
+                let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+                self.queue_server_request(value, bytes);
             }
+            return;
+        }
+        let Some(id) = object.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        if self.awaiting == Some(id)
+            && (object.contains_key("result") || object.contains_key("error"))
+        {
+            self.responses.entry(id).or_insert(value);
         }
     }
 
@@ -748,6 +763,47 @@ mod tests {
             Some(&json!({"ok":true}))
         );
         assert!(state.failure.is_none());
+    }
+
+    #[test]
+    fn batched_stdout_delivers_the_awaited_reply_and_queues_requests() {
+        let mut state = State {
+            awaiting: Some(5),
+            ..Default::default()
+        };
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 11, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 5, "result": {"tools": []}},
+            "not a message"
+        ]);
+        state.receive_stdout(format!("{batch}\n").as_bytes());
+        assert!(state.failure.is_none(), "{:?}", state.failure);
+        assert_eq!(state.responses[&5]["result"], json!({"tools": []}));
+        assert_eq!(state.take_server_requests()[0]["id"], 11);
+    }
+
+    #[test]
+    fn padded_batches_are_charged_each_requests_full_size() {
+        let mut state = State::default();
+        let big = "x".repeat(MAX_QUEUED_SERVER_REQUEST_BYTES / 2);
+        for id in 0..3 {
+            let mut members =
+                vec![json!({"jsonrpc": "2.0", "id": id, "method": "ping", "params": {"pad": big}})];
+            members.extend((0..10_000).map(|n| json!(n)));
+            state.receive_stdout(
+                format!(
+                    "{}
+",
+                    Value::Array(members)
+                )
+                .as_bytes(),
+            );
+        }
+        assert!(
+            state.failure.is_some(),
+            "1.5 MiB of queued requests accepted"
+        );
+        assert!(state.server_request_bytes <= MAX_QUEUED_SERVER_REQUEST_BYTES);
     }
 
     #[test]

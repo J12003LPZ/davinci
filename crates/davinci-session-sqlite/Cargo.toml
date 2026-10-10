@@ -8,6 +8,7 @@ description = "SQLite session backend matching @earendil-works/pi-session-backen
 
 [dependencies]
 davinci-session = { path = "../davinci-session" }
+davinci-sys = { path = "../davinci-sys" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

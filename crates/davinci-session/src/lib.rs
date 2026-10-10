@@ -1,5 +1,6 @@
 //! JSONL session store matching `@earendil-works/pi-agent-core` session harness.
 
+mod bounded;
 mod codec;
 mod discovery;
 mod errors;

@@ -16,6 +16,12 @@ use crate::repo::{
 use crate::types::{JsonlV4Header, LaneRecord, SessionEntry};
 use crate::{now_ms, LanePointer, SessionError, SessionMutation};
 
+/// Held while a session id is checked and its file published.
+const NAMES_LOCK: &str = ".sessions.lock";
+/// How long a loader or creator waits for another handle's short critical
+/// section (one append, one publish) before giving up.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const SESSION_ID_PATTERN_MSG: &str = "Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character";
 
 pub fn validate_session_id(id: &str) -> Result<(), SessionError> {
@@ -165,16 +171,14 @@ impl JsonlSessionRepo {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         validate_session_id(&id)?;
         let cwd = options.cwd;
+        let dir = self.sessions_root.join(jsonl_session_directory_name(&cwd));
+        let _naming = self.lock_names(&dir)?;
         if self.session_id_exists(&id, &cwd)? {
             return Err(SessionError::already_exists(format!(
                 "Session already exists: {id}"
             )));
         }
         let created_at = now_ms();
-        let dir = self.sessions_root.join(jsonl_session_directory_name(&cwd));
-        davinci_sys::fs::create_private_dir_all(&dir).map_err(|err| {
-            SessionError::storage(format!("Failed to create sessions directory: {err}"))
-        })?;
         let path = dir.join(session_file_name(created_at, &id));
         let header = JsonlV4Header {
             kind: "header".into(),
@@ -232,14 +236,7 @@ impl JsonlSessionRepo {
         let directories = if let Some(cwd) = cwd {
             vec![self.sessions_root.join(jsonl_session_directory_name(cwd))]
         } else {
-            match fs::read_dir(&self.sessions_root) {
-                Ok(entries) => entries
-                    .filter_map(|entry| entry.ok())
-                    .map(|entry| entry.path())
-                    .filter(|path| path.is_dir() || path.is_symlink())
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
+            crate::discovery::session_subdirectories(&self.sessions_root).unwrap_or_default()
         };
         for directory in directories {
             if !directory.exists() {
@@ -250,14 +247,12 @@ impl JsonlSessionRepo {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+                    || !entry.file_type().is_ok_and(|kind| kind.is_file())
+                {
                     continue;
                 }
-                let Ok(file) = fs::File::open(&path) else {
-                    continue;
-                };
-                let Some(Ok(first)) = std::io::BufRead::lines(std::io::BufReader::new(file)).next()
-                else {
+                let Some(first) = crate::bounded::read_header_line(&path) else {
                     continue;
                 };
                 let Ok(header) = parse_header(&first) else {
@@ -293,17 +288,15 @@ impl JsonlSessionRepo {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         validate_session_id(&id)?;
+        let mutations = source.session.state().create_fork_mutations(options)?;
+        let dir = self.sessions_root.join(jsonl_session_directory_name(cwd));
+        let _naming = self.lock_names(&dir)?;
         if self.session_id_exists(&id, cwd)? {
             return Err(SessionError::already_exists(format!(
                 "Session already exists: {id}"
             )));
         }
-        let mutations = source.session.state().create_fork_mutations(options)?;
         let created_at = now_ms();
-        let dir = self.sessions_root.join(jsonl_session_directory_name(cwd));
-        davinci_sys::fs::create_private_dir_all(&dir).map_err(|err| {
-            SessionError::storage(format!("Failed to create sessions directory: {err}"))
-        })?;
         let path = dir.join(session_file_name(created_at, &id));
         let header = JsonlV4Header {
             kind: "header".into(),
@@ -331,6 +324,19 @@ impl JsonlSessionRepo {
             })
         })?;
         JsonlStoredSession::load(&path)
+    }
+
+    /// Serialize id allocation in one sessions directory. "Is this id free?"
+    /// and "publish the file" are two steps, and the filename carries a
+    /// timestamp, so without this two creators of one id both pass the check
+    /// and publish twice (or, same millisecond, one rename replaces the other).
+    fn lock_names(&self, dir: &Path) -> Result<davinci_sys::lock::ExclusiveFileLock, SessionError> {
+        davinci_sys::fs::create_private_dir_all(dir).map_err(|err| {
+            SessionError::storage(format!("Failed to create sessions directory: {err}"))
+        })?;
+        davinci_sys::lock::ExclusiveFileLock::acquire(&dir.join(NAMES_LOCK), LOCK_WAIT).map_err(
+            |err| SessionError::storage(format!("Unable to lock sessions directory: {err}")),
+        )
     }
 
     fn session_id_exists(&self, id: &str, cwd: &str) -> Result<bool, SessionError> {
@@ -400,8 +406,58 @@ pub struct JsonlStoredSession {
     durable_len: u64,
 }
 
+/// What `load_with` may do about a tail that needs repair.
+enum Tail {
+    Detect,
+    /// Holds the session lock for the rewrite.
+    Repair(#[allow(dead_code)] davinci_sys::lock::ExclusiveFileLock),
+    ReadOnly,
+}
+
+/// How long a loader waits for an in-flight append before treating the
+/// lock as held by a long-lived writer. Appends hold it for milliseconds.
+const REPAIR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn session_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
 impl JsonlStoredSession {
     pub fn load(path: &Path) -> Result<Self, SessionError> {
+        if let Some(loaded) = Self::load_with(path, &Tail::Detect)? {
+            return Ok(loaded);
+        }
+        // The tail needs repair. Appenders write under the session lock, so a
+        // torn tail seen without it may be a line another handle is writing
+        // right now, and a rewrite from this snapshot would erase it (and
+        // anything appended after the read). Re-read under the lock, where
+        // the tail is stable, and repair only what is still torn then.
+        // A writer that keeps the lock (a live session in another handle)
+        // owns its tail: load the complete records read-only instead of
+        // waiting on it or rewriting under it.
+        let tail = match davinci_sys::lock::ExclusiveFileLock::acquire(
+            &session_lock_path(path),
+            REPAIR_LOCK_WAIT,
+        ) {
+            Ok(lock) => Tail::Repair(lock),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Tail::ReadOnly,
+            Err(err) => {
+                return Err(SessionError::storage(format!(
+                    "Unable to lock session {} for tail repair: {err}",
+                    path.display()
+                )))
+            }
+        };
+        Self::load_with(path, &tail)?
+            .ok_or_else(|| SessionError::storage("session tail repair did not complete"))
+    }
+
+    /// Parse `path`. What happens to a tail that needs rewriting depends on
+    /// `tail`: report it (`None`), rewrite it (the lock is held), or leave
+    /// it and return the complete records with writes refused.
+    fn load_with(path: &Path, tail: &Tail) -> Result<Option<Self>, SessionError> {
         let (content, torn_utf8_tail) = crate::read_session_text(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 SessionError::not_found(format!("Session not found: {}", path.display()))
@@ -434,6 +490,13 @@ impl JsonlStoredSession {
                 }
                 Err(err) if err.kind == "syntax" && index + 1 == physical_lines.len() => {
                     let valid_prefix = format!("{}\n", physical_lines[..index].join("\n"));
+                    match tail {
+                        Tail::Detect => return Ok(None),
+                        Tail::ReadOnly => {
+                            return Ok(Some(Self::read_only(session, &header, path)));
+                        }
+                        Tail::Repair(_) => {}
+                    }
                     publish_atomically(path, |temp_path| {
                         fs::write(temp_path, &valid_prefix).map_err(|write_err| {
                             SessionError::storage(format!(
@@ -442,14 +505,21 @@ impl JsonlStoredSession {
                             ))
                         })
                     })?;
-                    return Ok(Self {
+                    return Ok(Some(Self {
                         persistence_error: None,
                         durable_len: valid_prefix.len() as u64,
                         session,
                         info: JsonlSessionInfo::from_header(&header, path),
-                    });
+                    }));
                 }
                 Err(err) => return Err(invalid_file(path, index + 1, err)),
+            }
+        }
+        if torn_utf8_tail || !content.ends_with('\n') {
+            match tail {
+                Tail::Detect => return Ok(None),
+                Tail::ReadOnly => return Ok(Some(Self::read_only(session, &header, path))),
+                Tail::Repair(_) => {}
             }
         }
         if torn_utf8_tail {
@@ -478,12 +548,23 @@ impl JsonlStoredSession {
                     ))
                 })?;
         }
-        Ok(Self {
+        Ok(Some(Self {
             persistence_error: None,
             durable_len: content.len() as u64 + u64::from(!content.ends_with('\n')),
             session,
             info: JsonlSessionInfo::from_header(&header, path),
-        })
+        }))
+    }
+
+    fn read_only(session: Session, header: &JsonlV4Header, path: &Path) -> Self {
+        Self {
+            persistence_error: Some(
+                "another handle is writing this session's tail; reopen it to write".into(),
+            ),
+            durable_len: 0,
+            session,
+            info: JsonlSessionInfo::from_header(header, path),
+        }
     }
 
     pub fn info(&self) -> &JsonlSessionInfo {
@@ -648,19 +729,18 @@ impl JsonlStoredSession {
     }
 
     fn append_mutation(&mut self, mutation: SessionMutation) -> Result<(), SessionError> {
-        let mut lock_path = self.info.path.as_os_str().to_owned();
-        lock_path.push(".lock");
-        let _lock = davinci_sys::lock::ExclusiveFileLock::try_acquire(Path::new(&lock_path))
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    SessionError::storage(format!(
-                        "Session {} is being written by another handle; reopen it",
-                        self.info.path.display()
-                    ))
-                } else {
-                    SessionError::storage(format!("Unable to lock session: {err}"))
-                }
-            })?;
+        let _lock =
+            davinci_sys::lock::ExclusiveFileLock::try_acquire(&session_lock_path(&self.info.path))
+                .map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        SessionError::storage(format!(
+                            "Session {} is being written by another handle; reopen it",
+                            self.info.path.display()
+                        ))
+                    } else {
+                        SessionError::storage(format!("Unable to lock session: {err}"))
+                    }
+                })?;
         let current_len = fs::metadata(&self.info.path)
             .map_err(|err| {
                 SessionError::storage(format!(
@@ -1233,6 +1313,165 @@ mod tests {
             .list(Some(&dir.path().join("other/project").to_string_lossy()))
             .unwrap()
             .is_empty());
+    }
+
+    fn create_fixture(repo: &JsonlSessionRepo, id: &str, cwd: &str) -> JsonlStoredSession {
+        repo.create(JsonlCreateOptions {
+            id: Some(id.into()),
+            cwd: cwd.into(),
+            parent_session_id: None,
+            metadata: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn tail_repair_waits_for_an_in_flight_append_instead_of_erasing_it() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let mut writer = create_fixture(&repo, "racing", "/fixture");
+        writer.append_message("first").unwrap();
+        let path = writer.info.path.clone();
+        // Another handle is mid-append: it holds the session lock and has
+        // written only part of its line.
+        let lock =
+            davinci_sys::lock::ExclusiveFileLock::try_acquire(&session_lock_path(&path)).unwrap();
+        let line = encode_mutation(
+            &writer
+                .session
+                .plan_entry(user_message_entry("second-id", "second"), "main")
+                .unwrap()
+                .0,
+        );
+        let (head, rest) = line.split_at(line.len() / 2);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(head.as_bytes())
+            .unwrap();
+        let loader = {
+            let path = path.clone();
+            std::thread::spawn(move || JsonlStoredSession::load(&path))
+        };
+        // Give the loader time to see the torn tail; it must wait, not rewrite.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(rest.as_bytes())
+            .unwrap();
+        drop(lock);
+        let loaded = loader.join().unwrap().unwrap();
+        assert_eq!(loaded.get_stats().message_count, 2);
+        assert!(fs::read_to_string(&path).unwrap().ends_with(&line));
+    }
+
+    #[test]
+    fn a_tail_held_by_a_live_writer_loads_read_only_and_untouched() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let mut writer = create_fixture(&repo, "held", "/fixture");
+        writer.append_message("first").unwrap();
+        let path = writer.info.path.clone();
+        let _held =
+            davinci_sys::lock::ExclusiveFileLock::try_acquire(&session_lock_path(&path)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"kind":"entry""#)
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut loaded = JsonlStoredSession::load(&path).unwrap();
+        assert_eq!(loaded.get_stats().message_count, 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "a held tail was rewritten"
+        );
+        let err = loaded.append_message("refused").unwrap_err();
+        assert!(err.message.contains("reopen"), "{}", err.message);
+    }
+
+    #[test]
+    fn concurrent_forks_with_one_id_create_exactly_one_session() {
+        for _ in 0..10 {
+            let dir = tempdir().unwrap();
+            let repo = std::sync::Arc::new(JsonlSessionRepo::new(dir.path()));
+            let mut source = create_fixture(&repo, "source", "/fixture");
+            source.append_message("hello").unwrap();
+            let source = std::sync::Arc::new(source);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let forks: Vec<_> = (0..2)
+                .map(|_| {
+                    let (repo, source, barrier) = (repo.clone(), source.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        repo.fork(
+                            &source,
+                            &ForkOptions {
+                                id: Some("twin".into()),
+                                ..ForkOptions::default()
+                            },
+                            "/fixture",
+                        )
+                    })
+                })
+                .collect();
+            let results: Vec<_> = forks.into_iter().map(|t| t.join().unwrap()).collect();
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            let err = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+            assert_eq!(err.code, "already_exists");
+            let twins: Vec<_> = repo
+                .list(Some("/fixture"))
+                .unwrap()
+                .into_iter()
+                .filter(|info| info.id == "twin")
+                .collect();
+            assert_eq!(twins.len(), 1);
+            assert_eq!(repo.open(&twins[0]).unwrap().get_stats().message_count, 1);
+        }
+    }
+
+    #[test]
+    fn listing_skips_an_oversized_header_without_buffering_it() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let valid = create_fixture(&repo, "valid", "/fixture");
+        let huge = valid.info.path.with_file_name("huge.jsonl");
+        fs::write(&huge, vec![b'x'; crate::bounded::MAX_HEADER_LINE_BYTES * 4]).unwrap();
+        let ids: Vec<_> = repo
+            .list(Some("/fixture"))
+            .unwrap()
+            .into_iter()
+            .map(|info| info.id)
+            .collect();
+        assert_eq!(ids, ["valid"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_does_not_follow_symlinked_directories() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let elsewhere = JsonlSessionRepo::new(outside.path());
+        let planted = create_fixture(&elsewhere, "planted", "/elsewhere");
+        let root = dir.path().join("sessions");
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(planted.info.path.parent().unwrap(), root.join("--link--"))
+            .unwrap();
+        let repo = JsonlSessionRepo::new(&root);
+        create_fixture(&repo, "own", "/fixture");
+        let ids: Vec<_> = repo.list(None).unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["own"]);
+        let found: Vec<_> = crate::discover_sessions(&root, None)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(found, ["own"]);
     }
 
     #[test]

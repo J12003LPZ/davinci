@@ -510,6 +510,7 @@ mod tests {
             parent_session_id: None,
             source_format: 4,
             all_messages_text: "explain how the agent runtime works\nsure".into(),
+            messages_text_bytes: 40,
             message_count: 2,
         };
         assert_eq!(session_name(&summary), "tui-redesign");

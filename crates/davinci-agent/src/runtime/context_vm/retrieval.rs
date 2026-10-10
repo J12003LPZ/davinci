@@ -74,21 +74,54 @@ fn retrieve_inner(
     })
 }
 
+/// The most text one `retrieve_context` page returns. `limit` counts lines,
+/// and one line can be megabytes, so lines alone do not bound a page.
+pub const MAX_PAGE_BYTES: usize = 64 * 1024;
+
 /// Takes one page from a lazy line iterator. It pulls at most `limit + 1`
 /// lines past `offset` (the extra one only proves another page exists), so a
 /// huge source is never copied to serve the first page.
+///
+/// A page also stops before [`MAX_PAGE_BYTES`]; `next_offset` then points at
+/// the first line left out. A single line longer than a whole page is cut
+/// at the bound and marked, and the next page starts after it.
 fn page_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
     offset: usize,
     limit: usize,
 ) -> (String, Option<usize>) {
-    let mut page: Vec<&str> = lines.skip(offset).take(limit.saturating_add(1)).collect();
-    let truncated = page.len() > limit;
-    page.truncate(limit);
-    (
-        page.join("\n"),
-        truncated.then(|| offset.saturating_add(limit)),
-    )
+    let mut lines = lines.skip(offset);
+    let mut page = String::new();
+    let mut taken = 0usize;
+    while taken < limit {
+        let Some(line) = lines.next() else {
+            return (page, None);
+        };
+        let separator = usize::from(taken > 0);
+        let room = MAX_PAGE_BYTES.saturating_sub(page.len() + separator);
+        if line.len() > room {
+            if taken == 0 {
+                let mut cut = room.min(line.len());
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                page.push_str(&line[..cut]);
+                page.push_str(&format!(
+                    " … [line cut at {MAX_PAGE_BYTES} bytes of {}]",
+                    line.len()
+                ));
+                taken = 1;
+            }
+            return (page, Some(offset.saturating_add(taken)));
+        }
+        if separator == 1 {
+            page.push('\n');
+        }
+        page.push_str(line);
+        taken += 1;
+    }
+    let more = lines.next().is_some();
+    (page, more.then(|| offset.saturating_add(limit)))
 }
 
 pub fn retrieve_context_tool(
@@ -152,6 +185,31 @@ mod tests {
         assert_eq!(content, "line");
         assert_eq!(next, Some(1));
         assert!(pulled.get() <= 2, "pulled {} lines", pulled.get());
+    }
+
+    #[test]
+    fn a_page_is_bounded_in_bytes_not_only_lines() {
+        // One multi-megabyte line with limit=1.
+        let huge = "é".repeat(2 * 1024 * 1024);
+        let text = format!("{huge}\nsmall");
+        let (content, next) = page_lines(text.lines(), 0, 1);
+        assert!(
+            content.len() <= MAX_PAGE_BYTES + 64,
+            "{} bytes",
+            content.len()
+        );
+        assert!(content.contains("line cut at"));
+        assert_eq!(next, Some(1));
+        assert_eq!(page_lines(text.lines(), 1, 1), ("small".to_string(), None));
+        // Many medium lines: the page stops at the byte bound, and the next
+        // page resumes at the first line left out.
+        let line = "y".repeat(10_000);
+        let many = vec![line.as_str(); 100].join("\n");
+        let (content, next) = page_lines(many.lines(), 0, 400);
+        assert!(content.len() <= MAX_PAGE_BYTES);
+        let taken = content.lines().count();
+        assert_eq!(next, Some(taken));
+        assert!((1..100).contains(&taken));
     }
 
     #[test]

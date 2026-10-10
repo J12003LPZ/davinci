@@ -115,6 +115,37 @@ fn operation_entry_on_main_lineage(
     Ok(false)
 }
 
+/// The database holds whole transcripts, so it gets the JSONL backend's
+/// guarantees whatever the umask: the directory 0700 and the file 0600 on
+/// Unix. The file is created here, before SQLite opens it, because SQLite
+/// creates `-wal` and `-shm` with the main file's mode. A database left
+/// readable by an older build is tightened, sidecars included.
+fn restrict_database_files(path: &Path) -> Result<(), SessionError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        davinci_sys::fs::create_private_dir_all(parent).map_err(|err| {
+            SessionError::storage(format!("Unable to create sqlite directory: {err}"))
+        })?;
+    }
+    davinci_sys::fs::open_append_private(path)
+        .map_err(|err| SessionError::storage(format!("Unable to create sqlite database: {err}")))?;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        match davinci_sys::fs::restrict_to_owner(Path::new(&file)) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                return Err(SessionError::storage(format!(
+                    "Unable to restrict sqlite database permissions: {err}"
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn retry_wal_on_busy(mut enable: impl FnMut() -> rusqlite::Result<()>) -> rusqlite::Result<()> {
     // A journal-mode lock upgrade can return BUSY without invoking SQLite's
     // busy handler. Retry the whole statement so its read lock is released.
@@ -134,11 +165,7 @@ fn retry_wal_on_busy(mut enable: impl FnMut() -> rusqlite::Result<()>) -> rusqli
 
 impl SqliteSessionStore {
     pub fn open(path: &Path) -> Result<Self, SessionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                SessionError::storage(format!("Unable to create sqlite directory: {err}"))
-            })?;
-        }
+        restrict_database_files(path)?;
         let conn = Connection::open(path).map_err(|err| {
             SessionError::storage(format!("Unable to open sqlite database: {err}"))
         })?;
@@ -1027,6 +1054,7 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> 
         parent_session_id: row.get(3)?,
         source_format: 4,
         all_messages_text: String::new(),
+        messages_text_bytes: 0,
         message_count: 0,
     })
 }
@@ -1051,6 +1079,36 @@ pub fn now_ms_i64() -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn opening_creates_missing_directories_and_reopens() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("sessions.db");
+        drop(SqliteSessionStore::open(&path).unwrap());
+        SqliteSessionStore::open(&path).unwrap();
+        assert!(path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_directory_file_and_sidecars_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private").join("sessions.db");
+        let store = SqliteSessionStore::open(&path).unwrap();
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let wal = path.with_file_name("sessions.db-wal");
+        if wal.exists() {
+            assert_eq!(mode(&wal), 0o600);
+        }
+        drop(store);
+        // A database an older build left world-readable is tightened.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        SqliteSessionStore::open(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
 
     #[test]
     fn wal_initialization_retries_busy_but_preserves_other_errors() {

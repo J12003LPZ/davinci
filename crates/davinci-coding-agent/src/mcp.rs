@@ -36,11 +36,21 @@ fn resolve_origin(config: &mut ConfigFile, project_or_plugin: bool, sandbox_acti
     }
 }
 
+/// One config layer. A missing file is empty; an unreadable or malformed one
+/// still contributes nothing, but says so instead of silently disabling the
+/// servers it configures.
+fn load_layer(path: &Path) -> ConfigFile {
+    davinci_mcp::load_path(path).unwrap_or_else(|err| {
+        eprintln!("MCP config ignored: {err}");
+        ConfigFile::default()
+    })
+}
+
 pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool, sandbox_active: bool) -> ConfigFile {
     if let Ok(path) =
         std::env::var("DAVINCI_MCP_CONFIG").or_else(|_| std::env::var("PI_MCP_CONFIG"))
     {
-        let mut config = davinci_mcp::load_path(Path::new(&path)).unwrap_or_default();
+        let mut config = load_layer(Path::new(&path));
         resolve_origin(&mut config, false, sandbox_active);
         return config;
     }
@@ -48,7 +58,7 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool, sandbox_active: bool) -
         mcp_servers: davinci_coding_agent::plugins::active(agent_dir).mcp_servers(),
     };
     resolve_origin(&mut plugins, true, sandbox_active);
-    let mut user_file = davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default();
+    let mut user_file = load_layer(&agent_dir.join("mcp.json"));
     resolve_origin(&mut user_file, false, sandbox_active);
     let user = davinci_mcp::merge(plugins, user_file);
     if !trusted {
@@ -57,7 +67,7 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool, sandbox_active: bool) -
     let Some(path) = crate::project_config::resolve(cwd, "mcp.json") else {
         return user;
     };
-    let mut project = davinci_mcp::load_path(&path).unwrap_or_default();
+    let mut project = load_layer(&path);
     resolve_origin(&mut project, true, sandbox_active);
     davinci_mcp::merge(user, project)
 }
