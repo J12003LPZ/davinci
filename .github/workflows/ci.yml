@@ -508,7 +508,7 @@ jobs:
           export DAVINCI_CODEMODE_FIXTURE_MANIFEST
           # Every native case: deadlines, parallel reads, permission-model launch,
           # run closure after early errors, and fatal frame mapping.
-          cargo test -p davinci-coding-agent --test codemode_supervisor --locked -- --ignored --nocapture --test-threads=1
+          cargo test -p davinci-coding-agent --test codemode_supervisor --test codemode_supervisor_budget --locked -- --ignored --nocapture --test-threads=1
       - name: Current dependency advisory report
         working-directory: crates/davinci-coding-agent/codemode-host
         run: npm audit --omit=dev --json

@@ -458,6 +458,22 @@ impl PackageIntelligence {
                 }
             }
         }
+        // Use the query resolver's selected declaration as well: conditional
+        // exports and @types fallbacks are not top-level manifest fields.
+        if let Some(workspace) = ws_dir.strip_prefix(&root).ok().and_then(Path::to_str) {
+            if let Ok(resolved) = resolve_package(&root, Some(workspace), pkg) {
+                if let Some(types) = resolved.types_path {
+                    if let Ok(path) = root.join(&types).canonicalize() {
+                        if path.starts_with(&root) {
+                            if let Ok(bytes) = fs::read(path) {
+                                material.extend_from_slice(types.as_bytes());
+                                material.extend_from_slice(&bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         format!("installed:{}", digest(&material))
     }
 

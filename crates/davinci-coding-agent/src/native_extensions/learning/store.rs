@@ -538,6 +538,19 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_journals_fail_open_instead_of_becoming_empty() {
+        for name in ["candidates.jsonl", "skills.jsonl"] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = dir.path().join(name);
+            fs::create_dir(&journal).unwrap();
+            let sentinel = journal.join("preserve.txt");
+            fs::write(&sentinel, "retained evidence").unwrap();
+            assert!(LearningStore::open(dir.path().to_path_buf()).is_err());
+            assert_eq!(fs::read_to_string(sentinel).unwrap(), "retained evidence");
+        }
+    }
+
+    #[test]
     fn partial_utf8_tail_is_a_torn_append_not_a_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("candidates.jsonl");

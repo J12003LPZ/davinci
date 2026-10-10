@@ -241,3 +241,93 @@ fn cached_results_follow_the_installed_package() {
     );
     assert_eq!(version(&intel).as_deref(), Some("2.0.0"));
 }
+
+#[test]
+fn cached_symbol_follows_the_conditional_type_entry() {
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "package.json",
+        r#"{"dependencies":{"pkg":"*"}}"#,
+    );
+    write(
+        repo.path(),
+        "node_modules/pkg/package.json",
+        r#"{"name":"pkg","version":"1.0.0","exports":{".":{"types":"./dist/api.d.ts","import":"./dist/api.js"}}}"#,
+    );
+    let declaration = "node_modules/pkg/dist/api.d.ts";
+    write(
+        repo.path(),
+        declaration,
+        "export declare function answer(): number;\n",
+    );
+    let intel = PackageIntelligence::with_root(repo.path(), CacheRuntime::default());
+    let query = || {
+        let result = intel
+            .execute_tool(
+                "package_symbol",
+                &json!({"package":"pkg","symbol":"answer"}),
+            )
+            .unwrap();
+        serde_json::from_str::<Value>(&result.content).unwrap()
+    };
+    let before = query();
+    assert_eq!(before["found"], true, "{before}");
+    assert!(before["declaration"].as_str().unwrap().contains("number"));
+    // Same manifest, lock, version and declaration length; only source changes.
+    write(
+        repo.path(),
+        declaration,
+        "export declare function answer(): string;\n",
+    );
+    let after = query();
+    assert!(
+        after["declaration"].as_str().unwrap().contains("string"),
+        "{after}"
+    );
+}
+
+#[test]
+fn cached_symbol_follows_the_at_types_fallback() {
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "package.json",
+        r#"{"dependencies":{"pkg":"*"}}"#,
+    );
+    write(
+        repo.path(),
+        "node_modules/pkg/package.json",
+        r#"{"name":"pkg","version":"1.0.0"}"#,
+    );
+    let declaration = "node_modules/@types/pkg/index.d.ts";
+    write(
+        repo.path(),
+        declaration,
+        "export declare function answer(): number;\n",
+    );
+    let intel = PackageIntelligence::with_root(repo.path(), CacheRuntime::default());
+    let query = || {
+        serde_json::from_str::<Value>(
+            &intel
+                .execute_tool(
+                    "package_symbol",
+                    &json!({"package":"pkg","symbol":"answer"}),
+                )
+                .unwrap()
+                .content,
+        )
+        .unwrap()
+    };
+    assert!(query()["declaration"].as_str().unwrap().contains("number"));
+    write(
+        repo.path(),
+        declaration,
+        "export declare function answer(): string;\n",
+    );
+    let after = query();
+    assert!(
+        after["declaration"].as_str().unwrap().contains("string"),
+        "{after}"
+    );
+}
