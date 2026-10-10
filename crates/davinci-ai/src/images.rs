@@ -188,6 +188,8 @@ fn apply_images_response(output: &mut AssistantImages, model: &Model, response: 
         .and_then(Value::as_array)
         .and_then(|items| items.first())
     else {
+        output.stop_reason = "error".into();
+        output.error_message = Some("Provider response contained no choices".into());
         return;
     };
     let message = choice.get("message").unwrap_or(choice);
@@ -389,5 +391,39 @@ mod tests {
         }
         assert_eq!(output.stop_reason, "aborted");
         assert_eq!(output.error_message.as_deref(), Some("Request aborted"));
+    }
+
+    #[test]
+    fn response_without_choices_is_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("PI_OPENROUTER_IMAGES_REPLY").ok();
+        std::env::set_var(
+            "PI_OPENROUTER_IMAGES_REPLY",
+            json!({"id": "img-2", "choices": []}).to_string(),
+        );
+        let model = openrouter_image_models().remove(0);
+        let output = generate_images(
+            &model,
+            &ImagesContext {
+                input: vec![MessageContent::Text {
+                    text: "Generate a dog".into(),
+                }],
+            },
+            &GenerateImagesOptions {
+                api_key: Some("test".into()),
+                ..GenerateImagesOptions::default()
+            },
+        );
+        match previous {
+            Some(value) => std::env::set_var("PI_OPENROUTER_IMAGES_REPLY", value),
+            None => std::env::remove_var("PI_OPENROUTER_IMAGES_REPLY"),
+        }
+        assert_eq!(output.stop_reason, "error");
+        assert_eq!(
+            output.error_message.as_deref(),
+            Some("Provider response contained no choices")
+        );
+        assert_eq!(output.response_id.as_deref(), Some("img-2"));
+        assert!(output.output.is_empty());
     }
 }

@@ -89,14 +89,25 @@ fn cell_type(cell: &Value) -> &str {
 }
 
 /// Replace a cell's source. A code cell that changed has nothing to show
-/// for its old outputs, so they go and the execution count with them.
+/// for its old outputs, so they go and the execution count with them. A
+/// rewrite to identical source keeps its recorded run: nothing went stale.
 pub fn set_cell_source(cell: &mut Value, source: &str) {
     let is_code = cell_type(cell) == "code";
+    let unchanged = cell_source(cell) == source;
     if let Some(object) = cell.as_object_mut() {
-        object.insert("source".into(), source_value(source));
+        if !unchanged {
+            object.insert("source".into(), source_value(source));
+        }
         if is_code {
-            object.insert("outputs".into(), Value::Array(Vec::new()));
-            object.insert("execution_count".into(), Value::Null);
+            if unchanged {
+                object
+                    .entry("outputs")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                object.entry("execution_count").or_insert(Value::Null);
+            } else {
+                object.insert("outputs".into(), Value::Array(Vec::new()));
+                object.insert("execution_count".into(), Value::Null);
+            }
         }
     }
 }
@@ -711,5 +722,45 @@ mod tests {
         assert_eq!(detect_indent("{\n    \"cells\": []\n}"), 4);
         assert!(parse("{\"not\": \"a notebook\"}").is_none());
         assert!(parse("plain text").is_none());
+    }
+
+    #[test]
+    fn rewriting_a_code_cell_with_identical_source_keeps_its_run() {
+        let mut nb = notebook();
+        let before = nb["cells"][1].clone();
+        let same = cell_source(&before);
+        set_cell_source(&mut nb["cells"][1], &same);
+        assert_eq!(nb["cells"][1]["outputs"], before["outputs"]);
+        assert_eq!(nb["cells"][1]["execution_count"], json!(3));
+
+        set_cell_source(&mut nb["cells"][1], "changed");
+        assert_eq!(nb["cells"][1]["outputs"], json!([]));
+        assert_eq!(nb["cells"][1]["execution_count"], Value::Null);
+    }
+
+    #[test]
+    fn replacing_with_identical_source_through_notebook_edit_keeps_outputs() {
+        let mut nb = notebook();
+        let same = cell_source(&nb["cells"][1]);
+        structural_edit(&mut nb, "nb.ipynb", 2, EditMode::Replace, Some(&same), None).unwrap();
+        assert_eq!(nb["cells"][1]["execution_count"], json!(3));
+        assert_eq!(nb["cells"][1]["outputs"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn identical_source_into_a_cell_turned_code_still_gets_run_fields() {
+        let mut nb = notebook();
+        let same = cell_source(&nb["cells"][0]);
+        structural_edit(
+            &mut nb,
+            "nb.ipynb",
+            1,
+            EditMode::Replace,
+            Some(&same),
+            Some("code"),
+        )
+        .unwrap();
+        assert_eq!(nb["cells"][0]["outputs"], json!([]));
+        assert_eq!(nb["cells"][0]["execution_count"], Value::Null);
     }
 }

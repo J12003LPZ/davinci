@@ -17,17 +17,34 @@ const DEFAULT_MAX_WIDTH: u32 = 2000;
 const DEFAULT_MAX_HEIGHT: u32 = 2000;
 const DEFAULT_MAX_BYTES: usize = (4.5 * 1024.0 * 1024.0) as usize;
 
-pub fn convert_image_bytes_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
-    let image = image::load_from_memory(bytes).ok()?;
-    let rgba = image.to_rgba8();
-    if rgba.width() == 0 || rgba.height() == 0 || rgba.width() > 4096 || rgba.height() > 4096 {
-        return None;
-    }
-    let oriented = apply_exif_orientation(rgba, get_exif_orientation(bytes));
-    encode_dynamic(DynamicImage::ImageRgba8(oriented), ImageFormat::Png)
+/// Largest side `convert_image_bytes_to_png` will decode (terminal display).
+const MAX_CONVERT_SIDE: u32 = 4096;
+/// Pixel budget for `resize_image_in_process`, checked against the header
+/// before decoding so a decompression bomb is rejected without allocating it.
+const MAX_DECODE_PIXELS: u64 = 100_000_000;
+/// JPEG qualities tried best first; the first one that fits the byte limit wins.
+const JPEG_QUALITIES: [u8; 5] = [85, 80, 70, 55, 40];
+
+/// Width and height from the image header, without decoding the pixels.
+fn header_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
 }
 
-fn encode_dynamic(image: DynamicImage, format: ImageFormat) -> Option<Vec<u8>> {
+pub fn convert_image_bytes_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (width, height) = header_dimensions(bytes)?;
+    if width == 0 || height == 0 || width > MAX_CONVERT_SIDE || height > MAX_CONVERT_SIDE {
+        return None;
+    }
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let oriented = apply_exif_orientation(rgba, get_exif_orientation(bytes));
+    encode_dynamic(&DynamicImage::ImageRgba8(oriented), ImageFormat::Png)
+}
+
+fn encode_dynamic(image: &DynamicImage, format: ImageFormat) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     image.write_to(&mut Cursor::new(&mut out), format).ok()?;
     Some(out)
@@ -37,8 +54,57 @@ fn encoded_base64_len(bytes: &[u8]) -> usize {
     bytes.len().div_ceil(3) * 4
 }
 
+fn fits_inline(bytes: &[u8]) -> bool {
+    encoded_base64_len(bytes) < DEFAULT_MAX_BYTES
+}
+
+/// True when any pixel is not fully opaque.
+fn has_transparency(image: &DynamicImage) -> bool {
+    image.color().has_alpha() && image.to_rgba8().pixels().any(|pixel| pixel[3] < u8::MAX)
+}
+
+/// Highest-quality encoding that fits the inline limit: lossless PNG first,
+/// then JPEG from the best quality down. Images with real transparency stay
+/// PNG, because JPEG would flatten the alpha channel; the caller shrinks them
+/// instead.
+fn encode_within_limit(
+    resized: &DynamicImage,
+    preserve_alpha: bool,
+) -> Option<(&'static str, Vec<u8>)> {
+    let rgb = DynamicImage::ImageRgb8(resized.to_rgb8());
+    let png_source = if preserve_alpha { resized } else { &rgb };
+    if let Some(png) = encode_dynamic(png_source, ImageFormat::Png).filter(|png| fits_inline(png)) {
+        return Some(("image/png", png));
+    }
+    if preserve_alpha {
+        return None;
+    }
+    let raw = rgb.as_rgb8()?;
+    for quality in JPEG_QUALITIES {
+        let mut jpeg = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality);
+        if encoder
+            .write_image(
+                raw.as_raw(),
+                raw.width(),
+                raw.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .is_ok()
+            && fits_inline(&jpeg)
+        {
+            return Some(("image/jpeg", jpeg));
+        }
+    }
+    None
+}
+
 /// TS `resizeImageInProcess`: Lanczos3 fit within 2000×2000 and 4.5MB base64.
 pub fn resize_image_in_process(input: &[u8], mime_type: &str) -> Option<ResizedImage> {
+    let (header_width, header_height) = header_dimensions(input)?;
+    if header_width as u64 * header_height as u64 > MAX_DECODE_PIXELS {
+        return None;
+    }
     let image = image::load_from_memory(input).ok()?;
     let original_width = image.width();
     let original_height = image.height();
@@ -69,34 +135,10 @@ pub fn resize_image_in_process(input: &[u8], mime_type: &str) -> Option<ResizedI
             .max(1) as u32;
         target_height = DEFAULT_MAX_HEIGHT;
     }
-    let qualities = [80u8, 85, 70, 55, 40];
+    let preserve_alpha = has_transparency(&image);
     loop {
         let resized = image.resize_exact(target_width, target_height, FilterType::Lanczos3);
-        let mut candidates = Vec::new();
-        if let Some(png) = encode_dynamic(resized.clone(), ImageFormat::Png) {
-            candidates.push(("image/png", png));
-        }
-        let rgb = DynamicImage::ImageRgb8(resized.to_rgb8());
-        for quality in qualities {
-            let mut jpeg = Vec::new();
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality);
-            if encoder
-                .write_image(
-                    rgb.as_rgb8()?.as_raw(),
-                    target_width,
-                    target_height,
-                    image::ExtendedColorType::Rgb8,
-                )
-                .is_ok()
-            {
-                candidates.push(("image/jpeg", jpeg));
-            }
-        }
-        if let Some((mime, bytes)) = candidates
-            .into_iter()
-            .filter(|(_, bytes)| encoded_base64_len(bytes) < DEFAULT_MAX_BYTES)
-            .min_by_key(|(_, bytes)| bytes.len())
-        {
+        if let Some((mime, bytes)) = encode_within_limit(&resized, preserve_alpha) {
             return Some(ResizedImage {
                 bytes,
                 mime_type: mime.into(),
@@ -417,9 +459,106 @@ mod tests {
     }
 
     #[test]
+    fn convert_rejects_oversized_from_the_header() {
+        let wide = ImageBuffer::from_pixel(4097, 1, Rgba([1, 2, 3, 255]));
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(wide)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("png");
+        assert_eq!(header_dimensions(&png), Some((4097, 1)));
+        assert!(convert_image_bytes_to_png(&png).is_none());
+    }
+
+    #[test]
     fn orientation_6_rotates_dimensions() {
         let src = ImageBuffer::from_pixel(3, 1, Rgba([255, 0, 0, 255]));
         let rotated = apply_exif_orientation(src, 6);
         assert_eq!((rotated.width(), rotated.height()), (1, 3));
+    }
+
+    fn noise_img(width: u32, height: u32, alpha: u8) -> DynamicImage {
+        let mut state = 0x2545_f491u32;
+        let img = image::ImageBuffer::from_fn(width, height, |_, _| {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 8) as u8
+            };
+            image::Rgba([next(), next(), next(), alpha])
+        });
+        DynamicImage::ImageRgba8(img)
+    }
+
+    fn png_of(image: &DynamicImage) -> Vec<u8> {
+        let mut out = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
+            .expect("png");
+        out
+    }
+
+    #[test]
+    fn opaque_image_gets_the_best_jpeg_quality_that_fits() {
+        let image = noise_img(1100, 1100, 255);
+        assert!(!fits_inline(&png_of(&DynamicImage::ImageRgb8(
+            image.to_rgb8()
+        ))));
+        let (mime, bytes) = encode_within_limit(&image, false).expect("fits as jpeg");
+        assert_eq!(mime, "image/jpeg");
+        let mut best = Vec::new();
+        DynamicImage::ImageRgb8(image.to_rgb8())
+            .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut best, 85,
+            ))
+            .unwrap();
+        assert!(fits_inline(&best), "fixture must fit at q85");
+        assert_eq!(bytes, best);
+    }
+
+    #[test]
+    fn transparent_image_is_never_flattened_to_jpeg() {
+        let image = noise_img(1500, 1500, 128);
+        assert!(has_transparency(&image));
+        assert!(encode_within_limit(&image, true).is_none());
+        let small = noise_img(40, 40, 128);
+        let (mime, bytes) = encode_within_limit(&small, true).expect("small png fits");
+        assert_eq!(mime, "image/png");
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert!(decoded.pixels().all(|pixel| pixel[3] == 128));
+    }
+
+    #[test]
+    fn opaque_rgba_is_not_treated_as_transparent() {
+        assert!(!has_transparency(&noise_img(8, 8, 255)));
+        assert!(!has_transparency(&DynamicImage::ImageRgb8(
+            noise_img(8, 8, 255).to_rgb8()
+        )));
+    }
+
+    #[test]
+    fn oversized_resize_keeps_transparency_and_fits() {
+        let png = png_of(&noise_img(2400, 2400, 128));
+        let resized = resize_image_in_process(&png, "image/png").expect("resized");
+        assert!(resized.was_resized);
+        assert_eq!(resized.mime_type, "image/png");
+        let bytes = &resized.bytes;
+        assert!(fits_inline(bytes));
+        let decoded = image::load_from_memory(bytes).unwrap().to_rgba8();
+        assert!(decoded.pixels().any(|pixel| pixel[3] < 255));
+    }
+
+    #[test]
+    fn pixel_bomb_is_rejected_from_the_header() {
+        let bomb = image::ImageBuffer::<image::Luma<u8>, _>::from_pixel(
+            10_001,
+            10_000,
+            image::Luma([7u8]),
+        );
+        let mut png = Vec::new();
+        DynamicImage::ImageLuma8(bomb)
+            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+            .expect("png");
+        assert!(resize_image_in_process(&png, "image/png").is_none());
     }
 }
