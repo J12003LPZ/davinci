@@ -55,6 +55,21 @@ All 10 confirmed findings are fixed on `fix/deep-audit-findings-d01afb19`, stack
 
 More gaps were found while fixing, all in the redaction helpers and all closed in the commits above: a source-read window starting inside a multi-line quoted secret (now masked against the whole file, line counts kept), SSH2 and PuTTY key formats, URL passwords holding an unencoded `@`, `/` or quote, bare `TOKEN=` / `authtoken` keys, and a PuTTY body count that could hide a PEM `BEGIN` line. Two design choices: every token-named assignment is masked in Security Scan context, including tokenizer code (`let token = ...`); URL masks run to the last `@` of a whitespace-delimited token, so a URL with a port and an `@` in its query is over-masked.
 
+### Review follow-ups (PR #173 code review)
+
+| Item | Resolution | Commit |
+|---|---|---|
+| Git segments with unusual whitespace lost their GitMutation risk (regression from SHELL-01) | Refused segments whose program is git are unsafe | `d3597798` |
+| Bare `token` key masked comparisons (`token == expected`) | Values may not start with `=`/`>`; numeric values kept only for count names (`max_tokens`) | `c9375201`, `e8503c05` |
+| Planted or unterminated key marker hid the rest of the file | Blocks continue only over key text; base64 runs inside code lines are masked in place | `c9375201`, `e8503c05`, `43999d9f` |
+| Greedy URL mask lost hosts | Password ends at the authority; `host:port` recognized; nested URLs rescanned in one linear pass | `c9375201`, `e8503c05`, `43999d9f` |
+| Triple-quoted secrets | Masked with their lines | `c9375201` |
+| Lossy UTF-8 corrupted real MCP replies | A non-UTF-8 reply becomes a -32700 error for its id | `55c11f30` |
+| Extension writes under `--no-session` | Not changed: print mode turns `failures` into the reply, so every answer would become an error; not persisting is the `--no-session` contract | none |
+| `cargo tree` still reads project `.cargo/config.toml` (`build.rustc-wrapper`) | Open: needs filesystem awareness the string policy lacks; predates this PR | follow-up |
+| Two cwd encoders remain | Open, low: `JsonlSessionRepo::list` has no production caller | follow-up |
+| Whole-file masking per `sec_source_read` | Open, performance: cache masked text per path and side | follow-up |
+
 ## Confirmed findings
 
 ### SHELL-01: Auto mode approves CR-separated PowerShell statements
