@@ -44,8 +44,10 @@ pub(super) fn quoted_assignments(input: &str) -> String {
 pub(super) fn private_key_blocks(input: &str) -> String {
     static MARKER: OnceLock<Regex> = OnceLock::new();
     let marker = MARKER.get_or_init(|| {
-        // PEM and OpenSSH use five dashes; the SSH2 format uses four and spaces.
-        Regex::new(r"(?i)-{3,}\s*(BEGIN|END)\b[A-Z0-9 ]*PRIVATE KEY")
+        // PEM and OpenSSH use five dashes, SSH2 four and spaces. The key type
+        // between the words is free text (`X-ED25519`, tabs), but bounded so
+        // prose that merely says "begin ... private key" is not armor.
+        Regex::new(r"(?i)-{3,}\s*(BEGIN|END)\b[^\r\n]{0,40}?PRIVATE\s+KEY")
             .expect("fixed private key marker pattern")
     });
     static PUTTY: OnceLock<Regex> = OnceLock::new();
@@ -58,31 +60,27 @@ pub(super) fn private_key_blocks(input: &str) -> String {
     let mut putty_lines = 0usize;
     for line in input.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        if putty_lines > 0 {
-            putty_lines -= 1;
-            out.push_str(PRIVATE_KEY_MARKER);
-            out.push_str(&line[content.len()..]);
-            continue;
-        }
-        if let Some(count) = putty.captures(content) {
-            putty_lines = count[1].parse().unwrap_or(usize::MAX);
-            out.push_str(PRIVATE_KEY_MARKER);
-            out.push_str(&line[content.len()..]);
-            continue;
-        }
-        // Only a real armor marker opens or closes a block; the last one on
-        // the line decides, so a one-line key (escaped newlines in a string)
-        // opens and closes here and other text on the line changes nothing.
+        // Every line updates both trackers, masked or not, so one format's
+        // body can never hide the other's opening marker.
         let last = marker
             .captures_iter(content)
             .last()
             .map(|captures| captures[1].eq_ignore_ascii_case("BEGIN"));
-        if in_block || last.is_some() {
+        let putty_header = putty
+            .captures(content)
+            .map(|count| count[1].parse().unwrap_or(usize::MAX));
+        if in_block || last.is_some() || putty_lines > 0 || putty_header.is_some() {
             out.push_str(PRIVATE_KEY_MARKER);
             out.push_str(&line[content.len()..]);
         } else {
             out.push_str(line);
         }
+        putty_lines = putty_lines.saturating_sub(1);
+        if let Some(count) = putty_header {
+            putty_lines = putty_lines.max(count);
+        }
+        // The last armor marker on a line decides, so a one-line key (escaped
+        // newlines in a string) opens and closes here.
         if let Some(opens) = last {
             in_block = opens;
         }
@@ -92,12 +90,12 @@ pub(super) fn private_key_blocks(input: &str) -> String {
 
 /// Mask the password in `scheme://user:password@host` for any URL scheme:
 /// database, cache and broker URLs carry credentials the same way HTTP does.
-/// Passwords often hold an unencoded `@` or `/`, so the mask runs to the last
-/// `@` of the URL token rather than the first.
+/// Passwords often hold an unencoded `@`, `/` or quote, so the mask runs to
+/// the last `@` of the whitespace-delimited token rather than the first.
 pub(super) fn url_credentials(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(r#"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@"'<>`]*:[^\s"'<>`]*@"#)
+        Regex::new(r#"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@"'<>`]*:\S*@"#)
             .expect("fixed URL credential pattern")
     });
     pattern.replace_all(input, "$1[REDACTED]@").into_owned()
@@ -169,6 +167,39 @@ mod tests {
     }
 
     #[test]
+    fn one_key_format_never_hides_another_ones_marker() {
+        // A PuTTY body count that covers a PEM BEGIN line must still open the
+        // PEM block, and a PEM block must still see a PuTTY header.
+        let mixed = format!(
+            "Private-Lines: 1\n-----BEGIN PRIVATE KEY-----\n{BODY}\n{BODY}\n-----END PRIVATE KEY-----\nvisible\n"
+        );
+        let output = private_key_blocks(&mixed);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(output.ends_with("visible\n"), "{output}");
+
+        let mixed = format!(
+            "-----BEGIN PRIVATE KEY-----\nPrivate-Lines: 3\n-----END PRIVATE KEY-----\n{BODY}\n{BODY}\nvisible\n"
+        );
+        let output = private_key_blocks(&mixed);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(output.ends_with("visible\n"), "{output}");
+    }
+
+    #[test]
+    fn free_text_key_types_are_armor() {
+        for begin in [
+            "-----BEGIN X-ED25519 PRIVATE KEY-----",
+            "-----BEGIN\tRSA PRIVATE KEY-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        ] {
+            let input = format!("{begin}\n{BODY}\n-----END PRIVATE KEY-----\nvisible\n");
+            let output = private_key_blocks(&input);
+            assert!(!output.contains(BODY), "{begin}: {output}");
+            assert!(output.ends_with("visible\n"), "{output}");
+        }
+    }
+
+    #[test]
     fn multi_line_quoted_values_keep_their_line_count() {
         for input in [
             "password = \"fixture first\nfixture second\nfixture third\"\nvisible\n",
@@ -211,6 +242,7 @@ mod tests {
             // Unencoded `@` and `/` in the password.
             "postgres://admin:fixture@sensitive@db.internal/app",
             "postgres://admin:fixture/sensitive@db.internal/app",
+            "postgres://admin:fixture'sensitive\"x@db.internal/app",
             "DATABASE_URL=\"mysql://root:fixture-sensitive@db/app\"",
         ] {
             let output = url_credentials(url);
