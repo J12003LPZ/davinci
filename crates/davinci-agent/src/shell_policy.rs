@@ -787,17 +787,26 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
                 format!("matches package modification pattern in segment `{segment}`"),
             ));
         }
-        let unsafe_git = literal_shell_words(&without_stderr_join).is_some_and(|words| {
+        let is_git = |program: &str| {
             matches!(
-                words[0]
+                program
                     .rsplit(['/', '\\'])
                     .next()
                     .unwrap_or("")
                     .to_ascii_lowercase()
                     .as_str(),
                 "git" | "git.exe"
-            ) && !git_is_read_only(&words)
-        });
+            )
+        };
+        let unsafe_git = match literal_shell_words(&without_stderr_join) {
+            Some(words) => is_git(&words[0]) && !git_is_read_only(&words),
+            // Words the literal lexer refuses (unusual whitespace, quoting it
+            // cannot model) cannot prove a git command read-only.
+            None => without_stderr_join
+                .split(|ch: char| ch.is_whitespace() || ch.is_control())
+                .find(|word| !word.is_empty())
+                .is_some_and(|program| is_git(program.trim_matches(['"', '\'']))),
+        };
         if git_mutation_regex().is_match(segment) || unsafe_git {
             risks.push((
                 ShellRiskCategory::GitMutation,
@@ -1144,6 +1153,35 @@ mod tests {
             literal_shell_words("cat 'a\rb'"),
             Some(vec!["cat".into(), "a\rb".into()])
         );
+    }
+
+    #[test]
+    fn security_git_with_unusual_whitespace_is_still_a_git_mutation() {
+        for command in [
+            "git\u{b}-c\u{b}core.pager=fixture\u{b}log",
+            "git\u{c}push origin main",
+            "\"git\" log\u{85}--output=x",
+        ] {
+            let report = analyze_command(command);
+            assert!(
+                report
+                    .risks
+                    .iter()
+                    .any(|(category, _)| *category == ShellRiskCategory::GitMutation),
+                "{command:?}: {:?}",
+                report.risks
+            );
+            assert_ne!(
+                evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
+                ShellCommandDecision::Allowed,
+                "{command:?}"
+            );
+        }
+        // Non-git segments the lexer refuses are not mislabeled as git.
+        assert!(!analyze_command("echo\u{b}hi")
+            .risks
+            .iter()
+            .any(|(category, _)| *category == ShellRiskCategory::GitMutation));
     }
 
     #[test]
