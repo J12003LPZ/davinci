@@ -158,8 +158,16 @@ impl StdioTransport {
                     if let Some(method) = message.get("method").and_then(Value::as_str) {
                         if let Some(id) = message.get("id").cloned() {
                             // Never wait here: a server that is not reading its
-                            // stdin must not also stall this stdout drain.
-                            response_writer.enqueue(&server_request_reply(id, method));
+                            // stdin must not also stall this stdout drain. A
+                            // reply that cannot be queued fails the transport
+                            // instead of leaving the server waiting on it.
+                            if let Err(error) =
+                                response_writer.enqueue(&server_request_reply(id, method))
+                            {
+                                let _ = sender.send(Err(error));
+                                stop = true;
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -251,9 +259,9 @@ impl StdioTransport {
         }
     }
 
-    /// Best effort, never waits: the request already failed.
+    /// Best effort, never waits: the request already failed and reported it.
     fn cancel_request(&mut self, id: &Value) {
-        self.stdin.enqueue(&json!({
+        let _ = self.stdin.enqueue(&json!({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
             "params": { "requestId": id, "reason": "timeout" }
@@ -423,15 +431,26 @@ impl StdinWriter {
         }
     }
 
-    /// Queue a line without waiting for it; dropped if the queue is full.
-    fn enqueue(&self, value: &Value) {
-        if let Ok(line) = Self::encode(value) {
-            let _ = self.jobs.try_send(WriteJob {
+    /// Queue a line without waiting for it. A full queue (the server stopped
+    /// reading) or a stopped writer is an error, never a silent drop.
+    fn enqueue(&self, value: &Value) -> std::io::Result<()> {
+        let line = Self::encode(value)?;
+        self.jobs
+            .try_send(WriteJob {
                 line,
                 done: None,
                 abandoned: Arc::default(),
-            });
-        }
+            })
+            .map_err(|error| {
+                let reason = match error {
+                    TrySendError::Full(_) => "stdin queue is full",
+                    TrySendError::Disconnected(_) => "stdin writer stopped",
+                };
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("MCP server request could not be answered: {reason}"),
+                )
+            })
     }
 }
 
@@ -627,6 +646,33 @@ mod tests {
         // n=1 was already being written when its caller gave up, so it lands;
         // n=2 never started and is dropped; n=3 is written after n=1.
         assert_eq!(text, "{\"n\":1}\n{\"n\":3}\n");
+    }
+
+    #[test]
+    fn a_reply_that_cannot_be_queued_is_an_error_not_a_drop() {
+        let (release, gate) = mpsc::channel();
+        let writer = StdinWriter::spawn(GatedPipe {
+            gate: Some(gate),
+            written: Arc::default(),
+        });
+        let ping = |id: usize| writer.enqueue(&server_request_reply(json!(id), "ping"));
+        // One line blocks in the stalled pipe, then the queue fills.
+        ping(0).unwrap();
+        // Let the writer thread take it, so the slots below are all queue.
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        while writer.jobs.try_send(WriteJob {
+            line: Vec::new(),
+            done: None,
+            abandoned: Arc::new(AtomicBool::new(true)),
+        })
+        .is_ok()
+        {
+            assert!(started.elapsed() < Duration::from_secs(5), "queue never filled");
+        }
+        let error = ping(1).unwrap_err();
+        assert!(error.to_string().contains("stdin queue is full"), "{error}");
+        drop(release);
     }
 
     #[test]

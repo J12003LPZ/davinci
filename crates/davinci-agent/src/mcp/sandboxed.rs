@@ -83,27 +83,41 @@ impl State {
             let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                 continue;
             };
-            let Some(object) = value.as_object() else {
-                continue;
+            // A JSON-RPC batch is an array of messages; each member is routed
+            // as if it had arrived on its own line.
+            let messages = match value {
+                Value::Array(members) => members,
+                other => vec![other],
             };
-            if object.get("method").and_then(Value::as_str).is_some() {
-                if object.get("id").is_some() {
-                    self.queue_server_request(value, line.len());
-                    if self.failure.is_some() {
-                        self.stdout = Vec::new();
-                        return;
-                    }
+            let count = messages.len().max(1);
+            for message in messages {
+                // Queue accounting charges each member its share of the line.
+                self.receive_message(message, line.len() / count);
+                if self.failure.is_some() {
+                    self.stdout = Vec::new();
+                    return;
                 }
-                continue;
             }
-            let Some(id) = object.get("id").and_then(Value::as_u64) else {
-                continue;
-            };
-            if self.awaiting == Some(id)
-                && (object.contains_key("result") || object.contains_key("error"))
-            {
-                self.responses.entry(id).or_insert(value);
+        }
+    }
+
+    fn receive_message(&mut self, value: Value, bytes: usize) {
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        if object.get("method").and_then(Value::as_str).is_some() {
+            if object.get("id").is_some() {
+                self.queue_server_request(value, bytes);
             }
+            return;
+        }
+        let Some(id) = object.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        if self.awaiting == Some(id)
+            && (object.contains_key("result") || object.contains_key("error"))
+        {
+            self.responses.entry(id).or_insert(value);
         }
     }
 
@@ -748,6 +762,23 @@ mod tests {
             Some(&json!({"ok":true}))
         );
         assert!(state.failure.is_none());
+    }
+
+    #[test]
+    fn batched_stdout_delivers_the_awaited_reply_and_queues_requests() {
+        let mut state = State {
+            awaiting: Some(5),
+            ..Default::default()
+        };
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 11, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 5, "result": {"tools": []}},
+            "not a message"
+        ]);
+        state.receive_stdout(format!("{batch}\n").as_bytes());
+        assert!(state.failure.is_none(), "{:?}", state.failure);
+        assert_eq!(state.responses[&5]["result"], json!({"tools": []}));
+        assert_eq!(state.take_server_requests()[0]["id"], 11);
     }
 
     #[test]
