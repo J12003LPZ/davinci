@@ -6,32 +6,31 @@
 //! The host fills every list and decides every action; this view only draws.
 //! No TypeScript counterpart.
 //!
-//! Layout, top to bottom:
+//! Layout, top to bottom (the tab bar and search box stay pinned while the
+//! list scrolls; every row is separated from the next by a blank line):
 //!
 //! ```text
-//!   Installed 3   Discover   Marketplaces 1                      2/3
-//!   ━━━━━━━━━━━━  ─────────────────────────────────────────────────
+//!  Installed (3)  Discover  Marketplaces (1)      ✗ 1 error · ! 1 needs auth   2/3
 //!
-//!   ● code-review@claude-plugins-official        enabled · v1.0.0
-//!   │ from davinci · 1 command · 1 agent · hooks approved
-//! ❯ ! superpowers@superpowers-marketplace          enabled
-//!     from Claude Code · v6.2.0 · 14 skills · hooks need approval
-//!   ○ caveman@caveman                                disabled
-//!     from Codex · v1.4.0 · 20 skills · no hooks
+//!   ● code-review@claude-plugins-official · enabled · v1.0.0
+//!     from davinci · 1 command · 1 agent · hooks approved
+//!
+//! ❯ ! superpowers@superpowers-marketplace  ! needs auth · enabled
+//!     from Claude Code · v6.2.0 · 14 skills
+//!     401 from the server; run /login for it.
 //! ```
 //!
-//! The tab bar, its rule and the search box are pinned; the list scrolls
-//! under them. Unselected rows are two lines (name and status, one clipped
-//! description); the selected row opens into a full card behind a guide bar.
+//! The selected row shows two description lines and its note; the rest clip
+//! their description to one line. Skills never carry a problem badge.
 
 use super::sheet::{hint, Composer, SheetChrome};
 use crate::davinci::model::{ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, Model};
 use crate::davinci::theme::{State, Theme};
 use crate::davinci::ui::{
-    self, clip_ellipsis, pad, run_width, span, truncate_run, wrap, SELECTION_BAR, UNSELECTED_BAR,
+    self, clip_ellipsis, pad, span, truncate_run, wrap, SELECTION_BAR, UNSELECTED_BAR,
 };
 use ratatui::{
-    style::Color,
+    style::{Color, Style},
     text::{Line, Span},
 };
 
@@ -77,50 +76,127 @@ fn position(sheet: &ExtensionsSheet) -> Option<String> {
     (total > 0).then(|| format!("{}/{total}", index + 1))
 }
 
-/// The tab labels and the rule under them: the open view sits on a heavy
-/// accent stretch of an otherwise hair-thin rule.
+/// What is wrong with a row, if anything. Skills are instructions, not
+/// processes, so they never carry one; plugins and MCP servers do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Problem {
+    Error,
+    Auth,
+    Attention,
+}
+
+impl Problem {
+    fn of(item: &ExtensionRow, tab: ExtensionTab) -> Option<Self> {
+        if tab == ExtensionTab::Skills {
+            return None;
+        }
+        match item.state {
+            State::Failed | State::Attention => {}
+            _ => return None,
+        }
+        let text = format!(
+            "{} {}",
+            item.status,
+            item.note.as_deref().unwrap_or_default()
+        )
+        .to_lowercase();
+        let auth = [
+            "401",
+            "403",
+            "unauthor",
+            "forbidden",
+            "auth",
+            "login",
+            "token",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle));
+        Some(match (item.state, auth) {
+            (_, true) => Self::Auth,
+            (State::Failed, false) => Self::Error,
+            _ => Self::Attention,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Auth => "needs auth",
+            Self::Attention => "needs attention",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Error => State::Failed.glyph(),
+            Self::Auth | Self::Attention => State::Attention.glyph(),
+        }
+    }
+
+    fn color(self, th: &Theme) -> Color {
+        match self {
+            Self::Error => th.error,
+            Self::Auth | Self::Attention => th.warning,
+        }
+    }
+}
+
+/// `2 errors · 1 needs auth` over everything installed of this kind, so a
+/// problem is visible from Discover too.
+fn problem_summary(model: &Model, sheet: &ExtensionsSheet) -> Vec<Span<'static>> {
+    let th = &model.theme;
+    let mut out = Vec::new();
+    for kind in [Problem::Error, Problem::Auth, Problem::Attention] {
+        let n = sheet
+            .current_rows()
+            .iter()
+            .filter(|row| Problem::of(row, sheet.tab) == Some(kind))
+            .count();
+        if n == 0 {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(span(" · ", th.muted));
+        }
+        let label = match (kind, n) {
+            (Problem::Error, 1) => "1 error".to_string(),
+            (Problem::Error, n) => format!("{n} errors"),
+            (kind, n) => format!("{n} {}", kind.label()),
+        };
+        out.push(span(format!("{} {label}", kind.glyph()), kind.color(th)));
+    }
+    out
+}
+
+/// One row of tabs; the open one is a filled pill, as in Claude Code's
+/// plugin manager. Problems and the list position sit flush right.
 fn tab_bar(model: &Model, sheet: &ExtensionsSheet) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let cc = th.cc();
     let width = width_of(model);
-    let mut labels: Vec<Span<'static>> = vec![pad(2, None)];
-    let mut column = 2u16;
-    let mut open = (2u16, 0u16);
-    for (i, view) in sheet.tab.views().iter().enumerate() {
-        if i > 0 {
-            labels.push(pad(3, None));
-            column += 3;
-        }
-        let name = view.label();
-        let count = view_count(sheet, *view).map(|n| format!(" {n}"));
-        let used = (name.chars().count() + count.as_ref().map_or(0, |c| c.chars().count())) as u16;
-        let active = *view == sheet.view;
-        if active {
-            open = (column, used);
-        }
-        labels.push(span(name, if active { cc.permission } else { th.muted }));
-        if let Some(count) = count {
-            labels.push(span(
-                count,
-                if active { cc.permission } else { cc.inactive },
+    let mut labels: Vec<Span<'static>> = vec![pad(1, None)];
+    for view in sheet.tab.views() {
+        let name = match view_count(sheet, *view) {
+            Some(count) => format!("{} ({count})", view.label()),
+            None => view.label().to_string(),
+        };
+        if *view == sheet.view {
+            labels.push(Span::styled(
+                format!(" {name} "),
+                Style::default().fg(th.background).bg(th.text),
             ));
+        } else {
+            labels.push(span(format!(" {name} "), th.muted));
         }
-        column += used;
     }
-    let right = position(sheet)
-        .map(|text| vec![span(text, th.muted), pad(2, None)])
-        .unwrap_or_default();
-    let top = ui::spread(width, labels, right);
-
-    let rule_end = width.saturating_sub(2);
-    let mut rule: Vec<Span<'static>> = vec![pad(2.min(width), None)];
-    let (start, len) = open;
-    let (start, end) = (start.min(rule_end), (start + len).min(rule_end));
-    let hair = |n: u16| span("─".repeat(usize::from(n)), th.border);
-    rule.push(hair(start.saturating_sub(2)));
-    rule.push(span("━".repeat(usize::from(end - start)), cc.permission));
-    rule.push(hair(rule_end - end));
-    vec![top, fit(rule, width)]
+    let mut right = problem_summary(model, sheet);
+    if let Some(text) = position(sheet) {
+        if !right.is_empty() {
+            right.push(span("  ", th.muted));
+        }
+        right.push(span(text, th.muted));
+    }
+    right.push(pad(2, None));
+    vec![ui::spread(width, labels, right)]
 }
 
 /// A rounded box with `inner` on the left and `right` flush right.
@@ -290,24 +366,6 @@ fn status_color(word: &str, th: &Theme) -> Color {
     }
 }
 
-/// `connected · 4 tools` as chips, longest prefix of whole segments that fits:
-/// a clipped `v…` says nothing, a dropped version number says less than a cut one.
-fn status_spans(status: &str, room: u16, th: &Theme) -> Vec<Span<'static>> {
-    let mut parts = status.split(" · ").filter(|part| !part.is_empty());
-    let Some(first) = parts.next() else {
-        return Vec::new();
-    };
-    let mut out = vec![span(clip_ellipsis(first, room), status_color(first, th))];
-    for part in parts {
-        let extra = span(format!(" · {part}"), th.muted);
-        if run_width(&out) + run_width(std::slice::from_ref(&extra)) > room {
-            break;
-        }
-        out.push(extra);
-    }
-    out
-}
-
 /// The name with its qualifier dimmed: `name@marketplace`, `owner/name`.
 fn title_spans(title: &str, selected: bool, th: &Theme) -> Vec<Span<'static>> {
     let cc = th.cc();
@@ -337,9 +395,10 @@ fn note_color(item: &ExtensionRow, th: &Theme) -> Color {
     }
 }
 
-/// One row: name and status on the first line, one clipped description under
-/// it. The selected row opens into a card: the full description, the host's
-/// note and any pending confirmation, behind a guide bar.
+/// One row, three lines with a blank under it: name, then `· status · source`
+/// in muted ink, then one clipped description. A problem is badged on the
+/// first line and never folded away. The selected row also shows its note and
+/// any pending confirmation, indented under the description.
 fn card(
     model: &Model,
     item: &ExtensionRow,
@@ -351,14 +410,26 @@ fn card(
     let cc = th.cc();
     let width = width_of(model);
     let body = width.saturating_sub(INDENT);
-    let meta_room = if width < 48 {
-        0
-    } else {
-        (body.saturating_mul(2) / 5).min(44)
+    let tab = model
+        .extension_manager
+        .as_ref()
+        .map_or(ExtensionTab::Plugins, |sheet| sheet.tab);
+    let problem = Problem::of(item, tab);
+    // Skills are instructions: whatever state a host reports, they are fine.
+    let mut healthy;
+    let item =
+        if tab == ExtensionTab::Skills && matches!(item.state, State::Failed | State::Attention) {
+            healthy = item.clone();
+            healthy.state = State::Done;
+            &healthy
+        } else {
+            item
+        };
+    let (mark, mark_color) = match problem {
+        Some(problem) => (problem.glyph(), problem.color(th)),
+        None => glyph(item, kind, th),
     };
-    let name_room = body.saturating_sub(if meta_room == 0 { 0 } else { meta_room + 2 });
-    let (mark, mark_color) = glyph(item, kind, th);
-    let mut left = vec![
+    let mut line = vec![
         span(
             if selected {
                 SELECTION_BAR
@@ -370,71 +441,56 @@ fn card(
         span(mark, mark_color),
         pad(1, None),
     ];
-    left.extend(truncate_run(
-        title_spans(&item.title, selected, th),
-        name_room,
-    ));
-    let right = if meta_room == 0 {
-        Vec::new()
-    } else {
-        status_spans(&item.status, meta_room, th)
-    };
-    let mut rows = vec![ui::spread(width, left, right)];
+    line.extend(title_spans(&item.title, selected, th));
+    if let Some(problem) = problem {
+        line.push(span(
+            format!("  {} {}", problem.glyph(), problem.label()),
+            problem.color(th),
+        ));
+    }
+    let mut parts = item.status.split(" · ").filter(|part| !part.is_empty());
+    if let Some(first) = parts.next() {
+        line.push(span(" · ", th.muted));
+        line.push(span(first.to_string(), status_color(first, th)));
+        for part in parts {
+            line.push(span(format!(" · {part}"), th.muted));
+        }
+    }
+    let mut rows = vec![fit(line, width)];
 
     let lead = || pad(INDENT.min(width), None);
-    if !selected {
-        let first = item.detail.lines().next().unwrap_or("");
-        if !first.is_empty() {
+    let indent_rows = |text: &str, ink: Color, limit: usize| -> Vec<Line<'static>> {
+        text.lines()
+            .flat_map(|line| wrap(line, body))
+            .take(limit)
+            .map(|text| fit(vec![lead(), span(text, ink)], width))
+            .collect()
+    };
+    let first = item.detail.lines().next().unwrap_or("");
+    if selected {
+        rows.extend(indent_rows(&item.detail, th.text, 2));
+    } else if !first.is_empty() {
+        rows.push(fit(
+            vec![lead(), span(clip_ellipsis(first, body), th.muted)],
+            width,
+        ));
+    }
+    if let Some(note) = item.note.as_deref().filter(|n| !n.is_empty()) {
+        let ink = note_color(item, th);
+        if selected {
+            rows.extend(indent_rows(note, ink, 3));
+        } else if problem.is_some() {
+            let first = note.lines().next().unwrap_or("");
             rows.push(fit(
-                vec![lead(), span(clip_ellipsis(first, body), th.muted)],
+                vec![lead(), span(clip_ellipsis(first, body), ink)],
                 width,
             ));
         }
-        // A problem is never folded away: a failed or attention row keeps the
-        // first line of its note in view until it is selected.
-        if matches!(item.state, State::Failed | State::Attention) {
-            if let Some(note) = item.note.as_deref().and_then(|n| n.lines().next()) {
-                rows.push(fit(
-                    vec![
-                        lead(),
-                        span(clip_ellipsis(note, body), note_color(item, th)),
-                    ],
-                    width,
-                ));
-            }
-        }
-        return rows;
-    }
-    let guide = |color: Color, text: String, ink: Color| {
-        fit(
-            vec![
-                pad(2.min(width), None),
-                span("│", color),
-                pad(1, None),
-                span(text, ink),
-            ],
-            width,
-        )
-    };
-    let inner = width.saturating_sub(INDENT);
-    for line in item.detail.lines() {
-        for text in wrap(line, inner) {
-            rows.push(guide(cc.permission, text, th.text));
-        }
-    }
-    if let Some(note) = &item.note {
-        let ink = note_color(item, th);
-        for line in note.lines() {
-            for text in wrap(line, inner) {
-                rows.push(guide(cc.permission, text, ink));
-            }
-        }
     }
     if let Some(warning) = confirm {
-        for text in wrap(&warning, inner) {
-            rows.push(guide(th.warning, text, th.warning));
-        }
+        rows.extend(indent_rows(&warning, th.warning, 3));
     }
+    rows.push(Line::default());
     rows
 }
 
@@ -690,16 +746,16 @@ mod tests {
         let m = model(100);
         let drawn = text(&lines(&m));
         for value in [
-            "Installed 2",
+            "Installed (2)",
             "Discover",
-            "Marketplaces 1",
+            "Marketplaces (1)",
             "superpowers@superpowers-marketplace",
             "detail of caveman@caveman",
             "hooks changed, approval needed",
         ] {
             assert!(drawn.contains(value), "missing {value}:\n{drawn}");
         }
-        assert_eq!(ui::focused_row(&lines(&m)), Some(3));
+        assert_eq!(ui::focused_row(&lines(&m)), Some(2));
         let header: String = chrome(&m)
             .header_right
             .iter()
@@ -728,7 +784,7 @@ mod tests {
         let sheet = m.extension_manager.as_mut().unwrap();
         sheet.tab = ExtensionTab::Skills;
         let drawn = text(&lines(&m));
-        assert!(drawn.contains("Installed 1"), "{drawn}");
+        assert!(drawn.contains("Installed (1)"), "{drawn}");
         assert!(!drawn.contains("Marketplaces"), "{drawn}");
         let sheet = m.extension_manager.as_mut().unwrap();
         sheet.switch_view(1);

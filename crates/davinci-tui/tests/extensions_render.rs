@@ -75,7 +75,7 @@ fn a_long_registry_keeps_its_header_and_the_selected_row_on_screen() {
         let rows = draw(&m);
         let text = rows.join("\n");
         assert!(
-            text.contains("Installed 0"),
+            text.contains("Installed (0)"),
             "tab bar scrolled away:\n{text}"
         );
         assert!(text.contains("Search the MCP Registry"), "{text}");
@@ -114,25 +114,28 @@ fn rows_are_never_wider_than_the_terminal() {
 }
 
 #[test]
-fn a_selected_card_opens_and_the_others_stay_two_lines() {
+fn rows_are_separated_and_the_selected_one_shows_more() {
     let m = model(100, 40, discover_sheet(6, 2));
     let rows = draw(&m);
-    let text = rows.join("\n");
-    // The selected row shows its whole description and its install preview.
-    assert!(text.contains("pushing the list around."), "{text}");
+    let text = rows.join(
+        "
+",
+    );
+    // Status follows the name on the same line, not in a far column.
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("owner2/server-2 · featured · MCP Registry · v1.10.1")),
+        "{text}"
+    );
+    // The selected row opens its description and install preview.
     assert!(text.contains("Adds server-2: runs npx"), "{text}");
-    // An unselected row shows neither: its description is clipped.
+    // Others clip to one line and hide the preview.
     assert!(!text.contains("Adds server-3"), "{text}");
     let clipped = rows.iter().find(|r| r.contains("Description of server 3"));
     assert!(clipped.is_some_and(|r| r.contains('…')), "{text}");
-}
-
-#[test]
-fn status_chips_drop_whole_segments_instead_of_cutting_one() {
-    let m = model(60, 30, discover_sheet(3, 0));
-    let text = draw(&m).join("\n");
-    assert!(text.contains("featured"), "{text}");
-    assert!(!text.contains("v…"), "a version cut to `v…`:\n{text}");
+    // A blank row separates one entry from the next.
+    let at = rows.iter().position(|r| r.contains("server-3")).unwrap();
+    assert!(rows[at - 1].trim().is_empty(), "{text}");
 }
 
 #[test]
@@ -160,4 +163,109 @@ fn a_failed_row_keeps_its_error_visible_when_not_selected() {
     let text = draw(&model(100, 24, sheet)).join("\n");
     assert!(text.contains("executable not found"), "{text}");
     assert!(text.contains("connected · 4 tools"), "{text}");
+}
+
+fn problem_sheet(tab: ExtensionTab) -> ExtensionsSheet {
+    let row = |title: &str, status: &str, state: State, note: &str| ExtensionRow {
+        key: title.into(),
+        title: title.into(),
+        status: status.into(),
+        state,
+        detail: format!("detail of {title}"),
+        note: Some(note.into()),
+        ..ExtensionRow::default()
+    };
+    let rows = vec![
+        row("fine", "connected · 4 tools", State::Done, "all good"),
+        row(
+            "broken",
+            "error",
+            State::Failed,
+            "Cannot start server: spawn ENOENT",
+        ),
+        row("locked", "error", State::Failed, "HTTP 401 Unauthorized"),
+        row(
+            "stale",
+            "enabled · not running",
+            State::Attention,
+            "Starts with the next session.",
+        ),
+    ];
+    let mut sheet = ExtensionsSheet {
+        tab,
+        ..ExtensionsSheet::default()
+    };
+    match tab {
+        ExtensionTab::Skills => sheet.skills = rows,
+        ExtensionTab::Mcp => sheet.mcp = rows,
+        ExtensionTab::Plugins => sheet.plugins = rows,
+    }
+    sheet
+}
+
+#[test]
+fn errors_and_missing_auth_are_badged_and_counted_for_mcp_and_plugins() {
+    for tab in [ExtensionTab::Mcp, ExtensionTab::Plugins] {
+        let text = draw(&model(100, 40, problem_sheet(tab))).join(
+            "
+",
+        );
+        assert!(
+            text.contains("broken  × error"),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            text.contains("locked  ! needs auth"),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            text.contains("stale  ! needs attention"),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            text.contains("1 error"),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            text.contains("1 needs auth"),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            !text.contains("fine  !"),
+            "{tab:?}:
+{text}"
+        );
+    }
+}
+
+#[test]
+fn the_problem_summary_follows_you_into_discover() {
+    let mut sheet = problem_sheet(ExtensionTab::Mcp);
+    sheet.view = ExtensionView::Discover;
+    let text = draw(&model(100, 30, sheet)).join(
+        "
+",
+    );
+    assert!(text.contains("1 error"), "{text}");
+}
+
+#[test]
+fn skills_never_show_a_problem() {
+    let text = draw(&model(100, 40, problem_sheet(ExtensionTab::Skills))).join(
+        "
+",
+    );
+    assert!(!text.contains('×') && !text.contains("  !"), "{text}");
+    for word in ["× error", "needs auth", "needs attention", "1 error"] {
+        assert!(
+            !text.contains(word),
+            "{word}:
+{text}"
+        );
+    }
 }
