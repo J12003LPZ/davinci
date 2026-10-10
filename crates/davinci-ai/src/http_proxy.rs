@@ -111,7 +111,9 @@ fn get_proxy_for_url(target_url: &str, env: Option<&HashMap<String, String>>) ->
         proxy = get_proxy_env("all_proxy", env);
     }
     if !proxy.is_empty() && !proxy.contains("://") {
-        proxy = format!("{protocol}://{proxy}");
+        // A bare `host:port` names an HTTP proxy whatever the target scheme
+        // is, as with curl; the target's own scheme says nothing about it.
+        proxy = format!("http://{proxy}");
     }
     proxy
 }
@@ -144,15 +146,41 @@ pub fn http_connect_request(target_host: &str, target_port: u16, proxy: &Url) ->
         "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n"
     );
     if !proxy.username().is_empty() {
-        let password = proxy.password().unwrap_or("");
-        let token = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            format!("{}:{password}", proxy.username()),
-        );
+        // `Url` keeps userinfo percent-encoded; the credentials are the
+        // decoded bytes.
+        let user = percent_decode(proxy.username());
+        let password = percent_decode(proxy.password().unwrap_or(""));
+        let mut credentials = user;
+        credentials.push(b':');
+        credentials.extend_from_slice(&password);
+        let token = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, credentials);
         request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
     }
     request.push_str("\r\n");
     request
+}
+
+/// Decode `%XX` escapes; a `%` not followed by two hex digits stays literal.
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = bytes
+                .get(index + 1..index + 3)
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            if let Some(value) = pair {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
 }
 
 pub fn connect_response_ok(response: &str) -> bool {
@@ -238,7 +266,12 @@ pub fn tcp_connect_via_http_proxy(
             .read(&mut byte)
             .map_err(|err| format!("WebSocket connect failed: {err}"))?;
         if n == 0 {
-            break;
+            // EOF before the blank line: the response is incomplete, and a
+            // bare `200` status line must not open a tunnel.
+            return Err(
+                "WebSocket connect failed: proxy closed the connection before completing the CONNECT response"
+                    .to_string(),
+            );
         }
         collected.push(byte[0]);
         if collected.ends_with(b"\r\n\r\n") {
@@ -462,6 +495,50 @@ mod tests {
             server.join().unwrap();
         }
         (result, elapsed)
+    }
+
+    #[test]
+    fn scheme_less_proxy_is_an_http_proxy_for_https_targets() {
+        for key in ["HTTPS_PROXY", "ALL_PROXY"] {
+            let scoped = env(&[(key, "proxy.example:8080")]);
+            let url = resolve_http_proxy_url_for_target("https://api.example.com", Some(&scoped))
+                .unwrap()
+                .expect("a proxy");
+            assert_eq!(url.scheme(), "http");
+            assert_eq!(url.host_str(), Some("proxy.example"));
+            assert_eq!(url.port(), Some(8080));
+        }
+        let scoped = env(&[("HTTP_PROXY", "proxy.example:8080")]);
+        assert!(
+            resolve_http_proxy_url_for_target("http://api.example.com", Some(&scoped))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn proxy_basic_credentials_are_percent_decoded() {
+        let proxy = Url::parse("http://us%40er%20name:p%3Ass%25w%40rd@proxy.example:8080").unwrap();
+        let request = http_connect_request("chatgpt.com", 443, &proxy);
+        let token = request
+            .lines()
+            .find_map(|line| line.strip_prefix("Proxy-Authorization: Basic "))
+            .expect("auth header");
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token).unwrap();
+        assert_eq!(decoded, b"us@er name:p:ss%w@rd");
+        assert_eq!(percent_decode("100%"), b"100%");
+        assert_eq!(percent_decode("%zz%4"), b"%zz%4");
+    }
+
+    #[test]
+    fn connect_ok_status_without_the_blank_line_is_not_a_tunnel() {
+        let (result, _) = connect_to_fake_proxy(Duration::from_secs(5), |mut stream| {
+            stream.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+            // Close without the terminating CRLF CRLF.
+        });
+        let error = result.unwrap_err();
+        assert!(error.contains("before completing"), "{error}");
     }
 
     #[test]

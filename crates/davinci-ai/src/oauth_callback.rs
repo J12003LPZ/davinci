@@ -370,12 +370,9 @@ impl CallbackServer {
 
     pub fn redirect_uri(&self) -> Result<String, String> {
         let addr = self.local_addr()?;
-        Ok(format!(
-            "http://{}:{}{}",
-            addr.ip(),
-            addr.port(),
-            self.provider.path()
-        ))
+        // `SocketAddr` brackets IPv6 hosts (`[::1]:port`); a bare `::1:port`
+        // is not a valid authority.
+        Ok(format!("http://{addr}{}", self.provider.path()))
     }
 
     pub fn accept_one(&mut self) -> Result<CallbackResponse, String> {
@@ -489,7 +486,9 @@ impl CallbackServer {
         if response.code.is_some() {
             self.used = true;
         }
-        write_http_response(&mut stream, &response)?;
+        // The code is already in hand. A browser that disconnects before the
+        // reply is written must not cost the login its one-time code.
+        let _ = write_http_response(&mut stream, &response);
         Ok(Some(response))
     }
 }
@@ -658,6 +657,39 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.code.as_deref(), Some("pi-fixture-loop"));
         assert!(response.body.contains(TITLE_SUCCESS));
+    }
+
+    #[test]
+    fn ipv6_redirect_uri_brackets_the_host() {
+        let Ok(server) = CallbackServer::bind("::1", 0, CallbackProvider::Anthropic, "s") else {
+            return; // no IPv6 loopback on this machine
+        };
+        let uri = server.redirect_uri().unwrap();
+        let parsed = url::Url::parse(&uri).expect("valid redirect URI");
+        assert_eq!(parsed.host_str(), Some("[::1]"));
+        assert_eq!(parsed.port(), Some(server.local_addr().unwrap().port()));
+        assert_eq!(parsed.path(), "/callback");
+        let v4 = CallbackServer::bind("127.0.0.1", 0, CallbackProvider::Anthropic, "s").unwrap();
+        assert!(v4.redirect_uri().unwrap().starts_with("http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn a_browser_that_hangs_up_does_not_lose_the_code() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::Anthropic, "state-1").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .write_all(b"GET /callback?code=kept&state=state-1 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            // Hang up without reading the reply.
+            let _ = client.shutdown(std::net::Shutdown::Both);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let response = server.accept_until(deadline).unwrap();
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("kept"));
     }
 
     #[test]

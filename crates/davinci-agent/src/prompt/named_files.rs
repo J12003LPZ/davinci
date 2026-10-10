@@ -177,7 +177,8 @@ pub fn candidate_paths(text: &str) -> Vec<String> {
             || token.len() > 256
             || token.contains("://")
             || token.starts_with(['-', '~', '/', '\\'])
-            || token.contains("..")
+            // Only a `..` path component climbs out; `release..notes.txt` is a name.
+            || token.split(['/', '\\']).any(|component| component == "..")
             || !token
                 .chars()
                 .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
@@ -521,6 +522,13 @@ mod tests {
         assert!(candidate_paths("version 1.2 and 3.14 things").is_empty());
         assert!(candidate_paths("run --config=x.toml ../../etc/passwd").is_empty());
         assert_eq!(candidate_paths("a.py a.py"), vec!["a.py"]);
+        assert_eq!(
+            candidate_paths("Look at release..notes.txt and docs/v1..v2.md"),
+            vec!["release..notes.txt", "docs/v1..v2.md"]
+        );
+        for climbing in ["..", "../a.py", "a/../b.py", "..\\a.py", "a\\..\\b.py"] {
+            assert!(candidate_paths(climbing).is_empty(), "{climbing}");
+        }
     }
 
     #[test]
