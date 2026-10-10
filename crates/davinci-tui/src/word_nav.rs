@@ -75,8 +75,11 @@ pub fn default_word_segments(text: &str) -> Vec<WordSegment> {
     segments
 }
 
+/// Letters and digits of any script (`café`, `mañana`, `straße`), plus
+/// combining marks so a decomposed `é` stays one word. CJK is segmented
+/// separately by a dictionary.
 fn is_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+    !is_cjk(ch) && (ch.is_alphanumeric() || ch == '_' || matches!(ch as u32, 0x0300..=0x036F))
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -383,5 +386,27 @@ mod tests {
             },
         ];
         assert_eq!(find_word_forward(&text[6..], 0, &after), marker.len());
+    }
+
+    #[test]
+    fn accented_and_non_latin_words_are_one_word() {
+        let end = |t: &str| t.len();
+        assert_eq!(find_word_backward_default("hola café", end("hola café")), 5);
+        assert_eq!(find_word_backward_default("mañana", end("mañana")), 0);
+        assert_eq!(
+            find_word_backward_default("über straße", end("über straße")),
+            6
+        );
+        let decomposed = "cafe\u{301} x";
+        assert_eq!(
+            find_word_backward_default(decomposed, decomposed.len() - 2),
+            0
+        );
+        assert_eq!(
+            find_word_backward_default("привет мир", end("привет мир")),
+            13
+        );
+        assert_eq!(find_word_forward_default("café au", 0), "café".len());
+        assert_eq!(find_word_forward_default("mañana!", 0), "mañana".len());
     }
 }

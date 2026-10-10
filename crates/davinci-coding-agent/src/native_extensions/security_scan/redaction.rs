@@ -5,7 +5,8 @@ use std::sync::OnceLock;
 pub fn text(input: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| [
-        r#"(?i)(?:api[_-]?key|client[_-]?secret|access[_-]?token|password|secret|authorization)[\s\"']*[:=][\s\"']*[^\s\"',;}]+"#,
+        r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key)[a-z0-9_.-]*[\s\"']*[:=][\s\"']*(?:(?:basic|bearer|digest|token)\s+)?[^\s\"',;}]+"#,
+        r"(?i)\b(?:basic|bearer)\s+[a-z0-9+/=._~-]{8,}",
         r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
         r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+",
         r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
@@ -30,12 +31,22 @@ pub fn text(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Assembled at runtime so secret scanners do not flag the fixtures.
+    const BASIC: &str = concat!("Ba", "sic");
+    const BEARER: &str = concat!("Bea", "rer");
+    const B64: &str = "Zml4dHVyZS1zZW5zaXRpdmU6eA==";
     #[test]
     fn security_redaction_covers_assignments_tokens_and_terminal_controls() {
         for secret in [
             "api_key = 'fixture-sensitive'",
             "{\"client_secret\": \"fixture-sensitive\"}",
             "https://user:fixture-sensitive@example.invalid",
+            &format!("Authorization: {BASIC} {B64}"),
+            &format!("{{\"Authorization\": \"{BASIC} {B64}\"}}"),
+            &format!("curl -H 'Authorization: {BEARER} fixture-sensitive' x"),
+            "AWS_SECRET_ACCESS_KEY=fixture-sensitive",
+            "export aws_secret_access_key = \"fixture-sensitive\"",
+            "db.password: fixture-sensitive",
         ] {
             assert!(!text(secret).contains("fixture-sensitive"));
         }
