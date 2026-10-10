@@ -68,7 +68,24 @@ More gaps were found while fixing, all in the redaction helpers and all closed i
 | Extension writes under `--no-session` | Not changed: print mode turns `failures` into the reply, so every answer would become an error; not persisting is the `--no-session` contract | none |
 | `cargo tree` still reads project `.cargo/config.toml` (`build.rustc-wrapper`) | Open: needs filesystem awareness the string policy lacks; predates this PR | follow-up |
 | Two cwd encoders remain | Open, low: `JsonlSessionRepo::list` has no production caller | follow-up |
-| Whole-file masking per `sec_source_read` | Open, performance: cache masked text per path and side | follow-up |
+| Whole-file masking per `sec_source_read` | Fixed in round 2 (below) | round 2 |
+
+Second review of #172 and #173 (ten findings, all fixed in round 2):
+
+| Item | Resolution |
+|---|---|
+| Spaces were stripped before the key-text test, so `rm -rf /` in a planted block read as key material | A body line is one unbroken base64 token or only quoted fragments, at least 40 characters unless the closing marker follows; text with spaces is never key text |
+| A marker line was masked whole (also in `redact_evidence`), hiding code beside a planted marker | Only the marker and key-like runs inside the block are masked; `redact_evidence` uses the same pass |
+| `password: str = "..."` and other typed assignments leaked the value | Shared separator accepts a type annotation before `=` (also in the per-line redactor) |
+| Go `:=` and backtick strings leaked after the first word | Both accepted by the quoted-assignment mask |
+| `input("Password: ")` opened a quoted value that ran across lines and hid code | A key inside an open string literal cannot start a multi-line value; the scan resumes after the key so a later real assignment is still masked |
+| URL username with an unencoded `@` was never matched | Username may hold `@` (not `/`, `?`, `#`) |
+| `user:2024/abc@host` read as a port and leaked | Digits then `/` count as a port only when the `@` starts a path segment or another delimiter precedes it; otherwise masked (fail closed: `h:8443/u@x` now hides its host) |
+| A failed answer to a server ping discarded our correlated MCP reply | Answers to server requests are best effort; the reply is returned |
+| Unusual-whitespace fallback marked `git status 2>/dev/null` and similar reads as GitMutation | Fallback applies only when the segment holds whitespace or control characters other than space and tab |
+| Each `sec_source_read` re-masked the whole file | Masked text cached per (side, path) on the snapshot, never serialized, empty on clone |
+
+Known residuals: an unquoted 40+ character base64-only token with a digit, `+`, `/` or `=` inside a planted block (such as a long dot-free path) is still masked as key text; a key body line with none of those characters (about one line in a million) is not masked.
 
 ## Confirmed findings
 

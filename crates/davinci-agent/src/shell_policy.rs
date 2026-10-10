@@ -800,12 +800,21 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
         };
         let unsafe_git = match literal_shell_words(&without_stderr_join) {
             Some(words) => is_git(&words[0]) && !git_is_read_only(&words),
-            // Words the literal lexer refuses (unusual whitespace, quoting it
-            // cannot model) cannot prove a git command read-only.
-            None => without_stderr_join
-                .split(|ch: char| ch.is_whitespace() || ch.is_control())
-                .find(|word| !word.is_empty())
-                .is_some_and(|program| is_git(program.trim_matches(['"', '\'']))),
+            // Unusual whitespace or a control character can split words in one
+            // shell and not another, so the git mutation pattern (which looks
+            // for `git <space> push`) may not see the command: treat any git
+            // segment written that way as a mutation. Ordinary shell syntax
+            // the lexer refuses (`$VAR`, `2>/dev/null`) is left to that
+            // pattern, as before, so read-only git keeps working.
+            None => {
+                without_stderr_join
+                    .chars()
+                    .any(|ch| (ch.is_whitespace() || ch.is_control()) && !matches!(ch, ' ' | '\t'))
+                    && without_stderr_join
+                        .split(|ch: char| ch.is_whitespace() || ch.is_control())
+                        .find(|word| !word.is_empty())
+                        .is_some_and(|program| is_git(program.trim_matches(['"', '\''])))
+            }
         };
         if git_mutation_regex().is_match(segment) || unsafe_git {
             risks.push((
@@ -1182,6 +1191,35 @@ mod tests {
             .risks
             .iter()
             .any(|(category, _)| *category == ShellRiskCategory::GitMutation));
+        // Read-only git with ordinary shell syntax the lexer refuses stays
+        // allowed for writer roles.
+        for command in [
+            "git status 2>/dev/null",
+            "git log > log.txt",
+            "git diff \"$BASE\"...HEAD",
+            "git show HEAD:{a,b}",
+        ] {
+            assert!(
+                !analyze_command(command)
+                    .risks
+                    .iter()
+                    .any(|(category, _)| *category == ShellRiskCategory::GitMutation),
+                "{command:?}"
+            );
+            assert_eq!(
+                evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
+                ShellCommandDecision::Allowed,
+                "{command:?}"
+            );
+        }
+        // Mutations behind the same syntax are still caught by the pattern.
+        assert_ne!(
+            evaluate(
+                ShellPolicyProfile::WriteNoGitMutation,
+                "git push \"$REMOTE\" main"
+            ),
+            ShellCommandDecision::Allowed
+        );
     }
 
     #[test]

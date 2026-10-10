@@ -41,9 +41,10 @@ pub fn text(input: &str) -> String {
 fn key_assignments(line: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(
-            r#"(?i)([a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*)[\s"']*(?::=|[:=])[\s"']*(?:(?:basic|bearer|digest|token)\s+)?([^\s"',;}=>][^\s"',;}]*)"#,
-        )
+        Regex::new(&format!(
+            r#"(?i)([a-z0-9_.-]*(?:api[_-]?key|client[_-]?secret|access[_-]?token|secret|password|passwd|authorization|private[_-]?key|token)[a-z0-9_.-]*)[\s"']*{}[\s"']*(?:(?:basic|bearer|digest|token)\s+)?([^\s"',;}}=>][^\s"',;}}]*)"#,
+            super::super::credential_redaction::ASSIGNMENT_SEPARATOR
+        ))
         .expect("fixed credential assignment pattern")
     });
     pattern
@@ -190,6 +191,25 @@ mod tests {
                 "{secret} -> {output}"
             );
         }
+        // Typed and Go assignments: the type sat between the key and the
+        // quote, so only `key: Type` was masked and the value leaked.
+        for secret in [
+            "password: str = \"fixture sensitive phrase\"",
+            "let password: &str = \"fixture sensitive phrase\";",
+            "password := \"fixture sensitive phrase\"",
+            "const apiKey = `fixture sensitive phrase`;",
+            "let otp_token: u32 = 12345678;",
+        ] {
+            let output = text(secret);
+            assert!(
+                !output.contains("sensitive") && !output.contains("12345678"),
+                "{secret} -> {output}"
+            );
+        }
+        assert_eq!(
+            text("let max_tokens: usize = 4096;"),
+            "let max_tokens: usize = 4096;"
+        );
         for prose in [
             "the token expires after an hour",
             "Repeated grep call blocked by token governor; change the query",
