@@ -48,7 +48,15 @@ fn key_assignments(line: &str) -> String {
     });
     pattern
         .replace_all(line, |captures: &regex::Captures<'_>| {
-            let count = captures[1].to_ascii_lowercase().contains("token")
+            // `max_tokens`, `token_limit`: a count. `TOKEN=123456` may be an
+            // OTP or PIN, so a bare numeric token stays masked.
+            let key = captures[1].to_ascii_lowercase();
+            let count = key.contains("token")
+                && [
+                    "tokens", "max", "min", "limit", "budget", "count", "num", "len",
+                ]
+                .iter()
+                .any(|word| key.contains(word))
                 && captures[2].bytes().all(|byte| byte.is_ascii_digit());
             if count {
                 captures[0].to_string()
@@ -171,10 +179,14 @@ mod tests {
             "password := fixture-sensitive",
             "token := fixture-sensitive",
             "api_token=12345abc",
+            "TOKEN=12345678",
+            "otp_token: 12345678",
         ] {
             let output = text(secret);
             assert!(
-                !output.contains("fixture-sensitive") && !output.contains("12345abc"),
+                !output.contains("fixture-sensitive")
+                    && !output.contains("12345abc")
+                    && !output.contains("12345678"),
                 "{secret} -> {output}"
             );
         }

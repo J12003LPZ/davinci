@@ -41,9 +41,11 @@ pub(super) fn quoted_assignments(input: &str) -> String {
 /// marker. Line count and terminators are preserved so line-addressed reads
 /// of the masked text still line up with the source.
 ///
-/// A block without `END` (or a PuTTY body) continues only while lines look
-/// like key material: base64, an armor header, blank. The first other line
-/// ends it, so a planted marker cannot hide the code after it from a review.
+/// Inside a block (or a PuTTY body) a line that is wholly key material
+/// (base64, an armor header, blank) is replaced. A line that only contains
+/// key material, such as `pem += "MIIE...";`, keeps the block open and has
+/// each base64 run masked in place, so the code around it stays readable.
+/// Any other line ends the block: a planted marker cannot hide later code.
 pub(super) fn private_key_blocks(input: &str) -> String {
     static MARKER: OnceLock<Regex> = OnceLock::new();
     let marker = MARKER.get_or_init(|| {
@@ -72,13 +74,19 @@ pub(super) fn private_key_blocks(input: &str) -> String {
         let putty_header = putty
             .captures(content)
             .map(|count| count[1].parse().unwrap_or(usize::MAX));
-        let key_material = key_material_line(content) || last.is_some() || putty_header.is_some();
-        if !key_material {
+        let inside = in_block || putty_lines > 0;
+        let whole =
+            last.is_some() || putty_header.is_some() || (inside && key_material_line(content));
+        let partial = inside && !whole && base64_run().is_match(content);
+        if inside && !whole && !partial {
             in_block = false;
             putty_lines = 0;
         }
-        if in_block || last.is_some() || putty_lines > 0 || putty_header.is_some() {
+        if whole {
             out.push_str(PRIVATE_KEY_MARKER);
+            out.push_str(&line[content.len()..]);
+        } else if partial {
+            out.push_str(&base64_run().replace_all(content, PRIVATE_KEY_MARKER));
             out.push_str(&line[content.len()..]);
         } else {
             out.push_str(line);
@@ -94,6 +102,12 @@ pub(super) fn private_key_blocks(input: &str) -> String {
         }
     }
     out
+}
+
+/// A run long enough to be a fragment of a key body.
+fn base64_run() -> &'static Regex {
+    static RUN: OnceLock<Regex> = OnceLock::new();
+    RUN.get_or_init(|| Regex::new(r"[A-Za-z0-9+/]{16,}={0,2}").expect("fixed base64 run pattern"))
 }
 
 /// A line that can belong to a key body: base64 (also when quoted, escaped or
@@ -125,16 +139,41 @@ fn key_material_line(content: &str) -> bool {
 
 /// Mask the password in `scheme://user:password@host` for any URL scheme:
 /// database, cache and broker URLs carry credentials the same way HTTP does.
-/// The mask runs to the last `@` of the authority, so a password holding an
-/// unencoded `@` or quote is covered, but stops at `/`, `?` or `#`: an `@` in
-/// a path or query (`https://host:8443/u?email=a@b`) is not userinfo.
+///
+/// Passwords hold unencoded `@`, `/`, `#`, `?` and quotes in practice, so the
+/// password runs from `user:` to the last `@` before the first `/`, `?` or
+/// `#` that follows the first `@`. `host:8443/...` (digits, then a delimiter,
+/// before any `@`) is a port, not userinfo: `https://h:8443/u?email=a@b`
+/// keeps its host. The rest of the token is scanned again, so a second URL
+/// in it is still masked.
 pub(super) fn url_credentials(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@]*:[^\s/?#@]*@(?:[^\s/?#@]*@)*")
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/:@]*):(\S*)")
             .expect("fixed URL credential pattern")
     });
-    pattern.replace_all(input, "$1[REDACTED]@").into_owned()
+    pattern
+        .replace_all(input, |captures: &regex::Captures<'_>| {
+            let (scheme, user, rest) = (&captures[1], &captures[2], &captures[3]);
+            let delimiter = rest.find(['/', '?', '#']);
+            let first_at = rest.find('@');
+            let port = delimiter.is_some_and(|end| {
+                end > 0
+                    && first_at.is_none_or(|at| end < at)
+                    && rest[..end].bytes().all(|byte| byte.is_ascii_digit())
+            });
+            match first_at {
+                Some(first_at) if !port => {
+                    let authority_end = rest[first_at..]
+                        .find(['/', '?', '#'])
+                        .map_or(rest.len(), |offset| first_at + offset);
+                    let last_at = rest[..authority_end].rfind('@').unwrap_or(first_at);
+                    format!("{scheme}[REDACTED]{}", url_credentials(&rest[last_at..]))
+                }
+                _ => format!("{scheme}{user}:{}", url_credentials(rest)),
+            }
+        })
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -291,6 +330,31 @@ mod tests {
             url_credentials("postgres://db.internal:5432/app"),
             "postgres://db.internal:5432/app"
         );
+        // Passwords with #, ?, / and @, and a second URL in the same token.
+        for (url, host) in [
+            (
+                "postgres://u:pa#ss-sensitive@db.internal/app",
+                "@db.internal/app",
+            ),
+            (
+                "postgres://u:pa?ss-sensitive@db.internal/app",
+                "@db.internal/app",
+            ),
+            (
+                "postgres://u:pa/ss-sensitive@db.internal/app",
+                "@db.internal/app",
+            ),
+            (
+                "postgres://u:a@b-sensitive@db.internal/app?next=x@y",
+                "@db.internal/app?next=x@y",
+            ),
+            ("a://u:p@h,b://v:q-sensitive@k", "@k"),
+            ("http://h:8080/x?u=http://a:q-sensitive@b", "@b"),
+        ] {
+            let output = url_credentials(url);
+            assert!(!output.contains("sensitive"), "{url} -> {output}");
+            assert!(output.ends_with(host), "{url} -> {output}");
+        }
         // An `@` in a path, query or fragment is not userinfo: host, port and
         // the code after them stay visible.
         for visible in [
@@ -321,6 +385,23 @@ mod tests {
         let output = private_key_blocks(&putty);
         assert!(!output.contains(BODY), "{output}");
         assert!(output.contains("fn backdoor()"), "{output}");
+
+        // Key bodies built up in code keep the block open; only the base64 is
+        // masked, so the surrounding code (and padded code) stays readable.
+        let built = format!(
+            "-----BEGIN PRIVATE KEY-----\npem += \"{BODY}\";\nsb.append(\"{BODY}\");\nrun(\"{BODY}\"); exec(evil);\n-----END PRIVATE KEY-----\nvisible();\n"
+        );
+        let output = private_key_blocks(&built);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(
+            output.contains("pem += ") && output.contains("sb.append("),
+            "{output}"
+        );
+        assert!(
+            output.contains("exec(evil);") && output.contains("visible();"),
+            "{output}"
+        );
+        assert_eq!(output.lines().count(), built.lines().count());
 
         // Key bodies embedded in source keep masking across string syntax,
         // armor headers and blank lines.
