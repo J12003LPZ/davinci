@@ -7,7 +7,16 @@ use std::sync::OnceLock;
 
 pub(super) const PRIVATE_KEY_MARKER: &str = "[REDACTED PRIVATE KEY MATERIAL]";
 
-/// Mask quoted assignments before token-based redactors can remove their delimiters.
+/// Every whole-text mask, in order. Each keeps the line count, so a
+/// line-addressed read can mask the whole source and then take its window:
+/// a window that starts inside a key or a multi-line quoted value would
+/// otherwise miss the line that identifies it as a credential.
+pub(super) fn whole_text(input: &str) -> String {
+    url_credentials(&quoted_assignments(&private_key_blocks(input)))
+}
+
+/// Mask quoted assignments before token-based redactors can remove their
+/// delimiters. A value spanning lines keeps its line breaks after the mask.
 pub(super) fn quoted_assignments(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
@@ -16,7 +25,16 @@ pub(super) fn quoted_assignments(input: &str) -> String {
         )
         .expect("fixed quoted credential assignment pattern")
     });
-    pattern.replace_all(input, "[REDACTED]").into_owned()
+    pattern
+        .replace_all(input, |captures: &regex::Captures<'_>| {
+            let mut mask = String::from("[REDACTED]");
+            for (index, _) in captures[0].match_indices('\n') {
+                let crlf = captures[0][..index].ends_with('\r');
+                mask.push_str(if crlf { "\r\n" } else { "\n" });
+            }
+            mask
+        })
+        .into_owned()
 }
 
 /// Replace every line from a `BEGIN ... PRIVATE KEY` marker through its `END`
@@ -26,13 +44,32 @@ pub(super) fn quoted_assignments(input: &str) -> String {
 pub(super) fn private_key_blocks(input: &str) -> String {
     static MARKER: OnceLock<Regex> = OnceLock::new();
     let marker = MARKER.get_or_init(|| {
-        Regex::new(r"(?i)-----\s*(BEGIN|END)\b[A-Z0-9 ]*PRIVATE KEY")
+        // PEM and OpenSSH use five dashes; the SSH2 format uses four and spaces.
+        Regex::new(r"(?i)-{3,}\s*(BEGIN|END)\b[A-Z0-9 ]*PRIVATE KEY")
             .expect("fixed private key marker pattern")
+    });
+    static PUTTY: OnceLock<Regex> = OnceLock::new();
+    let putty = PUTTY.get_or_init(|| {
+        Regex::new(r"(?i)\bPrivate-Lines:\s*(\d+)").expect("fixed PuTTY key pattern")
     });
     let mut out = String::with_capacity(input.len());
     let mut in_block = false;
+    // PuTTY keys have no armor: `Private-Lines: N` precedes N body lines.
+    let mut putty_lines = 0usize;
     for line in input.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
+        if putty_lines > 0 {
+            putty_lines -= 1;
+            out.push_str(PRIVATE_KEY_MARKER);
+            out.push_str(&line[content.len()..]);
+            continue;
+        }
+        if let Some(count) = putty.captures(content) {
+            putty_lines = count[1].parse().unwrap_or(usize::MAX);
+            out.push_str(PRIVATE_KEY_MARKER);
+            out.push_str(&line[content.len()..]);
+            continue;
+        }
         // Only a real armor marker opens or closes a block; the last one on
         // the line decides, so a one-line key (escaped newlines in a string)
         // opens and closes here and other text on the line changes nothing.
@@ -55,10 +92,12 @@ pub(super) fn private_key_blocks(input: &str) -> String {
 
 /// Mask the password in `scheme://user:password@host` for any URL scheme:
 /// database, cache and broker URLs carry credentials the same way HTTP does.
+/// Passwords often hold an unencoded `@` or `/`, so the mask runs to the last
+/// `@` of the URL token rather than the first.
 pub(super) fn url_credentials(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@]*:[^\s/@]+@")
+        Regex::new(r#"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@"'<>`]*:[^\s"'<>`]*@"#)
             .expect("fixed URL credential pattern")
     });
     pattern.replace_all(input, "$1[REDACTED]@").into_owned()
@@ -109,6 +148,40 @@ mod tests {
     }
 
     #[test]
+    fn ssh2_and_putty_private_keys_are_masked() {
+        let ssh2 = format!(
+            "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nComment: \"fixture\"\n{BODY}\n---- END SSH2 ENCRYPTED PRIVATE KEY ----\nvisible\n"
+        );
+        let output = private_key_blocks(&ssh2);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(output.ends_with("visible\n"), "{output}");
+
+        let putty = format!(
+            "PuTTY-User-Key-File-3: ssh-ed25519\nPublic-Lines: 1\nAAAApublic\nPrivate-Lines: 2\n{BODY}\n{BODY}\nPrivate-MAC: fixture\n"
+        );
+        let output = private_key_blocks(&putty);
+        assert!(!output.contains(BODY), "{output}");
+        assert!(
+            output.contains("AAAApublic") && output.contains("Private-MAC"),
+            "{output}"
+        );
+        assert_eq!(output.lines().count(), putty.lines().count());
+    }
+
+    #[test]
+    fn multi_line_quoted_values_keep_their_line_count() {
+        for input in [
+            "password = \"fixture first\nfixture second\nfixture third\"\nvisible\n",
+            "password = \"fixture first\r\nfixture second\"\r\nvisible\r\n",
+        ] {
+            let output = whole_text(input);
+            assert!(!output.contains("fixture"), "{output:?}");
+            assert_eq!(output.lines().count(), input.lines().count(), "{output:?}");
+            assert!(output.contains("visible"), "{output:?}");
+        }
+    }
+
+    #[test]
     fn text_around_a_begin_marker_never_closes_the_block() {
         // "END" in other text on the BEGIN line (APPENDED, ENDPOINT, pem_end)
         // must not end the block before the body.
@@ -135,10 +208,15 @@ mod tests {
             "redis://:fixture-sensitive@cache:6379/0",
             "amqp://guest:fixture-sensitive@broker//",
             "https://user:fixture-sensitive@example.invalid",
+            // Unencoded `@` and `/` in the password.
+            "postgres://admin:fixture@sensitive@db.internal/app",
+            "postgres://admin:fixture/sensitive@db.internal/app",
+            "DATABASE_URL=\"mysql://root:fixture-sensitive@db/app\"",
         ] {
             let output = url_credentials(url);
-            assert!(!output.contains("fixture-sensitive"), "{output}");
+            assert!(!output.contains("sensitive"), "{output}");
             assert!(output.contains("[REDACTED]@"), "{output}");
+            assert!(!output.contains("[REDACTED]@sensitive"), "{output}");
         }
         assert_eq!(
             url_credentials("postgres://db.internal:5432/app"),

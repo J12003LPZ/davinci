@@ -474,10 +474,7 @@ fn normalize_path(path: &str) -> String {
 }
 
 pub fn redact_secrets(input: &str) -> String {
-    use super::credential_redaction as shared;
-    let mut output = shared::url_credentials(&shared::quoted_assignments(
-        &shared::private_key_blocks(input),
-    ));
+    let mut output = super::credential_redaction::whole_text(input);
     let patterns = [
         ("sk-", "sk-[REDACTED]"),
         ("ghp_", "ghp_[REDACTED]"),

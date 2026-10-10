@@ -13,23 +13,20 @@ pub fn text(input: &str) -> String {
         r"\bglpat-[A-Za-z0-9_-]{20,}",
         r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
     ].into_iter().map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern")).collect());
-    use super::super::credential_redaction as shared;
-    shared::url_credentials(&shared::quoted_assignments(&shared::private_key_blocks(
-        input,
-    )))
-    .lines()
-    .map(|line| {
-        let mut line = super::redact_evidence(line);
-        for pattern in patterns {
-            line = pattern.replace_all(&line, "[REDACTED]").into_owned();
-        }
-        line.chars()
-            .filter(|c| !c.is_control() || *c == '\t')
-            .filter(|c| !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-            .collect::<String>()
-    })
-    .collect::<Vec<_>>()
-    .join("\n")
+    super::super::credential_redaction::whole_text(input)
+        .lines()
+        .map(|line| {
+            let mut line = super::redact_evidence(line);
+            for pattern in patterns {
+                line = pattern.replace_all(&line, "[REDACTED]").into_owned();
+            }
+            line.chars()
+                .filter(|c| !c.is_control() || *c == '\t')
+                .filter(|c| !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

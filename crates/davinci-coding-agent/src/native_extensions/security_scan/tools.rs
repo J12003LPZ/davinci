@@ -71,10 +71,11 @@ pub fn execute(snapshot: &Snapshot, name: &str, args: Value) -> Result<Value, St
                     &input.snapshot_side,
                 )?
             };
-            // A window can start inside a private key, after its BEGIN line.
-            // Mask key blocks against the whole file, then take the same lines.
+            // A window can start inside a private key or a multi-line quoted
+            // secret, after the line that identifies it. Mask the whole file
+            // (line count is kept), then take the same lines.
             let file = snapshot.file(&input.path, &input.snapshot_side)?;
-            let masked = super::super::credential_redaction::private_key_blocks(&file.text);
+            let masked = super::super::credential_redaction::whole_text(&file.text);
             let window = masked
                 .lines()
                 .skip(input.start_line - 1)
@@ -249,6 +250,40 @@ mod tests {
             &snapshot,
             "sec_source_read",
             json!({"path":"key.rs","startLine":7,"endLine":7}),
+        )
+        .unwrap();
+        assert_eq!(tail["text"], "fn after() {}");
+    }
+
+    #[test]
+    fn source_reads_starting_inside_a_quoted_secret_stay_masked() {
+        let text = "fn before() {}\nlet password = \"fixture first\nfixture second\nfixture third\";\nfn after() {}\n";
+        let snapshot = Snapshot {
+            id: "fixture".into(),
+            files: [(
+                "cfg.rs".into(),
+                super::super::snapshot::SourceFile {
+                    hash: super::super::sha256_hex(text.as_bytes()),
+                    text: text.into(),
+                },
+            )]
+            .into(),
+            ..Snapshot::default()
+        };
+        for (start, end) in [(1, 5), (3, 3), (3, 4), (4, 5)] {
+            let read = execute(
+                &snapshot,
+                "sec_source_read",
+                json!({"path":"cfg.rs","startLine":start,"endLine":end}),
+            )
+            .unwrap();
+            let returned = read["text"].as_str().unwrap();
+            assert!(!returned.contains("fixture"), "{start}-{end}: {returned}");
+        }
+        let tail = execute(
+            &snapshot,
+            "sec_source_read",
+            json!({"path":"cfg.rs","startLine":5,"endLine":5}),
         )
         .unwrap();
         assert_eq!(tail["text"], "fn after() {}");
