@@ -406,6 +406,18 @@ pub struct JsonlStoredSession {
     durable_len: u64,
 }
 
+/// What `load_with` may do about a tail that needs repair.
+enum Tail {
+    Detect,
+    /// Holds the session lock for the rewrite.
+    Repair(#[allow(dead_code)] davinci_sys::lock::ExclusiveFileLock),
+    ReadOnly,
+}
+
+/// How long a loader waits for an in-flight append before treating the
+/// lock as held by a long-lived writer. Appends hold it for milliseconds.
+const REPAIR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn session_lock_path(path: &Path) -> PathBuf {
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
@@ -414,7 +426,7 @@ fn session_lock_path(path: &Path) -> PathBuf {
 
 impl JsonlStoredSession {
     pub fn load(path: &Path) -> Result<Self, SessionError> {
-        if let Some(loaded) = Self::load_with(path, false)? {
+        if let Some(loaded) = Self::load_with(path, &Tail::Detect)? {
             return Ok(loaded);
         }
         // The tail needs repair. Appenders write under the session lock, so a
@@ -422,21 +434,30 @@ impl JsonlStoredSession {
         // right now, and a rewrite from this snapshot would erase it (and
         // anything appended after the read). Re-read under the lock, where
         // the tail is stable, and repair only what is still torn then.
-        let _lock =
-            davinci_sys::lock::ExclusiveFileLock::acquire(&session_lock_path(path), LOCK_WAIT)
-                .map_err(|err| {
-                    SessionError::storage(format!(
-                        "Unable to lock session {} for tail repair: {err}",
-                        path.display()
-                    ))
-                })?;
-        Self::load_with(path, true)?
+        // A writer that keeps the lock (a live session in another handle)
+        // owns its tail: load the complete records read-only instead of
+        // waiting on it or rewriting under it.
+        let tail = match davinci_sys::lock::ExclusiveFileLock::acquire(
+            &session_lock_path(path),
+            REPAIR_LOCK_WAIT,
+        ) {
+            Ok(lock) => Tail::Repair(lock),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Tail::ReadOnly,
+            Err(err) => {
+                return Err(SessionError::storage(format!(
+                    "Unable to lock session {} for tail repair: {err}",
+                    path.display()
+                )))
+            }
+        };
+        Self::load_with(path, &tail)?
             .ok_or_else(|| SessionError::storage("session tail repair did not complete"))
     }
 
-    /// Parse `path`. A tail that needs rewriting returns `None` unless
-    /// `repair` says the caller holds the session lock.
-    fn load_with(path: &Path, repair: bool) -> Result<Option<Self>, SessionError> {
+    /// Parse `path`. What happens to a tail that needs rewriting depends on
+    /// `tail`: report it (`None`), rewrite it (the lock is held), or leave
+    /// it and return the complete records with writes refused.
+    fn load_with(path: &Path, tail: &Tail) -> Result<Option<Self>, SessionError> {
         let (content, torn_utf8_tail) = crate::read_session_text(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 SessionError::not_found(format!("Session not found: {}", path.display()))
@@ -468,10 +489,14 @@ impl JsonlStoredSession {
                     }
                 }
                 Err(err) if err.kind == "syntax" && index + 1 == physical_lines.len() => {
-                    if !repair {
-                        return Ok(None);
-                    }
                     let valid_prefix = format!("{}\n", physical_lines[..index].join("\n"));
+                    match tail {
+                        Tail::Detect => return Ok(None),
+                        Tail::ReadOnly => {
+                            return Ok(Some(Self::read_only(session, &header, path)));
+                        }
+                        Tail::Repair(_) => {}
+                    }
                     publish_atomically(path, |temp_path| {
                         fs::write(temp_path, &valid_prefix).map_err(|write_err| {
                             SessionError::storage(format!(
@@ -490,8 +515,12 @@ impl JsonlStoredSession {
                 Err(err) => return Err(invalid_file(path, index + 1, err)),
             }
         }
-        if (torn_utf8_tail || !content.ends_with('\n')) && !repair {
-            return Ok(None);
+        if torn_utf8_tail || !content.ends_with('\n') {
+            match tail {
+                Tail::Detect => return Ok(None),
+                Tail::ReadOnly => return Ok(Some(Self::read_only(session, &header, path))),
+                Tail::Repair(_) => {}
+            }
         }
         if torn_utf8_tail {
             // `content` is the complete-record prefix; drop the torn bytes.
@@ -525,6 +554,17 @@ impl JsonlStoredSession {
             session,
             info: JsonlSessionInfo::from_header(&header, path),
         }))
+    }
+
+    fn read_only(session: Session, header: &JsonlV4Header, path: &Path) -> Self {
+        Self {
+            persistence_error: Some(
+                "another handle is writing this session's tail; reopen it to write".into(),
+            ),
+            durable_len: 0,
+            session,
+            info: JsonlSessionInfo::from_header(header, path),
+        }
     }
 
     pub fn info(&self) -> &JsonlSessionInfo {
@@ -1326,6 +1366,33 @@ mod tests {
         let loaded = loader.join().unwrap().unwrap();
         assert_eq!(loaded.get_stats().message_count, 2);
         assert!(fs::read_to_string(&path).unwrap().ends_with(&line));
+    }
+
+    #[test]
+    fn a_tail_held_by_a_live_writer_loads_read_only_and_untouched() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let mut writer = create_fixture(&repo, "held", "/fixture");
+        writer.append_message("first").unwrap();
+        let path = writer.info.path.clone();
+        let _held =
+            davinci_sys::lock::ExclusiveFileLock::try_acquire(&session_lock_path(&path)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"kind":"entry""#)
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut loaded = JsonlStoredSession::load(&path).unwrap();
+        assert_eq!(loaded.get_stats().message_count, 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "a held tail was rewritten"
+        );
+        let err = loaded.append_message("refused").unwrap_err();
+        assert!(err.message.contains("reopen"), "{}", err.message);
     }
 
     #[test]
