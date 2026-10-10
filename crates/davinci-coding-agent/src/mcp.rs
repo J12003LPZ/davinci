@@ -18,6 +18,12 @@ use davinci_mcp::{ConfigFile, McpExecutionPolicy};
 /// asks for `sandboxed` is refused rather than silently run unsandboxed.
 fn resolve_origin(config: &mut ConfigFile, project_or_plugin: bool, sandbox_active: bool) {
     for server in config.mcp_servers.values_mut() {
+        // Trusting a server's own readOnlyHint turns its tools into
+        // approval-free reads. The layer that defines a server cannot also
+        // vouch for it; only the user's own config may.
+        if project_or_plugin {
+            server.trust_read_only_hints = false;
+        }
         if server.disabled || server.execution == Some(McpExecutionPolicy::Disabled) {
             server.execution = Some(McpExecutionPolicy::Disabled);
         } else if server.url.is_some() {
@@ -185,6 +191,47 @@ mod tests {
             Some(davinci_mcp::McpExecutionPolicy::Sandboxed),
             "an explicit sandbox request is refused, never silently run on the host"
         );
+    }
+
+    #[test]
+    fn only_the_user_layer_can_trust_a_servers_read_only_hints() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(project.join(".davinci")).unwrap();
+        std::fs::write(
+            agent_dir.join("mcp.json"),
+            r#"{"mcpServers":{
+                "user":{"url":"https://user.example/mcp","trustReadOnlyHints":true},
+                "shadowed":{"url":"https://user.example/mcp","trustReadOnlyHints":true}
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".davinci/mcp.json"),
+            r#"{"mcpServers":{
+                "project":{"url":"https://project.example/mcp","trustReadOnlyHints":true},
+                "shadowed":{"url":"https://project.example/mcp","trustReadOnlyHints":true}
+            }}"#,
+        )
+        .unwrap();
+        for sandbox in [false, true] {
+            let loaded = load(&agent_dir, &project, true, sandbox);
+            assert!(loaded.mcp_servers["user"].trust_read_only_hints);
+            assert!(!loaded.mcp_servers["project"].trust_read_only_hints);
+            // The project's definition replaced the user's, trust included.
+            assert!(!loaded.mcp_servers["shadowed"].trust_read_only_hints);
+        }
+
+        // Plugin servers go through the same project-or-plugin origin.
+        let mut plugin: ConfigFile = serde_json::from_value(serde_json::json!({
+            "mcpServers": {"plugin_x_y": {"command":"tool", "trustReadOnlyHints": true}}
+        }))
+        .unwrap();
+        resolve_origin(&mut plugin, true, false);
+        assert!(!plugin.mcp_servers["plugin_x_y"].trust_read_only_hints);
     }
 
     #[test]
