@@ -679,6 +679,21 @@ mod tests {
         assert!(error.contains("not valid UTF-8"), "{error}");
         let ok = client.call_tool("echo", json!({"text": "next"})).unwrap();
         assert_eq!(ok.text(), "next");
+
+        // Invalid bytes in the reply's id: the call fails at once (no wait
+        // for the call timeout), and the transport keeps working.
+        let started = std::time::Instant::now();
+        let error = client
+            .call_tool("echo", json!({"text": "corrupt-id"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A server request with invalid bytes is still answered, not dropped.
+        let ok = client
+            .call_tool("echo", json!({"text": "corrupt-ping"}))
+            .unwrap();
+        assert_eq!(ok.text(), "pinged:0");
     }
 
     #[test]

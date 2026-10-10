@@ -223,8 +223,9 @@ fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
     let p = policy(PermissionMode::Auto);
     let mut isolated = p.clone();
     isolated.execution_isolated = true;
-    // `cargo tree` and `cargo metadata` run the repository's configured
-    // rustc wrapper (and toolchain) for target information.
+    // Every cargo subcommand runs what the checkout configures: `tree` and
+    // `metadata` invoke the rustc wrapper, `fmt` can be shadowed by an
+    // `[alias]`, and `rust-toolchain.toml` picks the toolchain.
     for command in [
         "cargo build --offline",
         "cargo clippy --offline",
@@ -239,6 +240,7 @@ fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
     for command in [
         "cargo test --offline",
         "cargo check --offline",
+        "cargo fmt --check",
         "git status && cargo test --offline",
     ] {
         assert!(
@@ -251,13 +253,10 @@ fn auto_without_an_os_sandbox_asks_before_running_workspace_code() {
             "isolated Auto asked for {command}"
         );
     }
-    for command in ["cargo fmt --check", "git status"] {
-        assert_eq!(
-            verdict(&p, "bash", json!({"command":command})),
-            PermissionVerdict::Allow,
-            "{command}"
-        );
-    }
+    assert_eq!(
+        verdict(&p, "bash", json!({"command":"git status"})),
+        PermissionVerdict::Allow
+    );
     assert_eq!(
         verdict(&p, "write", json!({"path":"build.rs"})),
         PermissionVerdict::Allow

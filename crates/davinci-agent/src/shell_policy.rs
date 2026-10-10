@@ -479,31 +479,50 @@ fn selects_long_option(arg: &str, option: &str) -> bool {
     flag.starts_with("--") && flag.len() > 2 && option.starts_with(flag)
 }
 
-/// Words of a segment for a read-only check only: output and input
-/// redirections are removed, every `$VAR`, `${...}`, `$(...)` and backtick
-/// span becomes a placeholder, and brace characters are dropped. Anything
-/// still unmodelled, such as a nested substitution or a subshell, makes the
-/// lexer refuse it.
+/// Words of a segment for a read-only check only. Command substitution
+/// (`$(...)`, backticks, `<(...)`) runs a program wherever it appears, even
+/// in a redirect target or after `--`, so it refuses the segment outright.
+/// Otherwise redirections with a literal target are removed, each `$VAR` or
+/// `${VAR}` becomes a placeholder, and a brace group that expands to several
+/// words (`{a,b}`, `{1..3}`) becomes a glob character, so the glob rules in
+/// [`git_is_read_only`] apply to it. A literal brace group (`@{u}`,
+/// `HEAD^{commit}`) keeps a marker in place of its braces.
 ///
-/// An expansion can carry an option (`OPT=--output=~/.bashrc` in
+/// A variable can carry an option (`OPT=--output=~/.bashrc` in
 /// `git log $OPT`, or `BASE=--output=x` in `git diff "$BASE"...HEAD`), so a
 /// placeholder anywhere before `--` refuses the segment; only operands after
-/// `--` (`git diff -- "$FILE"`) may be expansions.
+/// `--` (`git diff -- "$FILE"`) may be variables.
 fn literal_words_with_placeholders(segment: &str) -> Option<Vec<String>> {
     const PLACEHOLDER: &str = "__shell_expansion__";
     static REDIRECT: OnceLock<regex::Regex> = OnceLock::new();
-    static EXPANSION: OnceLock<regex::Regex> = OnceLock::new();
+    static VARIABLE: OnceLock<regex::Regex> = OnceLock::new();
+    static BRACES: OnceLock<regex::Regex> = OnceLock::new();
+    if segment.contains("$(")
+        || segment.contains('`')
+        || segment.contains("<(")
+        || segment.contains(">(")
+    {
+        return None;
+    }
     let redirect = REDIRECT.get_or_init(|| {
-        regex::Regex::new(r"(?:^|[ \t])\d*(?:>>?|<)(?:&\d+|[ \t]*[^\s;|&<>]+)")
+        regex::Regex::new(r#"(?:^|[ \t])\d*(?:>>?|<)(?:&\d+|[ \t]*[^\s;|&<>$`()"']+)"#)
             .expect("fixed redirection pattern")
     });
-    let expansion = EXPANSION.get_or_init(|| {
-        regex::Regex::new(r"\$\([^()]*\)|`[^`]*`|\$\{[^{}]*\}|\$[A-Za-z0-9_@*#?!$-]+")
-            .expect("fixed expansion pattern")
+    let variable = VARIABLE.get_or_init(|| {
+        regex::Regex::new(r"\$\{[^{}]*\}|\$[A-Za-z0-9_@*#?!$-]+").expect("fixed variable pattern")
     });
+    let braces = BRACES
+        .get_or_init(|| regex::Regex::new(r"\{([^{}]*)\}").expect("fixed brace group pattern"));
     let without_redirects = redirect.replace_all(segment, " ");
-    let placeheld = expansion.replace_all(&without_redirects, PLACEHOLDER);
-    let words = literal_shell_words(&placeheld.replace(['{', '}'], ""))?;
+    let placeheld = variable.replace_all(&without_redirects, PLACEHOLDER);
+    let unbraced = braces.replace_all(&placeheld, |group: &regex::Captures<'_>| {
+        if group[1].contains(',') || group[1].contains("..") {
+            "*".to_string()
+        } else {
+            format!("%{}%", &group[1])
+        }
+    });
+    let words = literal_shell_words(&unbraced)?;
     let options_end = words
         .iter()
         .position(|word| word == "--")
@@ -514,7 +533,41 @@ fn literal_words_with_placeholders(segment: &str) -> Option<Vec<String>> {
     .then_some(words)
 }
 
+/// A shell word that expands to file names (a glob) or, in PowerShell,
+/// splats an array of arguments (`@opts`). Quotes are already gone, so a
+/// quoted glob counts too (fail closed).
+fn word_expands(word: &str) -> bool {
+    word.contains(['*', '?', '['])
+        || word
+            .strip_prefix('@')
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+}
+
+/// Whether shell expansion of an operand could produce an option. An
+/// expanded file name starts with the text before the first glob character,
+/// so `src/*` and `--grep=fix*` cannot become a different option, while `*`,
+/// `-*` and `--out*` can match a repository file named `--output=x`.
+fn word_may_expand_to_option(word: &str) -> bool {
+    if !word_expands(word) {
+        return false;
+    }
+    match word.find(['*', '?', '[']) {
+        Some(at) => {
+            let prefix = &word[..at];
+            word.starts_with('@')
+                || prefix.is_empty()
+                || (prefix.starts_with('-') && !prefix.contains('='))
+        }
+        None => true,
+    }
+}
+
 fn git_is_read_only(words: &[String]) -> bool {
+    let options_end = words
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(words.len());
     let mut args = &words[1..];
     while let Some(flag) = args.first() {
         if matches!(flag.as_str(), "-C" | "--git-dir" | "--work-tree") {
@@ -537,6 +590,19 @@ fn git_is_read_only(words: &[String]) -> bool {
     let Some((verb, args)) = args.split_first() else {
         return false;
     };
+    // A word the shell expands before the verb can shift which word git
+    // reads as the verb (`git -C * log` with a repository file named
+    // `push`); a glob verb is never a read-only name. After the verb, an
+    // expansion is only refused where it can become an option (a file
+    // named `--output=x` matched by `*`). Operands after `--` are safe.
+    let verb_at = words.len() - args.len() - 1;
+    if words[1..=verb_at].iter().any(|word| word_expands(word))
+        || words[verb_at + 1..options_end.max(verb_at + 1)]
+            .iter()
+            .any(|word| word_may_expand_to_option(word))
+    {
+        return false;
+    }
     if args.iter().any(|arg| {
         ["--output", "--ext-diff", "--textconv", "--show-signature"]
             .iter()
@@ -1180,7 +1246,12 @@ mod tests {
             "git log > log.txt",
             "git show HEAD:{a,b}",
             "git diff -- \"$FILE\"",
-            "git log -- $(cat paths.txt)",
+            "git show HEAD^{commit}",
+            "git log -- *",
+            "git log src/*",
+            "git log --grep=fix*",
+            "git show @",
+            "git log @{u}..HEAD",
         ] {
             assert!(
                 !analyze_command(command)
@@ -1217,6 +1288,24 @@ mod tests {
             "git diff \"$BASE\"...HEAD",
             "git show `echo --textconv` HEAD",
             "git -C $DIR status",
+            // A glob or splat can expand to a repository file named like an
+            // option (`--output=x`, `--ext-diff`) or to another verb.
+            "git log *",
+            "git diff -*",
+            "git log --out*",
+            "git show ?",
+            "git -C * log",
+            "git log @opts",
+            "git log '*'",
+            // Brace expansion and command substitution, wherever they sit.
+            "git -C {.,push,origin} status",
+            "git log {,--output=/x}",
+            "git log {-p,--ext-diff}",
+            "git status 2>$(git${IFS}push)",
+            "git log -- $(\"git\" push)",
+            "git log -- $(cat paths.txt)",
+            "git diff <(git push)",
+            "git -C x{,y} log",
         ] {
             assert_ne!(
                 evaluate(ShellPolicyProfile::WriteNoGitMutation, command),

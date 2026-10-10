@@ -297,7 +297,11 @@ impl StdioTransport {
             let Ok(Value::Object(message)) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            if message.get("id") != Some(id) {
+            // An error whose id could not be read (`null`, JSON-RPC's parse
+            // error) belongs to the one call in flight: calls are sequential.
+            let unreadable_id =
+                message.get("id") == Some(&Value::Null) && message.contains_key("error");
+            if message.get("id") != Some(id) && !unreadable_id {
                 continue;
             }
             let has_result = message.contains_key("result");
@@ -494,19 +498,32 @@ fn read_stdout_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<
 }
 
 /// Servers often log in a legacy code page, so a line that is not UTF-8 must
-/// not end the transport. A log line becomes empty and is skipped. A reply
-/// that carried invalid bytes is never delivered with replacement characters
-/// (the agent would act on corrupted content): it becomes a JSON-RPC error
-/// for its id, so that call fails visibly and later calls still work.
+/// not end the transport.
+/// - A notification (a log line) is dropped.
+/// - A server request is kept as decoded, so it is still answered (`ping`
+///   succeeds, anything else is refused) and the server does not wait on it;
+///   its params are never acted on.
+/// - A reply is never delivered with replacement characters (the agent would
+///   act on corrupted content): it becomes a JSON-RPC error for its id. When
+///   the invalid bytes were in the id itself, the error carries a `null` id,
+///   which fails the call in flight at once instead of at its timeout.
 fn invalid_utf8_line(lossy: &str) -> String {
     let as_error = |message: &Value| -> Option<Value> {
         let message = message.as_object()?;
         if message.contains_key("method") {
-            return None;
+            return message
+                .contains_key("id")
+                .then(|| Value::Object(message.clone()));
         }
+        let id = message.get("id")?;
+        let id = if id.as_str().is_some_and(|id| id.contains('\u{fffd}')) {
+            Value::Null
+        } else {
+            id.clone()
+        };
         Some(json!({
             "jsonrpc": "2.0",
-            "id": message.get("id")?,
+            "id": id,
             "error": {"code": -32700, "message": "MCP server reply was not valid UTF-8"},
         }))
     };

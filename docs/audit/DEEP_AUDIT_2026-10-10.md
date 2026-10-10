@@ -94,6 +94,20 @@ Round 3 (automated security review of the round 2 commits):
 | Narrowing the git fallback let `git $SUB origin` and `git "$(echo push)"` through writer roles | A git segment the lexer refuses is a mutation unless `git_is_read_only` proves it a read after redirections are dropped and expansions become placeholders |
 | An expansion could carry an option (`git log $OPT` with `--output=<file>`) | A placeholder before `--` refuses the segment; `git diff "$BASE"...HEAD` is therefore no longer allowed for writer roles, `git diff -- "$FILE"` is |
 
+Round 4 (fresh review of #172 and #173 at `ff026183`, plus one automated finding):
+
+| Item | Resolution |
+|---|---|
+| Globs and PowerShell splats expanded into git options (`git log *` with a file named `--output=x`, `git log @opts`) | A glob or splat before the verb is refused (it can shift the verb); after the verb, one whose literal prefix could start an option is refused |
+| Brace expansion hid a verb (`git -C {.,push,origin} status`) | A brace group with `,` or `..` is treated as a glob; literal groups (`@{u}`, `HEAD^{commit}`) stay reads |
+| Command substitution in a redirect target or after `--` was never inspected | `$(...)`, backticks and process substitution refuse a git segment the lexer could not read; redirect targets with expansions are not stripped |
+| A quote planted in a comment hid the code below it | A key after a comment marker (or inside a string) cannot open a multi-line value; the rest of its own line is still masked |
+| `let token = Command::new(cmd).spawn()` was masked | A call (path, `(`, closing `)` on the line) is code and stays visible; `TOKEN=fixture(sensitive` stays masked |
+| `sync_channel(8)` could deadlock a single-threaded language server (from #172) | The reader drops notifications (they get no reply), drops server requests only when full, and blocks only for our responses, so stdout is always drained |
+| `cargo fmt --check` ran without approval | Every cargo command asks in Auto outside a sandbox: an `[alias]` can shadow `fmt` and `rust-toolchain.toml` picks the binaries |
+| MCP stdio dropped server requests with invalid UTF-8; a mangled reply id hung its call | Requests are kept and answered; a reply with an unreadable id becomes a `null`-id error that fails the call in flight at once |
+| Each source window was masked three times | Source reads run only the per-line token masks on the cached masked text |
+
 ## Confirmed findings
 
 ### SHELL-01: Auto mode approves CR-separated PowerShell statements

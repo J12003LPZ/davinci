@@ -3,6 +3,12 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 pub fn text(input: &str) -> String {
+    premasked_text(&super::super::credential_redaction::whole_text(input))
+}
+
+/// [`text`] for input the whole-text masks already ran over (a window of
+/// `Snapshot::masked_text`): only the per-line token masks run.
+pub fn premasked_text(input: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         [
@@ -17,10 +23,10 @@ pub fn text(input: &str) -> String {
         .map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern"))
         .collect()
     });
-    super::super::credential_redaction::whole_text(input)
+    input
         .lines()
         .map(|line| {
-            let mut line = key_assignments(&super::redact_evidence(line));
+            let mut line = key_assignments(&super::redact_evidence_tokens(line));
             for pattern in patterns {
                 line = pattern.replace_all(&line, "[REDACTED]").into_owned();
             }
@@ -47,19 +53,33 @@ fn key_assignments(line: &str) -> String {
         ))
         .expect("fixed credential assignment pattern")
     });
+    static CALL: OnceLock<Regex> = OnceLock::new();
+    let call = CALL.get_or_init(|| {
+        Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|::)[A-Za-z_][A-Za-z0-9_]*)*\(")
+            .expect("fixed call pattern")
+    });
     pattern
         .replace_all(line, |captures: &regex::Captures<'_>| {
             // `max_tokens`, `token_limit`: a count. `TOKEN=123456` may be an
             // OTP or PIN, so a bare numeric token stays masked.
             let key = captures[1].to_ascii_lowercase();
+            let value = &captures[2];
             let count = key.contains("token")
                 && [
                     "tokens", "max", "min", "limit", "budget", "count", "num", "len",
                 ]
                 .iter()
                 .any(|word| key.contains(word))
-                && captures[2].bytes().all(|byte| byte.is_ascii_digit());
-            if count {
+                && value.bytes().all(|byte| byte.is_ascii_digit());
+            // A call is code a security review must see (`let token =
+            // Command::new(cmd).spawn()`, `secret = eval(blob)`): a path, `(`,
+            // and its `)` later on the line. `TOKEN=fixture(sensitive` has
+            // no closing paren and stays masked.
+            let code = call.find(value).is_some_and(|open| {
+                let after = captures.get(2).map_or(line.len(), |m| m.start()) + open.end();
+                line[after..].contains(')')
+            });
+            if count || code {
                 captures[0].to_string()
             } else {
                 "[REDACTED]".to_string()
@@ -162,9 +182,19 @@ mod tests {
             let output = text(secret);
             assert!(!output.contains("sensitive"), "{secret} -> {output}");
         }
-        // No value-shape allowlist: any token-named assignment is masked,
-        // including tokenizer code. Mentions without an assignment stay.
-        assert_eq!(text("let token = lexer.next();"), "let [REDACTED];");
+        // A call is code a review must see, whatever the variable is named.
+        for code in [
+            "let token = lexer.next();",
+            "let token = std::process::Command::new(cmd).spawn();",
+            "secret = eval(base64.b64decode(blob))",
+            "let password = Command::new(\"sh\").arg(x);",
+        ] {
+            assert_eq!(text(code), code);
+        }
+        // An unclosed paren is not a call: still a credential value.
+        assert!(!text("let token = abc(def").contains("abc(def"));
+        // A bare identifier or literal value stays masked.
+        assert_eq!(text("let token = other_value;"), "let [REDACTED];");
         // Comparisons, arrows and counts are code a review must see.
         for code in [
             "if token == expected_token {",

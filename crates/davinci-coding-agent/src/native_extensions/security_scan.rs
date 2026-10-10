@@ -1964,9 +1964,15 @@ fn safe_join(root: &Path, relative: &Path) -> Result<PathBuf, ToolError> {
 fn redact_evidence(line: &str) -> String {
     // Mask the armor and the key text after it, not the whole line: code on
     // the same line as a planted marker has to stay reviewable.
-    let mut out = super::credential_redaction::quoted_assignments(
+    redact_evidence_tokens(&super::credential_redaction::quoted_assignments(
         &super::credential_redaction::private_key_blocks(line),
-    );
+    ))
+}
+
+/// The per-line token masks of [`redact_evidence`], for text the whole-text
+/// masks (`credential_redaction::whole_text`) already ran over.
+fn redact_evidence_tokens(line: &str) -> String {
+    let mut out = line.to_string();
     for prefix in ["sk-", "ghp_", "Bearer "] {
         let mut search_start = 0;
         while let Some(offset) = out[search_start..].find(prefix) {

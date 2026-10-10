@@ -24,10 +24,12 @@ pub(super) const ASSIGNMENT_SEPARATOR: &str = r"(?::=|:[ \t]*&?(?:'[a-z_][a-z0-9
 /// Mask quoted assignments before token-based redactors can remove their
 /// delimiters. A value spanning lines keeps its line breaks after the mask.
 ///
-/// A key that sits inside a string literal (`input("Password: ")`) is a
-/// label, not an assignment: the quote after it closes that literal. Such a
-/// match is only refused when its "value" would run onto later lines, which
-/// is where the mistake hides code; on one line, masking it is harmless.
+/// A value spanning lines is only masked when its quote really opens a
+/// string: then the lines after it are string content (data, not code). The
+/// quote opens nothing when the key sits inside a string literal
+/// (`input("Password: ")`, where it closes that literal) or in a comment
+/// (`# password: "` planted above real code). Such a match is refused, and
+/// on one line, masking it is harmless and kept.
 pub(super) fn quoted_assignments(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
@@ -44,12 +46,24 @@ pub(super) fn quoted_assignments(input: &str) -> String {
             break;
         };
         let line_start = input[..key.start()].rfind('\n').map_or(0, |at| at + 1);
-        let inside_literal = open_quote(&input[line_start..key.start()])
+        let prefix = scan_prefix(&input[line_start..key.start()]);
+        let inside_literal = prefix
+            .open_quote
             .is_some_and(|quote| !captures["gap"].contains(quote));
-        if inside_literal && whole.as_str().contains('\n') {
-            // Retry after the key, so a real assignment the bogus match
-            // would have swallowed is still found.
-            from = key.end();
+        if (inside_literal || prefix.comment) && whole.as_str().contains('\n') {
+            // Mask only to the end of this line (a value written there is
+            // still hidden), then rescan from the next line, so a real
+            // assignment the bogus match would have swallowed is found.
+            let line_end = whole.start() + whole.as_str().find('\n').unwrap_or(whole.len());
+            let line_end = if input[..line_end].ends_with('\r') {
+                line_end - 1
+            } else {
+                line_end
+            };
+            out.push_str(&input[copied..whole.start()]);
+            out.push_str("[REDACTED]");
+            copied = line_end;
+            from = line_end;
             continue;
         }
         out.push_str(&input[copied..whole.start()]);
@@ -65,11 +79,21 @@ pub(super) fn quoted_assignments(input: &str) -> String {
     out
 }
 
-/// The quote character of a string literal still open at the end of
-/// `prefix`, if any.
-fn open_quote(prefix: &str) -> Option<char> {
+/// What the text before a key on its line says about the key.
+struct LinePrefix {
+    /// The quote of a string literal still open at the end, if any.
+    open_quote: Option<char>,
+    /// A comment marker outside any string (`#`, `//`, `/*`, `--`, `<!--`),
+    /// or a line that continues a block comment (` * ...`) or is an INI or
+    /// TeX comment (`;`, `%`).
+    comment: bool,
+}
+
+fn scan_prefix(prefix: &str) -> LinePrefix {
     let mut open = None;
     let mut escaped = false;
+    let mut comment = matches!(prefix.trim_start().chars().next(), Some('*' | ';' | '%'));
+    let mut previous = '\0';
     for ch in prefix.chars() {
         match open {
             Some(_) if escaped => escaped = false,
@@ -77,10 +101,22 @@ fn open_quote(prefix: &str) -> Option<char> {
             Some(quote) if ch == quote => open = None,
             Some(_) => {}
             None if matches!(ch, '"' | '\'' | '`') => open = Some(ch),
-            None => {}
+            None => {
+                if ch == '#'
+                    || (previous == '/' && matches!(ch, '/' | '*'))
+                    || (previous == '-' && ch == '-')
+                    || (previous == '<' && ch == '!')
+                {
+                    comment = true;
+                }
+            }
         }
+        previous = ch;
     }
-    open
+    LinePrefix {
+        open_quote: open,
+        comment,
+    }
 }
 
 /// Mask private key material. Line count and terminators are preserved so
@@ -803,6 +839,33 @@ mod tests {
         // Quoted keys (JSON, YAML) are still keys.
         let json = "{\"password\": \"fixture first\nfixture second\"}";
         assert!(!whole_text(json).contains("fixture"));
+        // A quote planted in a comment opens no string: the code under it
+        // stays visible. A one-line commented secret is still masked.
+        for comment in [
+            "# password: \"",
+            "// password = '",
+            "/* api_key: `",
+            " * secret = \"",
+            "-- token: \"",
+            "; password = \"",
+            "<!-- password: \"",
+        ] {
+            let input = format!("{comment}\nimport os; os.system(payload)\nx = \"y\"\n");
+            let output = whole_text(&input);
+            assert!(output.contains("os.system(payload)"), "{comment}: {output}");
+            assert_eq!(output.lines().count(), input.lines().count());
+        }
+        for one_line in [
+            "# password: \"fixture-sensitive\"\n",
+            "# password: \"fixture-sensitive\nnext_line()\nx = \"y\"\n",
+        ] {
+            let output = whole_text(one_line);
+            assert!(!output.contains("fixture-sensitive"), "{output}");
+            assert_eq!(output.lines().count(), one_line.lines().count());
+        }
+        assert!(
+            whole_text("# password: \"fixture\nnext_line()\nx = \"y\"\n").contains("next_line()")
+        );
     }
 
     #[test]

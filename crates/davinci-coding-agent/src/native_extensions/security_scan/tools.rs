@@ -83,7 +83,7 @@ pub fn execute(snapshot: &Snapshot, name: &str, args: Value) -> Result<Value, St
                 .take(input.end_line + 1 - input.start_line)
                 .collect::<Vec<_>>()
                 .join("\n");
-            let text = super::redaction::text(&window);
+            let text = super::redaction::premasked_text(&window);
             Ok(
                 json!({"snapshotId":snapshot.id, "path": input.path, "contentHash": file.hash,"snapshotSide":input.snapshot_side,
                 "startLine":input.start_line,"endLine":input.end_line,"redacted":text != raw,"text":text,
