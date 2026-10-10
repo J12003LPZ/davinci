@@ -1101,7 +1101,11 @@ fn bound_value(value: Value, depth: usize) -> Value {
     match value {
         Value::String(mut string) => {
             if string.len() > 2048 {
-                string.truncate(2048);
+                let mut end = 2048;
+                while !string.is_char_boundary(end) {
+                    end -= 1;
+                }
+                string.truncate(end);
                 string.push('…');
             }
             Value::String(string)
@@ -1127,6 +1131,28 @@ fn bound_value(value: Value, depth: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_strings_do_not_split_utf8_characters() {
+        for (prefix_len, character) in [
+            (2047, 'é'),
+            (2047, '界'),
+            (2046, '界'),
+            (2045, '🦀'),
+            (2046, '🦀'),
+            (2047, '🦀'),
+        ] {
+            let prefix = "a".repeat(prefix_len);
+            let value = bound_value(json!(format!("{prefix}{character}tail")), 0);
+            let text = value.as_str().unwrap();
+            assert_eq!(text, format!("{prefix}…"));
+            assert!(text.len() <= 2051);
+        }
+        assert_eq!(
+            bound_value(json!("a".repeat(2048)), 0),
+            json!("a".repeat(2048))
+        );
+    }
     use crate::runtime::operations::{
         CallerType, EffectClass, EffectProfile, ExecutionOwner, ExecutionOwnerId, IdempotencyScope,
         JournalId, JournalIdentity, OperationContext, OperationJournal, OperationKind,

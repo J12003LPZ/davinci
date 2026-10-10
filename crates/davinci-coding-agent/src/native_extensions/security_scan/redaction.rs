@@ -12,7 +12,7 @@ pub fn text(input: &str) -> String {
         r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
         r"https?://[^\s/:@]+:[^\s/@]+@",
     ].into_iter().map(|pattern| Regex::new(pattern).expect("fixed credential redaction pattern")).collect());
-    input
+    super::super::credential_redaction::quoted_assignments(input)
         .lines()
         .map(|line| {
             let mut line = super::redact_evidence(line);
@@ -31,6 +31,28 @@ pub fn text(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_credentials_are_fully_redacted_before_other_masks() {
+        for input in [
+            r#"password: "fixture first second third"; safe=visible"#,
+            r#"password="fixture first second third"; safe=visible"#,
+            r#"{"client_secret": "fixture first \"second\" third", "safe": "visible"}"#,
+            "password='fixture first \\'second third'; safe=visible",
+            "password: \"fixture é 界 🦀\"; safe=visible",
+            "password: \"fixture first second third",
+            "password: \"fixture first second third\\",
+            "password: \"fixture first\nsecond third\"; safe=visible",
+        ] {
+            let output = text(input);
+            for secret_part in ["fixture", "first", "second", "third", "é", "界", "🦀"] {
+                assert!(!output.contains(secret_part), "{output}");
+            }
+            if input.contains("visible") {
+                assert!(output.contains("visible"), "{output}");
+            }
+        }
+    }
     // Assembled at runtime so secret scanners do not flag the fixtures.
     const BASIC: &str = concat!("Ba", "sic");
     const BEARER: &str = concat!("Bea", "rer");

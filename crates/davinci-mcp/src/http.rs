@@ -104,6 +104,9 @@ impl HttpTransport {
             self.read_sse_response(response.into_reader(), want)?
         } else {
             let text = read_response_body(response.into_reader(), MAX_BODY_BYTES)?;
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                self.answer_batch_requests(&value)?;
+            }
             parse_http_body(&content_type, &text, want)?
         };
         Ok(Reply { session_id, value })
@@ -144,6 +147,22 @@ impl HttpTransport {
         Ok(())
     }
 
+    fn answer_batch_requests(&self, value: &Value) -> Result<()> {
+        let messages = match value {
+            Value::Array(messages) => messages.as_slice(),
+            other => std::slice::from_ref(other),
+        };
+        for message in messages {
+            if let (Some(id), Some(method)) = (
+                message.get("id"),
+                message.get("method").and_then(Value::as_str),
+            ) {
+                self.answer_server_request(id.clone(), method)?;
+            }
+        }
+        Ok(())
+    }
+
     fn read_sse_response(&self, reader: impl Read, want: Option<&Value>) -> Result<Value> {
         // Bound the underlying stream before read_line so one unterminated
         // SSE line cannot allocate past the response cap before we inspect it.
@@ -175,13 +194,14 @@ impl HttpTransport {
                 let Ok(value) = serde_json::from_str::<Value>(&event) else {
                     continue;
                 };
+                // Answer every server request before selecting our response:
+                // a later batch member still requires a reply.
+                self.answer_batch_requests(&value)?;
                 // A 2025-03-26 server may send a JSON-RPC batch as one event.
                 for message in flatten_batch(value) {
-                    if let (Some(id), Some(method)) = (
-                        message.get("id").cloned(),
-                        message.get("method").and_then(Value::as_str),
-                    ) {
-                        self.answer_server_request(id, method)?;
+                    if message.get("id").is_some()
+                        && message.get("method").and_then(Value::as_str).is_some()
+                    {
                         continue;
                     }
                     match want {
@@ -205,6 +225,7 @@ impl HttpTransport {
         if !data.is_empty() {
             let value: Value = serde_json::from_str(&data)
                 .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
+            self.answer_batch_requests(&value)?;
             for message in flatten_batch(value) {
                 if let Some(id) = want {
                     if message.get("method").is_none() && message.get("id") == Some(id) {
@@ -467,6 +488,76 @@ fn sse_events(text: &str) -> impl Iterator<Item = String> + '_ {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn uncorrelated_sse_keeps_the_last_notification() {
+        let transport = HttpTransport::new("http://127.0.0.1:1/mcp", BTreeMap::new()).unwrap();
+        let notification = json!({"jsonrpc":"2.0", "method":"notifications/message"});
+        let body = format!("data: {notification}\n\n");
+        assert_eq!(
+            transport.read_sse_response(body.as_bytes(), None).unwrap(),
+            notification
+        );
+    }
+
+    #[test]
+    fn batches_answer_server_requests_after_the_correlated_reply() {
+        use std::io::Write;
+        for (content_type, suffix) in [
+            ("text/event-stream", "\n\n"),
+            ("text/event-stream", ""),
+            ("application/json", ""),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = listener.accept().unwrap();
+                let _ = read_test_request(&mut first);
+                let batch = json!([
+                    {"jsonrpc":"2.0", "id":1, "result":{"ok":true}},
+                    {"jsonrpc":"2.0", "id":"after", "method":"ping"},
+                    {"jsonrpc":"2.0", "id":"unsupported", "method":"unknown"}
+                ]);
+                let body = if content_type == "text/event-stream" {
+                    format!("data: {batch}{suffix}")
+                } else {
+                    batch.to_string()
+                };
+                write!(first, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                first.flush().unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let mut replies = Vec::new();
+                while replies.len() < 2 && std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(1)))
+                                .unwrap();
+                            replies.push(read_test_request(&mut stream));
+                            write!(stream, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2))
+                        }
+                        Err(err) => panic!("{err}"),
+                    }
+                }
+                replies
+            });
+            let mut transport =
+                HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+            transport.set_call_timeout(Duration::from_secs(3));
+            let result = transport.call("tools/call", json!({}));
+            let replies = server.join().unwrap();
+            assert_eq!(result.unwrap()["ok"], true);
+            assert_eq!(replies.len(), 2, "{content_type} {suffix:?}: {replies:?}");
+            assert!(
+                replies[0].contains("\"id\":\"after\"") && replies[0].contains("\"result\":{}")
+            );
+            assert!(replies[1].contains("\"id\":\"unsupported\"") && replies[1].contains("-32601"));
+        }
+    }
 
     fn read_test_request(stream: &mut std::net::TcpStream) -> String {
         let mut bytes = Vec::new();
