@@ -3587,6 +3587,76 @@ fn extension_reload_does_not_load_untrusted_project_skills() {
 }
 
 #[test]
+fn extension_session_writes_report_persistence_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), "/fixture", Some("original")).unwrap();
+    let path = session.path.clone();
+    // The backing file becomes a directory: every write now fails.
+    std::fs::rename(&path, path.with_extension("backup")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let mut agent = Agent::new("x");
+    agent.session = Some(session);
+    let failures = apply_session_calls(
+        None,
+        &mut agent,
+        SessionCallUi::Silent,
+        &[
+            serde_json::json!({"op":"appendEntry","customType":"fixture","data":{"k":1}}),
+            serde_json::json!({"op":"setLabel","entryId":"fixture-entry","label":"x"}),
+            serde_json::json!({"op":"setSessionName","name":"renamed"}),
+        ],
+        false,
+    );
+    assert_eq!(
+        failures.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        [0, 1, 2],
+        "{failures:?}"
+    );
+    assert_eq!(
+        agent.session.as_ref().unwrap().display_name().as_deref(),
+        Some("original")
+    );
+}
+
+#[test]
+fn extension_session_calls_without_a_target_fail_instead_of_clearing() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), "/fixture", Some("original")).unwrap();
+    let path = session.path.clone();
+    let mut agent = Agent::new("x");
+    agent.session = Some(session);
+    let failures = apply_session_calls(
+        None,
+        &mut agent,
+        SessionCallUi::Silent,
+        &[
+            serde_json::json!({"op":"setLabel","label":"x"}),
+            serde_json::json!({"op":"setSessionName"}),
+        ],
+        false,
+    );
+    assert_eq!(
+        failures.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        [0, 1],
+        "{failures:?}"
+    );
+    assert_eq!(
+        JsonlSession::open(&path).unwrap().display_name().as_deref(),
+        Some("original")
+    );
+    // An explicit empty name still clears it.
+    let failures = apply_session_calls(
+        None,
+        &mut agent,
+        SessionCallUi::Silent,
+        &[serde_json::json!({"op":"setSessionName","name":""})],
+        false,
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(JsonlSession::open(&path).unwrap().display_name(), None);
+}
+
+#[test]
 fn suspend_dry_run_sets_status() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()
