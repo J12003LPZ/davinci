@@ -105,7 +105,8 @@ mod tests {
             Line::TooLong
         );
         assert!(buf.is_empty());
-        assert!(buf.capacity() <= 100, "{} bytes reserved", buf.capacity());
+        // Growth may round up, but never toward the 10 000-byte line.
+        assert!(buf.capacity() <= 256, "{} bytes reserved", buf.capacity());
         skip_line(&mut reader).unwrap();
         assert_eq!(
             read_line_capped(&mut reader, 100, &mut buf).unwrap(),
