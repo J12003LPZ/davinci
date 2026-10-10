@@ -169,6 +169,11 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     }
     if !working.is_empty() {
         working.insert(0, blank());
+        // The context bar is a heavy rule; a spinner touching it reads as
+        // part of the bar, so one row of air separates them.
+        if !meter.is_empty() {
+            working.push(blank());
+        }
     }
     let reserved = usize::from(!conversation)
         + top.len()
@@ -378,6 +383,29 @@ pub fn set_transcript_offset(model: &mut Model, bar: &Scrollbar, offset: usize) 
             &model.transcript,
         )
     });
+}
+
+/// Scroll the conversation so `entry` starts on the top row of the view, the
+/// way a block taller than the screen should be read: from its first line.
+/// When the rows from `entry` to the end fit the view, the newest stays in
+/// view instead. `false` when there is nothing to scroll.
+pub fn scroll_transcript_to_entry(model: &mut Model, entry: usize) -> bool {
+    let Some(bar) = transcript_scrollbar(model) else {
+        return false;
+    };
+    // The same layout `conversation_body` draws: text leaves the bar's column,
+    // and a blank, the banner and a blank lead the conversation.
+    let width = if model.width >= scrollbar::MIN_WIDTH {
+        model.width - 1
+    } else {
+        model.width
+    };
+    let head = 2 + startup::banner(model, &model.startup).len();
+    let start = head + transcript::rows_before(model, entry, width);
+    let max_top = bar.total.saturating_sub(bar.height as usize);
+    let offset = max_top.saturating_sub(start.min(max_top));
+    set_transcript_offset(model, &bar, offset);
+    true
 }
 
 /// A shared command panel for authentication, history, help, policies and
@@ -2521,6 +2549,68 @@ mod tests {
         assert!(!m.transcript.is_empty());
     }
 
+    fn with_slash_commands(mut m: Model) -> Model {
+        m.slash_commands = ["agents", "context", "config", "mcp"]
+            .into_iter()
+            .map(|name| crate::autocomplete::SlashCommandSpec {
+                name: name.to_string(),
+                description: format!("the {name} command"),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            })
+            .collect();
+        m
+    }
+
+    #[test]
+    fn up_walks_back_through_history_past_a_recalled_slash_command() {
+        let mut m = with_slash_commands(model(100, 24));
+        for line in ["hola", "/agents", "context"] {
+            for ch in line.chars() {
+                handle_key(&mut m, key(KeyCode::Char(ch)));
+            }
+            assert!(matches!(
+                handle_key(&mut m, key(KeyCode::Enter)),
+                Flow::Submit(_)
+            ));
+            m.running = false;
+        }
+        let draft = |m: &Model| m.composer.editor().get_text().to_string();
+        handle_key(&mut m, key(KeyCode::Up));
+        assert_eq!(draft(&m), "context");
+        handle_key(&mut m, key(KeyCode::Up));
+        assert_eq!(draft(&m), "/agents");
+        assert!(
+            m.suggestions.is_none(),
+            "a recalled command must not open the completion list"
+        );
+        handle_key(&mut m, key(KeyCode::Up));
+        assert_eq!(draft(&m), "hola");
+        handle_key(&mut m, key(KeyCode::Down));
+        assert_eq!(draft(&m), "/agents");
+        handle_key(&mut m, key(KeyCode::Down));
+        assert_eq!(draft(&m), "context");
+    }
+
+    #[test]
+    fn typing_a_slash_after_recalling_history_offers_commands_again() {
+        let mut m = with_slash_commands(model(100, 24));
+        for ch in "hola".chars() {
+            handle_key(&mut m, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut m, key(KeyCode::Enter));
+        m.running = false;
+        handle_key(&mut m, key(KeyCode::Up));
+        assert_eq!(m.composer.editor().get_text(), "hola");
+        // Editing the recalled text ends the browse.
+        handle_key(&mut m, key(KeyCode::End));
+        for _ in 0..4 {
+            handle_key(&mut m, key(KeyCode::Backspace));
+        }
+        handle_key(&mut m, key(KeyCode::Char('/')));
+        assert!(m.suggestions.is_some());
+    }
+
     #[test]
     fn double_esc_clears_the_draft_and_up_brings_it_back() {
         let mut m = model(100, 24);
@@ -4231,5 +4321,147 @@ mod workflows_view_keys {
         assert_eq!(m.screen, Screen::Workflows);
         press(&mut m, KeyCode::Esc);
         assert_ne!(m.screen, Screen::Workflows, "esc at the run list closes");
+    }
+}
+
+#[cfg(test)]
+mod working_line_spacing_tests {
+    use super::*;
+    use crate::davinci::model::{ContextCategory, ContextKind, ContextUsageView, Working};
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    fn rows(model: &Model, height: u16) -> Vec<String> {
+        compose(model, height)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn model_with_bar() -> Model {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        model.working = Some(Working::new());
+        model.context_meter = Some(ContextUsageView {
+            model: "gpt-6-luna".into(),
+            window: 200_000,
+            free: 150_000,
+            categories: vec![ContextCategory {
+                kind: ContextKind::SystemPrompt,
+                label: "System prompt".into(),
+                tokens: 4_000,
+            }],
+            buffer: 40_000,
+            sections: Vec::new(),
+        });
+        model
+    }
+
+    #[test]
+    fn a_blank_row_separates_the_working_line_from_the_context_bar() {
+        let rows = rows(&model_with_bar(), 44);
+        let working = rows
+            .iter()
+            .position(|row| row.contains("… ") && row.contains('('))
+            .expect("working line");
+        let bar = rows
+            .iter()
+            .position(|row| row.contains("◆ context"))
+            .expect("context bar");
+        assert!(bar > working + 1, "working {working}, bar {bar}");
+        assert!(
+            rows[working + 1..bar]
+                .iter()
+                .all(|row| row.trim().is_empty()),
+            "{:?}",
+            &rows[working..=bar]
+        );
+    }
+}
+
+#[cfg(test)]
+mod scroll_to_entry_tests {
+    use super::*;
+    use crate::davinci::model::{ContextCategory, ContextKind, ContextUsageView, Entry};
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    fn usage(sections: usize) -> ContextUsageView {
+        ContextUsageView {
+            model: "gpt-6-luna".into(),
+            window: 200_000,
+            free: 150_000,
+            categories: vec![ContextCategory {
+                kind: ContextKind::SystemPrompt,
+                label: "System prompt".into(),
+                tokens: 4_000,
+            }],
+            buffer: 40_000,
+            sections: (0..sections)
+                .map(|n| crate::davinci::model::ContextSection {
+                    title: format!("Section {n}"),
+                    command: None,
+                    items: (0..4).map(|i| (format!("item-{n}-{i}"), 100 + i)).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn chat(height: u16, sections: usize) -> Model {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            height,
+            true,
+        );
+        for n in 0..12 {
+            m.transcript.push(Entry::user(&format!("question {n}")));
+            m.transcript.push(Entry::Gap);
+        }
+        m.transcript.push(Entry::User("/context".into()));
+        m.transcript.push(Entry::ContextUsage(usage(sections)));
+        m
+    }
+
+    fn rows(m: &Model) -> Vec<String> {
+        compose(m, m.height)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_tall_block_opens_on_its_first_line_not_its_last() {
+        let mut m = chat(24, 6);
+        // Following the newest hides the heading above the fold.
+        assert!(!rows(&m)[0].contains("Context Usage"));
+        assert!({
+            let last = m.transcript.len() - 1;
+            scroll_transcript_to_entry(&mut m, last)
+        });
+        let shown = rows(&m);
+        assert!(shown[0].contains("Context Usage"), "{:?}", &shown[..3]);
+        assert!(shown.iter().any(|row| row.contains("Estimated usage")));
+    }
+
+    #[test]
+    fn a_block_that_fits_keeps_following_the_newest() {
+        let mut m = chat(60, 0);
+        {
+            let last = m.transcript.len() - 1;
+            scroll_transcript_to_entry(&mut m, last)
+        };
+        assert!(m.transcript_scroll.get().top.is_none());
+        assert!(rows(&m).iter().any(|row| row.contains("Context Usage")));
+    }
+
+    #[test]
+    fn sending_the_next_message_returns_to_the_newest() {
+        let mut m = chat(24, 6);
+        {
+            let last = m.transcript.len() - 1;
+            scroll_transcript_to_entry(&mut m, last)
+        };
+        assert!(m.transcript_scroll.get().top.is_some());
+        m.type_char("next");
+        m.submit();
+        assert!(m.transcript_scroll.get().top.is_none());
     }
 }

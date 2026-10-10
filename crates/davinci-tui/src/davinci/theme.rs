@@ -444,6 +444,12 @@ pub struct Cc {
     pub code_keyword: Color,
     pub code_string: Color,
     pub code_macro: Color,
+    /// One ink per `/context` category, in `ContextKind` order: system
+    /// prompt, system tools, MCP tools, custom agents, memory files, messages.
+    /// Six hues no other slot has to share, so two categories never look
+    /// alike in any theme. Reset on a palette with no colour, where each
+    /// category's glyph tells them apart.
+    pub category: [Color; 6],
 }
 
 const CC_DARK: Cc = Cc {
@@ -471,6 +477,14 @@ const CC_DARK: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    category: [
+        rgb(0x82AAFF),
+        rgb(0xF2D45C),
+        rgb(0x4EBA65),
+        rgb(0xFD5DB1),
+        rgb(0x4DD0E1),
+        rgb(0xD77757),
+    ],
 };
 
 const CC_DARK_256: Cc = Cc {
@@ -498,6 +512,14 @@ const CC_DARK_256: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    category: [
+        Color::Indexed(111),
+        Color::Indexed(221),
+        Color::Indexed(71),
+        Color::Indexed(205),
+        Color::Indexed(80),
+        Color::Indexed(173),
+    ],
 };
 
 const CC_LIGHT: Cc = Cc {
@@ -525,6 +547,14 @@ const CC_LIGHT: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    category: [
+        rgb(0x3B5BDB),
+        rgb(0xB8860B),
+        rgb(0x2F9E44),
+        rgb(0xD6336C),
+        rgb(0x0C8599),
+        rgb(0xD9480F),
+    ],
 };
 
 const CC_LIGHT_256: Cc = Cc {
@@ -552,6 +582,14 @@ const CC_LIGHT_256: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    category: [
+        Color::Indexed(62),
+        Color::Indexed(136),
+        Color::Indexed(34),
+        Color::Indexed(168),
+        Color::Indexed(31),
+        Color::Indexed(166),
+    ],
 };
 
 /// Vox conversation colors: mustard identity, navy user strip, cyan and
@@ -581,6 +619,14 @@ const CC_VOX: Cc = Cc {
     code_keyword: rgb(0xC45ADF),
     code_string: rgb(0xEABC34),
     code_macro: rgb(0x20C9D6),
+    category: [
+        rgb(0x4A7BF0),
+        rgb(0xEABC34),
+        rgb(0x6DBE5A),
+        rgb(0xC45ADF),
+        rgb(0x20C9D6),
+        rgb(0xE8604A),
+    ],
 };
 
 const CC_VOX_256: Cc = Cc {
@@ -608,6 +654,14 @@ const CC_VOX_256: Cc = Cc {
     code_keyword: Color::Indexed(176),
     code_string: Color::Indexed(179),
     code_macro: Color::Indexed(44),
+    category: [
+        Color::Indexed(69),
+        Color::Indexed(179),
+        Color::Indexed(71),
+        Color::Indexed(134),
+        Color::Indexed(44),
+        Color::Indexed(203),
+    ],
 };
 
 const CC_BASIC: Cc = Cc {
@@ -635,6 +689,14 @@ const CC_BASIC: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    category: [
+        Color::LightBlue,
+        Color::Yellow,
+        Color::Green,
+        Color::LightMagenta,
+        Color::Cyan,
+        Color::LightRed,
+    ],
 };
 
 const CC_NONE: Cc = Cc {
@@ -662,6 +724,7 @@ const CC_NONE: Cc = Cc {
     code_keyword: Color::Reset,
     code_string: Color::Reset,
     code_macro: Color::Reset,
+    category: [Color::Reset; 6],
 };
 
 impl Theme {
@@ -703,6 +766,7 @@ impl Theme {
             accept_edits: quiet,
             diff_add: quiet,
             diff_del: quiet,
+            category: [quiet; 6],
             user_bg: Color::Reset,
             bash_bg: Color::Reset,
             diff_add_bg: Color::Reset,

@@ -13,7 +13,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::context_usage::{format_tokens, kind_color};
+use super::context_usage::{format_tokens, kind_color, kind_glyph};
 use crate::davinci::model::{ContextBarMode, ContextUsageView, Model};
 use crate::davinci::ui::{span, MEASURE};
 
@@ -199,7 +199,10 @@ fn legend(model: &Model, view: &ContextUsageView, width: usize) -> Vec<Line<'sta
         .filter(|category| category.tokens > 0)
         .map(|category| {
             vec![
-                span("■ ", kind_color(&cc, category.kind)),
+                span(
+                    format!("{} ", kind_glyph(category.kind)),
+                    kind_color(&cc, category.kind),
+                ),
                 span(category.label.to_lowercase(), th.muted),
                 Span::styled(
                     format!(" {}", format_tokens(category.tokens)),

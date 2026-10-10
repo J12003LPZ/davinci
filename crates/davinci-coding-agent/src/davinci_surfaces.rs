@@ -614,6 +614,32 @@ pub fn freshness_label(has_provenance: bool, fingerprint_matches: bool) -> &'sta
     }
 }
 
+/// One row per MCP server instead of one per tool: `mcp__github__create_issue`
+/// and its forty siblings are `github (41 tools)`, which is what the reader
+/// can act on (`/mcp`) and a fraction of the text. Servers keep the order of
+/// their heaviest tool, as the agent reported it.
+fn mcp_servers(tools: &[davinci_agent::context_usage::ContextUsageItem]) -> Vec<(String, u64)> {
+    let mut servers: Vec<(String, u64, usize)> = Vec::new();
+    for tool in tools {
+        let rest = tool.name.strip_prefix("mcp__").unwrap_or(&tool.name);
+        let server = rest.split_once("__").map_or(rest, |(server, _)| server);
+        match servers.iter_mut().find(|(name, ..)| name == server) {
+            Some((_, tokens, count)) => {
+                *tokens += tool.tokens;
+                *count += 1;
+            }
+            None => servers.push((server.to_string(), tool.tokens, 1)),
+        }
+    }
+    servers
+        .into_iter()
+        .map(|(server, tokens, count)| {
+            let noun = if count == 1 { "tool" } else { "tools" };
+            (format!("{server} ({count} {noun})"), tokens)
+        })
+        .collect()
+}
+
 /// What `/context` draws, from the agent's per-category estimate.
 pub fn context_usage_view(
     usage: &davinci_agent::context_usage::ContextUsage,
@@ -675,7 +701,7 @@ pub fn context_usage_view(
         free: usage.free(),
         buffer: usage.autocompact_buffer,
         sections: vec![
-            section("MCP tools", Some("/mcp"), items(&usage.mcp_tools)),
+            section("MCP tools", Some("/mcp"), mcp_servers(&usage.mcp_tools)),
             section(
                 "Custom agents",
                 Some("/agents"),
@@ -1495,6 +1521,7 @@ mod tests {
         model.agents = Some(davinci_tui::davinci::model::AgentsSheet {
             agents: vec![row],
             selected_index: 0,
+            ..Default::default()
         });
 
         // Simulating refresh:
@@ -1821,5 +1848,50 @@ mod tests {
         assert!(!report.manual_verified);
         assert_eq!(report.named_gaps.len(), 3);
         assert!(report.named_gaps.iter().any(|g| g.contains("real PTY")));
+    }
+
+    #[test]
+    fn mcp_tools_collapse_to_one_row_per_server() {
+        let item = |name: &str, tokens| davinci_agent::context_usage::ContextUsageItem {
+            name: name.into(),
+            tokens,
+        };
+        let usage = davinci_agent::context_usage::ContextUsage {
+            model: "m".into(),
+            context_window: 200_000,
+            system_prompt: 100,
+            system_tools: 100,
+            mcp_tools: vec![
+                item("mcp__github__create_issue", 300),
+                item("mcp__linear__list_issues", 250),
+                item("mcp__github__get_pr", 200),
+                item("mcp__solo__only_tool", 10),
+            ],
+            custom_agents: Vec::new(),
+            memory_files: Vec::new(),
+            messages: 0,
+            autocompact_buffer: 0,
+        };
+        let view = context_usage_view(&usage);
+        let mcp = view
+            .sections
+            .iter()
+            .find(|section| section.title == "MCP tools")
+            .expect("mcp section");
+        assert_eq!(
+            mcp.items,
+            vec![
+                ("github (2 tools)".to_string(), 500),
+                ("linear (1 tool)".to_string(), 250),
+                ("solo (1 tool)".to_string(), 10),
+            ]
+        );
+        // The category total still counts every tool.
+        let category = view
+            .categories
+            .iter()
+            .find(|category| category.label == "MCP tools")
+            .expect("mcp category");
+        assert_eq!(category.tokens, 760);
     }
 }

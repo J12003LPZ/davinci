@@ -199,4 +199,76 @@ mod tests {
         agent.auto_compaction = false;
         assert_eq!(agent.context_usage().autocompact_buffer, 0);
     }
+
+    /// The host's configuration: an active context VM and a tool-overhead
+    /// estimator that returns the admission byte ceiling.
+    fn host_agent(mode: crate::ContextVmMode) -> Agent {
+        use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+        let mut agent = Agent::new("You are a coding agent.");
+        agent.context_window = 200_000;
+        agent.cwd = std::env::temp_dir();
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(mode);
+        agent.set_provider_context_overhead_estimator(|agent| {
+            serde_json::to_vec(&agent.provider_tool_specs())
+                .unwrap()
+                .len() as u64
+                + 128
+        });
+        agent
+    }
+
+    #[test]
+    fn an_empty_session_attributes_nothing_to_messages_in_every_vm_mode() {
+        for mode in [
+            crate::ContextVmMode::Off,
+            crate::ContextVmMode::Shadow,
+            crate::ContextVmMode::Active,
+        ] {
+            let agent = host_agent(mode);
+            let usage = agent.context_usage();
+            // The active VM sends a small state preface of its own; it was
+            // once 5k because byte ceilings were summed as tokens.
+            let allowed = if mode == crate::ContextVmMode::Active {
+                150
+            } else {
+                0
+            };
+            assert!(
+                usage.messages <= allowed,
+                "{mode:?} charged an empty session {} tokens",
+                usage.messages
+            );
+            assert_eq!(usage.used(), agent.estimated_context_tokens(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_active_vm_estimate_is_in_tokens_not_admission_bytes() {
+        let mut agent = host_agent(crate::ContextVmMode::Active);
+        let legacy = {
+            let mut off = host_agent(crate::ContextVmMode::Off);
+            off.messages.push(ChatMessage::text(
+                "user",
+                "hello there, explain the runtime",
+            ));
+            off.estimated_context_tokens()
+        };
+        agent.messages.push(ChatMessage::text(
+            "user",
+            "hello there, explain the runtime",
+        ));
+        let active = agent.estimated_context_tokens();
+        // The two paths measure one request; they may differ by framing, not 4x.
+        assert!(
+            active <= legacy + legacy / 4 + 64,
+            "active {active} vs legacy {legacy}"
+        );
+        let usage = agent.context_usage();
+        assert!(usage.messages < 200, "messages {}", usage.messages);
+    }
 }

@@ -2570,12 +2570,15 @@ impl Agent {
         }
     }
 
+    /// The active VM's request on the same four-bytes-a-token scale as the
+    /// other modes. The admission budget ([`Self::provider_context_budget`])
+    /// and the image's own `estimated_tokens` are byte ceilings; summed here
+    /// they showed an empty session as thousands of tokens and `/context`
+    /// filed the excess under Messages.
     fn context_vm_estimated_provider_tokens(&self, image: &runtime::ContextImage) -> u64 {
-        let budget = self.provider_context_budget();
-        image
-            .estimated_tokens
-            .saturating_add(budget.system)
-            .saturating_add(budget.tools)
+        estimate_context_tokens(&image.messages)
+            .saturating_add((self.provider_system_prompt().len() as u64).div_ceil(4))
+            .saturating_add(self.estimated_tool_schema_tokens())
     }
 
     /// Set once per request configuration using the actual tool catalog.

@@ -130,6 +130,12 @@ impl Editor {
         }
     }
 
+    /// Whether the buffer is a recalled history entry (`↑`/`↓`) rather than
+    /// text typed since. Editing it ends the browse.
+    pub fn is_browsing_history(&self) -> bool {
+        self.history_index > -1
+    }
+
     fn exit_history_browsing(&mut self) {
         self.history_index = -1;
         self.history_draft = None;

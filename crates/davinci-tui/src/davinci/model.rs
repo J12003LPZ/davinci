@@ -2261,6 +2261,15 @@ impl AgentRow {
 pub struct AgentsSheet {
     pub agents: Vec<AgentRow>,
     pub selected_index: usize,
+    /// The agent profiles that can be launched, listed under the live workers.
+    pub profiles: Vec<AgentProfileRow>,
+}
+
+/// One launchable agent profile on the `/agents` sheet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentProfileRow {
+    pub name: String,
+    pub description: String,
 }
 
 /// What one `/context` category is, for its glyph colour.
@@ -3685,6 +3694,15 @@ impl Model {
 
     pub fn refresh_suggestions(&mut self) {
         if !self.composer_owns_focus() {
+            self.suggestions = None;
+            self.suggestion_index = 0;
+            self.suggestion_picked = false;
+            return;
+        }
+        // A recalled history entry is not being typed. Offering completions
+        // for a recalled `/agents` would hand the next `↑` to the list and
+        // strand the user inside it instead of walking further back.
+        if self.composer.editor().is_browsing_history() {
             self.suggestions = None;
             self.suggestion_index = 0;
             self.suggestion_picked = false;

@@ -9,6 +9,11 @@
 - `ask_user_question` asks 1-4 questions in one dialog, as Claude Code does. Each question is single-select (the default) or `multi_select`, with optional `min_selections`/`max_selections`; on multi-select a typed custom answer counts as one more selection. The dialog shows `Question N of M` with a ✓ per answered question; `↑↓` moves, `space` toggles a checkbox, `1-9` pick, `tab`/`shift+tab` (or `←→`) change question without losing answers, `enter` continues and then submits from a review page, `d` defers and `esc` cancels the whole dialog. All answers are validated and written to the Living Plan in one revision, or none are; the tool result lists every answer with option ids and labels. The flat single-question input still works, RPC clients and the hosted TUI get one select at a time, and old sessions load unchanged.
 
 ### Fixed
+- The working line ("Levitating…") sits one row above the context bar instead of touching it.
+- `/context` gives every category its own glyph and hue (`■ ▲ ♦ ● ▼ █`), so system prompt and system tools no longer look alike, in any theme and on a palette with no colour. It opens on its "Context Usage" heading instead of its last section. MCP tools are one row per server (`github (41 tools)`), and long sections fold after five rows.
+- `/agents` lists the defined agent profiles under the live workers. With no worker running it used to show only "No workers active".
+- A fresh session no longer gains thousands of phantom tokens, filed under Messages, the first time `/context` runs. The active context VM summed byte ceilings (system prompt and tool schemas) as tokens; it now counts on the same four-bytes-a-token scale as the other modes.
+- `↑` keeps walking back through history after a recalled `/command`. The recalled text no longer opens the completion list, which took the next `↑`.
 - Design runs no longer need `--root-budget`. Each operation gets a subscription-only ledger of its own (12 requests and 15 minutes for a generation). A host-provided root budget still wins.
 - Design requests renew the ChatGPT login when it nears expiry, use SSE as subscription admission requires, and give the model the exact binding schema.
 - A rejected source tool call or binding now goes to a repair pass instead of ending the run, and its message names the rule that failed.
