@@ -35,6 +35,26 @@ The ledger was written at `ae974c6c`. Commit `7b92153a` landed afterwards and to
 | EXT-01 | Low | Confirmed (static) | `crates/davinci-coding-agent/src/main.rs:11203`, `:11222`, `:11231` | Extension host drops `appendEntry` / `setLabel` / `setSessionName` persistence errors (DVA-004 sibling) |
 | CM-01 | Low | Confirmed (static) | `crates/davinci-agent/src/codemode/dispatch.rs:339-345`; `runtime/capacity.rs:240-249` | A `SerialBarrier` child can run alongside parallel-safe children in Code Mode ReadOnly |
 
+## Remediation (PR #173)
+
+All 10 confirmed findings are fixed on `fix/deep-audit-findings-d01afb19`, stacked on #172. Each fix ships its regression test. The `dvprobe` probes were rebuilt against the fixed tree and rerun.
+
+| ID | Commits | Regression tests | Probe after fix |
+|---|---|---|---|
+| SHELL-01 | `2821f5c9` | `permission::tests::auto_treats_a_lone_carriage_return_as_a_statement_separator`, `shell_policy::tests::security_unusual_whitespace_never_reads_as_one_command`, `split_segments_handles_chaining_and_quotes` | `perm`: every `<CR>` row now `ASK` |
+| SHELL-02 | `2821f5c9` | `shell_policy::tests::security_cargo_queries_reject_compiler_and_manifest_overrides` | `perm`: both cargo rows `is_read_only=false decision=Denied` |
+| SEC-01 | `625ba631`, `99db6975`, `6d90f816`, `d8ea68f0` | `credential_redaction::tests::*` (PEM, one-line keys, text around markers, SSH2, PuTTY, mixed formats, free-text key types), `security_scan::tools::tests::source_reads_never_return_private_key_body_lines`, `snapshot::tests::every_openssh_and_putty_private_key_name_is_withheld` | `secread`: every key body line is `[REDACTED PRIVATE KEY MATERIAL]` in source reads and `report::sanitize` |
+| SEC-02 | `625ba631`, `6d90f816`, `d8ea68f0`, `97a95301` | `credential_redaction::tests::url_credentials_cover_every_scheme_and_keep_the_host` | `secread`: `postgres://[REDACTED]@db.internal/app` |
+| SEC-03 | `625ba631`, `d8ea68f0`, `97a95301` | `security_scan::redaction::tests::private_key_bodies_url_passwords_and_named_tokens_are_redacted` | `secread`: `NPM_TOKEN=[REDACTED]`, `GITLAB_TOKEN=[REDACTED]` |
+| CAND-03 | `625ba631`, `6d90f816` | `vector_memory::tests::private_keys_and_url_passwords_do_not_survive_memory_extraction` | n/a |
+| MCP-01 | `bcba19b8` | `stdio::tests::non_utf8_stdout_line_is_text_not_a_transport_error`, `tests::non_utf8_stdout_log_lines_do_not_end_the_transport` (fixture `--legacy-log`) | `mcp-stdio-utf8`: `first call: Ok("ok")`, `second call: Ok("ok")` |
+| MCP-04 | `511f733b` | `mcp::tests::only_the_user_layer_can_trust_a_servers_read_only_hints` | n/a (static) |
+| SESS-01 | `8415f834` | `discovery::tests::sessions_created_with_an_explicit_id_are_found_from_their_cwd` | `unc`: UNC row `discovered=true` |
+| EXT-01 | `156aa353` | `extension_session_writes_report_persistence_failures`, `extension_session_calls_without_a_target_fail_instead_of_clearing` | n/a (static) |
+| CM-01 | `a86c4fb0` | `runtime::capacity::tests::a_serial_holder_keeps_parallel_callers_out_and_vice_versa` | n/a (static) |
+
+More gaps were found while fixing, all in the redaction helpers and all closed in the commits above: a source-read window starting inside a multi-line quoted secret (now masked against the whole file, line counts kept), SSH2 and PuTTY key formats, URL passwords holding an unencoded `@`, `/` or quote, bare `TOKEN=` / `authtoken` keys, and a PuTTY body count that could hide a PEM `BEGIN` line. Two design choices: every token-named assignment is masked in Security Scan context, including tokenizer code (`let token = ...`); URL masks run to the last `@` of a whitespace-delimited token, so a URL with a port and an `@` in its query is over-masked.
+
 ## Confirmed findings
 
 ### SHELL-01: Auto mode approves CR-separated PowerShell statements
@@ -142,7 +162,7 @@ The ledger was written at `ae974c6c`. Commit `7b92153a` landed afterwards and to
 - **Severity:** Medium (hard failure on second run; Windows network shares only). **Status:** Confirmed.
 - **Location:** `crates/davinci-session/src/jsonl_repo.rs:46-49` (`jsonl_session_directory_name` uses `trim_start_matches`, stripping every leading separator) vs `crates/davinci-session/src/discovery.rs:115-119` (`encode_cwd_component` uses `strip_prefix`, stripping one). Caller: `crates/davinci-coding-agent/src/main.rs:1660-1676` (`resolve_session_ref` then `JsonlSessionRepo::create`); lookup at `discovery.rs:545-557` is scoped to the cwd directory.
 - **What is wrong:** For a cwd with two or more leading separators the two encoders disagree: `\\server\share\proj` becomes `--server-share-proj--` on create and `---server-share-proj--` on discovery. The session file is written where discovery never looks.
-- **Impact:** First `--session-id X` run creates the session. Every later `--session-id X` run misses it, falls through to create, and exits with `Session already exists: X`. `--continue` and `--resume` from that cwd also never list it. Plain sessions are unaffected because `JsonlSession::create` (`lib.rs:88`) uses `encode_cwd_component`; `JsonlSessionRepo::create` has one production caller, this one. Verbatim paths (`\\?\C:\...`) hit the same mismatch (static).
+- **Impact:** First `--session-id X` run creates the session. Every later `--session-id X` run misses it, falls through to create, and exits with `Session already exists: X`. `--continue` and `--resume` from that cwd also never list it. Plain sessions are unaffected because `JsonlSession::create` (`lib.rs:88`) uses `encode_cwd_component`; `JsonlSessionRepo::create` has one production caller, this one. Verbatim paths (`\\?\C:\...`) fail earlier: both encoders keep the `?`, which Windows rejects in a directory name, so `create` itself errors (os error 123, seen while writing the regression test). Not reachable through `std::env::current_dir`; recorded, not fixed.
 - **Evidence:** probe `unc` at HEAD:
   ```
   cwd=/home/u/proj         create_dir=--home-u-proj--      discover_dir=--home-u-proj--       discovered=true
