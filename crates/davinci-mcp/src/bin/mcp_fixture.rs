@@ -3,6 +3,8 @@
 //! Flags select a misbehaviour the client must survive:
 //! `--log-stdout` prints a plain log line before every reply,
 //! `--legacy-log` prints a log line that is not UTF-8 (cp1252) before every reply,
+//! `--legacy-reply` answers `tools/call` with text `corrupt` with a reply that
+//! is not UTF-8,
 //! `--sampling` sends a notification and a `sampling/createMessage` request
 //! (with the caller's own id) before answering `tools/call` and echoes the
 //! error code the client refused it with,
@@ -24,6 +26,7 @@ use std::io::{self, BufRead, Write};
 struct Flags {
     log_stdout: bool,
     legacy_log: bool,
+    legacy_reply: bool,
     sampling: bool,
     ping: bool,
     chatty: bool,
@@ -42,6 +45,7 @@ fn main() {
     let flags = Flags {
         log_stdout: has("--log-stdout"),
         legacy_log: has("--legacy-log"),
+        legacy_reply: has("--legacy-reply"),
         sampling: has("--sampling"),
         ping: has("--ping"),
         chatty: has("--chatty"),
@@ -116,6 +120,24 @@ fn main() {
             "tools/call" if flags.die => {
                 eprintln!("fatal: boom");
                 std::process::exit(1);
+            }
+            "tools/call"
+                if flags.legacy_reply
+                    && msg
+                        .pointer("/params/arguments/text")
+                        .and_then(Value::as_str)
+                        == Some("corrupt") =>
+            {
+                // A reply whose text holds one raw cp1252 byte (0xE9).
+                let mut bytes = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"caf"#
+                )
+                .into_bytes();
+                bytes.push(0xe9);
+                bytes.extend_from_slice(b"\"}]}}\n");
+                let _ = stdout.write_all(&bytes);
+                let _ = stdout.flush();
+                continue;
             }
             "tools/call" if flags.malformed_reply => json!({
                 "jsonrpc": "2.0",

@@ -670,6 +670,18 @@ mod tests {
     }
 
     #[test]
+    fn a_non_utf8_reply_fails_its_call_without_corrupting_or_ending_the_transport() {
+        let mut client = fixture_client(&["--legacy-reply"]);
+        let error = client
+            .call_tool("echo", json!({"text": "corrupt"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        let ok = client.call_tool("echo", json!({"text": "next"})).unwrap();
+        assert_eq!(ok.text(), "next");
+    }
+
+    #[test]
     fn server_requests_are_refused_and_notifications_ignored() {
         let mut client = fixture_client(&["--sampling"]);
         // The fixture sends a notification and a `sampling/createMessage`
