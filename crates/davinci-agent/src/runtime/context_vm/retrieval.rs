@@ -209,7 +209,7 @@ mod tests {
         assert!(content.len() <= MAX_PAGE_BYTES);
         let taken = content.lines().count();
         assert_eq!(next, Some(taken));
-        assert!(taken >= 1 && taken < 100);
+        assert!((1..100).contains(&taken));
     }
 
     #[test]

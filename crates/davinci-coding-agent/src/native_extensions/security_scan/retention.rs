@@ -46,7 +46,7 @@ pub fn sweep(agent_dir: &Path, retention_days: u32, now: SystemTime) -> usize {
             if !scan.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            if !newest_modification(&scan.path()).is_some_and(|newest| newest < cutoff) {
+            if newest_modification(&scan.path()).is_none_or(|newest| newest >= cutoff) {
                 continue;
             }
             let Ok(lease) =
