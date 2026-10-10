@@ -474,7 +474,7 @@ fn normalize_path(path: &str) -> String {
 }
 
 pub fn redact_secrets(input: &str) -> String {
-    let mut output = input.to_string();
+    let mut output = super::credential_redaction::quoted_assignments(input);
     let patterns = [
         ("sk-", "sk-[REDACTED]"),
         ("ghp_", "ghp_[REDACTED]"),
@@ -2911,6 +2911,25 @@ pub(crate) mod tests {
         assert!(!value.contains("hunter2"));
         let json = redact_secrets(r#"{"api_key": "abc", "token":"xyz"}"#);
         assert!(!json.contains("abc") && !json.contains("xyz"), "{json}");
+    }
+
+    #[test]
+    fn quoted_credentials_do_not_survive_memory_extraction() {
+        let content = r#"Remember this deployment setting: password="fixture first second third"; normal configuration remains visible."#;
+        let chunks = extract_chunks(
+            &[MemoryMessage {
+                role: "user".into(),
+                content: content.into(),
+            }],
+            4096,
+        );
+        assert!(!chunks.is_empty());
+        let text = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        assert!(!text.contains("first second third"), "{text}");
+        assert!(text.contains("configuration remains visible"), "{text}");
     }
 
     #[test]

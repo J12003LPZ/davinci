@@ -113,6 +113,95 @@ fn fork_retains_compaction_first_kept_reference() {
 }
 
 #[test]
+fn clone_omits_abandoned_branch_and_preserves_selected_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = JsonlSession::create(dir.path(), "/fixture", None).unwrap();
+    session.append_entry(user("root")).unwrap();
+    let root = session.leaf_id.clone();
+    session.append_entry(user("abandoned")).unwrap();
+    session.set_leaf(root);
+    session.append_entry(user("selected")).unwrap();
+    let selected = session.leaf_id.clone();
+    session.append_entry(user("later branch")).unwrap();
+    session.set_leaf(selected.clone());
+
+    let cloned = session.clone_session(dir.path()).unwrap();
+    let reopened = JsonlSession::open(&cloned.path).unwrap();
+    assert_ne!(reopened.header.id, session.header.id);
+    assert_eq!(
+        reopened.header.parent_session_id,
+        Some(session.header.id.clone())
+    );
+    assert_eq!(reopened.leaf_id, selected);
+    assert_eq!(
+        reopened.entries.iter().map(text_of).collect::<Vec<_>>(),
+        ["root", "selected"]
+    );
+}
+
+#[test]
+fn clone_retains_compaction_and_label_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = JsonlSession::create(dir.path(), "/fixture", None).unwrap();
+    session.append_entry(user("old")).unwrap();
+    session.append_entry(user("retained requirement")).unwrap();
+    let retained = session.leaf_id.clone().unwrap();
+    let mut compaction = user("");
+    compaction.entry_type = "compaction".into();
+    compaction.message = None;
+    compaction.extra.insert("summary".into(), json!("summary"));
+    compaction
+        .extra
+        .insert("firstKeptEntryId".into(), json!(retained));
+    session.append_entry(compaction).unwrap();
+    session
+        .append_entry(SessionEntry::label_change(&retained, Some("keep")))
+        .unwrap();
+    session.append_entry(user("latest")).unwrap();
+
+    let cloned = session.clone_session(dir.path()).unwrap();
+    let reopened = JsonlSession::open(&cloned.path).unwrap();
+    let context = build_context_entries(&reopened.entries, reopened.leaf_id.as_deref());
+    assert_eq!(
+        context
+            .iter()
+            .filter(|entry| entry.message.is_some())
+            .map(|entry| text_of(entry))
+            .collect::<Vec<_>>(),
+        ["retained requirement", "latest"]
+    );
+    assert_eq!(
+        davinci_session::resolved_labels(&reopened.entries)
+            .get(&retained)
+            .and_then(|label| label.0.as_deref()),
+        Some("keep")
+    );
+}
+
+#[test]
+fn completed_malformed_final_record_is_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt.jsonl");
+    header_only(&path);
+    for suffix in [
+        "{\"kind\":\"entry\"\n",
+        "{\"kind\":\"entry\"\r\n",
+        "{\"kind\":\"entry\"\npartial",
+    ] {
+        header_only(&path);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(JsonlStoredSession::load(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
 fn replay_rejects_nonconsecutive_lane_and_name_sequences() {
     let dir = tempfile::tempdir().unwrap();
     for mutation in [

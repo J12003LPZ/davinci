@@ -95,8 +95,15 @@ impl CancellationToken {
             let mut guard = self.callbacks.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *guard)
         };
+        // Cleanup must reach every callback and child even when one panics.
+        // Re-raise the first panic after propagation to preserve observability.
+        let mut panic = None;
         for cb in callbacks {
-            cb();
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)) {
+                if panic.is_none() {
+                    panic = Some(payload);
+                }
+            }
         }
 
         // Propagate to child tokens
@@ -114,7 +121,16 @@ impl CancellationToken {
                 callbacks: child_node.callbacks.clone(),
                 node: child_node,
             };
-            child_token.cancel();
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                child_token.cancel();
+            })) {
+                if panic.is_none() {
+                    panic = Some(payload);
+                }
+            }
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -227,6 +243,28 @@ fn after_flag_check_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panicking_callbacks_do_not_skip_cleanup_or_child_propagation() {
+        let parent = CancellationToken::new();
+        let first = parent.child_token();
+        let second = parent.child_token();
+        let grandchild = first.child_token();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        parent.on_cancel(|| panic!("synthetic parent callback failure"));
+        first.on_cancel(|| panic!("synthetic child callback failure"));
+        let flag = cleaned.clone();
+        parent.on_cancel(move || {
+            flag.store(true, Ordering::SeqCst);
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parent.cancel()));
+        assert!(result.is_err(), "callback panic must remain observable");
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert!(grandchild.is_cancelled());
+        parent.cancel();
+    }
 
     /// WOR-52: a child registered while the parent is mid-cancel must still
     /// end up cancelled. Before the fix `child_token` read the flag outside

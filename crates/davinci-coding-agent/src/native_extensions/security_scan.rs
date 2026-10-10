@@ -1965,7 +1965,7 @@ fn redact_evidence(line: &str) -> String {
     if line.to_ascii_uppercase().contains("PRIVATE KEY") {
         return "[REDACTED PRIVATE KEY MATERIAL]".into();
     }
-    let mut out = line.to_string();
+    let mut out = super::credential_redaction::quoted_assignments(line);
     for prefix in ["sk-", "ghp_", "Bearer "] {
         let mut search_start = 0;
         while let Some(offset) = out[search_start..].find(prefix) {

@@ -407,13 +407,20 @@ impl JsonlSession {
     }
 
     pub fn clone_session(&self, sessions_root: &Path) -> Result<Self, SessionError> {
+        // Entry IDs are scoped to a session, as in `fork`. Preserve them so
+        // compaction, labels, and other embedded references keep resolving.
+        let path = self
+            .leaf_id
+            .as_deref()
+            .map(|id| self.ancestry(id))
+            .transpose()?
+            .unwrap_or_default();
         let mut cloned = Self::create(sessions_root, &self.header.cwd, None)?;
         cloned.prepare_first_write()?;
         cloned.header.parent_session_id = Some(self.header.id.clone());
         cloned.rewrite_header()?;
-        for entry in &self.entries {
+        for entry in path {
             let mut clone = entry.clone();
-            clone.id = Uuid::new_v4().to_string();
             clone.parent_id = cloned.leaf_id.clone();
             cloned.append_entry(clone)?;
         }

@@ -1,10 +1,13 @@
 //! Bounded LSP JSON-RPC transport with Content-Length framing, cancellation, and tombstones.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Maximum allowed LSP message size (8 MiB).
 pub const MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+pub const MAX_HEADER_SIZE: usize = 16 * 1024;
+const MAX_BUFFER_SIZE: usize = MAX_FRAME_SIZE + MAX_HEADER_SIZE;
+const MAX_TOMBSTONES: usize = 1024;
 
 /// Maximum number of in-flight concurrent requests before applying backpressure.
 pub const MAX_PENDING_REQUESTS: usize = 64;
@@ -23,6 +26,7 @@ pub enum FrameParseError {
     InvalidContentLength,
     DuplicateContentLength,
     OversizedFrame(usize),
+    OversizedHeader(usize),
     InvalidUtf8Header,
 }
 
@@ -38,6 +42,10 @@ impl std::fmt::Display for FrameParseError {
                     "Oversized frame: {len} bytes exceeds max {MAX_FRAME_SIZE}"
                 )
             }
+            Self::OversizedHeader(len) => write!(
+                f,
+                "Oversized LSP header: {len} bytes exceeds max {MAX_HEADER_SIZE}"
+            ),
             Self::InvalidUtf8Header => write!(f, "Invalid UTF-8 in frame header or body"),
         }
     }
@@ -49,24 +57,49 @@ impl std::error::Error for FrameParseError {}
 #[derive(Debug, Default)]
 pub struct LspFrameParser {
     buffer: Vec<u8>,
+    error: Option<FrameParseError>,
 }
 
 impl LspFrameParser {
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self::default()
     }
 
     /// Appends incoming chunks to the internal buffer.
     pub fn feed(&mut self, chunk: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
+        let size = self.buffer.len().saturating_add(chunk.len());
+        if size > MAX_BUFFER_SIZE {
+            self.buffer.clear();
+            self.error = Some(FrameParseError::OversizedFrame(size));
+            return;
+        }
         self.buffer.extend_from_slice(chunk);
     }
 
     /// Attempts to extract the next frame, if complete.
     pub fn next_frame(&mut self) -> Result<Option<String>, FrameParseError> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
         let sep = b"\r\n\r\n";
         let Some(pos) = self.buffer.windows(sep.len()).position(|w| w == sep) else {
+            if self.buffer.len() > MAX_HEADER_SIZE {
+                let error = FrameParseError::OversizedHeader(self.buffer.len());
+                self.buffer.clear();
+                self.error = Some(error.clone());
+                return Err(error);
+            }
             return Ok(None);
         };
+        if pos + sep.len() > MAX_HEADER_SIZE {
+            let error = FrameParseError::OversizedHeader(pos + sep.len());
+            self.buffer.clear();
+            self.error = Some(error.clone());
+            return Err(error);
+        }
 
         let header_bytes = &self.buffer[..pos];
         let header_str =
@@ -125,6 +158,8 @@ pub struct RequestTable {
     next_id: u64,
     pending: HashMap<u64, PendingRequest>,
     tombstones: HashSet<u64>,
+    tombstone_order: VecDeque<u64>,
+    late_response_floor: u64,
 }
 
 impl Default for RequestTable {
@@ -139,6 +174,8 @@ impl RequestTable {
             next_id: 1,
             pending: HashMap::new(),
             tombstones: HashSet::new(),
+            tombstone_order: VecDeque::new(),
+            late_response_floor: 0,
         }
     }
 
@@ -149,7 +186,10 @@ impl RequestTable {
             ));
         }
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or("LSP request IDs exhausted")?;
         self.pending.insert(
             id,
             PendingRequest {
@@ -165,7 +205,7 @@ impl RequestTable {
     /// Cancel a request by ID: records a tombstone so late responses cannot be accepted.
     pub fn cancel_request(&mut self, id: u64) -> Option<PendingRequest> {
         if let Some(req) = self.pending.remove(&id) {
-            self.tombstones.insert(id);
+            self.record_tombstone(id);
             Some(req)
         } else {
             None
@@ -174,14 +214,16 @@ impl RequestTable {
 
     /// Handle an incoming response by ID.
     pub fn handle_response(&mut self, id: u64) -> Result<Option<PendingRequest>, String> {
-        if self.tombstones.contains(&id) {
+        if self.tombstones.contains(&id)
+            || (id > 0 && id <= self.late_response_floor && !self.pending.contains_key(&id))
+        {
             // Late reply to cancelled/timed out request safely dropped
             return Ok(None);
         }
         match self.pending.remove(&id) {
             Some(req) => {
                 if req.created_at.elapsed() > req.deadline {
-                    self.tombstones.insert(id);
+                    self.record_tombstone(id);
                     return Err(format!("Request {id} expired past deadline"));
                 }
                 Ok(Some(req))
@@ -200,9 +242,22 @@ impl RequestTable {
         }
         for &id in &expired {
             self.pending.remove(&id);
-            self.tombstones.insert(id);
+            self.record_tombstone(id);
         }
         expired
+    }
+
+    fn record_tombstone(&mut self, id: u64) {
+        if self.tombstones.insert(id) {
+            self.tombstone_order.push_back(id);
+        }
+        if self.tombstone_order.len() > MAX_TOMBSTONES {
+            let oldest = self.tombstone_order.pop_front().unwrap();
+            self.tombstones.remove(&oldest);
+            // IDs never repeat. Old retired replies can be dropped using a
+            // scalar horizon; pending requests below it still resolve normally.
+            self.late_response_floor = self.late_response_floor.max(oldest);
+        }
     }
 
     pub fn pending_count(&self) -> usize {
@@ -230,6 +285,71 @@ pub fn sanitize_stderr_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unterminated_header_is_bounded() {
+        let mut parser = LspFrameParser::new();
+        for _ in 0..3 {
+            parser.feed(&[b'x'; 8192]);
+        }
+        assert!(parser.next_frame().is_err());
+        assert!(parser.buffer.len() <= 16384);
+    }
+
+    #[test]
+    fn oversized_feed_is_rejected_without_retaining_it() {
+        let mut parser = LspFrameParser::new();
+        parser.feed(&vec![b'x'; MAX_FRAME_SIZE + 32768]);
+        assert!(parser.next_frame().is_err());
+        assert!(parser.buffer.len() <= MAX_FRAME_SIZE + 16384);
+    }
+
+    #[test]
+    fn cancellation_history_stays_bounded_and_old_replies_stay_rejected() {
+        let mut table = RequestTable::new();
+        let pending = table
+            .allocate_request("still pending", Duration::from_secs(60))
+            .unwrap();
+        for _ in 0..10000 {
+            let id = table
+                .allocate_request("cancel", Duration::from_secs(5))
+                .unwrap();
+            table.cancel_request(id).unwrap();
+        }
+        assert!(table.tombstones.len() <= 1024);
+        assert_eq!(table.handle_response(2).unwrap(), None);
+        assert_eq!(table.handle_response(9999).unwrap(), None);
+        assert_eq!(table.handle_response(pending).unwrap().unwrap().id, pending);
+        assert!(table.handle_response(10002).is_err());
+    }
+
+    #[test]
+    fn completed_oversized_header_is_rejected() {
+        let mut parser = LspFrameParser::new();
+        let frame = format!(
+            "X-Extra: {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            "x".repeat(MAX_HEADER_SIZE)
+        );
+        parser.feed(frame.as_bytes());
+        assert!(matches!(
+            parser.next_frame(),
+            Err(FrameParseError::OversizedHeader(_))
+        ));
+    }
+
+    #[test]
+    fn maximum_frame_parses_across_reads() {
+        let mut parser = LspFrameParser::new();
+        let body = "x".repeat(MAX_FRAME_SIZE);
+        let frame = lsp_frame(&body);
+        for chunk in frame.chunks(8192) {
+            parser.feed(chunk);
+            if frame.len() % 8192 != chunk.len() {
+                assert_eq!(parser.next_frame().unwrap(), None);
+            }
+        }
+        assert_eq!(parser.next_frame().unwrap(), Some(body));
+    }
 
     #[test]
     fn f10_length_counts_bytes() {

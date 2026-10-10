@@ -5,6 +5,7 @@ pub mod browser;
 pub mod build_intelligence;
 pub mod change_impact;
 pub mod content_router;
+mod credential_redaction;
 pub mod ecosystem;
 pub mod engineering_snapshot;
 pub mod git_intelligence;

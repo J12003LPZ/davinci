@@ -19,7 +19,9 @@ use davinci_agent::semantic::{
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -30,6 +32,7 @@ use std::time::{Duration, Instant};
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SERVER_ERROR_CHARS: usize = 512;
 const MAX_LOCAL_SESSIONS: usize = 8;
+const MAX_INCOMING_FRAMES: usize = 8;
 
 struct LocalBackendSessions {
     max_sessions: usize,
@@ -650,7 +653,7 @@ impl fmt::Debug for LspConnection {
 
 impl LspConnection {
     fn new(child: Child, stdin: ChildStdin, stdout: ChildStdout) -> Self {
-        let (sender, incoming) = mpsc::channel();
+        let (sender, incoming) = mpsc::sync_channel(MAX_INCOMING_FRAMES);
         thread::spawn(move || read_frames(stdout, sender));
         Self {
             child,
@@ -757,7 +760,7 @@ impl Drop for LspConnection {
     }
 }
 
-fn read_frames(mut stdout: ChildStdout, sender: mpsc::Sender<Result<Value, String>>) {
+fn read_frames(mut stdout: ChildStdout, sender: mpsc::SyncSender<Result<Value, String>>) {
     let mut parser = LspFrameParser::new();
     let mut chunk = [0_u8; 8192];
     loop {
@@ -803,19 +806,19 @@ fn read_frames(mut stdout: ChildStdout, sender: mpsc::Sender<Result<Value, Strin
 }
 
 fn drain_stderr(stderr: Option<std::process::ChildStderr>) {
-    let Some(stderr) = stderr else {
+    let Some(mut stderr) = stderr else {
         return;
     };
     thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
+        // Stderr is discarded. Read fixed-size bytes so a newline-free or
+        // non-UTF-8 stream cannot grow a String or stop draining the pipe.
+        let mut chunk = [0_u8; 8192];
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    let _ = super::transport::sanitize_stderr_line(&line);
-                }
+            match stderr.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
             }
         }
     });
@@ -1080,6 +1083,62 @@ fn format_server_error(error: &Value) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    #[ignore = "subprocess fixture; invoked by incoming_frames_apply_backpressure"]
+    fn resource_fixture_lsp() {
+        if !Path::new("resource-lsp-enabled").is_file() {
+            return;
+        }
+        // No newline and invalid UTF-8: stderr must keep draining as bytes.
+        std::io::stderr().write_all(&[0xff; 65536]).unwrap();
+        let mut output = std::io::stdout().lock();
+        output.write_all(b"\r\n").unwrap();
+        let frame = lsp_frame(&json!({"jsonrpc":"2.0", "method":"notifications/message", "params":{"text":"x".repeat(16384)}}).to_string());
+        for _ in 0..256 {
+            output.write_all(&frame).unwrap();
+        }
+        output.flush().unwrap();
+        std::fs::write("resource-lsp-finished", "done").unwrap();
+    }
+
+    #[test]
+    fn incoming_frames_apply_backpressure() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("resource-lsp-enabled"), "fixture").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "semantic::backend::tests::resource_fixture_lsp",
+                "--ignored",
+                "--nocapture",
+            ])
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        drain_stderr(child.stderr.take());
+        let connection = LspConnection::new(child, stdin, stdout);
+        // Confirm frames are flowing before checking that an idle consumer
+        // prevents the producer from buffering its entire output.
+        connection
+            .incoming
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let finished = dir.path().join("resource-lsp-finished");
+        while !finished.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let unbounded = finished.exists();
+        drop(connection);
+        assert!(!unbounded, "idle consumer allowed every frame to be queued");
+    }
 
     #[test]
     #[ignore = "subprocess fixture; invoked by cache_session_reuse_edit_and_restart"]

@@ -477,13 +477,15 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             let changed = if let (Some(session), Some(name)) =
                 (runtime.agent.session.as_mut(), command.name.as_deref())
             {
-                let _ = session.set_name(name);
-                session.display_name()
+                if let Err(error) = session.set_name(name) {
+                    return fail(id, &kind, error.to_string());
+                }
+                Some(session.display_name())
             } else {
                 None
             };
-            if changed.is_some() {
-                runtime.emit(RpcSessionEvent::SessionInfoChanged { name: changed });
+            if let Some(name) = changed {
+                runtime.emit(RpcSessionEvent::SessionInfoChanged { name });
             }
             ok(id, &kind, None)
         }
@@ -1930,6 +1932,82 @@ mod tests {
         assert_eq!(queue.1, vec!["later".to_string()]);
         let json = serde_json::to_value(&events[0]).unwrap();
         assert!(json.get("type").is_some());
+    }
+
+    #[test]
+    fn rename_reports_storage_failure_without_event_or_metadata_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "/fixture", Some("original")).unwrap();
+        let path = session.path.clone();
+        std::fs::rename(&path, path.with_extension("backup")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut runtime = RpcRuntime::new(
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        runtime.agent.session = Some(session);
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "set_session_name".into(),
+                name: Some("new name".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!response.success);
+        assert!(response.error.is_some());
+        assert!(runtime.take_events().is_empty());
+        assert_eq!(
+            runtime
+                .agent
+                .session
+                .as_ref()
+                .unwrap()
+                .display_name()
+                .as_deref(),
+            Some("original")
+        );
+    }
+
+    #[test]
+    fn clearing_session_name_emits_persisted_null_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "/fixture", None).unwrap();
+        let path = session.path.clone();
+        let mut runtime = RpcRuntime::new(
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        runtime.agent.session = Some(session);
+        for name in ["shown", ""] {
+            let response = handle_rpc(
+                &mut runtime,
+                RpcCommand {
+                    kind: "set_session_name".into(),
+                    name: Some(name.into()),
+                    ..RpcCommand::default()
+                },
+            );
+            assert!(response.success);
+            let events = runtime.take_events();
+            assert_eq!(events.len(), 1);
+            let event = serde_json::to_value(&events[0]).unwrap();
+            assert_eq!(event["type"], "session_info_changed");
+            assert_eq!(
+                event["name"],
+                if name.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::json!(name)
+                }
+            );
+            assert_eq!(
+                JsonlSession::open(&path).unwrap().display_name().as_deref(),
+                if name.is_empty() { None } else { Some(name) }
+            );
+        }
     }
 
     #[test]

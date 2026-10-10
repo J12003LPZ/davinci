@@ -488,7 +488,12 @@ impl JsonlStoredSession {
                         return Err(err);
                     }
                 }
-                Err(err) if err.kind == "syntax" && index + 1 == physical_lines.len() => {
+                Err(err)
+                    if err.kind == "syntax"
+                        && index + 1 == physical_lines.len()
+                        && !content.ends_with('\n')
+                        && !torn_utf8_tail =>
+                {
                     let valid_prefix = format!("{}\n", physical_lines[..index].join("\n"));
                     match tail {
                         Tail::Detect => return Ok(None),
