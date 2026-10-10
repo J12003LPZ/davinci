@@ -60,6 +60,7 @@ fn invalid_source_is_rejected_before_host_admission() {
         " \r\n\t",
         "// @codemode timeout=999999\nreturn 1",
         "// @options: timeout=999999\nreturn 1",
+        "\n  // a note first\n// @options: timeout=1\nreturn 1",
     ] {
         let request = CodeModeRequest {
             code: code.into(),
@@ -67,5 +68,24 @@ fn invalid_source_is_rejected_before_host_admission() {
             max_output_bytes: None,
         };
         assert!(CodeModeLimits::default().for_request(&request).is_err());
+    }
+}
+
+#[test]
+fn directive_text_after_the_header_is_ordinary_content() {
+    for code in [
+        "const example = `\n// @options: this is just text\n`;\nreturn example;",
+        "return 1;\n// @codemode is mentioned in a trailing comment",
+        "// an ordinary leading comment\nreturn 1",
+    ] {
+        let request = CodeModeRequest {
+            code: code.into(),
+            timeout_ms: None,
+            max_output_bytes: None,
+        };
+        assert!(
+            CodeModeLimits::default().for_request(&request).is_ok(),
+            "{code:?}"
+        );
     }
 }

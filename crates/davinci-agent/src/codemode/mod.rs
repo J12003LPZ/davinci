@@ -43,15 +43,28 @@ impl Default for CodeModeLimits {
     }
 }
 
+/// Whether the script opens with an option-header directive. Option
+/// headers are not a supported control channel, so they are refused rather
+/// than silently ignored. Only the header counts: the leading run of blank
+/// and `//` lines. The first line of code ends it, so the same text later in
+/// the script (a comment, or a line inside a template literal) is content.
+fn has_option_header(code: &str) -> bool {
+    for line in code.lines() {
+        let line = line.trim_start();
+        if line.starts_with("// @options:") || line.starts_with("// @codemode") {
+            return true;
+        }
+        if !line.is_empty() && !line.starts_with("//") {
+            return false;
+        }
+    }
+    false
+}
+
 impl CodeModeLimits {
     pub fn for_request(&self, request: &CodeModeRequest) -> Result<Self, CodeModeError> {
         let mut limits = self.clone();
-        if request.code.trim().is_empty()
-            || request.code.lines().any(|line| {
-                let line = line.trim_start();
-                line.starts_with("// @options:") || line.starts_with("// @codemode")
-            })
-        {
+        if request.code.trim().is_empty() || has_option_header(&request.code) {
             return Err(CodeModeError::new(
                 "INVALID_INPUT",
                 "nonempty source without option-header directives is required",

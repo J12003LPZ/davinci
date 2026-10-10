@@ -38,6 +38,46 @@ fn remaining_wall_ms(wall_ms: u64, elapsed: Duration) -> Option<u64> {
     wall_ms.checked_sub(elapsed_ms).filter(|left| *left > 0)
 }
 
+/// Run one pre-launch step on a helper thread and wait for it only while the
+/// run's deadline lasts and it is not cancelled. A step that stalls is
+/// abandoned, not interrupted: its thread finishes on its own and its result
+/// is dropped, but the run returns on time.
+fn before_deadline<T: Send + 'static>(
+    admitted: Instant,
+    wall_ms: u64,
+    cancellation: &davinci_agent::runtime::CancellationToken,
+    step: impl FnOnce() -> Result<T, CodeModeError> + Send + 'static,
+) -> Result<T, CodeModeError> {
+    let (sender, result) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("codemode-setup".into())
+        .spawn(move || {
+            let _ = sender.send(step());
+        })
+        .map_err(|_| CodeModeError::new("UNAVAILABLE", "host setup thread unavailable"))?;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(CodeModeError::new(
+                "CANCELLED",
+                "run cancelled before launch",
+            ));
+        }
+        let Some(remaining_ms) = remaining_wall_ms(wall_ms, admitted.elapsed()) else {
+            return Err(CodeModeError::new(
+                "TIMEOUT",
+                "run deadline expired during host setup",
+            ));
+        };
+        match result.recv_timeout(Duration::from_millis(remaining_ms.min(20))) {
+            Ok(outcome) => return outcome,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CodeModeError::new("UNAVAILABLE", "host setup step failed"))
+            }
+        }
+    }
+}
+
 fn node_fingerprint(node: &Path) -> io::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -505,28 +545,33 @@ impl NodeCodeModeHost {
         // The request's timeout covers the whole run: catalog discovery and
         // host launch spend it too, not only script execution.
         let admitted = Instant::now();
-        context.limits_for_request(request)?;
-        if node_fingerprint(&self.node)
-            .map_err(|_| CodeModeError::new("UNAVAILABLE", "Node executable binding unavailable"))?
-            != self.node_fingerprint
-        {
-            return Err(CodeModeError::new(
-                "UNAVAILABLE",
-                "Node executable changed since admission",
-            ));
-        }
-        HostAssets::validate(self.assets.root(), &self.manifest).map_err(|_| {
-            CodeModeError::new("UNAVAILABLE", "host assets changed since admission")
+        let wall_ms = context.limits_for_request(request)?.wall_ms;
+        // Re-binding checks hash files and the catalog asks the broker; any
+        // of them can stall (a slow disk, a hung tool source) before the
+        // watchdog below exists, so they run under the run's own deadline.
+        let (node, expected) = (self.node.clone(), self.node_fingerprint);
+        let (assets_root, manifest) = (self.assets.root().to_path_buf(), self.manifest.clone());
+        before_deadline(admitted, wall_ms, &context.cancellation, move || {
+            if node_fingerprint(&node).map_err(|_| {
+                CodeModeError::new("UNAVAILABLE", "Node executable binding unavailable")
+            })? != expected
+            {
+                return Err(CodeModeError::new(
+                    "UNAVAILABLE",
+                    "Node executable changed since admission",
+                ));
+            }
+            HostAssets::validate(&assets_root, &manifest).map_err(|_| {
+                CodeModeError::new("UNAVAILABLE", "host assets changed since admission")
+            })?;
+            Ok(())
         })?;
-        if context.cancellation.is_cancelled() {
-            return Err(CodeModeError::new(
-                "CANCELLED",
-                "run cancelled before launch",
-            ));
-        }
         // Privileged bootstrap: the guest's metadata budget stays its own.
-        let tools: Vec<Value> = broker
-            .catalog(1024)?
+        let catalog_broker = broker.clone();
+        let tools: Vec<Value> =
+            before_deadline(admitted, wall_ms, &context.cancellation, move || {
+                catalog_broker.catalog(1024)
+            })?
             .into_iter()
             .map(|name| json!({"name":name}))
             .collect();
@@ -895,6 +940,37 @@ mod tests {
         assert_eq!(remaining_wall_ms(100, Duration::from_millis(60)), Some(40));
         assert_eq!(remaining_wall_ms(100, Duration::from_millis(100)), None);
         assert_eq!(remaining_wall_ms(100, Duration::from_secs(3)), None);
+    }
+
+    #[test]
+    fn a_stalled_setup_step_cannot_outlive_the_run_deadline() {
+        let cancellation = davinci_agent::runtime::CancellationToken::new();
+        let started = Instant::now();
+        let (_hold, stalled) = mpsc::channel::<()>();
+        let error = before_deadline(started, 200, &cancellation, move || {
+            // A catalog that never answers.
+            let _ = stalled.recv();
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "TIMEOUT");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // A prompt step returns its value; a cancelled run stops waiting.
+        assert_eq!(
+            before_deadline(Instant::now(), 1000, &cancellation, || Ok(7)).unwrap(),
+            7
+        );
+        cancellation.cancel();
+        let error = before_deadline(Instant::now(), 60_000, &cancellation, || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "CANCELLED");
     }
 
     #[test]
