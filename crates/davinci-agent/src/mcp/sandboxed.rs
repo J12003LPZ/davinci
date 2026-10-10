@@ -89,10 +89,8 @@ impl State {
                 Value::Array(members) => members,
                 other => vec![other],
             };
-            let count = messages.len().max(1);
             for message in messages {
-                // Queue accounting charges each member its share of the line.
-                self.receive_message(message, line.len() / count);
+                self.receive_message(message);
                 if self.failure.is_some() {
                     self.stdout = Vec::new();
                     return;
@@ -101,12 +99,15 @@ impl State {
         }
     }
 
-    fn receive_message(&mut self, value: Value, bytes: usize) {
+    fn receive_message(&mut self, value: Value) {
         let Some(object) = value.as_object() else {
             return;
         };
         if object.get("method").and_then(Value::as_str).is_some() {
             if object.get("id").is_some() {
+                // Charged at its own encoded size, never a share of the line:
+                // padding a batch with tiny members must not shrink the bill.
+                let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
                 self.queue_server_request(value, bytes);
             }
             return;
@@ -779,6 +780,30 @@ mod tests {
         assert!(state.failure.is_none(), "{:?}", state.failure);
         assert_eq!(state.responses[&5]["result"], json!({"tools": []}));
         assert_eq!(state.take_server_requests()[0]["id"], 11);
+    }
+
+    #[test]
+    fn padded_batches_are_charged_each_requests_full_size() {
+        let mut state = State::default();
+        let big = "x".repeat(MAX_QUEUED_SERVER_REQUEST_BYTES / 2);
+        for id in 0..3 {
+            let mut members =
+                vec![json!({"jsonrpc": "2.0", "id": id, "method": "ping", "params": {"pad": big}})];
+            members.extend((0..10_000).map(|n| json!(n)));
+            state.receive_stdout(
+                format!(
+                    "{}
+",
+                    Value::Array(members)
+                )
+                .as_bytes(),
+            );
+        }
+        assert!(
+            state.failure.is_some(),
+            "1.5 MiB of queued requests accepted"
+        );
+        assert!(state.server_request_bytes <= MAX_QUEUED_SERVER_REQUEST_BYTES);
     }
 
     #[test]

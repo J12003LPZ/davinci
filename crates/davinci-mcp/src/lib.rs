@@ -758,7 +758,9 @@ mod tests {
         let mut page = 0;
         let err = collect_pages("tools/list", "tools", |_| {
             page += 1;
-            let tools: Vec<Value> = (0..1_000).map(|i| json!({"name": format!("t{i}")})).collect();
+            let tools: Vec<Value> = (0..1_000)
+                .map(|i| json!({"name": format!("t{i}")}))
+                .collect();
             Ok(json!({"tools": tools, "nextCursor": format!("c{page}")}))
         })
         .unwrap_err();
@@ -773,10 +775,15 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("bytes"), "{err}");
-        assert!(pages <= MAX_LIST_BYTES / (1024 * 1024) + 1, "{pages} pages read");
+        assert!(
+            pages <= MAX_LIST_BYTES / (1024 * 1024) + 1,
+            "{pages} pages read"
+        );
         // A normal list is untouched.
-        let items = collect_pages("tools/list", "tools", |_| Ok(json!({"tools": [{"name": "a"}]})))
-            .unwrap();
+        let items = collect_pages("tools/list", "tools", |_| {
+            Ok(json!({"tools": [{"name": "a"}]}))
+        })
+        .unwrap();
         assert_eq!(items.len(), 1);
     }
 

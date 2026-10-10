@@ -661,14 +661,19 @@ mod tests {
         // Let the writer thread take it, so the slots below are all queue.
         std::thread::sleep(Duration::from_millis(200));
         let started = Instant::now();
-        while writer.jobs.try_send(WriteJob {
-            line: Vec::new(),
-            done: None,
-            abandoned: Arc::new(AtomicBool::new(true)),
-        })
-        .is_ok()
+        while writer
+            .jobs
+            .try_send(WriteJob {
+                line: Vec::new(),
+                done: None,
+                abandoned: Arc::new(AtomicBool::new(true)),
+            })
+            .is_ok()
         {
-            assert!(started.elapsed() < Duration::from_secs(5), "queue never filled");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "queue never filled"
+            );
         }
         let error = ping(1).unwrap_err();
         assert!(error.to_string().contains("stdin queue is full"), "{error}");
