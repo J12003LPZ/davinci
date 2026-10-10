@@ -133,6 +133,11 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let meter = if conversation {
         let mut meter = context_bar::lines(chrome_model, height);
         meter.extend(plan_usage::lines(chrome_model, height));
+        // A row of air above it: the last transcript line (an error, a
+        // command's output) must not sit flush against the meter's header.
+        if !meter.is_empty() {
+            meter.insert(0, blank());
+        }
         meter
     } else {
         Vec::new()
@@ -450,7 +455,23 @@ fn command_panel_frame(
         model.width,
     )));
     rows.push(blank());
-    rows.extend(ui::window(content, rows_room, anchor, th));
+    // The extension manager keeps its tab bar and search box on screen while
+    // the list under them scrolls.
+    let pinned = match model.screen {
+        Screen::Extensions => extensions::pinned_rows(model),
+        _ => 0,
+    };
+    if pinned > 0 && rows_room > pinned + 2 && content.len() > pinned {
+        rows.extend(content[..pinned].iter().cloned());
+        rows.extend(ui::window(
+            content[pinned..].to_vec(),
+            rows_room - pinned,
+            anchor.saturating_sub(pinned),
+            th,
+        ));
+    } else {
+        rows.extend(ui::window(content, rows_room, anchor, th));
+    }
     rows.extend(notices);
     if safety > 0 {
         rows.push(chrome::status(model));
@@ -1706,6 +1727,51 @@ fn handle_extensions_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
 fn handle_installed_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
     let sheet = model.extension_manager.as_mut()?;
     let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+    let typing = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    // The filter box owns the letters while it is open; arrows still move.
+    if sheet.filtering {
+        return match key.code {
+            KeyCode::Esc => {
+                sheet.set_filter(String::new());
+                sheet.filtering = false;
+                Some(Flow::Continue)
+            }
+            KeyCode::Enter => {
+                sheet.filtering = false;
+                Some(Flow::Continue)
+            }
+            KeyCode::Backspace => {
+                let mut filter = sheet.filter.clone();
+                filter.pop();
+                sheet.set_filter(filter);
+                Some(Flow::Continue)
+            }
+            KeyCode::Char(ch) if typing => {
+                let filter = format!("{}{ch}", sheet.filter);
+                sheet.set_filter(filter);
+                Some(Flow::Continue)
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => None,
+            _ => Some(Flow::Continue),
+        };
+    }
+    if key.code == KeyCode::Esc && !sheet.filter.is_empty() && sheet.armed_here().is_none() {
+        sheet.set_filter(String::new());
+        return Some(Flow::Continue);
+    }
+    if key.code == KeyCode::Char('/') && plain && sheet.armed_here().is_none() {
+        sheet.filtering = true;
+        return Some(Flow::Continue);
+    }
+    // On a group heading enter (or space) folds and unfolds it.
+    if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) && plain {
+        if let Some(crate::davinci::model::ExtensionEntry::Group { .. }) = sheet.current_entry() {
+            sheet.toggle_group();
+            return Some(Flow::Continue);
+        }
+    }
     let row = sheet.current().cloned()?;
     let armed = sheet.armed_here();
     if key.code == KeyCode::Esc && armed.is_some() {
@@ -4004,6 +4070,82 @@ mod extension_manager_tests {
         press(&mut m, KeyCode::Right);
         assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
         assert!(armed(&m).is_none());
+    }
+
+    fn grouped_model() -> Model {
+        let mut m = model();
+        let sheet = m.extension_manager.as_mut().unwrap();
+        sheet.tab = ExtensionTab::Skills;
+        let skill = |title: &str, group: &str| ExtensionRow {
+            key: format!("{group}/{title}"),
+            title: title.into(),
+            status: if group == "Your skills" {
+                "user".into()
+            } else {
+                "plugin".into()
+            },
+            group: group.into(),
+            can_delete: true,
+            ..ExtensionRow::default()
+        };
+        let mut rows = vec![skill("mine", "Your skills")];
+        rows.extend((0..12).map(|n| skill(&format!("big-{n}"), "big@m")));
+        sheet.skills = rows;
+        m
+    }
+
+    fn entry_count(m: &Model) -> usize {
+        let sheet = m.extension_manager.as_ref().unwrap();
+        sheet.entries(sheet.tab).len()
+    }
+
+    #[test]
+    fn a_big_plugin_starts_folded_and_enter_on_its_heading_unfolds_it() {
+        let mut m = grouped_model();
+        // Your skills heading + its row + the folded big@m heading.
+        assert_eq!(entry_count(&m), 3);
+        press(&mut m, KeyCode::Down);
+        press(&mut m, KeyCode::Down);
+        assert!(m.extension_manager.as_ref().unwrap().current().is_none());
+        // Enter on a heading folds it; it never asks the host for details.
+        assert_eq!(press(&mut m, KeyCode::Enter), Flow::Continue);
+        assert_eq!(entry_count(&m), 3 + 12);
+        assert_eq!(press(&mut m, KeyCode::Char(' ')), Flow::Continue);
+        assert_eq!(entry_count(&m), 3);
+    }
+
+    #[test]
+    fn row_keys_do_nothing_on_a_group_heading() {
+        let mut m = grouped_model();
+        press(&mut m, KeyCode::Down);
+        press(&mut m, KeyCode::Down);
+        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
+        assert!(armed(&m).is_none());
+    }
+
+    #[test]
+    fn slash_filters_across_folded_groups_and_esc_clears_it() {
+        let mut m = grouped_model();
+        press(&mut m, KeyCode::Char('/'));
+        // `d` and `e` are filter text here, not delete or enable.
+        for ch in "big-1d".chars() {
+            press(&mut m, KeyCode::Char(ch));
+        }
+        press(&mut m, KeyCode::Backspace);
+        let sheet = m.extension_manager.as_ref().unwrap();
+        assert!(sheet.filtering);
+        // big-1, big-10 and big-11 under their opened heading.
+        assert_eq!(sheet.matching(ExtensionTab::Skills).len(), 3);
+        assert_eq!(entry_count(&m), 1 + 3);
+        press(&mut m, KeyCode::Enter);
+        let sheet = m.extension_manager.as_ref().unwrap();
+        assert!(!sheet.filtering && sheet.filter == "big-1");
+        // The first esc clears the filter and keeps the sheet; the next closes it.
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(m.screen, Screen::Extensions);
+        assert_eq!(entry_count(&m), 3);
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(m.screen, Screen::Agent);
     }
 
     fn discover_model() -> Model {

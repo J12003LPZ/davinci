@@ -5,12 +5,60 @@
 //! over marketplaces and online directories) and, for plugins, Marketplaces.
 //! The host fills every list and decides every action; this view only draws.
 //! No TypeScript counterpart.
+//!
+//! Layout, top to bottom (the tab bar and search box stay pinned while the
+//! list scrolls; every row is separated from the next by a blank line):
+//!
+//! ```text
+//!  Installed (3)  Discover  Marketplaces (1)      ✗ 1 error · ! 1 needs auth   2/3
+//!
+//!   ● code-review@claude-plugins-official · enabled · v1.0.0
+//!     from davinci · 1 command · 1 agent · hooks approved
+//!
+//! ❯ ! superpowers@superpowers-marketplace  ! needs auth · enabled
+//!     from Claude Code · v6.2.0 · 14 skills
+//!     401 from the server; run /login for it.
+//! ```
+//!
+//! The selected row shows two description lines and its note; the rest clip
+//! their description to one line. Skills never carry a problem badge.
 
 use super::sheet::{hint, Composer, SheetChrome};
-use crate::davinci::model::{ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, Model};
-use crate::davinci::theme::State;
-use crate::davinci::ui::{section_detail, section_row, span};
-use ratatui::text::{Line, Span};
+use crate::davinci::model::{
+    ExtensionEntry, ExtensionRow, ExtensionTab, ExtensionView, ExtensionsSheet, Model,
+};
+use crate::davinci::theme::{State, Theme};
+use crate::davinci::ui::{
+    self, clip_ellipsis, pad, span, truncate_run, wrap, SELECTION_BAR, UNSELECTED_BAR,
+};
+use ratatui::{
+    style::{Color, Style},
+    text::{Line, Span},
+};
+
+/// The widest the manager draws; a wider terminal leaves the rest empty so
+/// names and descriptions stay close enough to read as one row.
+const MAX_WIDTH: u16 = 112;
+/// `❯ ` + state glyph + space: where a row's name, and everything under it, starts.
+const INDENT: u16 = 4;
+/// The most header rows the list scroll keeps pinned on a short terminal.
+const MAX_PINNED: usize = 8;
+
+/// Which list a row belongs to, so its glyph says the right thing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Installed,
+    Discover,
+    Marketplace,
+}
+
+fn width_of(model: &Model) -> u16 {
+    model.width.min(MAX_WIDTH)
+}
+
+fn fit(spans: Vec<Span<'static>>, width: u16) -> Line<'static> {
+    Line::from(truncate_run(spans, width))
+}
 
 fn view_count(sheet: &ExtensionsSheet, view: ExtensionView) -> Option<usize> {
     match view {
@@ -20,34 +68,174 @@ fn view_count(sheet: &ExtensionsSheet, view: ExtensionView) -> Option<usize> {
     }
 }
 
-fn view_bar(model: &Model, sheet: &ExtensionsSheet) -> Line<'static> {
-    let th = &model.theme;
-    let mut spans: Vec<Span<'static>> = vec![span("   ", th.muted)];
-    for (i, view) in sheet.tab.views().iter().enumerate() {
-        if i > 0 {
-            spans.push(span("   ", th.muted));
+/// `n/total` for the open list, so a long registry says where you are.
+fn position(sheet: &ExtensionsSheet) -> Option<String> {
+    let (index, total) = match sheet.view {
+        ExtensionView::Installed => (sheet.index(), sheet.entries(sheet.tab).len()),
+        ExtensionView::Discover => (sheet.discover.index(), sheet.discover.results.len()),
+        ExtensionView::Marketplaces => (sheet.marketplace_index(), sheet.marketplaces.len()),
+    };
+    (total > 0).then(|| format!("{}/{total}", index + 1))
+}
+
+/// What is wrong with a row, if anything. Skills are instructions, not
+/// processes, so they never carry one; plugins and MCP servers do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Problem {
+    Error,
+    Auth,
+    Attention,
+}
+
+impl Problem {
+    fn of(item: &ExtensionRow, tab: ExtensionTab) -> Option<Self> {
+        if tab == ExtensionTab::Skills {
+            return None;
         }
-        let label = match view_count(sheet, *view) {
+        match item.state {
+            State::Failed | State::Attention => {}
+            _ => return None,
+        }
+        let text = format!(
+            "{} {}",
+            item.status,
+            item.note.as_deref().unwrap_or_default()
+        )
+        .to_lowercase();
+        let auth = [
+            "401",
+            "403",
+            "unauthor",
+            "forbidden",
+            "auth",
+            "login",
+            "token",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle));
+        Some(match (item.state, auth) {
+            (_, true) => Self::Auth,
+            (State::Failed, false) => Self::Error,
+            _ => Self::Attention,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Auth => "needs auth",
+            Self::Attention => "needs attention",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Error => State::Failed.glyph(),
+            Self::Auth | Self::Attention => State::Attention.glyph(),
+        }
+    }
+
+    fn color(self, th: &Theme) -> Color {
+        match self {
+            Self::Error => th.error,
+            Self::Auth | Self::Attention => th.warning,
+        }
+    }
+}
+
+/// `2 errors · 1 needs auth` over everything installed of this kind, so a
+/// problem is visible from Discover too.
+fn problem_summary(model: &Model, sheet: &ExtensionsSheet) -> Vec<Span<'static>> {
+    let th = &model.theme;
+    let mut out = Vec::new();
+    for kind in [Problem::Error, Problem::Auth, Problem::Attention] {
+        let n = sheet
+            .current_rows()
+            .iter()
+            .filter(|row| Problem::of(row, sheet.tab) == Some(kind))
+            .count();
+        if n == 0 {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(span(" · ", th.muted));
+        }
+        let label = match (kind, n) {
+            (Problem::Error, 1) => "1 error".to_string(),
+            (Problem::Error, n) => format!("{n} errors"),
+            (kind, n) => format!("{n} {}", kind.label()),
+        };
+        out.push(span(format!("{} {label}", kind.glyph()), kind.color(th)));
+    }
+    out
+}
+
+/// One row of tabs; the open one is a filled pill, as in Claude Code's
+/// plugin manager. Problems and the list position sit flush right.
+fn tab_bar(model: &Model, sheet: &ExtensionsSheet) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let width = width_of(model);
+    let mut labels: Vec<Span<'static>> = vec![pad(1, None)];
+    for view in sheet.tab.views() {
+        let name = match view_count(sheet, *view) {
             Some(count) => format!("{} ({count})", view.label()),
             None => view.label().to_string(),
         };
         if *view == sheet.view {
-            spans.push(span(format!("[{label}]"), model.theme.cc().permission));
+            labels.push(Span::styled(
+                format!(" {name} "),
+                Style::default().fg(th.background).bg(th.text),
+            ));
         } else {
-            spans.push(span(label, th.muted));
+            labels.push(span(format!(" {name} "), th.muted));
         }
     }
-    Line::from(crate::davinci::ui::truncate_run(spans, model.width))
+    let mut right = problem_summary(model, sheet);
+    if let Some(text) = position(sheet) {
+        if !right.is_empty() {
+            right.push(span("  ", th.muted));
+        }
+        right.push(span(text, th.muted));
+    }
+    right.push(pad(2, None));
+    vec![ui::spread(width, labels, right)]
 }
 
-fn colored(rows: Vec<Line<'static>>, color: ratatui::style::Color) -> Vec<Line<'static>> {
-    rows.into_iter()
-        .map(|mut row| {
-            for span in &mut row.spans {
-                span.style.fg = Some(color);
-            }
-            row
-        })
+/// A rounded box with `inner` on the left and `right` flush right.
+fn boxed(
+    model: &Model,
+    inner: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let width = width_of(model);
+    let edge = th.cc().permission;
+    let outer = width.saturating_sub(4);
+    if outer < 8 {
+        return vec![fit(inner, width)];
+    }
+    let room = outer - 4;
+    let wall = |text: &str| span(text, edge);
+    let mut middle = vec![pad(2, None), wall("│"), pad(1, None)];
+    middle.extend(ui::spread(room, inner, right).spans);
+    middle.extend([pad(1, None), wall("│")]);
+    let bar = "─".repeat(usize::from(outer - 2));
+    vec![
+        fit(vec![pad(2, None), wall(&format!("╭{bar}╮"))], width),
+        fit(middle, width),
+        fit(vec![pad(2, None), wall(&format!("╰{bar}╯"))], width),
+    ]
+}
+
+fn indented(model: &Model, text: &str, color: Color) -> Vec<Line<'static>> {
+    let width = width_of(model);
+    if text.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let lead = 2.min(width.saturating_sub(1));
+    wrap(text, width.saturating_sub(lead))
+        .into_iter()
+        .map(|text| fit(vec![pad(lead, None), span(text, color)], width))
         .collect()
 }
 
@@ -71,19 +259,99 @@ fn search_placeholder(tab: ExtensionTab) -> &'static str {
     }
 }
 
-pub fn lines(model: &Model) -> Vec<Line<'static>> {
+/// Everything above the list: it stays on screen while the list scrolls.
+fn header(model: &Model, sheet: &ExtensionsSheet) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width;
-    let Some(sheet) = &model.extension_manager else {
-        return section_detail(width, th, "Nothing to manage.");
-    };
-    let mut rows = vec![view_bar(model, sheet), Line::default()];
+    let mut rows = tab_bar(model, sheet);
+    rows.push(Line::default());
     if let Some(notice) = sheet.notice.as_deref().filter(|text| !text.is_empty()) {
         for line in notice.lines() {
-            rows.extend(colored(section_detail(width, th, line), th.muted));
+            rows.extend(indented(model, line, th.muted));
         }
         rows.push(Line::default());
     }
+    match sheet.view {
+        ExtensionView::Installed => {
+            if sheet.filtering || !sheet.filter.is_empty() {
+                let mut inner = vec![span("⌕ ", th.primary)];
+                if sheet.filter.is_empty() {
+                    inner.push(span("Filter by name or description", th.muted));
+                } else {
+                    inner.push(span(sheet.filter.clone(), th.text));
+                }
+                if sheet.filtering {
+                    inner.push(span("▏", th.primary));
+                }
+                let hits = sheet.matching(sheet.tab).len();
+                let right = vec![span(
+                    format!("{hits} of {}", sheet.current_rows().len()),
+                    th.muted,
+                )];
+                rows.extend(boxed(model, inner, right));
+                rows.push(Line::default());
+            }
+        }
+        ExtensionView::Discover => {
+            let discover = &sheet.discover;
+            let mut inner = vec![span("⌕ ", th.primary)];
+            if discover.query.is_empty() {
+                inner.push(span(search_placeholder(sheet.tab), th.muted));
+            } else {
+                inner.push(span(discover.query.clone(), th.text));
+                inner.push(span("▏", th.primary));
+            }
+            let right = if discover.searching {
+                vec![span("searching…", th.primary)]
+            } else if discover.results.is_empty() {
+                Vec::new()
+            } else {
+                let n = discover.results.len();
+                vec![span(
+                    format!("{n} result{}", if n == 1 { "" } else { "s" }),
+                    th.muted,
+                )]
+            };
+            rows.extend(boxed(model, inner, right));
+            if let Some(message) = discover.message.as_deref().filter(|m| !m.is_empty()) {
+                rows.extend(indented(model, message, th.muted));
+            }
+            rows.push(Line::default());
+        }
+        ExtensionView::Marketplaces => {
+            if let Some(input) = &sheet.marketplace_input {
+                let inner = vec![
+                    span("+ ", th.primary),
+                    span("Add marketplace: ", th.primary),
+                    span(input.clone(), th.text),
+                    span("▏", th.primary),
+                ];
+                rows.extend(boxed(model, inner, Vec::new()));
+                rows.extend(indented(
+                    model,
+                    "owner/repo on GitHub, a git URL, or a local folder. Enter adds it.",
+                    th.muted,
+                ));
+                rows.push(Line::default());
+            }
+        }
+    }
+    rows
+}
+
+/// How many leading rows the sheet keeps on screen while the list scrolls.
+pub fn pinned_rows(model: &Model) -> usize {
+    model
+        .extension_manager
+        .as_ref()
+        .map_or(0, |sheet| header(model, sheet).len().min(MAX_PINNED))
+}
+
+pub fn lines(model: &Model) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let Some(sheet) = &model.extension_manager else {
+        return indented(model, "Nothing to manage.", th.muted);
+    };
+    let mut rows = header(model, sheet);
     match sheet.view {
         ExtensionView::Installed => installed_lines(model, sheet, &mut rows),
         ExtensionView::Discover => discover_lines(model, sheet, &mut rows),
@@ -92,41 +360,260 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     rows
 }
 
-fn push_row(model: &Model, rows: &mut Vec<Line<'static>>, item: &ExtensionRow, selected: bool) {
-    let th = &model.theme;
-    let width = model.width;
-    rows.push(section_row(width, th, selected, &item.title, &item.status));
-    if !item.detail.is_empty() {
-        rows.extend(section_detail(width, th, &item.detail));
-    }
-    if let Some(note) = &item.note {
-        let color = match item.state {
-            State::Failed => th.error,
-            State::Attention => th.warning,
-            _ => th.muted,
+/// The state glyph and its colour. A search result says whether it can be
+/// installed; every other row says how healthy it is.
+fn glyph(item: &ExtensionRow, kind: Kind, th: &Theme) -> (&'static str, Color) {
+    if kind == Kind::Discover {
+        return if item.status == "installed" {
+            (State::Done.glyph(), th.success)
+        } else {
+            ("+", th.primary)
         };
-        for line in note.lines() {
-            rows.extend(colored(section_detail(width, th, line), color));
+    }
+    match item.state {
+        State::Failed => (State::Failed.glyph(), th.error),
+        State::Attention => (State::Attention.glyph(), th.warning),
+        State::Skipped => ("○", th.muted),
+        _ => ("●", th.success),
+    }
+}
+
+fn status_color(word: &str, th: &Theme) -> Color {
+    match word {
+        "enabled" | "connected" | "installed" | "approved" => th.success,
+        "failed" | "error" | "unreachable" => th.error,
+        "featured" => th.primary,
+        _ => th.muted,
+    }
+}
+
+/// The name with its qualifier dimmed: `name@marketplace`, `owner/name`.
+fn title_spans(title: &str, selected: bool, th: &Theme) -> Vec<Span<'static>> {
+    let cc = th.cc();
+    let title = title.strip_prefix("io.github.").unwrap_or(title);
+    let name_color = if selected { cc.permission } else { th.text };
+    let dim = th.muted;
+    if let Some(at) = title.find('@') {
+        vec![
+            span(title[..at].to_string(), name_color),
+            span(title[at..].to_string(), dim),
+        ]
+    } else if let Some(slash) = title.rfind('/') {
+        vec![
+            span(title[..=slash].to_string(), dim),
+            span(title[slash + 1..].to_string(), name_color),
+        ]
+    } else {
+        vec![span(title.to_string(), name_color)]
+    }
+}
+
+fn note_color(item: &ExtensionRow, th: &Theme) -> Color {
+    match item.state {
+        State::Failed => th.error,
+        State::Attention => th.warning,
+        _ => th.muted,
+    }
+}
+
+/// One row, three lines with a blank under it: name, then `· status · source`
+/// in muted ink, then one clipped description. A problem is badged on the
+/// first line and never folded away. The selected row also shows its note and
+/// any pending confirmation, indented under the description.
+fn card(
+    model: &Model,
+    item: &ExtensionRow,
+    kind: Kind,
+    selected: bool,
+    confirm: Option<String>,
+) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let width = width_of(model);
+    let body = width.saturating_sub(INDENT);
+    let tab = model
+        .extension_manager
+        .as_ref()
+        .map_or(ExtensionTab::Plugins, |sheet| sheet.tab);
+    let problem = Problem::of(item, tab);
+    // Skills are instructions: whatever state a host reports, they are fine.
+    let mut healthy;
+    let item =
+        if tab == ExtensionTab::Skills && matches!(item.state, State::Failed | State::Attention) {
+            healthy = item.clone();
+            healthy.state = State::Done;
+            &healthy
+        } else {
+            item
+        };
+    let (mark, mark_color) = match problem {
+        Some(problem) => (problem.glyph(), problem.color(th)),
+        None => glyph(item, kind, th),
+    };
+    let mut line = vec![
+        span(
+            if selected {
+                SELECTION_BAR
+            } else {
+                UNSELECTED_BAR
+            },
+            if selected { cc.permission } else { cc.inactive },
+        ),
+        span(mark, mark_color),
+        pad(1, None),
+    ];
+    line.extend(title_spans(&item.title, selected, th));
+    if let Some(problem) = problem {
+        line.push(span(
+            format!("  {} {}", problem.glyph(), problem.label()),
+            problem.color(th),
+        ));
+    }
+    let mut parts = item.status.split(" · ").filter(|part| !part.is_empty());
+    if let Some(first) = parts.next() {
+        line.push(span(" · ", th.muted));
+        line.push(span(first.to_string(), status_color(first, th)));
+        for part in parts {
+            line.push(span(format!(" · {part}"), th.muted));
         }
     }
+    let mut rows = vec![fit(line, width)];
+
+    let lead = || pad(INDENT.min(width), None);
+    let indent_rows = |text: &str, ink: Color, limit: usize| -> Vec<Line<'static>> {
+        text.lines()
+            .flat_map(|line| wrap(line, body))
+            .take(limit)
+            .map(|text| fit(vec![lead(), span(text, ink)], width))
+            .collect()
+    };
+    // The question comes first, directly under the name: a tall card can
+    // scroll, and the prompt must never be the part that is off screen.
+    if let Some(warning) = confirm.as_ref() {
+        rows.extend(indent_rows(warning, th.warning, usize::MAX));
+    }
+    // A pending confirmation shows everything it asks you to trust or delete:
+    // nothing above it, and none of it, is clipped.
+    let limit = |n: usize| if confirm.is_some() { usize::MAX } else { n };
+    let first = item.detail.lines().next().unwrap_or("");
+    if selected {
+        rows.extend(indent_rows(&item.detail, th.text, limit(2)));
+    } else if !first.is_empty() {
+        rows.push(fit(
+            vec![lead(), span(clip_ellipsis(first, body), th.muted)],
+            width,
+        ));
+    }
+    if let Some(note) = item.note.as_deref().filter(|n| !n.is_empty()) {
+        let ink = note_color(item, th);
+        if selected {
+            rows.extend(indent_rows(note, ink, limit(3)));
+        } else if problem.is_some() {
+            let first = note.lines().next().unwrap_or("");
+            rows.push(fit(
+                vec![lead(), span(clip_ellipsis(first, body), ink)],
+                width,
+            ));
+        }
+    }
+    rows.push(Line::default());
+    rows
+}
+
+/// A group heading: `▸ ecc@ecc · 293 skills`, and while it is folded a muted
+/// line of what is inside, so a closed group still says what it holds.
+fn group_heading(
+    model: &Model,
+    sheet: &ExtensionsSheet,
+    entry: &ExtensionEntry,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let ExtensionEntry::Group {
+        name,
+        shown,
+        total,
+        open,
+    } = entry
+    else {
+        return Vec::new();
+    };
+    let th = &model.theme;
+    let cc = th.cc();
+    let width = width_of(model);
+    let noun = match sheet.tab {
+        ExtensionTab::Plugins => "plugin",
+        ExtensionTab::Skills => "skill",
+        ExtensionTab::Mcp => "server",
+    };
+    let count = if shown == total {
+        format!("{total} {noun}{}", if *total == 1 { "" } else { "s" })
+    } else {
+        format!("{shown} of {total} {noun}s")
+    };
+    let mut line = vec![
+        span(
+            if selected {
+                SELECTION_BAR
+            } else {
+                UNSELECTED_BAR
+            },
+            if selected { cc.permission } else { cc.inactive },
+        ),
+        span(if *open { "▾" } else { "▸" }, th.primary),
+        pad(1, None),
+    ];
+    line.extend(title_spans(name, selected, th));
+    line.push(span(format!(" · {count}"), th.muted));
+    let mut rows = vec![fit(line, width)];
+    if !open {
+        let preview: Vec<&str> = sheet
+            .current_rows()
+            .iter()
+            .filter(|row| if row.group.is_empty() { "Other" } else { &row.group } == name)
+            .map(|row| row.title.as_str())
+            .collect();
+        let body = width.saturating_sub(INDENT);
+        rows.push(fit(
+            vec![
+                pad(INDENT.min(width), None),
+                span(clip_ellipsis(&preview.join(", "), body), th.muted),
+            ],
+            width,
+        ));
+    }
+    rows.push(Line::default());
+    rows
 }
 
 fn installed_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'static>>) {
     let th = &model.theme;
     let items = sheet.current_rows();
     if items.is_empty() {
-        rows.extend(section_detail(model.width, th, empty_text(sheet.tab)));
+        rows.extend(indented(model, empty_text(sheet.tab), th.muted));
+        return;
+    }
+    let entries = sheet.entries(sheet.tab);
+    if entries.is_empty() {
+        rows.extend(indented(
+            model,
+            &format!("Nothing matches \"{}\".", sheet.filter.trim()),
+            th.muted,
+        ));
         return;
     }
     let selected = sheet.index();
-    for (i, item) in items.iter().enumerate() {
-        push_row(model, rows, item, i == selected);
-        if i == selected {
-            if let Some(action) = sheet.armed_here() {
-                rows.extend(colored(
-                    section_detail(model.width, th, &confirm_warning(sheet.tab, action, item)),
-                    th.warning,
-                ));
+    for (i, entry) in entries.iter().enumerate() {
+        match entry {
+            ExtensionEntry::Group { .. } => {
+                rows.extend(group_heading(model, sheet, entry, i == selected));
+            }
+            ExtensionEntry::Row(at) => {
+                let item = &items[*at];
+                let confirm = (i == selected)
+                    .then(|| sheet.armed_here())
+                    .flatten()
+                    .map(|action| confirm_warning(sheet.tab, action, item));
+                rows.extend(card(model, item, Kind::Installed, i == selected, confirm));
             }
         }
     }
@@ -134,30 +621,7 @@ fn installed_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'
 
 fn discover_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'static>>) {
     let th = &model.theme;
-    let width = model.width;
     let discover = &sheet.discover;
-    let search = if discover.query.is_empty() {
-        vec![
-            span("   ⌕ ", th.primary),
-            span(search_placeholder(sheet.tab), th.muted),
-        ]
-    } else {
-        vec![
-            span("   ⌕ ", th.primary),
-            span(discover.query.clone(), th.text),
-            span("▏", th.primary),
-        ]
-    };
-    rows.push(Line::from(crate::davinci::ui::truncate_run(search, width)));
-    let status = if discover.searching {
-        Some("Searching…".to_string())
-    } else {
-        discover.message.clone()
-    };
-    if let Some(status) = status {
-        rows.extend(colored(section_detail(width, th, &status), th.muted));
-    }
-    rows.push(Line::default());
     if discover.results.is_empty() {
         if !discover.searching {
             let text = if discover.query.is_empty() {
@@ -165,88 +629,54 @@ fn discover_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'s
             } else {
                 "Nothing matches."
             };
-            rows.extend(section_detail(width, th, text));
+            rows.extend(indented(model, text, th.muted));
         }
         return;
     }
     let selected = discover.index();
     for (i, item) in discover.results.iter().enumerate() {
-        push_row(model, rows, item, i == selected);
-        if i == selected && discover.armed_here() {
-            rows.extend(colored(
-                section_detail(
-                    width,
-                    th,
-                    &format!(
-                        "Press enter again to install {} ({}). Esc cancels.",
-                        item.title, item.status
-                    ),
-                ),
-                th.warning,
-            ));
-        }
+        let confirm = (i == selected && discover.armed_here()).then(|| {
+            format!(
+                "Press enter again to install {} ({}). Esc cancels.",
+                item.title, item.status
+            )
+        });
+        rows.extend(card(model, item, Kind::Discover, i == selected, confirm));
     }
 }
 
 fn marketplace_lines(model: &Model, sheet: &ExtensionsSheet, rows: &mut Vec<Line<'static>>) {
     let th = &model.theme;
-    let width = model.width;
-    if let Some(input) = &sheet.marketplace_input {
-        rows.push(Line::from(crate::davinci::ui::truncate_run(
-            vec![
-                span("   Add marketplace: ", th.primary),
-                span(input.clone(), th.text),
-                span("▏", th.primary),
-            ],
-            width,
-        )));
-        rows.extend(colored(
-            section_detail(
-                width,
-                th,
-                "owner/repo on GitHub, a git URL, or a local folder. Enter adds it.",
-            ),
-            th.muted,
-        ));
-        rows.push(Line::default());
-    }
     if sheet.marketplaces.is_empty() {
-        rows.extend(section_detail(
-            width,
-            th,
+        rows.extend(indented(
+            model,
             "No marketplaces yet. Press a to add one, for example \
              anthropics/claude-plugins-official.",
+            th.muted,
         ));
         return;
     }
     let selected = sheet.marketplace_index();
     for (i, item) in sheet.marketplaces.iter().enumerate() {
-        push_row(model, rows, item, i == selected);
         let armed = sheet
             .armed
             .as_ref()
             .is_some_and(|(name, _)| i == selected && *name == item.key);
-        if armed {
-            rows.extend(colored(
-                section_detail(
-                    width,
-                    th,
-                    &format!(
-                        "Press y to remove the marketplace {}. Installed plugins stay. \
-                         Any other key cancels.",
-                        item.title
-                    ),
-                ),
-                th.warning,
-            ));
-        }
+        let confirm = armed.then(|| {
+            format!(
+                "Press y to remove the marketplace {}. Installed plugins stay. \
+                 Any other key cancels.",
+                item.title
+            )
+        });
+        rows.extend(card(model, item, Kind::Marketplace, i == selected, confirm));
     }
 }
 
 fn confirm_warning(tab: ExtensionTab, action: &str, item: &ExtensionRow) -> String {
     if action == "approve" {
         return format!(
-            "Press y to let the hooks of {} (listed above) run shell commands on this machine. \
+            "Press y to let the hooks of {} (listed below) run shell commands on this machine. \
              Any other key cancels.",
             item.title
         );
@@ -296,6 +726,26 @@ pub fn row_hints(item: Option<&ExtensionRow>, armed: Option<&str>) -> Vec<&'stat
     out
 }
 
+fn installed_hints(sheet: &ExtensionsSheet) -> Vec<&'static str> {
+    if sheet.filtering {
+        return vec!["type to filter", "↑↓ move", "enter keep", "esc clear"];
+    }
+    if let Some(ExtensionEntry::Group { open, .. }) = sheet.current_entry() {
+        return vec![
+            "←→ view",
+            "↑↓ move",
+            if open { "enter fold" } else { "enter unfold" },
+            "/ filter",
+        ];
+    }
+    let armed = sheet.armed_here();
+    let mut out = row_hints(sheet.current(), armed);
+    if armed.is_none() {
+        out.push("/ filter");
+    }
+    out
+}
+
 fn discover_hints(sheet: &ExtensionsSheet) -> Vec<&'static str> {
     if sheet.discover.armed_here() {
         return vec!["enter install", "esc cancel"];
@@ -336,7 +786,7 @@ pub fn chrome(model: &Model) -> SheetChrome {
     let (header, hints) = match &model.extension_manager {
         Some(sheet) => {
             let hints = match sheet.view {
-                ExtensionView::Installed => row_hints(sheet.current(), sheet.armed_here()),
+                ExtensionView::Installed => installed_hints(sheet),
                 ExtensionView::Discover => discover_hints(sheet),
                 ExtensionView::Marketplaces => marketplace_hints(sheet),
             };
@@ -424,7 +874,7 @@ mod tests {
         let m = model(100);
         let drawn = text(&lines(&m));
         for value in [
-            "[Installed (2)]",
+            "Installed (2)",
             "Discover",
             "Marketplaces (1)",
             "superpowers@superpowers-marketplace",
@@ -462,7 +912,7 @@ mod tests {
         let sheet = m.extension_manager.as_mut().unwrap();
         sheet.tab = ExtensionTab::Skills;
         let drawn = text(&lines(&m));
-        assert!(drawn.contains("[Installed (1)]"), "{drawn}");
+        assert!(drawn.contains("Installed (1)"), "{drawn}");
         assert!(!drawn.contains("Marketplaces"), "{drawn}");
         let sheet = m.extension_manager.as_mut().unwrap();
         sheet.switch_view(1);
