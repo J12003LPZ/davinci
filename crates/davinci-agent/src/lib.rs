@@ -79,7 +79,7 @@ pub use compaction::{
 pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
     load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
-    ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
+    ContextFile, ContextPriority, RootContextAccount, SelectedRootContext, INSTRUCTION_FILE,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
@@ -2180,17 +2180,11 @@ impl Agent {
         };
         let events = self.context_vm_events_for_vm();
         let selected = self.select_root_context(self.context_window);
+        // Repository instructions (AGENTS.md) are not items here:
+        // `provider_system_prompt` already carries them, mandatory and in the
+        // cached prefix. A copy in the image sent every one twice and, at
+        // optional priority, could be paged out from under the system copy.
         let mut items = Vec::new();
-        for file in selected.repository_files {
-            items.push(runtime::ContextItem {
-                source: format!("file::{}", file.path.display()),
-                content: file.body.clone(),
-                estimated_tokens: (file.body.len() as u64).div_ceil(4),
-                priority: 100,
-                stable_for_cache: true,
-                provenance: serde_json::json!({"provenance_kind":"repository_fact"}),
-            });
-        }
         for (index, message) in selected.ephemeral_messages.iter().enumerate() {
             let content = davinci_ai::content_text(&message.content);
             items.push(runtime::ContextItem {
