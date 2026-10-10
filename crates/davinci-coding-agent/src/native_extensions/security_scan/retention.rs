@@ -19,8 +19,12 @@ fn newest_modification(dir: &Path) -> Option<SystemTime> {
 }
 
 /// Remove scan directories older than `retention_days`. Returns how many went.
-/// A directory whose lock is held by a live scan cannot be removed on Windows
-/// and is recent everywhere else, so an active scan is never swept.
+///
+/// Age alone does not prove a scan is finished: a long or resumed scan can
+/// sit on old files, and on Unix holding `active.lock` does not stop another
+/// process from deleting the directory around it. So a scan is removed only
+/// while the sweeper itself holds that lease (the same lock `Store::open`
+/// takes), and any scan whose lease is held, or cannot be checked, is kept.
 pub fn sweep(agent_dir: &Path, retention_days: u32, now: SystemTime) -> usize {
     let window = Duration::from_secs(u64::from(retention_days.max(1)) * 24 * 60 * 60);
     let Some(cutoff) = now.checked_sub(window) else {
@@ -42,11 +46,24 @@ pub fn sweep(agent_dir: &Path, retention_days: u32, now: SystemTime) -> usize {
             if !scan.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            if newest_modification(&scan.path()).is_some_and(|newest| newest < cutoff)
-                && std::fs::remove_dir_all(scan.path()).is_ok()
-            {
+            if !newest_modification(&scan.path()).is_some_and(|newest| newest < cutoff) {
+                continue;
+            }
+            let Ok(lease) =
+                davinci_sys::lock::ExclusiveFileLock::try_acquire(&scan.path().join("active.lock"))
+            else {
+                continue;
+            };
+            // Windows cannot delete a file through someone else's handle, our
+            // own exclusive one included, so the lease is released first there;
+            // a scan that grabs it in that instant makes the removal fail.
+            #[cfg(windows)]
+            drop(lease);
+            if std::fs::remove_dir_all(scan.path()).is_ok() {
                 removed += 1;
             }
+            #[cfg(not(windows))]
+            drop(lease);
         }
     }
     removed
@@ -70,5 +87,28 @@ mod tests {
         assert_eq!(sweep(agent.path(), 2, later), 1);
         assert!(!repo.join("old-scan").exists());
         assert!(repo.join("feedback.json").exists());
+    }
+
+    #[test]
+    fn security_retention_keeps_an_old_scan_whose_lease_is_held() {
+        let agent = tempfile::tempdir().unwrap();
+        let scan = agent
+            .path()
+            .join("security-scans")
+            .join("repo")
+            .join("running");
+        std::fs::create_dir_all(&scan).unwrap();
+        std::fs::write(scan.join("checkpoint.json"), "{}").unwrap();
+        let lease =
+            davinci_sys::lock::ExclusiveFileLock::try_acquire(&scan.join("active.lock")).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(10 * 24 * 60 * 60);
+        assert_eq!(sweep(agent.path(), 1, later), 0);
+        assert!(
+            scan.join("checkpoint.json").exists(),
+            "a running scan was swept"
+        );
+        drop(lease);
+        assert_eq!(sweep(agent.path(), 1, later), 1);
+        assert!(!scan.exists());
     }
 }

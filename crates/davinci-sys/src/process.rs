@@ -103,23 +103,66 @@ pub fn set_own_process_group(command: &mut Command) {
 
 /// Kill `pid` and its descendants. On Unix, `pid` must be the leader of its
 /// own process group (see [`set_own_process_group`]).
+///
+/// Nothing here is looked up on PATH: cleanup runs during cancellation and
+/// timeouts, often for a repository-controlled process, and a PATH entry the
+/// repository or user environment planted must not get a `kill` or
+/// `taskkill` of its own run. Unix signals the group directly; Windows runs
+/// `taskkill.exe` from the system directory.
 pub fn kill_tree(pid: u32) {
-    if cfg!(windows) {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    } else {
-        let _ = Command::new("kill")
-            // A negative PID selects a process group, not a signal option.
-            .args(["-TERM", "--", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    #[cfg(unix)]
+    {
+        // pid 0 would signal our own group, and a value past i32::MAX would
+        // wrap to a negative group id: neither is a child of ours.
+        let Ok(group) = i32::try_from(pid) else {
+            return;
+        };
+        if group > 0 {
+            // SAFETY: plain syscall; a negative pid selects the process group.
+            unsafe { libc::kill(-group, libc::SIGTERM) };
+        }
     }
+    #[cfg(windows)]
+    {
+        if let Some(taskkill) = system_program("taskkill.exe") {
+            let _ = Command::new(taskkill)
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
+/// `name` in the Windows system directory (`GetSystemDirectoryW`, normally
+/// `C:\Windows\System32`), when it exists. Not read from `%SystemRoot%`,
+/// which the environment controls just like PATH.
+#[cfg(windows)]
+pub fn system_program(name: &str) -> Option<PathBuf> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 260];
+    loop {
+        // SAFETY: the buffer is valid for `len` u16s.
+        let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if len == 0 {
+            return None;
+        }
+        if (len as usize) < buffer.len() {
+            buffer.truncate(len as usize);
+            break;
+        }
+        // Too small: `len` is the size needed, terminator included.
+        buffer.resize(len as usize, 0);
+    }
+    let candidate = PathBuf::from(OsString::from_wide(&buffer)).join(name);
+    candidate.is_file().then_some(candidate)
 }
 
 #[derive(Default)]

@@ -163,25 +163,10 @@ fn run_status_interruptible(
     }
 }
 
+/// Stop Git and anything it started. `kill_tree` resolves no program on
+/// PATH, so cancellation cannot run a `kill` the environment supplied.
 fn terminate_child(child: &mut std::process::Child) {
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &format!("-{}", child.id())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    davinci_sys::process::kill_tree(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
