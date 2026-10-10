@@ -42,6 +42,27 @@ fn non_retryable_limit_pattern() -> &'static Regex {
     })
 }
 
+fn context_overflow_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        build_pattern(&[
+            "prompt is too long",
+            "context.?length.?exceeded",
+            "maximum context length",
+            "exceeds the context window",
+            "input is too long",
+            "too many (input )?tokens",
+        ])
+    })
+}
+
+/// True when a provider refused a request because its input does not fit the
+/// model's context window. A retry of the same input cannot succeed; a
+/// smaller input can.
+pub fn is_context_overflow_text(text: &str) -> bool {
+    context_overflow_pattern().is_match(text)
+}
+
 fn retryable_provider_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -111,6 +132,21 @@ pub fn is_retryable_error_text(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::stream::AssistantMessage;
+
+    #[test]
+    fn context_overflow_is_recognized_and_rate_limits_are_not() {
+        for text in [
+            "prompt is too long: 205000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens",
+            "context_length_exceeded",
+            "input exceeds the context window",
+        ] {
+            assert!(is_context_overflow_text(text), "{text}");
+        }
+        for text in ["HTTP 429 rate limit", "usage_limit_reached", "server error"] {
+            assert!(!is_context_overflow_text(text), "{text}");
+        }
+    }
 
     #[test]
     fn codex_subscription_exhaustion_and_policy_denials_never_retry() {

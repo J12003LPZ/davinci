@@ -5,9 +5,39 @@ retains the off default. Compaction/resume fixtures prove boundary behavior,
 not a long-task success or efficiency advantage for active mode.
 
 Context VM compiles a bounded working set from authoritative session history.
-The default mode remains off; shadow compares projections and active mode uses
-the compiled image. The agent API selects the mode with
-`set_context_vm_mode(ContextVmMode::Active)`.
+The default mode remains off; shadow compares projections, active mode uses
+the compiled image, and hybrid mode sends the off-mode transcript and compacts
+it with the VM ledger. The agent API selects the mode with
+`set_context_vm_mode(ContextVmMode::Active)`; `DAVINCI_CONTEXT_VM` and the
+`context-vm` setting accept `off`, `shadow`, `active` and `hybrid`.
+
+## Hybrid mode
+
+Hybrid keeps the off-mode request: the append-only transcript with native
+items and tool call/result pairs, unpruned, so each request extends the
+previous one. It sets no Context VM cache partition. The VM follows every turn
+with its deterministic ledger at no provider cost.
+
+Compaction starts when `calibrated_context_tokens()` passes the compaction
+threshold: the provider-reported size of the last request (input of every
+kind plus the reply) and the four-bytes-a-token estimate of messages added
+since, as Codex measures it; the plain estimate when no report applies. A
+provider that refuses the input as too long gets one compaction and the same
+request again per run.
+
+A compaction folds the ledger (one summarizer request over the events no fold
+has seen, or the deterministic state when that fails), renders it with every
+value's source refs and the superseded values, and keeps it with the most
+recent `keep_recent_tokens` of messages verbatim. It is persisted as an
+ordinary `compaction` entry, so reload, branching and native replay follow
+the off-mode paths. Without a session, where events are numbered by position,
+the VM is rebased onto the compacted transcript. A compaction or branch
+summary is never read as a user requirement.
+
+The compaction request is not a prefix-sharing request: the host summarizer
+is a separate completion, and the one recorded ChatGPT-route probe of a
+prefix-sharing compaction shape reported no cache reads. It sends the
+excerpted events since the last fold instead of the whole transcript.
 
 ## Provider admission and protocol
 

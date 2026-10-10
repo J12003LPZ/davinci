@@ -1,5 +1,31 @@
 # Context VM and graph hardening measurements
 
+## October 10, 2026: hybrid mode
+
+Same scripted session and fixture summarizer as below, run to 300 turns so
+the off and hybrid modes compact more than once (128k window, threshold at
+the window less the 16k reserve). Replies report the request at four bytes a
+token as their provider count. Structural and offline, as below.
+
+| Mode, 300 turns | Compactions | Summarizer calls / bytes | Non-prefix bytes | Prefix reuse | Requirement checks kept |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Off | 2 | 4 / 516,278 | 1,222,076 | 98.4% | 394/883 |
+| Active (fold policy below) | 25 | 25 / 919,565 | 8,791,022 | 61.2% | 883/883 |
+| Hybrid | 2 | 2 / 246,468 | 1,242,851 | 98.3% | 883/883 |
+| Hybrid, no summarizer | 2 | 0 / 0 | 1,242,851 | 98.3% | 883/883 |
+
+At 60 turns, before any compaction, hybrid requests are byte-identical to
+off. Hybrid's extra 1.7% of non-prefix bytes is the larger ledger summary
+after each compaction. Off's requirement loss starts at its first compaction
+because the fixture summary is generic: it shows that off depends entirely on
+the summarizer, not how a real model summarizes. Hybrid's ledger keeps the
+requirements with a summarizer that adds nothing, or none.
+
+Found on the way: a fold in a session wrote a `context_checkpoint` entry type
+that the session codec rejects, so a session with a fold could not be
+reopened. Fold records are now `custom` entries with that `customType`; the
+bare type is still read in memory.
+
 ## October 10, 2026: fold policy and cache-stable image
 
 Baseline: `6e5e81c` (main). Codex source read at `openai/codex@de8fab6`.

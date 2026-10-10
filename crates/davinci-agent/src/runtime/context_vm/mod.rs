@@ -22,8 +22,8 @@ pub(crate) use fold::fold_request;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
 pub use metrics::ContextVmMetrics;
 pub use reducer::{
-    parse_checkpoint_proposal, CheckpointProposal, ContextStateReducer, ProposedStateValue,
-    RetiredState, StateSlot, StateTransition, TransitionKind,
+    parse_checkpoint_proposal, render_ledger, CheckpointProposal, ContextStateReducer,
+    ProposedStateValue, RetiredState, StateSlot, StateTransition, TransitionKind,
 };
 pub use retrieval::{retrieve_context_tool, RetrieveContextRequest, RetrieveContextResult};
 pub use shadow::{compare_shadow_views, ShadowComparison};
@@ -514,6 +514,40 @@ impl ContextVmRuntime {
         Ok(root)
     }
 
+    /// Continue the current state on a history that was rewritten under it:
+    /// a compacted transcript without a session, whose events are numbered
+    /// by position and so look like another conversation. The state already
+    /// covers every event in `events`; later events extend it as usual.
+    pub fn rebase(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
+        if self
+            .state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .needs_rebuild
+        {
+            return self.rebuild_from_events(events);
+        }
+        let mut state = self.load_state_from_root()?;
+        let through = events.iter().map(|event| event.seq).max().unwrap_or(0);
+        state.through_seq = through;
+        let checkpoint = self.save_page(&ContextObject::Checkpoint(state))?;
+        self.record_events(events);
+        let old = self.root();
+        let root = ContextRoot {
+            epoch: old.epoch.saturating_add(1),
+            cache_namespace: String::new(),
+            checkpoint: Some(checkpoint),
+            deltas: Vec::new(),
+            episodes: old.episodes,
+            hot_event_refs: self.hot_refs(events),
+            evidence_refs: evidence_refs(events),
+            updates_since_fold: 0,
+            folded_through_seq: through,
+        };
+        self.install_root(root.clone(), through);
+        Ok(root)
+    }
+
     /// Capture the state a fold changes, so a fold whose checkpoint cannot be
     /// persisted can be undone and memory never runs ahead of the session.
     /// The fold counters are restored; work counters (rebuilds, page lookups,
@@ -784,7 +818,7 @@ pub fn latest_persisted_root(
     davinci_session::branch_entries(entries, leaf_id)
         .into_iter()
         .rev()
-        .filter(|entry| entry.entry_type == "context_checkpoint")
+        .filter(|entry| is_context_checkpoint_entry(entry))
         .find_map(|entry| {
             let root = serde_json::from_value(entry.extra.get("root")?.clone()).ok()?;
             let through_seq = entry
@@ -796,6 +830,20 @@ pub fn latest_persisted_root(
         })
 }
 
+/// `customType` of the session entry that records a fold.
+pub const CONTEXT_CHECKPOINT_CUSTOM_TYPE: &str = "context_checkpoint";
+
+/// A fold record: a custom entry, or the bare entry type earlier builds wrote,
+/// which the session codec rejects on reopen and only an unreopened
+/// in-memory session can still hold.
+pub fn is_context_checkpoint_entry(entry: &SessionEntry) -> bool {
+    entry.entry_type == CONTEXT_CHECKPOINT_CUSTOM_TYPE
+        || (entry.entry_type == "custom"
+            && entry.custom_type.as_deref() == Some(CONTEXT_CHECKPOINT_CUSTOM_TYPE))
+}
+
+/// The session entry recording a fold. It is a custom entry: the session
+/// codec accepts it on reopen, and history and event loading skip it.
 pub fn context_checkpoint_entry(
     root: &ContextRoot,
     through_seq: u64,
@@ -813,12 +861,12 @@ pub fn context_checkpoint_entry(
     extra.insert("prefixDigest".into(), Value::String(prefix_digest.into()));
     SessionEntry {
         id: format!("context-checkpoint-{}", uuid::Uuid::new_v4()),
-        entry_type: "context_checkpoint".into(),
+        entry_type: "custom".into(),
         parent_id,
         seq,
         timestamp: 0,
         message: None,
-        custom_type: None,
+        custom_type: Some(CONTEXT_CHECKPOINT_CUSTOM_TYPE.into()),
         extra,
     }
 }

@@ -17,7 +17,6 @@ use davinci_ai::{AssistantMessage, ChatMessage, ContentBlock, MessageContent, St
 use std::sync::{Arc, Mutex};
 
 const WINDOW: u64 = 128_000;
-const TURNS: usize = 60;
 
 const REQUIREMENTS: [(usize, &str); 3] = [
     (0, "Never modify files under migrations/."),
@@ -64,13 +63,19 @@ struct Calls {
     fold_prompt_bytes: usize,
 }
 
-fn reply(text: &str) -> AssistantMessage {
+/// A reply whose usage reports the request at four bytes a token, standing in
+/// for a provider count.
+fn reply(text: &str, request_bytes: usize) -> AssistantMessage {
     AssistantMessage {
         extra: Default::default(),
         id: "fixture".into(),
         role: "assistant".into(),
         model: "fixture".into(),
-        usage: None,
+        usage: Some(davinci_protocol::Usage {
+            input: request_bytes as u64 / 4,
+            output: 8,
+            ..Default::default()
+        }),
         error_message: None,
         content: vec![ContentBlock::Text { text: text.into() }],
         stop_reason: Some(StopReason::Stop),
@@ -81,7 +86,7 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-fn run(mode: ContextVmMode, summarizer: bool) -> serde_json::Value {
+fn run(mode: ContextVmMode, summarizer: bool, turns: usize) -> serde_json::Value {
     let mut agent = Agent::new("You are a coding agent.");
     agent.set_runtime(RuntimeHandle::new(
         RunId::new(),
@@ -119,7 +124,7 @@ fn run(mode: ContextVmMode, summarizer: bool) -> serde_json::Value {
     let mut requirement_checks = 0usize;
     let mut requirement_hits = 0usize;
     let mut lost = Vec::new();
-    for turn in 0..TURNS {
+    for turn in 0..turns {
         agent
             .messages
             .push(ChatMessage::text("user", user_text(turn)));
@@ -143,8 +148,10 @@ fn run(mode: ContextVmMode, summarizer: bool) -> serde_json::Value {
         agent
             .run_loop(move |agent: &Agent| {
                 let input = davinci_ai::openai_responses_input(&agent.messages_for_provider());
-                *captured.lock().unwrap() = serde_json::to_vec(&input).unwrap();
-                Ok::<_, String>(reply(&format!("Step {turn} recorded.")))
+                let bytes = serde_json::to_vec(&input).unwrap();
+                let size = bytes.len();
+                *captured.lock().unwrap() = bytes;
+                Ok::<_, String>(reply(&format!("Step {turn} recorded."), size))
             })
             .expect("turn runs");
         let wire = wire.lock().unwrap().clone();
@@ -177,6 +184,7 @@ fn run(mode: ContextVmMode, summarizer: bool) -> serde_json::Value {
     let stats = agent.run_stats();
     serde_json::json!({
         "mode": format!("{mode:?}"),
+        "turns": turns,
         "summarizer": summarizer,
         "requests": stats.model_turns,
         "compactions_or_folds": stats.compactions,
@@ -194,11 +202,17 @@ fn run(mode: ContextVmMode, summarizer: bool) -> serde_json::Value {
 #[test]
 #[ignore = "offline structural measurement; run with --ignored --nocapture"]
 fn context_vm_mode_efficiency_report() {
-    for (mode, summarizer) in [
-        (ContextVmMode::Off, true),
-        (ContextVmMode::Active, true),
-        (ContextVmMode::Active, false),
-    ] {
-        println!("CONTEXT_VM_EFFICIENCY {}", run(mode, summarizer));
+    // 60 turns stay under the off-mode compaction threshold; 300 turns
+    // compact more than once in every mode.
+    for turns in [60, 300] {
+        for (mode, summarizer) in [
+            (ContextVmMode::Off, true),
+            (ContextVmMode::Active, true),
+            (ContextVmMode::Active, false),
+            (ContextVmMode::Hybrid, true),
+            (ContextVmMode::Hybrid, false),
+        ] {
+            println!("CONTEXT_VM_EFFICIENCY {}", run(mode, summarizer, turns));
+        }
     }
 }

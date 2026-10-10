@@ -196,6 +196,80 @@ impl ContextStateReducer {
     }
 }
 
+/// Source refs shown per ledger value; the full list stays in the state.
+const LEDGER_REFS_PER_VALUE: usize = 2;
+
+/// The task ledger as the model reads it after a compaction: every slot of
+/// the validated state, each value with the sources it was traced to.
+/// Values are already bounded and deduplicated by the reducer.
+pub fn render_ledger(state: &CheckpointState) -> String {
+    fn refs(value: &StateValue<String>) -> String {
+        let refs = value
+            .provenance
+            .iter()
+            .flat_map(|provenance| &provenance.source_refs)
+            .take(LEDGER_REFS_PER_VALUE)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if refs.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", refs.join(", "))
+        }
+    }
+    let mut out = String::from(
+        "Task ledger kept by the Context VM. Each value is quoted from or traced to \
+         the sources in brackets; retrieve_context with sourceRef=<ref> returns a \
+         source exactly. Only Verification is backed by tool output; anything else \
+         claimed done is unverified.\n",
+    );
+    for (title, values) in [
+        ("Goals (user)", &state.goals),
+        ("Constraints (user or policy)", &state.constraints),
+        ("Decisions", &state.decisions),
+        ("In progress", &state.in_progress),
+        ("Completed", &state.completed),
+        ("Blockers", &state.blockers),
+        ("Modified files", &state.modified_files),
+        (
+            "Verification (tool output, newest last)",
+            &state.verification,
+        ),
+    ] {
+        if values.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n## {title}\n"));
+        for value in values {
+            out.push_str(&format!("- {}{}\n", value.value, refs(value)));
+        }
+    }
+    if !state.retired.is_empty() {
+        out.push_str("\n## Superseded or resolved (do not act on the old value)\n");
+        for retired in &state.retired {
+            let kind = match retired.kind {
+                TransitionKind::Resolve => "resolved",
+                TransitionKind::Supersede => "superseded",
+                TransitionKind::Reject => "rejected",
+            };
+            out.push_str(&format!(
+                "- {kind}: {} -> {}{}\n",
+                retired.previous.value,
+                retired.evidence.value,
+                refs(&retired.evidence)
+            ));
+        }
+    }
+    if let Some(narrative) = &state.narrative {
+        out.push_str(&format!(
+            "\n## Narrative (agent inference)\n{}{}\n",
+            narrative.value,
+            refs(narrative)
+        ));
+    }
+    out
+}
+
 pub fn parse_checkpoint_proposal(text: &str) -> Result<CheckpointProposal, String> {
     serde_json::from_str(text).map_err(|error| format!("invalid context fold JSON: {error}"))
 }
@@ -993,6 +1067,34 @@ mod ledger_tests {
         assert_eq!(goals[0], "Build the scheduler.");
         assert!(goals.contains(&"Never modify files under migrations/.".to_string()));
         assert_eq!(goals.last().unwrap(), "Continue with step 29.");
+    }
+
+    #[test]
+    fn the_ledger_shows_every_slot_with_sources_and_what_was_superseded() {
+        let value = |text: &str, source: &str| StateValue {
+            value: text.to_string(),
+            provenance: vec![ProvenanceRef {
+                kind: ProvenanceKind::UserDecision,
+                source_refs: vec![source.to_string()],
+                content_hash: String::new(),
+            }],
+        };
+        let state = CheckpointState {
+            constraints: vec![value("Use tokio.", "session:b")],
+            verification: vec![value("test result: ok", "session:c")],
+            retired: vec![RetiredState {
+                slot: StateSlot::Constraint,
+                kind: TransitionKind::Supersede,
+                previous: value("Use async-std.", "session:a"),
+                evidence: value("Use tokio.", "session:b"),
+            }],
+            ..CheckpointState::default()
+        };
+        let ledger = render_ledger(&state);
+        assert!(ledger.contains("## Constraints (user or policy)\n- Use tokio. [session:b]"));
+        assert!(ledger.contains("- test result: ok [session:c]"));
+        assert!(ledger.contains("- superseded: Use async-std. -> Use tokio. [session:b]"));
+        assert!(!ledger.contains("## Goals"), "empty slots are omitted");
     }
 
     #[test]

@@ -65,12 +65,12 @@ pub use branch::{
 pub use compaction::{
     branch_summary_context_message, build_history_prompt, calculate_context_tokens,
     compact_messages, compact_messages_with, compact_messages_with_options,
-    compaction_context_message, compaction_threshold, compute_file_lists, convert_to_llm,
-    env_summarizer, estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
-    format_file_operations, generate_summary_with_usage, get_summarization_failure,
-    serialize_conversation, should_compact, CompactionDetails, CompactionResult,
-    CompactionSettings, CompactionThreshold, CutPointResult, FileOperations, SummarizeRequest,
-    SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
+    compact_messages_with_summary, compaction_context_message, compaction_threshold,
+    compute_file_lists, convert_to_llm, env_summarizer, estimate_context_tokens, estimate_tokens,
+    extract_file_ops, find_cut_point, format_file_operations, generate_summary_with_usage,
+    get_summarization_failure, serialize_conversation, should_compact, CompactionDetails,
+    CompactionResult, CompactionSettings, CompactionThreshold, CutPointResult, FileOperations,
+    SummarizeRequest, SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CONTEXT_VM_FOLD_PROMPT,
     CONTEXT_VM_FOLD_SYSTEM_PROMPT, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
@@ -647,6 +647,9 @@ pub struct Agent {
     provider_output_limit: Option<u64>,
     prepared_context_image: Arc<Mutex<Option<PreparedContextImage>>>,
     prepared_context_generation: u64,
+    /// The newest provider-reported context size and the reply it belongs
+    /// to; see [`Agent::calibrated_context_tokens`].
+    last_provider_context: Option<ProviderContextObservation>,
     prepared_manifest_revisions: (u64, u64),
     /// Request-local suffix appended to the current prompt after repository context.
     provider_system_prompt_suffix: Option<String>,
@@ -808,6 +811,7 @@ impl Agent {
             provider_output_limit: None,
             prepared_context_image: Arc::new(Mutex::new(None)),
             prepared_context_generation: 0,
+            last_provider_context: None,
             prepared_manifest_revisions: (0, 0),
             provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
@@ -2458,7 +2462,7 @@ impl Agent {
 
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
         match self.context_vm_mode() {
-            ContextVmMode::Off => self.legacy_messages_for_provider(),
+            ContextVmMode::Off | ContextVmMode::Hybrid => self.legacy_messages_for_provider(),
             ContextVmMode::Shadow => {
                 let legacy = self.legacy_messages_for_provider();
                 self.record_context_vm_shadow(&legacy);
@@ -2497,8 +2501,10 @@ impl Agent {
     /// paged events out of its image; `off` and `shadow` keep the legacy tool
     /// catalog byte-identical.
     pub fn context_vm_offers_retrieval(&self) -> bool {
-        self.context_vm_mode() == ContextVmMode::Active
-            && self.tools.iter().any(|tool| tool == "retrieve_context")
+        matches!(
+            self.context_vm_mode(),
+            ContextVmMode::Active | ContextVmMode::Hybrid
+        ) && self.tools.iter().any(|tool| tool == "retrieve_context")
             && self
                 .runtime
                 .as_ref()
@@ -2579,6 +2585,44 @@ impl Agent {
         compaction::estimate_context_tokens(&image.messages)
             .saturating_add((self.provider_system_prompt().len() as u64).div_ceil(4))
             .saturating_add(self.estimated_tool_schema_tokens())
+    }
+
+    /// Remember what the provider reported for the request that produced
+    /// `reply`, now at the end of `messages`. Missing usage records nothing.
+    pub(crate) fn note_provider_context(
+        &mut self,
+        usage: Option<&davinci_protocol::Usage>,
+        reply: &ChatMessage,
+    ) {
+        let tokens = usage.map_or(0, |usage| {
+            usage
+                .input
+                .saturating_add(usage.cache_read)
+                .saturating_add(usage.cache_write)
+                .saturating_add(usage.output)
+        });
+        self.last_provider_context = (tokens > 0).then(|| ProviderContextObservation {
+            reply_index: self.messages.len().saturating_sub(1),
+            reply: reply.clone(),
+            tokens,
+        });
+    }
+
+    /// The next request's size in provider tokens where the provider has
+    /// measured most of it: the last reported count (input of every kind
+    /// plus the reply) and the four-bytes-a-token estimate of the messages
+    /// added since. Without a report, or once the history before that reply
+    /// was rewritten, the estimate of the whole request. Codex measures its
+    /// auto-compaction the same way.
+    pub fn calibrated_context_tokens(&self) -> u64 {
+        match &self.last_provider_context {
+            Some(observed) if self.messages.get(observed.reply_index) == Some(&observed.reply) => {
+                observed.tokens.saturating_add(estimate_context_tokens(
+                    &self.messages[observed.reply_index + 1..],
+                ))
+            }
+            _ => self.estimated_context_tokens(),
+        }
     }
 
     /// Set once per request configuration using the actual tool catalog.
@@ -3808,10 +3852,15 @@ impl Agent {
                 return Err(error);
             }
         };
-        let prefix_digest = self
-            .prepared_context_image()
-            .map(|image| image.prefix_digest.clone())
-            .unwrap_or_default();
+        // Only the active mode sends a compiled image whose prefix is worth
+        // recording; compiling one for any other mode is wasted work.
+        let prefix_digest = if self.context_vm_mode() == ContextVmMode::Active {
+            self.prepared_context_image()
+                .map(|image| image.prefix_digest.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let (before_tokens, after_tokens) = runtime.context_vm.last_fold_tokens().unwrap_or((0, 0));
         if let Some(session) = &mut self.session {
             let seq = session
@@ -3868,6 +3917,43 @@ impl Agent {
             .map(|runtime| runtime.context_vm.cache_affinity())
     }
 
+    /// Hybrid mode's compaction: fold the Context VM ledger (one summarizer
+    /// call over the events no fold has seen; the deterministic state when
+    /// it fails) and keep it with the most recent messages verbatim. The
+    /// caller persists the result as an ordinary compaction.
+    fn hybrid_compaction(
+        &mut self,
+        custom_instructions: Option<&str>,
+        tokens_before: u64,
+    ) -> CompactionResult {
+        let state = self
+            .fold_context(runtime::context_vm::FoldReason::Manual, custom_instructions)
+            .and_then(|_| {
+                self.runtime
+                    .as_ref()
+                    .ok_or_else(|| "context VM runtime is unavailable".to_string())?
+                    .context_vm
+                    .load_state_from_root()
+            });
+        match state {
+            Ok(state) => compact_messages_with_summary(
+                &self.messages,
+                self.compaction.keep_recent_tokens,
+                &runtime::context_vm::render_ledger(&state),
+            ),
+            Err(error) => CompactionResult {
+                summary: error,
+                messages: self.messages.clone(),
+                compacted: false,
+                details: CompactionDetails::default(),
+                first_kept_entry_id: String::new(),
+                tokens_before,
+                tokens_after: tokens_before,
+                usage: None,
+            },
+        }
+    }
+
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
         if self.context_vm_mode() == ContextVmMode::Active {
             self.is_compacting = true;
@@ -3917,53 +4003,58 @@ impl Agent {
                 estimated_tokens: estimated_before,
             });
         }
-        // Only the active branch's ancestry may seed the next summary; an
-        // abandoned branch's compaction describes a conversation that the
-        // user navigated away from.
-        let previous_summary = self.session.as_ref().and_then(|session| {
-            davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref())
-                .into_iter()
-                .rev()
-                .find(|entry| entry.entry_type == "compaction")
-                .and_then(|entry| {
-                    entry
-                        .extra
-                        .get("summary")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
+        let mut result = if self.context_vm_mode() == ContextVmMode::Hybrid {
+            self.hybrid_compaction(custom_instructions, estimated_before)
+        } else {
+            // Only the active branch's ancestry may seed the next summary; an
+            // abandoned branch's compaction describes a conversation that the
+            // user navigated away from.
+            let previous_summary = self.session.as_ref().and_then(|session| {
+                davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref())
+                    .into_iter()
+                    .rev()
+                    .find(|entry| entry.entry_type == "compaction")
+                    .and_then(|entry| {
+                        entry
+                            .extra
+                            .get("summary")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+            });
+            let provider = self.provider.clone();
+            let model_id = self.model_id.clone();
+            let bound = self.summarizer.clone().map(|inner| {
+                Summarizer::new(move |request| {
+                    let mut request = request.clone();
+                    if request.provider.is_empty() {
+                        request.provider = provider.clone();
+                    }
+                    if request.model_id.is_empty() {
+                        request.model_id = model_id.clone();
+                    }
+                    inner.summarize(&request)
                 })
-        });
-        let provider = self.provider.clone();
-        let model_id = self.model_id.clone();
-        let bound = self.summarizer.clone().map(|inner| {
-            Summarizer::new(move |request| {
-                let mut request = request.clone();
-                if request.provider.is_empty() {
-                    request.provider = provider.clone();
-                }
-                if request.model_id.is_empty() {
-                    request.model_id = model_id.clone();
-                }
-                inner.summarize(&request)
-            })
-        });
-        let observations = self.provider_observation_scope("compaction");
-        let mut result = compact_messages_with_options(
-            &self.messages,
-            custom_instructions,
-            self.compaction.keep_recent_tokens,
-            self.compaction.reserve_tokens,
-            previous_summary.as_deref(),
-            bound.as_ref(),
-        );
-        self.finish_auxiliary_observations(
-            observations,
-            if result.compacted {
-                "completed"
-            } else {
-                "failed"
-            },
-        );
+            });
+            let observations = self.provider_observation_scope("compaction");
+            let result = compact_messages_with_options(
+                &self.messages,
+                custom_instructions,
+                self.compaction.keep_recent_tokens,
+                self.compaction.reserve_tokens,
+                previous_summary.as_deref(),
+                bound.as_ref(),
+            );
+            self.finish_auxiliary_observations(
+                observations,
+                if result.compacted {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            );
+            result
+        };
         if result.compacted {
             if let Some(session) = &mut self.session {
                 let first_kept = first_kept_entry_id(session, &self.messages, &result.messages);
@@ -4008,6 +4099,17 @@ impl Agent {
             let previous_len = self.messages.len();
             self.messages = result.messages.clone();
             self.reindex_completion_context_after_compaction(previous_len);
+            self.last_provider_context = None;
+            if self.context_vm_mode() == ContextVmMode::Hybrid && self.session.is_none() {
+                // Without a session, events are numbered by position: carry
+                // the ledger over to the compacted transcript explicitly.
+                let events = self.context_vm_events_for_vm();
+                if let Some(runtime) = &self.runtime {
+                    if let Err(error) = runtime.context_vm.rebase(&events) {
+                        runtime.context_vm.record_failure("rebase", error);
+                    }
+                }
+            }
         }
         let estimated_after = self.estimated_context_tokens();
         if let Some(runtime) = &self.runtime {
@@ -4591,6 +4693,16 @@ pub(crate) fn custom_message_from_session_entry(entry: &SessionEntry) -> Option<
         extra,
         ..ChatMessage::default()
     })
+}
+
+/// The context size the provider reported for a request, and the reply that
+/// request produced. While that reply is still at `reply_index`, the history
+/// before it is what the count covers.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProviderContextObservation {
+    reply_index: usize,
+    reply: ChatMessage,
+    tokens: u64,
 }
 
 pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {

@@ -360,6 +360,9 @@ impl Agent {
         let mut new_messages = prompt_messages.clone();
         let mut capability_completion_reminders = 0_u32;
         let mut truncated_call_retries = 0_u32;
+        // Hybrid Context VM: one compaction per run answers a provider that
+        // refused the input as too long.
+        let mut overflow_compacted = false;
         let mut verification_reminded_generation = None;
         let mut turns_this_run = 0_u32;
         let mut fast_downgrade_notified = false;
@@ -477,9 +480,12 @@ impl Agent {
             }
 
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
+            let hybrid_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Hybrid;
             // The legacy path prunes tool output before deciding whether to
             // summarize. Active Context VM keeps Agent.messages untouched and
-            // folds its derived state instead.
+            // folds its derived state instead. Hybrid sends the legacy history
+            // unpruned, so every request extends the previous one, and only
+            // compaction rewrites it.
             // Active VM: tokens of events the hot window dropped before any fold
             // saw them, and whether the required context failed admission.
             let mut evicted_unfolded = 0;
@@ -500,6 +506,16 @@ impl Agent {
                         self.estimated_context_tokens()
                     }
                 }
+            } else if hybrid_context_vm {
+                // The ledger follows every turn at no provider cost; the
+                // provider's own count decides when to compact.
+                let events = self.context_vm_events_for_vm();
+                if let Some(runtime) = &self.runtime {
+                    if let Err(error) = runtime.context_vm.append_delta(&events) {
+                        runtime.context_vm.record_failure("append_delta", error);
+                    }
+                }
+                self.calibrated_context_tokens()
             } else {
                 self.prune_context();
                 self.estimated_context_tokens()
@@ -654,6 +670,27 @@ impl Agent {
                 );
             }
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
+            // A provider that refuses the input as too long has counted it;
+            // an estimate has not. Hybrid compacts once and asks again.
+            if hybrid_context_vm && self.auto_compaction && !overflow_compacted {
+                let refused = match &completion {
+                    Err(error) => davinci_ai::is_context_overflow_text(error),
+                    Ok((message, ..)) => {
+                        message.stop_reason == Some(StopReason::Error)
+                            && message
+                                .error_message
+                                .as_deref()
+                                .is_some_and(davinci_ai::is_context_overflow_text)
+                    }
+                };
+                if refused {
+                    overflow_compacted = true;
+                    if self.compact(None).compacted {
+                        self.stats.compactions += 1;
+                        continue;
+                    }
+                }
+            }
             let (mut assistant, stream_events, streamed_live, mut native_responses_resume) =
                 completion?;
             // The decoder already drops partial calls on a length stop; the
@@ -696,6 +733,12 @@ impl Agent {
                 );
             }
             self.messages.push(chat.clone());
+            if !matches!(
+                assistant.stop_reason,
+                Some(StopReason::Error | StopReason::Aborted)
+            ) {
+                self.note_provider_context(assistant.usage.as_ref(), &chat);
+            }
             self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
             self.ensure_session_persistence()?;
             new_messages.push(chat.clone());

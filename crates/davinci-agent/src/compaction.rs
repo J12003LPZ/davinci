@@ -392,6 +392,45 @@ pub fn compact_messages_with_options(
     }
 }
 
+/// Replace history with `summary` and the most recent `keep_recent_tokens`
+/// of messages, kept verbatim, without asking a summarizer: the caller
+/// already holds the summary (the Context VM task ledger). Messages dropped
+/// from a turn the cut splits are covered by that summary like the rest.
+pub fn compact_messages_with_summary(
+    messages: &[ChatMessage],
+    keep_recent_tokens: u64,
+    summary: &str,
+) -> CompactionResult {
+    if messages.len() < 2 {
+        return empty_result(messages);
+    }
+    let mut cut_index = find_cut_point(messages, keep_recent_tokens).first_kept_index;
+    if cut_index == 0 {
+        cut_index = messages.len().saturating_sub(1);
+    }
+    if cut_index == 0 {
+        return empty_result(messages);
+    }
+    let details = compute_file_lists(&extract_file_ops(&messages[..cut_index]));
+    let mut summary = summary.to_string();
+    summary.push_str(&format_file_operations(
+        &details.read_files,
+        &details.modified_files,
+    ));
+    let mut compacted = vec![compaction_context_message(&summary)];
+    compacted.extend(messages[cut_index..].iter().cloned());
+    CompactionResult {
+        tokens_before: estimate_context_tokens(messages),
+        tokens_after: estimate_context_tokens(&compacted),
+        summary,
+        messages: compacted,
+        compacted: true,
+        details,
+        first_kept_entry_id: String::new(),
+        usage: None,
+    }
+}
+
 fn empty_result(messages: &[ChatMessage]) -> CompactionResult {
     let tokens = estimate_context_tokens(messages);
     CompactionResult {

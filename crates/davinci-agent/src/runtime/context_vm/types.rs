@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 pub enum ContextVmMode {
     Off,
     Shadow,
+    /// The provider sees the compiled image: checkpoint, hot window, state.
     Active,
+    /// The provider sees the off-mode transcript, append-only with native
+    /// items; the VM keeps the task ledger and supplies it at compaction.
+    Hybrid,
 }
 
 impl ContextVmMode {
@@ -15,6 +19,7 @@ impl ContextVmMode {
         match value {
             Some("shadow") => Self::Shadow,
             Some("active") => Self::Active,
+            Some("hybrid") => Self::Hybrid,
             _ => Self::Off,
         }
     }

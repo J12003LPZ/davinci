@@ -264,3 +264,22 @@ fn the_state_update_shows_only_what_the_model_cannot_see_and_comes_last() {
     );
     assert_eq!(image.messages.len(), image.entries.len());
 }
+
+#[test]
+fn a_session_with_a_fold_reopens_and_restores_its_root() {
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = active_agent(1_000_000, 20_000);
+    agent.session =
+        Some(davinci_session::JsonlSession::create(sessions.path(), "fold", None).unwrap());
+    agent.prompt("Never touch migrations/.");
+    let root = agent.fold_context(FoldReason::Manual, None).unwrap();
+    let path = agent.session.as_ref().unwrap().path.clone();
+    // Earlier builds wrote an entry type the session codec rejects here.
+    let reopened = davinci_session::JsonlSession::open(&path).unwrap();
+    let (persisted, _) = davinci_agent::runtime::context_vm::latest_persisted_root(
+        &reopened.entries,
+        reopened.leaf_id.as_deref(),
+    )
+    .expect("the fold record survives reopening");
+    assert_eq!(persisted.checkpoint, root.checkpoint);
+}
