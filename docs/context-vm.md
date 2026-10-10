@@ -19,7 +19,12 @@ provider dispatch also receive the matching output limit.
 
 Token accounting uses conservative UTF-8/serialized-byte ceilings with framing
 allowances. These are admission estimates, not tokenizer measurements. They
-can reject context that a model-specific tokenizer would fit.
+can reject context that a model-specific tokenizer would fit. Fold decisions,
+`/context` and `estimated_context_tokens()` use the four-bytes-a-token
+heuristic of the off mode and the compaction threshold instead; measured
+against the threshold, the ceiling fired folds at about a quarter of the
+configured fill. A request whose required context fails admission always
+gets one fold before it is blocked.
 
 The checkpoint, mandatory policy/broker context, latest complete user request,
 newest event and complete live tool exchange are non-droppable. Optional
@@ -55,10 +60,44 @@ fallback does not infer completion and can grow until admission fails. Real
 semantic compression requires a functioning configured summarizer; it is not
 claimed from the deterministic fallback or fixture evals.
 
+The deterministic state is the requirement ledger of last resort. A user
+message over 512 bytes keeps its opening and every clause that reads as an
+instruction (never, must, only, instead, correction, ...), word for word, up
+to 1 KiB. Tool evidence keeps its head and its tail, where test runners print
+the verdict. The goal list keeps the first request and the newest half; older
+goals that state an instruction outlast routine ones. Sources stay
+retrievable.
+
+A fold sends the summarizer the parent state and only the events after
+`folded_through_seq`, the newest event an earlier fold saw. Validation still
+sees every event, so accepted values may cite older sources. A fresh or
+rebuilt root starts at zero and sends everything.
+
 New updates materialize one current checkpoint rather than chaining full-state
 copies. Legacy delta objects remain readable; subsequent updates collapse them.
 Branch changes rebuild state from the selected authoritative history. Cache
 pages are derived artifacts, not the source of truth.
+
+## Cache-stable image
+
+The hot window keeps its first event while everything from it still fits
+`hot_event_tokens`, so consecutive requests share every earlier message. When
+it overflows, or when the compile budget rather than the window bounds the
+image, it restarts at half of what fit. A window that slid one event per turn
+rewrote the provider input from its first message on every request.
+
+Content that changes on routine turns comes after the hot events: the delta
+and optional broker items not marked stable. The delta renders as a
+`state_update` with only the values the model cannot see elsewhere: not in the
+checkpoint at the head of the image and not fully backed by hot events it
+carries verbatim. It is omitted when empty. Admission still reserves the whole
+delta page, which stays retrievable by id.
+
+Automatic delta-depth and delta-token folds wait until events have left the
+hot window without a fold seeing them (`evicted_unfolded_tokens`), and are
+skipped without a summarizer: before that the model sees every event, and a
+deterministic fold only rotates the cache epoch. Window pressure, the hard
+admission limit, phase boundaries and manual folds are not held back.
 
 ## Prepared images and storage
 

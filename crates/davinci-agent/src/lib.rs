@@ -2570,12 +2570,15 @@ impl Agent {
         }
     }
 
+    /// The request on the four-bytes-a-token scale the legacy path, `/context`
+    /// and the compaction threshold use. The image's own `estimated_tokens` is
+    /// the admission ceiling (about a token per byte); measured against the
+    /// threshold it fired folds at roughly a quarter of the configured fill.
+    /// Admission keeps the ceiling (`prepared_context_image`).
     fn context_vm_estimated_provider_tokens(&self, image: &runtime::ContextImage) -> u64 {
-        let budget = self.provider_context_budget();
-        image
-            .estimated_tokens
-            .saturating_add(budget.system)
-            .saturating_add(budget.tools)
+        compaction::estimate_context_tokens(&image.messages)
+            .saturating_add((self.provider_system_prompt().len() as u64).div_ceil(4))
+            .saturating_add(self.estimated_tool_schema_tokens())
     }
 
     /// Set once per request configuration using the actual tool catalog.
@@ -3735,19 +3738,30 @@ impl Agent {
         let events = self.context_vm_events_for_vm();
         // A VM whose recorded events this history no longer extends holds
         // another history's state; the summarizer must not see it.
-        let parent = if runtime.context_vm.continues(&events) {
-            runtime
-                .context_vm
-                .load_state_from_root()
-                .unwrap_or_default()
+        let (parent, folded_through) = if runtime.context_vm.continues(&events) {
+            (
+                runtime
+                    .context_vm
+                    .load_state_from_root()
+                    .unwrap_or_default(),
+                runtime.context_vm.root().folded_through_seq,
+            )
         } else {
-            Default::default()
+            (Default::default(), 0)
         };
+        // An earlier fold already turned older events into the parent state,
+        // so the summarizer gets only the newer ones. Validation below still
+        // sees every event, so a value may cite an older source.
+        let unfolded = events
+            .iter()
+            .filter(|event| event.seq > folded_through)
+            .cloned()
+            .collect::<Vec<_>>();
         let observations = self.provider_observation_scope("compaction");
         let proposal = self.summarizer.as_ref().and_then(|summarizer| {
             let request = runtime::context_vm::fold_request(
                 &parent,
-                &events,
+                &unfolded,
                 custom_instructions,
                 self.context_window,
                 &self.provider,

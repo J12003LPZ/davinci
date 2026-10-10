@@ -237,6 +237,7 @@ impl ContextVmRuntime {
             hot_event_refs: self.hot_refs(events),
             evidence_refs: evidence_refs(events),
             updates_since_fold: 0,
+            folded_through_seq: 0,
         };
         let last_source_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
         self.install_root(root.clone(), last_source_seq);
@@ -300,12 +301,40 @@ impl ContextVmRuntime {
         let last_source_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
         self.install_root(root.clone(), last_source_seq);
         let compiler = ContextCompiler::new(self.store.clone());
-        let image = compiler.compile(ContextCompileRequest {
+        let mut image = compiler.compile(ContextCompileRequest {
             root: &root,
             hot_events: events,
             broker_packet,
             max_tokens,
         })?;
+        // When the budget rather than the hot window bounded the image, the
+        // compiler kept the newest events that fit, and would drop one more
+        // old event on each later turn, changing the provider prefix every
+        // time. Restart the window at half of what fit instead, as the hot
+        // window does when it overflows.
+        let admitted = image
+            .entries
+            .iter()
+            .filter(|entry| entry.category.starts_with("hot_"))
+            .map(|entry| (entry.id.as_str(), entry.estimated_tokens))
+            .collect::<HashMap<_, _>>();
+        if root
+            .hot_event_refs
+            .iter()
+            .any(|source| !admitted.contains_key(source.as_str()))
+        {
+            let fit = admitted
+                .values()
+                .fold(0u64, |sum, tokens| sum.saturating_add(*tokens));
+            root.hot_event_refs = newest_within(events, fit / 2, compiler::hot_entry_tokens);
+            self.install_root(root.clone(), last_source_seq);
+            image = compiler.compile(ContextCompileRequest {
+                root: &root,
+                hot_events: events,
+                broker_packet,
+                max_tokens,
+            })?;
+        }
         // Events outside the image, or folded episodes, are only reachable
         // through exact recovery from here on.
         let hot_in_image = image
@@ -463,6 +492,7 @@ impl ContextVmRuntime {
             hot_event_refs: self.hot_refs(events),
             evidence_refs: evidence_refs(events),
             updates_since_fold: 0,
+            folded_through_seq: events.iter().map(|event| event.seq).max().unwrap_or(0),
         };
         let before_tokens = estimate_state_tokens(&before);
         let after_tokens = estimate_state_tokens(&state);
@@ -682,23 +712,59 @@ impl ContextVmRuntime {
         diverged
     }
 
+    /// The recent events the image carries verbatim. The window keeps its
+    /// start while everything from that start still fits the budget, so it
+    /// only grows at the end: each request then repeats the previous one's
+    /// provider messages and the provider can reuse that cached prefix. A
+    /// window that slid one event per turn changed its first message, and
+    /// every message after it, on every request. When the window overflows it
+    /// advances in one step to half the budget, so the next advance is half a
+    /// window of new events away. A start that is not in `events` (a new
+    /// conversation or another branch) fills the whole budget again.
     fn hot_refs(&self, events: &[ContextEvent]) -> Vec<String> {
-        let mut tokens = 0u64;
-        let mut refs = Vec::new();
-        for event in events.iter().rev() {
-            // Images count at the provider ceiling, as the compiler counts them.
-            let estimate = (event.visible_text.len().div_ceil(4).max(1) as u64).saturating_add(
-                (event.images.len() as u64)
-                    .saturating_mul(crate::provider_budget::IMAGE_TOKEN_CEILING),
-            );
-            if !refs.is_empty() && tokens.saturating_add(estimate) > self.config.hot_event_tokens {
-                break;
+        let budget = self.config.hot_event_tokens;
+        let start = {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            state
+                .root
+                .hot_event_refs
+                .first()
+                .and_then(|start| events.iter().position(|event| &event.source_ref == start))
+        };
+        if let Some(start) = start {
+            let window = &events[start..];
+            let tokens = window
+                .iter()
+                .map(hot_event_tokens)
+                .fold(0u64, u64::saturating_add);
+            if tokens <= budget {
+                return window
+                    .iter()
+                    .map(|event| event.source_ref.clone())
+                    .collect();
             }
-            tokens = tokens.saturating_add(estimate);
-            refs.push(event.source_ref.clone());
+            return newest_within(events, budget / 2, hot_event_tokens);
         }
-        refs.reverse();
-        refs
+        newest_within(events, budget, hot_event_tokens)
+    }
+
+    /// Tokens of events the hot window no longer carries and no fold has
+    /// seen. Only the deterministic state holds what they said, so these are
+    /// what a fold would add to the model's view.
+    pub fn evicted_unfolded_tokens(&self, events: &[ContextEvent]) -> u64 {
+        let root = self.root();
+        let Some(start) = root
+            .hot_event_refs
+            .first()
+            .and_then(|start| events.iter().position(|event| &event.source_ref == start))
+        else {
+            return 0;
+        };
+        events[..start]
+            .iter()
+            .filter(|event| event.seq > root.folded_through_seq)
+            .map(hot_event_tokens)
+            .fold(0u64, u64::saturating_add)
     }
 
     fn bump_metrics(&self, update: impl FnOnce(&mut ContextVmMetrics)) {
@@ -757,6 +823,35 @@ pub fn context_checkpoint_entry(
     }
 }
 
+/// Hot-window size of one event. Images count at the provider ceiling, as
+/// the compiler counts them.
+fn hot_event_tokens(event: &ContextEvent) -> u64 {
+    (event.visible_text.len().div_ceil(4).max(1) as u64).saturating_add(
+        (event.images.len() as u64).saturating_mul(crate::provider_budget::IMAGE_TOKEN_CEILING),
+    )
+}
+
+/// The newest events that fit `budget` by `estimate`; always at least the
+/// newest one.
+fn newest_within(
+    events: &[ContextEvent],
+    budget: u64,
+    estimate: impl Fn(&ContextEvent) -> u64,
+) -> Vec<String> {
+    let mut tokens = 0u64;
+    let mut refs = Vec::new();
+    for event in events.iter().rev() {
+        let estimate = estimate(event);
+        if !refs.is_empty() && tokens.saturating_add(estimate) > budget {
+            break;
+        }
+        tokens = tokens.saturating_add(estimate);
+        refs.push(event.source_ref.clone());
+    }
+    refs.reverse();
+    refs
+}
+
 /// The root keeps only recent tool-result refs; older ones stay pageable
 /// through their sources, so a long session does not grow the checkpoint root.
 pub const MAX_ROOT_EVIDENCE_REFS: usize = 64;
@@ -807,6 +902,94 @@ mod persistence_tests {
             .into_iter()
             .map(|goal| goal.value)
             .collect()
+    }
+
+    /// Compile one image per turn, each turn adding a ~100-token user
+    /// message, and report how often the first hot message changed: every
+    /// such change rewrites the provider input from that message on.
+    fn hot_start_changes(vm: &ContextVmRuntime, max_tokens: u64) -> usize {
+        let mut messages = Vec::new();
+        let mut previous: Option<Vec<ChatMessage>> = None;
+        let mut changes = 0;
+        for turn in 0..40 {
+            messages.push(ChatMessage::text(
+                "user",
+                format!("turn {turn} {}", "x".repeat(400)),
+            ));
+            let image = vm
+                .compile(
+                    &events_from_messages(&messages),
+                    &ContextPacket::empty(),
+                    max_tokens,
+                )
+                .unwrap();
+            if let Some(previous) = &previous {
+                if image.messages[1] != previous[1] {
+                    changes += 1;
+                } else {
+                    // An unchanged start means the old input is a prefix.
+                    assert_eq!(&image.messages[..previous.len()], &previous[..]);
+                }
+            }
+            previous = Some(image.messages);
+        }
+        changes
+    }
+
+    #[test]
+    fn the_hot_window_grows_in_place_and_advances_by_half_a_window() {
+        let vm = ContextVmRuntime::new(
+            ContextVmConfig {
+                hot_event_tokens: 1_000,
+                ..ContextVmConfig::default()
+            },
+            Default::default(),
+        );
+        // A window sliding one event per turn changed its start on each of
+        // the ~30 turns after it filled.
+        let changes = hot_start_changes(&vm, 1_000_000);
+        assert!((3..=8).contains(&changes), "{changes}");
+        let events = vm.events();
+        assert!(vm.root().hot_event_refs.len() < events.len());
+    }
+
+    #[test]
+    fn a_budget_bound_image_advances_by_half_instead_of_one_event_a_turn() {
+        // The hot window never overflows; the compile budget binds first.
+        let vm = ContextVmRuntime::new(
+            ContextVmConfig {
+                hot_event_tokens: 1_000_000,
+                ..ContextVmConfig::default()
+            },
+            Default::default(),
+        );
+        let changes = hot_start_changes(&vm, 6_000);
+        assert!((2..=8).contains(&changes), "{changes}");
+    }
+
+    #[test]
+    fn evicted_events_count_as_unfolded_until_a_fold_sees_them() {
+        let vm = ContextVmRuntime::new(
+            ContextVmConfig {
+                hot_event_tokens: 300,
+                ..ContextVmConfig::default()
+            },
+            Default::default(),
+        );
+        let mut messages = Vec::new();
+        for turn in 0..3 {
+            messages.push(ChatMessage::text(
+                "user",
+                format!("{turn} {}", "x".repeat(400)),
+            ));
+        }
+        let events = events_from_messages(&messages);
+        vm.compile(&events, &ContextPacket::empty(), 1_000_000)
+            .unwrap();
+        assert!(vm.evicted_unfolded_tokens(&events) > 0);
+        vm.fold(FoldReason::Manual, &events).unwrap();
+        assert_eq!(vm.evicted_unfolded_tokens(&events), 0);
+        assert_eq!(vm.root().folded_through_seq, events.last().unwrap().seq);
     }
 
     #[test]

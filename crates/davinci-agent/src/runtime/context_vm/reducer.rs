@@ -158,7 +158,7 @@ impl ContextStateReducer {
                 ContextEventKind::User => push_unique(
                     &mut state.goals,
                     StateValue {
-                        value: excerpt(&event.visible_text),
+                        value: user_excerpt(&event.visible_text),
                         provenance: vec![provenance(event, ProvenanceKind::UserDecision)],
                     },
                 ),
@@ -171,7 +171,7 @@ impl ContextStateReducer {
                     push_refreshed(
                         &mut state.verification,
                         StateValue {
-                            value: excerpt(&event.visible_text),
+                            value: evidence_excerpt(&event.visible_text),
                             provenance: vec![provenance(event, ProvenanceKind::ToolEvidence)],
                         },
                     );
@@ -183,7 +183,7 @@ impl ContextStateReducer {
         // would grow the checkpoint by one goal per prompt forever. Keep the
         // original request and the most recent ones; every dropped value stays
         // retrievable by its source_ref.
-        keep_first_and_recent(&mut state.goals, FALLBACK_GOAL_LIMIT);
+        keep_first_directives_and_recent(&mut state.goals, FALLBACK_GOAL_LIMIT);
         keep_recent(&mut state.verification, FALLBACK_VERIFICATION_LIMIT);
         state.through_seq = state
             .through_seq
@@ -605,17 +605,127 @@ fn apply_transition(
     });
 }
 
-fn excerpt(text: &str) -> String {
-    if text.len() <= 512 {
+/// Deterministic values kept whole up to this size.
+const WHOLE_VALUE_BYTES: usize = 512;
+/// Bound on a deterministic excerpt, marker included. Proposals are held to
+/// the same bound.
+const EXCERPT_BYTES: usize = 1024;
+const EXCERPT_MARKER: &str = " [excerpt; retrieve source]";
+const EXCERPT_GAP: &str = " [...] ";
+
+/// The longest prefix of `text` within `max` bytes, on a char boundary.
+fn head(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The longest suffix of `text` within `max` bytes, on a char boundary.
+fn tail(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// Words that mark a clause as an instruction rather than narrative: what
+/// must, must not, or should instead happen. Matched on whole words.
+const DIRECTIVE_WORDS: &[&str] = &[
+    "never",
+    "must",
+    "always",
+    "don't",
+    "dont",
+    "do not",
+    "only",
+    "required",
+    "requirement",
+    "avoid",
+    "instead",
+    "correction",
+    "ensure",
+    "make sure",
+    "not allowed",
+    "forbidden",
+    "cannot",
+    "can't",
+    "shouldn't",
+    "should not",
+    "keep",
+    "prefer",
+];
+
+fn is_directive(clause: &str) -> bool {
+    let lower = clause.to_lowercase();
+    let words = lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    DIRECTIVE_WORDS.iter().any(|directive| {
+        let parts = directive.split(' ').collect::<Vec<_>>();
+        words
+            .windows(parts.len())
+            .any(|window| window == parts.as_slice())
+    })
+}
+
+/// A user message for the deterministic goal list. Short messages stay
+/// whole. A long one keeps its opening, then every clause that reads as an
+/// instruction, in order, as far as the bound allows: a constraint buried in
+/// a pasted design note survives, where a head-only cut dropped it. The
+/// source stays retrievable either way.
+fn user_excerpt(text: &str) -> String {
+    if text.len() <= WHOLE_VALUE_BYTES {
         return text.into();
     }
-    let end = text
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|i| *i <= 480)
-        .last()
-        .unwrap_or(0);
-    format!("{} [excerpt; retrieve source]", &text[..end])
+    let budget = EXCERPT_BYTES - EXCERPT_MARKER.len();
+    let mut out = head(text, 256).to_string();
+    let rest = &text[out.len()..];
+    // A clause the head cut in two is not quoted from its middle.
+    let cut = !out.ends_with(['.', ';', '!', '?', '\n']);
+    for (clause, _) in clauses(rest).into_iter().skip(usize::from(cut)) {
+        // Keep the clause's own terminator: the user's words stay exact.
+        let end = clause.as_ptr() as usize - rest.as_ptr() as usize + clause.len();
+        let ended = rest[end..]
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '.' | ';' | '!' | '?'))
+            .map_or(end, |c| end + c.len_utf8());
+        let clause = rest[end - clause.len()..ended].trim();
+        if clause.is_empty() || !is_directive(clause) {
+            continue;
+        }
+        if out.len() + EXCERPT_GAP.len() + clause.len() > budget {
+            continue;
+        }
+        out.push_str(EXCERPT_GAP);
+        out.push_str(clause);
+    }
+    out.push_str(EXCERPT_MARKER);
+    out
+}
+
+/// Tool evidence for the deterministic verification list: its head and its
+/// tail, where test runners and builds print their verdict.
+fn evidence_excerpt(text: &str) -> String {
+    if text.len() <= WHOLE_VALUE_BYTES {
+        return text.into();
+    }
+    let side = (EXCERPT_BYTES - EXCERPT_MARKER.len() - EXCERPT_GAP.len()) / 2;
+    format!(
+        "{}{EXCERPT_GAP}{}{EXCERPT_MARKER}",
+        head(text, side),
+        tail(text, side)
+    )
 }
 
 fn provenance(event: &ContextEvent, kind: ProvenanceKind) -> ProvenanceRef {
@@ -629,9 +739,23 @@ fn provenance(event: &ContextEvent, kind: ProvenanceKind) -> ProvenanceRef {
 const FALLBACK_GOAL_LIMIT: usize = 16;
 const FALLBACK_VERIFICATION_LIMIT: usize = 8;
 
-fn keep_first_and_recent(values: &mut Vec<StateValue<String>>, limit: usize) {
-    if values.len() > limit && limit > 1 {
-        values.drain(1..values.len() - (limit - 1));
+/// Bound the deterministic goal list. The original request and the newest
+/// half stay. Older goals in between go oldest first, but a goal that states
+/// an instruction ("never touch migrations") outlasts ones that do not
+/// ("continue with step 7"); when only instructions remain, the oldest goes.
+/// Every dropped value stays retrievable by its source_ref.
+fn keep_first_directives_and_recent(values: &mut Vec<StateValue<String>>, limit: usize) {
+    if limit < 2 {
+        return;
+    }
+    let recent = limit / 2;
+    while values.len() > limit {
+        let middle = 1..values.len() - recent;
+        let drop = middle
+            .clone()
+            .find(|&index| !is_directive(&values[index].value))
+            .unwrap_or(middle.start);
+        values.remove(drop);
     }
 }
 
@@ -797,5 +921,87 @@ mod provenance_tests {
         push_refreshed(&mut values, value("old pass", "b"));
         keep_recent(&mut values, FALLBACK_VERIFICATION_LIMIT);
         assert_eq!(values.last().unwrap().value, "old pass");
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use crate::runtime::context_vm::events_from_messages;
+    use davinci_ai::ChatMessage;
+
+    fn goals(messages: &[ChatMessage]) -> Vec<String> {
+        ContextStateReducer::deterministic_delta(
+            &CheckpointState::default(),
+            &events_from_messages(messages),
+        )
+        .checkpoint_patch
+        .goals
+        .into_iter()
+        .map(|goal| goal.value)
+        .collect()
+    }
+
+    #[test]
+    fn a_requirement_buried_in_a_long_paste_survives_word_for_word() {
+        let paste = format!(
+            "Design note:\n{}\nAll public functions must keep their current signatures.\n{}",
+            "The scheduler stores jobs in a queue. ".repeat(60),
+            "Workers report progress. ".repeat(60)
+        );
+        let goal = goals(&[ChatMessage::text("user", paste)]).remove(0);
+        assert!(
+            goal.contains("All public functions must keep their current signatures."),
+            "{goal}"
+        );
+        assert!(goal.starts_with("Design note:"), "{goal}");
+        assert!(goal.ends_with("[excerpt; retrieve source]"));
+        assert!(goal.len() <= EXCERPT_BYTES);
+    }
+
+    #[test]
+    fn a_long_test_log_keeps_its_verdict() {
+        let log = format!(
+            "running 40 tests\n{}test result: FAILED. 39 passed; 1 failed",
+            "test parser::case ... ok\n".repeat(200)
+        );
+        let mut event = events_from_messages(&[ChatMessage::text("user", "x")]).remove(0);
+        event.kind = ContextEventKind::ToolResult;
+        event.visible_text = log;
+        let state = ContextStateReducer::deterministic_delta(&CheckpointState::default(), &[event])
+            .checkpoint_patch;
+        let verdict = &state.verification[0].value;
+        assert!(verdict.starts_with("running 40 tests"), "{verdict}");
+        assert!(verdict.contains("test result: FAILED. 39 passed; 1 failed"));
+        assert!(verdict.len() <= EXCERPT_BYTES);
+    }
+
+    #[test]
+    fn an_old_instruction_outlasts_newer_routine_goals() {
+        let mut messages = vec![
+            ChatMessage::text("user", "Build the scheduler."),
+            ChatMessage::text("user", "Never modify files under migrations/."),
+        ];
+        for step in 0..30 {
+            messages.push(ChatMessage::text(
+                "user",
+                format!("Continue with step {step}."),
+            ));
+        }
+        let goals = goals(&messages);
+        assert_eq!(goals.len(), FALLBACK_GOAL_LIMIT);
+        assert_eq!(goals[0], "Build the scheduler.");
+        assert!(goals.contains(&"Never modify files under migrations/.".to_string()));
+        assert_eq!(goals.last().unwrap(), "Continue with step 29.");
+    }
+
+    #[test]
+    fn directive_words_match_whole_words_only() {
+        assert!(is_directive("Do not delete the tests"));
+        assert!(is_directive("you can't push to main"));
+        assert!(!is_directive(
+            "The scheduler keeps jobs and musters workers"
+        ));
+        assert!(!is_directive("Continue with step 4"));
     }
 }

@@ -116,6 +116,11 @@ pub struct ContextRoot {
     pub evidence_refs: Vec<String>,
     #[serde(default)]
     pub updates_since_fold: usize,
+    /// Newest event seq a fold has seen. Events after it have reached only the
+    /// deterministic state; a later fold summarizes just those. Zero (a fresh
+    /// or rebuilt root) means nothing has been folded.
+    #[serde(default)]
+    pub folded_through_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

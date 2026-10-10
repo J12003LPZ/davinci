@@ -480,6 +480,10 @@ impl Agent {
             // The legacy path prunes tool output before deciding whether to
             // summarize. Active Context VM keeps Agent.messages untouched and
             // folds its derived state instead.
+            // Active VM: tokens of events the hot window dropped before any fold
+            // saw them, and whether the required context failed admission.
+            let mut evicted_unfolded = 0;
+            let mut over_budget = false;
             let tokens = if active_context_vm {
                 self.invalidate_context_image();
                 let events = self.context_vm_events_for_vm();
@@ -487,10 +491,15 @@ impl Agent {
                     if let Err(error) = runtime.context_vm.append_delta(&events) {
                         runtime.context_vm.record_failure("append_delta", error);
                     }
+                    evicted_unfolded = runtime.context_vm.evicted_unfolded_tokens(&events);
                 }
-                self.prepared_context_image()
-                    .map(|image| self.context_vm_estimated_provider_tokens(&image))
-                    .unwrap_or_else(|_| self.estimated_context_tokens())
+                match self.prepared_context_image() {
+                    Ok(image) => self.context_vm_estimated_provider_tokens(&image),
+                    Err(error) => {
+                        over_budget = error == crate::runtime::context_vm::CONTEXT_BUDGET_EXCEEDED;
+                        self.estimated_context_tokens()
+                    }
+                }
             } else {
                 self.prune_context();
                 self.estimated_context_tokens()
@@ -498,6 +507,14 @@ impl Agent {
             self.stats.note_context(tokens);
             if self.auto_compaction && active_context_vm {
                 let decision = self.runtime.as_ref().map(|runtime| {
+                    // The hard limit outranks every economic rule: a fold is
+                    // the one recovery before the request is blocked.
+                    if over_budget {
+                        return crate::runtime::context_vm::ContextFoldDecision {
+                            should_fold: true,
+                            reason: Some(crate::runtime::context_vm::FoldReason::WindowPressure),
+                        };
+                    }
                     let root = runtime.context_vm.root();
                     let delta_tokens = root
                         .deltas
@@ -507,7 +524,7 @@ impl Agent {
                     let config = runtime.context_vm.config();
                     let mut settings = self.compaction;
                     settings.enabled = true;
-                    crate::runtime::context_vm::ContextFoldPolicy {
+                    let decision = crate::runtime::context_vm::ContextFoldPolicy {
                         max_delta_pages: config.max_delta_pages,
                         max_delta_tokens: config.max_delta_tokens,
                         window_pressure_percent: config.window_pressure_percent,
@@ -517,8 +534,26 @@ impl Agent {
                         delta_tokens,
                         tokens,
                         self.context_window,
+                        evicted_unfolded,
                         &settings,
-                    )
+                    );
+                    // Without a summarizer a maintenance fold copies the
+                    // deterministic state into a new checkpoint: no new
+                    // information, only a rotated cache epoch.
+                    let maintenance = matches!(
+                        decision.reason,
+                        Some(
+                            crate::runtime::context_vm::FoldReason::DeltaDepth
+                                | crate::runtime::context_vm::FoldReason::DeltaTokens
+                        )
+                    );
+                    if maintenance && self.summarizer.is_none() {
+                        return crate::runtime::context_vm::ContextFoldDecision {
+                            should_fold: false,
+                            reason: None,
+                        };
+                    }
+                    decision
                 });
                 if decision.is_some_and(|decision| decision.should_fold) {
                     if let Some(reason) = decision.and_then(|decision| decision.reason) {
