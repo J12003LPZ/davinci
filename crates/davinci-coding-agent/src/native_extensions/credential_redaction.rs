@@ -95,7 +95,7 @@ pub(super) fn private_key_blocks(input: &str) -> String {
 pub(super) fn url_credentials(input: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        Regex::new(r#"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@"'<>`]*:\S*@"#)
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/:@]*:\S*@")
             .expect("fixed URL credential pattern")
     });
     pattern.replace_all(input, "$1[REDACTED]@").into_owned()
@@ -243,6 +243,8 @@ mod tests {
             "postgres://admin:fixture@sensitive@db.internal/app",
             "postgres://admin:fixture/sensitive@db.internal/app",
             "postgres://admin:fixture'sensitive\"x@db.internal/app",
+            "postgres://o'neil:fixture-sensitive@db.internal/app",
+            "postgres://\"admin\":fixture-sensitive@db.internal/app",
             "DATABASE_URL=\"mysql://root:fixture-sensitive@db/app\"",
         ] {
             let output = url_credentials(url);
