@@ -507,6 +507,7 @@ mod tests {
     fn symlink_cwd_loader_preserves_nested_instruction_scope() {
         let root = tempfile::tempdir().unwrap();
         let checkout = root.path().join("checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
         fs::create_dir_all(checkout.join("src")).unwrap();
         fs::write(checkout.join("src/AGENTS.md"), "nested instructions").unwrap();
         fs::write(checkout.join("src/file.rs"), "").unwrap();
