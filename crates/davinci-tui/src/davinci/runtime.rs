@@ -589,13 +589,7 @@ impl Session {
     }
 
     fn selection_range(&self) -> Option<((u16, u16), (u16, u16))> {
-        let anchor = self.selection_anchor?;
-        let focus = self.selection_focus?;
-        Some(if (anchor.1, anchor.0) <= (focus.1, focus.0) {
-            (anchor, focus)
-        } else {
-            (focus, anchor)
-        })
+        selection_span(self.selection_anchor?, self.selection_focus?)
     }
 
     /// Own left-drag selection while mouse reporting is enabled. Releasing the
@@ -694,6 +688,20 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// The selected span, start first. A press that has not been dragged is a
+/// click, not a selection: nothing is highlighted, so a click does not leave
+/// a reversed cell behind that reads as a second cursor.
+fn selection_span(anchor: (u16, u16), focus: (u16, u16)) -> Option<((u16, u16), (u16, u16))> {
+    if anchor == focus {
+        return None;
+    }
+    Some(if (anchor.1, anchor.0) <= (focus.1, focus.0) {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    })
 }
 
 /// The wheel scrolls the conversation, or steps a list like the arrow
@@ -858,6 +866,13 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::NONE,
         ))));
+    }
+
+    #[test]
+    fn a_click_without_a_drag_highlights_nothing() {
+        assert_eq!(selection_span((7, 3), (7, 3)), None);
+        assert_eq!(selection_span((7, 3), (9, 3)), Some(((7, 3), (9, 3))));
+        assert_eq!(selection_span((9, 4), (2, 3)), Some(((2, 3), (9, 4))));
     }
 
     #[test]
