@@ -203,6 +203,15 @@ it marks two independent windows, deterministic code validation, and any missing
 telemetry as unestablished. A parent-only DaVinci campaign is valid: its absent
 Codex control is unavailable rather than an error or a fabricated comparison.
 
+A Codemode arm sets `"codemode": {"mode": "read-only", "nodePath": ...,
+"hostPath": ...}` in those settings, with absolute paths to an installed runtime
+outside the fixture. The runner then launches with `--codemode read-only`
+instead of `--no-session`: the `/config` switch alone stays off silently in a
+sessionless run, so the arm would measure the off path. The explicit flag fails
+the run loudly when Codemode cannot start. The session journal lands in the
+campaign agent directory, not the graded workspace. Other modes are rejected
+before any model call.
+
 DaVinci uses copied credentials and explicit settings. `--settings` selects an
 experimental configuration; defaults use fixed effort, stable prompt profile,
 full tools, and automatic verification. For a
