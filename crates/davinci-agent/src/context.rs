@@ -517,6 +517,7 @@ mod tests {
         let mut prompt = String::new();
         append_repository_context(&mut prompt, &files, &link);
         assert!(prompt.contains("src/AGENTS.md"), "{prompt}");
+        assert!(prompt.contains("nested instructions"), "{prompt}");
         assert!(!prompt.contains(root.path().to_str().unwrap()));
     }
 
