@@ -127,21 +127,24 @@ pub struct ContextFoldPolicy {
     pub window_pressure_percent: u8,
 }
 
-/// Delta-depth and delta-token folds are maintenance, not pressure relief. Every fold bumps the
-/// cache epoch and namespace, which discards the provider's warm prefix, so below this share of
-/// the window they wait for real pressure instead of rotating the cache on a fixed cadence.
-const MAINTENANCE_MIN_WINDOW_PERCENT: u64 = 50;
-
 impl ContextFoldPolicy {
     /// Honor the operator's compaction threshold in active VM mode too.
-    /// Delta maintenance stays independent of the pressure trigger but is held back
-    /// until the compiled context fills `MAINTENANCE_MIN_WINDOW_PERCENT` of the window.
+    /// `compiled_tokens` is the request on the same four-bytes-a-token scale
+    /// the threshold uses elsewhere, not the admission ceiling.
+    ///
+    /// Delta-depth and delta-token folds are maintenance, not pressure relief,
+    /// and every fold rotates the cache epoch and namespace. They wait until
+    /// `evicted_unfolded_tokens` is nonzero: events have left the hot window
+    /// that no fold has seen. Before that the model still sees every event
+    /// verbatim and a fold would add nothing to its view; after it, the window
+    /// advance has already changed the provider prefix.
     pub fn decide_automatic(
         &self,
         root: &ContextRoot,
         delta_tokens: u64,
         compiled_tokens: u64,
         context_window: u64,
+        evicted_unfolded_tokens: u64,
         settings: &crate::CompactionSettings,
     ) -> ContextFoldDecision {
         if !settings.enabled {
@@ -172,10 +175,7 @@ impl ContextFoldPolicy {
             decision.reason,
             Some(FoldReason::DeltaDepth | FoldReason::DeltaTokens)
         );
-        let below_floor = context_window > 0
-            && compiled_tokens.saturating_mul(100)
-                < context_window.saturating_mul(MAINTENANCE_MIN_WINDOW_PERCENT);
-        if maintenance && below_floor {
+        if maintenance && evicted_unfolded_tokens == 0 {
             return ContextFoldDecision {
                 should_fold: false,
                 reason: None,
@@ -330,7 +330,7 @@ mod threshold_tests {
                 ] {
                     assert_eq!(
                         policy
-                            .decide_automatic(&root, 0, tokens, window, &settings)
+                            .decide_automatic(&root, 0, tokens, window, 0, &settings)
                             .should_fold,
                         crate::should_compact(tokens, window, &settings)
                     );
@@ -341,7 +341,7 @@ mod threshold_tests {
                 };
                 assert!(
                     !policy
-                        .decide_automatic(&root, 0, window, window, &disabled)
+                        .decide_automatic(&root, 0, window, window, 0, &disabled)
                         .should_fold
                 );
             }
@@ -364,14 +364,14 @@ mod threshold_tests {
         };
         assert_eq!(
             policy
-                .decide_automatic(&root, 2000, 60_000, 100_000, &settings)
+                .decide_automatic(&root, 2000, 60_000, 100_000, 1, &settings)
                 .reason,
             Some(FoldReason::DeltaTokens)
         );
         root.updates_since_fold = 3;
         assert_eq!(
             policy
-                .decide_automatic(&root, 0, 60_000, 100_000, &settings)
+                .decide_automatic(&root, 0, 60_000, 100_000, 1, &settings)
                 .reason,
             Some(FoldReason::DeltaDepth)
         );
@@ -381,14 +381,14 @@ mod threshold_tests {
         };
         assert_eq!(
             policy
-                .decide_automatic(&root, 0, 80_000, 100_000, &defaults)
+                .decide_automatic(&root, 0, 80_000, 100_000, 0, &defaults)
                 .reason,
             Some(FoldReason::WindowPressure)
         );
     }
 
     #[test]
-    fn maintenance_folds_wait_for_window_fill_so_the_provider_cache_stays_warm() {
+    fn maintenance_folds_wait_until_unfolded_events_leave_the_hot_window() {
         let policy = ContextFoldPolicy {
             max_delta_pages: 3,
             max_delta_tokens: 2000,
@@ -409,17 +409,17 @@ mod threshold_tests {
                 threshold,
                 ..settings
             };
-            // Depth and token triggers are both met, but the window is nearly empty.
-            let early = policy.decide_automatic(&root, 5000, 3000, 100_000, &settings);
-            assert!(!early.should_fold, "{threshold:?}: {early:?}");
-            let filled = policy.decide_automatic(&root, 5000, 50_000, 100_000, &settings);
-            assert!(filled.should_fold, "{threshold:?}: {filled:?}");
+            // Depth and token triggers are met, but the model still sees every
+            // event verbatim: a fold would only rotate the cache.
+            for compiled in [3000, 50_000] {
+                let held = policy.decide_automatic(&root, 5000, compiled, 100_000, 0, &settings);
+                assert!(!held.should_fold, "{threshold:?}: {held:?}");
+            }
+            let evicted = policy.decide_automatic(&root, 5000, 3000, 100_000, 400, &settings);
+            assert!(evicted.should_fold, "{threshold:?}: {evicted:?}");
+            // Real pressure never waits for an eviction.
+            let pressure = policy.decide_automatic(&root, 0, 95_000, 100_000, 0, &settings);
+            assert_eq!(pressure.reason, Some(FoldReason::WindowPressure));
         }
-        // Unknown window keeps the structural triggers.
-        assert!(
-            policy
-                .decide_automatic(&root, 0, 3000, 0, &settings)
-                .should_fold
-        );
     }
 }

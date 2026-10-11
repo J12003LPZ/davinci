@@ -113,11 +113,16 @@ impl ContextVmRuntime {
 
     /// Retained event text only; excludes small source metadata and page cache.
     pub fn resident_source_bytes(&self) -> usize {
-        self.source_contents
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(String::len)
+        [&self.source_contents, &self.retained_sources]
+            .iter()
+            .map(|sources| {
+                sources
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .map(String::len)
+                    .sum::<usize>()
+            })
             .sum()
     }
 
@@ -138,7 +143,15 @@ impl ContextVmRuntime {
                 .ok_or("unknown context source_ref")?;
             return self.session_source_text(&binding, id, &expected);
         }
-        self.source_contents
+        if let Some(text) = self
+            .source_contents
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source_ref)
+        {
+            return Ok(text.clone());
+        }
+        self.retained_sources
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(source_ref)

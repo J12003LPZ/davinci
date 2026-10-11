@@ -4701,6 +4701,38 @@ fn wor20_failed_compaction_checkpoint_keeps_live_history() {
 }
 
 #[test]
+fn hybrid_compaction_whose_ledger_cannot_follow_keeps_live_history() {
+    use std::sync::atomic::Ordering;
+    let mut agent = Agent::new("You are a coding agent.");
+    agent.set_runtime(crate::RuntimeHandle::new(
+        crate::RunId::new(),
+        crate::AgentId::new(),
+        crate::RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+    for turn in 0..6 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(4_000)));
+        agent.record_assistant("ok");
+    }
+    let before = agent.messages.clone();
+    let prepared = agent.hybrid_compaction(None, 0);
+    assert!(prepared.compacted, "{}", prepared.summary);
+    let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
+    let root = vm.root();
+    let resident = vm.resident_source_bytes();
+
+    vm.store.fail_saves.store(true, Ordering::SeqCst);
+    let result = agent.commit_compaction(prepared);
+    vm.store.fail_saves.store(false, Ordering::SeqCst);
+
+    assert!(!result.compacted, "unrebased compaction reported success");
+    assert!(result.summary.contains("not applied"), "{}", result.summary);
+    assert_eq!(agent.messages, before);
+    assert_eq!(vm.root(), root);
+    assert_eq!(vm.resident_source_bytes(), resident);
+}
+
+#[test]
 fn wor32_abandoned_branch_summary_does_not_seed_the_active_branch() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = legacy_compaction_agent(dir.path());

@@ -1,11 +1,120 @@
 # Context VM and graph hardening measurements
 
+## October 10, 2026: hybrid mode
+
+Same scripted session and fixture summarizer as below, run to 300 turns so
+the off and hybrid modes compact more than once (128k window, threshold at
+the window less the 16k reserve). Replies report the request at four bytes a
+token as their provider count. Structural and offline, as below.
+
+| Mode, 300 turns | Compactions | Summarizer calls / bytes | Non-prefix bytes | Prefix reuse | Requirement checks kept |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Off | 2 | 4 / 516,278 | 1,222,076 | 98.4% | 394/883 |
+| Active (fold policy below) | 25 | 25 / 919,565 | 8,791,022 | 61.2% | 883/883 |
+| Hybrid | 2 | 2 / 246,468 | 1,242,851 | 98.3% | 883/883 |
+| Hybrid, no summarizer | 2 | 0 / 0 | 1,242,851 | 98.3% | 883/883 |
+
+At 60 turns, before any compaction, hybrid requests are byte-identical to
+off. Hybrid's extra 1.7% of non-prefix bytes is the larger ledger summary
+after each compaction. Off's requirement loss starts at its first compaction
+because the fixture summary is generic: it shows that off depends entirely on
+the summarizer, not how a real model summarizes. Hybrid's ledger keeps the
+requirements with a summarizer that adds nothing, or none.
+
+Found on the way: a fold in a session wrote a `context_checkpoint` entry type
+that the session codec rejects, so a session with a fold could not be
+reopened. Fold records are now `custom` entries with that `customType`; the
+bare type is still read in memory.
+
+## October 10, 2026: fold policy and cache-stable image
+
+Baseline: `6e5e81c` (main). Codex source read at `openai/codex@de8fab6`.
+Offline and structural only: no provider was called, so no cache hit, billed
+token, latency or task-success claim is made here.
+
+### Codex and DaVinci compaction, from source
+
+| | Codex (`codex-rs/core`) | DaVinci active VM (baseline) |
+| --- | --- | --- |
+| Model-visible history | Append-only items, reasoning items included, until compaction | Checkpoint + delta pages + a sliding hot window of recent events; older assistant/tool events rendered as wrapped text |
+| Trigger | Provider-reported `last_token_usage.total_tokens` plus a bytes/4 estimate of newer items, against `auto_compact_token_limit` and the effective window (`session/context_window.rs`) | Byte ceiling (about a token per byte) against an 80% pressure trigger, plus delta-depth/delta-token maintenance once the ceiling passed 50% |
+| Local compaction | Same conversation prefix plus the compaction prompt; new history is initial context, up to 20k tokens of recent user messages verbatim, and the summary (`compact.rs`) | Separate structured-JSON prompt over every event; validated `CheckpointProposal`; deterministic fallback |
+| Native/remote compaction | Normal `/responses` stream with a `CompactionTrigger` input item; exactly one opaque `compaction` output item is kept with up to 64k tokens of retained messages (`compact_remote_v2*.rs`) | Not implemented; the recorded ChatGPT-backend probe rejected standalone `/responses/compact`; remote v2 is unprobed |
+| Requirement retention | Recent user messages verbatim, newest first | Deterministic goals: 480-byte head of each user message, first + 15 newest |
+| Exact recovery | None | `retrieve_context` by page or source ref |
+
+### Defects found
+
+1. Fold pressure was the admission ceiling (about 1 token per byte) compared
+   with a threshold the off mode applies to bytes/4. The same 20-turn history
+   read 79,332 tokens active and 16,589 off.
+2. The hot window slid one event per turn and the delta sat before it, so
+   almost no request repeated the previous one's input prefix.
+3. A budget-bound image dropped one old event per turn: the same churn.
+4. Each fold re-sent every event to the summarizer, in a prompt that shares no
+   prefix with ordinary requests.
+5. Deterministic goals kept a 480-byte head: a requirement later in a long
+   paste was lost once its event left the window. Tool evidence lost its
+   trailing test verdict.
+6. Without a summarizer, maintenance folds only rotated the cache epoch.
+
+### Scripted session (`tests/context_vm_efficiency.rs`)
+
+60 turns, 128k window, about 3.5 KB of tool output per turn, three
+requirements (one inside a 5 KB paste, one correction). Each request goes
+through `run_loop` and `messages_for_provider()` and is serialized as OpenAI
+Responses input. "Non-prefix bytes" are request bytes after the longest
+common prefix with the previous request: an upper bound on what a prefix
+cache could not reuse, not a measured cache miss. The summarizer is a fixture
+that proposes nothing new, so retention rests on the deterministic state.
+
+| Mode | Folds | Summarizer prompt bytes | Request bytes | Non-prefix bytes | Prefix reuse | Requirement checks kept |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Off | 0 | 0 | 6,629,364 | 213,539 | 96.8% | 163/163 |
+| Active, baseline | 43 | 3,540,159 | 5,168,814 | 5,098,479 | 1.4% | 110/163 |
+| Active, this change | 3 | 148,342 | 3,639,547 | 690,404 | 81.0% | 163/163 |
+| Active, baseline, no summarizer | 43 | 0 | 5,168,814 | 5,098,479 | 1.4% | 110/163 |
+| Active, this change, no summarizer | 0 | 0 | 3,488,088 | 555,331 | 84.1% | 163/163 |
+
+Active mode still re-sends about 7.6 KB per steady turn against about 3.5 KB
+off, because the previous native tool exchange is re-rendered as wrapped
+evidence once it leaves the live suffix. Off mode never compacted in this
+fixture; a session long enough to compact would change its column. Both
+summarizer columns are fixtures, not model fold quality.
+
+Regression tests that fail on the baseline: `tests/context_vm_fold_policy.rs`
+(five) and the hot-window and budget-restart tests in
+`runtime/context_vm/mod.rs`. Reducer ledger tests cover the excerpt and goal
+eviction rules.
+
+### Not changed, and why
+
+- Admission still uses the byte ceiling. DaVinci has no context-overflow
+  recovery path, so a calibrated (smaller) admission estimate could dispatch
+  an over-window request. Calibrate from provider-reported input tokens only
+  together with an overflow retry.
+- Prepared-context revisions still hash history on every warm lookup (a few
+  times per request; 1.7-4.9 ms at 100-300 turns in the September 19 table).
+  Removing them needs proof that nothing mutates the public fields between
+  lookups; the measured cost does not justify a new invalidation scheme.
+- Remote compaction stays off: the typed remote-v2 shape is unprobed on the
+  ChatGPT backend and no authenticated call was authorized.
+
+### Remaining gates
+
+Live matched runs against Codex (same model, effort, fixtures and checks),
+provider-reported cached/uncached input, real summarizer fold quality,
+latency, and native reasoning continuity in active mode (historical
+assistant reasoning is not replayed there). The default stays off.
+
+## September 19, 2026: hardening measurements
+
 Measured on this Windows host in an optimized release build, September 19, 2026.
 Baseline source: main 1106b1be2bffa1fb7de6e8c0708cc59d1ca2e576.
 These are deterministic local fixtures. No live API calls, paid model
 evals, cross-platform CI run or terminal transport measurements are implied.
 
-## Context preparation: 16 paired samples per history size
+### Context preparation: 16 paired samples per history size
 
 Each turn contains a user request, about 8.4 KB of tool evidence and an assistant
 message. The authoritative history is JSONL-backed. A cold call invalidates the
@@ -27,7 +136,7 @@ pages still consume memory. Token ceilings use the same conservative accounting
 basis on both sides; they are not billed/tokenizer counts. Warm revision hashing
 still scans history bytes. Sixteen samples provide only coarse tail estimates.
 
-## Graph: 32 samples per size
+### Graph: 32 samples per size
 
 The synthetic DAG has sequential, seven-node-back and half-index dependencies.
 Rendering, navigation and hit testing use graph functions directly; the key
@@ -48,7 +157,11 @@ terminal transport, slower hardware and other DAG shapes can cost more. Memory
 is an owned-layout estimate, not total allocations or RSS. Zero-microsecond
 hit-test samples mean below the measurement resolution.
 
-## Reproduction
+### Reproduction
+
+The October 10 scripted session runs in a debug build with
+`cargo test -p davinci-agent --test context_vm_efficiency -- --ignored --nocapture`
+(`TRACE_LCP=1` prints per-turn bytes). For the September 19 runs:
 
 Run the following from the repository root with RTK installed. These are the
 commands used for this run. Offline mode needs cached Cargo dependencies. These two ignored tests emit JSON and assert their invariants.
@@ -58,7 +171,7 @@ rtk proxy cargo test -p davinci-agent --release --test context_vm_performance --
 rtk proxy cargo test -p davinci-tui --release --lib graph_dag_performance --offline --locked -- --ignored --nocapture
 ```
 
-## Correctness and delivery verification
+### Correctness and delivery verification
 
 The workspace test run covered 88 suites: 4,727 passed, one failed and 38 were
 ignored. The sole failure was an ample-budget cache-affinity fixture whose

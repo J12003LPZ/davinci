@@ -404,7 +404,7 @@ fn wor61_failed_checkpoint_persistence_rolls_the_fold_back() {
         .unwrap()
         .entries
         .iter()
-        .all(|entry| entry.entry_type != "context_checkpoint"));
+        .all(|entry| !davinci_agent::runtime::context_vm::is_context_checkpoint_entry(entry)));
 
     // A process that reloads the session sees the same state.
     let reloaded = active_agent_on(&path);

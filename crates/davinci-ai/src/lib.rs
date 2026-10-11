@@ -205,7 +205,7 @@ pub use responses_tools::{
     set_wire_kind, ResolvedResponsesTools, ResponsesToolWireKind, APPLY_PATCH_ROLLOUT_ENV,
     DROPPED_TOOL_CALLS_KEY, RESPONSES_TOOL_WIRE_KINDS_KEY, RESPONSES_TOOL_WIRE_KIND_KEY,
 };
-pub use retry::{is_retryable_assistant_error, is_retryable_error_text};
+pub use retry::{is_context_overflow_text, is_retryable_assistant_error, is_retryable_error_text};
 pub use shell::{
     command_timeout_from_env, execute_config_command, is_legacy_wsl_bash_path,
     resolve_shell_config, CommandTransport, ResolveCommandOptions, ShellConfig,

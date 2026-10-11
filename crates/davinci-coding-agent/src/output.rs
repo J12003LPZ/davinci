@@ -269,6 +269,7 @@ impl ContextVmStatusSummary {
             davinci_agent::runtime::ContextVmMode::Off => "off",
             davinci_agent::runtime::ContextVmMode::Shadow => "shadow",
             davinci_agent::runtime::ContextVmMode::Active => "active",
+            davinci_agent::runtime::ContextVmMode::Hybrid => "hybrid",
         }
         .to_string();
         let Some(runtime) = agent.runtime.as_ref() else {

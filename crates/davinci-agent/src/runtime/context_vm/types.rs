@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 pub enum ContextVmMode {
     Off,
     Shadow,
+    /// The provider sees the compiled image: checkpoint, hot window, state.
     Active,
+    /// The provider sees the off-mode transcript, append-only with native
+    /// items; the VM keeps the task ledger and supplies it at compaction.
+    Hybrid,
 }
 
 impl ContextVmMode {
@@ -15,6 +19,7 @@ impl ContextVmMode {
         match value {
             Some("shadow") => Self::Shadow,
             Some("active") => Self::Active,
+            Some("hybrid") => Self::Hybrid,
             _ => Self::Off,
         }
     }
@@ -116,6 +121,11 @@ pub struct ContextRoot {
     pub evidence_refs: Vec<String>,
     #[serde(default)]
     pub updates_since_fold: usize,
+    /// Newest event seq a fold has seen. Events after it have reached only the
+    /// deterministic state; a later fold summarizes just those. Zero (a fresh
+    /// or rebuilt root) means nothing has been folded.
+    #[serde(default)]
+    pub folded_through_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

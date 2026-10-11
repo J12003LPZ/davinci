@@ -106,8 +106,12 @@ pub(super) fn event_from_message(
     if visible_text.is_empty() && images.is_empty() {
         return None;
     }
+    // A compaction or branch summary rides in a user message, but its words
+    // are the summarizer's: never a user requirement.
+    let summary = visible_text.starts_with(crate::COMPACTION_SUMMARY_PREFIX)
+        || visible_text.starts_with(crate::BRANCH_SUMMARY_PREFIX);
     let (kind, provenance_kind) = match message.role.as_str() {
-        "user" => (ContextEventKind::User, ProvenanceKind::UserDecision),
+        "user" if !summary => (ContextEventKind::User, ProvenanceKind::UserDecision),
         "assistant" => (ContextEventKind::Assistant, ProvenanceKind::AgentInference),
         "toolResult" | "tool_result" => {
             (ContextEventKind::ToolResult, ProvenanceKind::ToolEvidence)

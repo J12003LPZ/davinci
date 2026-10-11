@@ -325,11 +325,16 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 id: "context-vm".into(),
                 label: "Context VM".into(),
                 description: Some(
-                    "How provider context is built: off (legacy message history), shadow (compile alongside and compare, send legacy), or active (send the Context VM projection). Applies from the next prompt. DAVINCI_CONTEXT_VM overrides it"
+                    "How provider context is built: off (legacy message history), shadow (compile alongside and compare, send legacy), active (send the Context VM projection), or hybrid (send legacy history; compact it with the Context VM task ledger). Applies from the next prompt. DAVINCI_CONTEXT_VM overrides it"
                         .into(),
                 ),
                 current_value: config.context_vm.clone(),
-                values: vec!["off".into(), "shadow".into(), "active".into()],
+                values: vec![
+                    "off".into(),
+                    "shadow".into(),
+                    "active".into(),
+                    "hybrid".into(),
+                ],
             },
             bool_item(
                 "plan-usage",
@@ -685,7 +690,7 @@ mod tests {
             .expect("context-vm");
         assert_eq!(item.label, "Context VM");
         assert_eq!(item.current_value, "off");
-        assert_eq!(item.values, vec!["off", "shadow", "active"]);
+        assert_eq!(item.values, vec!["off", "shadow", "active", "hybrid"]);
         let active = interactive_settings_list(&InteractiveSettingsConfig {
             context_vm: "active".into(),
             ..InteractiveSettingsConfig::default()
