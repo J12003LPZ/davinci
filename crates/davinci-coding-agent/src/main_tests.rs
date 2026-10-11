@@ -4721,6 +4721,7 @@ fn config_context_vm_row_persists_and_switches_the_live_agent() {
     for (value, mode) in [
         ("shadow", ContextVmMode::Shadow),
         ("active", ContextVmMode::Active),
+        ("hybrid", ContextVmMode::Hybrid),
         ("off", ContextVmMode::Off),
     ] {
         super::persist_interactive_setting(&format!("context-vm={value}")).unwrap();
@@ -4730,7 +4731,7 @@ fn config_context_vm_row_persists_and_switches_the_live_agent() {
     }
 
     let error = super::persist_interactive_setting("context-vm=turbo").unwrap_err();
-    assert!(error.contains("off, shadow or active"), "{error}");
+    assert!(error.contains("off, shadow, active or hybrid"), "{error}");
     assert_eq!(
         saved()["contextVm"],
         "off",
