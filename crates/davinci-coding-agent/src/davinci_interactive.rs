@@ -6293,6 +6293,7 @@ fn extension_rows(
             },
             detail: row.detail,
             note: row.note,
+            group: row.group,
             can_update: row.can_update,
             can_toggle: row.can_toggle,
             can_approve: row.can_approve,
@@ -6342,6 +6343,9 @@ fn open_extensions_sheet(
         selected: previous.selected,
         armed: if keep_armed { previous.armed } else { None },
         notice,
+        flipped: previous.flipped,
+        filter: previous.filter,
+        filtering: previous.filtering,
     });
     if !reopening {
         open_sheet(model, Screen::Extensions);
