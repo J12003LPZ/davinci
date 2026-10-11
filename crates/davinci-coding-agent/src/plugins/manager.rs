@@ -34,6 +34,8 @@ pub struct ManagedRow {
     pub health: Health,
     pub detail: String,
     pub note: Option<String>,
+    /// What the row is filed under in a long list (a skill's plugin or source).
+    pub group: String,
     pub can_update: bool,
     pub can_toggle: bool,
     pub can_approve: bool,
@@ -228,6 +230,7 @@ pub fn skill_rows(
             if let Some((plugin, _)) = plugin_roots.iter().find(|(_, root)| path.starts_with(root))
             {
                 row.status = "plugin".into();
+                row.group = plugin.clone();
                 row.note = Some(format!(
                     "From plugin {plugin}. Manage it in the Plugins tab."
                 ));
@@ -236,6 +239,12 @@ pub fn skill_rows(
                     "user"
                 } else {
                     "project"
+                }
+                .into();
+                row.group = if row.status == "user" {
+                    "Your skills"
+                } else {
+                    "This project"
                 }
                 .into();
                 let target = skill_target(&skill.path, removable_roots);
@@ -255,6 +264,7 @@ pub fn skill_rows(
                 }
             } else {
                 row.status = "other".into();
+                row.group = "Added by settings or packages".into();
                 row.note = Some(format!(
                     "{} (added by a setting or package; remove it there)",
                     skill.path.display()
@@ -263,7 +273,20 @@ pub fn skill_rows(
             row
         })
         .collect();
-    rows.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    // Your own skills first, then each plugin's, so a big plugin sits below
+    // them instead of burying them.
+    rows.sort_by_key(|row| {
+        (
+            match row.status.as_str() {
+                "user" => 0,
+                "project" => 1,
+                "other" => 2,
+                _ => 3,
+            },
+            row.group.to_lowercase(),
+            row.title.to_lowercase(),
+        )
+    });
     rows
 }
 
@@ -671,6 +694,10 @@ mod tests {
         let by = |name: &str| rows.iter().find(|row| row.title == name).unwrap().clone();
         assert!(by("mine").can_delete);
         assert_eq!(by("mine").status, "user");
+        // Filed by source, your own first: a long plugin list cannot bury them.
+        assert_eq!(by("mine").group, "Your skills");
+        assert_eq!(by("other").group, "Added by settings or packages");
+        assert_eq!(rows[0].title, "mine");
         assert!(!by("other").can_delete);
         assert!(skill_action(&skills, &agent_dir, &roots, "delete", &by("other").key).is_err());
         assert!(extra.exists());

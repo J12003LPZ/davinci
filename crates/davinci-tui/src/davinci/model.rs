@@ -1860,6 +1860,9 @@ pub struct ExtensionRow {
     pub detail: String,
     /// A warning, an error or who manages the row.
     pub note: Option<String>,
+    /// What the row is filed under (a plugin key, `Your skills`). A tab whose
+    /// rows carry one draws a collapsible heading per group; empty means none.
+    pub group: String,
     pub can_update: bool,
     pub can_toggle: bool,
     pub can_approve: bool,
@@ -1888,7 +1891,31 @@ pub struct ExtensionsSheet {
     pub armed: Option<(String, &'static str)>,
     /// The outcome of the last action.
     pub notice: Option<String>,
+    /// Groups the user flipped from their default (`tab position`, name).
+    pub flipped: std::collections::BTreeSet<(usize, String)>,
+    /// What the Installed list is narrowed to; `filtering` while it is typed.
+    pub filter: String,
+    pub filtering: bool,
 }
+
+/// One line of the Installed list: a group heading or a row (an index into
+/// the tab's rows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionEntry {
+    Group {
+        name: String,
+        /// Rows in the group that the filter lets through.
+        shown: usize,
+        /// Rows in the group.
+        total: usize,
+        open: bool,
+    },
+    Row(usize),
+}
+
+/// A group with this many rows or fewer starts open unless it comes from a
+/// plugin; the rest start folded, so one big plugin cannot bury the others.
+const OPEN_GROUP_ROWS: usize = 8;
 
 impl ExtensionsSheet {
     pub fn rows(&self, tab: ExtensionTab) -> &[ExtensionRow] {
@@ -1903,9 +1930,88 @@ impl ExtensionsSheet {
         self.rows(self.tab)
     }
 
-    /// The selection of the open tab, kept inside its rows.
+    fn group_of(row: &ExtensionRow) -> &str {
+        if row.group.is_empty() {
+            "Other"
+        } else {
+            &row.group
+        }
+    }
+
+    /// Whether `group` of `tab` is open: its default, unless flipped. A
+    /// filter opens every group it leaves rows in.
+    pub fn group_open(&self, tab: ExtensionTab, group: &str) -> bool {
+        if !self.filter.trim().is_empty() {
+            return true;
+        }
+        let members: Vec<&ExtensionRow> = self
+            .rows(tab)
+            .iter()
+            .filter(|row| Self::group_of(row) == group)
+            .collect();
+        let by_default =
+            members.len() <= OPEN_GROUP_ROWS || members.iter().any(|row| row.status != "plugin");
+        by_default != self.flipped.contains(&(tab.position(), group.to_string()))
+    }
+
+    /// The rows of `tab` the filter lets through, as indexes into them.
+    pub fn matching(&self, tab: ExtensionTab) -> Vec<usize> {
+        let rows = self.rows(tab);
+        let needle = self.filter.trim().to_lowercase();
+        (0..rows.len())
+            .filter(|&at| {
+                let row = &rows[at];
+                needle.is_empty()
+                    || [&row.title, &row.detail, &row.group]
+                        .iter()
+                        .any(|text| text.to_lowercase().contains(&needle))
+            })
+            .collect()
+    }
+
+    /// What the Installed list draws, top to bottom: the rows the filter lets
+    /// through, under a heading per group when the tab has groups. Rows of a
+    /// folded group are left out. Groups keep the order the host listed them.
+    pub fn entries(&self, tab: ExtensionTab) -> Vec<ExtensionEntry> {
+        let rows = self.rows(tab);
+        let hits = self.matching(tab);
+        if rows.iter().all(|row| row.group.is_empty()) {
+            return hits.into_iter().map(ExtensionEntry::Row).collect();
+        }
+        let mut order: Vec<&str> = Vec::new();
+        for &at in &hits {
+            let name = Self::group_of(&rows[at]);
+            if !order.contains(&name) {
+                order.push(name);
+            }
+        }
+        let mut out = Vec::new();
+        for name in order {
+            let open = self.group_open(tab, name);
+            let shown: Vec<usize> = hits
+                .iter()
+                .copied()
+                .filter(|&at| Self::group_of(&rows[at]) == name)
+                .collect();
+            out.push(ExtensionEntry::Group {
+                name: name.to_string(),
+                shown: shown.len(),
+                total: rows
+                    .iter()
+                    .filter(|row| Self::group_of(row) == name)
+                    .count(),
+                open,
+            });
+            if open {
+                out.extend(shown.into_iter().map(ExtensionEntry::Row));
+            }
+        }
+        out
+    }
+
+    /// The selection of the open tab, kept inside its entries.
     pub fn index(&self) -> usize {
-        let len = self.current_rows().len();
+        let len = self.entries(self.tab).len();
         if len == 0 {
             0
         } else {
@@ -1913,13 +2019,43 @@ impl ExtensionsSheet {
         }
     }
 
+    pub fn current_entry(&self) -> Option<ExtensionEntry> {
+        self.entries(self.tab).into_iter().nth(self.index())
+    }
+
+    /// The selected row; `None` on a group heading or an empty list.
     pub fn current(&self) -> Option<&ExtensionRow> {
-        self.current_rows().get(self.index())
+        match self.current_entry()? {
+            ExtensionEntry::Row(at) => self.current_rows().get(at),
+            ExtensionEntry::Group { .. } => None,
+        }
+    }
+
+    /// Fold or unfold the group under the selection (or the selected row's).
+    pub fn toggle_group(&mut self) -> bool {
+        let name = match self.current_entry() {
+            Some(ExtensionEntry::Group { name, .. }) => name,
+            Some(ExtensionEntry::Row(at)) => Self::group_of(&self.current_rows()[at]).to_string(),
+            None => return false,
+        };
+        let key = (self.tab.position(), name);
+        if !self.flipped.remove(&key) {
+            self.flipped.insert(key);
+        }
+        self.armed = None;
+        true
+    }
+
+    /// Change the filter and start from the top of what it leaves.
+    pub fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.selected[self.tab.position()] = 0;
+        self.armed = None;
     }
 
     /// One step wraps around; a page stops at the first or last row.
     pub fn move_selection(&mut self, delta: isize) {
-        let len = self.current_rows().len();
+        let len = self.entries(self.tab).len();
         if len == 0 {
             return;
         }
