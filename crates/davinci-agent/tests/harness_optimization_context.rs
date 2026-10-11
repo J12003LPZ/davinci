@@ -51,6 +51,8 @@ fn root_budget_shapes_provider_view_without_dropping_authority() {
 fn scoped_context_files_follow_target_ancestors() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
+    // Instructions are read only inside a checkout.
+    fs::create_dir(root.join(".git")).unwrap();
     fs::write(root.join("AGENTS.md"), "root authority").unwrap();
     fs::create_dir_all(root.join("crates/a/src")).unwrap();
     fs::create_dir_all(root.join("crates/b/src")).unwrap();
@@ -83,10 +85,18 @@ fn active_context_vm_reuses_repository_and_ephemeral_context_items() {
     agent.set_context_vm_mode(ContextVmMode::Active);
 
     let image = agent.context_vm_image().unwrap();
-    assert!(image
+    // Repository instructions go to the provider once, in the system prompt.
+    // The image once carried a second copy: every request paid for it twice.
+    assert!(agent
+        .provider_system_prompt()
+        .contains("repository authority"));
+    assert!(!image
         .entries
         .iter()
         .any(|entry| entry.source_ref == "file::AGENTS.md"));
+    assert!(!image.messages.iter().any(|message| {
+        davinci_ai::content_text(&message.content).contains("repository authority")
+    }));
     assert!(image
         .entries
         .iter()

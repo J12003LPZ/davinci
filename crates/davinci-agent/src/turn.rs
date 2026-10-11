@@ -497,15 +497,19 @@ impl Agent {
                     if let Err(error) = runtime.context_vm.append_delta(&events) {
                         runtime.context_vm.record_failure("append_delta", error);
                     }
-                    evicted_unfolded = runtime.context_vm.evicted_unfolded_tokens(&events);
                 }
-                match self.prepared_context_image() {
+                let tokens = match self.prepared_context_image() {
                     Ok(image) => self.context_vm_estimated_provider_tokens(&image),
                     Err(error) => {
                         over_budget = error == crate::runtime::context_vm::CONTEXT_BUDGET_EXCEEDED;
                         self.estimated_context_tokens()
                     }
+                };
+                // After the compile, which can move the hot window.
+                if let Some(runtime) = &self.runtime {
+                    evicted_unfolded = runtime.context_vm.evicted_unfolded_tokens(&events);
                 }
+                tokens
             } else if hybrid_context_vm {
                 // The ledger follows every turn at no provider cost; the
                 // provider's own count decides when to compact.
@@ -525,7 +529,14 @@ impl Agent {
                 let decision = self.runtime.as_ref().map(|runtime| {
                     // The hard limit outranks every economic rule: a fold is
                     // the one recovery before the request is blocked.
-                    if over_budget {
+                    //
+                    // Events left the image that no fold has seen: the model
+                    // now has only their deterministic state. A fold gives it
+                    // their summary on this turn. The window advance that
+                    // dropped them already changed the provider prefix, so the
+                    // fold costs no cached prefix of its own.
+                    let dropped_unfolded = evicted_unfolded > 0 && self.summarizer.is_some();
+                    if over_budget || dropped_unfolded {
                         return crate::runtime::context_vm::ContextFoldDecision {
                             should_fold: true,
                             reason: Some(crate::runtime::context_vm::FoldReason::WindowPressure),

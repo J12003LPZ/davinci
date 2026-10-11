@@ -590,7 +590,7 @@ davinci --approve
 davinci --no-approve
 ~~~
 
-AGENTS.md and CLAUDE.md can be loaded as repository context. Disable context-file discovery with:
+AGENTS.md is loaded as repository context, only inside a git checkout: from the repository root down to the working directory and, for files being edited, each directory between the working directory and the file. A session started outside a checkout (a home or Desktop folder) loads none. CLAUDE.md is not read: it holds Claude Code's instructions. Disable context-file discovery with:
 
 ~~~bash
 davinci --no-context-files

@@ -138,11 +138,14 @@ checkpoint at the head of the image and not fully backed by hot events it
 carries verbatim. It is omitted when empty. Admission still reserves the whole
 delta page, which stays retrievable by id.
 
-Automatic delta-depth and delta-token folds wait until events have left the
-hot window without a fold seeing them (`evicted_unfolded_tokens`), and are
-skipped without a summarizer: before that the model sees every event, and a
-deterministic fold only rotates the cache epoch. Window pressure, the hard
-admission limit, phase boundaries and manual folds are not held back.
+With a summarizer, a fold runs on the turn events leave the image without a
+fold seeing them (`evicted_unfolded_tokens`): the model would otherwise keep
+only their deterministic state, and the window advance that dropped them has
+already changed the provider prefix. Automatic delta-depth and delta-token
+folds wait for that and are skipped without a summarizer: before it the model
+sees every event, and a deterministic fold only rotates the cache epoch.
+Window pressure, the hard admission limit, phase boundaries and manual folds
+are not held back.
 
 ## Prepared images and storage
 

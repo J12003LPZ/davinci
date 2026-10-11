@@ -57,6 +57,9 @@ pub(crate) fn append_repository_context(prompt: &mut String, files: &[ContextFil
         .any(|file| file.path.strip_prefix(cwd).is_err())
         .then(|| fs::canonicalize(cwd).ok())
         .flatten();
+    // A file above `cwd` (the repository root's, in a subdirectory session)
+    // is named from the root, so it never reads as `cwd`'s own.
+    let repository = canonical_cwd.as_ref().and_then(|_| repository_root(cwd));
     let mut unique_bodies: Vec<(&str, Vec<String>)> = Vec::new();
     for file in files {
         // Preserve nested instruction scope without making the checkout root
@@ -72,6 +75,13 @@ pub(crate) fn append_repository_context(prompt: &mut String, files: &[ContextFil
             })
             .filter(|path| !path.as_os_str().is_empty())
             .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .or_else(|| {
+                let relative = file.path.strip_prefix(repository.as_ref()?).ok()?;
+                Some(format!(
+                    "<repository root>/{}",
+                    relative.to_string_lossy().replace('\\', "/")
+                ))
+            })
             .unwrap_or_else(|| file.name.clone());
         if let Some((_, paths)) = unique_bodies
             .iter_mut()
@@ -206,22 +216,55 @@ impl RootContextAccount {
     }
 }
 
+/// The repository instruction file davinci reads. `CLAUDE.md` is Claude
+/// Code's: its rules name Claude Code's own tools and rituals, and a large one
+/// cost every request thousands of tokens davinci could not act on.
+pub const INSTRUCTION_FILE: &str = "AGENTS.md";
+
+/// The checkout `cwd` is in: the nearest directory, `cwd` included, holding a
+/// `.git` entry (a directory, or a file in a linked worktree or submodule).
+/// `None` outside any repository.
+pub fn repository_root(cwd: &Path) -> Option<PathBuf> {
+    let cwd = fs::canonicalize(cwd).ok()?;
+    cwd.ancestors()
+        .find(|directory| directory.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// `AGENTS.md` from the repository root down to `cwd`, outermost first, so a
+/// nested file reads after the rules it refines. Outside a repository there
+/// is no codebase to describe and nothing is loaded: a session started in a
+/// home or Desktop folder must not pick up whatever instructions sit there.
 pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
     if !enabled {
         return Vec::new();
     }
-    let mut files = Vec::new();
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        let path = cwd.join(name);
-        if let Ok(body) = fs::read_to_string(&path) {
-            files.push(ContextFile {
+    let (Some(root), Ok(canonical)) = (repository_root(cwd), fs::canonicalize(cwd)) else {
+        return Vec::new();
+    };
+    let mut directories = canonical
+        .ancestors()
+        .take_while(|directory| directory.starts_with(&root))
+        .collect::<Vec<_>>();
+    directories.reverse();
+    directories
+        .into_iter()
+        .filter_map(|directory| {
+            // `cwd`'s own file keeps the path the caller gave, so it is
+            // labelled relative to `cwd` exactly as before.
+            let path = if directory == canonical {
+                cwd.join(INSTRUCTION_FILE)
+            } else {
+                directory.join(INSTRUCTION_FILE)
+            };
+            let body = fs::read_to_string(&path).ok()?;
+            Some(ContextFile {
                 path,
-                name: name.to_string(),
+                name: INSTRUCTION_FILE.to_string(),
                 body,
-            });
-        }
-    }
-    files
+            })
+        })
+        .collect()
 }
 
 pub fn load_context_files_for_targets(
@@ -229,7 +272,7 @@ pub fn load_context_files_for_targets(
     enabled: bool,
     targets: &[PathBuf],
 ) -> Vec<ContextFile> {
-    if !enabled {
+    if !enabled || repository_root(cwd).is_none() {
         return Vec::new();
     }
 
@@ -262,22 +305,20 @@ pub fn load_context_files_for_targets(
             .collect::<Vec<_>>();
         ancestors.reverse();
         for directory in ancestors {
-            for name in ["AGENTS.md", "CLAUDE.md"] {
-                let path = directory.join(name);
-                if !path.is_file() {
-                    continue;
-                }
-                let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                if !seen.insert(identity) {
-                    continue;
-                }
-                if let Ok(body) = fs::read_to_string(&path) {
-                    files.push(ContextFile {
-                        path,
-                        name: name.to_string(),
-                        body,
-                    });
-                }
+            let path = directory.join(INSTRUCTION_FILE);
+            if !path.is_file() {
+                continue;
+            }
+            let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !seen.insert(identity) {
+                continue;
+            }
+            if let Ok(body) = fs::read_to_string(&path) {
+                files.push(ContextFile {
+                    path,
+                    name: INSTRUCTION_FILE.to_string(),
+                    body,
+                });
             }
         }
     }
@@ -366,6 +407,85 @@ mod tests {
     }
 
     #[test]
+    fn only_agents_md_is_read_at_the_root_and_beside_targets() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("AGENTS.md"), "davinci rules").unwrap();
+        fs::write(root.path().join("CLAUDE.md"), "claude code rules").unwrap();
+        fs::write(root.path().join("src/CLAUDE.md"), "nested claude rules").unwrap();
+        fs::write(root.path().join("src/file.rs"), "").unwrap();
+
+        let files =
+            load_context_files_for_targets(root.path(), true, &[PathBuf::from("src/file.rs")]);
+        let bodies: Vec<&str> = files.iter().map(|file| file.body.as_str()).collect();
+        assert_eq!(bodies, ["davinci rules"]);
+
+        // A directory with CLAUDE.md alone gives davinci no instructions.
+        fs::remove_file(root.path().join("AGENTS.md")).unwrap();
+        assert!(load_context_files(root.path(), true).is_empty());
+    }
+
+    /// A session started in a folder that is no checkout (a home or Desktop
+    /// folder) loads no instructions, even when an AGENTS.md sits there.
+    #[test]
+    fn nothing_is_loaded_outside_a_repository() {
+        let outside = tempfile::tempdir().unwrap();
+        assert!(repository_root(outside.path()).is_none());
+        fs::create_dir(outside.path().join("src")).unwrap();
+        fs::write(outside.path().join("AGENTS.md"), "@CLAUDE.md").unwrap();
+        fs::write(outside.path().join("src/file.rs"), "").unwrap();
+        assert!(load_context_files(outside.path(), true).is_empty());
+        assert!(load_context_files_for_targets(
+            outside.path(),
+            true,
+            &[PathBuf::from("src/file.rs")]
+        )
+        .is_empty());
+    }
+
+    /// A folder holding several checkouts is not one: the AGENTS.md beside
+    /// them is never read from inside any of them.
+    #[test]
+    fn a_checkout_reads_from_its_root_down_and_never_above_it() {
+        let desktop = tempfile::tempdir().unwrap();
+        fs::write(desktop.path().join("AGENTS.md"), "desktop rules").unwrap();
+        let repo = desktop.path().join("project");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("crates/app")).unwrap();
+        fs::write(repo.join("AGENTS.md"), "project rules").unwrap();
+        fs::write(repo.join("crates/app/AGENTS.md"), "app rules").unwrap();
+
+        let bodies = |cwd: &Path| -> Vec<String> {
+            load_context_files(cwd, true)
+                .into_iter()
+                .map(|file| file.body)
+                .collect()
+        };
+        assert_eq!(bodies(&repo), ["project rules"]);
+        // In a subdirectory the root's rules come first, then the nearer ones.
+        let app = repo.join("crates/app");
+        assert_eq!(bodies(&app), ["project rules", "app rules"]);
+        assert_eq!(bodies(&repo.join("crates")), ["project rules"]);
+
+        // A linked worktree marks its root with a `.git` file.
+        let worktree = desktop.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: elsewhere").unwrap();
+        fs::write(worktree.join("AGENTS.md"), "worktree rules").unwrap();
+        assert_eq!(bodies(&worktree), ["worktree rules"]);
+
+        // The root's file is labelled from the root, the nearer one from cwd.
+        let mut prompt = String::new();
+        append_repository_context(&mut prompt, &load_context_files(&app, true), &app);
+        assert!(
+            prompt.contains(r#"paths=["<repository root>/AGENTS.md"]"#),
+            "{prompt}"
+        );
+        assert!(prompt.contains(r#"paths=["AGENTS.md"]"#), "{prompt}");
+    }
+
+    #[test]
     fn relative_cwd_loader_preserves_nested_instruction_scope() {
         let current = std::env::current_dir().unwrap();
         let root = tempfile::tempdir_in(&current).unwrap();
@@ -387,6 +507,7 @@ mod tests {
     fn symlink_cwd_loader_preserves_nested_instruction_scope() {
         let root = tempfile::tempdir().unwrap();
         let checkout = root.path().join("checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
         fs::create_dir_all(checkout.join("src")).unwrap();
         fs::write(checkout.join("src/AGENTS.md"), "nested instructions").unwrap();
         fs::write(checkout.join("src/file.rs"), "").unwrap();
@@ -396,6 +517,7 @@ mod tests {
         let mut prompt = String::new();
         append_repository_context(&mut prompt, &files, &link);
         assert!(prompt.contains("src/AGENTS.md"), "{prompt}");
+        assert!(prompt.contains("nested instructions"), "{prompt}");
         assert!(!prompt.contains(root.path().to_str().unwrap()));
     }
 

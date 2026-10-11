@@ -1011,7 +1011,7 @@ pub fn compaction() -> Compaction {
             "every Δ and its hunks · 7 files".into(),
             "the disegno plan, steps I–V".into(),
             "your instruction: store.rs decisions".into(),
-            "AGENTS.md and CLAUDE.md · re-read, not summarised".into(),
+            "AGENTS.md · re-read, not summarised".into(),
         ],
         folded: vec![
             "turns 1–18 · 96.4k".into(),
@@ -1655,7 +1655,7 @@ pub fn project_trust() -> ProjectTrustSheet {
             ),
             file(
                 State::Read,
-                "AGENTS.md · CLAUDE.md",
+                "AGENTS.md",
                 "1,208 lines, prepended to every turn",
                 "prompt text",
             ),
@@ -1692,7 +1692,7 @@ pub fn workshop() -> WorkshopSheet {
             ),
             (
                 State::Done,
-                "context files · AGENTS.md, CLAUDE.md · 4.1k".into(),
+                "context files · AGENTS.md · 4.1k".into(),
                 "6ms".into(),
                 None,
             ),

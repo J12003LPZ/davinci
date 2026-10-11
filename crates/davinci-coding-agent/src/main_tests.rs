@@ -3304,6 +3304,8 @@ fn show_loaded_resources_lists_context_skills_and_expands() {
         "---\nname: demo\ndescription: demo skill\n---\n# Demo\n",
     )
     .unwrap();
+    // AGENTS.md is read only inside a checkout.
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
     std::fs::write(dir.path().join("AGENTS.md"), "# agents\n").unwrap();
     let mut agent = Agent::new("x");
     agent.cwd = dir.path().to_path_buf();

@@ -28,7 +28,7 @@ pub struct ContextUsage {
     pub mcp_tools: Vec<ContextUsageItem>,
     /// Agent profiles advertised in the `agent` tool's schema.
     pub custom_agents: Vec<ContextUsageItem>,
-    /// Repository context files (`AGENTS.md`, `CLAUDE.md`, …).
+    /// Repository context files (`AGENTS.md`, root and nested).
     pub memory_files: Vec<ContextUsageItem>,
     /// Conversation history as the provider sees it, with plan and extension
     /// context for the next request.
@@ -198,5 +198,126 @@ mod tests {
         agent.context_window = 100_000;
         agent.auto_compaction = false;
         assert_eq!(agent.context_usage().autocompact_buffer, 0);
+    }
+
+    /// The host's configuration: an active context VM and a tool-overhead
+    /// estimator that returns the admission byte ceiling.
+    fn host_agent(mode: crate::ContextVmMode) -> Agent {
+        use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+        let mut agent = Agent::new("You are a coding agent.");
+        agent.context_window = 200_000;
+        agent.cwd = std::env::temp_dir();
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(mode);
+        agent.set_provider_context_overhead_estimator(|agent| {
+            serde_json::to_vec(&agent.provider_tool_specs())
+                .unwrap()
+                .len() as u64
+                + 128
+        });
+        agent
+    }
+
+    #[test]
+    fn an_empty_session_attributes_nothing_to_messages_in_every_vm_mode() {
+        for mode in [
+            crate::ContextVmMode::Off,
+            crate::ContextVmMode::Shadow,
+            crate::ContextVmMode::Active,
+        ] {
+            let agent = host_agent(mode);
+            let usage = agent.context_usage();
+            // The active VM sends a small state preface of its own; it was
+            // once 5k because byte ceilings were summed as tokens.
+            let allowed = if mode == crate::ContextVmMode::Active {
+                150
+            } else {
+                0
+            };
+            assert!(
+                usage.messages <= allowed,
+                "{mode:?} charged an empty session {} tokens",
+                usage.messages
+            );
+            assert_eq!(usage.used(), agent.estimated_context_tokens(), "{mode:?}");
+        }
+    }
+
+    /// A fresh session in a directory with a 40 KB CLAUDE.md showed 102k used,
+    /// 87k of it Messages: the active VM image carried a second copy of the
+    /// file, and the byte ceilings were summed as tokens. The file belongs to
+    /// Memory files and goes to the provider once, in the system prompt.
+    #[test]
+    fn a_large_memory_file_is_counted_and_sent_once_in_every_vm_mode() {
+        let body = "Follow the project rules. ".repeat(1_600);
+        for mode in [
+            crate::ContextVmMode::Off,
+            crate::ContextVmMode::Shadow,
+            crate::ContextVmMode::Active,
+        ] {
+            let mut agent = host_agent(mode);
+            agent.context_files.push(crate::ContextFile {
+                path: agent.cwd.join("CLAUDE.md"),
+                name: "CLAUDE.md".into(),
+                body: body.clone(),
+            });
+            agent.invalidate_context_image();
+            let usage = agent.context_usage();
+            let memory: u64 = usage.memory_files.iter().map(|item| item.tokens).sum();
+            assert!(
+                memory >= (body.len() as u64) / 4,
+                "{mode:?} memory {memory}"
+            );
+            let allowed = if mode == crate::ContextVmMode::Active {
+                150
+            } else {
+                0
+            };
+            assert!(
+                usage.messages <= allowed,
+                "{mode:?} charged {} tokens to Messages",
+                usage.messages
+            );
+            let copies = agent
+                .messages_for_provider()
+                .iter()
+                .filter(|message| {
+                    davinci_ai::content_text(&message.content).contains("Follow the project rules.")
+                })
+                .count();
+            assert_eq!(copies, 0, "{mode:?} sent CLAUDE.md in the messages too");
+            assert!(agent
+                .provider_system_prompt()
+                .contains("Follow the project rules."));
+        }
+    }
+
+    #[test]
+    fn the_active_vm_estimate_is_in_tokens_not_admission_bytes() {
+        let mut agent = host_agent(crate::ContextVmMode::Active);
+        let legacy = {
+            let mut off = host_agent(crate::ContextVmMode::Off);
+            off.messages.push(ChatMessage::text(
+                "user",
+                "hello there, explain the runtime",
+            ));
+            off.estimated_context_tokens()
+        };
+        agent.messages.push(ChatMessage::text(
+            "user",
+            "hello there, explain the runtime",
+        ));
+        let active = agent.estimated_context_tokens();
+        // The two paths measure one request; they may differ by framing, not 4x.
+        assert!(
+            active <= legacy + legacy / 4 + 64,
+            "active {active} vs legacy {legacy}"
+        );
+        let usage = agent.context_usage();
+        assert!(usage.messages < 200, "messages {}", usage.messages);
     }
 }
