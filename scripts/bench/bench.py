@@ -528,16 +528,21 @@ def run_one(harness, tid, rep, campaign=None):
     artifacts = {"artifact_leak": None, "transaction_leak": None,
                  "artifact_paths": None, "transaction_paths": None, "artifact_scan_scope": None}
     cleanup_complete = measured.get("cleanup_complete")
+    inspection_error = None
+    inspection_phase = "cleanup"
     try:
         if measured.get("cleanup_complete") is not True:
             raise RuntimeError("cannot inspect a workspace while execution may still be active")
+        inspection_phase = "changed_files"
         changed = changed_files(workdir)
         unrelated = [p for p in changed if p not in spec["allowed"]]
+        inspection_phase = "forbidden_artifacts"
         artifacts = forbidden_artifacts(workdir, tid)
         if artifacts["artifact_leak"]:
             stopped = stopped or "forbidden_artifact"
-    except (OSError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         changed = unrelated = None
+        inspection_error = {"phase": inspection_phase, "type": type(error).__name__, "message": str(error)}
         stopped = stopped or "change_inventory_failed"
     grading_evidence = {}
     if stopped:
@@ -583,6 +588,7 @@ def run_one(harness, tid, rep, campaign=None):
                                if campaign else "diagnostic-only"),
         "task_set": "legacy" if tid in LEGACY_TASKS else "large",
         "stop_reason": stopped,
+        "inspection_error": inspection_error,
         "regression_pass": regression["pass"] if regression else None,
         "regression_exit": regression["exit"] if regression else None,
         "grading_evidence": grading_evidence,
