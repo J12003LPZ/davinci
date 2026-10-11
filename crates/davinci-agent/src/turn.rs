@@ -480,7 +480,11 @@ impl Agent {
             // The legacy path prunes tool output before deciding whether to
             // summarize. Active Context VM keeps Agent.messages untouched and
             // folds its derived state instead.
-            let tokens = if active_context_vm {
+            // `tokens` is what the request weighs, for stats. The active VM
+            // decides folds on the admission scale instead (`fold_tokens`):
+            // admission caps the image in bytes, so the token estimate never
+            // reaches a fold threshold.
+            let (tokens, fold_tokens) = if active_context_vm {
                 self.invalidate_context_image();
                 let events = self.context_vm_events_for_vm();
                 if let Some(runtime) = &self.runtime {
@@ -489,11 +493,20 @@ impl Agent {
                     }
                 }
                 self.prepared_context_image()
-                    .map(|image| self.context_vm_estimated_provider_tokens(&image))
-                    .unwrap_or_else(|_| self.estimated_context_tokens())
+                    .map(|image| {
+                        (
+                            self.context_vm_estimated_provider_tokens(&image),
+                            self.context_vm_admission_tokens(&image),
+                        )
+                    })
+                    .unwrap_or_else(|_| {
+                        let tokens = self.estimated_context_tokens();
+                        (tokens, tokens)
+                    })
             } else {
                 self.prune_context();
-                self.estimated_context_tokens()
+                let tokens = self.estimated_context_tokens();
+                (tokens, tokens)
             };
             self.stats.note_context(tokens);
             if self.auto_compaction && active_context_vm {
@@ -515,7 +528,7 @@ impl Agent {
                     .decide_automatic(
                         &root,
                         delta_tokens,
-                        tokens,
+                        fold_tokens,
                         self.context_window,
                         &settings,
                     )

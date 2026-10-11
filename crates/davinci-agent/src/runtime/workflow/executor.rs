@@ -2630,8 +2630,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let reports = executor.runtime.take_labeled_messages(10).join("\n");
-        assert!(reports.contains("kind=\"workflow_worker\""));
-        assert!(reports.contains("status: completed"));
+        assert!(reports.contains("kind=\"workflow_worker\""), "{reports}");
+        assert!(reports.contains("status: completed"), "{reports}");
         let paths = paths.lock().unwrap();
         assert_eq!(paths.len(), 2);
         assert_ne!(paths[0], paths[1]);

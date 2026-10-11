@@ -15,16 +15,23 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let Some(sheet) = model
         .agents
         .as_ref()
-        .filter(|sheet| !sheet.agents.is_empty())
+        .filter(|sheet| !sheet.agents.is_empty() || !sheet.profiles.is_empty())
     else {
         return section_detail(
             width,
             th,
-            "No workers active. Workers appear when multi-agent tasks execute.",
+            "No agents defined. Add profiles under .davinci/agents/ or ~/.davinci/agent/agents/.",
         );
     };
 
     let mut rows = Vec::new();
+    if sheet.agents.is_empty() {
+        rows.extend(section_detail(
+            width,
+            th,
+            "No workers active. Workers appear when multi-agent tasks execute.",
+        ));
+    }
     for (i, agent) in sheet.agents.iter().enumerate() {
         let is_selected = i == sheet.selected_index;
 
@@ -78,12 +85,35 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             rows.extend(waiting_rows);
         }
     }
+    if !sheet.profiles.is_empty() {
+        if !rows.is_empty() {
+            rows.push(Line::default());
+        }
+        rows.extend(section_detail(
+            width,
+            th,
+            &format!("Available agents ({})", sheet.profiles.len()),
+        ));
+        for profile in &sheet.profiles {
+            rows.push(section_row(width, th, false, &profile.name, ""));
+            let description = if profile.description.is_empty() {
+                "(no description)"
+            } else {
+                profile.description.as_str()
+            };
+            rows.extend(section_detail(width, th, &format!("  {description}")));
+        }
+    }
     rows
 }
 
 pub fn chrome(model: &Model) -> SheetChrome {
     let th = &model.theme;
     let total = model.agents.as_ref().map_or(0, |sheet| sheet.agents.len());
+    let defined = model
+        .agents
+        .as_ref()
+        .map_or(0, |sheet| sheet.profiles.len());
     let active = model.agents.as_ref().map_or(0, |sheet| {
         sheet
             .agents
@@ -100,7 +130,14 @@ pub fn chrome(model: &Model) -> SheetChrome {
     });
 
     SheetChrome {
-        header_right: vec![span(format!("{total} workers"), th.muted)],
+        header_right: vec![span(
+            if defined == 0 {
+                format!("{total} workers")
+            } else {
+                format!("{total} workers · {defined} defined")
+            },
+            th.muted,
+        )],
         status_third: Some(vec![span(
             format!("{active} active · {done} finished"),
             th.muted,
@@ -123,7 +160,7 @@ pub fn chrome(model: &Model) -> SheetChrome {
 mod tests {
     use super::*;
     use crate::davinci::{
-        model::{AgentRow, AgentsSheet},
+        model::{AgentProfileRow, AgentRow, AgentsSheet},
         theme::{ColorDepth, Theme},
     };
 
@@ -150,6 +187,7 @@ mod tests {
         m.agents = Some(AgentsSheet {
             agents: vec![a1, a2],
             selected_index: 0,
+            ..Default::default()
         });
         m
     }
@@ -163,7 +201,33 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
+        assert!(joined.contains("No agents defined"));
+    }
+
+    #[test]
+    fn defined_profiles_show_when_no_worker_runs() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 24, false);
+        m.agents = Some(AgentsSheet {
+            profiles: vec![AgentProfileRow {
+                name: "code-improver".into(),
+                description: "Reviews diffs for simplifications".into(),
+            }],
+            ..Default::default()
+        });
+        let joined: String = lines(&m)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
         assert!(joined.contains("No workers active"));
+        assert!(joined.contains("Available agents (1)"));
+        assert!(joined.contains("code-improver"));
+        assert!(joined.contains("Reviews diffs for simplifications"));
+        let header: String = chrome(&m)
+            .header_right
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(header, "0 workers · 1 defined");
     }
 
     #[test]

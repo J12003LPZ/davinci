@@ -174,6 +174,16 @@ pub fn conversation_rows(model: &Model, width: u16) -> ConversationRows {
     ConversationRows { settled, live }
 }
 
+/// How many rows the entries before `entry` take at `width`, which is the
+/// row `entry` starts on within the conversation.
+pub fn rows_before(model: &Model, entry: usize, width: u16) -> usize {
+    let entries = &model.transcript[..entry.min(model.transcript.len())];
+    rendered_blocks(model, entries, width, Some(0))
+        .iter()
+        .map(Vec::len)
+        .sum()
+}
+
 /// Where the last scan for the first live entry ended, and what it assumed.
 /// Entries before `floor` were all settled then; they stay settled while
 /// nothing before `floor` is touched (`stamp`) and the global conditions the

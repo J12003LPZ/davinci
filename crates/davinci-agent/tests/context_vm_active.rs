@@ -421,3 +421,72 @@ fn automatic_fold_is_noticed_and_manual_fold_is_not() {
     assert!(notices[0].contains("folded"));
     assert!(notices[0].contains("retrieve_context"));
 }
+
+/// A long active-VM session must still fold on its own. Admission caps the
+/// image in bytes, so a fold decision fed the four-bytes-a-token estimate
+/// never saw more than a quarter of the window and never folded; older turns
+/// were paged out with no summary instead.
+#[test]
+fn a_full_active_window_folds_from_the_run_loop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut agent = Agent::new("You are a coding agent.");
+    agent.context_window = 100_000;
+    agent.auto_compaction = true;
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    let filler = "word ".repeat(1_600);
+    for index in 0..14 {
+        agent.messages.push(ChatMessage::text(
+            "user",
+            format!("request {index}: {filler}"),
+        ));
+        agent.messages.push(ChatMessage::text(
+            "assistant",
+            format!("reply {index}: {filler}"),
+        ));
+    }
+    agent.prompt("continue");
+    let folds = Arc::new(AtomicUsize::new(0));
+    let seen = folds.clone();
+    agent.summarizer = Some(davinci_agent::Summarizer::new(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(davinci_agent::SummarizeResponse {
+            text: serde_json::json!({"transitions": []}).to_string(),
+            usage: Default::default(),
+            stop_reason: None,
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+
+    agent
+        .run_loop(|_: &Agent| {
+            Ok::<_, String>(davinci_ai::AssistantMessage {
+                extra: Default::default(),
+                id: "fixture".into(),
+                role: "assistant".into(),
+                model: "fixture".into(),
+                usage: None,
+                error_message: None,
+                content: vec![davinci_ai::ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+            })
+        })
+        .expect("turn runs");
+
+    assert!(
+        folds.load(Ordering::SeqCst) > 0,
+        "a window the admission budget fills must fold"
+    );
+    // `/context` still reads in tokens, well under the admission figure.
+    let usage = agent.context_usage();
+    assert_eq!(usage.used(), agent.estimated_context_tokens());
+}
