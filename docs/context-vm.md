@@ -5,9 +5,54 @@ retains the off default. Compaction/resume fixtures prove boundary behavior,
 not a long-task success or efficiency advantage for active mode.
 
 Context VM compiles a bounded working set from authoritative session history.
-The default mode remains off; shadow compares projections and active mode uses
-the compiled image. The agent API selects the mode with
-`set_context_vm_mode(ContextVmMode::Active)`.
+The default mode remains off; shadow compares projections, active mode uses
+the compiled image, and hybrid mode sends the off-mode transcript and compacts
+it with the VM ledger. The agent API selects the mode with
+`set_context_vm_mode(ContextVmMode::Active)`; `DAVINCI_CONTEXT_VM` and the
+`context-vm` setting accept `off`, `shadow`, `active` and `hybrid`.
+
+## Hybrid mode
+
+Hybrid keeps the off-mode request: the append-only transcript with native
+items and tool call/result pairs, unpruned, so each request extends the
+previous one. It sets no Context VM cache partition. The VM follows every turn
+with its deterministic ledger at no provider cost.
+
+Compaction starts when `calibrated_context_tokens()` passes the compaction
+threshold: the provider-reported size of the last request (input of every
+kind plus the reply) and the four-bytes-a-token estimate of messages added
+since, as Codex measures it. A system prompt, tool catalog or other context
+outside the messages that changed since the report adds the estimate of its
+change; a report from another provider or model is not used. The plain
+estimate applies when no report does. A provider that refuses the input as
+too long gets one compaction and the same request again per run.
+
+A compaction folds the ledger (one summarizer request over the events no fold
+has seen, or the deterministic state when that fails), renders it with every
+value's source refs and the superseded values, and keeps it with the most
+recent `keep_recent_tokens` of messages verbatim. It is persisted as an
+ordinary `compaction` entry, so reload, branching and native replay follow
+the off-mode paths. A compaction or branch summary is never read as a user
+requirement.
+
+The replacement must estimate under the compaction threshold beside the
+system prompt, tool schemas and other context outside the messages. When the
+recent messages do not fit beside the ledger, the cut moves to a later turn
+boundary (never onto a tool result); when even the newest turn does not fit,
+nothing is compacted and the transcript is unchanged.
+
+Without a session, where events are numbered by position, the VM is rebased
+onto the compacted transcript before that transcript replaces the live one;
+a rebase that fails leaves the transcript as it was. The rebase keeps the
+exact text of every `transient:` source the ledger or its episodes still cite,
+so `retrieve_context` with those refs keeps working after any number of
+compactions. With a session, cited `session:` sources are read from the JSONL,
+which compaction does not shorten.
+
+The compaction request is not a prefix-sharing request: the host summarizer
+is a separate completion, and the one recorded ChatGPT-route probe of a
+prefix-sharing compaction shape reported no cache reads. It sends the
+excerpted events since the last fold instead of the whole transcript.
 
 ## Provider admission and protocol
 
@@ -19,7 +64,12 @@ provider dispatch also receive the matching output limit.
 
 Token accounting uses conservative UTF-8/serialized-byte ceilings with framing
 allowances. These are admission estimates, not tokenizer measurements. They
-can reject context that a model-specific tokenizer would fit.
+can reject context that a model-specific tokenizer would fit. Fold decisions,
+`/context` and `estimated_context_tokens()` use the four-bytes-a-token
+heuristic of the off mode and the compaction threshold instead; measured
+against the threshold, the ceiling fired folds at about a quarter of the
+configured fill. A request whose required context fails admission always
+gets one fold before it is blocked.
 
 The checkpoint, mandatory policy/broker context, latest complete user request,
 newest event and complete live tool exchange are non-droppable. Optional
@@ -55,10 +105,44 @@ fallback does not infer completion and can grow until admission fails. Real
 semantic compression requires a functioning configured summarizer; it is not
 claimed from the deterministic fallback or fixture evals.
 
+The deterministic state is the requirement ledger of last resort. A user
+message over 512 bytes keeps its opening and every clause that reads as an
+instruction (never, must, only, instead, correction, ...), word for word, up
+to 1 KiB. Tool evidence keeps its head and its tail, where test runners print
+the verdict. The goal list keeps the first request and the newest half; older
+goals that state an instruction outlast routine ones. Sources stay
+retrievable.
+
+A fold sends the summarizer the parent state and only the events after
+`folded_through_seq`, the newest event an earlier fold saw. Validation still
+sees every event, so accepted values may cite older sources. A fresh or
+rebuilt root starts at zero and sends everything.
+
 New updates materialize one current checkpoint rather than chaining full-state
 copies. Legacy delta objects remain readable; subsequent updates collapse them.
 Branch changes rebuild state from the selected authoritative history. Cache
 pages are derived artifacts, not the source of truth.
+
+## Cache-stable image
+
+The hot window keeps its first event while everything from it still fits
+`hot_event_tokens`, so consecutive requests share every earlier message. When
+it overflows, or when the compile budget rather than the window bounds the
+image, it restarts at half of what fit. A window that slid one event per turn
+rewrote the provider input from its first message on every request.
+
+Content that changes on routine turns comes after the hot events: the delta
+and optional broker items not marked stable. The delta renders as a
+`state_update` with only the values the model cannot see elsewhere: not in the
+checkpoint at the head of the image and not fully backed by hot events it
+carries verbatim. It is omitted when empty. Admission still reserves the whole
+delta page, which stays retrievable by id.
+
+Automatic delta-depth and delta-token folds wait until events have left the
+hot window without a fold seeing them (`evicted_unfolded_tokens`), and are
+skipped without a summarizer: before that the model sees every event, and a
+deterministic fold only rotates the cache epoch. Window pressure, the hard
+admission limit, phase boundaries and manual folds are not held back.
 
 ## Prepared images and storage
 

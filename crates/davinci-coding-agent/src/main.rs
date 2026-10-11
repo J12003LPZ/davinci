@@ -8201,8 +8201,12 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "context-vm" => {
             stored.context_vm = Some(
                 match value {
-                    "off" | "shadow" | "active" => value,
-                    _ => return Err(format!("context-vm is off, shadow or active, not {value}")),
+                    "off" | "shadow" | "active" | "hybrid" => value,
+                    _ => {
+                        return Err(format!(
+                            "context-vm is off, shadow, active or hybrid, not {value}"
+                        ))
+                    }
                 }
                 .to_string(),
             )

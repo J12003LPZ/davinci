@@ -2,11 +2,12 @@ use super::super::cache::digest;
 use super::super::context::{wrap_untrusted_data, ContextItem, ContextPacket};
 use super::super::context_manifest::{ContextManifestEntry, ProvenanceKind};
 use super::{
-    ContextEvent, ContextEventKind, ContextImage, ContextImageEntry, ContextObject,
-    ContextObjectStore, ContextPageRef, ContextRoot,
+    CheckpointState, ContextEvent, ContextEventKind, ContextImage, ContextImageEntry,
+    ContextObject, ContextObjectStore, ContextPageRef, ContextRoot, StateValue,
 };
 use davinci_ai::ChatMessage;
 use serde_json::Value;
+use std::collections::HashSet;
 
 pub struct ContextCompileRequest<'a> {
     pub root: &'a ContextRoot,
@@ -30,6 +31,7 @@ impl ContextCompiler {
         let mut messages = Vec::new();
         let mut used_tokens = 0u64;
 
+        let mut checkpoint_state = None;
         if let Some(checkpoint) = &request.root.checkpoint {
             let object = self.load_page(checkpoint)?;
             let content = object_content(&object)?;
@@ -37,19 +39,26 @@ impl ContextCompiler {
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
             messages.push(ChatMessage::text("custom", entry.content.clone()));
             entries.push(entry);
+            if let ContextObject::Checkpoint(state) = object {
+                checkpoint_state = Some(state);
+            }
         }
 
+        // Content that changes on routine turns goes after the hot events, so
+        // it never splits the prefix the provider cached last turn: the
+        // delta, and optional broker items not marked stable. The whole delta
+        // page is reserved here; what is rendered, after the hot events are
+        // chosen, is only the part the model cannot see elsewhere.
+        let mut deltas = Vec::new();
         for page in &request.root.deltas {
             let object = self.load_page(page)?;
             let content = object_content(&object)?;
-            // A delta changes on routine turns; keeping it out of the stable
-            // prefix lets the checkpoint before it stay cached.
             let mut entry = page_entry(page, "delta", content, true);
             entry.stable_for_cache = false;
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
-            messages.push(ChatMessage::text("custom", entry.content.clone()));
-            entries.push(entry);
+            deltas.push((entry, object));
         }
+        let mut volatile_broker = Vec::new();
 
         let latest_user = request
             .hot_events
@@ -105,7 +114,7 @@ impl ContextCompiler {
         // newest first: the hot set is already capped by the hot window, so
         // it is the recency reserve. Episode descriptors and the remaining
         // broker items share what is left. The messages keep their
-        // cache-friendly order: pages, broker, then hot.
+        // cache-friendly order: pages, stable broker, hot, then volatile.
         let mut optional_remaining = optional_limit.saturating_sub(used_tokens);
         let mut broker = request
             .broker_packet
@@ -171,15 +180,45 @@ impl ContextCompiler {
                 continue;
             };
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
-            messages.push(ChatMessage::text("custom", entry.content.clone()));
-            entries.push(entry);
+            if entry.stable_for_cache {
+                messages.push(ChatMessage::text("custom", entry.content.clone()));
+                entries.push(entry);
+            } else {
+                volatile_broker.push(entry);
+            }
         }
 
         used_tokens = used_tokens.saturating_add(hot_tokens);
+        let visible = selected_from_tail
+            .iter()
+            .map(|event| event.source_ref.as_str())
+            .collect::<HashSet<_>>();
         for event in selected_from_tail {
             let mut entry = event_entry(event);
             entry.mandatory |= required(event);
             messages.push(event_message(event));
+            entries.push(entry);
+        }
+        // A rendered view keeps the whole page's charge, so the image's
+        // estimate admits the same image again; an empty view is omitted
+        // along with its charge.
+        for (mut entry, object) in deltas {
+            if let ContextObject::Delta(delta) = &object {
+                let Some(view) =
+                    state_update_view(&delta.checkpoint_patch, checkpoint_state.as_ref(), &visible)
+                else {
+                    used_tokens = used_tokens.saturating_sub(entry.estimated_tokens);
+                    continue;
+                };
+                let content = wrap_untrusted_data(&entry.source_ref, &view);
+                entry.content_hash = digest(view.as_bytes());
+                entry.content = content;
+            }
+            messages.push(ChatMessage::text("custom", entry.content.clone()));
+            entries.push(entry);
+        }
+        for entry in volatile_broker {
+            messages.push(ChatMessage::text("custom", entry.content.clone()));
             entries.push(entry);
         }
 
@@ -270,6 +309,11 @@ fn broker_entry(item: &ContextItem) -> ContextImageEntry {
     }
 }
 
+/// What one hot event costs the compiler's budget.
+pub(super) fn hot_entry_tokens(event: &ContextEvent) -> u64 {
+    crate::provider_budget::message_token_ceiling(&event_message(event))
+}
+
 fn event_entry(event: &ContextEvent) -> ContextImageEntry {
     let category = match event.kind {
         ContextEventKind::User => "hot_user",
@@ -284,7 +328,7 @@ fn event_entry(event: &ContextEvent) -> ContextImageEntry {
         source_ref: event.source_ref.clone(),
         content_hash: event.content_hash.clone(),
         content: wrap_untrusted_data(&event.source_ref, &event.visible_text),
-        estimated_tokens: crate::provider_budget::message_token_ceiling(&event_message(event)),
+        estimated_tokens: hot_entry_tokens(event),
         mandatory: matches!(event.kind, ContextEventKind::User),
         stable_for_cache: false,
     }
@@ -314,6 +358,81 @@ fn event_message(event: &ContextEvent) -> ChatMessage {
     } else {
         ChatMessage::text(role, &event.visible_text)
     }
+}
+
+/// The current state the model cannot already see: values that are neither
+/// in the checkpoint at the head of the image nor fully backed by recent
+/// events it carries verbatim. Recent values come from those events, so this
+/// view changes when events leave the window rather than on every turn, and
+/// it stays out of the way of the cached prefix. None when nothing is left.
+/// The full delta page stays retrievable by its id.
+fn state_update_view(
+    state: &CheckpointState,
+    base: Option<&CheckpointState>,
+    visible: &HashSet<&str>,
+) -> Option<String> {
+    let empty = CheckpointState::default();
+    let base = base.unwrap_or(&empty);
+    let shown_verbatim = |value: &StateValue<String>| {
+        let mut sources = value
+            .provenance
+            .iter()
+            .flat_map(|provenance| &provenance.source_refs)
+            .peekable();
+        sources.peek().is_some() && sources.all(|source| visible.contains(source.as_str()))
+    };
+    let unseen = |values: &[StateValue<String>], base: &[StateValue<String>]| {
+        values
+            .iter()
+            .filter(|value| {
+                !base.iter().any(|known| known.value == value.value) && !shown_verbatim(value)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut view = serde_json::Map::new();
+    for (name, values, known) in [
+        ("goals", &state.goals, &base.goals),
+        ("constraints", &state.constraints, &base.constraints),
+        ("completed", &state.completed, &base.completed),
+        ("in_progress", &state.in_progress, &base.in_progress),
+        ("blockers", &state.blockers, &base.blockers),
+        ("decisions", &state.decisions, &base.decisions),
+        (
+            "modified_files",
+            &state.modified_files,
+            &base.modified_files,
+        ),
+        ("verification", &state.verification, &base.verification),
+    ] {
+        let values = unseen(values, known);
+        if !values.is_empty() {
+            view.insert(name.into(), serde_json::to_value(values).ok()?);
+        }
+    }
+    if let Some(narrative) = state
+        .narrative
+        .as_ref()
+        .filter(|narrative| base.narrative.as_ref() != Some(*narrative))
+        .filter(|narrative| !shown_verbatim(narrative))
+    {
+        view.insert("narrative".into(), serde_json::to_value(narrative).ok()?);
+    }
+    let retired = state
+        .retired
+        .iter()
+        .filter(|retired| !base.retired.contains(retired))
+        .collect::<Vec<_>>();
+    if !retired.is_empty() {
+        view.insert("retired".into(), serde_json::to_value(retired).ok()?);
+    }
+    if view.is_empty() {
+        return None;
+    }
+    let mut rendered = serde_json::Map::new();
+    rendered.insert("type".into(), "state_update".into());
+    rendered.extend(view);
+    serde_json::to_string(&rendered).ok()
 }
 
 fn object_content(object: &ContextObject) -> Result<String, String> {

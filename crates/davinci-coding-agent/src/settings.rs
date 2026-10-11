@@ -1401,7 +1401,9 @@ impl Settings {
     ) -> davinci_agent::runtime::ContextVmMode {
         use davinci_agent::runtime::ContextVmMode;
         match environment {
-            Some("off" | "shadow" | "active") => ContextVmMode::from_env_value(environment),
+            Some("off" | "shadow" | "active" | "hybrid") => {
+                ContextVmMode::from_env_value(environment)
+            }
             _ => ContextVmMode::from_env_value(self.context_vm.as_deref()),
         }
     }
@@ -1831,6 +1833,7 @@ pub fn to_interactive_config(
             davinci_agent::runtime::ContextVmMode::Off => "off",
             davinci_agent::runtime::ContextVmMode::Shadow => "shadow",
             davinci_agent::runtime::ContextVmMode::Active => "active",
+            davinci_agent::runtime::ContextVmMode::Hybrid => "hybrid",
         }
         .into(),
         plan_usage: settings.plan_usage.unwrap_or(true),
