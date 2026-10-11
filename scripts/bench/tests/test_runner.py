@@ -42,6 +42,20 @@ class RunnerTests(unittest.TestCase):
             command = bench.command("codex", "prompt", "workdir")
             self.assertNotIn('service_tier="fast"', command)
 
+    def test_codemode_arm_launches_explicitly_with_a_session(self):
+        off = bench.command("davinci", "prompt", "workdir", {"contextVm": "hybrid"})
+        self.assertIn("--no-session", off)
+        self.assertNotIn("--codemode", off)
+        on = bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": "read-only"}})
+        # --no-session would make the /config switch stay off silently.
+        self.assertNotIn("--no-session", on)
+        self.assertEqual(on[on.index("--codemode") + 1], "read-only")
+        explicit_off = bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": "off"}})
+        self.assertIn("--no-session", explicit_off)
+        for mode in ("controlled", "turbo"):
+            with self.assertRaises(ValueError):
+                bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": mode}})
+
     def test_prepared_fixture_contract_preserves_task_and_repository_rules(self):
         task = "Fix the real issue.\nKeep compatibility and add a regression test."
         instructions = b"Before edits create a worktree using CLAUDE_CODE_SESSION_ID.\nKeep tests.\n"

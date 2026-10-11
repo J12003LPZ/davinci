@@ -232,10 +232,25 @@ def forbidden_artifacts(workdir, tid):
             "artifact_scan_scope": "reserved grader, credential, harness artifact paths and symlinks; before grading"}
 
 
-def command(harness, prompt, workdir):
+def codemode_arm(settings):
+    """Codemode mode selected by the DaVinci settings, validated before any launch."""
+    block = (settings or {}).get("codemode")
+    mode = block.get("mode", "off") if isinstance(block, dict) else "off"
+    if mode not in ("off", "read-only"):
+        raise ValueError("benchmark codemode arm must be off or read-only")
+    return mode
+
+
+def command(harness, prompt, workdir, settings=None):
     if harness == "davinci":
+        # The /config switch silently stays off under --no-session, so an "on"
+        # arm would measure the off path. The explicit flag fails loudly instead
+        # and keeps the session journal Codemode records into (agent dir, not
+        # the graded workspace).
+        mode = codemode_arm(settings)
+        session = ["--no-session"] if mode == "off" else ["--codemode", mode]
         return [
-            os.environ.get("BENCH_DAVINCI", "davinci"), "--mode", "json", "--no-session",
+            os.environ.get("BENCH_DAVINCI", "davinci"), "--mode", "json", *session,
             "--provider", "openai-codex", "--model", MODEL, "--thinking", EFFORT,
             "--permission-mode", "always-approve", "-p", prompt,
         ]
@@ -475,7 +490,8 @@ def run_one(harness, tid, rep, campaign=None):
     env = (controlled_environment(os.environ, campaign["agent_dir"], subscription_only=bool(subscription))
            if campaign else dict(os.environ, PI_LEARNING_DISABLE_BACKGROUND="1", PYTHONUTF8="1"))
     with Collector() if harness == "codex" else nullcontext() as collector:
-        args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir)
+        settings = campaign["identities"][harness].get("effective_settings") if campaign else None
+        args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir, settings)
         if campaign:
             args[0] = campaign["executables"][harness]
             if file_hash(args[0]) != campaign["identities"][harness]["binary_sha256"]:
@@ -962,6 +978,7 @@ def main():
                 raise ValueError("; ".join(frozen_errors))
             fixtures = fixture_manifest(TASKS, tids)
             settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
+            codemode_arm(settings)
             manifest = campaign_identity(RUNS, args.variant, fixtures, args.harness,
                                          MODEL, EFFORT, settings, Path(HERE).parents[1])
             prices = None
