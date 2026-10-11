@@ -51,6 +51,8 @@ fn root_budget_shapes_provider_view_without_dropping_authority() {
 fn scoped_context_files_follow_target_ancestors() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
+    // Instructions are read only inside a checkout.
+    fs::create_dir(root.join(".git")).unwrap();
     fs::write(root.join("AGENTS.md"), "root authority").unwrap();
     fs::create_dir_all(root.join("crates/a/src")).unwrap();
     fs::create_dir_all(root.join("crates/b/src")).unwrap();

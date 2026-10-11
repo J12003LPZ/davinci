@@ -27,7 +27,6 @@ pub const IGNORED_STATE: &[&str] = &[".davinci/vector-memory/", ".davinci/graph/
 const REINDEX_BATCHES: usize = 40;
 /// How long `/setup` waits for a freshly started `ollama serve` to answer.
 const SERVE_WAIT: Duration = Duration::from_secs(8);
-const INSTRUCTION_FILES: &[&str] = &[davinci_agent::INSTRUCTION_FILE];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -665,12 +664,12 @@ pub fn gitignore_step(cwd: &Path, apply: bool) -> Step {
 pub fn instructions_step(cwd: &Path) -> Step {
     const ID: &str = "instructions";
     const TITLE: &str = "project instructions";
-    let found = cwd.ancestors().find_map(|dir| {
-        INSTRUCTION_FILES
-            .iter()
-            .map(|name| dir.join(name))
-            .find(|path| path.is_file())
-    });
+    // The files the agent loads, so the report and the session agree: inside
+    // a checkout, from its root down to `cwd`; outside one, none.
+    let found = davinci_agent::load_context_files(cwd, true)
+        .into_iter()
+        .next()
+        .map(|file| file.path);
     match found {
         Some(path) => Step::new(
             ID,
@@ -1021,15 +1020,16 @@ mod tests {
     #[test]
     fn missing_instructions_point_at_init() {
         let dir = tempfile::tempdir().unwrap();
-        let nested = dir.path().join("a");
+        let repo = dir.path().join("repo");
+        let nested = repo.join("a");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir(&nested).unwrap();
-        // An AGENTS.md above the temp directory would answer for it, so only
-        // a missing file is asserted on.
+        // An AGENTS.md beside the checkout is not the checkout's.
+        std::fs::write(dir.path().join("AGENTS.md"), "@CLAUDE.md").unwrap();
         let step = instructions_step(&nested);
-        if step.state == StepState::Action {
-            assert!(step.action.unwrap().contains("/init"));
-        }
-        std::fs::write(dir.path().join("AGENTS.md"), "# rules").unwrap();
+        assert_eq!(step.state, StepState::Action);
+        assert!(step.action.unwrap().contains("/init"));
+        std::fs::write(repo.join("AGENTS.md"), "# rules").unwrap();
         assert_eq!(instructions_step(&nested).state, StepState::Ready);
     }
 

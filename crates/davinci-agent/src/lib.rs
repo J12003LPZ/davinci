@@ -78,8 +78,9 @@ pub use compaction::{
 };
 pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
-    load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
-    ContextFile, ContextPriority, RootContextAccount, SelectedRootContext, INSTRUCTION_FILE,
+    load_context_files, load_context_files_for_targets, repository_root, ContextBudgetReport,
+    ContextContribution, ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
+    INSTRUCTION_FILE,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
