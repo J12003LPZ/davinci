@@ -133,6 +133,24 @@ impl NativeResponsesOutput {
     /// event payloads. Failed, incomplete, or unterminated streams cannot
     /// establish a native continuation prefix.
     pub fn from_events(events: &[Value]) -> Option<Self> {
+        if events.iter().any(|event| {
+            invalid_declared_event_payload(event)
+                || declared_event_veto(event).is_some()
+                || event.get("status").is_some_and(|status| {
+                    let expected = match event.get("type").and_then(Value::as_str) {
+                        Some("response.incomplete") => Some("incomplete"),
+                        Some("response.completed" | "response.done") => Some("completed"),
+                        _ => None,
+                    };
+                    expected.is_some_and(|expected| status.as_str() != Some(expected))
+                })
+                || matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("error" | "response.failed" | "response.incomplete")
+                )
+        }) {
+            return None;
+        }
         let terminal = events.iter().rev().find(|event| {
             matches!(
                 event.get("type").and_then(Value::as_str),
@@ -140,6 +158,9 @@ impl NativeResponsesOutput {
             )
         })?;
         if terminal.get("type").and_then(Value::as_str) == Some("response.incomplete")
+            || terminal
+                .pointer("/response/status")
+                .is_some_and(|status| !status.is_null() && !status.is_string())
             || terminal
                 .pointer("/response/status")
                 .and_then(Value::as_str)
@@ -207,6 +228,17 @@ impl NativeResponsesOutput {
     /// Extract native output from a non-streaming Responses response object.
     pub fn from_response_value(value: &Value) -> Option<Self> {
         let response = value.get("response").unwrap_or(value);
+        if invalid_declared_response_payload(response)
+            || crate::retry::declared_response_veto(response).is_some()
+        {
+            return None;
+        }
+        if response
+            .get("status")
+            .is_some_and(|status| !status.is_null() && !status.is_string())
+        {
+            return None;
+        }
         let status = response.get("status").and_then(Value::as_str);
         let has_error = response.get("error").is_some_and(|error| !error.is_null());
         if !matches!(status, None | Some("completed")) || has_error {
@@ -236,6 +268,140 @@ impl NativeResponsesOutput {
             }
             .into(),
         })
+    }
+}
+
+fn invalid_string_fields(value: &Value, fields: &[&str]) -> bool {
+    fields
+        .iter()
+        .any(|field| value.get(*field).is_some_and(|value| !value.is_string()))
+}
+
+fn invalid_declared_item(item: &Value) -> bool {
+    if !item.is_object() || invalid_string_fields(item, &["type"]) {
+        return true;
+    }
+    if matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) && item
+        .get("status")
+        .is_some_and(|status| !status.is_null() && !status.is_string())
+    {
+        return true;
+    }
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            invalid_string_fields(item, &["id", "call_id", "name", "arguments"])
+        }
+        Some("custom_tool_call") => {
+            invalid_string_fields(item, &["id", "call_id", "name", "input"])
+        }
+        _ => false, // Opaque future item fields are retained, not reinterpreted.
+    }
+}
+
+fn invalid_declared_error(error: &Value) -> bool {
+    !error.is_object()
+        || ["code", "type", "message"].iter().any(|field| {
+            error
+                .get(*field)
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+        })
+}
+
+pub(crate) fn invalid_declared_response_payload(response: &Value) -> bool {
+    !response.is_object()
+        || response.get("incomplete_details").is_some_and(|details| {
+            !details.is_null()
+                && (!details.is_object()
+                    || details
+                        .get("reason")
+                        .is_some_and(|reason| !reason.is_null() && !reason.is_string()))
+        })
+        || response
+            .get("error")
+            .is_some_and(|error| !error.is_null() && invalid_declared_error(error))
+        || response.get("output").is_some_and(|output| {
+            output
+                .as_array()
+                .is_none_or(|items| items.iter().any(invalid_declared_item))
+        })
+}
+
+/// Validate declared fields consumed by the decoder, not a closed-world schema.
+/// Missing fields retain legacy fixture compatibility; unknown extensions remain
+/// opaque. Explicitly malformed payloads cannot establish recovery or replay.
+pub(crate) fn invalid_declared_event_payload(event: &Value) -> bool {
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    if !event.is_object() || kind.is_empty() {
+        return true;
+    }
+    let invalid_index = || {
+        event
+            .get("output_index")
+            .is_some_and(|index| index.as_u64().is_none())
+    };
+    match kind {
+        "response.created"
+        | "response.in_progress"
+        | "response.queued"
+        | "response.completed"
+        | "response.done"
+        | "response.incomplete"
+        | "response.failed" => event
+            .get("response")
+            .is_some_and(invalid_declared_response_payload),
+        "response.output_item.added" | "response.output_item.done" => {
+            event.get("item").is_some_and(invalid_declared_item)
+                || event
+                    .get("output_index")
+                    .is_some_and(|index| index.as_u64().is_none())
+        }
+        "response.output_text.delta"
+        | "response.refusal.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.function_call_arguments.delta"
+        | "response.custom_tool_call_input.delta" => {
+            invalid_string_fields(event, &["delta"])
+                || event
+                    .get("output_index")
+                    .is_some_and(|index| index.as_u64().is_none())
+        }
+        "response.function_call_arguments.done" => {
+            invalid_string_fields(event, &["arguments"]) || invalid_index()
+        }
+        "response.custom_tool_call_input.done" => {
+            invalid_string_fields(event, &["input"]) || invalid_index()
+        }
+        "response.reasoning_summary_part.done" => {
+            event.get("part").is_some_and(|part| !part.is_object()) || invalid_index()
+        }
+        "error" => {
+            invalid_declared_error(event)
+                || event
+                    .get("error")
+                    .is_some_and(|error| !error.is_null() && invalid_declared_error(error))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn declared_event_veto(event: &Value) -> Option<crate::ResponseStreamFailure> {
+    match event.get("type").and_then(Value::as_str) {
+        Some(
+            "response.created"
+            | "response.in_progress"
+            | "response.queued"
+            | "response.completed"
+            | "response.done"
+            | "response.incomplete"
+            | "response.failed",
+        ) => event
+            .get("response")
+            .and_then(crate::retry::declared_response_veto),
+        _ => None,
     }
 }
 

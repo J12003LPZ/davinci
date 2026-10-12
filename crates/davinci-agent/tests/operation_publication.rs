@@ -32,6 +32,464 @@ struct Fixture {
     dispatcher: ToolOperationDispatcher,
 }
 
+fn interrupted_generation() -> AssistantMessage {
+    let model = davinci_ai::load_builtin_models()
+        .into_iter()
+        .find(|model| model.api == "openai-responses")
+        .unwrap();
+    davinci_ai::fixture_complete(
+        &model, &[],
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"partial_item\",\"call_id\":\"partial_call\",\"name\":\"counted_effect\",\"arguments\":\"\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"half\\\":\"}\n\n",
+    )
+}
+
+fn counted_effect_response(id: &str) -> AssistantMessage {
+    AssistantMessage {
+        extra: Default::default(),
+        id: "effect-generation".into(),
+        role: "assistant".into(),
+        content: vec![ContentBlock::ToolCall {
+            id: id.into(),
+            name: "counted_effect".into(),
+            arguments: json!({}),
+        }],
+        model: "fixture".into(),
+        usage: None,
+        stop_reason: Some(StopReason::ToolUse),
+        error_message: None,
+    }
+}
+
+fn counted_effect_agent(fixture: &Fixture) -> Agent {
+    let mut agent = fixture.agent();
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .register(RuntimeCapability::new(
+            "counted_effect",
+            CapabilitySource::NativeExtension,
+            ToolClass::Edit,
+            false,
+            &json!({"type":"object"}),
+            None,
+        ));
+    agent.apply_extension_tools(&["counted_effect".into()]);
+    agent.set_permission_mode(PermissionMode::AlwaysApprove);
+    agent.retry_attempts = 2;
+    agent.retry_base_delay_ms = 0;
+    agent.custom_tool_executor = Some(davinci_agent::CustomToolExecutor::new(|cwd, name, _| {
+        use std::io::Write;
+        assert_eq!(name, "counted_effect");
+        let mut effects = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cwd.join("actual-effects.txt"))
+            .unwrap();
+        writeln!(effects, "effect").unwrap();
+        effects.sync_all().unwrap();
+        Ok(ToolResult {
+            content: "counted effect acknowledged".into(),
+            is_error: false,
+            details: None,
+        })
+    }));
+    agent
+}
+
+fn actual_effect_count(fixture: &Fixture) -> usize {
+    std::fs::read_to_string(fixture.workspace.join("actual-effects.txt"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+#[test]
+fn preterminal_generation_retry_never_executes_partial_mutation() {
+    let fixture = Fixture::new();
+    let mut agent = counted_effect_agent(&fixture);
+    agent.prompt("Perform one counted effect.");
+    let mut calls = 0;
+    agent
+        .run_loop(|_| {
+            calls += 1;
+            Ok(match calls {
+                1 => interrupted_generation(),
+                2 => counted_effect_response("fresh_complete_call"),
+                _ => done_response(),
+            })
+        })
+        .unwrap();
+    assert_eq!(calls, 3);
+    assert_eq!(agent.run_stats().provider_retries, 1);
+    assert_eq!(actual_effect_count(&fixture), 1);
+    let snapshot = fixture.journal.snapshot().unwrap();
+    assert_eq!(snapshot.attempts.len(), 1);
+    assert_eq!(snapshot.attempts[0].state(), OperationState::Succeeded);
+    assert!(agent
+        .messages
+        .iter()
+        .all(|message| message.tool_call_id.as_deref() != Some("partial_call|partial_item")));
+}
+
+#[test]
+fn acknowledged_effect_is_not_reexecuted_during_returned_or_raw_generation_retry() {
+    for raw_error in [false, true] {
+        let fixture = Fixture::new();
+        let mut agent = counted_effect_agent(&fixture);
+        agent.prompt("Perform one counted effect and report it.");
+        let mut calls = 0;
+        agent
+            .run_loop(|current| {
+                calls += 1;
+                if calls == 1 {
+                    return Ok(counted_effect_response("acknowledged_call"));
+                }
+                assert_eq!(actual_effect_count(&fixture), 1);
+                let results = current
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.as_deref() == Some("acknowledged_call"))
+                    .collect::<Vec<_>>();
+                assert_eq!(results.len(), 1);
+                assert_eq!(
+                    davinci_ai::content_text(&results[0].content),
+                    "counted effect acknowledged"
+                );
+                let durable = JsonlSession::open(&fixture.session_path).unwrap();
+                assert!(durable.entries.iter().any(|entry| entry
+                    .message
+                    .as_ref()
+                    .is_some_and(|message| message["toolCallId"] == "acknowledged_call")));
+                if calls == 2 {
+                    if raw_error {
+                        Err("connection lost before the next response".into())
+                    } else {
+                        Ok(interrupted_generation())
+                    }
+                } else {
+                    Ok(done_response())
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(actual_effect_count(&fixture), 1);
+        assert_eq!(agent.run_stats().provider_retries, 1);
+        let snapshot = fixture.journal.snapshot().unwrap();
+        assert_eq!(snapshot.attempts.len(), 1);
+        assert!(snapshot
+            .outbox
+            .iter()
+            .all(|item| item.state == OutboxState::Acknowledged));
+        drop(agent);
+        let mut reloaded = fixture.agent();
+        let mut followups = 0;
+        reloaded
+            .run_loop(|_| {
+                followups += 1;
+                Ok(done_response())
+            })
+            .unwrap();
+        assert_eq!(followups, 1);
+        assert_eq!(actual_effect_count(&fixture), 1);
+        assert_eq!(
+            reloaded
+                .messages
+                .iter()
+                .filter(|message| message.tool_call_id.as_deref() == Some("acknowledged_call"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn malformed_completed_arguments_preserve_validation_without_generation_retry() {
+    let fixture = Fixture::new();
+    let mut agent = counted_effect_agent(&fixture);
+    agent.prompt("Validate the proposed effect.");
+    let model = davinci_ai::load_builtin_models()
+        .into_iter()
+        .find(|model| model.api == "openai-responses")
+        .unwrap();
+    let response = json!({
+        "type":"response.completed","response":{"status":"completed","output":[
+            {"type":"function_call","id":"bad_item","call_id":"bad_call",
+             "name":"counted_effect","arguments":"{\"half\":","status":"completed"}
+        ]}
+    });
+    let malformed = davinci_ai::fixture_complete(&model, &[], &format!("data: {response}\n\n"));
+    let mut calls = 0;
+    agent
+        .run_loop(|current| {
+            calls += 1;
+            if calls == 1 {
+                Ok(malformed.clone())
+            } else {
+                assert!(current
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "toolResult" && message.is_error == Some(true)));
+                Ok(done_response())
+            }
+        })
+        .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(agent.run_stats().provider_retries, 0);
+    assert_eq!(actual_effect_count(&fixture), 0);
+}
+
+#[test]
+fn generation_retry_exhaustion_preserves_terminal_failure_in_both_return_forms() {
+    for raw_error in [false, true] {
+        let fixture = Fixture::new();
+        let mut agent = counted_effect_agent(&fixture);
+        agent.prompt("Do not execute an incomplete call.");
+        let mut calls = 0;
+        let outcome = agent.run_loop(|_| -> Result<AssistantMessage, String> {
+            calls += 1;
+            if raw_error {
+                Err("connection lost".into())
+            } else {
+                Ok(interrupted_generation())
+            }
+        });
+        assert_eq!(calls, 3);
+        assert_eq!(agent.run_stats().provider_retries, 2);
+        assert_eq!(actual_effect_count(&fixture), 0);
+        assert!(fixture.journal.snapshot().unwrap().attempts.is_empty());
+        if raw_error {
+            assert_eq!(outcome.unwrap_err(), "connection lost");
+        } else {
+            let events = outcome.unwrap();
+            assert!(events.iter().any(|event| matches!(event,
+                davinci_agent::AgentEvent::AutoRetryEnd {
+                    success: false, final_error: Some(error), ..
+                } if error == "Stream ended before the tool call was complete")));
+        }
+    }
+}
+
+#[test]
+fn cancellation_at_retry_start_never_issues_another_generation_or_effect() {
+    for raw_error in [false, true] {
+        let fixture = Fixture::new();
+        let mut agent = counted_effect_agent(&fixture);
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        agent.abort_signal = Some(signal.clone());
+        agent.event_sink = Some(davinci_agent::EventSink(Arc::new(move |event| {
+            if matches!(event, davinci_agent::AgentEvent::AutoRetryStart { .. }) {
+                signal.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })));
+        agent.prompt("Cancel interrupted generation.");
+        let mut calls = 0;
+        let events = agent
+            .run_loop(|_| -> Result<AssistantMessage, String> {
+                calls += 1;
+                if raw_error {
+                    Err("connection lost".into())
+                } else {
+                    Ok(interrupted_generation())
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(agent.run_stats().provider_retries, 0);
+        assert_eq!(actual_effect_count(&fixture), 0);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            davinci_agent::AgentEvent::AutoRetryEnd { success: false, .. }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            davinci_agent::AgentEvent::AutoRetryEnd { success: true, .. }
+        )));
+    }
+}
+
+#[test]
+fn permission_revocation_during_generation_retry_blocks_fresh_call_ids() {
+    for raw_error in [false, true] {
+        let fixture = Fixture::new();
+        let mut agent = counted_effect_agent(&fixture);
+        let permissions = agent.permissions.clone();
+        agent.event_sink = Some(davinci_agent::EventSink(Arc::new(move |event| {
+            if matches!(event, davinci_agent::AgentEvent::AutoRetryStart { .. }) {
+                permissions
+                    .lock()
+                    .unwrap()
+                    .deny
+                    .push(davinci_agent::PermissionRule::bare("counted_effect"));
+            }
+        })));
+        agent.prompt("Revalidate permission after interruption.");
+        let mut calls = 0;
+        agent
+            .run_loop(|_| {
+                calls += 1;
+                match calls {
+                    1 if raw_error => Err("connection lost".into()),
+                    1 => Ok(interrupted_generation()),
+                    2 => Ok(counted_effect_response("fresh_id_after_revocation")),
+                    _ => Ok(done_response()),
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(agent.run_stats().provider_retries, 1);
+        assert_eq!(actual_effect_count(&fixture), 0);
+        assert!(agent
+            .messages
+            .iter()
+            .any(
+                |message| message.tool_call_id.as_deref() == Some("fresh_id_after_revocation")
+                    && message.is_error == Some(true)
+            ));
+        assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
+    }
+}
+
+#[test]
+fn cancellation_immediately_before_effect_dispatch_has_zero_actual_effects() {
+    let fixture = Fixture::new();
+    let mut agent = counted_effect_agent(&fixture);
+    let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    agent.abort_signal = Some(signal.clone());
+    agent.event_sink = Some(davinci_agent::EventSink(Arc::new(move |event| {
+        if matches!(event, davinci_agent::AgentEvent::ToolExecutionStart { .. }) {
+            signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    })));
+    agent.prompt("Cancel before dispatch.");
+    let mut calls = 0;
+    agent
+        .run_loop(|_| {
+            calls += 1;
+            Ok(counted_effect_response("must_not_dispatch"))
+        })
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(actual_effect_count(&fixture), 0);
+    assert!(fixture
+        .journal
+        .snapshot()
+        .unwrap()
+        .attempts
+        .iter()
+        .all(|attempt| attempt.state() != OperationState::Succeeded));
+}
+
+#[test]
+fn uncertain_journal_effect_blocks_dispatch_and_fresh_call_id_bypass() {
+    let fixture = Fixture::new();
+    let plan = fixture.provider_plan("uncertain_original", "counted_effect", &json!({}));
+    let admitted = match fixture.dispatcher.admit(plan.clone(), 7).unwrap() {
+        OperationAdmission::New(admitted) => admitted,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    fixture
+        .dispatcher
+        .dispatch(
+            &admitted,
+            &plan,
+            Some(7),
+            false,
+            || Ok(()),
+            || std::fs::write(fixture.workspace.join("actual-effects.txt"), "effect\n").unwrap(),
+        )
+        .unwrap();
+    // Lose the acknowledgment after a real effect. The operation journal,
+    // not a fresh model call ID, determines whether continuation is safe.
+    assert_eq!(actual_effect_count(&fixture), 1);
+    let mut agent = counted_effect_agent(&fixture);
+    agent.prompt("Continue only if safe.");
+    let mut calls = 0;
+    let result = agent.run_loop(|_| {
+        calls += 1;
+        Ok(counted_effect_response("fresh_id_not_proof"))
+    });
+    assert!(result.is_err());
+    assert_eq!(calls, 1);
+    assert_eq!(actual_effect_count(&fixture), 1);
+    assert_eq!(fixture.journal.snapshot().unwrap().attempts.len(), 1);
+}
+
+#[test]
+fn acknowledged_read_is_retained_without_reexecution_after_generation_disconnect() {
+    for raw_error in [false, true] {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.workspace.join("source.txt"), "read evidence").unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = reads.clone();
+        let mut agent = fixture.agent();
+        agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .capability_registry
+            .register(
+                RuntimeCapability::new(
+                    "counted_read",
+                    CapabilitySource::NativeExtension,
+                    ToolClass::Read,
+                    true,
+                    &json!({"type":"object"}),
+                    None,
+                )
+                .with_declared_effects(vec![DeclaredEffect::FileSystemRead]),
+            );
+        agent.apply_extension_tools(&["counted_read".into()]);
+        agent.set_permission_mode(PermissionMode::AlwaysApprove);
+        agent.retry_base_delay_ms = 0;
+        agent.custom_tool_executor =
+            Some(davinci_agent::CustomToolExecutor::new(move |cwd, _, _| {
+                let content = std::fs::read_to_string(cwd.join("source.txt")).unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: None,
+                })
+            }));
+        agent.prompt("Read once and retain the evidence.");
+        let mut calls = 0;
+        agent
+            .run_loop(|current| {
+                calls += 1;
+                if calls == 1 {
+                    let mut message = counted_effect_response("read_once");
+                    let ContentBlock::ToolCall { name, .. } = &mut message.content[0] else {
+                        unreachable!()
+                    };
+                    *name = "counted_read".into();
+                    return Ok(message);
+                }
+                assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(
+                    current
+                        .messages
+                        .iter()
+                        .filter(|message| message.tool_call_id.as_deref() == Some("read_once"))
+                        .count(),
+                    1
+                );
+                if calls == 2 && raw_error {
+                    Err("connection lost".into())
+                } else if calls == 2 {
+                    Ok(interrupted_generation())
+                } else {
+                    Ok(done_response())
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fixture.journal.snapshot().unwrap().attempts.len(), 1);
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();

@@ -60,6 +60,7 @@ pub mod responses_ledger;
 pub mod responses_request;
 pub mod responses_tools;
 mod retry;
+pub use retry::{response_stream_failure, ResponseStreamFailure};
 pub mod service_tier;
 mod shell;
 mod stream_decoder_pi;

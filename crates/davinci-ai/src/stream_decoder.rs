@@ -239,6 +239,7 @@ pub struct ResponsesDecoder {
     slots: HashMap<u64, Slot>,
     output_indices: HashMap<u64, usize>,
     started: bool,
+    recognized_event: bool,
     done: bool,
     pub raw_items: Vec<Value>,
     pub last_response_id: Option<String>,
@@ -254,6 +255,7 @@ impl ResponsesDecoder {
             slots: HashMap::new(),
             output_indices: HashMap::new(),
             started: false,
+            recognized_event: false,
             done: false,
             raw_items: Vec::new(),
             last_response_id: None,
@@ -262,6 +264,10 @@ impl ResponsesDecoder {
 
     pub fn raw_items(&self) -> &[Value] {
         &self.raw_items
+    }
+
+    pub(crate) fn has_recognized_event(&self) -> bool {
+        self.recognized_event
     }
 
     pub fn last_response_id(&self) -> Option<&str> {
@@ -737,6 +743,17 @@ impl ResponsesDecoder {
             .and_then(|response| response.pointer("/incomplete_details/reason"))
             .and_then(Value::as_str);
         let (mut stop_reason, mut error_message) = map_stop_reason(status, incomplete_reason);
+        if response
+            .and_then(|response| response.get("status"))
+            .is_some_and(|status| !status.is_null() && !status.is_string())
+        {
+            stop_reason = StopReason::Error;
+            error_message = Some("Response contains an invalid status field".into());
+            crate::retry::set_response_stream_failure(
+                &mut self.message,
+                crate::ResponseStreamFailure::InvalidStream,
+            );
+        }
         if let Some(error) = response
             .and_then(|response| response.get("error"))
             .filter(|error| !error.is_null())
@@ -753,6 +770,10 @@ impl ResponsesDecoder {
         {
             stop_reason = StopReason::Error;
             error_message = Some("Response contains an unfinished tool call".into());
+            crate::retry::set_response_stream_failure(
+                &mut self.message,
+                crate::ResponseStreamFailure::UnfinishedTerminalToolCall,
+            );
         }
         if stop_reason != StopReason::Stop {
             // Partial calls are presentation only. Never expose them to the
@@ -775,6 +796,16 @@ impl ResponsesDecoder {
         }
         self.message.stop_reason = Some(stop_reason);
         self.message.error_message = error_message;
+        if stop_reason == StopReason::Error
+            && crate::response_stream_failure(&self.message).is_none()
+        {
+            crate::retry::set_response_stream_failure(
+                &mut self.message,
+                response
+                    .map(crate::retry::classify_terminal_response_error)
+                    .unwrap_or(crate::ResponseStreamFailure::ProviderTerminalError),
+            );
+        }
         self.done = true;
         if stop_reason == StopReason::Error {
             out.push(AssistantMessageEvent::Error {
@@ -997,10 +1028,36 @@ impl StreamDecoder for ResponsesDecoder {
             return;
         }
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
-        if event_type.is_empty() {
+        if !event.is_object()
+            || event_type.is_empty()
+            || crate::responses_ledger::invalid_declared_event_payload(event)
+        {
+            crate::retry::set_response_stream_failure(
+                &mut self.message,
+                crate::ResponseStreamFailure::InvalidStream,
+            );
+            self.fail("Invalid Responses event envelope".into(), out);
             return;
         }
         self.start(out);
+        if let Some(failure) = crate::responses_ledger::declared_event_veto(event) {
+            crate::retry::set_response_stream_failure(&mut self.message, failure);
+            let detail = event
+                .get("response")
+                .map(codex_error_text)
+                .filter(|text| !text.starts_with('{') && !text.starts_with('['))
+                .unwrap_or_else(|| {
+                    event
+                        .pointer("/response/incomplete_details/reason")
+                        .and_then(Value::as_str)
+                        .map(|reason| format!("Response incomplete: {reason}"))
+                        .unwrap_or_else(|| {
+                            "Response declared a rejected or unsupported provider state".into()
+                        })
+                });
+            self.fail(detail, out);
+            return;
+        }
         let output_index = Self::output_index(event);
         match event_type {
             "response.created" | "response.in_progress" | "response.queued" => {
@@ -1111,7 +1168,37 @@ impl StreamDecoder for ResponsesDecoder {
                     .get("response")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                if event_type == "response.incomplete" || response.get("status").is_none() {
+                // Some terminal envelopes carry status beside `response`.
+                // Do not let a malformed envelope-level status be ignored
+                // while a completed nested response authorizes tool calls.
+                let expected_status = if event_type == "response.incomplete" {
+                    "incomplete"
+                } else {
+                    "completed"
+                };
+                if event
+                    .get("status")
+                    .is_some_and(|status| status.as_str() != Some(expected_status))
+                {
+                    crate::retry::set_response_stream_failure(
+                        &mut self.message,
+                        crate::ResponseStreamFailure::InvalidStream,
+                    );
+                    if !response.is_object() {
+                        response = serde_json::json!({});
+                    }
+                    // Force the shared finalizer to fail closed even if the
+                    // nested response claims completion.
+                    response["status"] = Value::Number(503.into());
+                }
+                // An incomplete event cannot turn a declared cancellation,
+                // unknown state, or malformed status into a retryable failure.
+                let status = response.get("status");
+                if status.is_none()
+                    || (event_type == "response.incomplete"
+                        && (status.is_some_and(Value::is_null)
+                            || status.and_then(Value::as_str) == Some("completed")))
+                {
                     response["status"] = Value::String(
                         if event_type == "response.incomplete" {
                             "incomplete"
@@ -1127,6 +1214,13 @@ impl StreamDecoder for ResponsesDecoder {
                 self.finalize(Some(&response), out);
             }
             "response.failed" => {
+                crate::retry::set_response_stream_failure(
+                    &mut self.message,
+                    event
+                        .get("response")
+                        .map(crate::retry::classify_terminal_response_error)
+                        .unwrap_or(crate::ResponseStreamFailure::ProviderTerminalError),
+                );
                 let text = event
                     .get("response")
                     .map(codex_error_text)
@@ -1135,17 +1229,30 @@ impl StreamDecoder for ResponsesDecoder {
                 self.fail(text, out);
             }
             "error" => {
+                crate::retry::set_response_stream_failure(
+                    &mut self.message,
+                    crate::retry::classify_terminal_response_error(event),
+                );
                 let text = codex_error_text(event);
                 self.fail(format!("Codex error: {text}"), out);
             }
-            _ => {}
+            _ => return,
         }
+        self.recognized_event = true;
     }
 
     fn finish(&mut self, out: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         if !self.done {
             // The connection closed before the terminal event: keep what
             // arrived, but the turn did not finish.
+            crate::retry::set_response_stream_failure(
+                &mut self.message,
+                if self.recognized_event {
+                    crate::ResponseStreamFailure::MissingTerminal
+                } else {
+                    crate::ResponseStreamFailure::Unknown
+                },
+            );
             let cut_tool_call = self
                 .slots
                 .values()
@@ -1202,6 +1309,80 @@ mod tests {
         (message, out)
     }
 
+    #[test]
+    fn unknown_only_responses_events_do_not_establish_retry_authority() {
+        let unknown = "data: {\"type\":\"not_a_responses_event\"}\n\n";
+        let (message, _) = run(unknown);
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            crate::response_stream_failure(&message),
+            Some(crate::ResponseStreamFailure::Unknown)
+        );
+        assert!(!crate::is_retryable_assistant_error(&message));
+        let (known, _) = run(&format!(
+            "{unknown}data: {{\"type\":\"response.created\"}}\n\n{unknown}"
+        ));
+        assert_eq!(
+            crate::response_stream_failure(&known),
+            Some(crate::ResponseStreamFailure::MissingTerminal)
+        );
+        assert!(crate::is_retryable_assistant_error(&known));
+        let (completed,_) = run(&format!("{unknown}data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[]}}}}\n\n"));
+        assert_eq!(completed.stop_reason, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn malformed_known_payloads_never_establish_retry_evidence() {
+        for event in [
+            serde_json::json!({"type":"response.output_item.done","item":false}),
+            serde_json::json!({"type":"response.output_item.added","item":[]}),
+            serde_json::json!({"type":"response.output_item.done","item":{"type":"function_call","status":false,"arguments":"{}"}}),
+            serde_json::json!({"type":"response.output_text.delta","delta":503}),
+            serde_json::json!({"type":"response.reasoning_text.delta","delta":null}),
+            serde_json::json!({"type":"response.function_call_arguments.done","arguments":false}),
+            serde_json::json!({"type":"response.custom_tool_call_input.done","input":{}}),
+            serde_json::json!({"type":"response.created","response":[]}),
+            serde_json::json!({"type":"response.output_item.done","output_index":"503","item":{"type":"message"}}),
+            serde_json::json!({"type":"error","error":false,"message":"HTTP 503; please retry your request"}),
+            serde_json::json!({"type":"response.failed","response":{"status":"failed","error":false,"message":"HTTP 503; please retry your request"}}),
+            serde_json::json!({"type":"response.function_call_arguments.done","output_index":false}),
+            serde_json::json!({"type":"response.reasoning_summary_part.done","part":false}),
+        ] {
+            let (message, _) = run(&format!("data: {event}\n\n"));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream),
+                "{event}"
+            );
+            assert!(!crate::is_retryable_assistant_error(&message));
+            let terminal = serde_json::json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}});
+            let (message, _) = run(&format!("data: {event}\n\ndata: {terminal}\n\n"));
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert!(crate::NativeResponsesOutput::from_events(&[event, terminal]).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_terminal_response_returns_invalidity_instead_of_panicking() {
+        for response in [
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!(null),
+            serde_json::json!({"id":"r","status":"completed","output":false}),
+            serde_json::json!({"id":"r","status":"completed","output":[false]}),
+        ] {
+            let event = serde_json::json!({"type":"response.completed","response":response});
+            let (message, _) = run(&format!("data: {event}\n\n"));
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(crate::NativeResponsesOutput::from_events(&[event]).is_none());
+            assert!(crate::NativeResponsesOutput::from_response_value(&response).is_none());
+        }
+    }
+
     fn names(events: &[AssistantMessageEvent]) -> Vec<&'static str> {
         events
             .iter()
@@ -1220,6 +1401,286 @@ mod tests {
                 AssistantMessageEvent::Error { .. } => "error",
             })
             .collect()
+    }
+
+    #[test]
+    fn malformed_envelope_status_never_authorizes_terminal_tool_calls() {
+        for status in [
+            serde_json::json!(503),
+            serde_json::json!("cancelled"),
+            serde_json::Value::Null,
+        ] {
+            let event = serde_json::json!({
+                "type":"response.completed",
+                "status":status,
+                "response":{
+                    "id":"r",
+                    "status":"completed",
+                    "output":[{
+                        "type":"function_call",
+                        "id":"i",
+                        "call_id":"c",
+                        "name":"read",
+                        "arguments":"{}",
+                        "status":"completed"
+                    }]
+                }
+            });
+            let (message, _) = run(&format!("data: {event}\n\n"));
+
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(!message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+            assert!(crate::NativeResponsesOutput::from_events(&[event]).is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_provider_errors_preserve_bounded_transient_retry_policy() {
+        for kind in [
+            "response.failed",
+            "error",
+            "response.done",
+            "response.completed",
+            "response.incomplete",
+        ] {
+            for (code, text, retryable) in [
+                (
+                    "server_error",
+                    "HTTP 503 server error; please retry your request",
+                    true,
+                ),
+                ("rate_limit_exceeded", "HTTP 429 rate limit", true),
+                ("server_error", "please retry your request", true),
+                ("insufficient_quota", "HTTP 429 insufficient_quota", false),
+                ("usage_limit_reached", "HTTP 429 usage_limit_reached", false),
+                (
+                    "chatpass_v2_scope_not_authorized",
+                    "HTTP 503 chatpass_v2_scope_not_authorized",
+                    false,
+                ),
+                (
+                    "context_length_exceeded",
+                    "context_length_exceeded; please retry your request",
+                    false,
+                ),
+                ("invalid_request_error", "invalid arguments", false),
+                (
+                    "insufficient_quota",
+                    "HTTP 503; please retry your request",
+                    false,
+                ),
+                (
+                    "chatpass_v2_scope_not_authorized",
+                    "HTTP 503; please retry your request",
+                    false,
+                ),
+                (
+                    "invalid_request_error",
+                    "HTTP 503; please retry your request",
+                    false,
+                ),
+                (
+                    "content_policy_violation",
+                    "HTTP 503; please retry your request",
+                    false,
+                ),
+                (
+                    "invalid_prompt",
+                    "HTTP 503; please retry your request",
+                    false,
+                ),
+                (
+                    "image_content_policy_violation",
+                    "HTTP 503; please retry your request",
+                    false,
+                ),
+            ] {
+                let error = serde_json::json!({"code": code, "message": text});
+                let event = if kind == "error" {
+                    serde_json::json!({"type": kind, "error": error})
+                } else {
+                    serde_json::json!({"type": kind, "response": {"status": if kind == "response.incomplete" { "incomplete" } else { "failed" }, "output": [], "error": error}})
+                };
+                let (message, _) = run(&format!("data: {event}\n\n"));
+                assert_eq!(message.stop_reason, Some(StopReason::Error));
+                assert_eq!(
+                    crate::is_retryable_assistant_error(&message),
+                    retryable,
+                    "{event}"
+                );
+                assert!(!message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_content_filter_reason_vetoes_transient_error_text() {
+        for kind in ["response.incomplete", "response.done", "response.completed"] {
+            let event = serde_json::json!({
+                "type": kind,
+                "response": {
+                    "status": "incomplete", "output": [],
+                    "incomplete_details": {"reason": "content_filter"},
+                    "error": {"code": "server_error", "message": "HTTP 503; please retry your request"},
+                },
+            });
+            let (message, _) = run(&format!("data: {event}\n\n"));
+            assert!(!crate::is_retryable_assistant_error(&message), "{kind}");
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::ProviderTerminalRejection)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_or_unknown_terminal_status_never_retries_transient_text() {
+        for status in ["cancelled", "503", "queued", "in_progress"] {
+            let event = serde_json::json!({
+                "type": "response.done",
+                "response": {"status": status, "output": [],
+                    "error": {"code": "server_error", "message": "HTTP 503; please retry your request"}},
+            });
+            let (message, _) = run(&format!("data: {event}\n\n"));
+            assert!(!crate::is_retryable_assistant_error(&message), "{status}");
+        }
+    }
+
+    #[test]
+    fn malformed_declared_status_never_authorizes_calls() {
+        for status in [
+            serde_json::json!(true),
+            serde_json::json!(503),
+            serde_json::json!({}),
+        ] {
+            let response = serde_json::json!({
+                "id": "fixture", "status": status,
+                "output": [{"type":"function_call","id":"item","call_id":"call","name":"write","arguments":"{}","status":"completed"}],
+            });
+            let (message, _) = run(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"type": "response.done", "response": response})
+            ));
+            assert_eq!(message.stop_reason, Some(StopReason::Error), "{status}");
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::Unknown)
+            );
+            assert!(!crate::is_retryable_assistant_error(&message));
+            assert!(message.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_declared_status_never_produces_native_output() {
+        for status in [
+            serde_json::json!(true),
+            serde_json::json!(503),
+            serde_json::json!({}),
+        ] {
+            let response = serde_json::json!({"id": "fixture", "status": status, "output": []});
+            let event = serde_json::json!({"type": "response.done", "response": response});
+            assert!(
+                crate::responses_ledger::NativeResponsesOutput::from_events(&[event]).is_none(),
+                "{status}"
+            );
+            assert!(
+                crate::responses_ledger::NativeResponsesOutput::from_response_value(&response)
+                    .is_none(),
+                "{status}"
+            );
+        }
+        for response in [
+            serde_json::json!({"id": "fixture", "output": []}),
+            serde_json::json!({"id": "fixture", "status": null, "output": []}),
+            serde_json::json!({"id": "fixture", "status": "completed", "output": []}),
+        ] {
+            assert!(
+                crate::responses_ledger::NativeResponsesOutput::from_response_value(&response)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn preterminal_declared_status_vetoes_survive_eof_and_terminal_output() {
+        for status in [
+            serde_json::json!(true),
+            serde_json::json!(503),
+            serde_json::json!("unexpected"),
+            serde_json::json!("cancelled"),
+        ] {
+            let event = serde_json::json!({"type":"response.created","response":{"status":status}});
+            let (message, _) = run(&format!("data: {event}\n\n"));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(if status == "cancelled" {
+                    crate::ResponseStreamFailure::ProviderTerminalRejection
+                } else {
+                    crate::ResponseStreamFailure::Unknown
+                })
+            );
+            assert!(!crate::is_retryable_assistant_error(&message));
+            let terminal = serde_json::json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[{"type":"function_call","id":"i","call_id":"c","name":"write","arguments":"{}"}]}});
+            let (message, _) = run(&format!("data: {event}\n\ndata: {terminal}\n\n"));
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert!(message.content.is_empty());
+            assert!(crate::NativeResponsesOutput::from_events(&[event, terminal]).is_none());
+        }
+    }
+
+    #[test]
+    fn declared_content_filter_precedes_completed_callable_output() {
+        let response = serde_json::json!({"id":"r","status":"completed","incomplete_details":{"reason":"content_filter"},
+            "output":[{"type":"function_call","id":"i","call_id":"c","name":"write","arguments":"{}","status":"completed"}]});
+        let event = serde_json::json!({"type":"response.completed","response":response});
+        for message in [
+            run(&format!("data: {event}\n\n")).0,
+            crate::stream::parse_provider_response(&model(), &response.to_string()),
+        ] {
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::ProviderTerminalRejection)
+            );
+            assert!(!crate::is_retryable_assistant_error(&message));
+            assert!(message.content.is_empty());
+        }
+        assert!(crate::NativeResponsesOutput::from_events(&[event]).is_none());
+        assert!(crate::NativeResponsesOutput::from_response_value(&response).is_none());
+    }
+
+    #[test]
+    fn malformed_incomplete_details_never_authorize_calls_or_native() {
+        for details in [
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({"reason":false}),
+            serde_json::json!({"reason":503}),
+        ] {
+            let response = serde_json::json!({"id":"r","status":"completed","incomplete_details":details,
+                "output":[{"type":"function_call","id":"i","call_id":"c","name":"write","arguments":"{}","status":"completed"}]});
+            let event = serde_json::json!({"type":"response.completed","response":response});
+            let (message, _) = run(&format!("data: {event}\n\n"));
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(message.content.is_empty());
+            assert!(crate::NativeResponsesOutput::from_events(&[event]).is_none());
+            assert!(crate::NativeResponsesOutput::from_response_value(&response).is_none());
+        }
     }
 
     #[test]
@@ -1472,6 +1933,33 @@ data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":
 "#,
         );
         assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert!(!message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+        assert!(crate::is_retryable_assistant_error(&message));
+    }
+
+    #[test]
+    fn preterminal_eof_matrix_drops_all_provisional_calls_before_retry() {
+        for corpus in [
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"fixture\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"item\",\"call_id\":\"call\",\"name\":\"apply_patch\",\"input\":\"half\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item\",\"call_id\":\"call\",\"name\":\"read\",\"arguments\":\"{}\"}}\n\n",
+        ] {
+            let (message, events) = run(corpus);
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::MissingTerminal)
+            );
+            assert!(crate::is_retryable_assistant_error(&message));
+            assert!(!message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+            assert!(matches!(events.last(), Some(AssistantMessageEvent::Error { .. })));
+        }
     }
 
     #[test]

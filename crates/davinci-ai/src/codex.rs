@@ -1326,6 +1326,157 @@ data: {"type":"response.completed","response":{"status":"completed"}}
     }
 
     #[test]
+    fn localhost_structured_control_errors_keep_bounded_recovery() {
+        let _guard = lock_env();
+        use crate::StopReason;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+        let previous_reply = std::env::var("PI_CODEX_WS_REPLY").ok();
+        let previous_url = std::env::var("PI_CODEX_WS_URL").ok();
+        std::env::remove_var("PI_CODEX_WS_REPLY");
+        for code in [
+            PREVIOUS_RESPONSE_NOT_FOUND,
+            WEBSOCKET_CONNECTION_LIMIT_REACHED,
+        ] {
+            for exhausted in [false, true] {
+                let session = format!("control-{code}-{exhausted}");
+                let account = "acc_control";
+                let old =
+                    serde_json::json!({"model":"gpt-5","input":[{"role":"user","content":"old"}]});
+                let acknowledged = serde_json::json!({"type":"function_call_output","call_id":"already-executed","output":"acknowledged"});
+                let body = serde_json::json!({"model":"gpt-5","input":[old["input"][0],acknowledged,{"role":"user","content":"next"}]});
+                store_cached_continuation(
+                    Some(&session),
+                    account,
+                    CachedWebSocketContinuation {
+                        last_request_body: old,
+                        last_response_id: "resp_old".into(),
+                        last_response_items: serde_json::json!([acknowledged]),
+                    },
+                    false,
+                    Instant::now(),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                std::env::set_var(
+                    "PI_CODEX_WS_URL",
+                    format!("ws://{}/codex/responses", listener.local_addr().unwrap()),
+                );
+                let stop = Arc::new(AtomicBool::new(false));
+                let server_stop = stop.clone();
+                let server = std::thread::spawn(move || {
+                    let mut bodies = Vec::new();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while bodies.len() < 2 && !server_stop.load(Ordering::Relaxed) {
+                        let mut stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline);
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            Err(err) => panic!("{err}"),
+                        };
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut headers = Vec::new();
+                        while !headers.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte).unwrap();
+                            headers.push(byte[0]);
+                        }
+                        let headers = String::from_utf8(headers).unwrap();
+                        let key = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':')
+                                    .filter(|(name, _)| {
+                                        name.eq_ignore_ascii_case("sec-websocket-key")
+                                    })
+                                    .map(|(_, value)| value.trim())
+                            })
+                            .unwrap();
+                        let accept = crate::codex_ws::accept_key_for_tests(key);
+                        write!(stream,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
+                        let mut header = [0; 2];
+                        stream.read_exact(&mut header).unwrap();
+                        assert_eq!(header[0], 0x81);
+                        assert_ne!(header[1] & 0x80, 0);
+                        let mut len = (header[1] & 0x7f) as usize;
+                        if len == 126 {
+                            let mut ext = [0; 2];
+                            stream.read_exact(&mut ext).unwrap();
+                            len = u16::from_be_bytes(ext) as usize;
+                        }
+                        assert!(len < 65536);
+                        let mut mask = [0; 4];
+                        stream.read_exact(&mut mask).unwrap();
+                        let mut bytes = vec![0; len];
+                        stream.read_exact(&mut bytes).unwrap();
+                        for (index, byte) in bytes.iter_mut().enumerate() {
+                            *byte ^= mask[index % 4];
+                        }
+                        bodies.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+                        let event = if bodies.len() == 1 || exhausted {
+                            serde_json::json!({"type":"error","error":{"code":code}})
+                        } else {
+                            serde_json::json!({"type":"response.completed","response":{"id":"resp_new","status":"completed","output":[]}})
+                        };
+                        crate::codex_ws::write_unmasked_text(&mut stream, &event.to_string())
+                            .unwrap();
+                    }
+                    bodies
+                });
+                let outcome = try_codex_websocket_transport(
+                    &model(),
+                    &body,
+                    &mock_token(account),
+                    Some("auto"),
+                    Some(&session),
+                    None,
+                    Some(2000),
+                    Some(2000),
+                );
+                stop.store(true, Ordering::Relaxed);
+                let bodies = server.join().unwrap();
+                assert_eq!(bodies.len(), 2, "{code}/{exhausted}: {outcome:?}");
+                assert_eq!(bodies[0]["previous_response_id"], "resp_old");
+                if code == PREVIOUS_RESPONSE_NOT_FOUND {
+                    assert!(bodies[1].get("previous_response_id").is_none());
+                    assert_eq!(bodies[1]["input"], body["input"]);
+                }
+                if exhausted {
+                    assert!(matches!(outcome, Ok(CodexWebsocketOutcome::FallbackToSse)));
+                }
+                if !exhausted {
+                    let Ok(CodexWebsocketOutcome::Message(message)) = outcome else {
+                        panic!("expected recovered completion")
+                    };
+                    assert_eq!(message.message.stop_reason, Some(StopReason::Stop));
+                    assert!(message.message.content.is_empty());
+                }
+                close_openai_codex_websocket_sessions(Some(&session));
+                reset_openai_codex_websocket_debug_stats(Some(&session));
+            }
+        }
+        match previous_reply {
+            Some(value) => std::env::set_var("PI_CODEX_WS_REPLY", value),
+            None => std::env::remove_var("PI_CODEX_WS_REPLY"),
+        }
+        match previous_url {
+            Some(value) => std::env::set_var("PI_CODEX_WS_URL", value),
+            None => std::env::remove_var("PI_CODEX_WS_URL"),
+        }
+    }
+
+    #[test]
     fn localhost_websocket_reuses_the_live_socket() {
         let _guard = lock_env();
         use std::io::{Read, Write};

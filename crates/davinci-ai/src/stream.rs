@@ -475,7 +475,7 @@ fn read_provider_stream(
     let mut raw = String::new();
     let mut frames = 0usize;
     let mut aborted = false;
-    let mut read_error: Option<String> = None;
+    let mut read_error: Option<(String, crate::ResponseStreamFailure)> = None;
 
     // Raw frames are only needed to assemble native Responses output.
     let keep_raw_events = native_responses_api(model);
@@ -502,7 +502,10 @@ fn read_provider_stream(
             Ok(Ok(line)) => line,
             Ok(Err(err)) => {
                 crate::trace::log(&format!("sse read error after {frames} frames: {err}"));
-                read_error = Some(format!("Unable to read provider response: {err}"));
+                read_error = Some((
+                    format!("Unable to read provider response: {err}"),
+                    crate::retry::classify_stream_read_error(&err),
+                ));
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -510,12 +513,18 @@ fn read_provider_stream(
         };
         stream_bytes = stream_bytes.saturating_add(line.len());
         if stream_bytes > MAX_STREAM_BYTES {
-            read_error = Some("provider stream exceeds 256 MiB".into());
+            read_error = Some((
+                "provider stream exceeds 256 MiB".into(),
+                crate::ResponseStreamFailure::InvalidStream,
+            ));
             break;
         }
         if frames == 0 {
             if raw.len().saturating_add(line.len()) > crate::stream_reader::MAX_FRAME_BYTES {
-                read_error = Some("non-streaming provider response exceeds 16 MiB".into());
+                read_error = Some((
+                    "non-streaming provider response exceeds 16 MiB".into(),
+                    crate::ResponseStreamFailure::InvalidStream,
+                ));
                 break;
             }
             raw.push_str(&line);
@@ -561,19 +570,24 @@ fn read_provider_stream(
         }
     }
 
-    if !aborted && read_error.is_none() {
+    if !aborted {
         // A frame that failed to parse may have carried content or tool-call
         // bytes; a terminal event after the hole must not make the turn
         // look complete.
         if let Some(reason) = framer.malformed() {
-            read_error = Some(format!("Provider stream contained a {reason}"));
+            read_error = Some((
+                format!("Provider stream contained a {reason}"),
+                crate::ResponseStreamFailure::InvalidStream,
+            ));
+        } else if native_responses_api(model) && framer.saw_done() && !decoder.is_done() {
+            read_error = Some((
+                "Provider stream ended with a sentinel before its terminal response".into(),
+                crate::ResponseStreamFailure::InvalidStream,
+            ));
         }
     }
 
-    if frames == 0 && !aborted {
-        if let Some(err) = read_error {
-            return Err(err);
-        }
+    if frames == 0 && !aborted && read_error.is_none() {
         if crate::trace::enabled() {
             // Response bodies can contain user-visible output, provider prompt
             // fragments in errors, or opaque reasoning. Trace only the size.
@@ -582,10 +596,21 @@ fn read_provider_stream(
                 raw.len()
             ));
         }
-        let message = parse_provider_response(model, &raw);
-        let synthesized = events_from_complete(&message);
+        let mut message = parse_provider_response(model, &raw);
+        let mut synthesized = events_from_complete(&message);
         for event in &synthesized {
             on_event(event);
+        }
+        if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            abort_message(&mut message);
+            let event = AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                error: message.clone(),
+            };
+            on_event(&event);
+            synthesized.push(event);
+            PartialRetention::finish(&mut synthesized, &message);
+            return Ok((message, synthesized, None));
         }
         let native = native_responses_api(model)
             .then(|| serde_json::from_str::<Value>(&raw).ok())
@@ -596,11 +621,11 @@ fn read_provider_stream(
         return Ok((message, synthesized, native));
     }
 
+    aborted |= abort.is_some_and(|flag| flag.load(Ordering::Relaxed));
     if aborted {
         let mut closing = Vec::new();
         let mut message = decoder.finish(&mut closing);
-        message.stop_reason = Some(StopReason::Aborted);
-        message.error_message = Some("Request was aborted".into());
+        abort_message(&mut message);
         let event = AssistantMessageEvent::Error {
             reason: StopReason::Aborted,
             error: message.clone(),
@@ -613,11 +638,27 @@ fn read_provider_stream(
 
     let start = events.len();
     let mut message = decoder.finish(&mut events);
-    if let Some(err) = read_error.filter(|_| message.stop_reason != Some(StopReason::Error)) {
-        // The connection dropped after the stream began: keep what arrived,
-        // say why it stopped.
+    if let Some((err, failure)) = read_error {
+        // Preserve typed failures even before the first frame. Parser sizes
+        // and locations in error text are not HTTP status or retry evidence.
         message.stop_reason = Some(StopReason::Error);
         message.error_message = Some(err);
+        let failure = if frames > 0
+            && failure == crate::ResponseStreamFailure::TransportInterrupted
+            && crate::response_stream_failure(&message)
+                == Some(crate::ResponseStreamFailure::Unknown)
+        {
+            // A timeout after unknown-only frames does not establish that
+            // those frames formed a valid Responses stream.
+            crate::ResponseStreamFailure::Unknown
+        } else {
+            failure
+        };
+        crate::retry::set_response_stream_failure(&mut message, failure);
+        message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
+        message.extra.remove(crate::RESPONSES_TOOL_WIRE_KINDS_KEY);
         events.truncate(start);
         events.push(AssistantMessageEvent::Error {
             reason: StopReason::Error,
@@ -626,6 +667,15 @@ fn read_provider_stream(
     }
     for event in &events[start..] {
         on_event(event);
+    }
+    if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        abort_message(&mut message);
+        let event = AssistantMessageEvent::Error {
+            reason: StopReason::Aborted,
+            error: message.clone(),
+        };
+        on_event(&event);
+        events.push(event);
     }
     PartialRetention::finish(&mut events, &message);
     let native = if native_responses_api(model)
@@ -637,6 +687,21 @@ fn read_provider_stream(
         None
     };
     Ok((message, events, native))
+}
+
+pub(crate) fn abort_message(message: &mut AssistantMessage) {
+    message.stop_reason = Some(StopReason::Aborted);
+    message.error_message = Some("Request was aborted".into());
+    message
+        .content
+        .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
+    for key in [
+        crate::RESPONSES_TOOL_WIRE_KINDS_KEY,
+        NATIVE_ITEMS_KEY,
+        NATIVE_MODEL_KEY,
+    ] {
+        message.extra.remove(key);
+    }
 }
 
 pub fn complete_from_events(events: &[AssistantMessageEvent]) -> Option<AssistantMessage> {
@@ -3036,7 +3101,7 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
             // An HTML error page or truncated JSON behind an HTTP 200 is a
             // failed exchange, not assistant text. Report only its size: the
             // body may carry user content or provider prompt fragments.
-            return AssistantMessage {
+            let mut message = AssistantMessage {
                 extra: Default::default(),
                 id: Uuid::new_v4().to_string(),
                 role: "assistant".into(),
@@ -3049,12 +3114,38 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
                     raw.len()
                 )),
             };
+            crate::retry::set_response_stream_failure(
+                &mut message,
+                crate::ResponseStreamFailure::InvalidStream,
+            );
+            return message;
         }
     };
     let mut content = Vec::new();
     let response = value.get("response").unwrap_or(&value);
+    if native_responses_api(model)
+        && response.get("error").is_some_and(|error| !error.is_null())
+        && response.get("status").is_none()
+    {
+        let mut decoder = crate::ResponsesDecoder::new(model);
+        let mut events = Vec::new();
+        let mut event = response.clone();
+        event["type"] = Value::String("error".into());
+        decoder.feed(&event, &mut events);
+        return decoder.finish(&mut events);
+    }
+    // The legacy fixture parser also accepts Bedrock's output.message shape.
+    // That documented object is not a malformed Responses output array.
+    let legacy_bedrock_output = response
+        .pointer("/output/message/content")
+        .is_some_and(Value::is_array);
     if response.get("output").is_some_and(Value::is_array)
-        || (native_responses_api(model) && response.get("status").is_some())
+        || (native_responses_api(model)
+            && (response.get("status").is_some()
+                || response.get("incomplete_details").is_some()
+                || crate::retry::declared_response_veto(response).is_some()
+                || (response.get("output").is_some() && !legacy_bedrock_output)
+                || value.get("response").is_some()))
     {
         // Responses shares one normalizer across JSON, SSE, and WebSocket.
         // In particular, a 200 response can still be incomplete or failed.
@@ -3802,6 +3893,18 @@ mod tests {
         std::sync::mpsc::Sender<()>,
         std::thread::JoinHandle<bool>,
     ) {
+        sse_server_bytes(first.as_bytes(), second.as_bytes(), patience)
+    }
+
+    fn sse_server_bytes(
+        first: &'static [u8],
+        second: &'static [u8],
+        patience: Duration,
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<bool>,
+    ) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3834,10 +3937,11 @@ mod tests {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
-            stream.write_all(first.as_bytes()).unwrap();
+            stream.write_all(first).unwrap();
             stream.flush().unwrap();
             let released = release_rx.recv_timeout(patience).is_ok();
-            stream.write_all(second.as_bytes()).unwrap();
+            // Invalid-data tests deliberately make the client close early.
+            let _ = stream.write_all(second);
             stream.flush().unwrap();
             let _ = stream.shutdown(std::net::Shutdown::Both);
             released
@@ -4045,6 +4149,411 @@ mod tests {
                 server.join().unwrap(),
                 "provider socket survived completion (cancel={cancel})"
             );
+        }
+    }
+
+    #[test]
+    fn invalid_reader_data_never_inherits_retryable_decoder_eof() {
+        let oversized = vec![b'x'; crate::stream_reader::MAX_FRAME_BYTES + 1].leak();
+        for invalid in [b"data: \xff\n\n".as_slice(), oversized] {
+            let (base, release, server) = sse_server_bytes(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"fixture\"}}\n\n",
+                invalid,
+                Duration::from_secs(2),
+            );
+            release.send(()).unwrap();
+            let mut model = loopback_model(&base);
+            model.api = "openai-responses".into();
+            let envelope = live_complete_streaming_with_sink_envelope(
+                &model,
+                &[ChatMessage::text("user", "fixture")],
+                &loopback_auth(),
+                None,
+                &[],
+                &StreamOptions::default(),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert!(server.join().unwrap());
+            assert_eq!(
+                crate::response_stream_failure(&envelope.message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(!crate::is_retryable_assistant_error(&envelope.message));
+            assert!(envelope.native_responses.is_none());
+        }
+    }
+
+    #[test]
+    fn missing_usage_is_not_backfilled_by_later_complete_generation() {
+        let observations = crate::provider_observation::ObservationScope::capture();
+        for (terminal, expected_stop) in [
+            ("", StopReason::Error),
+            ("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", StopReason::Stop),
+            ("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":0}}}}\n\n", StopReason::Stop),
+        ] {
+            let (base, release, server) = sse_server(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"fixture\"}}\n\n",
+                terminal, Duration::from_secs(2),
+            );
+            release.send(()).unwrap();
+            let mut model = loopback_model(&base);
+            model.api = "openai-responses".into();
+            let envelope = live_complete_streaming_with_sink_envelope(
+                &model, &[ChatMessage::text("user", "fixture")], &loopback_auth(),
+                None, &[], &StreamOptions::default(), &mut |_| {},
+            ).unwrap();
+            assert!(server.join().unwrap());
+            assert_eq!(envelope.message.stop_reason, Some(expected_stop));
+            if expected_stop == StopReason::Stop {
+                assert!(!crate::is_retryable_assistant_error(&envelope.message));
+            } else {
+                assert!(envelope.native_responses.is_none());
+            }
+        }
+        let records = observations.finish("completed");
+        let attempts = records
+            .iter()
+            .filter(|record| record.kind == "attempt_end")
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 3);
+        for attempt in &attempts[..2] {
+            assert!(attempt.raw_usage.is_none());
+            assert_eq!(attempt.usage_complete, None);
+        }
+        assert_eq!(attempts[2].usage_complete, Some(true));
+        assert_eq!(
+            attempts[2].raw_usage.as_ref().unwrap().input_total,
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn idle_timeout_recovery_is_independent_of_first_sse_frame() {
+        for first in [
+            "",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"fixture\"}}\n\n",
+        ] {
+            let (base, release, server) = sse_server(first, "", Duration::from_secs(2));
+            let mut model = loopback_model(&base);
+            model.api = "openai-responses".into();
+            let result = live_complete_streaming_with_sink_envelope(
+                &model,
+                &[ChatMessage::text("user", "fixture")],
+                &loopback_auth(),
+                None,
+                &[],
+                &StreamOptions {
+                    timeout_ms: Some(100),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            );
+            release.send(()).unwrap();
+            assert!(server.join().unwrap());
+            let envelope = result.unwrap();
+            assert_eq!(envelope.message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&envelope.message),
+                Some(crate::ResponseStreamFailure::TransportInterrupted)
+            );
+            assert!(crate::is_retryable_assistant_error(&envelope.message));
+            assert!(envelope.native_responses.is_none());
+            assert!(!envelope
+                .message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+        }
+    }
+
+    #[test]
+    fn malformed_first_sse_frame_never_retries_parser_locations_as_status_codes() {
+        for spaces in [502, 428] {
+            let malformed = format!("data: {}!\n\n", " ".repeat(spaces)).leak();
+            let (base, release, server) = sse_server(malformed, "", Duration::from_secs(2));
+            release.send(()).unwrap();
+            let mut model = loopback_model(&base);
+            model.api = "openai-responses".into();
+            let result = live_complete_streaming_with_sink_envelope(
+                &model,
+                &[ChatMessage::text("user", "fixture")],
+                &loopback_auth(),
+                None,
+                &[],
+                &StreamOptions::default(),
+                &mut |_| {},
+            );
+            assert!(server.join().unwrap());
+            if let Err(error) = &result {
+                assert!(!crate::is_retryable_error_text(error), "{error}");
+            }
+            let envelope = result.expect("typed malformed framing failure");
+            assert_eq!(envelope.message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&envelope.message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(!crate::is_retryable_assistant_error(&envelope.message));
+            assert!(envelope.message.content.is_empty());
+            assert!(envelope.native_responses.is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_only_sse_timeout_cannot_grant_interruption_retry() {
+        let (base, release, server) = sse_server(
+            "data: {\"type\":\"not_a_responses_event\"}\n\n",
+            "",
+            Duration::from_secs(2),
+        );
+        let mut model = loopback_model(&base);
+        model.api = "openai-responses".into();
+        let result = live_complete_streaming_with_sink_envelope(
+            &model,
+            &[ChatMessage::text("user", "fixture")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions {
+                timeout_ms: Some(100),
+                ..Default::default()
+            },
+            &mut |_| {},
+        );
+        release.send(()).unwrap();
+        assert!(server.join().unwrap());
+        let envelope = result.unwrap();
+        assert_eq!(
+            crate::response_stream_failure(&envelope.message),
+            Some(crate::ResponseStreamFailure::Unknown)
+        );
+        assert!(!crate::is_retryable_assistant_error(&envelope.message));
+        assert!(envelope.native_responses.is_none());
+    }
+
+    #[test]
+    fn malformed_json_body_never_retries_sizes_as_status_codes() {
+        for api in [
+            "openai-responses",
+            "openai-completions",
+            "anthropic-messages",
+        ] {
+            let mut model = loopback_model("http://127.0.0.1");
+            model.api = api.into();
+            let message = parse_provider_response(&model, &"!".repeat(503));
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert!(!crate::is_retryable_assistant_error(&message), "{api}");
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(message.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_responses_fields_cannot_use_chat_completion_tool_parser() {
+        let mut model = loopback_model("http://127.0.0.1");
+        model.api = "openai-responses".into();
+        let choices = serde_json::json!([{"message":{"tool_calls":[{"id":"c","function":{"name":"write","arguments":"{}"}}]}}]);
+        for body in [
+            serde_json::json!({"output":false,"choices":choices}),
+            serde_json::json!({"response":false,"choices":choices}),
+            serde_json::json!({"response":{"output":false},"choices":choices}),
+            serde_json::json!({"incomplete_details":{"reason":false},"choices":choices}),
+        ] {
+            let message = parse_provider_response(&model, &body.to_string());
+            assert_eq!(message.stop_reason, Some(StopReason::Error), "{body}");
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(message.content.is_empty());
+            assert!(crate::NativeResponsesOutput::from_response_value(&body).is_none());
+        }
+    }
+
+    #[test]
+    fn nonobject_responses_sse_never_authorizes_terminal_calls_or_retry() {
+        for payload in [
+            "503",
+            "[]",
+            "null",
+            "\"503\"",
+            "true",
+            "{}",
+            "{\"type\":false}",
+        ] {
+            for terminal in [false, true] {
+                let mut corpus = format!("data: {payload}\n\n");
+                if terminal {
+                    corpus.push_str("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"i\",\"call_id\":\"c\",\"name\":\"write\",\"arguments\":\"{}\",\"status\":\"completed\"}]}}\n\n");
+                }
+                let (base, release, server) = sse_server(corpus.leak(), "", Duration::from_secs(2));
+                release.send(()).unwrap();
+                let mut model = loopback_model(&base);
+                model.api = "openai-responses".into();
+                let result = live_complete_streaming_with_sink_envelope(
+                    &model,
+                    &[ChatMessage::text("user", "fixture")],
+                    &loopback_auth(),
+                    None,
+                    &[],
+                    &StreamOptions::default(),
+                    &mut |_| {},
+                )
+                .unwrap();
+                assert!(server.join().unwrap());
+                assert_eq!(result.message.stop_reason, Some(StopReason::Error));
+                assert_eq!(
+                    crate::response_stream_failure(&result.message),
+                    Some(crate::ResponseStreamFailure::InvalidStream)
+                );
+                assert!(!crate::is_retryable_assistant_error(&result.message));
+                assert!(result.native_responses.is_none());
+                assert!(!result
+                    .message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn declared_rejection_blocks_legacy_choices_parser() {
+        let mut model = loopback_model("http://127.0.0.1");
+        model.api = "openai-responses".into();
+        let choices = serde_json::json!([{"message":{"tool_calls":[{"id":"c","function":{"name":"write","arguments":"{}"}}]}}]);
+        for body in [
+            serde_json::json!({"incomplete_details":{"reason":"content_filter"},"choices":choices}),
+            serde_json::json!({"code":"insufficient_quota","choices":choices}),
+        ] {
+            let message = parse_provider_response(&model, &body.to_string());
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::ProviderTerminalRejection)
+            );
+            assert!(message.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn whole_json_responses_preserve_structured_rejection_vetoes() {
+        let mut model = loopback_model("http://127.0.0.1");
+        model.api = "openai-responses".into();
+        for (code, retryable) in [
+            ("server_error", true),
+            ("rate_limit_exceeded", true),
+            ("insufficient_quota", false),
+            ("context_length_exceeded", false),
+            ("chatpass_v2_scope_not_authorized", false),
+            ("content_policy_violation", false),
+        ] {
+            let body = serde_json::json!({
+                "status": "failed", "output": [],
+                "error": {"code": code, "message": "HTTP 503; please retry your request"},
+            });
+            let message = parse_provider_response(&model, &body.to_string());
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::is_retryable_assistant_error(&message),
+                retryable,
+                "{code}"
+            );
+            assert!(message.content.is_empty());
+            if !retryable {
+                assert_eq!(
+                    crate::response_stream_failure(&message),
+                    Some(crate::ResponseStreamFailure::ProviderTerminalRejection)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_preterminal_responses_stream_is_not_retryable_eof() {
+        let (base, release, server) = sse_server(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"fixture\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"unterminated\n\n",
+            Duration::from_secs(2),
+        );
+        release.send(()).unwrap();
+        let mut model = loopback_model(&base);
+        model.api = "openai-responses".into();
+        let (message, events) = live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "fixture")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(server.join().unwrap());
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert!(!crate::is_retryable_assistant_error(&message));
+        assert!(message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.contains("malformed SSE frame")));
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error { .. })
+        ));
+    }
+
+    #[test]
+    fn cancellation_from_terminal_callback_strips_calls_and_native_output() {
+        let response = serde_json::json!({"id":"terminal","status":"completed","output":[
+            {"type":"function_call","id":"fc","call_id":"call","name":"apply_patch","arguments":"{}"}]});
+        for json_body in [false, true] {
+            let corpus = if json_body {
+                response.to_string()
+            } else {
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"type":"response.completed","response":response})
+                )
+            };
+            let (base, release, server) = sse_server(corpus.leak(), "", Duration::from_secs(2));
+            release.send(()).unwrap();
+            let mut model = loopback_model(&base);
+            model.api = "openai-responses".into();
+            let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let options = StreamOptions {
+                abort_signal: Some(abort.clone()),
+                ..StreamOptions::default()
+            };
+            let result = live_complete_streaming_with_sink_envelope(
+                &model,
+                &[ChatMessage::text("user", "fixture")],
+                &loopback_auth(),
+                None,
+                &[],
+                &options,
+                &mut |event| {
+                    if matches!(event, AssistantMessageEvent::ToolcallEnd { .. }) {
+                        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            )
+            .unwrap();
+            assert!(server.join().unwrap());
+            assert_eq!(result.message.stop_reason, Some(StopReason::Aborted));
+            assert!(!result
+                .message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+            assert!(!result
+                .message
+                .extra
+                .contains_key(crate::RESPONSES_TOOL_WIRE_KINDS_KEY));
+            assert!(result.native_responses.is_none());
         }
     }
 
