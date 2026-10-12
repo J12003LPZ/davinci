@@ -361,3 +361,28 @@ prefix, and cache ratios. Missing usage remains unavailable. Wire dumps contain
 full conversations and file contents; keep them private and outside Git. Timed
 campaigns deliberately remove inherited wire-dump settings, so collect those
 separately from timing evidence.
+
+### Harness-only arm options and concurrent slots
+
+A `bench` key in the `--settings` file carries options for the harness, not the
+agent. It is recorded in the campaign's effective settings and never written to
+the agent's `settings.json`:
+
+```json
+{ "bench": { "tokenGovernor": {"enabled": false},
+             "appendSystemPrompt": "Text appended to the DaVinci system prompt." } }
+```
+
+- `tokenGovernor` writes `token-governor.json` into the isolated agent
+  directory. Use it for a Token Governor on/off pair; the environment switches
+  cannot be used because the harness strips `DAVINCI_*` variables.
+- `appendSystemPrompt` passes `--append-system-prompt`. A steered arm is a
+  different treatment from an unsteered one; compare it only with an arm that
+  differs in one thing.
+
+`BENCH_CAMPAIGN_SLOT=<name>` takes a separate machine lock so one campaign can
+run beside another. The slot is recorded as `campaign_slot` in the manifest.
+Concurrent campaigns share the machine and the provider account, so their wall
+times are not comparable with a solo campaign, and each needs its own
+credential lineage (two campaigns refreshing copies of one login invalidate
+each other).

@@ -56,6 +56,43 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": mode}})
 
+    def test_bench_options_steer_the_prompt_and_disable_the_governor_file_only(self):
+        steer = {"bench": {"appendSystemPrompt": "Prefer codemode."}}
+        args = bench.command("davinci", "prompt", "workdir", steer)
+        self.assertEqual(args[args.index("--append-system-prompt") + 1], "Prefer codemode.")
+        self.assertNotIn("--append-system-prompt", bench.command("davinci", "prompt", "workdir", {}))
+        for bad in ({"bench": {"other": 1}}, {"bench": {"tokenGovernor": {"enabled": "no"}}},
+                    {"bench": {"tokenGovernor": {"enabled": False, "antiLoop": False}}},
+                    {"bench": {"appendSystemPrompt": " "}}, {"bench": []}):
+            with self.assertRaises(ValueError):
+                runner.bench_options(bad)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "auth.json").write_text("{}")
+            settings = {"autoVerify": True, "bench": {"tokenGovernor": {"enabled": False}}}
+            record = runner.isolate_settings(source, root / "off", settings)
+            self.assertEqual(json.loads((root / "off/settings.json").read_text()), {"autoVerify": True})
+            self.assertEqual(json.loads((root / "off/token-governor.json").read_text()), {"enabled": False})
+            # The arm stays distinguishable in the recorded identity.
+            self.assertEqual(record["settings"], settings)
+            runner.isolate_settings(source, root / "default", {"autoVerify": True})
+            self.assertFalse((root / "default/token-governor.json").exists())
+
+    def test_campaign_slot_selects_a_separate_validated_lock(self):
+        with patch.dict(os.environ, {"BENCH_CAMPAIGN_SLOT": ""}):
+            default = runner._campaign_lock_path()
+            self.assertIsNone(runner.campaign_slot())
+        with patch.dict(os.environ, {"BENCH_CAMPAIGN_SLOT": "side-1"}):
+            self.assertEqual(runner.campaign_slot(), "side-1")
+            self.assertNotEqual(runner._campaign_lock_path(), default)
+            self.assertEqual(runner._campaign_lock_path().parent, default.parent)
+        for bad in ("../x", "A", "x" * 33, "a b"):
+            with patch.dict(os.environ, {"BENCH_CAMPAIGN_SLOT": bad}):
+                with self.assertRaises(ValueError):
+                    runner._campaign_lock_path()
+
     def test_prepared_fixture_contract_preserves_task_and_repository_rules(self):
         task = "Fix the real issue.\nKeep compatibility and add a regression test."
         instructions = b"Before edits create a worktree using CLAUDE_CODE_SESSION_ID.\nKeep tests.\n"
