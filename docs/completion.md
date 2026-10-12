@@ -6,6 +6,21 @@ at least three nonempty clauses separated by sentences, commas, semicolons or
 newlines. Plan Mode and read-only runs do not trigger it. This initial threshold
 is deterministic; it has not been tuned or accepted against a private dev split.
 
+The review is not sent when a check already passed on the latest change, that
+is, when the completion evidence is `verified`: the review ends in "rerun the
+appropriate checks", and that turn would only repeat the check. Every other
+evidence state (no check, a failed check, a check that covered part of the
+change, a pass that a later edit made stale) still gets the review, and a later
+unverified edit in the same prompt is reviewed. `RunStats` counts these as
+`completionRequirementReviewsSkipped`, at most one per prompt.
+
+Two limits. `verified` is the verification gate's own definition, so a
+workspace-wide `cargo check` or `cargo clippy` counts as a passing check here
+as it does there; such a run says nothing about tests for each requirement,
+and the review that would ask for them is not sent. And the review is decided
+before the harness's automatic rerun of the last check, so an edit made after
+the last passing check still gets the review even when that rerun would pass.
+
 The reminder asks the same agent to list explicit requirements, identify a check
 for each, add missing coverage in existing test files, update obsolete tests and
 rerun checks. The existing mutation verification gate still follows this step.

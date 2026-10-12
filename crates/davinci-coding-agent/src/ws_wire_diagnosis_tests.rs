@@ -502,6 +502,15 @@ fn run(config: &RunConfig) -> RunResult {
     std::fs::create_dir_all(&root).unwrap();
     let output = root.join("result.json");
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Other tests in this binary set harness variables on the shared process
+    // environment while they run, and a child would inherit whatever is set
+    // at the moment it starts. Drop them all before setting this run's own.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("DAVINCI_") || name.starts_with("PI_") {
+            command.env_remove(&key);
+        }
+    }
     command
         .args([
             "--exact",
@@ -514,24 +523,6 @@ fn run(config: &RunConfig) -> RunResult {
         .env(CHILD_OUTPUT, &output)
         .env(CHILD_ROOT, &root)
         .env("PI_CODING_AGENT_DIR", root.join("agent"));
-    for key in [
-        "DAVINCI_CONTEXT_VM",
-        "DAVINCI_PRUNE_PROFILE",
-        "PI_GRAPH_CACHE_KEY",
-        "PI_GRAPH_ROLE",
-        "PI_CACHE_RETENTION",
-        "PI_OFFLINE",
-        "DAVINCI_OPENAI_VERBOSITY",
-        "DAVINCI_REASONING_SUMMARY",
-        "DAVINCI_TURN_CONTEXT",
-        "DAVINCI_AUTO_VERIFY",
-        "DAVINCI_WIRE_DUMP",
-        "PI_OPENAI_CACHE_EXPLICIT_BOUNDARIES",
-        "PI_OPENAI_CACHE_NATIVE_REPLAY",
-        "PI_OPENAI_CACHE_WORKER_AFFINITY",
-    ] {
-        command.env_remove(key);
-    }
     if let Some(profile) = &config.prune_profile {
         command.env("DAVINCI_PRUNE_PROFILE", profile);
     }

@@ -1,11 +1,12 @@
 //! WS3 diagnosis: what the real turn loop does when a provider stream is cut.
 //!
-//! Every test here PINS CURRENT BEHAVIOUR found during the diagnosis of the
-//! 324-run luna-high benchmark (four runs exited 1 on "Stream ended before the
-//! tool call was complete" with no retry; four retried runs lost their token
-//! totals in the benchmark row). None of these assertions describes intended
-//! behaviour. A later fix is expected to flip the assertions marked
-//! `PINNED (diagnosis)` deliberately.
+//! Written during the diagnosis of the 324-run luna-high benchmark, where four
+//! runs exited 1 on "Stream ended before the tool call was complete" with no
+//! retry. The tests first pinned that behaviour; they now assert the fix: a
+//! cut inside a tool call is retried within the budget, nothing from a cut
+//! response executes, and a tool call stuck repeating one fragment is
+//! abandoned. Assertions still marked `PINNED (diagnosis)` describe behaviour
+//! that was found and deliberately left as it is.
 //!
 //! The path under test is the production one, end to end and offline:
 //! a loopback HTTP server plays a scripted provider, the request goes through
@@ -420,14 +421,13 @@ fn ws3_default_retry_budget_is_three_retries_and_no_http_level_retry() {
     assert_eq!(agent.provider_max_retries, None);
 }
 
-/// The two error texts a cut stream can produce are classified differently,
-/// and that classification alone decides whether the loop retries.
+/// Both error texts a cut stream can produce are retryable. Before the fix
+/// the tool-call wording matched nothing in `retry.rs` (WS3-F1).
 #[test]
-fn ws3_cut_tool_call_error_text_is_not_classified_retryable() {
-    // PINNED (diagnosis): root cause of the four exit-1 benchmark runs.
+fn ws3_cut_tool_call_error_text_is_classified_retryable() {
     let cut_tool_call = "Stream ended before the tool call was complete";
     let cut_elsewhere = "stream ended before a terminal response event";
-    assert!(!davinci_ai::is_retryable_error_text(cut_tool_call));
+    assert!(davinci_ai::is_retryable_error_text(cut_tool_call));
     assert!(davinci_ai::is_retryable_error_text(cut_elsewhere));
     let message = |text: &str| -> davinci_ai::AssistantMessage {
         serde_json::from_value(json!({
@@ -436,7 +436,7 @@ fn ws3_cut_tool_call_error_text_is_not_classified_retryable() {
         }))
         .unwrap()
     };
-    assert!(!davinci_ai::is_retryable_assistant_error(&message(
+    assert!(davinci_ai::is_retryable_assistant_error(&message(
         cut_tool_call
     )));
     assert!(davinci_ai::is_retryable_assistant_error(&message(
@@ -452,7 +452,6 @@ fn ws3_cut_during_text_is_retried_and_the_retry_resends_the_same_request() {
     let outcome = run(vec![Reply::Sse(frames(&cut)), final_answer()], |_| {});
     describe("(a) cut during text", &outcome);
 
-    // PINNED (diagnosis): this position IS retried.
     assert_eq!(outcome.requests, 2);
     let retries = outcome.retry_events();
     assert_eq!(retries.len(), 2);
@@ -468,95 +467,136 @@ fn ws3_cut_during_text_is_retried_and_the_retry_resends_the_same_request() {
     assert_eq!(outcome.final_assistant(), (Some(StopReason::Stop), None));
     assert_eq!(outcome.print_mode_exit_code(), 0);
 
-    // PINNED (diagnosis): the retry is a full restart. The failed attempt is
-    // not added to the conversation, so the second request is identical.
+    // The retry is a full restart. The failed attempt is not added to the
+    // conversation, so the second request is identical.
     assert_eq!(outcome.bodies[0], outcome.bodies[1]);
 
-    // PINNED (diagnosis): the cut attempt was already streamed to the sink
-    // (start, partial text, error) and is not withdrawn; the recorded list
-    // returned by `run_loop` only holds the successful attempt.
+    // PINNED (diagnosis, WS3-F5, not changed): the cut attempt was already
+    // streamed to the sink (start, partial text, error) and is not withdrawn;
+    // the recorded list returned by `run_loop` only holds the successful
+    // attempt.
     assert_eq!(outcome.count(&outcome.sunk, "update/start"), 2);
     assert_eq!(outcome.count(&outcome.sunk, "update/error"), 1);
     assert_eq!(outcome.count(&outcome.recorded_labels(), "update/start"), 1);
     assert_eq!(outcome.count(&outcome.recorded_labels(), "update/error"), 0);
 }
 
-/// (b) Cut while the first tool call's arguments are streaming.
+/// The replies after a cut attempt: the whole response, then a final answer
+/// for the request after the tool results and for each reminder the loop adds
+/// (unverified change; requirement review when two files changed).
+fn retried_whole(cut: &[Value], calls: &[Value]) -> Vec<Reply> {
+    let mut whole = vec![created()];
+    whole.extend(calls.iter().cloned());
+    whole.push(completed());
+    vec![
+        Reply::Sse(frames(cut)),
+        Reply::Sse(frames(&whole)),
+        final_answer(),
+        final_answer(),
+        final_answer(),
+    ]
+}
+
+fn assert_retried_once(outcome: &Outcome, follow_ups: usize) {
+    assert_eq!(
+        outcome.requests,
+        2 + follow_ups,
+        "cut attempt, retry, follow-ups"
+    );
+    let retries = outcome.retry_events();
+    assert_eq!(retries[0]["type"], "auto_retry_start");
+    assert_eq!(retries[0]["attempt"], 1);
+    assert_eq!(
+        retries[0]["errorMessage"],
+        "Stream ended before the tool call was complete"
+    );
+    assert_eq!(retries[1]["type"], "auto_retry_end");
+    assert_eq!(retries[1]["success"], true);
+    assert_eq!(outcome.stats.provider_retries, 1);
+    // The cut attempt left nothing in the conversation.
+    assert_eq!(outcome.bodies[0], outcome.bodies[1]);
+    assert_eq!(outcome.final_assistant(), (Some(StopReason::Stop), None));
+    assert_eq!(outcome.print_mode_exit_code(), 0);
+}
+
+/// (b) Cut while the first tool call's arguments are streaming: retried, and
+/// the call runs once, from the attempt that completed.
 #[test]
-fn ws3_cut_during_first_tool_call_is_not_retried_and_ends_the_run() {
+fn ws3_cut_during_first_tool_call_is_retried_and_the_call_runs_once() {
     let mut cut = vec![created()];
     cut.extend(write_call(0, SIDE_EFFECT, false));
-    let outcome = run(vec![Reply::Sse(frames(&cut)), final_answer()], |_| {});
+    let outcome = run(
+        retried_whole(&cut, &write_call(0, SIDE_EFFECT, true)),
+        |_| {},
+    );
     describe("(b) cut during first tool call", &outcome);
 
-    // PINNED (diagnosis): no retry, although three retries were available.
-    assert_eq!(outcome.requests, 1);
-    assert!(outcome.retry_events().is_empty());
-    assert_eq!(outcome.stats.provider_retries, 0);
+    assert_retried_once(&outcome, 2);
+    assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 1);
     assert_eq!(
-        outcome.final_assistant(),
-        (
-            Some(StopReason::Error),
-            Some("Stream ended before the tool call was complete".into())
-        )
+        outcome.side_effect_text.as_deref(),
+        Some("written by a tool call")
     );
-    assert_eq!(outcome.print_mode_exit_code(), 1);
-    let recorded = outcome.recorded_labels();
-    assert_eq!(
-        &recorded[recorded.len() - 4..],
-        ["update/error", "message_end", "turn_end", "agent_end"]
-    );
-    // The partial call was streamed (start, delta, a synthetic end) and then
-    // dropped; nothing ran.
-    assert_eq!(outcome.count(&outcome.sunk, "update/toolcall_start"), 1);
-    assert_eq!(outcome.count(&outcome.sunk, "update/toolcall_end"), 1);
-    assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 0);
-    assert!(!outcome.side_effect_exists);
-    // PINNED (diagnosis): the cut attempt is counted as usage-unknown.
-    assert_eq!(outcome.stats.provider_attempts, Some(1));
-    assert_eq!(outcome.stats.usage_complete_attempts, Some(0));
+    // The cut attempt's usage stays unknown; the others are complete.
+    assert_eq!(outcome.stats.provider_attempts, Some(4));
+    assert_eq!(outcome.stats.usage_complete_attempts, Some(3));
     assert_eq!(outcome.stats.usage_unknown_attempts, Some(1));
 }
 
 /// (b, transport variant) The same position, but the socket dies inside an
 /// HTTP chunk, so the reader reports an I/O error instead of a clean EOF.
 #[test]
-fn ws3_transport_error_during_first_tool_call_is_reported_as_the_same_cut() {
+fn ws3_transport_error_during_first_tool_call_is_retried_as_the_same_cut() {
     let mut cut = vec![created()];
     cut.extend(write_call(0, SIDE_EFFECT, false));
-    let outcome = run(
-        vec![Reply::SseBrokenChunk(frames(&cut)), final_answer()],
-        |_| {},
-    );
+    let mut replies = retried_whole(&cut, &write_call(0, SIDE_EFFECT, true));
+    replies[0] = Reply::SseBrokenChunk(frames(&cut));
+    let outcome = run(replies, |_| {});
     describe("(b2) transport error during first tool call", &outcome);
 
-    // PINNED (diagnosis): the decoder's text wins over the transport's
-    // ("Unable to read provider response: ..."), so this is not retried
-    // either. There is one path, not a separate one for transport errors.
-    assert_eq!(outcome.requests, 1);
-    assert!(outcome.retry_events().is_empty());
-    assert_eq!(
-        outcome.final_assistant(),
-        (
-            Some(StopReason::Error),
-            Some("Stream ended before the tool call was complete".into())
-        )
-    );
-    assert_eq!(outcome.print_mode_exit_code(), 1);
+    // The decoder's text wins over the transport's ("Unable to read provider
+    // response: ..."): one path, not a separate one for transport errors.
+    assert_retried_once(&outcome, 2);
+    assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 1);
 }
 
-/// (c) Cut during a second tool call, after the first one completed.
+/// (c) Cut during a second tool call, after the first one completed. The
+/// first call was complete on the wire in the cut attempt and must not run
+/// from it: each call runs once, from the retried response.
 #[test]
-fn ws3_cut_during_second_tool_call_is_not_retried_and_runs_no_tool() {
+fn ws3_cut_during_second_tool_call_is_retried_and_each_call_runs_once() {
     let mut cut = vec![created()];
     cut.extend(write_call(0, SIDE_EFFECT, true));
     cut.extend(write_call(1, "ws3_second.txt", false));
-    let outcome = run(vec![Reply::Sse(frames(&cut)), final_answer()], |_| {});
+    let mut calls = write_call(0, SIDE_EFFECT, true);
+    calls.extend(write_call(1, "ws3_second.txt", true));
+    let outcome = run(retried_whole(&cut, &calls), |_| {});
     describe("(c) cut during second tool call", &outcome);
 
-    // PINNED (diagnosis): no retry.
-    assert_eq!(outcome.requests, 1);
-    assert!(outcome.retry_events().is_empty());
+    assert_retried_once(&outcome, 3);
+    // Executed twice: once per call, both from the retried response.
+    assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 2);
+    assert_eq!(
+        outcome.side_effect_text.as_deref(),
+        Some("written by a tool call")
+    );
+}
+
+/// The retry budget still ends the run: four cut attempts, then the error
+/// and exit code 1, with nothing executed.
+#[test]
+fn ws3_cut_tool_calls_stop_at_the_retry_budget_with_an_error() {
+    let mut cut = vec![created()];
+    cut.extend(write_call(0, SIDE_EFFECT, false));
+    let cut = Reply::Sse(frames(&cut));
+    let outcome = run(
+        vec![cut.clone(), cut.clone(), cut.clone(), cut, final_answer()],
+        |_| {},
+    );
+    describe("budget: four cut attempts", &outcome);
+
+    assert_eq!(outcome.requests, 4, "one attempt and three retries");
+    assert_eq!(outcome.stats.provider_retries, 3);
     assert_eq!(
         outcome.final_assistant(),
         (
@@ -565,16 +605,39 @@ fn ws3_cut_during_second_tool_call_is_not_retried_and_runs_no_tool() {
         )
     );
     assert_eq!(outcome.print_mode_exit_code(), 1);
-    // PINNED (diagnosis): the first call was complete on the wire, and was
-    // announced to the sink, but tool calls only execute after the whole
-    // response is accepted. It never ran.
-    assert_eq!(outcome.count(&outcome.sunk, "update/toolcall_end"), 2);
+    assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 0);
+    assert!(!outcome.side_effect_exists);
+}
+
+/// A tool call that repeats one fragment without stopping (WS3-F9) is
+/// abandoned at the bound while the stream is still open, and is not retried.
+#[test]
+fn ws3_runaway_tool_call_is_abandoned_at_the_bound_and_not_retried() {
+    let mut runaway = vec![created()];
+    runaway.extend(write_call(0, SIDE_EFFECT, false));
+    // The recorded fragment: an escaped newline, 49,605 times in a row.
+    // Twice the bound here, to show the reader stopped before the end.
+    for _ in 0..16_384 {
+        runaway.push(json!({"type":"response.function_call_arguments.delta",
+            "output_index":0,"delta":"\\n"}));
+    }
+    let outcome = run(vec![Reply::Sse(frames(&runaway)), final_answer()], |_| {});
+
+    assert_eq!(outcome.requests, 1);
+    assert!(outcome.retry_events().is_empty());
+    let (stop, error) = outcome.final_assistant();
+    assert_eq!(stop, Some(StopReason::Error));
+    assert!(error.unwrap().contains("repeated one fragment"));
+    assert_eq!(outcome.print_mode_exit_code(), 1);
+    // One delta for the first half of the arguments, then the fragment 8,192
+    // times: the first starts the run and the 8,193rd fails the call.
+    assert_eq!(outcome.count(&outcome.sunk, "update/toolcall_delta"), 8193);
     assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 0);
     assert!(!outcome.side_effect_exists);
 }
 
 /// (d) Cut after a tool call completed and before the terminal event, with
-/// nothing open. This is the position where a retry happens today.
+/// nothing open.
 #[test]
 fn ws3_cut_after_a_completed_tool_call_is_retried_and_the_call_runs_once() {
     let mut cut = vec![created()];
@@ -594,7 +657,7 @@ fn ws3_cut_after_a_completed_tool_call_is_retried_and_the_call_runs_once() {
     );
     describe("(d) cut after a completed tool call", &outcome);
 
-    // PINNED (diagnosis): retried, because no tool-call slot was open.
+    // Retried before the fix too, because no tool-call slot was open.
     assert_eq!(outcome.requests, 4, "cut attempt, retry, two follow-ups");
     let retries = outcome.retry_events();
     assert_eq!(retries[0]["type"], "auto_retry_start");

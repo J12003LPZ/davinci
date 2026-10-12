@@ -26,6 +26,23 @@ use crate::stream::{
 /// this wording.
 pub(crate) const TRUNCATED_STREAM: &str = "stream ended before a terminal response event";
 
+/// A tool call whose stream repeats itself for this many fragments in a row is
+/// a model stuck in a loop: recorded runs sent an escaped newline 49,605 times
+/// over 15 minutes. "Repeats itself" means each fragment equals the one 1, 2,
+/// 3 or 4 places before it, so a loop that alternates fragments is caught too.
+/// The bound is a judgement: it is about 2.5 minutes at the recorded rate, and
+/// it also ends a call whose real content is one short pattern this many
+/// fragments long, such as an array of several thousand identical numbers.
+pub(crate) const MAX_REPEATED_TOOL_DELTAS: u32 = 8192;
+
+/// Longest cycle of fragments the runaway check recognises.
+const MAX_REPEAT_PERIOD: usize = 4;
+
+/// Deliberately matches nothing in `retry.rs`: the provider did not fail, and
+/// resending the same request has no evidence of producing a different call.
+pub(crate) const RUNAWAY_TOOL_CALL: &str =
+    "The model repeated one fragment inside a tool call without stopping; the response was abandoned";
+
 /// A decoder for one provider wire format.
 pub trait StreamDecoder {
     /// Fold one provider event into the message, pushing the stream events it
@@ -240,6 +257,12 @@ pub struct ResponsesDecoder {
     output_indices: HashMap<u64, usize>,
     started: bool,
     done: bool,
+    /// Runaway check: the output index being watched, its last
+    /// `MAX_REPEAT_PERIOD` fragments (newest last), and for each period how
+    /// many fragments in a row matched the one that many places back.
+    repeat_index: u64,
+    repeat_recent: Vec<String>,
+    repeat_runs: [u32; MAX_REPEAT_PERIOD],
     pub raw_items: Vec<Value>,
     pub last_response_id: Option<String>,
 }
@@ -255,9 +278,52 @@ impl ResponsesDecoder {
             output_indices: HashMap::new(),
             started: false,
             done: false,
+            repeat_index: 0,
+            repeat_recent: Vec::new(),
+            repeat_runs: [0; MAX_REPEAT_PERIOD],
             raw_items: Vec::new(),
             last_response_id: None,
         }
+    }
+
+    /// Counts consecutive identical tool-call fragments and fails the response
+    /// at the bound. Returns true when it did.
+    fn runaway_tool_call(
+        &mut self,
+        output_index: u64,
+        delta: &str,
+        out: &mut Vec<AssistantMessageEvent>,
+    ) -> bool {
+        if delta.is_empty() {
+            return false;
+        }
+        if self.repeat_index != output_index {
+            self.repeat_index = output_index;
+            self.repeat_recent.clear();
+            self.repeat_runs = [0; MAX_REPEAT_PERIOD];
+        }
+        let seen = self.repeat_recent.len();
+        for (offset, run) in self.repeat_runs.iter_mut().enumerate() {
+            let period = offset + 1;
+            *run = if seen >= period && self.repeat_recent[seen - period] == delta {
+                *run + 1
+            } else {
+                0
+            };
+        }
+        if seen == MAX_REPEAT_PERIOD {
+            self.repeat_recent.remove(0);
+        }
+        self.repeat_recent.push(delta.to_string());
+        if self
+            .repeat_runs
+            .iter()
+            .all(|run| *run < MAX_REPEATED_TOOL_DELTAS)
+        {
+            return false;
+        }
+        self.fail(RUNAWAY_TOOL_CALL.into(), out);
+        true
     }
 
     pub fn raw_items(&self) -> &[Value] {
@@ -1040,6 +1106,9 @@ impl StreamDecoder for ResponsesDecoder {
                         return;
                     }
                     let delta = event_delta(event);
+                    if self.runaway_tool_call(output_index, &delta, out) {
+                        return;
+                    }
                     if let Some(stored) = self.slots.get_mut(&output_index) {
                         stored.partial.push_str(&delta);
                     }
@@ -1070,6 +1139,9 @@ impl StreamDecoder for ResponsesDecoder {
                         return;
                     }
                     let delta = event_delta(event);
+                    if self.runaway_tool_call(output_index, &delta, out) {
+                        return;
+                    }
                     if let Some(stored) = self.slots.get_mut(&output_index) {
                         stored.partial.push_str(&delta);
                     }
@@ -1472,6 +1544,122 @@ data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":
 "#,
         );
         assert_eq!(message.stop_reason, Some(StopReason::Error));
+    }
+
+    fn tool_delta(delta: &str) -> Value {
+        serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":delta})
+    }
+
+    fn open_tool_call(decoder: &mut ResponsesDecoder, events: &mut Vec<AssistantMessageEvent>) {
+        decoder.feed(
+            &serde_json::json!({"type":"response.output_item.added","output_index":0,
+                "item":{"type":"function_call","id":"fc","call_id":"c","name":"edit","arguments":""}}),
+            events,
+        );
+        decoder.feed(&tool_delta("{\"text\":\""), events);
+    }
+
+    #[test]
+    fn a_tool_call_repeating_one_fragment_is_abandoned_and_never_retried() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        open_tool_call(&mut decoder, &mut events);
+        for _ in 0..MAX_REPEATED_TOOL_DELTAS {
+            decoder.feed(&tool_delta("\\n"), &mut events);
+        }
+        assert!(!decoder.is_done(), "one short of the bound keeps reading");
+        decoder.feed(&tool_delta("\\n"), &mut events);
+        assert!(decoder.is_done(), "the reader stops at the bound");
+        let message = decoder.finish(&mut events);
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(message.error_message.as_deref(), Some(RUNAWAY_TOOL_CALL));
+        assert!(!crate::is_retryable_assistant_error(&message));
+        assert!(!message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+        assert_eq!(names(&events).last(), Some(&"error"));
+    }
+
+    #[test]
+    fn a_tool_call_cycling_through_a_few_fragments_is_abandoned() {
+        for cycle in [
+            vec!["\\n", " "],
+            vec!["a", "b", "c"],
+            vec!["a", "b", "c", "d"],
+        ] {
+            let mut decoder = ResponsesDecoder::new(&model());
+            let mut events = Vec::new();
+            open_tool_call(&mut decoder, &mut events);
+            let mut fed = 0;
+            while !decoder.is_done() && fed < 3 * MAX_REPEATED_TOOL_DELTAS {
+                decoder.feed(&tool_delta(cycle[fed as usize % cycle.len()]), &mut events);
+                fed += 1;
+            }
+            assert_eq!(
+                fed,
+                MAX_REPEATED_TOOL_DELTAS + cycle.len() as u32,
+                "{cycle:?}"
+            );
+            let message = decoder.finish(&mut events);
+            assert_eq!(message.error_message.as_deref(), Some(RUNAWAY_TOOL_CALL));
+        }
+    }
+
+    #[test]
+    fn the_runaway_check_follows_one_tool_call_and_covers_custom_input() {
+        // Two calls streaming in turn never build a run on either.
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        for index in 0..2 {
+            decoder.feed(
+                &serde_json::json!({"type":"response.output_item.added","output_index":index,
+                    "item":{"type":"function_call","id":format!("fc{index}"),
+                            "call_id":format!("c{index}"),"name":"edit","arguments":""}}),
+                &mut events,
+            );
+        }
+        for fragment in 0..4 * MAX_REPEATED_TOOL_DELTAS {
+            decoder.feed(
+                &serde_json::json!({"type":"response.function_call_arguments.delta",
+                    "output_index":fragment % 2,"delta":"x"}),
+                &mut events,
+            );
+        }
+        assert!(!decoder.is_done());
+
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type":"response.output_item.added","output_index":0,
+                "item":{"type":"custom_tool_call","id":"ct","call_id":"c","name":"apply_patch","input":""}}),
+            &mut events,
+        );
+        for _ in 0..=MAX_REPEATED_TOOL_DELTAS {
+            decoder.feed(
+                &serde_json::json!({"type":"response.custom_tool_call_input.delta",
+                    "output_index":0,"delta":"\\n"}),
+                &mut events,
+            );
+        }
+        assert!(decoder.is_done());
+    }
+
+    #[test]
+    fn a_long_tool_call_with_varied_fragments_is_not_a_runaway() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        open_tool_call(&mut decoder, &mut events);
+        // Blank-line-heavy content with a different line now and then, at a
+        // spacing no short cycle fits.
+        for line in 0..3 * MAX_REPEATED_TOOL_DELTAS {
+            decoder.feed(&tool_delta("\\n"), &mut events);
+            if line % 100 == 99 {
+                decoder.feed(&tool_delta(&format!("line {line}")), &mut events);
+            }
+        }
+        decoder.feed(&tool_delta("\"}"), &mut events);
+        assert!(!decoder.is_done());
     }
 
     #[test]

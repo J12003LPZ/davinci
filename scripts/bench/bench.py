@@ -427,6 +427,11 @@ def parse_stream(harness, stdout):
         stats["usage_complete_attempts"] = complete_count
         stats["usage_unknown_attempts"] = (attempts - complete_count if type(attempts) is int else None)
         stats["usage_completeness_ratio"] = complete_count / attempts if attempts else None
+        # What the attempts with a full receipt used. A lower bound when any
+        # attempt is unknown: the exact totals below stay null in that case.
+        known = [davinci_usage(receipts[identity][1]) for identity in complete_receipts - uncertain_receipts]
+        stats["known_usage"] = {field: sum(values[field] for values in known)
+                                for field in ("input", "cached", "cache_write", "output")} if known else None
         if not stats["request_metrics_complete"] or not receipts or usage_conflict:
             add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
             usage_conflict = True
@@ -453,7 +458,7 @@ def parse_stream(harness, stdout):
         # A truncated JSON record may have omitted an entire paid attempt.
         add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
         usage_conflict = True
-        stats["usage_unknown_attempts"] = stats["usage_completeness_ratio"] = None
+        stats["usage_unknown_attempts"] = stats["usage_completeness_ratio"] = stats["known_usage"] = None
         if harness == "davinci":
             stats["request_metrics_available"] = stats["request_metrics_complete"] = False
             for field in ("logical_requests", "requests", "provider_attempts", "coding_provider_attempts",
@@ -621,7 +626,7 @@ def run_one(harness, tid, rep, campaign=None):
         result["task_set"] = "private"
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts",
                 "runtime_stats",
-                "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio",
+                "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio", "known_usage",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",
                 "mutations_after_reminder", "executed_leaf_operations", "batch_children_reported",
                 "mutation_metric_scope", "executed_leaf_scope",

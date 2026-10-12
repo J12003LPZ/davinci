@@ -108,6 +108,29 @@ None of these is a fix for a reproduced client defect. Each is an experiment tha
 
 Until one of these is measured, no cache change should ship.
 
+### 3.6 Addendum, 2026-10-12: where the lost cache goes
+
+Offline only: recorded logs, DaVinci source, and the public Codex source (`codex-rs/core/src/client.rs` in `openai/codex`, read on this date). No live run.
+
+**What the logs show.** The provider reports cache reads on a fixed grid: 512 plus a multiple of 1,024 tokens (1,670 of the 1,728 later requests in five of the campaigns; the other 58 are zero). On that grid, each later request falls into one of four classes:
+
+| Class | Meaning | Share of 1,805 later requests in 6 campaigns |
+|---|---|---|
+| full | read back everything the previous request sent | 8% to 25% per campaign |
+| own, partial | less than that, but at least this conversation's first request | 13% to 56% |
+| foreign only | less than this conversation's own first request | 29% to 69% |
+| zero | nothing | 2% to 15% |
+
+A "foreign only" read cannot come from this conversation's cache entry, because that entry would cover at least its first request, which the provider had already processed. It matches the prefix shared with other runs: system prompt and tools. So the request was answered from a cache store that had seen other DaVinci runs and not this one. The three campaigns that ran with nothing else on the machine have the highest foreign share (56%, 60%, 69%), so concurrency between campaigns is not the cause. The cache read also goes down inside a run: `t6-bookings-r0` in the baseline reads 8,704, then 9,728, then 8,704, then 8,704 while its input only grows.
+
+**What DaVinci sends on this route.** `collect_request_headers` in `crates/davinci-ai/src/stream.rs` adds a `session-id` header for the Codex backend route only. For the sign-in route the match arm is `"openai-codex-responses" => {}`: no session or affinity header of any kind. The body's `prompt_cache_key` is `CacheIdentity::cache_key`, a hash of provider, model, system prompt, tool schema and permission surface. It is the same for every conversation with the same setup, so it does not identify a conversation either. Each request is also a new connection (`max_idle_connections(0)`), sent a median of 0.11 s after the previous response ended (215 requests with wire dump file times).
+
+**What Codex sends.** Its `prompt_cache_key` defaults to the session id, one per conversation. A comment in its client says "ChatGPT derives cache affinity from the Responses session-id header", and it sends that id as the session header. It also replays a server-issued `x-codex-turn-state` token, documented there as a sticky-routing token, on every request of a turn, and it keeps one WebSocket per turn and sends only new items with `previous_response_id`. Codex talks to the ChatGPT Codex backend; DaVinci's sign-in route is `https://api.openai.com/v1`.
+
+**Conclusion and its limit.** DaVinci gives the provider nothing that ties the requests of one conversation together, and the logs show the requests being served from stores that do not hold the conversation. Codex gives three such signals. That is the cause consistent with every observation so far. It is not proven: no run has yet shown that a per-conversation key or session header restores reuse on the sign-in route, and the published rule for that route (routing by prompt prefix and `prompt_cache_key`) would predict that one shared key already keeps requests together.
+
+**Smallest probe.** Two runs of one small task, identical except that the second uses a `prompt_cache_key` unique to the run. Compare the share of full reads. If it moves, repeat with a `session_id` header added. This changes what is sent on the subscription route, so it needs the owner's approval, and it needs the usage limit to have reset.
+
 ## 4. WS2: extra model turns
 
 ### 4.1 Findings
