@@ -29,6 +29,7 @@ CHECK = re.compile(r"\b(pytest|unittest|compileall|py_compile)\b|\b(cargo|go|npm
 # reports cache hits in coarse blocks, so the tail of the prefix never matches.
 FULL_REUSE_SLACK = 2048
 STATS = ("modelTurns", "toolCalls", "toolBatches", "batchOperations", "completionRequirementReminders",
+         "completionRequirementReviewsSkipped",
          "verificationCommandsRun", "repeatedReads", "repeatedSearches", "providerAttempts", "providerRetries",
          "usageCompleteAttempts", "usageUnknownAttempts", "compactions", "peakContextTokens")
 
