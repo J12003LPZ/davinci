@@ -213,6 +213,10 @@ pub struct RunStats {
     /// `completion.requirements` continuations, at most one per real prompt.
     #[serde(default)]
     pub completion_requirement_reminders: u64,
+    /// Requirement reviews not sent because a check had already passed on the
+    /// latest change.
+    #[serde(default)]
+    pub completion_requirement_reviews_skipped: u64,
     /// `completion.hook_block` continuations.
     #[serde(default)]
     pub completion_hook_blocks: u64,
@@ -410,6 +414,7 @@ mod tests {
         obj.remove("verificationFailures");
         obj.remove("capabilityIncompleteEvidence");
         obj.remove("completionRequirementReminders");
+        obj.remove("completionRequirementReviewsSkipped");
         obj.remove("completionHookBlocks");
         obj.remove("completionHookLimitHits");
         obj.remove("userSteers");
@@ -422,6 +427,7 @@ mod tests {
         assert_eq!(restored.verification_failures, 0);
         assert_eq!(restored.capability_incomplete_evidence, 0);
         assert_eq!(restored.completion_requirement_reminders, 0);
+        assert_eq!(restored.completion_requirement_reviews_skipped, 0);
         assert_eq!(restored.completion_hook_blocks, 0);
         assert_eq!(restored.completion_hook_limit_hits, 0);
         assert_eq!(restored.user_steers, 0);

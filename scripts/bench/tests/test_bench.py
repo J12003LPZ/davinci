@@ -102,6 +102,26 @@ class StreamTelemetryTests(unittest.TestCase):
         self.assertFalse(result["usage_available"])
         for field in ("input", "cached", "cache_write", "output", "first_request_input_tokens"):
             self.assertIsNone(result[field], field)
+        # The successful attempt's usage is kept beside the null exact totals.
+        self.assertEqual(result["known_usage"], {"input": 10, "cached": 0, "cache_write": 0, "output": 5})
+
+    def test_known_usage_equals_the_exact_totals_when_every_attempt_reported(self):
+        failed = {"input": 20, "output": 2, "cacheRead": 5, "cacheWrite": 3}
+        success = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        events = self.observed_stream([(1, "failed", failed), (2, "completed", success)])
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertEqual(result["usage_unknown_attempts"], 0)
+        self.assertEqual(result["known_usage"], {field: result[field]
+                                                 for field in ("input", "cached", "cache_write", "output")})
+
+    def test_known_usage_is_null_without_a_complete_receipt_or_on_a_truncated_stream(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        unknown = self.observed_stream([(1, "failed", None)])
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, unknown)))
+        self.assertIsNone(result["known_usage"])
+        complete = "\n".join(map(json.dumps, self.observed_stream([(1, "completed", usage)])))
+        self.assertEqual(bench.parse_stream("davinci", complete)["known_usage"]["input"], 10)
+        self.assertIsNone(bench.parse_stream("davinci", complete + '\n{"type": "message_upd')["known_usage"])
 
     def test_observed_attempt_receipts_include_failed_usage_and_ignore_terminal_done(self):
         failed = {"input": 20, "output": 2, "cacheRead": 5, "cacheWrite": 3}

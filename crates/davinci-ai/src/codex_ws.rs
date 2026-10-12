@@ -132,7 +132,13 @@ pub fn process_codex_websocket(
         }
     };
     if aborted {
-        observation.finish("aborted", None, message.usage.clone());
+        // Cut short by the caller's abort flag, or by the runaway check.
+        let status = if message.stop_reason == Some(StopReason::Aborted) {
+            "aborted"
+        } else {
+            "failed"
+        };
+        observation.finish(status, None, message.usage.clone());
         // The socket is mid-response; nothing later can reuse it.
         release_live_socket(acquired.key, stream, false);
         return Ok(CodexWebsocketMessage {
@@ -965,6 +971,17 @@ fn read_codex_events(
                     break;
                 }
                 events.push(parsed);
+                // The decoder gave up on a tool call that kept repeating
+                // itself. Stop reading; the caller drops the socket, which is
+                // still mid-response.
+                if decoder.is_done() {
+                    let message = decoder.finish(&mut produced);
+                    if message.error_message.as_deref()
+                        == Some(crate::stream_decoder::RUNAWAY_TOOL_CALL)
+                    {
+                        return Ok((events, message, true));
+                    }
+                }
             }
             OPCODE_CLOSE => {
                 if !saw_completion {
@@ -1967,6 +1984,44 @@ mod tests {
                 response["output"].as_array().unwrap().clone()
             );
         }
+    }
+
+    #[test]
+    fn a_runaway_tool_call_stops_the_websocket_read_before_the_stream_ends() {
+        let event = |value: Value| frame(true, OPCODE_TEXT, &serde_json::to_vec(&value).unwrap());
+        let mut wire = event(
+            serde_json::json!({"type":"response.output_item.added","output_index":0,
+            "item":{"type":"function_call","id":"fc","call_id":"c","name":"edit","arguments":""}}),
+        );
+        // Twice the bound and no terminal event: reading to the end would
+        // fail on the closed socket instead.
+        for _ in 0..2 * crate::stream_decoder::MAX_REPEATED_TOOL_DELTAS {
+            wire.extend(event(
+                serde_json::json!({"type":"response.function_call_arguments.delta",
+                "output_index":0,"delta":"\\n"}),
+            ));
+        }
+        let (events, message, cut_short) = read_codex_events(
+            &mut WsStream::for_test(wire),
+            Some(1000),
+            &mut false,
+            &mut ResponsesDecoder::new(&codex_model()),
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(cut_short, "the socket is dropped, not kept for reuse");
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some(crate::stream_decoder::RUNAWAY_TOOL_CALL)
+        );
+        assert!(!crate::is_retryable_assistant_error(&message));
+        assert!(message.content.is_empty());
+        assert_eq!(
+            events.len() as u32,
+            crate::stream_decoder::MAX_REPEATED_TOOL_DELTAS + 2
+        );
     }
 
     #[test]

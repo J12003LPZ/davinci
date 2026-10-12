@@ -14,8 +14,16 @@ token as their provider count. Structural and offline, as below.
 | Hybrid | 2 | 2 / 246,468 | 1,242,851 | 98.3% | 883/883 |
 | Hybrid, no summarizer | 2 | 0 / 0 | 1,242,851 | 98.3% | 883/883 |
 
-At 60 turns, before any compaction, hybrid requests are byte-identical to
-off. Hybrid's extra 1.7% of non-prefix bytes is the larger ledger summary
+Hybrid requests are byte-identical to off until off prunes old tool results,
+which it does once the context passes 65% of the window. Hybrid never prunes,
+so with default settings the first differing request follows an off-mode prune
+pass, before any compaction. With pruning disabled the first difference is the
+first request after the earlier of the two modes' compactions. In
+`crates/davinci-coding-agent/src/ws_wire_diagnosis_tests.rs`,
+`ws4_hybrid_matches_off_on_the_wire_before_compaction` holds the equality for
+a 42-request conversation through the real request path and
+`ws4_hybrid_first_diverges_at_compaction` holds the two divergence points.
+Hybrid's extra 1.7% of non-prefix bytes is the larger ledger summary
 after each compaction. Off's requirement loss starts at its first compaction
 because the fixture summary is generic: it shows that off depends entirely on
 the summarizer, not how a real model summarizes. Hybrid's ledger keeps the

@@ -34,6 +34,8 @@ pub(crate) struct CompletionState {
     git_before: Option<BTreeMap<PathBuf, [u8; 2]>>,
     pub(crate) mutations: BTreeSet<PathBuf>,
     requirement_sent: bool,
+    /// Mutation generation at which the review was last skipped as verified.
+    requirement_skipped_generation: Option<u64>,
     hook_blocks: u32,
     hook_limit_noticed: bool,
     initial_mutation_generation: u64,
@@ -253,6 +255,16 @@ impl Agent {
         if state.requirement_sent || state.request.is_empty() {
             return false;
         }
+        // A finish attempt repeated after another gate (a hook block, a
+        // capability reminder) with nothing changed since the skip: same
+        // answer, without observing the workspace again.
+        let verified = self.completion_evidence() == crate::CompletionEvidence::Verified;
+        if verified
+            && state.requirement_skipped_generation
+                == Some(self.mutation_verification_state().mutation_generation)
+        {
+            return false;
+        }
         // Only this run's own changes justify a review. A text-only answer or
         // read-only tools cannot attribute outside edits (an editor save, a
         // watcher) to the run; shell writes advance the mutation generation.
@@ -294,6 +306,28 @@ impl Agent {
                 && !matches!((&state.before, &after), (Some(before), Some(after)) if before.path_changed(after, path) == Some(false))
         });
         if paths.is_empty() || (paths.len() < 2 && requirement_clause_count(&state.request) < 3) {
+            return false;
+        }
+        // The reminder ends in "rerun the appropriate checks". When a check
+        // already passed on the latest change, that turn only repeats it, so
+        // the answer stands. Any other evidence state still gets the review.
+        // Not marked as sent: a later unverified edit in this prompt is
+        // reviewed. Counted once per prompt.
+        if verified {
+            let generation = self.mutation_verification_state().mutation_generation;
+            let first = self
+                .completion_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .requirement_skipped_generation
+                .replace(generation)
+                .is_none();
+            if first {
+                self.stats.completion_requirement_reviews_skipped = self
+                    .stats
+                    .completion_requirement_reviews_skipped
+                    .saturating_add(1);
+            }
             return false;
         }
         let mut message = String::from(
@@ -1271,6 +1305,108 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| matches!(event, AgentEvent::CompletionReminder { .. })));
+    }
+
+    fn passing_check(path: &str) -> crate::verification::Assessment {
+        crate::verification::Assessment {
+            kind: crate::verification::CheckKind::TargetedScript,
+            covered: vec![path.into()],
+            complete: false,
+            full_workspace: false,
+            reason: "test",
+        }
+    }
+
+    const THREE_CLAUSES: &str = "Handle normal input, reject invalid input; preserve the format.";
+
+    fn reminders(agent: &mut Agent) -> usize {
+        agent
+            .run_loop(reply)
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CompletionReminder { .. }))
+            .count()
+    }
+
+    #[test]
+    fn requirement_review_is_skipped_when_a_check_passed_on_the_latest_change() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt(THREE_CLAUSES);
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let generation = agent.mutation_verification_state().mutation_generation;
+        agent.record_verification_assessment(
+            generation,
+            "pytest",
+            &passing_check("app.py"),
+            Some(true),
+        );
+        assert_eq!(reminders(&mut agent), 0);
+        assert_eq!(agent.stats.model_turns, 1);
+        assert_eq!(agent.stats.completion_requirement_reminders, 0);
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+    }
+
+    #[test]
+    fn requirement_review_still_fires_without_a_passing_check_on_the_latest_change() {
+        // No check at all, a failed check, a check on only one of two changed
+        // files, and a pass that an edit made stale.
+        for case in ["none", "failed", "partial", "stale"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut agent = fixture(root.path());
+            agent.prompt(THREE_CLAUSES);
+            std::fs::write(root.path().join("app.py"), "after").unwrap();
+            let mut paths = vec![PathBuf::from("app.py")];
+            if case == "partial" {
+                std::fs::write(root.path().join("lib.py"), "after").unwrap();
+                paths.push("lib.py".into());
+            }
+            agent.record_successful_mutation_paths(paths);
+            let generation = agent.mutation_verification_state().mutation_generation;
+            if case != "none" {
+                agent.record_verification_assessment(
+                    generation,
+                    "pytest",
+                    &passing_check("app.py"),
+                    Some(case != "failed"),
+                );
+            }
+            if case == "stale" {
+                agent.record_successful_mutation_paths(vec!["app.py".into()]);
+            }
+            assert_eq!(reminders(&mut agent), 1, "{case}");
+            assert_eq!(agent.stats.completion_requirement_reminders, 1, "{case}");
+            assert_eq!(
+                agent.stats.completion_requirement_reviews_skipped, 0,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_edit_after_a_skipped_review_is_still_reviewed() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt(THREE_CLAUSES);
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let generation = agent.mutation_verification_state().mutation_generation;
+        agent.record_verification_assessment(
+            generation,
+            "pytest",
+            &passing_check("app.py"),
+            Some(true),
+        );
+        let mut events = Vec::new();
+        assert!(!agent.queue_requirement_completion(&mut events));
+        // A repeated finish attempt with nothing changed is one skip, not two.
+        assert!(!agent.queue_requirement_completion(&mut events));
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+        std::fs::write(root.path().join("app.py"), "later").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        assert!(agent.queue_requirement_completion(&mut events));
+        assert_eq!(agent.stats.completion_requirement_reminders, 1);
     }
 
     #[test]

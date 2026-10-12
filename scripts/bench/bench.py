@@ -36,7 +36,8 @@ from campaign import (LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task
 from runner import (create_campaign, isolate_settings, controlled_environment, select_tasks,
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
                     pin_model_store, model_stop_reason, validate_large_manifest, container_command,
-                    campaign_lock, parent_identity, source_identity)
+                    campaign_lock, parent_identity, source_identity, bench_options,
+                    campaign_slot)
 from codex_otel import Collector, request_metrics
 from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
@@ -232,11 +233,28 @@ def forbidden_artifacts(workdir, tid):
             "artifact_scan_scope": "reserved grader, credential, harness artifact paths and symlinks; before grading"}
 
 
-def command(harness, prompt, workdir):
+def codemode_arm(settings):
+    """Codemode mode selected by the DaVinci settings, validated before any launch."""
+    block = (settings or {}).get("codemode")
+    mode = block.get("mode", "off") if isinstance(block, dict) else "off"
+    if mode not in ("off", "read-only"):
+        raise ValueError("benchmark codemode arm must be off or read-only")
+    return mode
+
+
+def command(harness, prompt, workdir, settings=None):
     if harness == "davinci":
+        # The /config switch silently stays off under --no-session, so an "on"
+        # arm would measure the off path. The explicit flag fails loudly instead
+        # and keeps the session journal Codemode records into (agent dir, not
+        # the graded workspace).
+        mode = codemode_arm(settings)
+        session = ["--no-session"] if mode == "off" else ["--codemode", mode]
+        steer = bench_options(settings).get("appendSystemPrompt")
         return [
-            os.environ.get("BENCH_DAVINCI", "davinci"), "--mode", "json", "--no-session",
+            os.environ.get("BENCH_DAVINCI", "davinci"), "--mode", "json", *session,
             "--provider", "openai-codex", "--model", MODEL, "--thinking", EFFORT,
+            *(["--append-system-prompt", steer] if steer else []),
             "--permission-mode", "always-approve", "-p", prompt,
         ]
     # --ignore-user-config drops a user's service_tier = "fast" (priority
@@ -409,6 +427,11 @@ def parse_stream(harness, stdout):
         stats["usage_complete_attempts"] = complete_count
         stats["usage_unknown_attempts"] = (attempts - complete_count if type(attempts) is int else None)
         stats["usage_completeness_ratio"] = complete_count / attempts if attempts else None
+        # What the attempts with a full receipt used. A lower bound when any
+        # attempt is unknown: the exact totals below stay null in that case.
+        known = [davinci_usage(receipts[identity][1]) for identity in complete_receipts - uncertain_receipts]
+        stats["known_usage"] = {field: sum(values[field] for values in known)
+                                for field in ("input", "cached", "cache_write", "output")} if known else None
         if not stats["request_metrics_complete"] or not receipts or usage_conflict:
             add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
             usage_conflict = True
@@ -435,7 +458,7 @@ def parse_stream(harness, stdout):
         # A truncated JSON record may have omitted an entire paid attempt.
         add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
         usage_conflict = True
-        stats["usage_unknown_attempts"] = stats["usage_completeness_ratio"] = None
+        stats["usage_unknown_attempts"] = stats["usage_completeness_ratio"] = stats["known_usage"] = None
         if harness == "davinci":
             stats["request_metrics_available"] = stats["request_metrics_complete"] = False
             for field in ("logical_requests", "requests", "provider_attempts", "coding_provider_attempts",
@@ -462,6 +485,17 @@ def grading_timeout(campaign):
     return timeout
 
 
+def wire_dump_directory(settings, harness, tid, rep):
+    """Per-run request dump directory for a diagnostic DaVinci arm, else None.
+
+    It sits beside the run directories, never inside the graded workspace. The
+    dumps hold conversation content, including files the agent read.
+    """
+    if harness != "davinci" or not bench_options(settings).get("wireDump"):
+        return None
+    return os.path.join(RUNS, "wire", f"{tid}-r{rep}")
+
+
 def run_one(harness, tid, rep, campaign=None):
     subscription = campaign.get("subscription") if campaign else None
     if subscription:
@@ -475,7 +509,12 @@ def run_one(harness, tid, rep, campaign=None):
     env = (controlled_environment(os.environ, campaign["agent_dir"], subscription_only=bool(subscription))
            if campaign else dict(os.environ, PI_LEARNING_DISABLE_BACKGROUND="1", PYTHONUTF8="1"))
     with Collector() if harness == "codex" else nullcontext() as collector:
-        args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir)
+        settings = campaign["identities"][harness].get("effective_settings") if campaign else None
+        args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir, settings)
+        dump = wire_dump_directory(settings, harness, tid, rep)
+        if dump:
+            # controlled_environment strips DAVINCI_*; this one is declared by the arm.
+            env["DAVINCI_WIRE_DUMP"] = dump
         if campaign:
             args[0] = campaign["executables"][harness]
             if file_hash(args[0]) != campaign["identities"][harness]["binary_sha256"]:
@@ -512,16 +551,21 @@ def run_one(harness, tid, rep, campaign=None):
     artifacts = {"artifact_leak": None, "transaction_leak": None,
                  "artifact_paths": None, "transaction_paths": None, "artifact_scan_scope": None}
     cleanup_complete = measured.get("cleanup_complete")
+    inspection_error = None
+    inspection_phase = "cleanup"
     try:
         if measured.get("cleanup_complete") is not True:
             raise RuntimeError("cannot inspect a workspace while execution may still be active")
+        inspection_phase = "changed_files"
         changed = changed_files(workdir)
         unrelated = [p for p in changed if p not in spec["allowed"]]
+        inspection_phase = "forbidden_artifacts"
         artifacts = forbidden_artifacts(workdir, tid)
         if artifacts["artifact_leak"]:
             stopped = stopped or "forbidden_artifact"
-    except (OSError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         changed = unrelated = None
+        inspection_error = {"phase": inspection_phase, "type": type(error).__name__, "message": str(error)}
         stopped = stopped or "change_inventory_failed"
     grading_evidence = {}
     if stopped:
@@ -567,6 +611,7 @@ def run_one(harness, tid, rep, campaign=None):
                                if campaign else "diagnostic-only"),
         "task_set": "legacy" if tid in LEGACY_TASKS else "large",
         "stop_reason": stopped,
+        "inspection_error": inspection_error,
         "regression_pass": regression["pass"] if regression else None,
         "regression_exit": regression["exit"] if regression else None,
         "grading_evidence": grading_evidence,
@@ -581,7 +626,7 @@ def run_one(harness, tid, rep, campaign=None):
         result["task_set"] = "private"
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts",
                 "runtime_stats",
-                "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio",
+                "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio", "known_usage",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",
                 "mutations_after_reminder", "executed_leaf_operations", "batch_children_reported",
                 "mutation_metric_scope", "executed_leaf_scope",
@@ -962,6 +1007,8 @@ def main():
                 raise ValueError("; ".join(frozen_errors))
             fixtures = fixture_manifest(TASKS, tids)
             settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
+            codemode_arm(settings)
+            bench_options(settings)
             manifest = campaign_identity(RUNS, args.variant, fixtures, args.harness,
                                          MODEL, EFFORT, settings, Path(HERE).parents[1])
             prices = None
@@ -981,6 +1028,10 @@ def main():
                      if args.order == "counterbalanced" else
                      [(h, t, r) for r in repetitions for t in tids for h in args.harness])
             manifest["campaign_lock"] = lock
+            manifest["campaign_slot"] = campaign_slot()
+            # Dumping adds I/O to every request: such a campaign is for diagnosis,
+            # never for a timing comparison.
+            manifest["diagnostic_wire_dump"] = bool(bench_options(settings).get("wireDump"))
             manifest.update(tasks=tids, repetitions=repetitions, harnesses=args.harness,
                             order=args.order, order_seed=args.order_seed, schedule=order,
                             grading_timeout_seconds=args.grading_timeout)

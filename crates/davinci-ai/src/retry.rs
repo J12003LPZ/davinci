@@ -223,6 +223,9 @@ fn retryable_provider_pattern() -> &'static Regex {
             "ended without",
             "stream ended before message_stop",
             "stream ended before a terminal response event",
+            // The same cut, with a tool call still open. Nothing from a cut
+            // response is executed, so a retry cannot repeat a side effect.
+            "stream ended before the tool call was complete",
             "http2 request did not get a response",
             "retry delay",
             "you can retry your request",

@@ -203,6 +203,15 @@ it marks two independent windows, deterministic code validation, and any missing
 telemetry as unestablished. A parent-only DaVinci campaign is valid: its absent
 Codex control is unavailable rather than an error or a fabricated comparison.
 
+A Codemode arm sets `"codemode": {"mode": "read-only", "nodePath": ...,
+"hostPath": ...}` in those settings, with absolute paths to an installed runtime
+outside the fixture. The runner then launches with `--codemode read-only`
+instead of `--no-session`: the `/config` switch alone stays off silently in a
+sessionless run, so the arm would measure the off path. The explicit flag fails
+the run loudly when Codemode cannot start. The session journal lands in the
+campaign agent directory, not the graded workspace. Other modes are rejected
+before any model call.
+
 DaVinci uses copied credentials and explicit settings. `--settings` selects an
 experimental configuration; defaults use fixed effort, stable prompt profile,
 full tools, and automatic verification. For a
@@ -212,6 +221,24 @@ Inherited product/provider/OTEL overrides are stripped. Codex uses
 `--ignore-user-config` and a local sanitized OTLP collector. Source cleanliness,
 binary bytes, fixture hashes, and the pinned model catalog are rechecked during
 the campaign.
+
+A terminal DaVinci `Provider error:` reply stops the campaign even when startup
+fails before a provider-observation or `message_end` error event. Expired or
+missing credentials are classified as `credentials`; other terminal provider
+faults as `provider_error`. The failed row and transcript are retained, and its
+grader is not run. Ordinary assistant discussion and tool output are not scanned
+as terminal provider replies. Inventory failures retain `inspection_error`
+(phase, exception type, and message) in the local result row.
+
+For sequential campaigns, OAuth refreshes belong to the copied campaign agent
+directory, not the original credential source. Copying that original again can
+reuse a superseded refresh token. After a clean campaign, use its `_agent`
+directory as the next campaign's credential source via
+`DAVINCI_CODING_AGENT_DIR`; do not copy campaign credentials back over the user's
+normal login. An outer driver must stop on a nonzero run or validation result.
+The paired `gate` requires both arms; a DaVinci-only ablation must instead pass
+`campaign_errors` completeness/identity validation and must not be labeled a
+paired screening gate pass. Never stitch aborted campaign rows into a new one.
 
 Both harnesses receive the same execution-environment preamble followed by the
 unchanged task text. The runner has already prepared an isolated repository;
@@ -334,3 +361,33 @@ prefix, and cache ratios. Missing usage remains unavailable. Wire dumps contain
 full conversations and file contents; keep them private and outside Git. Timed
 campaigns deliberately remove inherited wire-dump settings, so collect those
 separately from timing evidence.
+
+### Harness-only arm options and concurrent slots
+
+A `bench` key in the `--settings` file carries options for the harness, not the
+agent. It is recorded in the campaign's effective settings and never written to
+the agent's `settings.json`:
+
+```json
+{ "bench": { "tokenGovernor": {"enabled": false},
+             "appendSystemPrompt": "Text appended to the DaVinci system prompt." } }
+```
+
+- `tokenGovernor` writes `token-governor.json` into the isolated agent
+  directory. Use it for a Token Governor on/off pair; the environment switches
+  cannot be used because the harness strips `DAVINCI_*` variables.
+- `wireDump: true` sets `DAVINCI_WIRE_DUMP` for each DaVinci run to
+  `<campaign>/wire/<task>-r<rep>`, outside the graded workspace. The dumps
+  contain conversation content and files the agent read: keep them local. The
+  manifest records `diagnostic_wire_dump`; such a campaign is for diagnosis and
+  must not be used for a timing comparison.
+- `appendSystemPrompt` passes `--append-system-prompt`. A steered arm is a
+  different treatment from an unsteered one; compare it only with an arm that
+  differs in one thing.
+
+`BENCH_CAMPAIGN_SLOT=<name>` takes a separate machine lock so one campaign can
+run beside another. The slot is recorded as `campaign_slot` in the manifest.
+Concurrent campaigns share the machine and the provider account, so their wall
+times are not comparable with a solo campaign, and each needs its own
+credential lineage (two campaigns refreshing copies of one login invalidate
+each other).
