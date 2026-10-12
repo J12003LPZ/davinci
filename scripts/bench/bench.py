@@ -36,7 +36,8 @@ from campaign import (LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task
 from runner import (create_campaign, isolate_settings, controlled_environment, select_tasks,
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
                     pin_model_store, model_stop_reason, validate_large_manifest, container_command,
-                    campaign_lock, parent_identity, source_identity)
+                    campaign_lock, parent_identity, source_identity, bench_options,
+                    campaign_slot)
 from codex_otel import Collector, request_metrics
 from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
@@ -249,9 +250,11 @@ def command(harness, prompt, workdir, settings=None):
         # the graded workspace).
         mode = codemode_arm(settings)
         session = ["--no-session"] if mode == "off" else ["--codemode", mode]
+        steer = bench_options(settings).get("appendSystemPrompt")
         return [
             os.environ.get("BENCH_DAVINCI", "davinci"), "--mode", "json", *session,
             "--provider", "openai-codex", "--model", MODEL, "--thinking", EFFORT,
+            *(["--append-system-prompt", steer] if steer else []),
             "--permission-mode", "always-approve", "-p", prompt,
         ]
     # --ignore-user-config drops a user's service_tier = "fast" (priority
@@ -985,6 +988,7 @@ def main():
             fixtures = fixture_manifest(TASKS, tids)
             settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
             codemode_arm(settings)
+            bench_options(settings)
             manifest = campaign_identity(RUNS, args.variant, fixtures, args.harness,
                                          MODEL, EFFORT, settings, Path(HERE).parents[1])
             prices = None
@@ -1004,6 +1008,7 @@ def main():
                      if args.order == "counterbalanced" else
                      [(h, t, r) for r in repetitions for t in tids for h in args.harness])
             manifest["campaign_lock"] = lock
+            manifest["campaign_slot"] = campaign_slot()
             manifest.update(tasks=tids, repetitions=repetitions, harnesses=args.harness,
                             order=args.order, order_seed=args.order_seed, schedule=order,
                             grading_timeout_seconds=args.grading_timeout)
