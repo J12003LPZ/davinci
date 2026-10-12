@@ -157,6 +157,7 @@ def grader_preflight():
 
 def stop_reason(stdout, stderr):
     errors = [stderr]
+    terminal_provider_error = False
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -170,13 +171,30 @@ def stop_reason(stdout, stderr):
             message = event.get("message")
             if isinstance(message, dict) and message.get("stopReason") == "error":
                 errors.append(str(message.get("errorMessage", "")))
+        elif event.get("type") == "agent_end":
+            # DaVinci can fail before a provider request exists (expired OAuth,
+            # missing credentials). That path has no message_end error event;
+            # it emits the harness's prefixed error in the terminal envelope.
+            messages = event.get("messages")
+            for message in messages if isinstance(messages, list) else []:
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                content = message.get("content")
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict) or block.get("type") != "text":
+                        continue
+                    value = block.get("text")
+                    if isinstance(value, str) and value.startswith("Provider error: "):
+                        errors.append(value)
+                        terminal_provider_error = True
     text = "\n".join(errors).lower()
     if any(value in text for value in ("usage limit", "usage_limit_reached", "rate limit", "rate_limit", "quota exceeded", "insufficient_quota")):
         return "usage_limit"
     if any(value in text for value in ("unauthorized", "invalid api key", "incorrect api key",
-            "authentication failed", "credentials expired", "refresh token expired", "not logged in")):
+            "authentication failed", "credentials expired", "refresh token expired", "not logged in",
+            "sign-in expired", "credential cannot be used", "no credential for")):
         return "credentials"
-    return None
+    return "provider_error" if terminal_provider_error else None
 
 
 def pin_model_store(path, model):

@@ -222,6 +222,24 @@ Inherited product/provider/OTEL overrides are stripped. Codex uses
 binary bytes, fixture hashes, and the pinned model catalog are rechecked during
 the campaign.
 
+A terminal DaVinci `Provider error:` reply stops the campaign even when startup
+fails before a provider-observation or `message_end` error event. Expired or
+missing credentials are classified as `credentials`; other terminal provider
+faults as `provider_error`. The failed row and transcript are retained, and its
+grader is not run. Ordinary assistant discussion and tool output are not scanned
+as terminal provider replies. Inventory failures retain `inspection_error`
+(phase, exception type, and message) in the local result row.
+
+For sequential campaigns, OAuth refreshes belong to the copied campaign agent
+directory, not the original credential source. Copying that original again can
+reuse a superseded refresh token. After a clean campaign, use its `_agent`
+directory as the next campaign's credential source via
+`DAVINCI_CODING_AGENT_DIR`; do not copy campaign credentials back over the user's
+normal login. An outer driver must stop on a nonzero run or validation result.
+The paired `gate` requires both arms; a DaVinci-only ablation must instead pass
+`campaign_errors` completeness/identity validation and must not be labeled a
+paired screening gate pass. Never stitch aborted campaign rows into a new one.
+
 Both harnesses receive the same execution-environment preamble followed by the
 unchanged task text. The runner has already prepared an isolated repository;
 the preamble directs edits and verification to that directory and excludes
