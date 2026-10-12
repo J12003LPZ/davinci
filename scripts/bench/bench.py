@@ -480,6 +480,17 @@ def grading_timeout(campaign):
     return timeout
 
 
+def wire_dump_directory(settings, harness, tid, rep):
+    """Per-run request dump directory for a diagnostic DaVinci arm, else None.
+
+    It sits beside the run directories, never inside the graded workspace. The
+    dumps hold conversation content, including files the agent read.
+    """
+    if harness != "davinci" or not bench_options(settings).get("wireDump"):
+        return None
+    return os.path.join(RUNS, "wire", f"{tid}-r{rep}")
+
+
 def run_one(harness, tid, rep, campaign=None):
     subscription = campaign.get("subscription") if campaign else None
     if subscription:
@@ -495,6 +506,10 @@ def run_one(harness, tid, rep, campaign=None):
     with Collector() if harness == "codex" else nullcontext() as collector:
         settings = campaign["identities"][harness].get("effective_settings") if campaign else None
         args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir, settings)
+        dump = wire_dump_directory(settings, harness, tid, rep)
+        if dump:
+            # controlled_environment strips DAVINCI_*; this one is declared by the arm.
+            env["DAVINCI_WIRE_DUMP"] = dump
         if campaign:
             args[0] = campaign["executables"][harness]
             if file_hash(args[0]) != campaign["identities"][harness]["binary_sha256"]:
@@ -1009,6 +1024,9 @@ def main():
                      [(h, t, r) for r in repetitions for t in tids for h in args.harness])
             manifest["campaign_lock"] = lock
             manifest["campaign_slot"] = campaign_slot()
+            # Dumping adds I/O to every request: such a campaign is for diagnosis,
+            # never for a timing comparison.
+            manifest["diagnostic_wire_dump"] = bool(bench_options(settings).get("wireDump"))
             manifest.update(tasks=tids, repetitions=repetitions, harnesses=args.harness,
                             order=args.order, order_seed=args.order_seed, schedule=order,
                             grading_timeout_seconds=args.grading_timeout)
