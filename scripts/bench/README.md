@@ -376,6 +376,11 @@ the agent's `settings.json`:
 - `tokenGovernor` writes `token-governor.json` into the isolated agent
   directory. Use it for a Token Governor on/off pair; the environment switches
   cannot be used because the harness strips `DAVINCI_*` variables.
+- `wireDump: true` sets `DAVINCI_WIRE_DUMP` for each DaVinci run to
+  `<campaign>/wire/<task>-r<rep>`, outside the graded workspace. The dumps
+  contain conversation content and files the agent read: keep them local. The
+  manifest records `diagnostic_wire_dump`; such a campaign is for diagnosis and
+  must not be used for a timing comparison.
 - `appendSystemPrompt` passes `--append-system-prompt`. A steered arm is a
   different treatment from an unsteered one; compare it only with an arm that
   differs in one thing.

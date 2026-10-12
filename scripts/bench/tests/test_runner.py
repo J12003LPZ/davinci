@@ -80,6 +80,26 @@ class RunnerTests(unittest.TestCase):
             runner.isolate_settings(source, root / "default", {"autoVerify": True})
             self.assertFalse((root / "default/token-governor.json").exists())
 
+    def test_wire_dump_arm_gets_a_per_run_directory_outside_the_workspace(self):
+        on = {"bench": {"wireDump": True}}
+        with patch.object(bench, "RUNS", os.path.join("campaign", "root")):
+            dump = bench.wire_dump_directory(on, "davinci", "t1-intervals", 2)
+            workdir = os.path.join(bench.RUNS, "davinci", "t1-intervals-r2")
+            self.assertEqual(dump, os.path.join("campaign", "root", "wire", "t1-intervals-r2"))
+            self.assertNotEqual(os.path.commonpath([dump, workdir]), workdir)
+            self.assertIsNone(bench.wire_dump_directory(on, "codex", "t1-intervals", 2))
+            self.assertIsNone(bench.wire_dump_directory({}, "davinci", "t1-intervals", 2))
+            self.assertIsNone(bench.wire_dump_directory({"bench": {"wireDump": False}}, "davinci", "t1", 0))
+        with self.assertRaises(ValueError):
+            runner.bench_options({"bench": {"wireDump": "yes"}})
+        # The switch is harness-only: it never reaches the agent's settings file.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source").mkdir()
+            (root / "source" / "auth.json").write_text("{}")
+            runner.isolate_settings(root / "source", root / "agent", {"autoVerify": True, **on})
+            self.assertEqual(json.loads((root / "agent/settings.json").read_text()), {"autoVerify": True})
+
     def test_campaign_slot_selects_a_separate_validated_lock(self):
         with patch.dict(os.environ, {"BENCH_CAMPAIGN_SLOT": ""}):
             default = runner._campaign_lock_path()

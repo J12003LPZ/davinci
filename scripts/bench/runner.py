@@ -609,8 +609,10 @@ def bench_options(settings):
     are never written to the agent's settings.json.
     """
     block = (settings or {}).get("bench", {})
-    if not isinstance(block, dict) or set(block) - {"tokenGovernor", "appendSystemPrompt"}:
-        raise ValueError("bench settings accept only tokenGovernor and appendSystemPrompt")
+    if not isinstance(block, dict) or set(block) - {"tokenGovernor", "appendSystemPrompt", "wireDump"}:
+        raise ValueError("bench settings accept only tokenGovernor, appendSystemPrompt and wireDump")
+    if type(block.get("wireDump", False)) is not bool:
+        raise ValueError("bench.wireDump must be true or false")
     governor = block.get("tokenGovernor")
     if governor is not None and (not isinstance(governor, dict) or set(governor) != {"enabled"}
                                  or type(governor["enabled"]) is not bool):
