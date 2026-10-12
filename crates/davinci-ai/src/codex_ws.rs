@@ -966,22 +966,20 @@ fn read_codex_events(
                 // Decoder rejection is terminal even when the wire event
                 // itself was malformed. Never read past that evidence.
                 if decoder.is_done() {
-                    saw_completion = true;
                     events.push(parsed);
-                    break;
-                }
-                events.push(parsed);
-                // The decoder gave up on a tool call that kept repeating
-                // itself. Stop reading; the caller drops the socket, which is
-                // still mid-response.
-                if decoder.is_done() {
+                    // The decoder gave up on a tool call that kept repeating
+                    // itself. Stop reading; the caller drops the socket, which
+                    // is still mid-response.
                     let message = decoder.finish(&mut produced);
                     if message.error_message.as_deref()
                         == Some(crate::stream_decoder::RUNAWAY_TOOL_CALL)
                     {
                         return Ok((events, message, true));
                     }
+                    saw_completion = true;
+                    break;
                 }
+                events.push(parsed);
             }
             OPCODE_CLOSE => {
                 if !saw_completion {

@@ -497,7 +497,9 @@ fn retried_whole(cut: &[Value], calls: &[Value]) -> Vec<Reply> {
     ]
 }
 
-fn assert_retried_once(outcome: &Outcome, follow_ups: usize) {
+const CUT_TOOL_CALL: &str = "Stream ended before the tool call was complete";
+
+fn assert_retried_once(outcome: &Outcome, follow_ups: usize, error: &str) {
     assert_eq!(
         outcome.requests,
         2 + follow_ups,
@@ -506,10 +508,7 @@ fn assert_retried_once(outcome: &Outcome, follow_ups: usize) {
     let retries = outcome.retry_events();
     assert_eq!(retries[0]["type"], "auto_retry_start");
     assert_eq!(retries[0]["attempt"], 1);
-    assert_eq!(
-        retries[0]["errorMessage"],
-        "Stream ended before the tool call was complete"
-    );
+    assert_eq!(retries[0]["errorMessage"], error);
     assert_eq!(retries[1]["type"], "auto_retry_end");
     assert_eq!(retries[1]["success"], true);
     assert_eq!(outcome.stats.provider_retries, 1);
@@ -531,7 +530,7 @@ fn ws3_cut_during_first_tool_call_is_retried_and_the_call_runs_once() {
     );
     describe("(b) cut during first tool call", &outcome);
 
-    assert_retried_once(&outcome, 2);
+    assert_retried_once(&outcome, 2, CUT_TOOL_CALL);
     assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 1);
     assert_eq!(
         outcome.side_effect_text.as_deref(),
@@ -554,9 +553,14 @@ fn ws3_transport_error_during_first_tool_call_is_retried_as_the_same_cut() {
     let outcome = run(replies, |_| {});
     describe("(b2) transport error during first tool call", &outcome);
 
-    // The decoder's text wins over the transport's ("Unable to read provider
-    // response: ..."): one path, not a separate one for transport errors.
-    assert_retried_once(&outcome, 2);
+    // The transport's text is reported, and its typed failure (interrupted
+    // transport) is what makes the attempt retryable: same retry, same
+    // budget, nothing executed from the cut response.
+    assert_retried_once(
+        &outcome,
+        2,
+        "Unable to read provider response: Peer disconnected",
+    );
     assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 1);
 }
 
@@ -573,7 +577,7 @@ fn ws3_cut_during_second_tool_call_is_retried_and_each_call_runs_once() {
     let outcome = run(retried_whole(&cut, &calls), |_| {});
     describe("(c) cut during second tool call", &outcome);
 
-    assert_retried_once(&outcome, 3);
+    assert_retried_once(&outcome, 3, CUT_TOOL_CALL);
     // Executed twice: once per call, both from the retried response.
     assert_eq!(outcome.count(&outcome.sunk, "tool_execution_start"), 2);
     assert_eq!(
