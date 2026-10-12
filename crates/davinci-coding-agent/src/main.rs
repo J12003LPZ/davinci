@@ -12915,6 +12915,10 @@ mod tests;
 #[path = "wor33_cache_identity_tests.rs"]
 mod wor33_cache_identity_tests;
 
+#[cfg(test)]
+#[path = "ws_wire_diagnosis_tests.rs"]
+mod ws_wire_diagnosis_tests;
+
 fn teammate_idle_timeout() -> std::time::Duration {
     std::env::var("DAVINCI_TEAMMATE_IDLE_TIMEOUT_MS")
         .ok()
