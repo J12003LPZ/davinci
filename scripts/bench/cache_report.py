@@ -7,20 +7,25 @@ logical request body), `<seq>-<pid>-wire.json` (the frame actually sent, when
 the WebSocket transport was used) and `<seq>-<pid>-usage.json` (the usage the
 provider reported). For each request, in order, this prints total and cached
 input tokens, whether the wire frame continued a previous response
-(`previous_response_id`), the prompt_cache_key, and the first place the
+(`previous_response_id`), a digest of the prompt_cache_key, and the first place the
 logical body stops extending the previous request's logical body.
 Each row also includes stable digests for the complete logical/wire bodies
 and the instructions, tools, and input components. The per-process summary
 records whether the first request had zero cached input.
 
-An append-only conversation shows `break=-` on every row. Any other value
+An append-only logical input shows `break=-` on every row. This is local
+JSON continuity, not proof of provider cache reuse or acknowledged native replay.
+Any other value
 names the part that changed: `instructions`, `tools`, `shorter`, or
-`input[i]` with the two differing items printed underneath.
+`input[i]` with only digests and sizes of the differing items underneath.
+No raw prompt content, provider labels, routing keys, or paths are printed.
+This offline reader does not enable tracing or create additional raw captures.
 """
 import glob
 import hashlib
 import json
 import os
+import re
 import sys
 
 
@@ -51,9 +56,11 @@ def first_break(prev, cur):
 
 
 def brief(item):
-    kind = item.get("type") or item.get("role") or "?"
-    text = json.dumps(item, ensure_ascii=False)
-    return f"{kind}: {text[:200]}"
+    """Summarize untrusted capture content without copying any of it."""
+    encoded = json.dumps(
+        item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return f"digest={digest(item)} bytes={len(encoded)}"
 
 
 def token_pair(usage):
@@ -108,32 +115,46 @@ def first_request_cache_state(pairs):
 def main(folder):
     groups = {}
     for path in glob.glob(os.path.join(folder, "*-logical.json")):
-        seq, pid, _ = os.path.basename(path).split("-", 2)
-        groups.setdefault(pid, []).append((int(seq), path))
+        match = re.fullmatch(r"([0-9]+)-([0-9]+)-logical\.json", os.path.basename(path))
+        if match:
+            seq, pid = match.groups()
+            groups.setdefault(pid, []).append((int(seq), path))
     if not groups:
-        print(f"no *-logical.json files in {folder}")
+        print("no numbered *-logical.json captures")
         return 1
     for pid, items in sorted(groups.items()):
         print(f"process {pid}")
         prev = None
         pairs = []
         for seq, path in sorted(items):
-            body = load(path)
             usage_path = path.replace("-logical.json", "-usage.json")
             wire_path = path.replace("-logical.json", "-wire.json")
-            usage = load(usage_path) if os.path.exists(usage_path) else {}
-            wire = load(wire_path) if os.path.exists(wire_path) else {}
+            try:
+                body = load(path)
+                usage = load(usage_path) if os.path.exists(usage_path) else {}
+                wire = load(wire_path) if os.path.exists(wire_path) else {}
+                if not isinstance(body, dict) or not isinstance(wire, dict):
+                    raise ValueError("invalid request shape")
+                if not isinstance(body.get("input") or [], list):
+                    raise ValueError("invalid input shape")
+            except (OSError, ValueError):
+                print(f"  #{seq:04d} invalid capture; content and path withheld")
+                return 2
             total, cached = token_pair(usage)
             pairs.append((total, cached))
+            output = usage.get("output") if isinstance(usage, dict) else None
+            if type(output) is not int or output < 0:
+                output = None
             mode = "delta" if wire.get("previous_response_id") else ("full" if wire else "http")
-            key = str(body.get("prompt_cache_key", "-"))
+            key = digest(body["prompt_cache_key"]) if "prompt_cache_key" in body else "-"
             fingerprints = request_fingerprints(body, wire)
             where, pair = first_break(prev, body) if prev is not None else (None, None)
             print(f"  #{seq:04d} items={len(body.get('input') or []):3d} total={number(total):>11} "
                   f"cached={number(cached):>11} {mode:5} key={key[:20]:20} break={where or '-'} "
                   f"body={fingerprints['body']} wire={fingerprints['wire']} "
                   f"instructions={fingerprints['instructions']} tools={fingerprints['tools']} "
-                  f"input={fingerprints['input']}")
+                  f"input={fingerprints['input']} output={number(output)} "
+                  "usage_completeness=unknown")
             if pair:
                 print(f"         before: {brief(pair[0])}")
                 print(f"         after:  {brief(pair[1])}")

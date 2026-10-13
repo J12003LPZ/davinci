@@ -3939,6 +3939,37 @@ fn inline_check_finishes_without_extra_model_or_verifier_execution() {
 }
 
 #[test]
+fn environment_prefixed_pytest_without_discovery_cannot_verify_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["changed.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    let command = "PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/test_changed.py -q";
+    let args = serde_json::json!({"command":command});
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert("check".into(), generation);
+    agent.command_receipts.lock().unwrap().push_back(
+        crate::runtime::evidence_store::ExecutionReceipt {
+            operation_id: "check".into(),
+            argv: vec![command.into()],
+            started: true,
+            exit_code: Some(0),
+            ..Default::default()
+        },
+    );
+    let result = ToolResult {
+        content: "runner output unavailable".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    agent.observe_shell_verification("check", dir.path(), "bash", &args, &result, &result);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+#[test]
 fn shell_verification_requires_original_terminal_status_and_fresh_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let agent = verifying_agent(dir.path());

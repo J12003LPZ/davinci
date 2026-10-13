@@ -79,3 +79,42 @@ fn cache_partition_change_is_routing_not_prefix_content() {
         b.manifest().ordered_prefix_fingerprint
     );
 }
+
+#[test]
+fn prepared_manifest_is_deterministic_content_free_and_noninterfering() {
+    let secret = "SYNTHETIC_PRIVATE_BEARER_COOKIE_PATH_REASONING";
+    let model = sol();
+    let body = request_body_with(
+        &model,
+        &[ChatMessage::text("user", secret)],
+        Some(secret),
+        &[davinci_ai::ToolSpec {
+            name: "fixture_read".into(),
+            description: secret.into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": secret}}
+            }),
+            constrained_sampling: None,
+        }],
+        &StreamOptions {
+            cache_key: Some(secret.into()),
+            thinking_level: Some(davinci_protocol::ThinkingLevel::High),
+            ..StreamOptions::default()
+        },
+    );
+    let original_bytes = serde_json::to_vec(&body).unwrap();
+    let prepared = PreparedProviderRequest::new(body.clone());
+    let repeated = PreparedProviderRequest::new(body.clone());
+    assert_eq!(prepared.body(), &body);
+    assert_eq!(serde_json::to_vec(prepared.body()).unwrap(), original_bytes);
+    assert_eq!(prepared.manifest(), repeated.manifest());
+    let metadata = serde_json::to_string(prepared.manifest()).unwrap();
+    assert!(!metadata.contains(secret));
+    assert!(!metadata.contains("fixture_read"));
+    assert!(prepared.manifest().request_bytes_before_compression > 0);
+
+    let absent = PreparedProviderRequest::new(serde_json::json!({}));
+    assert_eq!(absent.body(), &serde_json::json!({}));
+    assert!(absent.manifest().segments.is_empty());
+}

@@ -3,8 +3,134 @@
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::stream::{AssistantMessage, StopReason};
+
+const RESPONSE_STREAM_FAILURE_KEY: &str = "__davinci_response_stream_failure";
+
+/// Host decoder/reader evidence, not provider text or operation retry authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStreamFailure {
+    MissingTerminal,
+    TransportInterrupted,
+    InvalidStream,
+    UnfinishedTerminalToolCall,
+    ProviderTerminalError,
+    ProviderTerminalRejection,
+    Unknown,
+}
+
+pub(crate) fn set_response_stream_failure(
+    message: &mut AssistantMessage,
+    failure: ResponseStreamFailure,
+) {
+    message.extra.insert(
+        RESPONSE_STREAM_FAILURE_KEY.into(),
+        serde_json::to_value(failure).expect("stream failure enum"),
+    );
+}
+
+pub fn response_stream_failure(message: &AssistantMessage) -> Option<ResponseStreamFailure> {
+    message.extra.get(RESPONSE_STREAM_FAILURE_KEY).map(|value| {
+        serde_json::from_value(value.clone()).unwrap_or(ResponseStreamFailure::Unknown)
+    })
+}
+
+fn read_failure(kind: std::io::ErrorKind) -> ResponseStreamFailure {
+    use std::io::ErrorKind;
+    match kind {
+        ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::UnexpectedEof
+        | ErrorKind::TimedOut => ResponseStreamFailure::TransportInterrupted,
+        ErrorKind::InvalidData => ResponseStreamFailure::InvalidStream,
+        _ => ResponseStreamFailure::Unknown,
+    }
+}
+
+pub(crate) fn classify_stream_read_error(error: &std::io::Error) -> ResponseStreamFailure {
+    // ureq 3 keeps its timeout evidence inside an ErrorKind::Other wrapper.
+    // Do not infer interruption from arbitrary Other error strings.
+    if error.kind() == std::io::ErrorKind::Other
+        && matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ureq_stream::Error>()),
+            Some(ureq_stream::Error::Timeout(_))
+        )
+    {
+        return ResponseStreamFailure::TransportInterrupted;
+    }
+    read_failure(error.kind())
+}
+
+pub(crate) fn classify_terminal_response_error(
+    response: &serde_json::Value,
+) -> ResponseStreamFailure {
+    match response.get("status") {
+        Some(serde_json::Value::String(status)) if status == "cancelled" => {
+            return ResponseStreamFailure::ProviderTerminalRejection;
+        }
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(status))
+            if matches!(status.as_str(), "completed" | "failed" | "incomplete") => {}
+        _ => return ResponseStreamFailure::Unknown,
+    }
+    classify_provider_terminal_error(response)
+}
+
+pub(crate) fn classify_provider_terminal_error(event: &serde_json::Value) -> ResponseStreamFailure {
+    let rejected = event
+        .pointer("/incomplete_details/reason")
+        .and_then(serde_json::Value::as_str)
+        == Some("content_filter")
+        || std::iter::once(event)
+            .chain(event.get("error"))
+            .any(|error| {
+                ["code", "type"].iter().any(|key| {
+                    error
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|code| {
+                            let code = code.to_ascii_lowercase();
+                            non_retryable_limit_pattern().is_match(&code)
+                                || code.starts_with("invalid_")
+                                || code.ends_with("_policy_violation")
+                                || matches!(
+                                    code.as_str(),
+                                    "authentication_error" | "permission_denied" | "content_filter"
+                                )
+                        })
+                })
+            });
+    if rejected {
+        ResponseStreamFailure::ProviderTerminalRejection
+    } else {
+        ResponseStreamFailure::ProviderTerminalError
+    }
+}
+
+pub(crate) fn declared_response_veto(
+    response: &serde_json::Value,
+) -> Option<ResponseStreamFailure> {
+    match response.get("status") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(status)) if status == "cancelled" => {
+            return Some(ResponseStreamFailure::ProviderTerminalRejection);
+        }
+        Some(serde_json::Value::String(status))
+            if matches!(
+                status.as_str(),
+                "queued" | "in_progress" | "completed" | "failed" | "incomplete"
+            ) => {}
+        _ => return Some(ResponseStreamFailure::Unknown),
+    }
+    (classify_provider_terminal_error(response) == ResponseStreamFailure::ProviderTerminalRejection)
+        .then_some(ResponseStreamFailure::ProviderTerminalRejection)
+}
 
 fn build_pattern(patterns: &[&str]) -> Regex {
     Regex::new(&format!("(?i){}", patterns.join("|"))).expect("retry pattern")
@@ -121,6 +247,23 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     if non_retryable_limit_pattern().is_match(error_message) {
         return false;
     }
+    if let Some(failure) = response_stream_failure(message) {
+        let retryable = match failure {
+            ResponseStreamFailure::MissingTerminal
+            | ResponseStreamFailure::TransportInterrupted => true,
+            // A terminal event ends this attempt, not necessarily the recovery
+            // budget. Retain the existing transient-provider policy.
+            ResponseStreamFailure::ProviderTerminalError => {
+                retryable_provider_pattern().is_match(error_message)
+            }
+            _ => false,
+        };
+        return retryable
+            && !message
+                .content
+                .iter()
+                .any(|block| matches!(block, crate::ContentBlock::ToolCall { .. }));
+    }
     retryable_provider_pattern().is_match(error_message)
 }
 
@@ -149,6 +292,127 @@ mod tests {
         for text in ["HTTP 429 rate limit", "usage_limit_reached", "server error"] {
             assert!(!is_context_overflow_text(text), "{text}");
         }
+    }
+
+    #[test]
+    fn typed_stream_evidence_is_fail_closed_and_never_operation_authority() {
+        for (failure, retryable) in [
+            (ResponseStreamFailure::MissingTerminal, true),
+            (ResponseStreamFailure::TransportInterrupted, true),
+            (ResponseStreamFailure::InvalidStream, false),
+            (ResponseStreamFailure::UnfinishedTerminalToolCall, false),
+            (ResponseStreamFailure::ProviderTerminalError, true),
+            (ResponseStreamFailure::ProviderTerminalRejection, false),
+            (ResponseStreamFailure::Unknown, false),
+        ] {
+            let mut message = error_message("server error 503: stream terminated");
+            set_response_stream_failure(&mut message, failure);
+            assert_eq!(response_stream_failure(&message), Some(failure));
+            assert_eq!(is_retryable_assistant_error(&message), retryable);
+            message.stop_reason = Some(StopReason::Aborted);
+            assert!(!is_retryable_assistant_error(&message));
+            message.stop_reason = Some(StopReason::Error);
+            message.error_message = Some("HTTP 429 usage_limit_reached".into());
+            assert!(!is_retryable_assistant_error(&message));
+        }
+        let mut unknown = error_message("server error 503");
+        unknown.extra.insert(
+            RESPONSE_STREAM_FAILURE_KEY.into(),
+            serde_json::json!("future_or_invalid_kind"),
+        );
+        assert!(!is_retryable_assistant_error(&unknown));
+
+        let mut executable = error_message("stream terminated");
+        set_response_stream_failure(&mut executable, ResponseStreamFailure::MissingTerminal);
+        executable.content.push(crate::ContentBlock::ToolCall {
+            id: "new_id".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(!is_retryable_assistant_error(&executable));
+    }
+
+    #[test]
+    fn typed_reader_causes_separate_interruption_invalid_data_and_unknown() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert_eq!(
+                read_failure(kind),
+                ResponseStreamFailure::TransportInterrupted
+            );
+        }
+        assert_eq!(
+            read_failure(std::io::ErrorKind::InvalidData),
+            ResponseStreamFailure::InvalidStream
+        );
+        assert_eq!(
+            read_failure(std::io::ErrorKind::Other),
+            ResponseStreamFailure::Unknown
+        );
+        assert_eq!(
+            read_failure(std::io::ErrorKind::PermissionDenied),
+            ResponseStreamFailure::Unknown
+        );
+    }
+
+    #[test]
+    fn wrapped_ureq_idle_timeout_is_an_interruption_not_arbitrary_other() {
+        let timeout = ureq_stream::Error::Timeout(ureq_stream::Timeout::RecvBody).into_io();
+        assert_eq!(timeout.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            classify_stream_read_error(&timeout),
+            ResponseStreamFailure::TransportInterrupted
+        );
+        let other = std::io::Error::other("timeout 503, but no typed transport evidence");
+        assert_eq!(
+            classify_stream_read_error(&other),
+            ResponseStreamFailure::Unknown
+        );
+        for (kind, expected) in [
+            (
+                std::io::ErrorKind::InvalidData,
+                ResponseStreamFailure::InvalidStream,
+            ),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                ResponseStreamFailure::Unknown,
+            ),
+        ] {
+            let contradictory = std::io::Error::new(
+                kind,
+                ureq_stream::Error::Timeout(ureq_stream::Timeout::RecvBody),
+            );
+            assert_eq!(classify_stream_read_error(&contradictory), expected);
+        }
+    }
+
+    #[test]
+    fn terminal_rejection_codes_override_misleading_transient_messages() {
+        for event in [
+            serde_json::json!({"code": "insufficient_quota", "error": {"message": "HTTP 503; please retry your request"}}),
+            serde_json::json!({"message": "HTTP 503", "error": {"type": "permission_denied"}}),
+            serde_json::json!({"code": "server_error", "error": {"code": "content_policy_violation"}}),
+        ] {
+            let mut message = error_message("HTTP 503; please retry your request");
+            set_response_stream_failure(&mut message, classify_provider_terminal_error(&event));
+            assert!(!is_retryable_assistant_error(&message), "{event}");
+        }
+        let mut executable = error_message("HTTP 503 server error");
+        set_response_stream_failure(
+            &mut executable,
+            ResponseStreamFailure::ProviderTerminalError,
+        );
+        executable.content.push(crate::ContentBlock::ToolCall {
+            id: "new_id".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(!is_retryable_assistant_error(&executable));
     }
 
     #[test]

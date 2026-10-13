@@ -9,6 +9,13 @@ pub(crate) fn runner(command: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn runner_words(words: &[String]) -> Option<&'static str> {
+    // Match shell verification classification, including literal assignments
+    // outside or inside RTK's transparent wrapper. Assignment values do not
+    // supply runner identity or evidence.
+    let start = words
+        .iter()
+        .position(|word| !crate::shell_policy::shell_env_assignment(word))?;
+    let words = &words[start..];
     let (name, rest) = words.split_first()?;
     let name = name.rsplit(['/', '\\']).next()?.trim_end_matches(".exe");
     if name == "rtk" {
@@ -155,6 +162,60 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn environment_prefixed_pytest_requires_discovery() {
+        for command in [
+            "python -m pytest -q",
+            "PYTHONDONTWRITEBYTECODE=1 python -m pytest -q",
+            "A=one B=two rtk proxy python -m pytest tests/test_changed.py -q",
+        ] {
+            let receipt = crate::runtime::evidence_store::ExecutionReceipt {
+                argv: vec![command.into()],
+                started: true,
+                exit_code: Some(0),
+                ..Default::default()
+            };
+            assert!(receipt.requires_test_discovery(), "{command}");
+            assert!(!receipt.is_verified_check(), "{command}");
+        }
+    }
+
+    #[test]
+    fn environment_assignment_discovery_evaluation_preserves_runner_and_zero_test_gates() {
+        let rust = b"test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+        let baseline = counts("cargo test --lib", rust, b"").unwrap();
+        for command in [
+            "A=one cargo test --lib",
+            "A=one B=two rtk proxy cargo +1.88.0 test --lib",
+            "rtk proxy A=one cargo test --lib",
+        ] {
+            assert_eq!(counts(command, rust, b"").unwrap(), baseline);
+            let zero = b"test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+            assert!(!crate::verification::tests_passed(
+                &counts(command, zero, b"").unwrap()
+            ));
+        }
+        assert_eq!(
+            counts(
+                "A=one python -m unittest discover",
+                b"",
+                b"Ran 2 tests in 0.01s\n\nOK\n"
+            )
+            .unwrap()
+            .passed,
+            2
+        );
+        for command in [
+            "A=one",
+            "9INVALID=one cargo test",
+            "A=one echo cargo test",
+            "A=one cargo test || echo passed",
+            "A=one pytest -q",
+        ] {
+            assert!(counts(command, rust, b"").is_none(), "{command}");
+        }
+    }
+
     #[test]
     fn node_tap_requires_complete_consistent_nonempty_discovery() {
         let command = "node --test --test-reporter=tap tests/app.test.cjs";

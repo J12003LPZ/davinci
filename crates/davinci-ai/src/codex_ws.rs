@@ -49,6 +49,18 @@ pub fn process_codex_websocket(
     abort: AbortFlag<'_>,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<CodexWebsocketMessage, String> {
+    if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        let mut message = ResponsesDecoder::new(model).finish(&mut Vec::new());
+        crate::stream::abort_message(&mut message);
+        on_event(&AssistantMessageEvent::Error {
+            reason: StopReason::Aborted,
+            error: message.clone(),
+        });
+        return Ok(CodexWebsocketMessage {
+            message,
+            native_responses: None,
+        });
+    }
     if let Ok(reply) = std::env::var("PI_CODEX_WS_REPLY") {
         return process_fixture(
             &reply,
@@ -60,6 +72,7 @@ pub fn process_codex_websocket(
             account_id,
             use_cached_context,
             started,
+            abort,
             on_event,
         );
     }
@@ -133,9 +146,18 @@ pub fn process_codex_websocket(
             native_responses: None,
         });
     }
+    if message.stop_reason == Some(StopReason::Error) {
+        observation.finish("failed", None, message.usage.clone());
+        // A rejected response cannot authorize continuation or socket reuse.
+        release_live_socket(acquired.key, stream, false);
+        return Ok(CodexWebsocketMessage {
+            message,
+            native_responses: None,
+        });
+    }
     let native_responses = NativeResponsesOutput::from_events(&events);
-    let mut keep = acquired.key.is_some();
-    if use_cached_context {
+    let mut keep = acquired.key.is_some() && native_responses.is_some();
+    if use_cached_context && native_responses.is_some() {
         if let Some(response_id) = events.iter().rev().find_map(|event| {
             event
                 .pointer("/response/id")
@@ -184,6 +206,7 @@ fn process_fixture(
     account_id: &str,
     use_cached_context: bool,
     started: &mut bool,
+    abort: AbortFlag<'_>,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<CodexWebsocketMessage, String> {
     match reply {
@@ -209,9 +232,24 @@ fn process_fixture(
             for event in &events {
                 on_event(event);
             }
-            let message = done_message(&events)?;
-            if use_cached_context {
-                let raw_events = fixture_raw_events(corpus);
+            let mut message = done_message(&events)?;
+            if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                crate::stream::abort_message(&mut message);
+                on_event(&AssistantMessageEvent::Error {
+                    reason: StopReason::Aborted,
+                    error: message.clone(),
+                });
+                return Ok(CodexWebsocketMessage {
+                    message,
+                    native_responses: None,
+                });
+            }
+            let raw_events = fixture_raw_events(corpus);
+            let native_responses = NativeResponsesOutput::from_events(&raw_events);
+            if use_cached_context
+                && message.stop_reason != Some(StopReason::Error)
+                && native_responses.is_some()
+            {
                 let mut response_items = native_response_items_from_events(&raw_events);
                 if response_items.as_array().is_some_and(Vec::is_empty) {
                     // Old minimal fixtures predate native output-item events.
@@ -231,7 +269,6 @@ fn process_fixture(
                     Instant::now(),
                 );
             }
-            let native_responses = NativeResponsesOutput::from_events(&fixture_raw_events(corpus));
             Ok(CodexWebsocketMessage {
                 message,
                 native_responses,
@@ -492,6 +529,7 @@ enum WsInner {
     Memory {
         reader: std::io::Cursor<Vec<u8>>,
         written: Vec<u8>,
+        failure: Option<std::io::ErrorKind>,
     },
 }
 
@@ -511,6 +549,7 @@ impl WsStream {
             inner: WsInner::Memory {
                 reader: std::io::Cursor::new(bytes),
                 written: Vec::new(),
+                failure: None,
             },
         }
     }
@@ -530,7 +569,16 @@ impl Read for WsStream {
             WsInner::Plain(stream) => stream.read(buf),
             WsInner::Tls(stream) => stream.read(buf),
             #[cfg(test)]
-            WsInner::Memory { reader, .. } => reader.read(buf),
+            WsInner::Memory {
+                reader, failure, ..
+            } => {
+                if reader.position() == reader.get_ref().len() as u64 {
+                    if let Some(kind) = failure.take() {
+                        return Err(std::io::Error::new(kind, "fixture 503"));
+                    }
+                }
+                reader.read(buf)
+            }
         }
     }
 }
@@ -828,8 +876,7 @@ fn read_codex_events(
         if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             let mut closing = Vec::new();
             let mut message = decoder.finish(&mut closing);
-            message.stop_reason = Some(StopReason::Aborted);
-            message.error_message = Some("Request was aborted".into());
+            crate::stream::abort_message(&mut message);
             on_event(&AssistantMessageEvent::Error {
                 reason: StopReason::Aborted,
                 error: message.clone(),
@@ -839,14 +886,34 @@ fn read_codex_events(
         let (opcode, payload) = match read_message(stream, idle_timeout_ms) {
             Ok(frame) => frame,
             Err(_) if saw_completion => break,
-            Err(err) => return Err(err),
+            Err(WsReadError::Transport(err)) => {
+                if !events.is_empty() && !decoder.has_recognized_event() {
+                    return failed_websocket_message(
+                        decoder,
+                        events,
+                        on_event,
+                        crate::ResponseStreamFailure::Unknown,
+                    );
+                }
+                return Err(err);
+            }
+            Err(WsReadError::Invalid) => {
+                return invalid_websocket_message(decoder, events, on_event);
+            }
+            Err(WsReadError::Classified(failure)) => {
+                return failed_websocket_message(decoder, events, on_event, failure);
+            }
         };
         match opcode {
             OPCODE_TEXT => {
-                let text = String::from_utf8(payload)
-                    .map_err(|_| "Invalid Codex WebSocket JSON: invalid utf8".to_string())?;
-                let parsed: Value = serde_json::from_str(&text)
-                    .map_err(|err| format!("Invalid Codex WebSocket JSON: {err}"))?;
+                let parsed: Value = match std::str::from_utf8(&payload)
+                    .ok()
+                    .and_then(|text| serde_json::from_str(text).ok())
+                    .filter(Value::is_object)
+                {
+                    Some(parsed) => parsed,
+                    None => return invalid_websocket_message(decoder, events, on_event),
+                };
                 let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or("");
                 if crate::trace::enabled() {
                     crate::trace::log(&format!(
@@ -854,23 +921,32 @@ fn read_codex_events(
                         crate::trace::describe_event(&parsed)
                     ));
                 }
-                if event_type == "error" {
-                    let detail = parsed
-                        .pointer("/error/message")
-                        .or_else(|| parsed.get("message"))
-                        .or_else(|| parsed.pointer("/error/code"))
-                        .or_else(|| parsed.get("code"))
+                // These codes belong to the existing bounded transport
+                // controller, not the agent's generation retry policy.
+                let control = match event_type {
+                    "error" => Some(&parsed),
+                    "response.failed" => parsed.get("response"),
+                    _ => None,
+                };
+                if let Some(control) = control.filter(|control| {
+                    !crate::responses_ledger::invalid_declared_event_payload(&parsed)
+                        && crate::retry::classify_terminal_response_error(control)
+                            == crate::ResponseStreamFailure::ProviderTerminalError
+                }) {
+                    if let Some(code) = control
+                        .pointer("/error/code")
+                        .or_else(|| control.get("code"))
                         .and_then(Value::as_str)
-                        .unwrap_or("error");
-                    return Err(format!("Codex error: {detail}"));
-                }
-                if event_type == "response.failed" {
-                    let reason = parsed
-                        .pointer("/response/error/message")
-                        .or_else(|| parsed.pointer("/response/error/code"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("Codex response failed");
-                    return Err(format!("Codex error: {reason}"));
+                        .filter(|code| {
+                            matches!(
+                                *code,
+                                crate::codex::PREVIOUS_RESPONSE_NOT_FOUND
+                                    | crate::codex::WEBSOCKET_CONNECTION_LIMIT_REACHED
+                            )
+                        })
+                    {
+                        return Err(code.to_string());
+                    }
                 }
                 if matches!(
                     event_type,
@@ -887,52 +963,112 @@ fn read_codex_events(
                 for event in &produced[first..] {
                     on_event(event);
                 }
-                if matches!(
-                    event_type,
-                    "response.completed" | "response.done" | "response.incomplete"
-                ) {
-                    saw_completion = true;
-                    events.push(parsed);
-                    break;
-                }
-                events.push(parsed);
-                // The decoder gave up on a tool call that kept repeating
-                // itself. Stop reading; the caller drops the socket, which is
-                // still mid-response.
+                // Decoder rejection is terminal even when the wire event
+                // itself was malformed. Never read past that evidence.
                 if decoder.is_done() {
+                    events.push(parsed);
+                    // The decoder gave up on a tool call that kept repeating
+                    // itself. Stop reading; the caller drops the socket, which
+                    // is still mid-response.
                     let message = decoder.finish(&mut produced);
                     if message.error_message.as_deref()
                         == Some(crate::stream_decoder::RUNAWAY_TOOL_CALL)
                     {
                         return Ok((events, message, true));
                     }
+                    saw_completion = true;
+                    break;
                 }
+                events.push(parsed);
             }
             OPCODE_CLOSE => {
                 if !saw_completion {
+                    if !events.is_empty() && !decoder.has_recognized_event() {
+                        return failed_websocket_message(
+                            decoder,
+                            events,
+                            on_event,
+                            crate::ResponseStreamFailure::Unknown,
+                        );
+                    }
                     return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into());
                 }
                 break;
             }
-            _ => {}
+            _ => return invalid_websocket_message(decoder, events, on_event),
         }
     }
     if !saw_completion {
         return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into());
     }
     let first = produced.len();
-    let message = decoder.finish(&mut produced);
+    let mut message = decoder.finish(&mut produced);
     for event in &produced[first..] {
         on_event(event);
     }
+    if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        crate::stream::abort_message(&mut message);
+        on_event(&AssistantMessageEvent::Error {
+            reason: StopReason::Aborted,
+            error: message.clone(),
+        });
+        return Ok((events, message, true));
+    }
     Ok((events, message, false))
+}
+
+fn invalid_websocket_message(
+    decoder: &mut ResponsesDecoder,
+    events: Vec<Value>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<(Vec<Value>, AssistantMessage, bool), String> {
+    failed_websocket_message(
+        decoder,
+        events,
+        on_event,
+        crate::ResponseStreamFailure::InvalidStream,
+    )
+}
+
+fn failed_websocket_message(
+    decoder: &mut ResponsesDecoder,
+    events: Vec<Value>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+    failure: crate::ResponseStreamFailure,
+) -> Result<(Vec<Value>, AssistantMessage, bool), String> {
+    let mut message = decoder.finish(&mut Vec::new());
+    message.stop_reason = Some(StopReason::Error);
+    message.error_message = Some(
+        match failure {
+            crate::ResponseStreamFailure::InvalidStream => "Invalid Codex WebSocket response frame",
+            _ => "Unclassified Codex WebSocket reader failure",
+        }
+        .into(),
+    );
+    message
+        .content
+        .retain(|block| !matches!(block, crate::ContentBlock::ToolCall { .. }));
+    message.extra.remove(crate::RESPONSES_TOOL_WIRE_KINDS_KEY);
+    crate::retry::set_response_stream_failure(&mut message, failure);
+    on_event(&AssistantMessageEvent::Error {
+        reason: StopReason::Error,
+        error: message.clone(),
+    });
+    Ok((events, message, false))
+}
+
+#[derive(Debug)]
+enum WsReadError {
+    Transport(String),
+    Invalid,
+    Classified(crate::ResponseStreamFailure),
 }
 
 /// Reads a complete WebSocket message and handles interleaved control frames.
 fn read_message(
     stream: &mut WsStream,
     idle_timeout_ms: Option<u64>,
-) -> Result<(u8, Vec<u8>), String> {
+) -> Result<(u8, Vec<u8>), WsReadError> {
     let mut opcode = None;
     let mut payload = Vec::new();
     loop {
@@ -940,36 +1076,35 @@ fn read_message(
         match frame_opcode {
             OPCODE_PING => {
                 if !fin {
-                    return Err("Fragmented WebSocket control frame".into());
+                    return Err(WsReadError::Invalid);
                 }
-                write_frame(stream, OPCODE_PONG, &data, true)?;
+                write_frame(stream, OPCODE_PONG, &data, true).map_err(WsReadError::Transport)?;
                 continue;
             }
             OPCODE_PONG => {
                 if !fin {
-                    return Err("Fragmented WebSocket control frame".into());
+                    return Err(WsReadError::Invalid);
                 }
                 continue;
             }
             OPCODE_CLOSE => return Ok((OPCODE_CLOSE, data)),
             0x0 if opcode.is_none() => {
-                return Err("WebSocket continuation without a start frame".into());
+                return Err(WsReadError::Invalid);
             }
             0x0 => {}
             start => {
                 if opcode.is_some() {
-                    return Err("WebSocket data frame inside a fragmented message".into());
+                    return Err(WsReadError::Invalid);
                 }
                 opcode = Some(start);
             }
         }
         if payload.len().saturating_add(data.len()) > 8 * 1024 * 1024 {
-            return Err("WebSocket message too big".into());
+            return Err(WsReadError::Invalid);
         }
         payload.extend_from_slice(&data);
         if fin {
-            let opcode =
-                opcode.ok_or_else(|| "WebSocket message has no start frame".to_string())?;
+            let opcode = opcode.ok_or(WsReadError::Invalid)?;
             return Ok((opcode, payload));
         }
     }
@@ -978,13 +1113,26 @@ fn read_message(
 fn read_frame(
     stream: &mut WsStream,
     idle_timeout_ms: Option<u64>,
-) -> Result<(bool, u8, Vec<u8>), String> {
+) -> Result<(bool, u8, Vec<u8>), WsReadError> {
     let mut header = [0u8; 2];
     read_exact(stream, &mut header, idle_timeout_ms)?;
     let fin = header[0] & 0x80 != 0;
     let opcode = header[0] & 0x0f;
     let masked = header[1] & 0x80 != 0;
+    // No extensions are negotiated, and server frames must be unmasked.
+    if header[0] & 0x70 != 0
+        || masked
+        || !matches!(
+            opcode,
+            0 | OPCODE_TEXT | 0x2 | OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG
+        )
+    {
+        return Err(WsReadError::Invalid);
+    }
     let mut len = (header[1] & 0x7f) as u64;
+    if opcode >= OPCODE_CLOSE && (!fin || len > 125) {
+        return Err(WsReadError::Invalid);
+    }
     if len == 126 {
         let mut ext = [0u8; 2];
         read_exact(stream, &mut ext, idle_timeout_ms)?;
@@ -995,7 +1143,7 @@ fn read_frame(
         len = u64::from_be_bytes(ext);
     }
     if len > 8 * 1024 * 1024 {
-        return Err("WebSocket message too big".into());
+        return Err(WsReadError::Invalid);
     }
     let mask = if masked {
         let mut key = [0u8; 4];
@@ -1018,13 +1166,30 @@ fn read_exact(
     stream: &mut WsStream,
     buf: &mut [u8],
     idle_timeout_ms: Option<u64>,
-) -> Result<(), String> {
+) -> Result<(), WsReadError> {
     let mut offset = 0;
     while offset < buf.len() {
         match stream.read(&mut buf[offset..]) {
-            Ok(0) => return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into()),
+            Ok(0) => {
+                return Err(WsReadError::Transport(
+                    WEBSOCKET_CLOSED_BEFORE_COMPLETED.into(),
+                ))
+            }
             Ok(read) => offset += read,
-            Err(err) => return Err(map_io_error(err, idle_timeout_ms)),
+            Err(err) => {
+                // Preserve reader evidence before any text-policy or fallback
+                // decision. WouldBlock is this socket's configured idle timeout.
+                let failure = crate::retry::classify_stream_read_error(&err);
+                return Err(
+                    if failure == crate::ResponseStreamFailure::TransportInterrupted
+                        || err.kind() == std::io::ErrorKind::WouldBlock
+                    {
+                        WsReadError::Transport(map_io_error(err, idle_timeout_ms))
+                    } else {
+                        WsReadError::Classified(failure)
+                    },
+                );
+            }
         }
     }
     Ok(())
@@ -1243,6 +1408,530 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_event_preserves_declared_status_vetoes() {
+        for status in [
+            serde_json::json!("cancelled"),
+            serde_json::json!("queued"),
+            serde_json::json!("503"),
+            serde_json::json!(true),
+        ] {
+            let response = serde_json::json!({
+                "status":status,
+                "error":{"code":"server_error","message":"HTTP 503; please retry your request"},
+                "output":mixed_output()
+            });
+            let event = serde_json::json!({"type":"response.incomplete","response":response});
+            for message in [
+                crate::fixture_complete(&codex_model(), &[], &format!("data: {event}\n\n")),
+                decode_wire_events(&[event]),
+            ] {
+                assert_eq!(message.stop_reason, Some(StopReason::Error));
+                assert!(
+                    !crate::is_retryable_assistant_error(&message),
+                    "{status}: {message:?}"
+                );
+                assert!(!message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, crate::ContentBlock::ToolCall { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn bare_json_error_preserves_structured_rejection() {
+        for code in [
+            "insufficient_quota",
+            "context_length_exceeded",
+            "invalid_prompt",
+            "content_filter",
+            "server_error",
+        ] {
+            let response = serde_json::json!({"error":{"code":code,"message":"HTTP 503; please retry your request"}});
+            let message =
+                crate::stream::parse_provider_response(&codex_model(), &response.to_string());
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::is_retryable_assistant_error(&message),
+                code == "server_error",
+                "{code}: {message:?}"
+            );
+            assert!(crate::response_stream_failure(&message).is_some());
+            assert!(message.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn websocket_terminal_errors_preserve_structured_rejection() {
+        for event_type in ["error", "response.failed"] {
+            for code in [
+                "insufficient_quota",
+                "context_length_exceeded",
+                "invalid_prompt",
+                "content_filter",
+                "server_error",
+            ] {
+                let error = serde_json::json!({"code":code,"message":"HTTP 503; please retry your request"});
+                let event = if event_type == "error" {
+                    serde_json::json!({"type":event_type,"error":error})
+                } else {
+                    serde_json::json!({"type":event_type,"response":{"status":"failed","error":error}})
+                };
+                let message = decode_wire_events(&[
+                    serde_json::json!({"type":"response.created","response":{"id":"rejected"}}),
+                    serde_json::json!({"type":"response.output_item.done","output_index":0,"item":mixed_output()[2]}),
+                    event,
+                ]);
+                assert_eq!(message.stop_reason, Some(StopReason::Error));
+                assert_eq!(
+                    crate::is_retryable_assistant_error(&message),
+                    code == "server_error",
+                    "{event_type}/{code}: {message:?}"
+                );
+                assert!(crate::response_stream_failure(&message).is_some());
+                assert!(!message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, crate::ContentBlock::ToolCall { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn json_error_output_shape_cannot_bypass_structured_rejection() {
+        for output in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!("503")),
+            Some(serde_json::json!([])),
+        ] {
+            for wrapped in [false, true] {
+                let mut response = serde_json::json!({"error":{"code":"insufficient_quota","message":"HTTP 503; please retry your request"}});
+                if let Some(output) = &output {
+                    response["output"] = output.clone();
+                }
+                let document = if wrapped {
+                    serde_json::json!({"response":response})
+                } else {
+                    response.clone()
+                };
+                let message =
+                    crate::stream::parse_provider_response(&codex_model(), &document.to_string());
+                assert_eq!(message.stop_reason, Some(StopReason::Error), "{document}");
+                assert!(!crate::is_retryable_assistant_error(&message), "{document}");
+                assert!(message.content.is_empty());
+                assert_eq!(
+                    crate::response_stream_failure(&message),
+                    Some(crate::ResponseStreamFailure::ProviderTerminalRejection)
+                );
+                assert!(NativeResponsesOutput::from_response_value(&response).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn error_events_preserve_declared_status_vetoes() {
+        for status in [
+            serde_json::json!("cancelled"),
+            serde_json::json!("queued"),
+            serde_json::json!(true),
+        ] {
+            let event = serde_json::json!({"type":"error","status":status,"error":{"code":"server_error","message":"HTTP 503; please retry your request"}});
+            for message in [
+                crate::fixture_complete(&codex_model(), &[], &format!("data: {event}\n\n")),
+                decode_wire_events(&[event]),
+            ] {
+                assert_eq!(message.stop_reason, Some(StopReason::Error));
+                assert!(
+                    !crate::is_retryable_assistant_error(&message),
+                    "{status}: {message:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_malformed_frames_are_typed_nonretryable_failures() {
+        for malformed in [
+            frame(
+                true,
+                OPCODE_TEXT,
+                format!("{}!", " ".repeat(502)).as_bytes(),
+            ),
+            frame(
+                true,
+                OPCODE_TEXT,
+                format!("{}!", " ".repeat(428)).as_bytes(),
+            ),
+            frame(true, OPCODE_TEXT, &[0xff]),
+            frame(true, 0, b"invalid continuation"),
+            frame(true, 0x2, b"binary"),
+            frame(true, 0x3, b"reserved"),
+            vec![0xc1, 0],
+            frame(false, OPCODE_CLOSE, b""),
+            frame(true, OPCODE_PING, &[0; 126]),
+        ] {
+            let mut wire = frame(
+                true,
+                OPCODE_TEXT,
+                br#"{"type":"response.created","response":{"id":"fixture"}}"#,
+            );
+            wire.extend(malformed);
+            let result = read_codex_events(
+                &mut WsStream::for_test(wire),
+                Some(1000),
+                &mut false,
+                &mut ResponsesDecoder::new(&codex_model()),
+                None,
+                &mut |_| {},
+            );
+            let (_, message, aborted) = result.expect("typed invalid stream, not raw parser error");
+            assert!(!aborted);
+            assert_eq!(message.stop_reason, Some(StopReason::Error));
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(!crate::is_retryable_assistant_error(&message));
+            assert!(message.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn websocket_reader_kind_vetoes_survive_before_and_after_start() {
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            for after_start in [false, true] {
+                let wire = if after_start {
+                    frame(
+                        true,
+                        OPCODE_TEXT,
+                        br#"{"type":"response.created","response":{"id":"fixture"}}"#,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let mut stream = WsStream::for_test(wire);
+                if let WsInner::Memory { failure, .. } = &mut stream.inner {
+                    *failure = Some(kind);
+                }
+                let (_, message, _) = read_codex_events(
+                    &mut stream,
+                    Some(1000),
+                    &mut false,
+                    &mut ResponsesDecoder::new(&codex_model()),
+                    None,
+                    &mut |_| {},
+                )
+                .expect("reader veto must be typed, not raw transport fallback");
+                assert_eq!(message.stop_reason, Some(StopReason::Error));
+                assert_eq!(
+                    crate::response_stream_failure(&message),
+                    Some(if kind == std::io::ErrorKind::InvalidData {
+                        crate::ResponseStreamFailure::InvalidStream
+                    } else {
+                        crate::ResponseStreamFailure::Unknown
+                    })
+                );
+                assert!(!crate::is_retryable_assistant_error(&message));
+                assert!(message.content.is_empty());
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let mut stream = WsStream::for_test(Vec::new());
+            if let WsInner::Memory { failure, .. } = &mut stream.inner {
+                *failure = Some(kind);
+            }
+            let error = read_codex_events(
+                &mut stream,
+                Some(1000),
+                &mut false,
+                &mut ResponsesDecoder::new(&codex_model()),
+                None,
+                &mut |_| {},
+            )
+            .unwrap_err();
+            assert!(crate::is_retryable_error_text(&error), "{kind:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn websocket_decoder_rejection_precedes_later_transport_or_control() {
+        for after_start in [false, true] {
+            for next in ["close", "timeout", "control"] {
+                let mut wire = if after_start {
+                    frame(
+                        true,
+                        OPCODE_TEXT,
+                        br#"{"type":"response.created","response":{"id":"r"}}"#,
+                    )
+                } else {
+                    Vec::new()
+                };
+                wire.extend(frame(true, OPCODE_TEXT, b"{}"));
+                if next == "control" {
+                    wire.extend(frame(
+                        true,
+                        OPCODE_TEXT,
+                        br#"{"type":"error","error":{"code":"previous_response_not_found"}}"#,
+                    ));
+                } else if next == "close" {
+                    wire.extend(frame(true, OPCODE_CLOSE, b""));
+                }
+                let mut stream = WsStream::for_test(wire);
+                if next == "timeout" {
+                    if let WsInner::Memory { failure, .. } = &mut stream.inner {
+                        *failure = Some(std::io::ErrorKind::TimedOut);
+                    }
+                }
+                let (_, message, _) = read_codex_events(
+                    &mut stream,
+                    Some(1000),
+                    &mut false,
+                    &mut ResponsesDecoder::new(&codex_model()),
+                    None,
+                    &mut |_| {},
+                )
+                .expect("decoder rejection must return immediately");
+                assert_eq!(
+                    crate::response_stream_failure(&message),
+                    Some(crate::ResponseStreamFailure::InvalidStream)
+                );
+                assert!(!crate::is_retryable_assistant_error(&message));
+                assert!(message.content.is_empty());
+                if let WsInner::Memory {
+                    reader, failure, ..
+                } = &stream.inner
+                {
+                    if next == "timeout" {
+                        assert!(failure.is_some());
+                    } else {
+                        assert!(reader.position() < reader.get_ref().len() as u64);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_cancellation_from_terminal_callback_strips_calls() {
+        let response =
+            serde_json::json!({"id":"terminal","status":"completed","output":mixed_output()});
+        let event = serde_json::json!({"type":"response.completed","response":response});
+        let wire = frame(true, OPCODE_TEXT, &serde_json::to_vec(&event).unwrap());
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_, message, aborted) = read_codex_events(
+            &mut WsStream::for_test(wire),
+            Some(1000),
+            &mut false,
+            &mut ResponsesDecoder::new(&codex_model()),
+            Some(&abort),
+            &mut |event| {
+                if matches!(event, AssistantMessageEvent::ToolcallEnd { .. }) {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap();
+        assert!(aborted);
+        assert_eq!(message.stop_reason, Some(StopReason::Aborted));
+        assert!(!message
+            .content
+            .iter()
+            .any(|block| matches!(block, crate::ContentBlock::ToolCall { .. })));
+        assert!(!message
+            .extra
+            .contains_key(crate::RESPONSES_TOOL_WIRE_KINDS_KEY));
+    }
+
+    #[test]
+    fn fixture_done_callback_cancellation_strips_calls_and_continuation() {
+        let _guard = crate::codex::websocket_state_test_lock();
+        let session = "fixture-terminal-cancellation";
+        let account = "fixture";
+        crate::codex::close_openai_codex_websocket_sessions(Some(session));
+        let previous = std::env::var("PI_CODEX_WS_REPLY").ok();
+        std::env::set_var("PI_CODEX_WS_REPLY",serde_json::json!({"type":"response.completed",
+            "response":{"id":"r","status":"completed","output":[{"type":"function_call","id":"i","call_id":"c","name":"write","arguments":"{}"}]}}).to_string());
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = process_codex_websocket(
+            "ws://127.0.0.1",
+            &serde_json::json!({"model":"gpt-5","input":[]}),
+            &[],
+            &codex_model(),
+            1000,
+            Some(1000),
+            Some(session),
+            account,
+            true,
+            &mut false,
+            Some(&abort),
+            &mut |event| {
+                if matches!(event, AssistantMessageEvent::Done { .. }) {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        );
+        match previous {
+            Some(value) => std::env::set_var("PI_CODEX_WS_REPLY", value),
+            None => std::env::remove_var("PI_CODEX_WS_REPLY"),
+        }
+        let result = result.unwrap();
+        assert_eq!(result.message.stop_reason, Some(StopReason::Aborted));
+        assert!(!result
+            .message
+            .content
+            .iter()
+            .any(|block| matches!(block, crate::ContentBlock::ToolCall { .. })));
+        assert!(result.native_responses.is_none());
+        assert!(
+            acquire_cached_continuation(Some(session), account, Instant::now())
+                .1
+                .is_none()
+        );
+        crate::codex::close_openai_codex_websocket_sessions(Some(session));
+    }
+
+    #[test]
+    fn incomplete_live_response_never_seeds_cached_continuation() {
+        let _guard = crate::codex::websocket_state_test_lock();
+        let previous = std::env::var("PI_CODEX_WS_REPLY").ok();
+        std::env::remove_var("PI_CODEX_WS_REPLY");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("{err}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let key = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-key"))
+                        .map(|(_, value)| value.trim())
+                })
+                .unwrap();
+            let accept = accept_key(key);
+            write!(stream,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
+            let body = read_masked_text(&mut stream).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap()["type"],
+                "response.create"
+            );
+            write_unmasked_text(&mut stream,
+                r#"{"type":"response.incomplete","response":{"id":"r","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}"#).unwrap();
+        });
+        let session = "incomplete-native-admission";
+        let account = "fixture";
+        crate::codex::close_openai_codex_websocket_sessions(Some(session));
+        let result = process_codex_websocket(
+            &url,
+            &serde_json::json!({"model":"gpt-5","input":[]}),
+            &[],
+            &codex_model(),
+            2000,
+            Some(2000),
+            Some(session),
+            account,
+            true,
+            &mut false,
+            None,
+            &mut |_| {},
+        );
+        server.join().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("PI_CODEX_WS_REPLY", value),
+            None => std::env::remove_var("PI_CODEX_WS_REPLY"),
+        }
+        let result = result.unwrap();
+        assert_eq!(result.message.stop_reason, Some(StopReason::Length));
+        assert!(result.native_responses.is_none());
+        assert!(
+            acquire_cached_continuation(Some(session), account, Instant::now())
+                .1
+                .is_none()
+        );
+        crate::codex::close_openai_codex_websocket_sessions(Some(session));
+    }
+
+    #[test]
+    fn malformed_control_payload_cannot_bypass_decoder_validation() {
+        for code in [
+            crate::codex::PREVIOUS_RESPONSE_NOT_FOUND,
+            crate::codex::WEBSOCKET_CONNECTION_LIMIT_REACHED,
+        ] {
+            let event = serde_json::json!({"type":"error","error":{"code":code,"message":503}});
+            let wire = frame(true, OPCODE_TEXT, &serde_json::to_vec(&event).unwrap());
+            let (_, message, _) = read_codex_events(
+                &mut WsStream::for_test(wire),
+                Some(1000),
+                &mut false,
+                &mut ResponsesDecoder::new(&codex_model()),
+                None,
+                &mut |_| {},
+            )
+            .expect("malformed control is not transport recovery authority");
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::InvalidStream)
+            );
+            assert!(!crate::is_retryable_assistant_error(&message));
+        }
+    }
+
+    #[test]
+    fn websocket_unknown_only_events_cannot_authorize_disconnect_retry() {
+        for close in [false, true] {
+            let mut wire = frame(true, OPCODE_TEXT, br#"{"type":"not_a_responses_event"}"#);
+            if close {
+                wire.extend(frame(true, OPCODE_CLOSE, b""));
+            }
+            let (_, message, _) = read_codex_events(
+                &mut WsStream::for_test(wire),
+                Some(1000),
+                &mut false,
+                &mut ResponsesDecoder::new(&codex_model()),
+                None,
+                &mut |_| {},
+            )
+            .expect("unknown-only evidence must remain typed");
+            assert_eq!(
+                crate::response_stream_failure(&message),
+                Some(crate::ResponseStreamFailure::Unknown)
+            );
+            assert!(!crate::is_retryable_assistant_error(&message));
+        }
+    }
+
+    #[test]
     fn sse_websocket_and_nonstreaming_share_terminal_output_normalization() {
         let response = serde_json::json!({"id":"resp_parity", "status":"completed", "output":mixed_output(), "usage":{"input_tokens":17, "output_tokens":9}});
         let terminal = serde_json::json!({"type":"response.completed", "response":response});
@@ -1444,6 +2133,7 @@ mod tests {
             "acc_test",
             true,
             &mut started,
+            None,
             &mut |_| {},
         )
         .expect("fixture completes");

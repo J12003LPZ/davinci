@@ -784,7 +784,7 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
     }
 }
 
-fn shell_env_assignment(word: &str) -> bool {
+pub(crate) fn shell_env_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };
