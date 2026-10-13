@@ -73,7 +73,7 @@ jobs:
         run: npm --prefix crates/davinci-coding-agent/design-ui run test:e2e
       - name: Preserve companion browser diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: design-companion-${{ runner.os }}
           path: crates/davinci-coding-agent/design-ui/test-results
@@ -125,7 +125,7 @@ jobs:
           cargo test -p davinci-coding-agent --locked --test design_runtime -- --ignored --nocapture --test-threads=1 2>&1 | tee "$DAVINCI_DESIGN_EVIDENCE/native-tests.log"
       - name: Preserve native gate diagnostics and successful capture evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: design-native-linux
           path: ${{ env.DAVINCI_DESIGN_EVIDENCE }}
@@ -135,7 +135,7 @@ jobs:
         run: cargo test -p davinci-coding-agent --locked --test design_handoff native_target_flow -- --ignored --nocapture
       - name: Preserve target handoff receipt
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: design-target-linux
           path: |

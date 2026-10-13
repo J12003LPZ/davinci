@@ -189,7 +189,7 @@ jobs:
           python scripts/lsp-benchmark.py --binary "$binary" --scenario startup --repetitions 20 --output "$RUNNER_TEMP/lsp-startup.json"
           python scripts/lsp-benchmark.py --binary "$binary" --scenario polyglot --repetitions 20 --output "$RUNNER_TEMP/lsp-polyglot.json"
       - name: Preserve language-intelligence measurements
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: language-intelligence-${{ runner.os }}
           path: |
