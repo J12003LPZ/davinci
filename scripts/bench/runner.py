@@ -157,6 +157,7 @@ def grader_preflight():
 
 def stop_reason(stdout, stderr):
     errors = [stderr]
+    terminal_provider_error = False
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -170,13 +171,30 @@ def stop_reason(stdout, stderr):
             message = event.get("message")
             if isinstance(message, dict) and message.get("stopReason") == "error":
                 errors.append(str(message.get("errorMessage", "")))
+        elif event.get("type") == "agent_end":
+            # DaVinci can fail before a provider request exists (expired OAuth,
+            # missing credentials). That path has no message_end error event;
+            # it emits the harness's prefixed error in the terminal envelope.
+            messages = event.get("messages")
+            for message in messages if isinstance(messages, list) else []:
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                content = message.get("content")
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict) or block.get("type") != "text":
+                        continue
+                    value = block.get("text")
+                    if isinstance(value, str) and value.startswith("Provider error: "):
+                        errors.append(value)
+                        terminal_provider_error = True
     text = "\n".join(errors).lower()
     if any(value in text for value in ("usage limit", "usage_limit_reached", "rate limit", "rate_limit", "quota exceeded", "insufficient_quota")):
         return "usage_limit"
     if any(value in text for value in ("unauthorized", "invalid api key", "incorrect api key",
-            "authentication failed", "credentials expired", "refresh token expired", "not logged in")):
+            "authentication failed", "credentials expired", "refresh token expired", "not logged in",
+            "sign-in expired", "credential cannot be used", "no credential for")):
         return "credentials"
-    return None
+    return "provider_error" if terminal_provider_error else None
 
 
 def pin_model_store(path, model):
@@ -584,8 +602,30 @@ def create_campaign(root, manifest):
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
+def bench_options(settings):
+    """Harness-only options under the `bench` settings key, validated before any launch.
+
+    They stay in the recorded effective settings (so arms differ by identity) but
+    are never written to the agent's settings.json.
+    """
+    block = (settings or {}).get("bench", {})
+    if not isinstance(block, dict) or set(block) - {"tokenGovernor", "appendSystemPrompt", "wireDump"}:
+        raise ValueError("bench settings accept only tokenGovernor, appendSystemPrompt and wireDump")
+    if type(block.get("wireDump", False)) is not bool:
+        raise ValueError("bench.wireDump must be true or false")
+    governor = block.get("tokenGovernor")
+    if governor is not None and (not isinstance(governor, dict) or set(governor) != {"enabled"}
+                                 or type(governor["enabled"]) is not bool):
+        raise ValueError('bench.tokenGovernor must be {"enabled": true} or {"enabled": false}')
+    prompt = block.get("appendSystemPrompt")
+    if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
+        raise ValueError("bench.appendSystemPrompt must be non-empty text")
+    return block
+
+
 def isolate_settings(source, target, settings, *, subscription_only=False):
     """Restrict host permissions; tools in the same agent remain able to read auth."""
+    options = bench_options(settings)
     source, target = Path(source), Path(target)
     auth = source / "auth.json"
     if not auth.is_file():
@@ -606,14 +646,34 @@ def isolate_settings(source, target, settings, *, subscription_only=False):
         (target / "auth.json").write_text(json.dumps(credentials) + "\n", encoding="utf-8")
     (target / "auth.json").chmod(0o600)
     (target / "settings.json").write_text(
-        json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        json.dumps({key: value for key, value in settings.items() if key != "bench"},
+                   indent=2) + "\n", encoding="utf-8")
+    if "tokenGovernor" in options:
+        # The agent reads this file from its agent directory; the environment
+        # switches are stripped by controlled_environment.
+        (target / "token-governor.json").write_text(
+            json.dumps(options["tokenGovernor"]) + "\n", encoding="utf-8")
     return {"directory": str(target.resolve()), "settings": settings}
+
+
+def campaign_slot():
+    """Explicit opt-in to a second lock, for a campaign run beside another one.
+
+    Concurrent campaigns share the machine and the provider account, so their
+    wall times are not comparable with a solo campaign; the slot is recorded in
+    the manifest so a report can tell.
+    """
+    slot = os.environ.get("BENCH_CAMPAIGN_SLOT", "").strip()
+    if slot and not re.fullmatch(r"[a-z0-9-]{1,32}", slot):
+        raise ValueError("BENCH_CAMPAIGN_SLOT must be 1-32 characters of a-z, 0-9 or -")
+    return slot or None
 
 
 def _campaign_lock_path():
     system_temp = (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"
                    if os.name == "nt" else Path("/tmp"))
-    return system_temp / "davinci-benchmark-campaign.lock"
+    slot = campaign_slot()
+    return system_temp / ("davinci-benchmark-campaign" + (f".{slot}" if slot else "") + ".lock")
 
 
 class _CampaignOwner:

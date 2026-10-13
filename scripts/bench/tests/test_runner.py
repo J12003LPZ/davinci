@@ -42,6 +42,77 @@ class RunnerTests(unittest.TestCase):
             command = bench.command("codex", "prompt", "workdir")
             self.assertNotIn('service_tier="fast"', command)
 
+    def test_codemode_arm_launches_explicitly_with_a_session(self):
+        off = bench.command("davinci", "prompt", "workdir", {"contextVm": "hybrid"})
+        self.assertIn("--no-session", off)
+        self.assertNotIn("--codemode", off)
+        on = bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": "read-only"}})
+        # --no-session would make the /config switch stay off silently.
+        self.assertNotIn("--no-session", on)
+        self.assertEqual(on[on.index("--codemode") + 1], "read-only")
+        explicit_off = bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": "off"}})
+        self.assertIn("--no-session", explicit_off)
+        for mode in ("controlled", "turbo"):
+            with self.assertRaises(ValueError):
+                bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": mode}})
+
+    def test_bench_options_steer_the_prompt_and_disable_the_governor_file_only(self):
+        steer = {"bench": {"appendSystemPrompt": "Prefer codemode."}}
+        args = bench.command("davinci", "prompt", "workdir", steer)
+        self.assertEqual(args[args.index("--append-system-prompt") + 1], "Prefer codemode.")
+        self.assertNotIn("--append-system-prompt", bench.command("davinci", "prompt", "workdir", {}))
+        for bad in ({"bench": {"other": 1}}, {"bench": {"tokenGovernor": {"enabled": "no"}}},
+                    {"bench": {"tokenGovernor": {"enabled": False, "antiLoop": False}}},
+                    {"bench": {"appendSystemPrompt": " "}}, {"bench": []}):
+            with self.assertRaises(ValueError):
+                runner.bench_options(bad)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "auth.json").write_text("{}")
+            settings = {"autoVerify": True, "bench": {"tokenGovernor": {"enabled": False}}}
+            record = runner.isolate_settings(source, root / "off", settings)
+            self.assertEqual(json.loads((root / "off/settings.json").read_text()), {"autoVerify": True})
+            self.assertEqual(json.loads((root / "off/token-governor.json").read_text()), {"enabled": False})
+            # The arm stays distinguishable in the recorded identity.
+            self.assertEqual(record["settings"], settings)
+            runner.isolate_settings(source, root / "default", {"autoVerify": True})
+            self.assertFalse((root / "default/token-governor.json").exists())
+
+    def test_wire_dump_arm_gets_a_per_run_directory_outside_the_workspace(self):
+        on = {"bench": {"wireDump": True}}
+        with patch.object(bench, "RUNS", os.path.join("campaign", "root")):
+            dump = bench.wire_dump_directory(on, "davinci", "t1-intervals", 2)
+            workdir = os.path.join(bench.RUNS, "davinci", "t1-intervals-r2")
+            self.assertEqual(dump, os.path.join("campaign", "root", "wire", "t1-intervals-r2"))
+            self.assertNotEqual(os.path.commonpath([dump, workdir]), workdir)
+            self.assertIsNone(bench.wire_dump_directory(on, "codex", "t1-intervals", 2))
+            self.assertIsNone(bench.wire_dump_directory({}, "davinci", "t1-intervals", 2))
+            self.assertIsNone(bench.wire_dump_directory({"bench": {"wireDump": False}}, "davinci", "t1", 0))
+        with self.assertRaises(ValueError):
+            runner.bench_options({"bench": {"wireDump": "yes"}})
+        # The switch is harness-only: it never reaches the agent's settings file.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source").mkdir()
+            (root / "source" / "auth.json").write_text("{}")
+            runner.isolate_settings(root / "source", root / "agent", {"autoVerify": True, **on})
+            self.assertEqual(json.loads((root / "agent/settings.json").read_text()), {"autoVerify": True})
+
+    def test_campaign_slot_selects_a_separate_validated_lock(self):
+        with patch.dict(os.environ, {"BENCH_CAMPAIGN_SLOT": ""}):
+            default = runner._campaign_lock_path()
+            self.assertIsNone(runner.campaign_slot())
+        with patch.dict(os.environ, {"BENCH_CAMPAIGN_SLOT": "side-1"}):
+            self.assertEqual(runner.campaign_slot(), "side-1")
+            self.assertNotEqual(runner._campaign_lock_path(), default)
+            self.assertEqual(runner._campaign_lock_path().parent, default.parent)
+        for bad in ("../x", "A", "x" * 33, "a b"):
+            with patch.dict(os.environ, {"BENCH_CAMPAIGN_SLOT": bad}):
+                with self.assertRaises(ValueError):
+                    runner._campaign_lock_path()
+
     def test_prepared_fixture_contract_preserves_task_and_repository_rules(self):
         task = "Fix the real issue.\nKeep compatibility and add a regression test."
         instructions = b"Before edits create a worktree using CLAUDE_CODE_SESSION_ID.\nKeep tests.\n"
@@ -130,6 +201,8 @@ class RunnerTests(unittest.TestCase):
                 self.assertIsNone(rows[0]["unrelated"])
                 self.assertIsNone(rows[0]["artifact_leak"])
                 self.assertEqual(rows[0]["stop_reason"], "change_inventory_failed")
+                self.assertEqual(rows[0]["inspection_error"], {
+                    "phase": "changed_files", "type": "RuntimeError", "message": "git status failed"})
 
     def test_checkpoint_identity_is_bound_to_binary_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -189,6 +262,70 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(runner.stop_reason(json.dumps({"type": "error", "message": text}), ""), expected)
         self.assertIsNone(runner.stop_reason(json.dumps({"type": "item.completed",
             "item": {"type": "agent_message", "text": "Usage limit reached"}}), ""))
+
+    def test_terminal_provider_failures_stop_without_scanning_normal_prose(self):
+        failures = [
+            ("The openai-codex sign-in expired and could not be refreshed. Run /login openai-codex.", "credentials"),
+            ("The stored openai-codex credential cannot be used: missing access token. Run /login openai-codex.", "credentials"),
+            ("No credential for openai-codex. Run /login openai-codex.", "credentials"),
+            ("Usage limit reached", "usage_limit"),
+            ("Connection closed before response completed", "provider_error"),
+        ]
+        for text, expected in failures:
+            with self.subTest(text=text):
+                message = {"role": "assistant", "content": [{"type": "text", "text": "Provider error: " + text}]}
+                terminal = {"type": "agent_end", "messages": [message], "willRetry": False}
+                self.assertEqual(runner.stop_reason(json.dumps(terminal), ""), expected)
+                # Tool output and ordinary model discussion are not provider faults.
+                ordinary = {"type": "message_end", "message": message}
+                self.assertIsNone(runner.stop_reason(json.dumps(ordinary), ""))
+                terminal["messages"][0]["content"][0]["text"] = "Discussing this error: " + text
+                self.assertIsNone(runner.stop_reason(json.dumps(terminal), ""))
+        for malformed in ({"type": "agent_end", "messages": None},
+                          {"type": "agent_end", "messages": [None, {"content": "invalid"}]},
+                          {"type": "agent_end", "messages": [{"role": "user", "content": [{"type": "text", "text": "Provider error: Unauthorized"}]}]}):
+            self.assertIsNone(runner.stop_reason(json.dumps(malformed), ""))
+
+    def test_artifact_inventory_error_records_the_failing_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            measured = {"exit": 0, "stdout": "", "stderr": "", "wall_s": 1,
+                        "started_at": "start", "finished_at": "end", "cleanup_complete": True}
+            with (patch.object(bench, "RUNS", tmp),
+                  patch.object(bench, "load", return_value={"prompt": "fixture", "allowed": []}),
+                  patch.object(bench, "prepare", side_effect=lambda tid, dest: Path(dest).mkdir(parents=True)),
+                  patch.object(bench, "changed_files", return_value=[]),
+                  patch.object(bench, "forbidden_artifacts", side_effect=OSError("fixture inventory unreadable")),
+                  patch.object(bench, "grade") as grade,
+                  patch.object(bench, "execute", return_value=measured), patch("builtins.print")):
+                with self.assertRaisesRegex(RuntimeError, "change_inventory_failed"):
+                    bench.run_one("davinci", "t1-intervals", 0)
+                grade.assert_not_called()
+            rows = bench.load_rows(str(Path(tmp) / "results.jsonl"))
+            self.assertEqual(rows[0]["inspection_error"], {
+                "phase": "forbidden_artifacts", "type": "OSError", "message": "fixture inventory unreadable"})
+            self.assertFalse(rows[0]["pass"])
+
+    def test_expired_auth_preserves_one_ungraded_row_then_stops(self):
+        event = {"type": "agent_end", "messages": [{"role": "assistant", "content": [{
+            "type": "text", "text": "Provider error: The openai-codex sign-in expired and could not be refreshed. Run /login openai-codex."}]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            measured = {"exit": 1, "stdout": json.dumps(event), "stderr": "", "wall_s": 2,
+                        "started_at": "start", "finished_at": "end", "cleanup_complete": True}
+            with (patch.object(bench, "RUNS", tmp),
+                  patch.object(bench, "load", return_value={"prompt": "fixture", "allowed": []}),
+                  patch.object(bench, "prepare", side_effect=lambda tid, dest: Path(dest).mkdir(parents=True)),
+                  patch.object(bench, "changed_files", return_value=[]),
+                  patch.object(bench, "forbidden_artifacts", return_value={"transaction_leak": False, "artifact_leak": False}),
+                  patch.object(bench, "grade") as grade,
+                  patch.object(bench, "execute", return_value=measured), patch("builtins.print")):
+                with self.assertRaisesRegex(RuntimeError, "campaign stopped: credentials"):
+                    bench.run_one("davinci", "t1-intervals", 0)
+                grade.assert_not_called()
+            rows = bench.load_rows(str(Path(tmp) / "results.jsonl"))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["stop_reason"], "credentials")
+            self.assertFalse(rows[0]["pass"])
+            self.assertEqual(rows[0]["grading_evidence"], {})
 
     def test_run_row_preserves_failed_process_and_full_precision(self):
         with tempfile.TemporaryDirectory() as tmp:
