@@ -888,3 +888,39 @@ fn attempt_rows_record_the_transport_shape_and_usage_of_every_request() {
     let raw = ends[1].raw_usage.as_ref().expect("raw usage");
     assert_eq!((raw.input_total, raw.cache_read), (Some(1300), Some(900)));
 }
+
+#[test]
+fn a_temporary_socket_never_seeds_a_continuation() {
+    // The cached socket is busy, so the request runs on a temporary one that is closed after use.
+    let session = Session::open("public-ws-busy");
+    let out1 = text_output("m1", "one");
+    let server = Server::start(vec![
+        vec![Reply::Events(vec![completed("resp_1", &out1, 1000, 0)])],
+        vec![Reply::Events(vec![completed(
+            "resp_2",
+            &text_output("m2", "2"),
+            1100,
+            0,
+        )])],
+    ]);
+    let mode = PublicWsMode::Continuation;
+    let in1 = vec![user("a")];
+    send(&server.url, mode, session.0, &body(in1.clone())).unwrap();
+    // Take the cached socket out so the next request finds it busy.
+    let held = acquire_live_socket(&server.url, &[], 2000, Some(session.0), PUBLIC_WS_SLOT);
+    assert!(held.is_err() || held.as_ref().is_ok_and(|s| s.reused));
+    let in2 = extend(&in1, &out1, user("b"));
+    let (_, shape) = send(&server.url, mode, session.0, &body(in2)).unwrap();
+    assert!(
+        !shape.socket_reused,
+        "the busy socket forces a temporary one"
+    );
+    assert!(
+        acquire_cached_continuation(Some(session.0), PUBLIC_WS_SLOT, Instant::now())
+            .1
+            .is_none_or(|c| c.last_response_id != "resp_2"),
+        "an id from a temporary socket must not be stored"
+    );
+    drop(held);
+    server.finish();
+}

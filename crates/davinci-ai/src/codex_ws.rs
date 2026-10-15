@@ -1338,6 +1338,7 @@ pub fn process_public_websocket(
             PUBLIC_WS_SLOT,
         )?;
     }
+    let acquired_key_present = acquired.key.is_some();
     let mut stream = acquired.stream;
     let socket_reused = acquired.reused;
     // A response id is only valid on the connection that produced it. A new socket
@@ -1425,7 +1426,9 @@ pub fn process_public_websocket(
     }
     let native_responses = NativeResponsesOutput::from_events(&events);
     let mut keep = acquired.key.is_some() && native_responses.is_some();
-    if mode == PublicWsMode::Continuation && native_responses.is_some() {
+    // Only the cached socket may seed a continuation: a temporary socket (the cached one was
+    // busy) is closed after this request, so its id would be unusable on the next one.
+    if mode == PublicWsMode::Continuation && native_responses.is_some() && acquired_key_present {
         match events.iter().rev().find_map(|event| {
             event
                 .pointer("/response/id")

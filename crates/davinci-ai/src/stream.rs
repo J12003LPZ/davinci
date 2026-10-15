@@ -1240,13 +1240,6 @@ fn live_complete_streaming_with_sink_envelope_inner(
     result
 }
 
-/// Conversation id for public WebSocket requests that carry no session id, so one process
-/// still reuses one socket. Never shared across processes.
-fn public_ws_fallback_session_id() -> &'static str {
-    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ID.get_or_init(|| format!("public-ws-{}", uuid::Uuid::new_v4()))
-}
-
 /// The public Responses WebSocket experiment. The HTTP request headers are reused so the
 /// only difference from the HTTP arm is the transport (and, for the continuation mode, the
 /// `previous_response_id` request shape). A failure is returned as an explicit error:
@@ -1270,11 +1263,15 @@ fn complete_public_websocket(
         .filter(|(name, _)| !HTTP_ONLY.iter().any(|http| name.eq_ignore_ascii_case(http)))
         .cloned()
         .collect();
+    // A request with no conversation id (summaries, titles) gets a private one: its socket is
+    // closed right after, so it can never share a socket or a continuation with another request.
+    let private_id = format!("public-ws-once-{}", uuid::Uuid::new_v4());
     let session_id = options
         .session_id
         .as_deref()
         .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| public_ws_fallback_session_id());
+        .unwrap_or(private_id.as_str());
+    let is_private = session_id == private_id;
     let connect_timeout =
         crate::codex::resolve_websocket_connect_timeout_ms(options.websocket_connect_timeout_ms);
     crate::trace::log(&format!(
@@ -1284,7 +1281,7 @@ fn complete_public_websocket(
     ));
     let mut collected = Vec::new();
     let mut started = false;
-    let (message, shape) = crate::codex_ws::process_public_websocket(
+    let outcome = crate::codex_ws::process_public_websocket(
         crate::codex_ws::PUBLIC_RESPONSES_WS_URL,
         prepared.body(),
         &ws_headers,
@@ -1299,8 +1296,11 @@ fn complete_public_websocket(
             collected.push(event.clone());
             on_event(event);
         },
-    )
-    .map_err(|error| {
+    );
+    if is_private {
+        crate::codex::close_openai_codex_websocket_sessions(Some(session_id));
+    }
+    let (message, shape) = outcome.map_err(|error| {
         crate::trace::log(&format!(
             "public websocket failed (started={started}): {error}"
         ));

@@ -60,9 +60,15 @@ There is no silent fallback. The existing Codex WebSocket path downgrades to SSE
 - `previous_response_not_found` and other provider errors surface as a failed response. The failed attempt is
   recorded, the socket is closed and the stored id is cleared, so the caller's own retry starts from the full input on
   a new socket. The transport performs no hidden retry.
-- A cached socket the server has already closed is detected before sending and replaced, so an idle close costs no
-  failed attempt. A 60-minute connection limit is handled the same way on the next request.
+- A cached socket the server has already closed is detected before sending and replaced, so an idle close usually costs no
+  failed attempt. The probe peeks the TCP socket, so on TLS a close that arrived in the same read as the last response
+  can be missed; that request then fails explicitly and the caller's retry opens a new socket. A server ping sent while
+  idle makes the probe replace the socket and drop the continuation (a cache miss, not an error).
 - A cancelled response closes its socket and clears the stored id.
+- If the cached socket is busy (two requests in one conversation at once), the second runs on a temporary socket that
+  is closed afterwards and never stores a continuation id.
+- A request with no conversation id (summaries, titles) gets a private id and its socket is closed right after, so it
+  never shares a socket or id with the main conversation.
 - `PI_CODEX_WS_REPLY` (fixture replay) is refused on this path.
 - Subscription-policy admission still requires HTTP/SSE, so the policy mode refuses these values.
 
@@ -88,7 +94,7 @@ one that shipped.
 
 ## Offline validation
 
-A scripted loopback server plays the provider; no network and no credentials. 21 tests:
+A scripted loopback server plays the provider; no network and no credentials. 22 tests:
 
 - selection: only the two explicit values on the public route; `auto`, `sse`, `websocket`, `websocket-cached`, empty and
   mis-cased values, the ChatGPT backend route and other providers never select it
