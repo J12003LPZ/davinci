@@ -1,0 +1,458 @@
+"""Classify recorded large-task runs: which requirements failed, and how each run ended.
+
+    python scripts/bench/large_task_failures.py <campaign-dir> [<campaign-dir> ...] --out <dir>
+
+Offline and read-only. For each campaign directory it reads `results.jsonl`,
+`<harness>/<task>-r<rep>.stdout.jsonl` and, when the campaign recorded it,
+`<harness>/<task>-r<rep>.grader.json` (the hidden grader's pytest output). It
+makes no model calls, runs no grader or test, and writes only to `--out`,
+which must lie outside every campaign directory.
+
+The output is sanitized: run identity, requirement IDs, event codes, counts and
+repository-relative changed paths. Prompts, model text, command lines, command
+output, assertion messages, file contents and absolute paths are never copied.
+
+Each run gets three kinds of field, kept apart on purpose:
+  observed   read directly from the logs (edits, checks and their exit status,
+             reminders, failed hidden tests);
+  hypothesis one label from a fixed rule over the observed fields; it names a
+             likely cause, it does not prove one;
+  unknowns   evidence that was missing or unreadable for this run.
+Exploration quality and the model's reasoning are not visible in event codes;
+the summary says so rather than guessing.
+"""
+import argparse
+import csv
+import json
+from pathlib import Path
+import re
+
+from turn_cache_audit import EDITORS, SHELLS, events, leaves
+
+# Hidden grader test function -> requirement, and how plainly the task prompt
+# states it: "explicit" (the prompt says it), "partial" (the prompt says it, the
+# grader checks a detail it does not), "implicit" (the prompt does not say it).
+# Source: scripts/bench/make_large_tasks.py prompts and hidden graders.
+REQUIREMENTS = {
+    "m1-config-parser": {
+        "test_whitespace_comments_bom_and_duplicate_last_wins":
+            ("m1.bom_trim_duplicates", "partial", "BOM, trimming, comments, last duplicate wins"),
+        "test_invalid_syntax": ("m1.reject_malformed", "explicit", "malformed or empty keys raise ValueError"),
+        "test_empty_input_and_precedence_do_not_mutate_callers":
+            ("m1.precedence_no_mutation", "explicit", "override order; caller mappings not mutated"),
+        "test_values_keep_equals_after_first_separator":
+            ("m1.equals_in_value", "implicit", "'=' after the first separator stays in the value"),
+    },
+    "m2-public-api-migration": {
+        "test_new_signature_and_compatibility_shim":
+            ("m2.signature_and_shim", "partial", "render_user signature, core shim, no package re-export"),
+        "test_all_callers_use_new_behavior": ("m2.callers_migrated", "explicit", "every internal caller migrated"),
+        "test_validation_errors_propagate": ("m2.validation_propagates", "explicit", "validation errors propagate"),
+        "test_no_stale_internal_imports_or_exports":
+            ("m2.no_stale_imports", "explicit", "no stale internal imports; __all__ updated"),
+    },
+    "m3-state-persistence": {
+        "test_idempotence_scope_and_ordering":
+            ("m3.idempotence_scope_order", "explicit", "idempotent per scope; event order kept"),
+        "test_restart_and_caller_immutability":
+            ("m3.restart_no_mutation", "explicit", "restart reloads state; caller dict not mutated"),
+        "test_failed_replace_rolls_back": ("m3.atomic_rollback", "explicit", "prior file intact when replace fails"),
+        "test_invalid_inputs": ("m3.invalid_inputs", "partial", "invalid scope, request id or delta rejected"),
+    },
+    "m4-cli-feature": {
+        "test_report_json_and_name_order": ("m4.json_name_sort", "explicit", "JSON output; name sort"),
+        "test_total_sort_and_tax": ("m4.total_sort_tax", "explicit", "descending total sort; INVENTORY_TAX"),
+        "test_invalid_inputs_exit_two": ("m4.invalid_exit_two", "partial", "invalid input exits with status 2"),
+        "test_legacy_total_still_works": ("m4.legacy_total", "explicit", "legacy total command unchanged"),
+    },
+}
+PYTHON = r"\bpython[\d.]*(?:\.exe)?"
+ADHOC = re.compile(PYTHON + r"\s+-c\b|" + PYTHON + r"\s+-\s*<<")
+# A test runner, not a mention of a test file (`cat tests/test_x.py` is a read).
+RUNNER = re.compile(r"\b(?:pytest|unittest)\b|" + PYTHON + r"\s+\S*test_[\w.-]+\.py\b|\b(?:cargo|go|npm|pnpm)\s+test\b")
+COMPILE = re.compile(r"\b(?:compileall|py_compile)\b")
+SHELL_WRITE = re.compile(r"(?<![<>&\d])>{1,2}\s*(?!/dev/null|NUL\b)[\w./\\-]|\bsed\s+-i\b|\btee\b"
+                         r"|\b(?:mv|cp|rm|Set-Content|Out-File)\b")
+FAILED_LINE = re.compile(r"^(FAILED|ERROR)\s+(\S+)")
+PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.M)
+
+
+def is_test_path(path):
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.startswith("test_") or name.endswith("_test.py") or "/tests/" in "/" + path.replace("\\", "/")
+
+
+def public_test_file(manifest, task):
+    command = (manifest.get(task) or {}).get("public_verification") or ""
+    found = re.search(r"\S*test\S*\.py", command)
+    return found.group(0).replace("\\", "/") if found else None
+
+
+def check_kind(command, public_file):
+    """None for a command that is not a check, else what it checks."""
+    text = command.replace("\\", "/")
+    if ADHOC.search(text):
+        return "adhoc"
+    if not RUNNER.search(text):
+        return "compile" if COMPILE.search(text) else None
+    if public_file and public_file in text:
+        return "public"
+    if re.search(r"\bpytest\b", text) and not re.search(r"\S+\.py\b|\s-k\s", text.split("pytest", 1)[1]):
+        return "suite"  # the whole suite: public tests plus any the agent added
+    return "targeted"
+
+
+def edit_paths(name, args):
+    if name == "apply_patch":
+        return PATCH_PATH.findall(str(args.get("input") or args.get("patch") or ""))
+    path = args.get("path") or args.get("file_path")
+    return [path] if isinstance(path, str) else []
+
+
+class Timeline:
+    """Ordered, sanitized steps: ("edit", is_test) | ("check", kind, status) | ("reminder", reason) | ...."""
+
+    def __init__(self):
+        self.steps, self.shell_writes, self.unknown_check_status = [], 0, 0
+
+    def edit(self, path):
+        self.steps.append(("edit", is_test_path(path)))
+
+    def shell(self, command, public_file):
+        kind = check_kind(command, public_file)
+        if kind is None:
+            if SHELL_WRITE.search(command):
+                self.shell_writes += 1
+            return None
+        self.steps.append(["check", kind, "unknown"])
+        return self.steps[-1]
+
+
+def davinci_timeline(path, public_file):
+    timeline, pending, stats, final = Timeline(), {}, {}, False
+    for event in events(path):
+        kind = event.get("type")
+        if kind == "tool_execution_start":
+            call = event.get("toolCallId")
+            checks = []
+            for name, args in leaves(event.get("toolName"), event.get("args")):
+                if name in EDITORS:
+                    for edited in edit_paths(name, args):
+                        timeline.edit(edited)
+                    checks.append(None)
+                elif name in SHELLS:
+                    checks.append(timeline.shell(str(args.get("command", "")), public_file))
+                else:
+                    checks.append(None)
+            if isinstance(call, str):
+                pending[call] = checks
+        elif kind == "tool_execution_end":
+            checks = pending.pop(event.get("toolCallId"), None) if isinstance(event.get("toolCallId"), str) else None
+            if not checks:
+                continue
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            operations = details.get("operations") if details.get("batch") is True else None
+            for index, step in enumerate(checks):
+                if step is None:
+                    continue
+                if isinstance(operations, list):
+                    child = operations[index] if index < len(operations) else None
+                    status = child.get("status") if isinstance(child, dict) else None
+                    step[2] = {"ok": "pass", "error": "fail"}.get(status, "unknown")
+                elif type(event.get("isError")) is bool:
+                    step[2] = "fail" if event["isError"] else "pass"
+        elif kind == "completion_reminder":
+            reason = event.get("reason_code")
+            timeline.steps.append(("reminder", reason if isinstance(reason, str) and reason else "unknown"))
+        elif kind == "message_end":
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            reason = message.get("davinciCapabilityReminder")
+            if isinstance(reason, str) and reason:
+                timeline.steps.append(("reminder", "capability"))
+        elif kind == "verification_notice":
+            timeline.steps.append(("notice", str(event.get("status") or "unknown")))
+        elif kind == "harness_stats":
+            stats = event.get("runtime") if isinstance(event.get("runtime"), dict) else {}
+        elif kind == "agent_end":
+            final = True
+    timeline.unknown_check_status = sum(1 for s in timeline.steps if s[0] == "check" and s[2] == "unknown")
+    return timeline, stats, final
+
+
+def codex_timeline(path, public_file):
+    timeline, final = Timeline(), False
+    for event in events(path):
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        if event.get("type") == "item.completed" and item.get("type") == "command_execution":
+            step = timeline.shell(str(item.get("command", "")), public_file)
+            code = item.get("exit_code")
+            if step is not None and type(code) is int:
+                step[2] = "pass" if code == 0 else "fail"
+        elif event.get("type") == "item.completed" and item.get("type") == "file_change":
+            for change in item.get("changes") or []:
+                if isinstance(change, dict) and isinstance(change.get("path"), str):
+                    timeline.edit(change["path"])
+        elif event.get("type") == "turn.completed":
+            final = True
+    timeline.unknown_check_status = sum(1 for s in timeline.steps if s[0] == "check" and s[2] == "unknown")
+    return timeline, None, final
+
+
+def failed_tests(grader_path):
+    """(status, [test function names]) from the stored hidden-grader output."""
+    try:
+        record = json.loads(grader_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "unavailable", []
+    output = "\n".join(str(record.get(key) or "") for key in ("stdout", "stderr"))
+    names = []
+    for line in output.splitlines():
+        found = FAILED_LINE.match(line.strip())
+        if found:
+            node = found.group(2)
+            names.append(node.split("::", 1)[1].split("[", 1)[0] if "::" in node else "<collection>")
+    return "parsed", names
+
+
+def token(step):
+    if step[0] == "edit":
+        return "T" if step[1] else "E"
+    if step[0] == "check":
+        return {"public": "P", "suite": "S", "targeted": "X", "adhoc": "A", "compile": "C"}[step[1]] + \
+            {"pass": "+", "fail": "-", "unknown": "?"}[step[2]]
+    return {"reminder": "R", "notice": "N"}[step[0]]
+
+
+def observe(timeline, stats, final):
+    steps = timeline.steps
+    edits = [i for i, s in enumerate(steps) if s[0] == "edit"]
+    last_edit = edits[-1] if edits else -1
+    # A compile check shows the code imports, not that it behaves.
+    after_edit = [s for s in steps[last_edit + 1:] if s[0] == "check" and s[1] != "compile"]
+    last = after_edit[-1] if after_edit else None
+    reminders = [i for i, s in enumerate(steps) if s[0] == "reminder"]
+    tail = steps[reminders[0] + 1:] if reminders else []
+    checks = [s for s in steps if s[0] == "check"]
+    count = lambda rows, test: sum(1 for s in rows if test(s))
+    return {
+        "timeline": " ".join(token(s) for s in steps) + (" F" if final else ""),
+        "final_answer": final,
+        "edits": len(edits),
+        "test_edits": count(steps, lambda s: s[0] == "edit" and s[1]),
+        "checks": len(checks),
+        "check_passes": count(checks, lambda s: s[2] == "pass"),
+        "check_failures": count(checks, lambda s: s[2] == "fail"),
+        "adhoc_checks": count(checks, lambda s: s[1] == "adhoc"),
+        "checks_after_last_edit": len(after_edit),
+        "last_check_after_last_edit": f"{last[1]}:{last[2]}" if last else "none",
+        "reminders": len(reminders),
+        "reminder_reasons": ";".join(sorted({s[1] for s in steps if s[0] == "reminder"})),
+        "requirement_reviews_skipped": (stats or {}).get("completionRequirementReviewsSkipped") if stats is not None
+            else "n/a",
+        "verification_notices": ";".join(s[1] for s in steps if s[0] == "notice"),
+        "edits_after_first_reminder": count(tail, lambda s: s[0] == "edit") if reminders else None,
+        "test_edits_after_first_reminder": count(tail, lambda s: s[0] == "edit" and s[1]) if reminders else None,
+        "checks_after_first_reminder": count(tail, lambda s: s[0] == "check") if reminders else None,
+        "check_passes_after_first_reminder": count(tail, lambda s: s[0] == "check" and s[2] == "pass")
+            if reminders else None,
+    }
+
+
+def hypothesis(row, seen):
+    """One label from a fixed rule. A likely cause, not a proven one."""
+    if row.get("pass"):
+        return "passed"
+    if row.get("stop_reason"):
+        return "not_graded"
+    if not row.get("changed"):
+        return "no_change"
+    last = seen["last_check_after_last_edit"]
+    if last == "none":
+        return "finished_unverified"
+    if last.endswith(":fail"):
+        return "finished_with_failing_check"
+    if last.endswith(":unknown"):
+        return "last_check_outcome_unknown"
+    if seen["test_edits"] == 0 and seen["adhoc_checks"] == 0:
+        return "stopped_on_existing_checks"
+    return "own_checks_passed_hidden_failed"
+
+
+def classify(campaign, row, manifest):
+    harness, task, rep = row.get("harness"), row.get("task"), row.get("rep")
+    base = campaign / str(harness) / f"{task}-r{rep}"
+    public_file = public_test_file(manifest, task)
+    unknowns = []
+    log = Path(str(base) + ".stdout.jsonl")
+    if not log.is_file():
+        timeline, stats, final = Timeline(), {}, False
+        unknowns.append("stdout_log_missing")
+    elif harness == "codex":
+        timeline, stats, final = codex_timeline(log, public_file)
+    else:
+        timeline, stats, final = davinci_timeline(log, public_file)
+    if timeline.unknown_check_status:
+        unknowns.append(f"check_status_unknown:{timeline.unknown_check_status}")
+    if timeline.shell_writes:
+        unknowns.append(f"shell_may_have_written:{timeline.shell_writes}")
+    seen = observe(timeline, stats, final)
+    mapping = REQUIREMENTS.get(task, {})
+    failed_status, names = failed_tests(Path(str(base) + ".grader.json"))
+    if failed_status == "unavailable" and not row.get("pass"):
+        unknowns.append("grader_log_missing")
+    elif failed_status == "parsed" and not names and row.get("tests_failed"):
+        failed_status = "unparsed"
+        unknowns.append("grader_failures_unparsed")
+    requirements = []
+    for name in dict.fromkeys(names):
+        if name == "<collection>":
+            requirements.append((f"{task}.grader_collection", "n/a"))
+        elif name in mapping:
+            requirements.append((mapping[name][0], mapping[name][1]))
+        else:
+            requirements.append((f"unmapped:{name}", "unknown"))
+    changed = row.get("changed") or []
+    return {
+        "campaign": campaign.name, "variant": row.get("variant"), "model": row.get("model"),
+        "harness": harness, "task": task, "rep": rep,
+        "binary_sha256": row.get("binary_sha256"),
+        "pass": row.get("pass"), "grader_pass": row.get("grader_pass"),
+        "tests_passed": row.get("tests_passed"), "tests_failed": row.get("tests_failed"),
+        "stop_reason": row.get("stop_reason"), "exit": row.get("exit"),
+        "failed_requirements_source": failed_status,
+        "failed_requirements": ";".join(r for r, _ in requirements),
+        "failed_requirement_prompt_states": ";".join(s for _, s in requirements),
+        "changed_files": ";".join(sorted(p for p in changed if isinstance(p, str))),
+        "public_test_changed": public_file in changed if public_file else None,
+        "unrelated_changes": len(row.get("unrelated") or []),
+        **seen,
+        "hypothesis": hypothesis(row, seen),
+        "unknowns": ";".join(unknowns),
+    }
+
+
+def summarize(rows):
+    def tally(values):
+        result = {}
+        for value in values:
+            result[value] = result.get(value, 0) + 1
+        return dict(sorted(result.items()))
+
+    per_harness = {}
+    for harness in sorted({str(r["harness"]) for r in rows}):
+        mine = [r for r in rows if str(r["harness"]) == harness]
+        failed = [r for r in mine if not r["pass"]]
+        states = {}
+        for r in failed:
+            for req, state in zip(filter(None, r["failed_requirements"].split(";")),
+                                  r["failed_requirement_prompt_states"].split(";")):
+                states[req] = state
+        reminded = [r for r in mine if r["reminders"]]
+        per_harness[harness] = {
+            "runs": len(mine), "passes": sum(1 for r in mine if r["pass"]),
+            "hypothesis": tally(r["hypothesis"] for r in mine),
+            "failed_requirement_runs": {
+                req: {"runs": n, "prompt_states": states[req]}
+                for req, n in tally(req for r in failed for req in filter(None, r["failed_requirements"].split(";"))).items()},
+            "failed_runs_by_requirement_source": tally(r["failed_requirements_source"] for r in failed),
+            "failed_runs_only_partial_or_implicit": sum(
+                1 for r in failed if r["failed_requirements"]
+                and all(s in ("partial", "implicit") for s in r["failed_requirement_prompt_states"].split(";"))),
+            "runs_with_reminder": len(reminded),
+            "reminded_runs_adding_test_edits_after": sum(1 for r in reminded if r["test_edits_after_first_reminder"]),
+            "reminded_runs_passing": sum(1 for r in reminded if r["pass"]),
+            "runs_with_review_skipped": sum(1 for r in mine if isinstance(r["requirement_reviews_skipped"], int)
+                                            and r["requirement_reviews_skipped"] > 0),
+            "runs_editing_tests": sum(1 for r in mine if r["test_edits"]),
+            "runs_with_unknowns": sum(1 for r in mine if r["unknowns"]),
+        }
+    # Same task and repetition under different harnesses: where the failed
+    # requirement sets differ, the trajectories diverged even if both failed.
+    divergences = []
+    keys = sorted({(r["campaign"], r["task"], r["rep"]) for r in rows}, key=str)
+    for campaign, task, rep in keys:
+        group = {str(r["harness"]): r for r in rows if (r["campaign"], r["task"], r["rep"]) == (campaign, task, rep)}
+        if len(group) < 2:
+            continue
+        sets = {h: set(filter(None, r["failed_requirements"].split(";"))) for h, r in group.items()}
+        if len({frozenset(s) for s in sets.values()}) > 1 or len({r["hypothesis"] for r in group.values()}) > 1:
+            divergences.append({"campaign": campaign, "task": task, "rep": rep,
+                                "failed_requirements": {h: sorted(s) for h, s in sets.items()},
+                                "hypothesis": {h: r["hypothesis"] for h, r in group.items()}})
+    return {
+        "runs": len(rows), "per_harness": per_harness, "divergences": divergences,
+        "requirement_prompt_states": {req: state for task in REQUIREMENTS.values() for req, state, _ in task.values()},
+        "hypothesis_rules": {
+            "stopped_on_existing_checks": "last check after the last edit passed; no test edits and no ad hoc checks",
+            "own_checks_passed_hidden_failed": "last check after the last edit passed; the run edited tests or ran ad hoc checks",
+            "finished_with_failing_check": "last check after the last edit failed",
+            "finished_unverified": "no check after the last edit",
+            "last_check_outcome_unknown": "last check after the last edit has no recorded exit status",
+            "not_graded": "the run stopped (stop_reason) before or during grading",
+            "no_change": "no changed files recorded",
+        },
+        "not_observable": [
+            "exploration quality: which files were read is not weighed against what the task needed",
+            "model reasoning and misunderstanding: no model text is analysed",
+            "whether a passing agent-written test exercised the failed requirement",
+        ],
+    }
+
+
+FIELDS = ("campaign", "variant", "model", "harness", "task", "rep", "pass", "grader_pass", "tests_passed",
+          "tests_failed", "stop_reason", "exit", "failed_requirements_source", "failed_requirements",
+          "failed_requirement_prompt_states", "hypothesis", "unknowns", "timeline", "final_answer", "edits",
+          "test_edits", "checks", "check_passes", "check_failures", "adhoc_checks", "checks_after_last_edit",
+          "last_check_after_last_edit", "reminders", "reminder_reasons", "requirement_reviews_skipped",
+          "verification_notices", "edits_after_first_reminder", "test_edits_after_first_reminder",
+          "checks_after_first_reminder", "check_passes_after_first_reminder", "changed_files",
+          "public_test_changed", "unrelated_changes", "binary_sha256")
+
+
+def load_rows(campaign):
+    rows = []
+    for line in (campaign / "results.jsonl").read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and str(row.get("task", "")).startswith("m"):
+            rows.append(row)
+    return rows
+
+
+def run(campaigns, out, manifest_path):
+    out = out.resolve()
+    for campaign in campaigns:
+        if out == campaign.resolve() or campaign.resolve() in out.parents:
+            raise ValueError("--out must be outside every campaign directory")
+        if not (campaign / "results.jsonl").is_file():
+            raise ValueError(f"no results.jsonl in {campaign.name}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")).get("fixtures", {})
+    rows = [classify(campaign, row, manifest) for campaign in campaigns for row in load_rows(campaign)]
+    summary = summarize(rows)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / "large-task-runs.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    (out / "large-task-runs.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    (out / "large-task-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return rows, summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("campaigns", type=Path, nargs="+")
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parent / "large_manifest.json")
+    args = parser.parse_args()
+    try:
+        _, summary = run(args.campaigns, args.out, args.manifest)
+    except ValueError as error:
+        parser.error(str(error))
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()

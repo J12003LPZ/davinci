@@ -362,6 +362,17 @@ full conversations and file contents; keep them private and outside Git. Timed
 campaigns deliberately remove inherited wire-dump settings, so collect those
 separately from timing evidence.
 
+`large_task_failures.py <campaign> [...] --out <dir>` classifies recorded `m*`
+runs from `results.jsonl`, the stdout event logs and the stored
+`<run>.grader.json`. It runs no grader and no model, refuses an `--out` inside a
+campaign, and writes `large-task-runs.csv`/`.json` and `large-task-summary.json`
+with requirement IDs, event codes and counts only, never prompts, model text,
+commands, output or absolute paths. Each run keeps observed fields (the
+edit/check/reminder timeline, failed hidden requirements and whether the prompt
+states them) separate from a rule-based `hypothesis` label and an `unknowns`
+list. Older campaigns without `.grader.json` report the failed requirements as
+unavailable.
+
 ### Harness-only arm options and concurrent slots
 
 A `bench` key in the `--settings` file carries options for the harness, not the
