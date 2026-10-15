@@ -222,6 +222,8 @@ diagnostic evidence, **not** independent holdout evidence.
 
 Not started. Both arms use the ChatGPT subscription.
 
+Pinned inputs, blockers, stopping rules and metrics: [v2-stage1-launch.md](v2-stage1-launch.md).
+
 **Stage 1: development set, 24 runs.**
 
 - Arms: DaVinci at a pinned current-main build with product defaults, and Codex
