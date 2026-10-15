@@ -75,18 +75,39 @@ def load_rows(root):
     return rows
 
 
+def usage_known(row):
+    """True only when the run reported complete token totals. Unknown is never treated as zero."""
+    return row.get("input_tokens") is not None and row.get("cached_tokens") is not None
+
+
+def known_lower_bound(row):
+    """Uncached input from the attempts that did report usage. Labeled lower bound; never used for scoring."""
+    known = row.get("known_usage")
+    if not isinstance(known, dict) or known.get("input") is None or known.get("cached") is None:
+        return None
+    return known["input"] - known["cached"]
+
+
 def metrics(row):
-    unc = row["input_tokens"] - row["cached_tokens"]
+    known = usage_known(row)
+    unc = row["input_tokens"] - row["cached_tokens"] if known else None
     later_in, later_cached = row.get("later_request_input_tokens"), row.get("later_request_cached_tokens")
-    ratio_later = later_cached / later_in if later_in else None
+    ratio_later = later_cached / later_in if known and later_in else None
     settings = row.get("effective_settings")
     mode = None
     if isinstance(settings, dict):
         mode = "session" if settings.get("experimentalSessionCacheKey") is True else "shared"
-    return {"uncached": unc, "ratio_later": ratio_later, "requests": row["requests"], "wall": row["wall_s"],
+    return {"usage_known": known, "uncached_lower_bound": None if known else known_lower_bound(row),
+            "uncached": unc, "ratio_later": ratio_later, "requests": row["requests"], "wall": row["wall_s"],
             "cache_write": row.get("cache_write_tokens"), "pass": bool(row["pass"]),
-            "first_cached": row.get("first_request_cached_tokens"), "cache_key_mode": mode,
+            "first_cached": row.get("first_request_cached_tokens") if known else None, "cache_key_mode": mode,
             "stop": row.get("stop_reason")}
+
+
+def unscorable(measured):
+    """Measured runs without complete usage. They make the registered verdict INCOMPLETE; no value is invented."""
+    return {seq: {"uncached_lower_bound": m["uncached_lower_bound"], "label": "lower bound from reporting attempts only"}
+            for seq, m in sorted(measured.items()) if not m["usage_known"]}
 
 
 def mode_errors(plan, rows, require):
@@ -111,6 +132,10 @@ def evaluate(rows, profile="full"):
     measured = {s: metrics(r) for s, r in rows.items() if plan[s]["role"] == "measured"}
     if len(measured) != 16:
         return {"verdict": "INCOMPLETE", "reason": "%d of 16 measured runs present" % len(measured)}
+    missing = unscorable(measured)
+    if missing:
+        return {"verdict": "INCOMPLETE", "reason": "%d of 16 measured runs have unknown usage" % len(missing),
+                "unscorable_runs": missing}
     pairs = {}
     for seq, m in measured.items():
         pairs.setdefault(plan[seq]["pair"], {})[plan[seq]["arm"]] = m
@@ -159,6 +184,11 @@ def evaluate_pilot(rows):
     measured = {s: metrics(r) for s, r in rows.items() if plan[s]["role"] == "measured"}
     if len(measured) != 8:
         return {"verdict": "INCOMPLETE", "reason": "%d of 8 measured runs present" % len(measured)}
+    missing = unscorable(measured)
+    if missing:
+        return {"verdict": "INCOMPLETE", "reason": "%d of 8 measured runs have unknown usage" % len(missing),
+                "unscorable_runs": missing,
+                "note": "thresholds are not changed and no usage is imputed; report complete pairs descriptively only"}
     pairs = {}
     for seq, m in measured.items():
         pairs.setdefault(plan[seq]["pair"], {})[plan[seq]["arm"]] = m

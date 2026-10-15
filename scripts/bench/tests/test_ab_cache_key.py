@@ -222,5 +222,95 @@ class PilotTests(unittest.TestCase):
         self.assertEqual(ab.evaluate(bad)["verdict"], "INVALID")
 
 
+def unknown_usage(row_, known_input=None, known_cached=None):
+    """Shape the harness writes when an attempt reported no usage: totals null, known part kept apart."""
+    row_ = dict(row_)
+    row_.update(input_tokens=None, cached_tokens=None, later_request_input_tokens=None,
+                later_request_cached_tokens=None, first_request_cached_tokens=None,
+                cache_write_tokens=None, usage_unknown_attempts=1)
+    if known_input is not None:
+        row_["known_usage"] = {"input": known_input, "cached": known_cached}
+    return row_
+
+
+REGISTERED_THRESHOLDS = (0.10, 3, 1.10, 0.25, 6, 0.10)
+PILOT_ARM = {run["seq"]: run["arm"] for run in ab.schedule("pilot")}
+
+
+class UnknownUsageTests(unittest.TestCase):
+    """A run with unknown usage is unscorable. It never crashes the report and never counts as zero."""
+
+    def pilot_with_unknown(self, *seqs):
+        def mutate(out):
+            for seq in seqs:
+                out[seq] = unknown_usage(out[seq], 238_905, 159_744)
+        return pilot_rows(mutate=mutate)
+
+    def test_metrics_keeps_unknown_as_none(self):
+        m = ab.metrics(unknown_usage(pilot_row("shared"), 238_905, 159_744))
+        self.assertFalse(m["usage_known"])
+        self.assertIsNone(m["uncached"])
+        self.assertIsNone(m["ratio_later"])
+        self.assertIsNone(m["first_cached"])
+        self.assertIsNone(m["cache_write"])
+        self.assertEqual(m["uncached_lower_bound"], 79_161)
+
+    def test_complete_rows_are_unchanged(self):
+        m = ab.metrics(pilot_row("shared", unc=90_000))
+        self.assertTrue(m["usage_known"])
+        self.assertEqual(m["uncached"], 90_000)
+        self.assertIsNone(m["uncached_lower_bound"])
+
+    def test_lower_bound_is_absent_when_nothing_reported(self):
+        self.assertIsNone(ab.metrics(unknown_usage(pilot_row("shared")))["uncached_lower_bound"])
+
+    def test_pilot_with_unknown_usage_is_incomplete_and_names_the_runs(self):
+        result = ab.evaluate(self.pilot_with_unknown(7, 8), "pilot")
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+        self.assertEqual(sorted(result["unscorable_runs"]), [7, 8])
+        self.assertIn("lower bound", result["unscorable_runs"][7]["label"])
+        self.assertIn("not changed", result["note"])
+
+    def test_one_unknown_run_is_enough_to_block_a_verdict(self):
+        result = ab.evaluate(self.pilot_with_unknown(5), "pilot")
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+        self.assertEqual(sorted(result["unscorable_runs"]), [5])
+
+    def test_lower_bound_never_enters_a_verdict(self):
+        """Even a lower bound that would make the session arm look great cannot produce PROMISING."""
+        result = ab.evaluate(self.pilot_with_unknown(7, 8), "pilot")
+        self.assertNotIn(result["verdict"], ("PROMISING", "NOT_PROMISING", "MIXED"))
+
+    def test_unknown_usage_in_a_warmup_does_not_block_scoring(self):
+        rows_ = pilot_rows()
+        rows_[1] = unknown_usage(pilot_row("shared"))
+        rows_[1]["effective_settings"] = {}
+        self.assertNotEqual(ab.evaluate(rows_, "pilot")["verdict"], "INCOMPLETE")
+
+    def test_a_stop_still_outranks_unknown_usage(self):
+        rows_ = self.pilot_with_unknown(7)
+        rows_[3] = pilot_row(PILOT_ARM[3], stop="credentials")
+        self.assertEqual(ab.evaluate(rows_, "pilot")["verdict"], "STOPPED")
+
+    def test_a_wrong_mode_still_outranks_unknown_usage(self):
+        rows_ = self.pilot_with_unknown(7)
+        rows_[3] = pilot_row(PILOT_ARM[3], mode="session" if PILOT_ARM[3] == "shared" else "shared")
+        self.assertEqual(ab.evaluate(rows_, "pilot")["verdict"], "INVALID")
+
+    def test_full_study_with_unknown_usage_is_incomplete(self):
+        rows_ = rows()
+        seq = next(iter(rows_))
+        rows_[seq] = unknown_usage(rows_[seq], 10, 5)
+        result = ab.evaluate(rows_)
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+        self.assertEqual(list(result["unscorable_runs"]), [seq])
+
+    def test_thresholds_are_the_registered_ones(self):
+        self.assertEqual(
+            (ab.PILOT_MIN_RATIO_GAIN, ab.PILOT_MIN_PAIRS, ab.MAX_REQUEST_GROWTH, ab.MIN_UNCACHED_DROP,
+             ab.MIN_PAIRS_BETTER, ab.MIN_RATIO_GAIN),
+            REGISTERED_THRESHOLDS)
+
+
 if __name__ == "__main__":
     unittest.main()

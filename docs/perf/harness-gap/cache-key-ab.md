@@ -146,3 +146,17 @@ transport probe", never "change the default". A two-run outcome is not used for 
 
 Transport (HTTP versus WebSocket), headers, retention, model routing, tasks outside the four public
 families, or any other harness.
+
+## Unknown usage (added after the 10-run pilot)
+
+A run whose provider attempts did not all report usage has `input_tokens` and `cached_tokens` set to null. The
+report treats that run as unscorable:
+
+- `metrics()` returns `usage_known: false` and `None` for uncached, later ratio, first-request cached and cache writes.
+  Unknown is never counted as zero.
+- `evaluate()` and `evaluate_pilot()` return `INCOMPLETE` with `unscorable_runs`, after the `INVALID` and `STOPPED`
+  checks. No threshold changed and nothing is imputed.
+- `uncached_lower_bound` is the uncached input of the attempts that did report. It is labeled as a lower bound, is
+  informational only and never enters a verdict.
+
+The frozen pilot (`ab-pilot-20261015-b`, runs 7 and 8 unknown) evaluates to `INCOMPLETE`, which is its registered verdict.
