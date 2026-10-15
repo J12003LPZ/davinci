@@ -17,8 +17,11 @@ identifiers outside a conservative character set become "redacted", and changed
 paths that are absolute, UNC, drive-relative, contain `..` or unusual characters
 are withheld and counted under `unknowns`.
 
-Some hidden requirements have a disputed grader contract (`DISPUTED`); the
-`contract` field says whether a run failed only those.
+Each hidden test is categorized (`REQUIREMENTS`, `CASES`) as specified, mixed,
+underspecified or contradictory. `failure_basis` says what a run's failed tests
+can establish by themselves: only a specified failure is evidence against the
+agent; mixed and unmapped failures leave the cause indeterminate. Results are
+grouped by model, then harness, and never pooled across models.
 
 Each run gets three kinds of field, kept apart on purpose:
   observed   read directly from the logs (edits, checks and their exit status,
@@ -32,62 +35,73 @@ the summary says so rather than guessing.
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 import re
 import sys
 
 from turn_cache_audit import EDITORS, SHELLS, events, leaves
 
-# Hidden grader test function -> requirement, and how plainly the task prompt
-# states it: "explicit" (the prompt says it), "partial" (the prompt says it, the
-# grader checks a detail it does not), "implicit" (the prompt does not say it).
-# Source: scripts/bench/make_large_tasks.py prompts and hidden graders.
+# Hidden grader test -> (requirement, category, what it checks). Categories say
+# what a failure of that test can establish, judged against the prompt, the
+# starter code and its public test (scripts/bench/make_large_tasks.py) and
+# confirmed by running variants of the reference solution against the hidden
+# tests (docs/perf/harness-gap/large-task-contracts.md):
+#   specified       every assertion follows from the prompt or starter behavior;
+#                   a failure is a failure to do what was asked.
+#   mixed           specified assertions share the test with unstated behavior
+#                   or an unstated mechanism; a failure alone cannot say which.
+#   underspecified  the assertions check only behavior the prompt leaves open.
+#   contradictory   no solution satisfies the prompt, the starter public test and
+#                   this test together.
+# Only "specified" failures are evidence about the agent by themselves. The
+# others are not false failures either: they are not attributable either way.
 REQUIREMENTS = {
     "m1-config-parser": {
         "test_whitespace_comments_bom_and_duplicate_last_wins":
-            ("m1.bom_trim_duplicates", "partial", "BOM, trimming, comments, last duplicate wins"),
-        "test_invalid_syntax": ("m1.reject_malformed", "explicit", "malformed or empty keys raise ValueError"),
+            ("m1.bom_trim_duplicates", "mixed", "trim, comments, last duplicate wins (stated); BOM (not stated)"),
+        "test_invalid_syntax": ("m1.reject_malformed", "specified", "malformed or empty keys raise ValueError"),
         "test_empty_input_and_precedence_do_not_mutate_callers":
-            ("m1.precedence_no_mutation", "explicit", "override order; caller mappings not mutated"),
+            ("m1.precedence_no_mutation", "specified", "override order; caller mappings not mutated"),
         "test_values_keep_equals_after_first_separator":
-            ("m1.equals_in_value", "implicit", "'=' after the first separator stays in the value"),
+            ("m1.equals_in_value", "specified", "starter behavior: split on the first '=' only"),
     },
     "m2-public-api-migration": {
         "test_new_signature_and_compatibility_shim":
-            ("m2.signature_and_shim", "partial", "render_user signature, core shim, no package re-export"),
-        "test_all_callers_use_new_behavior": ("m2.callers_migrated", "explicit", "every internal caller migrated"),
-        "test_validation_errors_propagate": ("m2.validation_propagates", "explicit", "validation errors propagate"),
+            ("m2.signature_and_shim", "mixed",
+             "signature, shim, no package re-export (stated); trimming, name-only uppercase (not stated)"),
+        "test_all_callers_use_new_behavior": ("m2.callers_migrated", "specified", "every internal caller works"),
+        "test_validation_errors_propagate":
+            ("m2.blank_name_rejected", "underspecified", "whitespace-only name rejected; the starter accepts it"),
         "test_no_stale_internal_imports_or_exports":
-            ("m2.no_stale_imports", "explicit", "no stale internal imports; __all__ updated"),
+            ("m2.no_stale_imports", "mixed",
+             "no stale internal imports, __all__ (stated); also bans tests importing the promised shim"),
     },
     "m3-state-persistence": {
         "test_idempotence_scope_and_ordering":
-            ("m3.idempotence_scope_order", "explicit", "idempotent per scope; event order kept"),
+            ("m3.idempotence_scope_order", "specified", "idempotent per scope; event order kept"),
         "test_restart_and_caller_immutability":
-            ("m3.restart_no_mutation", "explicit", "restart reloads state; caller dict not mutated"),
-        "test_failed_replace_rolls_back": ("m3.atomic_rollback", "explicit", "prior file intact when replace fails"),
-        "test_invalid_inputs": ("m3.invalid_inputs", "partial", "invalid scope, request id or delta rejected"),
+            ("m3.restart_no_mutation", "specified", "restart reloads state; caller dict not mutated"),
+        "test_failed_replace_rolls_back":
+            ("m3.atomic_rollback", "mixed",
+             "prior file intact when replace fails (stated); json_store must expose `os` (not stated)"),
+        "test_invalid_inputs": ("m3.invalid_ids", "specified", "empty scope or request id rejected"),
     },
     "m4-cli-feature": {
-        "test_report_json_and_name_order": ("m4.json_name_sort", "explicit", "JSON output; name sort"),
-        "test_total_sort_and_tax": ("m4.total_sort_tax", "explicit", "descending total sort; INVENTORY_TAX"),
-        "test_invalid_inputs_exit_two": ("m4.invalid_exit_two", "partial", "invalid input exits with status 2"),
-        "test_legacy_total_still_works": ("m4.legacy_total", "explicit", "legacy total command unchanged"),
+        "test_report_json_and_name_order": ("m4.json_name_sort", "specified", "JSON output; name sort"),
+        "test_total_sort_and_tax": ("m4.total_sort_tax", "specified", "descending total sort; INVENTORY_TAX"),
+        "test_invalid_inputs_exit_two":
+            ("m4.invalid_exit_two", "mixed", "invalid input exits 2 (stated); via SystemExit from main() (not stated)"),
+        "test_legacy_total_still_works":
+            ("m4.legacy_total", "contradictory", "starter and public test add arguments; hidden multiplies pairs"),
     },
 }
-# Requirements whose grader contract is itself in question, so failing one is
-# not by itself evidence about the agent. Source:
-# docs/perf/harness-gap/benchmark-integrity.md, rechecked against
-# make_large_tasks.py. "contradictory": no solution can satisfy the prompt, the
-# starter public test and the hidden test together. "underspecified": the hidden
-# test fixes behavior the prompt leaves open.
-DISPUTED = {
-    "m1.bom_trim_duplicates": "underspecified",  # BOM acceptance is not stated
-    "m2.signature_and_shim": "underspecified",   # trimming and name-only uppercase are not stated
-    "m2.no_stale_imports": "underspecified",     # the scan also rejects a test importing the promised shim
-    "m3.invalid_inputs": "underspecified",       # whether an empty delta is invalid is not stated
-    "m4.legacy_total": "contradictory",          # starter and public test add (10 2 -> 12.00); hidden multiplies pairs
+# One case of a parametrized test that differs from the rest of it.
+CASES = {
+    ("m3-state-persistence", "test_invalid_inputs", "a-r-delta2"):
+        ("m3.empty_delta", "underspecified", "empty delta rejected rather than a no-op"),
 }
+CATEGORIES = ("specified", "mixed", "underspecified", "contradictory", "unknown")
 SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,79}")
 # Leading dots are allowed (.github); an all-dot part or a trailing dot is not,
 # because Windows strips trailing dots and "..." would no longer name what it says.
@@ -99,7 +113,7 @@ RUNNER = re.compile(r"\b(?:pytest|unittest)\b|" + PYTHON + r"\s+\S*test_[\w.-]+\
 COMPILE = re.compile(r"\b(?:compileall|py_compile)\b")
 SHELL_WRITE = re.compile(r"(?<![<>&\d])>{1,2}\s*(?!/dev/null|NUL\b)[\w./\\-]|\bsed\s+-i\b|\btee\b"
                          r"|\b(?:mv|cp|rm|Set-Content|Out-File)\b")
-FAILED_LINE = re.compile(r"^(FAILED|ERROR)\s+(\S+)")
+FAILED_LINE = re.compile(r"^(FAILED|ERROR) (.+?)(?: - .*)?$")
 PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.M)
 
 
@@ -254,7 +268,7 @@ def codex_timeline(path, public_file):
 
 
 def failed_tests(grader_path):
-    """(status, [test function names]) from the stored hidden-grader output."""
+    """(status, [(test function, case id)]) from the stored hidden-grader output."""
     try:
         record = json.loads(grader_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -262,10 +276,16 @@ def failed_tests(grader_path):
     output = "\n".join(str(record.get(key) or "") for key in ("stdout", "stderr"))
     names = []
     for line in output.splitlines():
-        found = FAILED_LINE.match(line.strip())
-        if found:
-            node = found.group(2)
-            names.append(node.split("::", 1)[1].split("[", 1)[0] if "::" in node else "<collection>")
+        found = FAILED_LINE.match(line.rstrip())
+        if not found:
+            continue
+        node = found.group(2)
+        if "::" not in node:
+            names.append(("<collection>", None))
+            continue
+        name = node.split("::", 1)[1]
+        case = name[name.index("[") + 1:name.rindex("]")] if "[" in name and name.endswith("]") else None
+        names.append((name.split("[", 1)[0], case))
     return "parsed", names
 
 
@@ -333,14 +353,16 @@ def hypothesis(row, seen):
     return "own_checks_passed_hidden_failed"
 
 
-def contract(requirements):
-    """Whether the failed requirements say anything about the agent."""
-    if not requirements:
+def failure_basis(requirements, status):
+    """What the failed hidden tests can establish about the agent, by themselves."""
+    if status != "parsed" or not requirements:
         return "unknown"
-    disputed = [r for r, _ in requirements if r in DISPUTED]
-    if len(disputed) == len(requirements):
-        return "only_disputed_failed"
-    return "some_undisputed_failed" if disputed else "only_undisputed_failed"
+    categories = {category for _, category in requirements}
+    if "specified" in categories:
+        return "specified_failure"
+    if categories & {"mixed", "unknown"}:
+        return "cause_indeterminate"
+    return "only_underspecified_or_contradictory"
 
 
 def classify(campaign, label, row, manifest):
@@ -374,13 +396,19 @@ def classify(campaign, label, row, manifest):
         failed_status = "unparsed"
         unknowns.append("grader_failures_unparsed")
     requirements = []
-    for name in dict.fromkeys(names):
+    for name, case in names:
         if name == "<collection>":
-            requirements.append((f"{task}.grader_collection", "n/a"))
+            found = (f"{task}.grader_collection", "unknown")
+        elif (task, name, case) in CASES:
+            found = CASES[(task, name, case)][:2]
         elif name in mapping:
-            requirements.append((mapping[name][0], mapping[name][1]))
+            found = mapping[name][:2]
         else:
-            requirements.append((f"unmapped:{safe_token(name)}", "unknown"))
+            found = (f"unmapped:{safe_token(name)}", "unknown")
+        if found not in requirements:
+            requirements.append(found)
+    if failed_status == "unavailable" or failed_status == "unparsed":
+        requirements = []
     changed = row.get("changed") if isinstance(row.get("changed"), list) else []
     paths = [safe_relative_path(p) for p in changed]
     if None in paths:
@@ -400,9 +428,9 @@ def classify(campaign, label, row, manifest):
         "exit": numeric(row.get("exit")),
         "failed_requirements_source": failed_status,
         "failed_requirements": ";".join(r for r, _ in requirements),
-        "failed_requirement_prompt_states": ";".join(s for _, s in requirements),
-        "failed_requirements_disputed": ";".join(r for r, _ in requirements if r in DISPUTED),
-        "contract": "passed" if row.get("pass") else contract(requirements),
+        "failed_requirement_categories": ";".join(c for _, c in requirements),
+        **{f"failed_{category}": sum(1 for _, c in requirements if c == category) for category in CATEGORIES},
+        "failure_basis": "passed" if row.get("pass") else failure_basis(requirements, failed_status),
         "changed_files": ";".join(paths),
         "public_test_changed": public_file in changed if public_file else None,
         "unrelated_changes": len(unrelated) if isinstance(unrelated, list) else None,
@@ -419,35 +447,35 @@ def summarize(rows):
             result[value] = result.get(value, 0) + 1
         return dict(sorted(result.items()))
 
-    per_harness = {}
-    for harness in sorted({str(r["harness"]) for r in rows}):
-        mine = [r for r in rows if str(r["harness"]) == harness]
-        failed = [r for r in mine if not r["pass"]]
-        states = {}
-        for r in failed:
-            for req, state in zip(filter(None, r["failed_requirements"].split(";")),
-                                  r["failed_requirement_prompt_states"].split(";")):
-                states[req] = state
+    categories = {req: category for task in REQUIREMENTS.values() for req, category, _ in task.values()}
+    categories.update({req: category for req, category, _ in CASES.values()})
+
+    def group(mine):
+        failed = [r for r in mine if r["pass"] is not True]
         reminded = [r for r in mine if r["reminders"]]
-        per_harness[harness] = {
-            "runs": len(mine), "passes": sum(1 for r in mine if r["pass"]),
+        return {
+            "runs": len(mine), "passes": sum(1 for r in mine if r["pass"] is True),
+            "failure_basis": tally(r["failure_basis"] for r in mine),
             "hypothesis": tally(r["hypothesis"] for r in mine),
-            "contract": tally(r["contract"] for r in mine),
             "failed_requirement_runs": {
-                req: {"runs": n, "prompt_states": states[req], "disputed": DISPUTED.get(req)}
+                req: {"runs": n, "category": categories.get(req, "unknown")}
                 for req, n in tally(req for r in failed for req in filter(None, r["failed_requirements"].split(";"))).items()},
             "failed_runs_by_requirement_source": tally(r["failed_requirements_source"] for r in failed),
-            "failed_runs_only_partial_or_implicit": sum(
-                1 for r in failed if r["failed_requirements"]
-                and all(s in ("partial", "implicit") for s in r["failed_requirement_prompt_states"].split(";"))),
             "runs_with_reminder": len(reminded),
             "reminded_runs_adding_test_edits_after": sum(1 for r in reminded if r["test_edits_after_first_reminder"]),
-            "reminded_runs_passing": sum(1 for r in reminded if r["pass"]),
+            "reminded_runs_passing": sum(1 for r in reminded if r["pass"] is True),
             "runs_with_review_skipped": sum(1 for r in mine if isinstance(r["requirement_reviews_skipped"], int)
                                             and r["requirement_reviews_skipped"] > 0),
             "runs_editing_tests": sum(1 for r in mine if r["test_edits"]),
             "runs_with_unknowns": sum(1 for r in mine if r["unknowns"]),
         }
+
+    # Models are never pooled: a GPT-5.6 baseline and GPT-6 campaigns stay apart.
+    per_model = {}
+    for model in sorted({str(r["model"]) for r in rows}):
+        of_model = [r for r in rows if str(r["model"]) == model]
+        per_model[model] = {harness: group([r for r in of_model if str(r["harness"]) == harness])
+                            for harness in sorted({str(r["harness"]) for r in of_model})}
     # Same task and repetition under different harnesses: where the failed
     # requirement sets differ, the trajectories diverged even if both failed.
     divergences = []
@@ -462,14 +490,16 @@ def summarize(rows):
                                 "failed_requirements": {h: sorted(s) for h, s in sets.items()},
                                 "hypothesis": {h: r["hypothesis"] for h, r in group.items()}})
     return {
-        "runs": len(rows), "per_harness": per_harness, "divergences": divergences,
-        "requirement_prompt_states": {req: state for task in REQUIREMENTS.values() for req, state, _ in task.values()},
-        "disputed_requirements": DISPUTED,
-        "contract_rules": {
-            "only_disputed_failed": "every failed hidden requirement is disputed; the failure may be the grader's",
-            "some_undisputed_failed": "at least one failed requirement is undisputed",
-            "only_undisputed_failed": "no failed requirement is disputed",
-            "unknown": "failed requirements unavailable or unparsed",
+        "runs": len(rows), "per_model": per_model, "divergences": divergences,
+        "requirement_categories": categories,
+        "failure_basis_rules": {
+            "specified_failure": "at least one failed hidden test checks only stated or starter behavior: "
+                                 "the run did not do something it was asked to do",
+            "cause_indeterminate": "no specified failure; a failed test mixes stated and unstated behavior, or is "
+                                   "unmapped, so the grader output cannot say which part failed",
+            "only_underspecified_or_contradictory": "every failure is on unstated or contradictory behavior: "
+                                                    "not evidence against the agent, and not proof it was right",
+            "unknown": "failed tests unavailable or unparsed",
         },
         "hypothesis_rules": {
             "stopped_on_existing_checks": "last check after the last edit passed; no test edits and no ad hoc checks",
@@ -490,8 +520,8 @@ def summarize(rows):
 
 FIELDS = ("campaign", "variant", "model", "harness", "task", "rep", "pass", "grader_pass", "tests_passed",
           "tests_failed", "stop_reason", "exit", "failed_requirements_source", "failed_requirements",
-          "failed_requirement_prompt_states", "failed_requirements_disputed", "contract", "hypothesis",
-          "unknowns", "timeline", "final_answer", "edits",
+          "failed_requirement_categories", "failure_basis", "failed_specified", "failed_mixed",
+          "failed_underspecified", "failed_contradictory", "failed_unknown", "hypothesis", "unknowns", "timeline", "final_answer", "edits",
           "test_edits", "checks", "check_passes", "check_failures", "adhoc_checks", "checks_after_last_edit",
           "last_check_after_last_edit", "reminders", "reminder_reasons", "requirement_reviews_skipped",
           "verification_notices", "edits_after_first_reminder", "test_edits_after_first_reminder",
@@ -562,14 +592,63 @@ def run(campaigns, out, manifest_path, allow_empty=False):
     return rows, summary
 
 
+# Never entered while locating: credentials, wire dumps, Git data, run workspaces.
+LOCATE_SKIP = {"_agent", "wire", ".git", "davinci", "codex", "tasks", "node_modules"}
+
+
+def locate(roots, depth=4):
+    """Campaign directories under `roots` with large-task rows, one dict each.
+
+    Reads only `results.jsonl` and lists `<harness>/` for `*.grader.json` names.
+    """
+    found = []
+    for root in roots:
+        if not Path(root).is_dir():
+            continue
+        for directory, subdirs, files in os.walk(root):
+            level = len(Path(directory).relative_to(root).parts)
+            subdirs[:] = [] if level >= depth else sorted(d for d in subdirs if d not in LOCATE_SKIP)
+            if "results.jsonl" not in files:
+                continue
+            large, total = load_rows(Path(directory))
+            if not large:
+                continue
+            values = lambda key: sorted({safe_token(r.get(key)) for r in large if r.get(key)} - {"redacted"})
+            graders = sum(1 for harness in ("davinci", "codex") if (Path(directory) / harness).is_dir()
+                          for name in os.listdir(Path(directory) / harness)
+                          if name.startswith("m") and name.endswith(".grader.json"))
+            started = sorted(str(r["started_at"]) for r in large if isinstance(r.get("started_at"), str))
+            shas = sorted({str(r.get("source_sha"))[:12] for r in large
+                           if re.fullmatch(r"[0-9a-f]{7,40}", str(r.get("source_sha")))})
+            found.append({
+                "path": directory, "rows": total,
+                "large_runs": {h: sum(1 for r in large if safe_token(r.get("harness")) == h) for h in values("harness")},
+                "large_passes": sum(1 for r in large if r.get("pass") is True),
+                "models": values("model"), "source_sha": shas, "grader_logs": graders,
+                "first_started": started[0] if started else None,
+                "original_baseline_candidate": "gpt-5.6-luna" in values("model")
+                                               or any(sha.startswith("e8a276ec") for sha in shas),
+            })
+    return sorted(found, key=lambda item: (item["first_started"] or "", item["path"]))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("campaigns", type=Path, nargs="+")
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("campaigns", type=Path, nargs="+",
+                        help="campaign directories, or search roots with --locate")
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--locate", action="store_true",
+                        help="list campaigns with large-task rows under the given roots; read-only, writes nothing")
     parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parent / "large_manifest.json")
     parser.add_argument("--allow-empty", action="store_true",
                         help="continue when a selected campaign has no large-task runs (listed in the summary)")
     args = parser.parse_args()
+    if args.locate:
+        for item in locate(args.campaigns):
+            print(json.dumps(item))
+        return
+    if args.out is None:
+        parser.error("--out is required unless --locate")
     try:
         _, summary = run(args.campaigns, args.out, args.manifest, args.allow_empty)
     except ValueError as error:

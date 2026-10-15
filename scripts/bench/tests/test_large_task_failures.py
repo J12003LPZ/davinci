@@ -100,16 +100,16 @@ class LargeTaskFailureTests(unittest.TestCase):
         result = rows[0]
         self.assertEqual(result["hypothesis"], "stopped_on_existing_checks")
         self.assertEqual(result["failed_requirements"], "m1.reject_malformed;m1.equals_in_value")
-        self.assertEqual(result["failed_requirement_prompt_states"], "explicit;implicit")
+        self.assertEqual(result["failed_requirement_categories"], "specified;specified")
+        self.assertEqual((result["failure_basis"], result["failed_specified"]), ("specified_failure", 2))
         self.assertEqual(result["timeline"], "E P+ F")
         self.assertEqual(result["last_check_after_last_edit"], "public:pass")
         self.assertEqual(result["requirement_reviews_skipped"], 1)
         self.assertEqual(result["reminders"], 0)
         self.assertIsNone(result["edits_after_first_reminder"])
-        self.assertEqual(summary["per_harness"]["davinci"]["runs_with_review_skipped"], 1)
-        self.assertEqual(summary["per_harness"]["davinci"]["failed_requirement_runs"]["m1.equals_in_value"],
-                         {"runs": 1, "prompt_states": "implicit", "disputed": None})
-        self.assertEqual(result["contract"], "only_undisputed_failed")
+        self.assertEqual(summary["per_model"]["m"]["davinci"]["runs_with_review_skipped"], 1)
+        self.assertEqual(summary["per_model"]["m"]["davinci"]["failed_requirement_runs"]["m1.equals_in_value"],
+                         {"runs": 1, "category": "specified"})
 
     def test_reminder_followed_by_new_tests_is_recorded_and_labelled_as_own_checks(self):
         self.campaign.add(row("davinci", "m3-state-persistence", changed=["state_core/service.py"]), [
@@ -143,7 +143,8 @@ class LargeTaskFailureTests(unittest.TestCase):
         self.assertEqual(result["timeline"], "E P- F")
         self.assertEqual(result["hypothesis"], "finished_with_failing_check")
         self.assertEqual(result["requirement_reviews_skipped"], "n/a")
-        self.assertEqual(result["failed_requirement_prompt_states"], "partial")
+        self.assertEqual(result["failed_requirement_categories"], "mixed")
+        self.assertEqual(result["failure_basis"], "cause_indeterminate")
 
     def test_batch_children_carry_their_own_status_and_reads_are_not_checks(self):
         self.campaign.add(row("davinci", "m1-config-parser"), [
@@ -300,20 +301,67 @@ class LargeTaskFailureTests(unittest.TestCase):
             self.assertEqual((result["timeline"], result["failed_requirements_source"]), ("", "unavailable"))
         self.assertEqual(sorted(str(r["harness"]) for r in rows), ["davinci", "redacted"])
 
-    def test_disputed_requirements_are_separated_from_undisputed_ones(self):
-        self.campaign.add(row("davinci", "m4-cli-feature", changed=["cli.py"]), [final()],
-                          grader("test_hidden_cli.py::test_legacy_total_still_works"))
-        self.campaign.add(row("codex", "m4-cli-feature", changed=["cli.py"]), [], grader(
-            "test_hidden_cli.py::test_legacy_total_still_works", "test_hidden_cli.py::test_total_sort_and_tax"))
-        rows, summary = self.campaign.run(self.out)
-        by = self.by_task(rows)
-        self.assertEqual(by[("davinci", "m4-cli-feature")]["contract"], "only_disputed_failed")
-        self.assertEqual(by[("davinci", "m4-cli-feature")]["failed_requirements_disputed"], "m4.legacy_total")
-        self.assertEqual(by[("codex", "m4-cli-feature")]["contract"], "some_undisputed_failed")
-        self.assertEqual(summary["per_harness"]["codex"]["failed_requirement_runs"]["m4.legacy_total"]["disputed"],
-                         "contradictory")
-        self.assertTrue(set(classifier.DISPUTED) <= {req for t in classifier.REQUIREMENTS.values()
-                                                     for req, _, _ in t.values()})
+    def test_failure_basis_separates_what_the_grader_output_can_establish(self):
+        cases = {
+            # (task, failed nodes) -> (requirements, categories, basis)
+            "m4-cli-feature": (["test_hidden_cli.py::test_legacy_total_still_works"],
+                               "m4.legacy_total", "contradictory", "only_underspecified_or_contradictory"),
+            "m3-state-persistence": (["test_hidden_state.py::test_invalid_inputs[a-r-delta2]",
+                                      "test_hidden_state.py::test_failed_replace_rolls_back"],
+                                     "m3.empty_delta;m3.atomic_rollback", "underspecified;mixed",
+                                     "cause_indeterminate"),
+            "m1-config-parser": (["test_hidden_config.py::test_invalid_syntax[  = value]",
+                                  "test_hidden_config.py::test_whitespace_comments_bom_and_duplicate_last_wins"],
+                                 "m1.reject_malformed;m1.bom_trim_duplicates", "specified;mixed",
+                                 "specified_failure"),
+            "m2-public-api-migration": (["test_hidden_api.py::test_validation_errors_propagate"],
+                                        "m2.blank_name_rejected", "underspecified",
+                                        "only_underspecified_or_contradictory"),
+        }
+        for task, (nodes, _, _, _) in cases.items():
+            self.campaign.add(row("davinci", task, changed=["cli.py"]), [final()], grader(*nodes))
+        rows = self.by_task(self.campaign.run(self.out)[0])
+        for task, (_, requirements, categories, basis) in cases.items():
+            result = rows[("davinci", task)]
+            self.assertEqual((result["failed_requirements"], result["failed_requirement_categories"],
+                              result["failure_basis"]), (requirements, categories, basis), task)
+        self.assertEqual(rows[("davinci", "m3-state-persistence")]["failed_mixed"], 1)
+
+    def test_other_cases_of_a_parametrized_test_keep_its_category(self):
+        self.campaign.add(row("davinci", "m3-state-persistence", changed=["a.py"]), [final()],
+                          grader("test_hidden_state.py::test_invalid_inputs[-r-delta0]",
+                                 "test_hidden_state.py::test_invalid_inputs[a--delta1]"))
+        result = self.campaign.run(self.out)[0][0]
+        self.assertEqual((result["failed_requirements"], result["failure_basis"]),
+                         ("m3.invalid_ids", "specified_failure"))
+
+    def test_unknown_grader_detail_never_counts_as_a_category(self):
+        self.campaign.add(row("davinci", "m1-config-parser"), [final()])
+        self.campaign.add(row("davinci", "m4-cli-feature"), [final()],
+                          {"stdout": "ERROR test_hidden_cli.py - ImportError", "stderr": ""})
+        rows = self.by_task(self.campaign.run(self.out)[0])
+        self.assertEqual(rows[("davinci", "m1-config-parser")]["failure_basis"], "unknown")
+        collection = rows[("davinci", "m4-cli-feature")]
+        self.assertEqual((collection["failure_basis"], collection["failed_unknown"]), ("cause_indeterminate", 1))
+
+    def test_models_are_never_pooled(self):
+        self.campaign.add(row("davinci", "m1-config-parser", model="gpt-5.6-luna"), [final()],
+                          grader("test_hidden_config.py::test_invalid_syntax[broken]"))
+        self.campaign.add(row("davinci", "m2-public-api-migration", model="gpt-6-luna"), [final()],
+                          grader("test_hidden_api.py::test_validation_errors_propagate"))
+        _, summary = self.campaign.run(self.out)
+        self.assertEqual(set(summary["per_model"]), {"gpt-5.6-luna", "gpt-6-luna"})
+        self.assertEqual(summary["per_model"]["gpt-5.6-luna"]["davinci"]["failure_basis"], {"specified_failure": 1})
+        self.assertEqual(summary["per_model"]["gpt-6-luna"]["davinci"]["failure_basis"],
+                         {"only_underspecified_or_contradictory": 1})
+
+    def test_every_category_is_known_and_every_case_names_a_real_test(self):
+        for task, mapping in classifier.REQUIREMENTS.items():
+            for requirement, category, _ in mapping.values():
+                self.assertIn(category, classifier.CATEGORIES, requirement)
+        for (task, name, _), (_, category, _) in classifier.CASES.items():
+            self.assertIn(name, classifier.REQUIREMENTS[task])
+            self.assertIn(category, classifier.CATEGORIES)
 
     def test_variant_subdirectories_are_expanded(self):
         parent = Path(self.temporary.name) / "luna-x"
@@ -359,6 +407,39 @@ class LargeTaskFailureTests(unittest.TestCase):
         finally:
             for module, name, value in saved:
                 setattr(module, name, value)
+
+    def test_locate_finds_large_campaigns_without_entering_private_directories(self):
+        root = Path(self.temporary.name) / "bench"
+
+        def campaign(relative, rows, graders=()):
+            directory = root / relative
+            directory.mkdir(parents=True)
+            (directory / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            for name in graders:
+                (directory / "davinci").mkdir(exist_ok=True)
+                (directory / "davinci" / name).write_text("{}", encoding="utf-8")
+
+        campaign("old-h2h", [dict(row("davinci", "m1-config-parser", model="gpt-5.6-luna",
+                                      source_sha="e8a276ec" + "0" * 32, started_at="2026-10-01T00:00:00Z")),
+                             row("codex", "m1-config-parser", model="gpt-5.6-luna"),
+                             row("davinci", "t1-intervals")])
+        campaign("luna-high-recovery-02/vm-off-cm-off+codex",
+                 [dict(row("davinci", "m4-cli-feature", model="gpt-6-luna", started_at="2026-10-10T00:00:00Z"))], graders=["m4-cli-feature-r0.grader.json", "t1-intervals-r0.grader.json"])
+        campaign("luna-high-wire-01", [row("davinci", "t1-intervals")])
+        campaign("x/_agent", [row("davinci", "m1-config-parser", model=SECRET)])
+        campaign("y/davinci/m1-config-parser-r0", [row("davinci", "m1-config-parser", model=SECRET)])
+        before = snapshot(root)
+        found = classifier.locate([root, Path(self.temporary.name) / "missing"])
+        self.assertEqual(before, snapshot(root))
+        self.assertEqual([Path(item["path"]).relative_to(root).as_posix() for item in found],
+                         ["old-h2h", "luna-high-recovery-02/vm-off-cm-off+codex"])
+        old, new = found
+        self.assertEqual((old["rows"], old["large_runs"], old["models"], old["source_sha"],
+                          old["original_baseline_candidate"]),
+                         (3, {"codex": 1, "davinci": 1}, ["gpt-5.6-luna"], ["e8a276ec0000"], True))
+        self.assertEqual((new["grader_logs"], new["models"], new["original_baseline_candidate"]),
+                         (1, ["gpt-6-luna"], False))
+        self.assertNotIn(SECRET, json.dumps(found))
 
     def assertOutputHasNo(self, *needles):
         for path in self.out.iterdir():

@@ -371,12 +371,15 @@ commands, output or absolute paths; unsafe identifiers become `redacted` and
 unsafe changed paths are withheld and counted. A directory without
 `results.jsonl` stands for its variant subdirectories; a selected campaign with
 no `m*` rows is an error unless `--allow-empty`. Each run keeps observed fields
-(the edit/check/reminder timeline, failed hidden requirements and whether the
-prompt states them) separate from a rule-based `hypothesis` label, a `contract`
-label (whether only requirements disputed in
-`docs/perf/harness-gap/benchmark-integrity.md` failed) and an `unknowns` list.
-Older campaigns without `.grader.json` report the failed requirements as
-unavailable.
+(the edit/check/reminder timeline and failed hidden tests, each categorized as
+specified, mixed, underspecified or contradictory per
+`docs/perf/harness-gap/large-task-contracts.md`) separate from a rule-based
+`hypothesis`, a `failure_basis` (only a specified failure is evidence against
+the agent by itself) and an `unknowns` list. Summaries are grouped by model and
+never pooled across models. Older campaigns without `.grader.json` report the
+failed tests as unavailable. `--locate <root> [...]` lists campaigns with large-
+task rows (model, source commit, grader-log count) without writing anything and
+without entering `_agent`, `wire`, `.git` or run directories.
 
 ### Harness-only arm options and concurrent slots
 
