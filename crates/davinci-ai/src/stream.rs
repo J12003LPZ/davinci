@@ -1112,6 +1112,10 @@ fn live_complete_streaming_with_sink_envelope_inner(
     headers.extend(crate::cloud_auth::request_auth_headers(
         model, auth, &url, body,
     )?);
+    // Experiment, opt-in by an explicit transport value: failures are errors, never SSE.
+    if let Some(mode) = crate::codex_ws::PublicWsMode::select(model, options.transport.as_deref()) {
+        return complete_public_websocket(model, &prepared, options, &headers, mode, on_event);
+    }
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd =
         model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model);
@@ -1234,6 +1238,98 @@ fn live_complete_streaming_with_sink_envelope_inner(
     };
     observation.finish(status, Some(http_status), usage);
     result
+}
+
+/// Conversation id for public WebSocket requests that carry no session id, so one process
+/// still reuses one socket. Never shared across processes.
+fn public_ws_fallback_session_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| format!("public-ws-{}", uuid::Uuid::new_v4()))
+}
+
+/// The public Responses WebSocket experiment. The HTTP request headers are reused so the
+/// only difference from the HTTP arm is the transport (and, for the continuation mode, the
+/// `previous_response_id` request shape). A failure is returned as an explicit error:
+/// there is no SSE fallback, no retry on another transport and no silent downgrade.
+fn complete_public_websocket(
+    model: &Model,
+    prepared: &crate::responses_request::PreparedProviderRequest,
+    options: &StreamOptions,
+    headers: &[(String, String)],
+    mode: crate::codex_ws::PublicWsMode,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<ProviderCompletionEnvelope, String> {
+    const HTTP_ONLY: [&str; 4] = [
+        "content-type",
+        "accept",
+        "content-length",
+        "accept-encoding",
+    ];
+    let ws_headers: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| !HTTP_ONLY.iter().any(|http| name.eq_ignore_ascii_case(http)))
+        .cloned()
+        .collect();
+    let session_id = options
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| public_ws_fallback_session_id());
+    let connect_timeout =
+        crate::codex::resolve_websocket_connect_timeout_ms(options.websocket_connect_timeout_ms);
+    crate::trace::log(&format!(
+        "public websocket {:?} {}",
+        mode,
+        crate::trace::redact_url(crate::codex_ws::PUBLIC_RESPONSES_WS_URL)
+    ));
+    let mut collected = Vec::new();
+    let mut started = false;
+    let (message, shape) = crate::codex_ws::process_public_websocket(
+        crate::codex_ws::PUBLIC_RESPONSES_WS_URL,
+        prepared.body(),
+        &ws_headers,
+        model,
+        mode,
+        connect_timeout,
+        options.timeout_ms,
+        session_id,
+        &mut started,
+        options.abort_signal.as_ref(),
+        &mut |event| {
+            collected.push(event.clone());
+            on_event(event);
+        },
+    )
+    .map_err(|error| {
+        crate::trace::log(&format!(
+            "public websocket failed (started={started}): {error}"
+        ));
+        format!("public WebSocket transport failed (no SSE fallback): {error}")
+    })?;
+    crate::trace::log(&format!(
+        "public websocket reply stop={:?} reused={} previous_response_id={} input_items={}",
+        message.message.stop_reason,
+        shape.socket_reused,
+        shape.previous_response_id,
+        shape.input_items
+    ));
+    let events = if collected.is_empty() {
+        let synthesized = events_from_complete(&message.message);
+        for event in &synthesized {
+            on_event(event);
+        }
+        synthesized
+    } else {
+        collected
+    };
+    let native_responses = message.native_responses.and_then(|output| {
+        crate::responses_ledger::NativeResponsesTurn::from_prepared(prepared, output)
+    });
+    Ok(ProviderCompletionEnvelope {
+        message: message.message,
+        stream_events: events,
+        native_responses,
+    })
 }
 
 /// One raw provider exchange used by the explicit maintainer Codex probe.

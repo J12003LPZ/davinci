@@ -1204,6 +1204,249 @@ fn map_io_error(err: std::io::Error, idle_timeout_ms: Option<u64>) -> String {
     format!("WebSocket error: {err}")
 }
 
+/// The public Responses WebSocket experiment. Opt-in only, selected by an explicit
+/// `transport` value; never reached by `auto`, `websocket` or `websocket-cached`.
+///
+/// Two separable effects, never both from one value:
+/// - `Persistent`: one socket per conversation, every request carries the full `input`
+///   and no `previous_response_id`.
+/// - `Continuation`: the same socket, plus `previous_response_id` with only the new
+///   input items, whenever the previous request is an exact prefix of the next one.
+pub(crate) const PUBLIC_RESPONSES_WS_URL: &str = "wss://api.openai.com/v1/responses";
+pub const PUBLIC_WS_TRANSPORT_PERSISTENT: &str = "public-websocket";
+pub const PUBLIC_WS_TRANSPORT_CONTINUATION: &str = "public-websocket-continuation";
+/// The public route has no ChatGPT account id; one fixed slot keys its socket and continuation.
+const PUBLIC_WS_SLOT: &str = "public-plan";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicWsMode {
+    Persistent,
+    Continuation,
+}
+
+impl PublicWsMode {
+    /// Some only for the documented public plan route and an explicit experimental value.
+    pub fn select(model: &Model, transport: Option<&str>) -> Option<Self> {
+        if !crate::openai_siwc::is_public_plan_model(model) {
+            return None;
+        }
+        match transport {
+            Some(PUBLIC_WS_TRANSPORT_PERSISTENT) => Some(Self::Persistent),
+            Some(PUBLIC_WS_TRANSPORT_CONTINUATION) => Some(Self::Continuation),
+            _ => None,
+        }
+    }
+}
+
+/// Request-shape facts for one public WebSocket request, kept for the experiment report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicWsRequestShape {
+    pub socket_reused: bool,
+    pub previous_response_id: bool,
+    pub input_items: usize,
+}
+
+/// True when a cached socket has nothing waiting to be read and the peer has not closed it.
+/// Between responses a healthy socket is silent, so any readable byte, including EOF or a TLS
+/// close_notify, means it must not carry the next request.
+fn socket_is_quiet_and_open(stream: &WsStream) -> bool {
+    let tcp = match &stream.inner {
+        WsInner::Plain(inner) => inner,
+        WsInner::Tls(inner) => &inner.sock,
+        #[cfg(test)]
+        WsInner::Memory { .. } => return true,
+    };
+    if tcp.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    let quiet = matches!(
+        tcp.peek(&mut probe),
+        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock
+    );
+    quiet && tcp.set_nonblocking(false).is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_public_websocket(
+    url: &str,
+    body: &Value,
+    headers: &[(String, String)],
+    model: &Model,
+    mode: PublicWsMode,
+    connect_timeout_ms: u64,
+    idle_timeout_ms: Option<u64>,
+    session_id: &str,
+    started: &mut bool,
+    abort: AbortFlag<'_>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<(CodexWebsocketMessage, PublicWsRequestShape), String> {
+    if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        let mut message = ResponsesDecoder::new(model).finish(&mut Vec::new());
+        crate::stream::abort_message(&mut message);
+        on_event(&AssistantMessageEvent::Error {
+            reason: StopReason::Aborted,
+            error: message.clone(),
+        });
+        return Ok((
+            CodexWebsocketMessage {
+                message,
+                native_responses: None,
+            },
+            PublicWsRequestShape {
+                socket_reused: false,
+                previous_response_id: false,
+                input_items: 0,
+            },
+        ));
+    }
+    if std::env::var_os("PI_CODEX_WS_REPLY").is_some() {
+        return Err(
+            "the public WebSocket experiment never replays fixtures; unset PI_CODEX_WS_REPLY"
+                .into(),
+        );
+    }
+    if !allows_live_websocket(url) {
+        return Err("WebSocket transport is not available in this runtime".into());
+    }
+    // The create event mirrors the Responses body except transport-only fields.
+    let mut logical = body.clone();
+    if let Value::Object(map) = &mut logical {
+        map.remove("stream");
+        map.remove("background");
+        map.remove("previous_response_id");
+    }
+    let mut acquired = acquire_live_socket(
+        url,
+        headers,
+        connect_timeout_ms,
+        Some(session_id),
+        PUBLIC_WS_SLOT,
+    )?;
+    if acquired.reused && !socket_is_quiet_and_open(&acquired.stream) {
+        // The server already closed this idle socket (or has unread frames on it). Replace it
+        // before any request is sent, so the dead connection costs no failed model attempt.
+        release_live_socket(acquired.key, acquired.stream, false);
+        acquired = acquire_live_socket(
+            url,
+            headers,
+            connect_timeout_ms,
+            Some(session_id),
+            PUBLIC_WS_SLOT,
+        )?;
+    }
+    let mut stream = acquired.stream;
+    let socket_reused = acquired.reused;
+    // A response id is only valid on the connection that produced it. A new socket
+    // therefore always starts from the full input, and the stored state is dropped.
+    let continuation = if mode == PublicWsMode::Continuation && socket_reused {
+        acquire_cached_continuation(Some(session_id), PUBLIC_WS_SLOT, Instant::now()).1
+    } else {
+        crate::codex::clear_cached_continuation(Some(session_id), PUBLIC_WS_SLOT);
+        None
+    };
+    let (request_body, _) = build_cached_websocket_request_body(&logical, continuation.as_ref());
+    let shape = PublicWsRequestShape {
+        socket_reused,
+        previous_response_id: request_body.get("previous_response_id").is_some(),
+        input_items: request_body
+            .get("input")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+    };
+    record_websocket_request_stats(
+        Some(session_id),
+        socket_reused,
+        mode == PublicWsMode::Continuation,
+        &request_body,
+    );
+    let idle_timeout_ms = idle_timeout_ms
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(idle_timeout_ms)))
+        .map_err(|err| format!("WebSocket timeout: {err}"))?;
+    let mut outgoing = request_body.clone();
+    if let Value::Object(map) = &mut outgoing {
+        map.insert("type".into(), Value::String("response.create".into()));
+    }
+    crate::wire_dump::write_current("wire", &outgoing);
+    let observation = crate::provider_observation::Attempt::try_start("websocket")?;
+    if let Err(err) = write_text_frame(&mut stream, &outgoing.to_string()) {
+        observation.finish("failed", None, None);
+        release_live_socket(acquired.key, stream, false);
+        crate::codex::clear_cached_continuation(Some(session_id), PUBLIC_WS_SLOT);
+        return Err(err);
+    }
+    let mut decoder = ResponsesDecoder::new(model);
+    let (events, message, aborted) = match read_codex_events(
+        &mut stream,
+        Some(idle_timeout_ms),
+        started,
+        &mut decoder,
+        abort,
+        on_event,
+    ) {
+        Ok(read) => read,
+        Err(err) => {
+            observation.finish("failed", None, None);
+            release_live_socket(acquired.key, stream, false);
+            crate::codex::clear_cached_continuation(Some(session_id), PUBLIC_WS_SLOT);
+            return Err(err);
+        }
+    };
+    if aborted || message.stop_reason == Some(StopReason::Error) {
+        let status = if message.stop_reason == Some(StopReason::Aborted) {
+            "aborted"
+        } else {
+            "failed"
+        };
+        observation.finish(status, None, message.usage.clone());
+        // Mid-response or rejected: the socket and the continuation state are both unusable.
+        release_live_socket(acquired.key, stream, false);
+        crate::codex::clear_cached_continuation(Some(session_id), PUBLIC_WS_SLOT);
+        return Ok((
+            CodexWebsocketMessage {
+                message,
+                native_responses: None,
+            },
+            shape,
+        ));
+    }
+    let native_responses = NativeResponsesOutput::from_events(&events);
+    let mut keep = acquired.key.is_some() && native_responses.is_some();
+    if mode == PublicWsMode::Continuation && native_responses.is_some() {
+        match events.iter().rev().find_map(|event| {
+            event
+                .pointer("/response/id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }) {
+            Some(response_id) => store_cached_continuation(
+                Some(session_id),
+                PUBLIC_WS_SLOT,
+                CachedWebSocketContinuation {
+                    last_request_body: logical.clone(),
+                    last_response_id: response_id,
+                    last_response_items: native_response_items_from_events(&events),
+                },
+                socket_reused,
+                Instant::now(),
+            ),
+            None => keep = false,
+        }
+    }
+    release_live_socket(acquired.key, stream, keep);
+    observation.finish("completed", None, message.usage.clone());
+    Ok((
+        CodexWebsocketMessage {
+            message,
+            native_responses,
+        },
+        shape,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn accept_key_for_tests(key: &str) -> String {
     accept_key(key)
@@ -1244,6 +1487,10 @@ pub(crate) fn write_unmasked_text(stream: &mut impl Write, text: &str) -> std::i
     stream.write_all(&frame)?;
     stream.flush()
 }
+
+#[cfg(test)]
+#[path = "codex_ws_public_tests.rs"]
+mod public_tests;
 
 #[cfg(test)]
 mod tests {
