@@ -18,6 +18,7 @@ This is a maintainer tool, never a test: it starts real harnesses and spends
 model usage on both the davinci and the Codex CLI accounts.
 """
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -167,6 +168,19 @@ def grade(tid, workdir, timeout=120, *, phase="grader", evidence=None):
     passed = int(m.group(1)) if (m := re.search(r"(\d+) passed", tail)) else 0
     failed = sum(int(x) for x in re.findall(r"(\d+) (?:failed|error)", tail))
     return checked["pass"], passed, failed, tail
+
+
+def unrelated_paths(changed, spec):
+    """Changed paths outside the task's allowlist.
+
+    `allowed_patterns` (v2 fixtures) admits new files such as `tests/test_*.py`;
+    a pattern matches only at its own directory depth. Tasks without it keep
+    the exact allowlist.
+    """
+    patterns = spec.get("allowed_patterns") or []
+    return [path for path in changed if path not in spec["allowed"]
+            and not any(fnmatch.fnmatchcase(path, pattern) and path.count("/") == pattern.count("/")
+                        for pattern in patterns)]
 
 
 def changed_files(workdir, ignore=True):
@@ -558,7 +572,7 @@ def run_one(harness, tid, rep, campaign=None):
             raise RuntimeError("cannot inspect a workspace while execution may still be active")
         inspection_phase = "changed_files"
         changed = changed_files(workdir)
-        unrelated = [p for p in changed if p not in spec["allowed"]]
+        unrelated = unrelated_paths(changed, spec)
         inspection_phase = "forbidden_artifacts"
         artifacts = forbidden_artifacts(workdir, tid)
         if artifacts["artifact_leak"]:
@@ -678,7 +692,7 @@ def validate_fixture_manifest(task_ids, large_manifest):
         if tid in LEGACY_TASKS:
             continue
         expected = large_manifest["fixtures"][tid]
-        for field in ("task_set", "allowed", "public_verification"):
+        for field in ("task_set", "allowed", "allowed_patterns", "public_verification"):
             if metadata.get(field) != expected.get(field):
                 errors.append(f"{tid}: metadata mismatch for {field}")
         for directory, field in (("repo", "public_hash"), ("solution", "reference_solution_hash"),

@@ -245,6 +245,8 @@ class LargeTaskFailureTests(unittest.TestCase):
         import re
         source = Path(make_large_tasks.__file__).read_text(encoding="utf-8")
         for task, mapping in classifier.REQUIREMENTS.items():
+            if task not in {spec["id"] for spec in make_large_tasks.TASK_SPECS}:
+                continue  # v2 tasks are checked against their own generator in test_large_fixtures_v2
             block = source.split(f'"id": "{task}"', 1)[1].split('"hidden": {', 1)[1].split('"solution": {', 1)[0]
             self.assertEqual(set(re.findall(r"def (test_\w+)\(", block)), set(mapping), task)
 
@@ -343,6 +345,15 @@ class LargeTaskFailureTests(unittest.TestCase):
         self.assertEqual(rows[("davinci", "m1-config-parser")]["failure_basis"], "unknown")
         collection = rows[("davinci", "m4-cli-feature")]
         self.assertEqual((collection["failure_basis"], collection["failed_unknown"]), ("cause_indeterminate", 1))
+
+    def test_v2_failures_are_all_specified(self):
+        self.campaign.add(row("davinci", "m3-state-persistence-v2", changed=["state_core/service.py"]), [final()],
+                          grader("test_hidden_state.py::test_invalid_input_raises[empty-delta]",
+                                 "test_hidden_state.py::test_failed_write_keeps_the_previous_file"))
+        result = self.campaign.run(self.out)[0][0]
+        self.assertEqual((result["failed_requirements"], result["failed_requirement_categories"],
+                          result["failure_basis"]), ("m3.validation;m3.atomic", "specified;specified",
+                                                     "specified_failure"))
 
     def test_models_are_never_pooled(self):
         self.campaign.add(row("davinci", "m1-config-parser", model="gpt-5.6-luna"), [final()],

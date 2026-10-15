@@ -102,6 +102,20 @@ Generators overwrite their own generated fixtures: run them before freezing a
 campaign, never during one. `validate --task-set all` checks legacy and large
 membership without looking up legacy entries in the large-only manifest.
 
+**Large tasks v2.** `make_large_tasks.py` and `large_manifest.json` (v1) are
+frozen historical fixtures; several of their hidden tests are contradictory or
+underspecified (`docs/perf/harness-gap/large-task-contracts.md`). New campaigns
+use v2: `python scripts/bench/make_large_tasks_v2.py` writes
+`tasks/m*-v2` and `large_manifest_v2.json`, and
+`python scripts/bench/large_v2_validation.py` (pytest required) checks that
+each starter fails exactly its pinned hidden tests, each reference passes
+hidden and public tests, alternative implementations pass and deliberately
+broken ones fail exactly their intended tests. Select v2 with
+`--task-set large --large-manifest scripts/bench/large_manifest_v2.json`. v2
+fixtures are public: they are diagnostic, never holdout evidence. Their
+`allowed_patterns` lets agents add `tests/test_*.py` files without those
+counting as unrelated edits.
+
 Large manifests now declare `hash_order: relative-posix-codepoint-v1`. Public,
 reference, and grader trees are hashed in that portable relative-path order.
 The previous Windows Path sort order produced different hashes on Linux. Only

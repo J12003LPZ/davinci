@@ -40,6 +40,7 @@ from pathlib import Path
 import re
 import sys
 
+from make_large_tasks_v2 import REQUIREMENTS as V2_REQUIREMENTS
 from turn_cache_audit import EDITORS, SHELLS, events, leaves
 
 # Hidden grader test -> (requirement, category, what it checks). Categories say
@@ -96,6 +97,10 @@ REQUIREMENTS = {
             ("m4.legacy_total", "contradictory", "starter and public test add arguments; hidden multiplies pairs"),
     },
 }
+# v2 (make_large_tasks_v2.py) traces every hidden test to a prompt clause or
+# starter behavior and was validated offline, so all of its tests are specified.
+REQUIREMENTS.update({task: {test: (requirement, "specified", source) for test, (requirement, source) in tests.items()}
+                     for task, tests in V2_REQUIREMENTS.items()})
 # One case of a parametrized test that differs from the rest of it.
 CASES = {
     ("m3-state-persistence", "test_invalid_inputs", "a-r-delta2"):
@@ -569,7 +574,9 @@ def run(campaigns, out, manifest_path, allow_empty=False):
             raise ValueError("--out must be outside every campaign directory")
     if (out / "results.jsonl").exists():
         raise ValueError("--out looks like a campaign directory (it has results.jsonl)")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")).get("fixtures", {})
+    manifest = {}
+    for path in manifest_path if isinstance(manifest_path, (list, tuple)) else [manifest_path]:
+        manifest.update(json.loads(Path(path).read_text(encoding="utf-8")).get("fixtures", {}))
     rows, empty = [], []
     for label, campaign in selected:
         large, total = load_rows(campaign)
@@ -639,7 +646,9 @@ def main():
     parser.add_argument("--out", type=Path)
     parser.add_argument("--locate", action="store_true",
                         help="list campaigns with large-task rows under the given roots; read-only, writes nothing")
-    parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parent / "large_manifest.json")
+    here = Path(__file__).resolve().parent
+    parser.add_argument("--manifest", type=Path, action="append",
+                        help="fixture manifest(s); default: large_manifest.json and large_manifest_v2.json")
     parser.add_argument("--allow-empty", action="store_true",
                         help="continue when a selected campaign has no large-task runs (listed in the summary)")
     args = parser.parse_args()
@@ -650,7 +659,8 @@ def main():
     if args.out is None:
         parser.error("--out is required unless --locate")
     try:
-        _, summary = run(args.campaigns, args.out, args.manifest, args.allow_empty)
+        manifests = args.manifest or [here / "large_manifest.json", here / "large_manifest_v2.json"]
+        _, summary = run(args.campaigns, args.out, manifests, args.allow_empty)
     except ValueError as error:
         parser.error(str(error))
     for entry in summary["campaigns_without_large_runs"]:
