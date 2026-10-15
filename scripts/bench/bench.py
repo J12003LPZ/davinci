@@ -37,7 +37,7 @@ from runner import (create_campaign, isolate_settings, controlled_environment, s
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
                     pin_model_store, model_stop_reason, validate_large_manifest, container_command,
                     campaign_lock, parent_identity, source_identity, bench_options,
-                    campaign_slot)
+                    campaign_slot, PYTHON_TEXT_ENV, GRADING_ENV_VERSION)
 from codex_otel import Collector, request_metrics
 from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
@@ -133,6 +133,7 @@ def run_grading_check(command, workdir, timeout, phase, evidence=None):
     path = Path(str(workdir) + f".{phase}.json")
     path.write_text(json.dumps({
         "schema_version": 1, "phase": phase, "command": command,
+        "grading_env_version": GRADING_ENV_VERSION, "python_text_env": dict(PYTHON_TEXT_ENV),
         "cwd": str(Path(workdir).resolve()), "timeout_seconds": timeout, **checked,
     }, indent=2), encoding="utf-8")
     if evidence is not None:
@@ -542,7 +543,7 @@ def run_one(harness, tid, rep, campaign=None):
         raise FileExistsError("run directory already exists")
     prepare(tid, workdir)
     env = (controlled_environment(os.environ, campaign["agent_dir"], subscription_only=bool(subscription))
-           if campaign else dict(os.environ, PI_LEARNING_DISABLE_BACKGROUND="1", PYTHONUTF8="1"))
+           if campaign else dict(os.environ, PI_LEARNING_DISABLE_BACKGROUND="1", **PYTHON_TEXT_ENV))
     with Collector() if harness == "codex" else nullcontext() as collector:
         settings = campaign["identities"][harness].get("effective_settings") if campaign else None
         args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir, settings)

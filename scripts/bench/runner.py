@@ -31,6 +31,14 @@ BASE_SETTINGS = {"compaction": {"enabled": True, "reserveTokens": 16384, "keepRe
     "effortPolicy": "fixed", "toolSurface": "full", "autoVerify": True,
     "promptProfile": "stable"}
 
+# Python text I/O mode shared by the agent and every grading command. A test that
+# round-trips non-ASCII text through a child process (print, then read it back with
+# text=True) passes or fails with the interpreter's mode, so the agent that wrote and
+# ran the test and the grader that scores it must agree. Version 1 graders inherited
+# the host's mode and disagreed with the agent on Windows; version 2 sets this.
+PYTHON_TEXT_ENV = {"PYTHONUTF8": "1"}
+GRADING_ENV_VERSION = 2
+
 GRADING_ISOLATIONS = ("diagnostic-only", "container")
 _CONTAINER_ENV_KEYS = frozenset({
     "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "PYTHONUTF8",
@@ -858,7 +866,7 @@ def controlled_environment(inherited, agent_dir, *, subscription_only=False):
               and not (subscription_only and key.upper().endswith(("_API_KEY", "_AUTH_TOKEN")))}
     result.update({"DAVINCI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
                    "PI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
-                   "PI_LEARNING_DISABLE_BACKGROUND": "1", "PYTHONUTF8": "1"})
+                   "PI_LEARNING_DISABLE_BACKGROUND": "1", **PYTHON_TEXT_ENV})
     return result
 
 

@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 from campaign import digest, fixture_manifest
-from runner import execute
+from runner import PYTHON_TEXT_ENV, execute
 
 
 class GradingLifecycleError(RuntimeError):
@@ -232,7 +232,8 @@ def apply_hidden(spec, hidden, workdir):
 
 
 def run_check(command, workdir, timeout=120):
-    env = dict(os.environ, DAVINCI_OFFLINE="1", PI_OFFLINE="1", PYTHONDONTWRITEBYTECODE="1")
+    env = dict(os.environ, DAVINCI_OFFLINE="1", PI_OFFLINE="1", PYTHONDONTWRITEBYTECODE="1",
+               **PYTHON_TEXT_ENV)
     result = execute(argv(command), workdir, env, timeout)
     return {"pass": result["exit"] == 0 and result.get("cleanup_complete") is True,
             "exit": result["exit"], "cleanup_complete": result.get("cleanup_complete"),
