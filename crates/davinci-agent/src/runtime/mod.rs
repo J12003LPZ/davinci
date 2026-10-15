@@ -47,8 +47,8 @@ pub mod worktree;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use cache::{
-    hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names, CacheIdentity,
-    CacheMissReason,
+    hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
+    session_partitioned_cache_key, CacheIdentity, CacheMissReason,
 };
 pub use cancellation::CancellationToken;
 pub use capabilities::{

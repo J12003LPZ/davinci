@@ -350,6 +350,9 @@ struct RunConfig {
     prune_profile: Option<String>,
     /// Build each request twice and require identical bytes.
     check_determinism: bool,
+    /// `experimentalSessionCacheKey` in the run's settings.json (default off).
+    #[serde(default)]
+    session_cache_key: bool,
 }
 
 fn config(label: &str, mode: &str, session: bool) -> RunConfig {
@@ -361,6 +364,7 @@ fn config(label: &str, mode: &str, session: bool) -> RunConfig {
         script: Script::Equivalence,
         prune_profile: None,
         check_determinism: false,
+        session_cache_key: false,
     }
 }
 
@@ -568,20 +572,23 @@ fn run_in_process(config: &RunConfig, root: &Path) -> RunResult {
     seed_workspace(&cwd);
     // The benchmark's settings (C:\bench\luna-high-wire-settings), with the
     // Context VM mode under test.
+    let mut stored = json!({
+        "compaction": {"enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000},
+        "showCacheMissNotices": false,
+        "transport": "auto",
+        "serviceTier": null,
+        "effortPolicy": "fixed",
+        "toolSurface": "full",
+        "autoVerify": true,
+        "promptProfile": "stable",
+        "contextVm": config.mode.as_str(),
+    });
+    if config.session_cache_key {
+        stored["experimentalSessionCacheKey"] = json!(true);
+    }
     std::fs::write(
         agent_dir.join("settings.json"),
-        serde_json::to_string_pretty(&json!({
-            "compaction": {"enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000},
-            "showCacheMissNotices": false,
-            "transport": "auto",
-            "serviceTier": null,
-            "effortPolicy": "fixed",
-            "toolSurface": "full",
-            "autoVerify": true,
-            "promptProfile": "stable",
-            "contextVm": config.mode.as_str(),
-        }))
-        .unwrap(),
+        serde_json::to_string_pretty(&stored).unwrap(),
     )
     .unwrap();
     // The benchmark command line: --mode json [--no-session] --provider
@@ -731,12 +738,14 @@ fn run_in_process(config: &RunConfig, root: &Path) -> RunResult {
             let system = current.provider_system_prompt();
             let provider_messages = current.messages_for_provider();
             let request_tools = provider_tools(current);
-            let cache_key = Some(live_cache_key(
+            let cache_key = Some(request_cache_key(
                 &model,
                 &auth,
                 &system,
                 current,
                 &request_tools,
+                load_settings(&default_agent_dir()).session_cache_key_experiment_enabled(),
+                transport_session.conversation_id(),
             ));
             let options = StreamOptions {
                 thinking_level: Some(current.request_thinking_level()),
@@ -1270,6 +1279,7 @@ fn ws4_hybrid_first_diverges_at_compaction() {
         script: Script::Filling(40),
         prune_profile: prune_profile.map(str::to_string),
         check_determinism: false,
+        session_cache_key: false,
     };
     let first_after = |result: &RunResult, counter: fn(&Captured) -> u64| {
         result
@@ -1640,4 +1650,155 @@ fn ws1_request_serialization_is_deterministic() {
         println!("WS_ORDER session={session}: byte offsets include/input/instructions/model/tools = {positions:?} of {}", text.len());
         assert!(text.starts_with("{\"include\":"));
     }
+}
+
+/// The experiment changes the `prompt_cache_key` and nothing else: with the
+/// setting on, every serialized request is the default run's request with only
+/// that one field different.
+#[test]
+fn exp_session_cache_key_changes_only_prompt_cache_key() {
+    for session in [false, true] {
+        let shared = run(&config("exp-key", "off", session));
+        let partitioned = run(&RunConfig {
+            session_cache_key: true,
+            ..config("exp-key", "off", session)
+        });
+        assert_eq!(
+            shared.requests.len(),
+            partitioned.requests.len(),
+            "session={session}: the experiment changed the number of requests"
+        );
+        for (index, (a, b)) in shared
+            .requests
+            .iter()
+            .zip(&partitioned.requests)
+            .enumerate()
+        {
+            let strip = |request: &Captured| {
+                let mut body = request.body.clone();
+                body.as_object_mut().unwrap().remove("prompt_cache_key");
+                body
+            };
+            if let Some((path, x, y)) = first_diff(&strip(a), &strip(b), "$") {
+                panic!(
+                    "session={session}: request {index} differs outside prompt_cache_key at {path}: {} -> {}",
+                    clip(&x),
+                    clip(&y)
+                );
+            }
+            let (shared_key, new_key) = (
+                a.body["prompt_cache_key"].as_str().expect("shared key"),
+                b.body["prompt_cache_key"]
+                    .as_str()
+                    .expect("partitioned key"),
+            );
+            assert_ne!(
+                shared_key, new_key,
+                "session={session}: request {index} kept the shared key"
+            );
+            assert!(
+                new_key.starts_with(&format!("{shared_key}-s")),
+                "session={session}: {new_key} does not extend {shared_key}"
+            );
+            assert!(new_key.chars().count() <= 64, "{new_key}");
+            assert!(
+                new_key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "{new_key}"
+            );
+        }
+    }
+}
+
+/// One key for the whole conversation, including every request after the
+/// first prompt (continuation) and with or without a persisted session; two
+/// conversations get two keys.
+#[test]
+fn exp_session_cache_key_is_stable_within_a_conversation_and_differs_between_them() {
+    for session in [false, true] {
+        let first = run(&RunConfig {
+            session_cache_key: true,
+            ..config("exp-key-stable", "off", session)
+        });
+        let second = run(&RunConfig {
+            session_cache_key: true,
+            ..config("exp-key-stable", "off", session)
+        });
+        let keys = |result: &RunResult| -> std::collections::BTreeSet<String> {
+            result
+                .requests
+                .iter()
+                .map(|r| r.body["prompt_cache_key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (a, b) = (keys(&first), keys(&second));
+        assert_eq!(
+            a.len(),
+            1,
+            "session={session}: keys moved within a conversation: {a:?}"
+        );
+        assert_eq!(
+            b.len(),
+            1,
+            "session={session}: keys moved within a conversation: {b:?}"
+        );
+        assert!(
+            first.requests.iter().any(|r| r.prompt > 0),
+            "session={session}: the script must include a continuation prompt"
+        );
+        assert_ne!(a, b, "session={session}: two conversations shared a key");
+    }
+}
+
+/// The default is the shared key, with no suffix, whatever else is in settings.
+#[test]
+fn exp_session_cache_key_default_is_the_shared_key() {
+    let result = run(&config("exp-key-default", "off", false));
+    for (index, request) in result.requests.iter().enumerate() {
+        let key = request.body["prompt_cache_key"].as_str().unwrap();
+        assert!(key.starts_with("ci-root-"), "request {index}: {key}");
+        assert_eq!(key.len(), "ci-root-".len() + 16, "request {index}: {key}");
+        assert!(!key.contains("-s"), "request {index}: {key}");
+    }
+}
+
+#[test]
+fn exp_env_override_cannot_mask_the_session_experiment() {
+    let shared = || "ci-root-0123456789abcdef".to_string();
+    // Default: the override wins exactly as before, and its absence computes the key.
+    assert_eq!(
+        select_cache_key(Some("pinned"), false, false, shared).unwrap(),
+        "pinned"
+    );
+    assert_eq!(
+        select_cache_key(None, false, false, shared).unwrap(),
+        "ci-root-0123456789abcdef"
+    );
+    assert_eq!(
+        select_cache_key(Some(""), false, false, shared).unwrap(),
+        "ci-root-0123456789abcdef"
+    );
+    // Experiment on: no override computes the key; an empty override is no override.
+    assert_eq!(
+        select_cache_key(None, true, false, shared).unwrap(),
+        "ci-root-0123456789abcdef"
+    );
+    assert_eq!(
+        select_cache_key(Some(""), true, false, shared).unwrap(),
+        "ci-root-0123456789abcdef"
+    );
+    // Experiment on with a stray override in a top-level process: refuse, never mask.
+    let error = select_cache_key(Some("pinned"), true, false, shared).unwrap_err();
+    assert!(error.contains("PI_GRAPH_CACHE_KEY") && error.contains("experimentalSessionCacheKey"));
+    // A graph worker keeps the key its parent handed it.
+    assert_eq!(
+        select_cache_key(Some("pinned"), true, true, shared).unwrap(),
+        "pinned"
+    );
+    // The key is never computed when an override decides.
+    assert_eq!(
+        select_cache_key(Some("pinned"), false, false, || panic!("computed")).unwrap(),
+        "pinned"
+    );
 }

@@ -316,6 +316,11 @@ pub struct Settings {
     pub openai_verbosity: Option<String>,
     #[serde(default, rename = "autoVerify")]
     pub auto_verify: Option<bool>,
+    /// Experiment, default off: partition the provider `prompt_cache_key` per
+    /// conversation instead of sharing one key across compatible runs. Changes
+    /// no other request field. See `session_partitioned_cache_key`.
+    #[serde(default, rename = "experimentalSessionCacheKey")]
+    pub experimental_session_cache_key: Option<bool>,
     /// Attach files the user's request names to the turn (default true).
     #[serde(default, rename = "namedFileContext")]
     pub named_file_context: Option<bool>,
@@ -1393,6 +1398,11 @@ impl Settings {
         self.auto_verify.unwrap_or(true) && !matches!(environment, Some("0" | "false" | "off"))
     }
 
+    /// Only an explicit `true` turns the session cache-key experiment on.
+    pub fn session_cache_key_experiment_enabled(&self) -> bool {
+        self.experimental_session_cache_key == Some(true)
+    }
+
     /// The environment variable wins when it names a mode; otherwise the stored
     /// setting; otherwise off. Unknown values fall back to off, as the env does.
     pub fn context_vm_mode(
@@ -2220,6 +2230,22 @@ mod tests {
         }
         assert!(defaults.auto_verify_enabled(Some("1")));
         assert!(!settings.auto_verify_enabled(Some("1")));
+    }
+
+    #[test]
+    fn session_cache_key_experiment_is_off_unless_explicitly_enabled() {
+        assert!(!super::Settings::default().session_cache_key_experiment_enabled());
+        for json in [
+            r#"{}"#,
+            r#"{"experimentalSessionCacheKey":null}"#,
+            r#"{"experimentalSessionCacheKey":false}"#,
+        ] {
+            let settings: super::Settings = serde_json::from_str(json).unwrap();
+            assert!(!settings.session_cache_key_experiment_enabled(), "{json}");
+        }
+        let on: super::Settings =
+            serde_json::from_str(r#"{"experimentalSessionCacheKey":true}"#).unwrap();
+        assert!(on.session_cache_key_experiment_enabled());
     }
 
     #[test]

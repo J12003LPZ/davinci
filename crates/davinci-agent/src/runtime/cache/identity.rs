@@ -5,6 +5,10 @@
 //!
 //! Key invariant: the cache key MUST NOT include random process IDs, wall-clock time,
 //! session IDs when compatible requests should share a prefix, or transient runtime state.
+//!
+//! The one sanctioned exception is [`session_partitioned_cache_key`], which a caller may
+//! apply only behind an explicit experiment switch. It is never part of
+//! [`CacheIdentity::cache_key`], so the default key is unchanged.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -167,6 +171,31 @@ pub fn legacy_prompt_cache_key(domain: &str, fields: &[&str], prefix: &str) -> S
     format!("{prefix}{}", &hex[..16])
 }
 
+/// Experimental: partition a prompt-cache key by conversation.
+///
+/// Returns `{shared_key}-s{16 hex}`, where the suffix is a SHA-256 digest of the shared key
+/// and the conversation id. The shared key stays in the digest and in the text, so any change
+/// to the prefix identity (model, system prompt, tool schema, permissions, context) still
+/// changes the key exactly as it does without the experiment. The raw id is never written
+/// out, so the key carries no path, secret, or transcript content.
+///
+/// The result depends only on its two arguments: it is stable for as long as the caller
+/// passes the same conversation id (retries, continuation, resume) and differs between
+/// conversations. An empty conversation id returns the shared key unchanged rather than a
+/// constant partition.
+pub fn session_partitioned_cache_key(shared_key: &str, conversation_id: &str) -> String {
+    if conversation_id.is_empty() {
+        return shared_key.to_string();
+    }
+    let mut h = Sha256::new();
+    h.update(b"cache_session_partition_v1\n");
+    h.update(shared_key.as_bytes());
+    h.update(b"\n");
+    h.update(conversation_id.as_bytes());
+    let hex = format!("{:x}", davinci_sys::hex::Lower(&h.finalize()));
+    format!("{shared_key}-s{}", &hex[..16])
+}
+
 /// Compute a SHA-256 hash of an ordered list of tool names (sorted for stability).
 pub fn hash_tool_names(tools: &[&str]) -> String {
     let mut sorted: Vec<&str> = tools.to_vec();
@@ -245,6 +274,54 @@ mod tests {
         let mut id4 = sample_identity();
         id4.contract_hash = Some("some-contract-hash".into());
         assert_ne!(id1.cache_key(), id4.cache_key());
+    }
+
+    #[test]
+    fn session_partition_is_stable_per_conversation_and_distinct_across_conversations() {
+        let shared = sample_identity().cache_key();
+        let first = session_partitioned_cache_key(&shared, "conversation-a");
+        assert_eq!(
+            first,
+            session_partitioned_cache_key(&shared, "conversation-a")
+        );
+        assert_ne!(
+            first,
+            session_partitioned_cache_key(&shared, "conversation-b")
+        );
+        assert_ne!(first, shared, "the experiment must change the key");
+        assert!(first.starts_with(&format!("{shared}-s")), "{first}");
+    }
+
+    #[test]
+    fn session_partition_still_follows_the_prefix_identity() {
+        let a = sample_identity();
+        let mut b = sample_identity();
+        b.system_prompt_hash = hash_system_prompt("Different system prompt");
+        assert_ne!(
+            session_partitioned_cache_key(&a.cache_key(), "same-conversation"),
+            session_partitioned_cache_key(&b.cache_key(), "same-conversation"),
+        );
+    }
+
+    #[test]
+    fn session_partition_is_provider_safe_and_leaks_nothing() {
+        let shared = sample_identity().cache_key();
+        let secret = r"C:\Users\someone\project\token=NOT-A-REAL-SECRET hello world";
+        let key = session_partitioned_cache_key(&shared, secret);
+        assert!(key.chars().count() <= 64, "{key}");
+        assert!(
+            key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "{key}"
+        );
+        for fragment in ["Users", "someone", "project", "NOT-A-REAL", "hello"] {
+            assert!(!key.contains(fragment), "{key} leaks {fragment}");
+        }
+    }
+
+    #[test]
+    fn session_partition_with_no_conversation_id_is_the_shared_key() {
+        let shared = sample_identity().cache_key();
+        assert_eq!(session_partitioned_cache_key(&shared, ""), shared);
     }
 
     #[test]

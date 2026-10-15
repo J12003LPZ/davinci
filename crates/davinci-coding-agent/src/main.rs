@@ -2398,6 +2398,21 @@ impl ProviderTransportSession {
     }
 }
 
+impl ProviderTransportSession {
+    /// Identity of the conversation for the session cache-key experiment. A
+    /// persisted session keeps its header id across retries, resume and new
+    /// processes. With no session it is one random id per process, so every
+    /// prompt, retry and continuation of that conversation shares one key.
+    fn conversation_id(&self) -> &str {
+        static PROCESS_CONVERSATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if self.ephemeral {
+            PROCESS_CONVERSATION.get_or_init(|| uuid::Uuid::new_v4().to_string())
+        } else {
+            &self.id
+        }
+    }
+}
+
 impl Drop for ProviderTransportSession {
     fn drop(&mut self) {
         if self.ephemeral {
@@ -2836,6 +2851,49 @@ fn live_cache_key(
         role: Some("root".into()),
     }
     .cache_key()
+}
+
+/// The `prompt_cache_key` sent with one live request: the shared key by
+/// default. Only with `experimentalSessionCacheKey` is it partitioned by
+/// conversation; nothing else about the request depends on the switch.
+fn request_cache_key(
+    model: &davinci_ai::Model,
+    auth: &ResolvedAuth,
+    system: &str,
+    agent: &Agent,
+    request_tools: &[ToolSpec],
+    session_experiment: bool,
+    conversation_id: &str,
+) -> String {
+    let shared = live_cache_key(model, auth, system, agent, request_tools);
+    if session_experiment {
+        davinci_agent::session_partitioned_cache_key(&shared, conversation_id)
+    } else {
+        shared
+    }
+}
+
+/// Chooses the `prompt_cache_key` for one live request.
+///
+/// A non-empty `PI_GRAPH_CACHE_KEY` wins, as it always has: a graph worker is
+/// handed its key that way. With the session experiment on, that override
+/// would silently replace the experiment key and the run would be measured as
+/// something it was not, so a top-level process refuses to start the request.
+/// Graph workers keep the override because their parent resolved it already.
+fn select_cache_key(
+    env_override: Option<&str>,
+    session_experiment: bool,
+    is_graph_worker: bool,
+    compute: impl FnOnce() -> String,
+) -> Result<String, String> {
+    match env_override.filter(|value| !value.is_empty()) {
+        Some(_) if session_experiment && !is_graph_worker => Err(
+            "experimentalSessionCacheKey is on but PI_GRAPH_CACHE_KEY is set, which would replace              the experiment key. Unset PI_GRAPH_CACHE_KEY or turn the experiment off."
+                .to_string(),
+        ),
+        Some(value) => Ok(value.to_string()),
+        None => Ok(compute()),
+    }
 }
 
 fn complete_prompt_with_host(
@@ -3406,7 +3464,7 @@ fn complete_prompt_with_host(
                     )
                     .map(CompleteOutput::from)
                 }
-                (false, Some(model), Some(auth), None) => {
+                (false, Some(model), Some(auth), None) => 'request: {
                     // Every stream event reaches the sink the moment it is
                     // decoded, as a `MessageUpdate` carrying the partial
                     // message, with a `MessageStart` ahead of the first one.
@@ -3427,10 +3485,27 @@ fn complete_prompt_with_host(
                     };
                     let provider_messages = current.messages_for_provider();
                     let request_tools = provider_tools(current);
-                    let cache_key = std::env::var("PI_GRAPH_CACHE_KEY")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| Some(live_cache_key(model, auth, &system, current, &request_tools)));
+                    let stored_settings = load_settings(&default_agent_dir());
+                    let session_experiment = stored_settings.session_cache_key_experiment_enabled();
+                    let cache_key = match select_cache_key(
+                        std::env::var("PI_GRAPH_CACHE_KEY").ok().as_deref(),
+                        session_experiment,
+                        std::env::var_os("PI_GRAPH_ROLE").is_some(),
+                        || {
+                            request_cache_key(
+                                model,
+                                auth,
+                                &system,
+                                current,
+                                &request_tools,
+                                session_experiment,
+                                transport_session.conversation_id(),
+                            )
+                        },
+                    ) {
+                        Ok(key) => Some(key),
+                        Err(message) => break 'request Err(message),
+                    };
                     let result = live_complete_streaming_with_sink_envelope(
                         model,
                         &provider_messages,
@@ -3446,8 +3521,7 @@ fn complete_prompt_with_host(
                             max_retries: current.provider_max_retries,
                             max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
                             max_tokens: current.context_vm_provider_output_limit(),
-                            websocket_connect_timeout_ms: load_settings(&default_agent_dir())
-                                .websocket_connect_timeout_ms,
+                            websocket_connect_timeout_ms: stored_settings.websocket_connect_timeout_ms,
                             transport: current.transport.clone(),
                             session_id: Some(transport_session.id.clone()),
                             cache_key,
