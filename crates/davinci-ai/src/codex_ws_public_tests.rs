@@ -169,7 +169,7 @@ fn completed(id: &str, output: &[Value], input_tokens: u64, cached: u64) -> Valu
     json!({"type":"response.completed","response":{
         "id":id,"status":"completed","output":output,
         "usage":{"input_tokens":input_tokens,"output_tokens":7,"total_tokens":input_tokens + 7,
-                 "input_tokens_details":{"cached_tokens":cached}}}})
+                 "input_tokens_details":{"cached_tokens":cached,"cache_write_tokens":0}}}})
 }
 
 fn body(input: Vec<Value>) -> Value {
@@ -831,4 +831,60 @@ fn encrypted_reasoning_is_replayed_by_persistent_mode_and_carried_by_the_server_
         }
         assert_eq!(seen[1].1["include"], json!(["reasoning.encrypted_content"]));
     }
+}
+
+#[test]
+fn attempt_rows_record_the_transport_shape_and_usage_of_every_request() {
+    let session = Session::open("public-ws-observation");
+    let out1 = text_output("m1", "one");
+    let server = Server::start(vec![vec![
+        Reply::Events(vec![completed("resp_1", &out1, 1000, 0)]),
+        Reply::Events(vec![completed(
+            "resp_2",
+            &text_output("m2", "2"),
+            1300,
+            900,
+        )]),
+    ]]);
+    let scope = crate::provider_observation::ObservationScope::capture();
+    let in1 = vec![user("a")];
+    let in2 = extend(&in1, &out1, user("b"));
+    crate::provider_observation::begin_request("coding", "gpt-6-luna", Some("high"), "schema");
+    send(
+        &server.url,
+        PublicWsMode::Continuation,
+        session.0,
+        &body(in1),
+    )
+    .unwrap();
+    crate::provider_observation::begin_request("coding", "gpt-6-luna", Some("high"), "schema");
+    send(
+        &server.url,
+        PublicWsMode::Continuation,
+        session.0,
+        &body(in2),
+    )
+    .unwrap();
+    server.finish();
+    let events = scope.finish("completed");
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "attempt_start")
+        .collect();
+    assert_eq!(
+        starts
+            .iter()
+            .map(|e| e.transport.as_deref())
+            .collect::<Vec<_>>(),
+        [
+            Some(PUBLIC_WS_ATTEMPT_FULL),
+            Some(PUBLIC_WS_ATTEMPT_CONTINUATION)
+        ]
+    );
+    let ends: Vec<_> = events.iter().filter(|e| e.kind == "attempt_end").collect();
+    assert!(ends
+        .iter()
+        .all(|e| e.status == "completed" && e.usage_complete == Some(true)));
+    let raw = ends[1].raw_usage.as_ref().expect("raw usage");
+    assert_eq!((raw.input_total, raw.cache_read), (Some(1300), Some(900)));
 }

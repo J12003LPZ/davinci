@@ -1217,6 +1217,9 @@ pub const PUBLIC_WS_TRANSPORT_PERSISTENT: &str = "public-websocket";
 pub const PUBLIC_WS_TRANSPORT_CONTINUATION: &str = "public-websocket-continuation";
 /// The public route has no ChatGPT account id; one fixed slot keys its socket and continuation.
 const PUBLIC_WS_SLOT: &str = "public-plan";
+/// Attempt transport labels: full-input replay and `previous_response_id` continuation.
+pub const PUBLIC_WS_ATTEMPT_FULL: &str = "websocket";
+pub const PUBLIC_WS_ATTEMPT_CONTINUATION: &str = "websocket-continuation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicWsMode {
@@ -1371,7 +1374,14 @@ pub fn process_public_websocket(
         map.insert("type".into(), Value::String("response.create".into()));
     }
     crate::wire_dump::write_current("wire", &outgoing);
-    let observation = crate::provider_observation::Attempt::try_start("websocket")?;
+    // The attempt label records the request shape, so a run proves from its own rows which
+    // requests used a continuation instead of inferring it from settings.
+    let observation =
+        crate::provider_observation::Attempt::try_start(if shape.previous_response_id {
+            PUBLIC_WS_ATTEMPT_CONTINUATION
+        } else {
+            PUBLIC_WS_ATTEMPT_FULL
+        })?;
     if let Err(err) = write_text_frame(&mut stream, &outgoing.to_string()) {
         observation.finish("failed", None, None);
         release_live_socket(acquired.key, stream, false);
