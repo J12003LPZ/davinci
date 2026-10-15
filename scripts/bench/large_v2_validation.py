@@ -55,12 +55,22 @@ def failures(files, hidden, tests=None, timeout=300):
         match = FAILED.match(line.rstrip())
         if match:
             found.add(match.group(2) or "<collection>")
-    if result.returncode not in (0, 1) and not found:
+    # Only exit 0 is a pass and only exit 1 with named failures is a failure
+    # list; anything else (pytest missing, nothing collected, internal error)
+    # must not read as "no failures".
+    if result.returncode != 0 and not found:
         found.add(f"<pytest exit {result.returncode}>")
     return sorted(found)
 
 
+def require_pytest():
+    probe = subprocess.run([sys.executable, "-m", "pytest", "--version"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        raise SystemExit("pytest is required: python -m pip install -r scripts/bench/v2-validation-requirements.txt")
+
+
 def validate(only=None):
+    require_pytest()
     report, errors = {}, []
     for spec in v2.TASK_SPECS:
         task = spec["id"]

@@ -195,11 +195,12 @@ by the always-on static tests:
 | Each deliberately broken implementation fails exactly its intended tests | pass (29) |
 | `bench.py validate --task-set large --large-manifest large_manifest_v2.json` | pass (starters fail, references pass) |
 
-50 implementation runs take about 40 seconds on Linux. CI runs the static tests
-on Linux and Windows. It does not install pytest, so the behavioral run is
-skipped there; it was run on Linux only. The hidden tests use only portable
-calls (`sys.executable` subprocesses, `monkeypatch`), but Windows behavior is
-unverified until the validator runs there.
+50 implementation runs take about 40 seconds on Linux. CI job
+`bench-v2-validation` installs the pinned
+`scripts/bench/v2-validation-requirements.txt` and runs the behavioral
+validator and the v2 tests on Linux and Windows; there a missing pytest fails
+the job (`BENCH_REQUIRE_BEHAVIORAL=1`). The general `python-tests` job is
+unchanged and still skips the behavioral run without pytest.
 
 These fixtures, their hidden tests and references are public. Passing them is
 diagnostic evidence, **not** independent holdout evidence.

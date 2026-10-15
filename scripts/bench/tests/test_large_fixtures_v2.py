@@ -1,6 +1,7 @@
 """Contract checks for the v2 large-task fixtures. Offline; no model calls."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -17,6 +18,8 @@ import bench  # noqa: E402
 from runner import LEGACY_TASKS, validate_large_manifest  # noqa: E402
 
 HAS_PYTEST = importlib.util.find_spec("pytest") is not None
+# Set in the dedicated CI job: there a missing pytest is a failure, not a skip.
+REQUIRE_BEHAVIORAL = os.environ.get("BENCH_REQUIRE_BEHAVIORAL") == "1"
 
 
 def hidden_tests(spec):
@@ -93,19 +96,90 @@ class LargeFixturesV2Tests(unittest.TestCase):
             for variant in variants:
                 validation.implementation(spec, variant)
 
-    def test_new_test_files_are_allowed_only_where_declared(self):
-        spec = {"allowed": ["cli.py"], "allowed_patterns": ["tests/test_*.py"]}
-        self.assertEqual(bench.unrelated_paths(
-            ["cli.py", "tests/test_extra.py", "tests/deep/test_x.py", "tests/helper.py", "test_hidden_cli.py"], spec),
-            ["tests/deep/test_x.py", "tests/helper.py", "test_hidden_cli.py"])
-        self.assertEqual(bench.unrelated_paths(["cli.py", "tests/test_extra.py"], {"allowed": ["cli.py"]}),
-                         ["tests/test_extra.py"])
-
-    @unittest.skipUnless(HAS_PYTEST, "pytest is needed to run the hidden tests")
     def test_starters_references_alternatives_and_broken_implementations(self):
+        if not HAS_PYTEST:
+            if REQUIRE_BEHAVIORAL:
+                self.fail("BENCH_REQUIRE_BEHAVIORAL=1 but pytest is not installed")
+            self.skipTest("pytest is needed to run the hidden tests")
         report, errors = validation.validate()
         self.assertEqual(errors, [])
         self.assertEqual(set(report), {spec["id"] for spec in v2.TASK_SPECS})
+
+
+
+class AllowedPatternBoundaryTests(unittest.TestCase):
+    """`allowed_patterns` may admit new test files and nothing else."""
+
+    SPEC = {"allowed": ["cli.py", "tests/test_public_cli.py"], "allowed_patterns": ["tests/test_*.py"]}
+
+    def test_admits_only_plain_new_test_files_in_the_named_directory(self):
+        admitted = ["tests/test_extra.py", "tests/test_report_2.py", "tests/test_X.py"]
+        refused = [
+            "tests/deep/test_x.py", "tests/../cli.py", "tests/test_x.py/../../cli.py", "../tests/test_x.py",
+            "/tmp/tests/test_x.py", "C:/w/tests/test_x.py", "tests\\test_x.py", "tests/test_.py",
+            "tests/test_x.pyc", "tests/test_x.py.bak", "tests/test_x.PY", "tests/test x.py", "tests/test_-x.py",
+            "tests/test_\u00e9.py", "tests/test_x\n.py", "tests/conftest.py", "tests/helper.py",
+            "tests/__init__.py", "test_root.py", "test_hidden_cli.py", "Tests/test_x.py", "./tests/test_x.py",
+            "inventory/test_x.py", "tests/test_x.py:stream", "",
+        ]
+        changed = ["cli.py", "tests/test_public_cli.py", *admitted, *refused]
+        self.assertEqual(bench.unrelated_paths(changed, self.SPEC), refused)
+
+    def test_broad_or_unsafe_patterns_are_rejected_before_use(self):
+        manifest = json.loads((ROOT / "large_manifest_v2.json").read_text(encoding="utf-8"))
+        task = manifest["tasks"][0]
+        for pattern in ["*", "**", "*.py", "tests/*", "tests/*.py", "test_*.py", "tests/**/test_*.py",
+                        "../tests/test_*.py", "/tests/test_*.py", "tests/../test_*.py", "./tests/test_*.py",
+                        "tests\\test_*.py", "tests/test_?.py", "tests/test_[a-z].py", "tests/test_*",
+                        "tests/test_*.py*", "C:/tests/test_*.py", "", None, 3]:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(ValueError):
+                    bench.unrelated_paths(["cli.py"], {"allowed": ["cli.py"], "allowed_patterns": [pattern]})
+                broken = json.loads(json.dumps(manifest))
+                broken["fixtures"][task]["allowed_patterns"] = [pattern]
+                with self.assertRaises(ValueError):
+                    validate_large_manifest(broken)
+        for patterns in ([], "tests/test_*.py", ["tests/test_*.py"] * 5):
+            with self.assertRaises(ValueError):
+                bench.unrelated_paths([], {"allowed": [], "allowed_patterns": patterns})
+
+    def test_v1_specs_keep_the_exact_allowlist(self):
+        v1_manifest = json.loads((ROOT / "large_manifest.json").read_text(encoding="utf-8"))
+        self.assertTrue(validate_large_manifest(v1_manifest))
+        for task, entry in v1_manifest["fixtures"].items():
+            self.assertNotIn("allowed_patterns", entry)
+            changed = [*entry["allowed"], "tests/test_extra.py", "notes.md"]
+            self.assertEqual(bench.unrelated_paths(changed, entry), ["tests/test_extra.py", "notes.md"], task)
+
+    def test_a_real_workspace_admits_a_new_test_file_but_not_a_symlinked_one(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, outside, tasks = root / "work", root / "outside.py", root / "tasks"
+            (work / "tests").mkdir(parents=True)
+            (work / "cli.py").write_text("x = 1\n", encoding="utf-8")
+            (tasks / "m-fixture" / "hidden").mkdir(parents=True)
+            (tasks / "m-fixture" / "hidden" / "test_hidden_cli.py").write_text("", encoding="utf-8")
+            for args in (["init", "-q"], ["config", "user.email", "b@e"], ["config", "user.name", "b"],
+                         ["config", "core.hooksPath", ""], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                self.assertEqual(bench.git(str(work), *args).returncode, 0, args)
+            (work / "cli.py").write_text("x = 2\n", encoding="utf-8")
+            (work / "tests" / "test_new.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+            (work / "tests" / "helper.py").write_text("", encoding="utf-8")
+            (work / "test_hidden_cli.py").write_text("", encoding="utf-8")
+            outside.write_text("secret = 1\n", encoding="utf-8")
+            changed = bench.changed_files(str(work))
+            self.assertEqual(bench.unrelated_paths(changed, {"allowed": ["cli.py"],
+                                                             "allowed_patterns": ["tests/test_*.py"]}),
+                             ["test_hidden_cli.py", "tests/helper.py"])
+            with patch.object(bench, "TASKS", str(tasks)):
+                self.assertEqual(bench.forbidden_artifacts(work, "m-fixture")["artifact_paths"], ["test_hidden_cli.py"])
+                try:
+                    os.symlink(outside, work / "tests" / "test_link.py")
+                except (OSError, NotImplementedError):
+                    self.skipTest("symlinks unavailable")
+                artifacts = bench.forbidden_artifacts(work, "m-fixture")
+            self.assertTrue(artifacts["artifact_leak"])
+            self.assertIn("tests/test_link.py", artifacts["artifact_paths"])
 
 
 if __name__ == "__main__":

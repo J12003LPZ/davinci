@@ -319,6 +319,28 @@ jobs:
               exit 1
           }
 
+  bench-v2-validation:
+    name: bench-v2-validation (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The behavioral test fails instead of skipping when pytest is missing.
+      BENCH_REQUIRE_BEHAVIORAL: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Provision pinned pytest
+        run: python -m pip install --disable-pip-version-check -r scripts/bench/v2-validation-requirements.txt
+      - name: Large-task v2 behavioral validation
+        run: python scripts/bench/large_v2_validation.py
+      - name: Large-task v2 fixture, traceability and boundary tests
+        run: python -m unittest discover -s scripts/bench/tests -p "test_large_fixtures_v2.py"
+
   workspace-test-shards:
     name: workspace-test (${{ matrix.os }}, ${{ matrix.package }})
     strategy:

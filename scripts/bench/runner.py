@@ -912,6 +912,12 @@ def validate_large_manifest(manifest):
                 raise ValueError("invalid large fixture hash: " + task)
         if not isinstance(entry.get("public_verification"), str) or not entry["public_verification"].strip():
             raise ValueError("missing public verification: " + task)
+        if "allowed_patterns" in entry:
+            patterns = entry["allowed_patterns"]
+            if (not isinstance(patterns, list) or not patterns or len(patterns) > 4
+                    or any(not isinstance(p, str) or re.fullmatch(r"(?:[A-Za-z0-9_]+/)+test_\*\.py", p) is None
+                           for p in patterns)):
+                raise ValueError("invalid large allowed_patterns: " + task)
     return True
 
 

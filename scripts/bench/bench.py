@@ -18,7 +18,6 @@ This is a maintainer tool, never a test: it starts real harnesses and spends
 model usage on both the davinci and the Codex CLI accounts.
 """
 import argparse
-import fnmatch
 import hashlib
 import json
 import os
@@ -170,17 +169,39 @@ def grade(tid, workdir, timeout=120, *, phase="grader", evidence=None):
     return checked["pass"], passed, failed, tail
 
 
+# The only allowed_patterns shape: test files directly inside a named
+# directory, e.g. tests/test_*.py. No root-level pattern (hidden graders live
+# at the root), no other wildcard, no dot segments.
+ALLOWED_PATTERN = re.compile(r"((?:[A-Za-z0-9_]+/)+)test_\*\.py")
+
+
+def allowed_pattern_matchers(patterns):
+    """Compiled matchers for `allowed_patterns`; a ValueError for any other shape."""
+    if patterns is None:
+        return []
+    if not isinstance(patterns, list) or not patterns or len(patterns) > 4:
+        raise ValueError("allowed_patterns must be a short non-empty list")
+    matchers = []
+    for pattern in patterns:
+        found = ALLOWED_PATTERN.fullmatch(pattern) if isinstance(pattern, str) else None
+        if found is None:
+            raise ValueError(f"unsupported allowed pattern: {pattern!r}")
+        matchers.append(re.compile(re.escape(found.group(1)) + r"test_[A-Za-z0-9_]+\.py"))
+    return matchers
+
+
 def unrelated_paths(changed, spec):
     """Changed paths outside the task's allowlist.
 
-    `allowed_patterns` (v2 fixtures) admits new files such as `tests/test_*.py`;
-    a pattern matches only at its own directory depth. Tasks without it keep
-    the exact allowlist.
+    `allowed_patterns` (v2 fixtures) admits new test files such as
+    `tests/test_extra.py`: same directory, a plain `test_<name>.py` name. Tasks
+    without it keep the exact allowlist. Paths come from `git status` of the
+    workspace, so nothing outside it can be admitted; symlinks are refused
+    separately by `forbidden_artifacts`.
     """
-    patterns = spec.get("allowed_patterns") or []
+    matchers = allowed_pattern_matchers(spec.get("allowed_patterns"))
     return [path for path in changed if path not in spec["allowed"]
-            and not any(fnmatch.fnmatchcase(path, pattern) and path.count("/") == pattern.count("/")
-                        for pattern in patterns)]
+            and not any(matcher.fullmatch(path) for matcher in matchers)]
 
 
 def changed_files(workdir, ignore=True):

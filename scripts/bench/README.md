@@ -107,14 +107,21 @@ frozen historical fixtures; several of their hidden tests are contradictory or
 underspecified (`docs/perf/harness-gap/large-task-contracts.md`). New campaigns
 use v2: `python scripts/bench/make_large_tasks_v2.py` writes
 `tasks/m*-v2` and `large_manifest_v2.json`, and
-`python scripts/bench/large_v2_validation.py` (pytest required) checks that
+`python scripts/bench/large_v2_validation.py` (install the pinned
+`scripts/bench/v2-validation-requirements.txt` first; it exits nonzero without
+pytest) checks that
 each starter fails exactly its pinned hidden tests, each reference passes
 hidden and public tests, alternative implementations pass and deliberately
 broken ones fail exactly their intended tests. Select v2 with
 `--task-set large --large-manifest scripts/bench/large_manifest_v2.json`. v2
 fixtures are public: they are diagnostic, never holdout evidence. Their
 `allowed_patterns` lets agents add `tests/test_*.py` files without those
-counting as unrelated edits.
+counting as unrelated edits. Only `<dir>/test_*.py` patterns are accepted
+(no root-level, recursive or other wildcards), and they admit only
+`<dir>/test_<letters, digits, _>.py`; manifests without the field keep the
+exact allowlist. CI job `bench-v2-validation` runs the behavioral validator and
+the v2 tests on Linux and Windows with `BENCH_REQUIRE_BEHAVIORAL=1`, so a
+missing pytest fails instead of skipping.
 
 Large manifests now declare `hash_order: relative-posix-codepoint-v1`. Public,
 reference, and grader trees are hashed in that portable relative-path order.
