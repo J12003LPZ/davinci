@@ -498,7 +498,7 @@ def parse_stream(harness, stdout):
         if harness == "davinci":
             stats["request_metrics_available"] = stats["request_metrics_complete"] = False
             for field in ("logical_requests", "requests", "provider_attempts", "coding_provider_attempts",
-                          "prewarm_attempts", "requests_after_first_reminder"):
+                          "prewarm_attempts", "requests_after_first_reminder", "provider_transports"):
                 stats[field] = None
     stats["usage_available"] = usage_seen and not missing
     stats["reasoning_tokens"] = (sum(reasoning_values) if reasoning_values and not usage_conflict
@@ -660,7 +660,7 @@ def run_one(harness, tid, rep, campaign=None):
         result.update({key: spec["private_provenance"][key] for key in
                        ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes")})
         result["task_set"] = "private"
-    for key in ("logical_requests", "provider_attempts", "prewarm_attempts",
+    for key in ("logical_requests", "provider_attempts", "prewarm_attempts", "provider_transports",
                 "runtime_stats",
                 "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio", "known_usage",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",

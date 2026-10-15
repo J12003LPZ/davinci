@@ -4,6 +4,13 @@ PURPOSES = frozenset({"coding", "worker", "reviewer", "compaction", "learning",
                       "security_watch", "prewarm"})
 
 
+def transport_counts(transport_of):
+    counts = {}
+    for label in transport_of.values():
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def activity(events):
     logical, ended, attempts, attempts_ended = set(), set(), set(), set()
     owners = {}
@@ -18,6 +25,7 @@ def activity(events):
     leaf_baseline = leaf_max = None
     leaf_invalid = False
     tools = {}
+    transport_of = {}
     for event in events:
         kind = event.get("type")
         if kind == "mutation_observation":
@@ -75,6 +83,12 @@ def activity(events):
                     overflow = True
                     continue
                 target = attempts if phase == "attempt_start" else attempts_ended
+                if phase == "attempt_start":
+                    # One label per attempt: a replayed start must not count twice.
+                    label = observation.get("transport")
+                    label = label if isinstance(label, str) and 0 < len(label) <= 40 else "unknown"
+                    identity = (purpose, request, attempt)
+                    transport_of[identity] = label if transport_of.get(identity, label) == label else "conflict"
                 target.add((purpose, request, attempt))
             elif phase == "telemetry_overflow":
                 overflow = True
@@ -135,6 +149,7 @@ def activity(events):
         "requests": count(logical, "coding"),
         "provider_attempts": len(attempts) if available else None,
         "coding_provider_attempts": count(attempts, "coding"),
+        "provider_transports": transport_counts(transport_of) if available else None,
         "prewarm_attempts": count(attempts, "prewarm"),
         "request_metrics_available": available,
         "request_metrics_complete": available and not unknown_outcome and logical == ended and attempts == attempts_ended

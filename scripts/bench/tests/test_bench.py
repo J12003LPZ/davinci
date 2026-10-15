@@ -466,6 +466,37 @@ class StreamTelemetryTests(unittest.TestCase):
         self.assertEqual(result["batch_children_reported"], 1)
         self.assertIsNone(result["executed_leaf_operations"])
 
+    def test_provider_transports_count_each_attempt_once_by_its_label(self):
+        def observation(kind, attempt=None, transport=None):
+            body = {"schema_version": 1, "kind": kind, "logical_request_id": "r1",
+                    "attempt_id": attempt, "purpose": "coding", "status": "completed"}
+            if transport is not None:
+                body["transport"] = transport
+            return {"type": "provider_observation", "observation": body}
+        events = [observation("logical_start"),
+                  observation("attempt_start", 1, "websocket"), observation("attempt_end", 1),
+                  observation("attempt_start", 2, "websocket-continuation"), observation("attempt_end", 2),
+                  observation("attempt_start", 3), observation("attempt_end", 3),
+                  observation("logical_end")]
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events + events)))
+        self.assertEqual(result["provider_attempts"], 3)
+        self.assertEqual(result["provider_transports"],
+                         {"unknown": 1, "websocket": 1, "websocket-continuation": 1})
+
+    def test_a_replayed_start_with_a_different_label_is_a_conflict_not_a_second_attempt(self):
+        def start(transport):
+            return {"type": "provider_observation", "observation": {
+                "schema_version": 1, "kind": "attempt_start", "logical_request_id": "r1",
+                "attempt_id": 1, "purpose": "coding", "status": "started", "transport": transport}}
+        logical = {"type": "provider_observation", "observation": {
+            "schema_version": 1, "kind": "logical_start", "logical_request_id": "r1",
+            "purpose": "coding", "status": "started"}}
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, [logical, start("http"), start("websocket")])))
+        self.assertEqual(result["provider_transports"], {"conflict": 1})
+
+    def test_unavailable_telemetry_leaves_transports_unknown(self):
+        self.assertIsNone(bench.parse_stream("davinci", "")["provider_transports"])
+
     def test_gate_and_auto_verification_are_separate(self):
         events = [
             {"type": "message_end", "message": {"davinciCapabilityReminder": "verification_required"}},
