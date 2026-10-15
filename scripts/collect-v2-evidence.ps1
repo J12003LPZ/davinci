@@ -107,7 +107,8 @@ if ($LASTEXITCODE -ne 0) { throw "harness pin $HarnessPin is not an ancestor of 
 & git -C $Repo diff --quiet $HarnessPin HEAD -- scripts/bench
 if ($LASTEXITCODE -ne 0) { throw "scripts/bench differs from harness pin $HarnessPin; this is not the pinned harness" }
 $manifest = Join-Path $Bench 'large_manifest_v2.json'
-$actual = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+$hasher = [Security.Cryptography.SHA256]::Create()
+$actual = (($hasher.ComputeHash([IO.File]::ReadAllBytes($manifest)) | ForEach-Object { $_.ToString('x2') }) -join '')
 if ($actual -ne $ManifestSha256) {
     throw "large_manifest_v2.json SHA-256 is $actual, expected $ManifestSha256 (line endings converted on checkout?)"
 }
