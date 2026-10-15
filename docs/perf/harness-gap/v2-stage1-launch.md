@@ -32,26 +32,17 @@ a baseline for, a v2 number.
 
 ## 2. Launch blockers (open)
 
-1. **No green CI for the DaVinci commit.** On `main` @ `8119a17` CI run
-   38327165232 has 40 of 42 jobs green. `workspace-test (windows-latest,
-   davinci-coding-agent)` was cancelled after about 55 minutes, which fails
-   `workspace-tests`. The checkpoint builder requires every job for that exact
-   commit to be green, so no checkpoint can be built until that shard passes,
-   by a re-run or a fix on `main`. Either is the owner's decision.
-   Diagnosis (2026-10-15): the job hit its 45-minute limit (check-run
-   annotation); GitHub kept no log for it. The same limit hit `main@eaaba04d`,
-   whose log shows `repo_intelligence_export_star_barrels_resolve_calls` (in
-   `crates/davinci-coding-agent/tests/repo_intelligence_edges.rs`) running past
-   60 s. Locally the Rust sources match `8119a17`; that test alone passed 300 of
-   300, but the whole test binary at 4 threads hung once in 150 runs (on
-   `repo_intelligence_package_exports_conditions_subpaths_and_tsconfig_extends`).
-   So the shard has an intermittent hang in that test file, cause unconfirmed.
-   `gh run rerun 38327165232 --failed` re-runs only that job and the summary
-   job on the same commit; the checkpoint builder reads the latest attempt, so
-   a green rerun is valid proof. It may hang again; a fix would be a
-   production change and needs approval. Pinning a
-   different commit would change this specification.
-2. **Harness CI.** The `bench-v2-validation` job must be green on the harness
+1. **Green CI for the DaVinci commit: CLEARED 2026-10-15.** Run 38327165232
+   attempt 1 had the Windows `davinci-coding-agent` shard hit the 45-minute
+   limit (check-run annotation; no log kept). The same limit hit
+   `main@eaaba04d`, whose log shows `repo_intelligence_export_star_barrels_resolve_calls`
+   past 60 s. Locally the whole `repo_intelligence_edges` binary at 4 threads
+   hung once in 150 runs, so that test file has an intermittent hang, cause
+   unconfirmed. One `gh run rerun 38327165232 --failed` re-ran only that shard
+   and the `workspace-tests` aggregate: attempt 2 passed (shard 22 min), all 42
+   jobs success, and `release_identity.fetch_ci` validates it for this exact
+   commit (CI run 38327165232 plus workflow-lint 38327165291). No check was
+   weakened. The hang is not fixed, so a future run can hit it again.2. **Harness CI.** The `bench-v2-validation` job must be green on the harness
    commit on Linux and Windows.
 3. **Windows validation on the benchmark machine.** `large_v2_validation.py`
    and the v2 tests must pass there (section 4 of the Windows workflow below).
@@ -160,3 +151,14 @@ Never share `locate.jsonl`, `*-stdout.json`, `large-task-runs.*`, `.stdout.jsonl
 `.grader.json`, wire dumps or anything under `_agent`. If no GPT-5.6 baseline is
 found, it is not under `C:\bench`: rerun with `-BenchRoot` set to the folder
 that holds it.
+
+## 7. Known issue in the historical classifier (not fixed; pin unchanged)
+
+`large_task_failures.py` per-run categories and `failure_basis` are correct, but
+its roll-up `failed_requirement_runs` keys categories by requirement name only,
+so v2's `specified` overwrites v1's label for names both share
+(`m4.legacy_total` shows `specified`, v1 grades it `contradictory`). Read v1
+history from `large-task-runs.json`, not the roll-up. Fixing it changes
+`scripts/bench`, so it waits until after Stage 1 or a deliberate pin move.
+Also: the 60 `luna-high-vm` DaVinci runs never started (exit 1, zero tool calls,
+no tokens) and account for 45 of the 46 "specified" failures.
