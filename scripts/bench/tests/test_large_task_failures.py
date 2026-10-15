@@ -59,7 +59,8 @@ class Campaign:
     def add(self, result, stream=None, grade=None):
         self.rows.append(result)
         base = self.root / result["harness"] / f"{result['task']}-r{result['rep']}"
-        base.parent.mkdir(exist_ok=True)
+        if stream is not None or grade is not None:
+            base.parent.mkdir(exist_ok=True)
         if stream is not None:
             Path(str(base) + ".stdout.jsonl").write_text(
                 "".join(json.dumps(e) + "\n" for e in stream), encoding="utf-8")
@@ -107,7 +108,8 @@ class LargeTaskFailureTests(unittest.TestCase):
         self.assertIsNone(result["edits_after_first_reminder"])
         self.assertEqual(summary["per_harness"]["davinci"]["runs_with_review_skipped"], 1)
         self.assertEqual(summary["per_harness"]["davinci"]["failed_requirement_runs"]["m1.equals_in_value"],
-                         {"runs": 1, "prompt_states": "implicit"})
+                         {"runs": 1, "prompt_states": "implicit", "disputed": None})
+        self.assertEqual(result["contract"], "only_undisputed_failed")
 
     def test_reminder_followed_by_new_tests_is_recorded_and_labelled_as_own_checks(self):
         self.campaign.add(row("davinci", "m3-state-persistence", changed=["state_core/service.py"]), [
@@ -208,10 +210,14 @@ class LargeTaskFailureTests(unittest.TestCase):
         self.assertEqual(summary["divergences"][0]["failed_requirements"],
                          {"codex": ["m1.equals_in_value"], "davinci": ["m1.reject_malformed"]})
 
-    def test_legacy_tasks_are_ignored(self):
+    def test_a_campaign_without_large_runs_is_an_error_unless_allowed(self):
         self.campaign.add(row("davinci", "t1-intervals"), [final()])
-        rows, summary = self.campaign.run(self.out)
+        with self.assertRaisesRegex(ValueError, r"no large-task \(m\*\) runs in: campaign-01 \(1 rows\)"):
+            self.campaign.run(self.out)
+        self.assertFalse(self.out.exists())
+        rows, summary = classifier.run([self.campaign.root], self.out, MANIFEST, allow_empty=True)
         self.assertEqual((rows, summary["runs"]), ([], 0))
+        self.assertEqual(summary["campaigns_without_large_runs"], [{"campaign": "campaign-01", "rows": 1}])
 
     def test_output_is_sanitized_and_campaign_is_untouched(self):
         self.campaign.add(row("davinci", "m1-config-parser"), [
@@ -240,6 +246,125 @@ class LargeTaskFailureTests(unittest.TestCase):
         for task, mapping in classifier.REQUIREMENTS.items():
             block = source.split(f'"id": "{task}"', 1)[1].split('"hidden": {', 1)[1].split('"solution": {', 1)[0]
             self.assertEqual(set(re.findall(r"def (test_\w+)\(", block)), set(mapping), task)
+
+
+    def test_unsafe_changed_paths_are_withheld_and_safe_ones_kept(self):
+        unsafe = [f"C:\\Users\\{SECRET}\\a.py", f"C:/{SECRET}/a.py", f"c:{SECRET}.py",
+                  f"\\\\server\\{SECRET}\\a.py", f"//server/{SECRET}/a.py", f"/home/{SECRET}/a.py",
+                  f"~/{SECRET}.py", f"../{SECRET}.py", f"a/../../{SECRET}.py", f"a\\..\\{SECRET}.py",
+                  f"file:///{SECRET}", f"a.py:{SECRET}", f"a\x00{SECRET}.py", f"a\n{SECRET}.py",
+                  f"{SECRET} space.py", f"caf\u00e9{SECRET}.py", "x" * 300, "", ".", 42, None, {"p": SECRET}]
+        safe = ["config_parser.py", "tests\\test_public_config.py", "./README.md", "pkg//sub/./mod.py"]
+        self.campaign.add(row("davinci", "m1-config-parser", changed=safe + unsafe), [final()],
+                          grader("test_hidden_config.py::test_invalid_syntax[broken]"))
+        result = self.campaign.run(self.out)[0][0]
+        self.assertEqual(result["changed_files"],
+                         "README.md;config_parser.py;pkg/sub/mod.py;tests/test_public_config.py")
+        self.assertIn(f"changed_paths_withheld:{len(unsafe)}", result["unknowns"])
+        self.assertOutputHasNo(SECRET, "C:", "server", "/home", "~/", "..")
+
+    def test_safe_relative_path_contract(self):
+        cases = {"a.py": "a.py", "src\\pkg\\m.py": "src/pkg/m.py", "./x/./y.py": "x/y.py",
+                 "C:\\x.py": None, "C:x.py": None, "\\\\h\\s\\x.py": None, "//h/s": None, "/x": None,
+                 "~/x": None, "../x": None, "x/..": None, "x/.../y": None, "a./b": None, "-rf": None, ".github/ci.yml": ".github/ci.yml",
+                 "x\ty": None, "x\x7fy": None, "": None, "/": None, ".": None, b"a.py": None, 3: None}
+        for value, expected in cases.items():
+            self.assertEqual(classifier.safe_relative_path(value), expected, repr(value))
+
+    def test_free_text_fields_are_redacted(self):
+        self.campaign.add(row("davinci", "m1-config-parser", variant=f"C:\\{SECRET}", model=f"gpt {SECRET}",
+                              stop_reason=f"not run: {SECRET}", binary_sha256=SECRET, tests_passed=SECRET,
+                              exit=SECRET, unrelated=SECRET), [
+            *edit("e1", "config_parser.py"),
+            {"type": "completion_reminder", "reason_code": f"{SECRET} please write tests"},
+            {"type": "verification_notice", "status": f"/home/{SECRET}"},
+            final(),
+        ], {"stdout": f"FAILED test_hidden_config.py::{SECRET}/../x - boom\n1 failed", "stderr": ""})
+        result = self.campaign.run(self.out)[0][0]
+        self.assertEqual((result["variant"], result["model"], result["stop_reason"], result["binary_sha256"],
+                          result["tests_passed"], result["exit"], result["unrelated_changes"]),
+                         ("redacted", "redacted", "redacted", None, None, None, None))
+        self.assertEqual((result["reminder_reasons"], result["verification_notices"]), ("redacted", "redacted"))
+        self.assertEqual(result["failed_requirements"], "unmapped:redacted")
+        self.assertOutputHasNo(SECRET, "/home")
+
+    def test_unsafe_run_identity_never_reads_outside_the_campaign(self):
+        outside = self.campaign.root.parent / "m1-config-parser-r0"
+        Path(str(outside) + ".stdout.jsonl").write_text(json.dumps(start("x", "edit", path="a.py")) + "\n",
+                                                         encoding="utf-8")
+        self.campaign.add(dict(row("davinci", "m1-config-parser"), harness=".."))
+        self.campaign.add(dict(row("davinci", "m1-config-parser", rep=1), task="m1/../../x"))
+        rows = self.campaign.run(self.out)[0]
+        for result in rows:
+            self.assertIn("unsafe_run_identity", result["unknowns"])
+            self.assertEqual((result["timeline"], result["failed_requirements_source"]), ("", "unavailable"))
+        self.assertEqual(sorted(str(r["harness"]) for r in rows), ["davinci", "redacted"])
+
+    def test_disputed_requirements_are_separated_from_undisputed_ones(self):
+        self.campaign.add(row("davinci", "m4-cli-feature", changed=["cli.py"]), [final()],
+                          grader("test_hidden_cli.py::test_legacy_total_still_works"))
+        self.campaign.add(row("codex", "m4-cli-feature", changed=["cli.py"]), [], grader(
+            "test_hidden_cli.py::test_legacy_total_still_works", "test_hidden_cli.py::test_total_sort_and_tax"))
+        rows, summary = self.campaign.run(self.out)
+        by = self.by_task(rows)
+        self.assertEqual(by[("davinci", "m4-cli-feature")]["contract"], "only_disputed_failed")
+        self.assertEqual(by[("davinci", "m4-cli-feature")]["failed_requirements_disputed"], "m4.legacy_total")
+        self.assertEqual(by[("codex", "m4-cli-feature")]["contract"], "some_undisputed_failed")
+        self.assertEqual(summary["per_harness"]["codex"]["failed_requirement_runs"]["m4.legacy_total"]["disputed"],
+                         "contradictory")
+        self.assertTrue(set(classifier.DISPUTED) <= {req for t in classifier.REQUIREMENTS.values()
+                                                     for req, _, _ in t.values()})
+
+    def test_variant_subdirectories_are_expanded(self):
+        parent = Path(self.temporary.name) / "luna-x"
+        for variant, harness in (("arm-a", "davinci"), ("arm-b", "codex")):
+            (parent / variant).mkdir(parents=True)
+            (parent / variant / "results.jsonl").write_text(
+                json.dumps(row(harness, "m1-config-parser")) + "\n", encoding="utf-8")
+        rows, summary = classifier.run([parent], self.out, MANIFEST)
+        self.assertEqual(summary["campaigns"], ["luna-x/arm-a", "luna-x/arm-b"])
+        self.assertEqual(sorted(r["campaign"] for r in rows), ["luna-x/arm-a", "luna-x/arm-b"])
+        with self.assertRaisesRegex(ValueError, "no results.jsonl"):
+            classifier.run([Path(self.temporary.name) / "missing"], self.out, MANIFEST)
+
+    def test_an_output_directory_that_looks_like_a_campaign_is_refused(self):
+        self.campaign.add(row("davinci", "m1-config-parser"), [final()])
+        self.out.mkdir()
+        (self.out / "results.jsonl").write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "looks like a campaign"):
+            self.campaign.run(self.out)
+
+    def test_no_process_network_or_grader_execution(self):
+        import os
+        import socket
+        import subprocess
+        source = Path(classifier.__file__).read_text(encoding="utf-8")
+        for name in ("subprocess", "socket", "urllib", "http.client", "os.system", "exec(", "eval(",
+                     "import bench", "importlib"):
+            self.assertNotIn(name, source)
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("the classifier must not start processes or open connections")
+
+        self.campaign.add(row("davinci", "m1-config-parser"), [
+            *edit("e1", "config_parser.py"), *shell("s1", "pytest -q", False), final()],
+            grader("test_hidden_config.py::test_invalid_syntax[broken]"))
+        patches = [(subprocess, "Popen"), (subprocess, "run"), (os, "system"), (socket, "socket"),
+                   (socket, "create_connection")]
+        saved = [(module, name, getattr(module, name)) for module, name in patches]
+        try:
+            for module, name in patches:
+                setattr(module, name, refuse)
+            self.campaign.run(self.out)
+        finally:
+            for module, name, value in saved:
+                setattr(module, name, value)
+
+    def assertOutputHasNo(self, *needles):
+        for path in self.out.iterdir():
+            text = path.read_text(encoding="utf-8")
+            for needle in needles:
+                self.assertNotIn(needle, text, f"{needle!r} in {path.name}")
 
 
 if __name__ == "__main__":

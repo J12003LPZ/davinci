@@ -367,10 +367,15 @@ runs from `results.jsonl`, the stdout event logs and the stored
 `<run>.grader.json`. It runs no grader and no model, refuses an `--out` inside a
 campaign, and writes `large-task-runs.csv`/`.json` and `large-task-summary.json`
 with requirement IDs, event codes and counts only, never prompts, model text,
-commands, output or absolute paths. Each run keeps observed fields (the
-edit/check/reminder timeline, failed hidden requirements and whether the prompt
-states them) separate from a rule-based `hypothesis` label and an `unknowns`
-list. Older campaigns without `.grader.json` report the failed requirements as
+commands, output or absolute paths; unsafe identifiers become `redacted` and
+unsafe changed paths are withheld and counted. A directory without
+`results.jsonl` stands for its variant subdirectories; a selected campaign with
+no `m*` rows is an error unless `--allow-empty`. Each run keeps observed fields
+(the edit/check/reminder timeline, failed hidden requirements and whether the
+prompt states them) separate from a rule-based `hypothesis` label, a `contract`
+label (whether only requirements disputed in
+`docs/perf/harness-gap/benchmark-integrity.md` failed) and an `unknowns` list.
+Older campaigns without `.grader.json` report the failed requirements as
 unavailable.
 
 ### Harness-only arm options and concurrent slots

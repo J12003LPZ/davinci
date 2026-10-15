@@ -6,11 +6,19 @@ Offline and read-only. For each campaign directory it reads `results.jsonl`,
 `<harness>/<task>-r<rep>.stdout.jsonl` and, when the campaign recorded it,
 `<harness>/<task>-r<rep>.grader.json` (the hidden grader's pytest output). It
 makes no model calls, runs no grader or test, and writes only to `--out`,
-which must lie outside every campaign directory.
+which must lie outside every campaign directory. A directory without
+`results.jsonl` stands for its immediate variant subdirectories that have one.
+A selected campaign with no large-task rows is an error unless `--allow-empty`.
 
 The output is sanitized: run identity, requirement IDs, event codes, counts and
 repository-relative changed paths. Prompts, model text, command lines, command
-output, assertion messages, file contents and absolute paths are never copied.
+output, assertion messages, file contents and absolute paths are never copied;
+identifiers outside a conservative character set become "redacted", and changed
+paths that are absolute, UNC, drive-relative, contain `..` or unusual characters
+are withheld and counted under `unknowns`.
+
+Some hidden requirements have a disputed grader contract (`DISPUTED`); the
+`contract` field says whether a run failed only those.
 
 Each run gets three kinds of field, kept apart on purpose:
   observed   read directly from the logs (edits, checks and their exit status,
@@ -26,6 +34,7 @@ import csv
 import json
 from pathlib import Path
 import re
+import sys
 
 from turn_cache_audit import EDITORS, SHELLS, events, leaves
 
@@ -66,6 +75,23 @@ REQUIREMENTS = {
         "test_legacy_total_still_works": ("m4.legacy_total", "explicit", "legacy total command unchanged"),
     },
 }
+# Requirements whose grader contract is itself in question, so failing one is
+# not by itself evidence about the agent. Source:
+# docs/perf/harness-gap/benchmark-integrity.md, rechecked against
+# make_large_tasks.py. "contradictory": no solution can satisfy the prompt, the
+# starter public test and the hidden test together. "underspecified": the hidden
+# test fixes behavior the prompt leaves open.
+DISPUTED = {
+    "m1.bom_trim_duplicates": "underspecified",  # BOM acceptance is not stated
+    "m2.signature_and_shim": "underspecified",   # trimming and name-only uppercase are not stated
+    "m2.no_stale_imports": "underspecified",     # the scan also rejects a test importing the promised shim
+    "m3.invalid_inputs": "underspecified",       # whether an empty delta is invalid is not stated
+    "m4.legacy_total": "contradictory",          # starter and public test add (10 2 -> 12.00); hidden multiplies pairs
+}
+SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,79}")
+# Leading dots are allowed (.github); an all-dot part or a trailing dot is not,
+# because Windows strips trailing dots and "..." would no longer name what it says.
+SAFE_PART = re.compile(r"(?!\.+$)[A-Za-z0-9_.][A-Za-z0-9_.+-]{0,99}(?<!\.)")
 PYTHON = r"\bpython[\d.]*(?:\.exe)?"
 ADHOC = re.compile(PYTHON + r"\s+-c\b|" + PYTHON + r"\s+-\s*<<")
 # A test runner, not a mention of a test file (`cat tests/test_x.py` is a read).
@@ -75,6 +101,35 @@ SHELL_WRITE = re.compile(r"(?<![<>&\d])>{1,2}\s*(?!/dev/null|NUL\b)[\w./\\-]|\bs
                          r"|\b(?:mv|cp|rm|Set-Content|Out-File)\b")
 FAILED_LINE = re.compile(r"^(FAILED|ERROR)\s+(\S+)")
 PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.M)
+
+
+def safe_token(value):
+    """A short identifier from a log or row, or "redacted". Never free text."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    text = str(value)
+    return text if SAFE_TOKEN.fullmatch(text) else "redacted"
+
+
+def safe_relative_path(value):
+    """A repository-relative path in "/" form, or None when it could leak or escape.
+
+    Rejects absolute Windows, Unix and UNC paths, drive-relative and `~` forms,
+    any `..` or all-dot segment, a trailing dot, URLs and alternate data
+    streams (`:`), control characters, and segments outside a conservative
+    character set.
+    """
+    if not isinstance(value, str) or not value or len(value) > 260:
+        return None
+    text = value.replace("\\", "/")
+    if text.startswith(("/", "~")) or ":" in text or any(ord(c) < 32 or ord(c) == 127 for c in text):
+        return None
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." or not SAFE_PART.fullmatch(part) for part in parts):
+        return None
+    return "/".join(parts)
 
 
 def is_test_path(path):
@@ -163,14 +218,14 @@ def davinci_timeline(path, public_file):
                     step[2] = "fail" if event["isError"] else "pass"
         elif kind == "completion_reminder":
             reason = event.get("reason_code")
-            timeline.steps.append(("reminder", reason if isinstance(reason, str) and reason else "unknown"))
+            timeline.steps.append(("reminder", safe_token(reason) if isinstance(reason, str) and reason else "unknown"))
         elif kind == "message_end":
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
             reason = message.get("davinciCapabilityReminder")
             if isinstance(reason, str) and reason:
                 timeline.steps.append(("reminder", "capability"))
         elif kind == "verification_notice":
-            timeline.steps.append(("notice", str(event.get("status") or "unknown")))
+            timeline.steps.append(("notice", safe_token(event.get("status") or "unknown")))
         elif kind == "harness_stats":
             stats = event.get("runtime") if isinstance(event.get("runtime"), dict) else {}
         elif kind == "agent_end":
@@ -278,13 +333,28 @@ def hypothesis(row, seen):
     return "own_checks_passed_hidden_failed"
 
 
-def classify(campaign, row, manifest):
-    harness, task, rep = row.get("harness"), row.get("task"), row.get("rep")
+def contract(requirements):
+    """Whether the failed requirements say anything about the agent."""
+    if not requirements:
+        return "unknown"
+    disputed = [r for r, _ in requirements if r in DISPUTED]
+    if len(disputed) == len(requirements):
+        return "only_disputed_failed"
+    return "some_undisputed_failed" if disputed else "only_undisputed_failed"
+
+
+def classify(campaign, label, row, manifest):
+    harness, task, rep = (safe_token(row.get(key)) for key in ("harness", "task", "rep"))
+    # These name the log files, so an unsafe value must not reach a path.
+    readable = "redacted" not in (harness, task, rep) and None not in (harness, task, rep)
     base = campaign / str(harness) / f"{task}-r{rep}"
     public_file = public_test_file(manifest, task)
     unknowns = []
     log = Path(str(base) + ".stdout.jsonl")
-    if not log.is_file():
+    if not readable:
+        timeline, stats, final = Timeline(), {}, False
+        unknowns.append("unsafe_run_identity")
+    elif not log.is_file():
         timeline, stats, final = Timeline(), {}, False
         unknowns.append("stdout_log_missing")
     elif harness == "codex":
@@ -297,7 +367,7 @@ def classify(campaign, row, manifest):
         unknowns.append(f"shell_may_have_written:{timeline.shell_writes}")
     seen = observe(timeline, stats, final)
     mapping = REQUIREMENTS.get(task, {})
-    failed_status, names = failed_tests(Path(str(base) + ".grader.json"))
+    failed_status, names = failed_tests(Path(str(base) + ".grader.json")) if readable else ("unavailable", [])
     if failed_status == "unavailable" and not row.get("pass"):
         unknowns.append("grader_log_missing")
     elif failed_status == "parsed" and not names and row.get("tests_failed"):
@@ -310,21 +380,32 @@ def classify(campaign, row, manifest):
         elif name in mapping:
             requirements.append((mapping[name][0], mapping[name][1]))
         else:
-            requirements.append((f"unmapped:{name}", "unknown"))
-    changed = row.get("changed") or []
+            requirements.append((f"unmapped:{safe_token(name)}", "unknown"))
+    changed = row.get("changed") if isinstance(row.get("changed"), list) else []
+    paths = [safe_relative_path(p) for p in changed]
+    if None in paths:
+        unknowns.append(f"changed_paths_withheld:{paths.count(None)}")
+    paths = sorted({p for p in paths if p})
+    numeric = lambda value: value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    flag = lambda value: value if isinstance(value, bool) else None
+    unrelated = row.get("unrelated")
     return {
-        "campaign": campaign.name, "variant": row.get("variant"), "model": row.get("model"),
+        "campaign": label, "variant": safe_token(row.get("variant")), "model": safe_token(row.get("model")),
         "harness": harness, "task": task, "rep": rep,
-        "binary_sha256": row.get("binary_sha256"),
-        "pass": row.get("pass"), "grader_pass": row.get("grader_pass"),
-        "tests_passed": row.get("tests_passed"), "tests_failed": row.get("tests_failed"),
-        "stop_reason": row.get("stop_reason"), "exit": row.get("exit"),
+        "binary_sha256": row.get("binary_sha256") if re.fullmatch(r"[0-9a-f]{64}", str(row.get("binary_sha256")))
+            else None,
+        "pass": flag(row.get("pass")), "grader_pass": flag(row.get("grader_pass")),
+        "tests_passed": numeric(row.get("tests_passed")), "tests_failed": numeric(row.get("tests_failed")),
+        "stop_reason": safe_token(row.get("stop_reason")) if row.get("stop_reason") else None,
+        "exit": numeric(row.get("exit")),
         "failed_requirements_source": failed_status,
         "failed_requirements": ";".join(r for r, _ in requirements),
         "failed_requirement_prompt_states": ";".join(s for _, s in requirements),
-        "changed_files": ";".join(sorted(p for p in changed if isinstance(p, str))),
+        "failed_requirements_disputed": ";".join(r for r, _ in requirements if r in DISPUTED),
+        "contract": "passed" if row.get("pass") else contract(requirements),
+        "changed_files": ";".join(paths),
         "public_test_changed": public_file in changed if public_file else None,
-        "unrelated_changes": len(row.get("unrelated") or []),
+        "unrelated_changes": len(unrelated) if isinstance(unrelated, list) else None,
         **seen,
         "hypothesis": hypothesis(row, seen),
         "unknowns": ";".join(unknowns),
@@ -351,8 +432,9 @@ def summarize(rows):
         per_harness[harness] = {
             "runs": len(mine), "passes": sum(1 for r in mine if r["pass"]),
             "hypothesis": tally(r["hypothesis"] for r in mine),
+            "contract": tally(r["contract"] for r in mine),
             "failed_requirement_runs": {
-                req: {"runs": n, "prompt_states": states[req]}
+                req: {"runs": n, "prompt_states": states[req], "disputed": DISPUTED.get(req)}
                 for req, n in tally(req for r in failed for req in filter(None, r["failed_requirements"].split(";"))).items()},
             "failed_runs_by_requirement_source": tally(r["failed_requirements_source"] for r in failed),
             "failed_runs_only_partial_or_implicit": sum(
@@ -382,6 +464,13 @@ def summarize(rows):
     return {
         "runs": len(rows), "per_harness": per_harness, "divergences": divergences,
         "requirement_prompt_states": {req: state for task in REQUIREMENTS.values() for req, state, _ in task.values()},
+        "disputed_requirements": DISPUTED,
+        "contract_rules": {
+            "only_disputed_failed": "every failed hidden requirement is disputed; the failure may be the grader's",
+            "some_undisputed_failed": "at least one failed requirement is undisputed",
+            "only_undisputed_failed": "no failed requirement is disputed",
+            "unknown": "failed requirements unavailable or unparsed",
+        },
         "hypothesis_rules": {
             "stopped_on_existing_checks": "last check after the last edit passed; no test edits and no ad hoc checks",
             "own_checks_passed_hidden_failed": "last check after the last edit passed; the run edited tests or ran ad hoc checks",
@@ -401,7 +490,8 @@ def summarize(rows):
 
 FIELDS = ("campaign", "variant", "model", "harness", "task", "rep", "pass", "grader_pass", "tests_passed",
           "tests_failed", "stop_reason", "exit", "failed_requirements_source", "failed_requirements",
-          "failed_requirement_prompt_states", "hypothesis", "unknowns", "timeline", "final_answer", "edits",
+          "failed_requirement_prompt_states", "failed_requirements_disputed", "contract", "hypothesis",
+          "unknowns", "timeline", "final_answer", "edits",
           "test_edits", "checks", "check_passes", "check_failures", "adhoc_checks", "checks_after_last_edit",
           "last_check_after_last_edit", "reminders", "reminder_reasons", "requirement_reviews_skipped",
           "verification_notices", "edits_after_first_reminder", "test_edits_after_first_reminder",
@@ -410,27 +500,58 @@ FIELDS = ("campaign", "variant", "model", "harness", "task", "rep", "pass", "gra
 
 
 def load_rows(campaign):
-    rows = []
+    """(large-task rows, total rows) from one results.jsonl."""
+    rows, total = [], 0
     for line in (campaign / "results.jsonl").read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             row = json.loads(line)
         except ValueError:
             continue
-        if isinstance(row, dict) and str(row.get("task", "")).startswith("m"):
+        if not isinstance(row, dict):
+            continue
+        total += 1
+        if str(row.get("task", "")).startswith("m"):
             rows.append(row)
-    return rows
+    return rows, total
 
 
-def run(campaigns, out, manifest_path):
-    out = out.resolve()
+def expand(campaigns):
+    """(label, directory) for each campaign; a directory without results.jsonl
+    stands for its immediate subdirectories that have one (campaign variants)."""
+    found = []
     for campaign in campaigns:
+        if (campaign / "results.jsonl").is_file():
+            found.append((safe_token(campaign.resolve().name), campaign))
+            continue
+        variants = sorted(p for p in campaign.iterdir() if (p / "results.jsonl").is_file()) \
+            if campaign.is_dir() else []
+        if not variants:
+            raise ValueError(f"no results.jsonl in {campaign.name} or its immediate subdirectories")
+        found += [(f"{safe_token(campaign.resolve().name)}/{safe_token(p.name)}", p) for p in variants]
+    return found
+
+
+def run(campaigns, out, manifest_path, allow_empty=False):
+    out = out.resolve()
+    selected = expand(campaigns)
+    for _, campaign in selected:
         if out == campaign.resolve() or campaign.resolve() in out.parents:
             raise ValueError("--out must be outside every campaign directory")
-        if not (campaign / "results.jsonl").is_file():
-            raise ValueError(f"no results.jsonl in {campaign.name}")
+    if (out / "results.jsonl").exists():
+        raise ValueError("--out looks like a campaign directory (it has results.jsonl)")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")).get("fixtures", {})
-    rows = [classify(campaign, row, manifest) for campaign in campaigns for row in load_rows(campaign)]
+    rows, empty = [], []
+    for label, campaign in selected:
+        large, total = load_rows(campaign)
+        if not large:
+            empty.append({"campaign": label, "rows": total})
+        rows += [classify(campaign, label, row, manifest) for row in large]
+    if empty and not allow_empty:
+        raise ValueError("no large-task (m*) runs in: " + ", ".join(
+            f"{e['campaign']} ({e['rows']} rows)" for e in empty) + "; pass --allow-empty to continue without them")
     summary = summarize(rows)
+    summary["campaigns"] = [label for label, _ in selected]
+    summary["campaigns_without_large_runs"] = empty
     out.mkdir(parents=True, exist_ok=True)
     with (out / "large-task-runs.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, FIELDS, extrasaction="ignore")
@@ -446,11 +567,15 @@ def main():
     parser.add_argument("campaigns", type=Path, nargs="+")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parent / "large_manifest.json")
+    parser.add_argument("--allow-empty", action="store_true",
+                        help="continue when a selected campaign has no large-task runs (listed in the summary)")
     args = parser.parse_args()
     try:
-        _, summary = run(args.campaigns, args.out, args.manifest)
+        _, summary = run(args.campaigns, args.out, args.manifest, args.allow_empty)
     except ValueError as error:
         parser.error(str(error))
+    for entry in summary["campaigns_without_large_runs"]:
+        print(f"warning: no large-task runs in {entry['campaign']} ({entry['rows']} rows)", file=sys.stderr)
     print(json.dumps(summary, indent=2))
 
 
