@@ -340,6 +340,8 @@ jobs:
         run: python scripts/bench/large_v2_validation.py
       - name: Large-task v2 fixture, traceability and boundary tests
         run: python -m unittest discover -s scripts/bench/tests -p "test_large_fixtures_v2.py"
+      - name: Evidence script and manifest checkout-bytes tests
+        run: python -m unittest discover -s scripts/tests -p "test_collect_v2_evidence.py"
 
   workspace-test-shards:
     name: workspace-test (${{ matrix.os }}, ${{ matrix.package }})

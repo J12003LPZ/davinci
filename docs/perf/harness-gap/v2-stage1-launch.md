@@ -37,7 +37,19 @@ a baseline for, a v2 number.
    davinci-coding-agent)` was cancelled after about 55 minutes, which fails
    `workspace-tests`. The checkpoint builder requires every job for that exact
    commit to be green, so no checkpoint can be built until that shard passes,
-   by a re-run or a fix on `main`. Either is the owner's decision. Pinning a
+   by a re-run or a fix on `main`. Either is the owner's decision.
+   Diagnosis (2026-10-15): the job hit its 45-minute limit (check-run
+   annotation); GitHub kept no log for it. The same limit hit `main@eaaba04d`,
+   whose log shows `repo_intelligence_export_star_barrels_resolve_calls` (in
+   `crates/davinci-coding-agent/tests/repo_intelligence_edges.rs`) running past
+   60 s. Locally the Rust sources match `8119a17`; that test alone passed 300 of
+   300, but the whole test binary at 4 threads hung once in 150 runs (on
+   `repo_intelligence_package_exports_conditions_subpaths_and_tsconfig_extends`).
+   So the shard has an intermittent hang in that test file, cause unconfirmed.
+   `gh run rerun 38327165232 --failed` re-runs only that job and the summary
+   job on the same commit; the checkpoint builder reads the latest attempt, so
+   a green rerun is valid proof. It may hang again; a fix would be a
+   production change and needs approval. Pinning a
    different commit would change this specification.
 2. **Harness CI.** The `bench-v2-validation` job must be green on the harness
    commit on Linux and Windows.
@@ -113,55 +125,38 @@ superiority claim, no generalization claim, no promotion decision.
 
 ## 6. Windows evidence workflow (offline, runs nothing live)
 
-Copy and paste into PowerShell. It touches only `%TEMP%`: a fresh clone, a
-private virtual environment and an output folder. It does not touch your active
-DaVinci checkout, and it only reads `C:\bench`.
+One script does all of it: `scripts/collect-v2-evidence.ps1`. It touches only
+two new folders under `%TEMP%` (output and a private virtual environment), never
+your active DaVinci checkout, and only reads `C:\bench`. It fingerprints
+`C:\bench` before and after and fails if anything changed. It stops at the first
+failure: dirty clone, `scripts/bench` differing from the harness pin, wrong
+manifest SHA-256, an existing output folder, dependency install, the v2
+validator, or any regression test. Each run needs a fresh folder, so nothing is
+ever deleted. GPT-5.6 and GPT-6 campaigns are classified into separate folders.
+
+Copy and paste into PowerShell (5.1 or 7):
 
 ```powershell
-# 1. Fresh clone of the analysis branch into %TEMP%
-$Branch = "claude/blissful-einstein-lufuzs"
-$Work   = Join-Path $env:TEMP "davinci-analysis"
-$Out    = Join-Path $env:TEMP "davinci-evidence"
-if (Test-Path $Work) { Remove-Item -Recurse -Force $Work }
-git clone --quiet --branch $Branch --single-branch https://github.com/J12003LPZ/davinci $Work
-New-Item -ItemType Directory -Force $Out | Out-Null
-git -C $Work log -1 --format=%H | Out-File -Encoding utf8 (Join-Path $Out "analysis-commit.txt")
-
-# 2. Isolated Python environment with the pinned test tooling
-python -m venv (Join-Path $Out "venv")
-$Py = Join-Path $Out "venv\Scripts\python.exe"
-& $Py -m pip install --disable-pip-version-check -r "$Work\scripts\bench\v2-validation-requirements.txt"
-
-# 3. Validate v2 on Windows (offline; runs the hidden tests locally)
-& $Py "$Work\scripts\bench\large_v2_validation.py" | Out-File -Encoding utf8 (Join-Path $Out "v2-validation.json")
-"v2 validator exit code: $LASTEXITCODE"
-$env:BENCH_REQUIRE_BEHAVIORAL = "1"
-& $Py -m unittest discover -s "$Work\scripts\bench\tests" -p "test_large_fixtures_v2.py"
-Remove-Item Env:BENCH_REQUIRE_BEHAVIORAL
-
-# 4. Locate campaigns with large-task runs (read-only)
-& $Py "$Work\scripts\bench\large_task_failures.py" --locate C:\bench | Out-File -Encoding utf8 (Join-Path $Out "locate.jsonl")
-$found = Get-Content (Join-Path $Out "locate.jsonl") | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json }
-$found | Format-Table path, models, large_runs, large_passes, grader_logs, original_baseline_candidate -AutoSize
-
-# 5. Classify the GPT-5.6 baseline and the GPT-6 campaigns separately
-$base = @($found | Where-Object { $_.original_baseline_candidate } | ForEach-Object { $_.path })
-$gpt6 = @($found | Where-Object { -not $_.original_baseline_candidate -and $_.models -contains "gpt-6-luna" } | ForEach-Object { $_.path })
-if ($base.Count) { & $Py "$Work\scripts\bench\large_task_failures.py" @base --out (Join-Path $Out "gpt-5.6") } else { "No GPT-5.6 baseline found under C:\bench" }
-if ($gpt6.Count) { & $Py "$Work\scripts\bench\large_task_failures.py" @gpt6 --out (Join-Path $Out "gpt-6") } else { "No GPT-6 campaigns found under C:\bench" }
-explorer $Out
+$Stamp = Get-Date -Format yyyyMMdd-HHmmss
+$Work  = Join-Path $env:TEMP "davinci-analysis-$Stamp"
+$Root  = Join-Path $env:TEMP "v2-evidence-$Stamp"
+git clone --quiet --branch claude/blissful-einstein-lufuzs --single-branch https://github.com/J12003LPZ/davinci $Work
+if ($LASTEXITCODE -ne 0) { throw "clone failed" }
+powershell -NoProfile -ExecutionPolicy Bypass -File "$Work\scripts\collect-v2-evidence.ps1" `
+  -OutDir "$Root\evidence" -VenvDir "$Root\venv" -BenchRoot C:\bench
+"exit code: $LASTEXITCODE"
 ```
 
-Return these two sanitized summaries:
+Exit code 0 and "ALL CHECKS PASSED" mean every step passed. Anything else
+prints `STOP: <reason>`; send that line. On success return only:
 
-1. `%TEMP%\davinci-evidence\gpt-5.6\large-task-summary.json`, the original
-   GPT-5.6 Luna baseline;
-2. `%TEMP%\davinci-evidence\gpt-6\large-task-summary.json`, the GPT-6 Luna
-   campaigns.
+1. `%TEMP%\v2-evidence-<stamp>\evidence\gpt-5.6\large-task-summary.json`
+   (the original GPT-5.6 Luna baseline, if found);
+2. `...\evidence\gpt-6\large-task-summary.json` (the GPT-6 Luna campaigns);
+3. `...\evidence\evidence-manifest.json` (commit, pins, tool versions,
+   before/after fingerprints of `C:\bench`) and `v2-validation.json`.
 
-Also report the validator exit code printed in step 3; `v2-validation.json`
-holds only test names and may be shared too. Do not share `locate.jsonl` if
-your folder names are private, and never share `.stdout.jsonl`,
-`.grader.json`, wire dumps or anything under `_agent`. If step 5 prints "No
-GPT-5.6 baseline found", the baseline is not under `C:\bench`: rerun step 4
-with the folder that holds it in place of `C:\bench`.
+Never share `locate.jsonl`, `*-stdout.json`, `large-task-runs.*`, `.stdout.jsonl`,
+`.grader.json`, wire dumps or anything under `_agent`. If no GPT-5.6 baseline is
+found, it is not under `C:\bench`: rerun with `-BenchRoot` set to the folder
+that holds it.
