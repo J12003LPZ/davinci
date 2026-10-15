@@ -228,5 +228,41 @@ class ValidityTests(unittest.TestCase):
                          (0.10, 3, 1.10, 1.10))
 
 
+class StopConditionTests(unittest.TestCase):
+    def run_for(self, arm, seq=4):
+        return {"seq": seq, "arm": arm, "role": "measured"}
+
+    def test_a_clean_run_continues(self):
+        for arm in ab.ARMS:
+            self.assertIsNone(ab.stop_reason(self.run_for(arm), row(arm, usage_unknown_attempts=0)))
+
+    def test_a_harness_stop_stops(self):
+        self.assertIn("credentials", ab.stop_reason(self.run_for("ws"), row("ws", stop_reason="credentials")))
+
+    def test_a_fallback_or_wrong_shape_stops(self):
+        self.assertIn("fallback", ab.stop_reason(self.run_for("ws"), row("ws", provider_transports={"http": 1, "websocket": 9})))
+        self.assertIn("continuation", ab.stop_reason(self.run_for("wsc"), row("wsc", provider_transports={"websocket": 9})))
+
+    def test_incomplete_usage_on_a_websocket_run_stops_at_once(self):
+        for arm in ("ws", "wsc"):
+            self.assertIn("usage incomplete", ab.stop_reason(
+                self.run_for(arm), row(arm, usage_unknown_attempts=1)))
+            self.assertIn("usage incomplete", ab.stop_reason(
+                self.run_for(arm), row(arm, input_tokens=None, cached_tokens=None)))
+
+    def test_one_http_stall_is_recorded_not_fatal(self):
+        self.assertIsNone(ab.stop_reason(self.run_for("http"), row("http", usage_unknown_attempts=1)))
+
+    def test_two_failed_attempts_in_one_http_run_stop(self):
+        self.assertIn("2 attempts", ab.stop_reason(self.run_for("http"), row("http", usage_unknown_attempts=2)))
+
+    def test_the_third_failed_attempt_overall_is_allowed_and_the_fourth_stops(self):
+        self.assertIsNone(ab.stop_reason(self.run_for("http"), row("http", usage_unknown_attempts=1), unknown_so_far=2))
+        self.assertIn("in total", ab.stop_reason(self.run_for("http"), row("http", usage_unknown_attempts=1), unknown_so_far=3))
+
+    def test_the_launcher_pins_are_these(self):
+        self.assertEqual((ab.MAX_UNKNOWN_ATTEMPTS_RUN, ab.MAX_UNKNOWN_ATTEMPTS_TOTAL), (1, 3))
+
+
 if __name__ == "__main__":
     unittest.main()

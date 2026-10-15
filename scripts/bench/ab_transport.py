@@ -104,6 +104,32 @@ def arm_errors(plan, rows):
     return errors
 
 
+MAX_UNKNOWN_ATTEMPTS_RUN = 1   # provider attempts without a complete usage receipt, one run
+MAX_UNKNOWN_ATTEMPTS_TOTAL = 3
+
+
+def stop_reason(run, row, unknown_so_far=0):
+    """Predefined stop conditions for one finished run; None means continue. A stop ends the experiment.
+
+    `unknown_so_far` counts attempts without a usage receipt in the earlier runs. The checks are
+    the ones in the protocol, in order, and read only fields the harness already wrote.
+    """
+    if row.get("stop_reason"):
+        return "harness stop: %s" % row["stop_reason"]
+    errors = arm_errors({run["seq"]: run}, {run["seq"]: row})
+    if errors:
+        return errors[0]
+    unknown = row.get("usage_unknown_attempts")
+    if run["arm"] != "http" and (row.get("input_tokens") is None or (type(unknown) is int and unknown > 0)):
+        return "run %d: usage incomplete on a WebSocket run" % run["seq"]
+    if type(unknown) is int:
+        if unknown > MAX_UNKNOWN_ATTEMPTS_RUN:
+            return "run %d: %d attempts without usage" % (run["seq"], unknown)
+        if unknown_so_far + unknown > MAX_UNKNOWN_ATTEMPTS_TOTAL:
+            return "run %d: %d attempts without usage in total" % (run["seq"], unknown_so_far + unknown)
+    return None
+
+
 def compare(tasks, arm, base):
     a, b = tasks[base], tasks[arm]
     drops, gains, lower, higher = [], [], 0, 0
