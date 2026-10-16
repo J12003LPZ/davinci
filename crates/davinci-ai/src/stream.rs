@@ -1112,9 +1112,30 @@ fn live_complete_streaming_with_sink_envelope_inner(
     headers.extend(crate::cloud_auth::request_auth_headers(
         model, auth, &url, body,
     )?);
-    // Experiment, opt-in by an explicit transport value: failures are errors, never SSE.
-    if let Some(mode) = crate::codex_ws::PublicWsMode::select(model, options.transport.as_deref()) {
-        return complete_public_websocket(model, &prepared, options, &headers, mode, on_event);
+    // Opt-in by an explicit transport value. A failure before any response byte reached the
+    // caller falls back to HTTP for this request and keeps the conversation on HTTP for a while;
+    // a failure after output began is returned and never replayed.
+    if crate::codex_ws::public_websocket_selected(model, options.transport.as_deref()) {
+        let conversation = options.session_id.as_deref().filter(|id| !id.is_empty());
+        if conversation.is_some_and(crate::codex_ws::public_ws_in_backoff) {
+            crate::trace::log("public websocket in backoff after a failure; using http");
+        } else {
+            match complete_public_websocket(model, &prepared, options, &headers, on_event) {
+                Ok(envelope) => return Ok(envelope),
+                Err(failure) => match public_ws_next(&failure) {
+                    PublicWsNext::ReturnError(error) => return Err(error),
+                    PublicWsNext::FallBackToHttp => {
+                        if let Some(id) = conversation {
+                            crate::codex_ws::note_public_ws_fallback(id);
+                        }
+                        crate::trace::log(&format!(
+                            "public websocket failed before any output; using http: {}",
+                            failure.message
+                        ));
+                    }
+                },
+            }
+        }
     }
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd =
@@ -1240,31 +1261,52 @@ fn live_complete_streaming_with_sink_envelope_inner(
     result
 }
 
-/// The public Responses WebSocket experiment. The HTTP request headers are reused so the
-/// only difference from the HTTP arm is the transport (and, for the continuation mode, the
-/// `previous_response_id` request shape). A failure is returned as an explicit error:
-/// there is no SSE fallback, no retry on another transport and no silent downgrade.
-fn complete_public_websocket(
-    model: &Model,
-    prepared: &crate::responses_request::PreparedProviderRequest,
-    options: &StreamOptions,
-    headers: &[(String, String)],
-    mode: crate::codex_ws::PublicWsMode,
-    on_event: &mut dyn FnMut(&AssistantMessageEvent),
-) -> Result<ProviderCompletionEnvelope, String> {
+/// What the caller does with a failed public WebSocket request.
+#[derive(Debug, PartialEq, Eq)]
+enum PublicWsNext {
+    ReturnError(String),
+    FallBackToHttp,
+}
+
+fn public_ws_next(failure: &crate::codex_ws::PublicWsFailure) -> PublicWsNext {
+    if failure.http_fallback_safe {
+        PublicWsNext::FallBackToHttp
+    } else {
+        PublicWsNext::ReturnError(format!(
+            "public WebSocket transport failed after output began (not replayed over HTTP): {}",
+            failure.message
+        ))
+    }
+}
+
+/// The HTTP request headers minus the ones that only describe an HTTP body. The WebSocket
+/// handshake adds its own. Everything else, including the authorization, is sent unchanged.
+fn public_ws_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     const HTTP_ONLY: [&str; 4] = [
         "content-type",
         "accept",
         "content-length",
         "accept-encoding",
     ];
-    let ws_headers: Vec<(String, String)> = headers
+    headers
         .iter()
         .filter(|(name, _)| !HTTP_ONLY.iter().any(|http| name.eq_ignore_ascii_case(http)))
         .cloned()
-        .collect();
+        .collect()
+}
+
+/// The public Responses WebSocket transport. The HTTP request headers are reused so the only
+/// difference from the HTTP path is the transport.
+fn complete_public_websocket(
+    model: &Model,
+    prepared: &crate::responses_request::PreparedProviderRequest,
+    options: &StreamOptions,
+    headers: &[(String, String)],
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<ProviderCompletionEnvelope, crate::codex_ws::PublicWsFailure> {
+    let ws_headers = public_ws_headers(headers);
     // A request with no conversation id (summaries, titles) gets a private one: its socket is
-    // closed right after, so it can never share a socket or a continuation with another request.
+    // closed right after, so it can never share a socket with another request.
     let private_id = format!("public-ws-once-{}", uuid::Uuid::new_v4());
     let session_id = options
         .session_id
@@ -1274,19 +1316,18 @@ fn complete_public_websocket(
     let is_private = session_id == private_id;
     let connect_timeout =
         crate::codex::resolve_websocket_connect_timeout_ms(options.websocket_connect_timeout_ms);
+    let url = crate::codex_ws::public_ws_url();
     crate::trace::log(&format!(
-        "public websocket {:?} {}",
-        mode,
-        crate::trace::redact_url(crate::codex_ws::PUBLIC_RESPONSES_WS_URL)
+        "public websocket {}",
+        crate::trace::redact_url(&url)
     ));
     let mut collected = Vec::new();
     let mut started = false;
     let outcome = crate::codex_ws::process_public_websocket(
-        crate::codex_ws::PUBLIC_RESPONSES_WS_URL,
+        &url,
         prepared.body(),
         &ws_headers,
         model,
-        mode,
         connect_timeout,
         options.timeout_ms,
         session_id,
@@ -1300,18 +1341,15 @@ fn complete_public_websocket(
     if is_private {
         crate::codex::close_openai_codex_websocket_sessions(Some(session_id));
     }
-    let (message, shape) = outcome.map_err(|error| {
+    let (message, shape) = outcome.inspect_err(|failure| {
         crate::trace::log(&format!(
-            "public websocket failed (started={started}): {error}"
+            "public websocket failed (started={started}, http_fallback_safe={}): {}",
+            failure.http_fallback_safe, failure.message
         ));
-        format!("public WebSocket transport failed (no SSE fallback): {error}")
     })?;
     crate::trace::log(&format!(
-        "public websocket reply stop={:?} reused={} previous_response_id={} input_items={}",
-        message.message.stop_reason,
-        shape.socket_reused,
-        shape.previous_response_id,
-        shape.input_items
+        "public websocket reply stop={:?} reused={} input_items={}",
+        message.message.stop_reason, shape.socket_reused, shape.input_items
     ));
     let events = if collected.is_empty() {
         let synthesized = events_from_complete(&message.message);
@@ -3431,6 +3469,58 @@ pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMess
 
 #[cfg(test)]
 mod tests {
+    fn header(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn public_ws_headers_drop_only_the_headers_that_describe_an_http_body() {
+        let headers = vec![
+            header("Content-Type", "application/json"),
+            header("Authorization", "Bearer token"),
+            header("ACCEPT", "text/event-stream"),
+            header("User-Agent", "davinci"),
+            header("Content-Length", "123"),
+            header("accept-encoding", "gzip"),
+            header("X-Client-Request-Id", "abc"),
+            header("accept-language", "en"),
+        ];
+        let kept = super::public_ws_headers(&headers);
+        assert_eq!(
+            kept,
+            vec![
+                header("Authorization", "Bearer token"),
+                header("User-Agent", "davinci"),
+                header("X-Client-Request-Id", "abc"),
+                header("accept-language", "en"),
+            ],
+            "order and values are kept; 'accept-language' is not 'accept'"
+        );
+    }
+
+    #[test]
+    fn a_websocket_failure_falls_back_to_http_only_when_nothing_reached_the_caller() {
+        let safe = crate::codex_ws::PublicWsFailure {
+            message: "refused".into(),
+            http_fallback_safe: true,
+        };
+        assert_eq!(
+            super::public_ws_next(&safe),
+            super::PublicWsNext::FallBackToHttp
+        );
+        let begun = crate::codex_ws::PublicWsFailure {
+            message: "closed mid-stream".into(),
+            http_fallback_safe: false,
+        };
+        match super::public_ws_next(&begun) {
+            super::PublicWsNext::ReturnError(error) => {
+                assert!(error.contains("not replayed over HTTP"), "{error}");
+                assert!(error.contains("closed mid-stream"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn regression_provider_headers_preserve_other_quota_windows() {
         crate::codex_usage::record(
