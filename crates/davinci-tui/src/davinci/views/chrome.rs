@@ -132,6 +132,12 @@ fn conversation_status(model: &Model) -> Line<'static> {
     if model.exit_armed {
         return Line::from(span("  Press Ctrl-C again to exit", cc.inactive));
     }
+    if model
+        .quit_armed
+        .is_some_and(|at| at.elapsed() < crate::davinci::model::QUIT_WINDOW)
+    {
+        return Line::from(span("  Press Ctrl-D again to exit", cc.inactive));
+    }
     if model.clear_pending() {
         return Line::from(span("  Esc again to clear", cc.inactive));
     }
@@ -1234,6 +1240,12 @@ fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
     let th = &model.theme;
     if model.exit_armed {
         return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
+    }
+    if model
+        .quit_armed
+        .is_some_and(|at| at.elapsed() < crate::davinci::model::QUIT_WINDOW)
+    {
+        return Line::from(vec![span("ctrl+d again to exit", th.primary)]);
     }
     if model.clear_pending() {
         return Line::from(vec![span("esc again to clear", th.primary)]);

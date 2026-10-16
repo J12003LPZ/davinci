@@ -31,6 +31,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::app::{self, Flow};
 use super::model::Model;
+use super::model::TerminalTask;
 use super::views::scrollbar::Scrollbar;
 use super::views::viewer::ViewerTask;
 
@@ -526,6 +527,21 @@ impl Session {
         self.terminal.clear()
     }
 
+    /// ctrl+z: give the terminal back, stop until the shell continues the
+    /// process, then take it again with every mode re-asserted.
+    fn suspend(&mut self) -> io::Result<()> {
+        restore()?;
+        #[cfg(unix)]
+        {
+            let pid = std::process::id().to_string();
+            // SIGSTOP returns control here once the job is continued.
+            let _ = std::process::Command::new("kill")
+                .args(["-STOP", &pid])
+                .status();
+        }
+        self.reacquire()
+    }
+
     /// Terminal work the transcript viewer asked for: give the screen back,
     /// do it, take the screen again.
     fn run_viewer_task(&mut self, task: ViewerTask, model: &mut Model) -> io::Result<()> {
@@ -539,11 +555,7 @@ impl Session {
             }
         };
         self.reacquire()?;
-        model.toast = Some((
-            note.unwrap_or_else(|err| format!("transcript: {err}")),
-            Instant::now(),
-        ));
-        model.dirty = true;
+        model.push_toast(note.unwrap_or_else(|err| format!("transcript: {err}")));
         Ok(())
     }
 
@@ -658,6 +670,11 @@ impl Session {
         }
         if let Some(task) = model.viewer_task.take() {
             self.run_viewer_task(task, model)?;
+        }
+        match model.terminal_task.take() {
+            Some(TerminalTask::Redraw) => self.terminal.clear()?,
+            Some(TerminalTask::Suspend) => self.suspend()?,
+            None => {}
         }
         let mouse = !env_flag("DAVINCI_DISABLE_MOUSE");
         if mouse != MOUSE.load(Ordering::SeqCst) {
@@ -836,8 +853,7 @@ impl Session {
             Ok(_) => format!("opened {}", link.url),
             Err(err) => format!("could not open {}: {err}", link.url),
         };
-        model.toast = Some((note, Instant::now()));
-        model.dirty = true;
+        model.push_toast(note);
         true
     }
 
@@ -955,8 +971,7 @@ fn copy_to_clipboard(model: &mut Model, text: &str) {
         }
         Err(err) => format!("copy failed: {err}"),
     };
-    model.toast = Some((note, Instant::now()));
-    model.dirty = true;
+    model.push_toast(note);
 }
 
 /// The wheel scrolls the conversation, or steps a list like the arrow

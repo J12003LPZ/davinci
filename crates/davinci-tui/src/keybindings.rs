@@ -115,6 +115,8 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("app.clipboard.pasteImage", &["ctrl+v", "alt+v"]),
         ("davinci.interrupt", &["ctrl+c"]),
         ("davinci.quit", &["ctrl+d"]),
+        ("davinci.redraw", &["ctrl+l"]),
+        ("davinci.suspend", &["ctrl+z"]),
         ("davinci.instrumenta.toggle", &["ctrl+alt+p"]),
         ("davinci.sessions.toggle", &["ctrl+s"]),
         ("davinci.cogitator.toggle", &["alt+p"]),

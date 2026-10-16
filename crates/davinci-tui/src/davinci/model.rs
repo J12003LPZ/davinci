@@ -2719,6 +2719,8 @@ pub struct Model {
     /// A short note in the footer's right corner, such as which way a copy
     /// went. It shows for [`TOAST_SECONDS`] and then gives the corner back.
     pub toast: Option<(String, std::time::Instant)>,
+    /// Notes waiting for the corner; each shows for [`TOAST_SECONDS`] in turn.
+    pub toast_queue: std::collections::VecDeque<String>,
     /// The typewriter on the newest reply, when one is being written.
     pub reveal: Option<Reveal>,
     /// When the reveal last stepped; the step is sized from real time.
@@ -2965,6 +2967,11 @@ pub struct Model {
     pub history_store: Option<crate::history_store::HistoryStore>,
     /// The Ctrl+R search over earlier prompts, while it is open.
     pub history_search: Option<HistorySearch>,
+    /// When ctrl+d was last pressed on an empty composer: a second press
+    /// within [`QUIT_WINDOW`] leaves.
+    pub quit_armed: Option<std::time::Instant>,
+    /// Terminal work for the runtime to do before the next frame.
+    pub terminal_task: Option<TerminalTask>,
     /// The last drawn frame's pointer targets; empty until the first draw.
     pub hit_cache: std::cell::RefCell<Option<HitCache>>,
     /// Where the composer drew its text, as of the last frame.
@@ -3169,6 +3176,19 @@ pub struct ComposerHit {
     pub shell: bool,
 }
 
+/// How long after a first ctrl+d a second one still counts.
+pub const QUIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Something only the runtime can do to the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTask {
+    /// Repaint every cell (ctrl+l).
+    Redraw,
+    /// Hand the terminal back and stop the process until it is continued
+    /// (ctrl+z).
+    Suspend,
+}
+
 /// What the last drawn frame offered to the pointer, so a click or a wheel
 /// notch is tested against the screen as the user saw it rather than
 /// composing the whole frame again.
@@ -3290,6 +3310,7 @@ impl Model {
             terminal_focused: true,
             native_cursor: false,
             toast: None,
+            toast_queue: std::collections::VecDeque::new(),
             reveal: None,
             reveal_clock: None,
             reveal_floor: None,
@@ -3422,6 +3443,8 @@ impl Model {
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
             history_search: None,
+            quit_armed: None,
+            terminal_task: None,
             hit_cache: std::cell::RefCell::new(None),
             composer_hit: std::cell::Cell::new(None),
             session_history: Vec::new(),
@@ -3624,8 +3647,34 @@ impl Model {
     /// One step of the shared 250ms clock. Besides bumping `tick`, it rolls
     /// the working line's token counter toward its real value while
     /// animation is on, so every event loop animates the number the same way.
+    /// Show `note` in the footer corner now, or after the one showing.
+    pub fn push_toast(&mut self, note: String) {
+        let showing = self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(TOAST_SECONDS));
+        if showing {
+            // Repeats of the note already waiting add nothing.
+            if self.toast_queue.back() != Some(&note) {
+                self.toast_queue.push_back(note);
+            }
+        } else {
+            self.toast = Some((note, std::time::Instant::now()));
+        }
+        self.dirty = true;
+    }
+
     pub fn advance_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        let expired = self
+            .toast
+            .as_ref()
+            .is_none_or(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(TOAST_SECONDS));
+        if expired {
+            if let Some(next) = self.toast_queue.pop_front() {
+                self.toast = Some((next, std::time::Instant::now()));
+            }
+        }
         self.advance_reveal();
         // A running tool or an open prompt is work the token stream cannot
         // see; neither is a stall.

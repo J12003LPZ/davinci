@@ -1355,7 +1355,24 @@ fn action_matches(model: &Model, data: Option<&str>, action: &str) -> bool {
 
 fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
     if model.keybindings.matches(data, "davinci.quit") && model.composer.is_empty() {
-        return Some(Flow::Quit);
+        // One press arms; a second within the window leaves, so a stray
+        // ctrl+d does not end the session.
+        let armed = model
+            .quit_armed
+            .is_some_and(|at| at.elapsed() < super::model::QUIT_WINDOW);
+        if armed {
+            return Some(Flow::Quit);
+        }
+        model.quit_armed = Some(std::time::Instant::now());
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.redraw") {
+        model.terminal_task = Some(super::model::TerminalTask::Redraw);
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.suspend") && cfg!(unix) {
+        model.terminal_task = Some(super::model::TerminalTask::Suspend);
+        return Some(Flow::Continue);
     }
     if model
         .keybindings
@@ -3351,7 +3368,36 @@ mod tests {
         assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Continue);
         assert_eq!(m.composer, "qxQ");
         m.composer.clear();
+        // The first press only arms; the second, soon after, leaves.
+        assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Continue);
+        let shown: String = compose(&m, m.height)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("Press Ctrl-D again to exit"), "{shown}");
         assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Quit);
+    }
+
+    #[test]
+    fn a_late_second_ctrl_d_only_arms_again() {
+        let mut m = model(100, 24);
+        m.quit_armed = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Continue);
+        assert!(m.quit_armed.is_some_and(|at| at.elapsed().as_secs() < 1));
+    }
+
+    #[test]
+    fn ctrl_l_asks_for_a_repaint_and_ctrl_z_for_a_suspend() {
+        use super::super::model::TerminalTask;
+        let mut m = model(100, 24);
+        handle_key(&mut m, ctrl('l'));
+        assert_eq!(m.terminal_task.take(), Some(TerminalTask::Redraw));
+        handle_key(&mut m, ctrl('z'));
+        assert_eq!(
+            m.terminal_task.take(),
+            cfg!(unix).then_some(TerminalTask::Suspend)
+        );
     }
 
     /// Every state the shell can be in, so the responsive and NO_COLOR audits
@@ -5023,6 +5069,24 @@ mod scroll_to_entry_tests {
             suggestion_rows: None,
         });
         assert!(super::super::runtime::route_click_target(&mut m, click));
+    }
+
+    #[test]
+    fn toasts_wait_their_turn_instead_of_replacing_each_other() {
+        let mut m = chat(24, 6);
+        m.push_toast("first".into());
+        m.push_toast("second".into());
+        m.push_toast("second".into());
+        assert_eq!(m.toast.as_ref().map(|t| t.0.as_str()), Some("first"));
+        assert_eq!(m.toast_queue.len(), 1, "a repeat is not queued twice");
+        // Once the first has had its time, the next tick brings the second.
+        m.toast = Some((
+            "first".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(10),
+        ));
+        m.advance_tick();
+        assert_eq!(m.toast.as_ref().map(|t| t.0.as_str()), Some("second"));
+        assert!(m.toast_queue.is_empty());
     }
 
     #[test]
