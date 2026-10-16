@@ -74,6 +74,7 @@ mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
 mod stream_http;
+mod stream_http_reuse;
 mod stream_reader;
 mod thinking;
 pub mod trace;

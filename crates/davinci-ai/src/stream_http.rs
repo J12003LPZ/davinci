@@ -17,6 +17,9 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 pub(crate) struct Cancellation {
     closed: Arc<AtomicBool>,
     abort: Option<Arc<AtomicBool>>,
+    /// The stream reached its own terminal event. Releasing the reader afterwards is not a
+    /// cancellation, so a reusable connection may still drain the end of the body.
+    finished: Arc<AtomicBool>,
 }
 
 impl Cancellation {
@@ -24,8 +27,16 @@ impl Cancellation {
         self.closed.store(true, Ordering::Relaxed);
     }
 
-    fn check(&self) -> Result<(), ureq_stream::Error> {
-        if self.closed.load(Ordering::Relaxed)
+    pub(crate) fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn check(&self) -> Result<(), ureq_stream::Error> {
+        if (self.closed.load(Ordering::Relaxed) && !self.finished.load(Ordering::Relaxed))
             || self
                 .abort
                 .as_ref()
@@ -110,6 +121,7 @@ impl<T: Transport> Transport for CancelTransport<T> {
 pub(crate) struct Response {
     response: ureq_stream::http::Response<ureq_stream::Body>,
     cancellation: Cancellation,
+    lease: Option<crate::stream_http_reuse::Lease>,
 }
 
 impl Response {
@@ -130,7 +142,12 @@ impl Response {
             .and_then(|value| value.to_str().ok())
     }
     pub(crate) fn into_reader(self) -> (impl Read + Send + 'static, Cancellation) {
-        (self.response.into_body().into_reader(), self.cancellation)
+        let reader = crate::stream_http_reuse::LeasedReader::new(
+            self.response.into_body().into_reader(),
+            self.lease,
+            self.cancellation.clone(),
+        );
+        (reader, self.cancellation)
     }
     pub(crate) fn into_string(self) -> io::Result<String> {
         let (reader, _) = self.into_reader();
@@ -188,6 +205,45 @@ pub(crate) fn send(
         connector,
         ureq_stream::unversioned::resolver::DefaultResolver::default(),
     );
+    execute(&agent, cancellation, None, url, headers, body, compress_zstd)
+}
+
+/// Sends on the session connection chosen by `plan`; without a lease it is exactly `send`.
+pub(crate) fn send_reusing(
+    plan: crate::stream_http_reuse::Plan,
+    url: &str,
+    headers: &[(String, String)],
+    body: &serde_json::Value,
+    timeout_ms: Option<u64>,
+    compress_zstd: bool,
+    abort: Option<Arc<AtomicBool>>,
+) -> Result<Response, ProviderError> {
+    let Some(lease) = plan.lease else {
+        return send(url, headers, body, timeout_ms, compress_zstd, abort);
+    };
+    let idle = timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(crate::http::PROVIDER_IDLE_TIMEOUT);
+    let cancellation = Cancellation {
+        abort,
+        ..Cancellation::default()
+    };
+    // Installed before the send so the pool's liveness probe judges this request, not the last.
+    lease.install(cancellation.clone(), idle);
+    let agent = lease.agent();
+    execute(&agent, cancellation, Some(lease), url, headers, body, compress_zstd)
+}
+
+fn execute(
+    agent: &ureq_stream::Agent,
+    cancellation: Cancellation,
+    lease: Option<crate::stream_http_reuse::Lease>,
+    url: &str,
+    headers: &[(String, String)],
+    body: &serde_json::Value,
+    compress_zstd: bool,
+) -> Result<Response, ProviderError> {
     let mut request = agent.post(url);
     for (key, value) in headers {
         request = request.header(key.as_str(), value.as_str());
@@ -216,6 +272,7 @@ pub(crate) fn send(
     let response = Response {
         response,
         cancellation,
+        lease,
     };
     if response.status() >= 400 {
         let mut error = ProviderError::new(

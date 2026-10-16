@@ -551,6 +551,9 @@ fn read_provider_stream(
             break;
         }
     }
+    if !aborted && read_error.is_none() && (decoder.is_done() || framer.saw_done()) {
+        line_rx.mark_finished();
+    }
     drop(line_rx);
     aborted |= abort.is_some_and(|flag| flag.load(Ordering::Relaxed));
     // A connection torn down after the stream's own end (`[DONE]`, the
@@ -1116,15 +1119,24 @@ fn live_complete_streaming_with_sink_envelope_inner(
     if let Some(mode) = crate::codex_ws::PublicWsMode::select(model, options.transport.as_deref()) {
         return complete_public_websocket(model, &prepared, options, &headers, mode, on_event);
     }
+    let reuse_connection =
+        crate::stream_http_reuse::selected(model, options.transport.as_deref());
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd =
         model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model);
     crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
     let (response, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
-            let observation = crate::provider_observation::Attempt::try_start("http")
+            // Experiment, opt-in by an explicit transport value: one connection per conversation.
+            let plan = if reuse_connection {
+                crate::stream_http_reuse::plan(options.session_id.as_deref())
+            } else {
+                crate::stream_http_reuse::Plan::one_shot("http")
+            };
+            let observation = crate::provider_observation::Attempt::try_start(plan.label)
                 .map_err(|error| crate::provider_retry::ProviderError::new(None, error))?;
-            match crate::stream_http::send(
+            match crate::stream_http::send_reusing(
+                plan,
                 &url,
                 &headers,
                 body,

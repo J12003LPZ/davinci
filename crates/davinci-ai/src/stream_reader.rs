@@ -18,6 +18,13 @@ impl std::ops::Deref for ResponseLines {
     }
 }
 
+impl ResponseLines {
+    /// The provider's own terminal event was read; dropping this reader is not a cancellation.
+    pub(crate) fn mark_finished(&self) {
+        self.cancellation.mark_finished();
+    }
+}
+
 impl Drop for ResponseLines {
     fn drop(&mut self) {
         self.cancellation.cancel();
