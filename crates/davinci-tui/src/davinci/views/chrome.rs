@@ -1014,11 +1014,17 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
 /// selection reads without color (design.md §6). Nothing is drawn when there is
 /// nothing on offer.
 pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
+    suggestions_with_items(model).0
+}
+
+/// The completion rows, and the item each row belongs to (an item may take
+/// several), so a click on a row can pick its item.
+pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
     let Some(found) = &model.suggestions else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if found.items.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let cc = model.theme.cc();
@@ -1040,6 +1046,7 @@ pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
     let selected = model.suggestion_index.min(items.len() - 1);
     let (start, end) = visible_items(&heights, selected, 5);
     let mut out = Vec::new();
+    let mut owners = Vec::new();
     for (index, rows) in items.iter().enumerate().take(end).skip(start) {
         let color = if index == selected {
             cc.permission
@@ -1055,9 +1062,10 @@ pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
                 spans,
                 model.width,
             )));
+            owners.push(index);
         }
     }
-    out
+    (out, owners)
 }
 
 fn suggestion_label(prefix: &str, model: &Model, label: &str) -> String {

@@ -617,7 +617,7 @@ impl Session {
         if !HELD.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let mouse = true;
+        let mouse = !env_flag("DAVINCI_DISABLE_MOUSE");
         if mouse != MOUSE.load(Ordering::SeqCst) {
             #[cfg(unix)]
             {
@@ -694,6 +694,7 @@ impl Session {
     pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
         use event::MouseEventKind;
         if route_graph_mouse(model, mouse)
+            || route_click_target(model, mouse)
             || route_scroll_mouse(model, &mut self.scrollbar_grab, self.scrollbar, mouse)
         {
             // A selection held in conversation rows survives the wheel; one
@@ -802,7 +803,7 @@ pub fn route_scroll_mouse(
     drawn: Option<Scrollbar>,
     mouse: event::MouseEvent,
 ) -> bool {
-    use super::views::scrollbar::WHEEL_ROWS;
+    let wheel_rows = wheel_rows();
     use event::{MouseButton::Left, MouseEventKind};
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -814,7 +815,7 @@ pub fn route_scroll_mouse(
                 model.suggestion_move(if up { -1 } else { 1 });
                 return true;
             }
-            if app::scroll_transcript(model, if up { WHEEL_ROWS } else { -WHEEL_ROWS }) {
+            if app::scroll_transcript(model, if up { wheel_rows } else { -wheel_rows }) {
                 return true;
             }
             if model.screen != super::model::Screen::Agent || model.overlay.is_some() {
@@ -855,6 +856,64 @@ pub fn route_scroll_mouse(
 
 /// Whether `row` falls on the open completion list. Nothing is composed
 /// unless a list is open.
+/// A truthy environment flag (`1`, `true`, `yes`, `on`).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Rows one wheel notch scrolls: `DAVINCI_SCROLL_SPEED` (0.25–20) times the
+/// default three.
+fn wheel_rows() -> isize {
+    use std::sync::OnceLock;
+    static ROWS: OnceLock<isize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        let speed = std::env::var("DAVINCI_SCROLL_SPEED")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|speed| speed.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.25, 20.0);
+        ((super::views::scrollbar::WHEEL_ROWS as f64 * speed).round() as isize).max(1)
+    })
+}
+
+/// A left click on a drawn target: jump back to the newest output, or take
+/// the completion under the pointer. `DAVINCI_DISABLE_MOUSE_CLICKS` leaves
+/// only the wheel.
+pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) -> bool {
+    use event::{MouseButton::Left, MouseEventKind};
+    if mouse.kind != MouseEventKind::Down(Left)
+        || model.overlay.is_some()
+        || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
+    {
+        return false;
+    }
+    let frame = app::compose_frame(model, model.height);
+    let Some(hit) = frame
+        .targets
+        .iter()
+        .find(|hit| hit.rows.contains(&mouse.row))
+    else {
+        return false;
+    };
+    match hit.target {
+        app::Target::JumpToBottom => {
+            model.transcript_scroll.take();
+        }
+        app::Target::Suggestion(index) => {
+            model.suggestion_index = index;
+            model.suggestion_picked = true;
+            model.accept_suggestion();
+        }
+    }
+    true
+}
+
 fn over_suggestions(model: &Model, row: u16) -> bool {
     model.overlay.is_none()
         && model.suggestions.is_some()

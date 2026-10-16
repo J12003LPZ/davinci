@@ -54,6 +54,8 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
 }
 
 pub struct ComposedFrame {
+    /// Screen rows that react to a click, in draw order.
+    pub targets: Vec<HitTarget>,
     pub lines: Vec<Line<'static>>,
     pub graph: Option<super::views::graph_nav::GraphFrame>,
     /// The conversation's scrollbar, when it has more rows than fit.
@@ -65,6 +67,22 @@ pub struct ComposedFrame {
     pub caret: Option<(u16, u16)>,
 }
 
+/// What a click lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The `↓ Jump to bottom` row of a scrolled-back conversation.
+    JumpToBottom,
+    /// The completion item at this index.
+    Suggestion(usize),
+}
+
+/// A clickable band of screen rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitTarget {
+    pub rows: std::ops::Range<u16>,
+    pub target: Target,
+}
+
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let height = height as usize;
     if height == 0 {
@@ -73,6 +91,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             graph: None,
             scrollbar: None,
             suggestion_rows: None,
+            targets: Vec::new(),
             caret: None,
         };
     }
@@ -97,6 +116,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             graph: None,
             scrollbar: None,
             suggestion_rows: None,
+            targets: Vec::new(),
             caret: None,
         };
     }
@@ -110,6 +130,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
                 graph: None,
                 scrollbar: None,
                 suggestion_rows: None,
+                targets: Vec::new(),
                 caret: None,
             };
         }
@@ -127,7 +148,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let (composer_rows, composer_caret) = composer_rows(chrome_model);
     // What the composer offers sits directly above it, inside the same stack,
     // so the list moves with the composer at any window height.
-    let offered = chrome::suggestions(chrome_model);
+    let (offered, offered_items) = chrome::suggestions_with_items(chrome_model);
     let top = extension_rows(model, &model.extensions.header);
     let bottom = extension_rows(model, &model.extensions.footer);
     let above = extension_rows(model, &model.extensions.above());
@@ -233,7 +254,23 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         let start = rows.len().min(height) as u16;
         start..(rows.len() + offered.len()).min(height) as u16
     });
+    let offered_start = rows.len().min(height) as u16;
     rows.extend(offered);
+    let mut targets = Vec::new();
+    if let Some(bar) = scrollbar.as_ref().filter(|bar| bar.offset > 0) {
+        let last = bar.top + bar.height.saturating_sub(1);
+        targets.push(HitTarget {
+            rows: last..last + 1,
+            target: Target::JumpToBottom,
+        });
+    }
+    for (at, item) in offered_items.iter().enumerate() {
+        let row = offered_start + at as u16;
+        targets.push(HitTarget {
+            rows: row..row + 1,
+            target: Target::Suggestion(*item),
+        });
+    }
     let caret = composer_caret
         .map(|(row, column)| (column, rows.len() + row))
         .filter(|&(_, row)| row < height)
@@ -253,6 +290,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         graph,
         scrollbar,
         suggestion_rows,
+        targets,
         caret,
     }
 }
@@ -351,8 +389,14 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
     let mut rows = rows_of(top..top + height);
     if offset > 0 {
         let cc = model.theme.cc();
+        let fresh = model.transcript.len().saturating_sub(scroll.entries);
         let below = format!(
-            "  ↓ {offset} {} below · scroll down or pgdn to return",
+            "  ↓ Jump to bottom · {}{offset} {} below · click, End or pgdn",
+            match fresh {
+                0 => String::new(),
+                1 => "1 new message · ".to_owned(),
+                n => format!("{n} new messages · "),
+            },
             if offset == 1 { "line" } else { "lines" }
         );
         if let Some(last) = rows.last_mut() {
@@ -896,6 +940,22 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     {
         return Flow::Continue;
     }
+    if matches!(key.code, KeyCode::Home | KeyCode::End)
+        && key.modifiers == KeyModifiers::CONTROL
+        && model.screen == Screen::Agent
+        && model.overlay.is_none()
+        && scroll_transcript(
+            model,
+            if key.code == KeyCode::Home {
+                isize::MAX / 2
+            } else {
+                isize::MIN / 2
+            },
+        )
+    {
+        return Flow::Continue;
+    }
+
     let data = key_event_bytes(&key);
     if key.kind != KeyEventKind::Release && key.code != KeyCode::Esc {
         model.clear_armed = None;
@@ -4670,6 +4730,61 @@ mod scroll_to_entry_tests {
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    fn scrolled_back_with_news() -> Model {
+        let mut m = chat(24, 6);
+        let last = m.transcript.len() - 1;
+        scroll_transcript_to_entry(&mut m, last);
+        for n in 0..2 {
+            m.transcript.push(Entry::user(&format!("streamed {n}")));
+        }
+        m
+    }
+
+    #[test]
+    fn the_jump_row_counts_what_arrived_while_scrolled_back() {
+        let m = scrolled_back_with_news();
+        let shown = rows(&m);
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.contains("Jump to bottom · 2 new messages")),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_the_jump_row_follows_the_newest_again() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut m = scrolled_back_with_news();
+        let frame = compose_frame(&m, m.height);
+        let hit = frame
+            .targets
+            .iter()
+            .find(|hit| hit.target == Target::JumpToBottom)
+            .expect("a jump target while scrolled back");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: hit.rows.start,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+        assert!(m.transcript_scroll.get().top.is_none());
+        assert!(compose_frame(&m, m.height).targets.is_empty());
+    }
+
+    #[test]
+    fn ctrl_home_and_ctrl_end_reach_the_ends_of_the_conversation() {
+        let mut m = chat(24, 6);
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        handle_key(&mut m, ctrl(KeyCode::Home));
+        assert!(rows(&m).iter().any(|row| row.contains("↓ Jump to bottom")));
+        let bar = transcript_scrollbar(&m).expect("bar");
+        assert_eq!(bar.offset, bar.max_offset());
+        handle_key(&mut m, ctrl(KeyCode::End));
+        assert!(m.transcript_scroll.get().top.is_none());
     }
 
     #[test]
