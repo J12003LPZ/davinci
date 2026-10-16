@@ -189,7 +189,11 @@ fn encode(path: &str) -> String {
 /// addresses go through unchanged. A `file://` address never does: the opener
 /// would run an executable, script or shortcut that model output merely
 /// names, so only a folder is opened (the file's own folder for a file).
-pub fn opener_target(url: &str, is_dir: impl Fn(&Path) -> bool) -> Option<String> {
+pub fn opener_target(
+    url: &str,
+    is_dir: impl Fn(&Path) -> bool,
+    resolve: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<String> {
     let Some(rest) = url.strip_prefix("file://") else {
         return Some(url.to_owned());
     };
@@ -212,8 +216,17 @@ pub fn opener_target(url: &str, is_dir: impl Fn(&Path) -> bool) -> Option<String
         path.parent()?.to_path_buf()
     };
     // A bundle is a folder the opener launches (`open Foo.app`), so neither
-    // it nor anything inside it is handed over.
-    let launches = folder.components().any(|part| {
+    // it nor anything inside it is handed over. A symlink can hide one behind
+    // an innocent name, so the resolved path is checked too, and a folder
+    // that cannot be resolved is refused.
+    if is_bundle_path(&folder) || is_bundle_path(&resolve(&folder)?) {
+        return None;
+    }
+    Some(folder.to_string_lossy().into_owned())
+}
+
+fn is_bundle_path(path: &Path) -> bool {
+    path.components().any(|part| {
         part.as_os_str()
             .to_str()
             .and_then(|name| name.rsplit_once('.'))
@@ -222,11 +235,7 @@ pub fn opener_target(url: &str, is_dir: impl Fn(&Path) -> bool) -> Option<String
                     .iter()
                     .any(|bundle| ext.eq_ignore_ascii_case(bundle))
             })
-    });
-    if launches {
-        return None;
-    }
-    Some(folder.to_string_lossy().into_owned())
+    })
 }
 
 const BUNDLE_EXTENSIONS: [&str; 12] = [
@@ -323,23 +332,35 @@ mod tests {
     #[test]
     fn a_file_link_opens_its_folder_never_the_file() {
         let is_dir = |p: &Path| p == Path::new("/work/app/src");
+        let same = |p: &Path| Some(p.to_path_buf());
         assert_eq!(
-            opener_target("https://x.dev/y", is_dir).as_deref(),
+            opener_target("https://x.dev/y", is_dir, same).as_deref(),
             Some("https://x.dev/y")
         );
         let folder = Path::new("/work/app/src").to_string_lossy().into_owned();
         assert_eq!(
-            opener_target("file:///work/app/src", is_dir).as_deref(),
+            opener_target("file:///work/app/src", is_dir, same).as_deref(),
             Some(folder.as_str())
         );
         assert_eq!(
-            opener_target("file:///work/app/src/evil%20run.exe", is_dir).as_deref(),
+            opener_target("file:///work/app/src/evil%20run.exe", is_dir, same).as_deref(),
             Some(folder.as_str())
         );
-        assert_eq!(opener_target("file:///work/%ZZ", is_dir), None);
+        assert_eq!(opener_target("file:///work/%ZZ", is_dir, same), None);
         // Bundles launch when opened, and so does anything inside one.
-        assert_eq!(opener_target("file:///Apps/Evil.APP", |_| true), None);
-        assert_eq!(opener_target("file:///Apps/Evil.app/x/y", |_| false), None);
+        assert_eq!(opener_target("file:///Apps/Evil.APP", |_| true, same), None);
+        assert_eq!(
+            opener_target("file:///Apps/Evil.app/x/y", |_| false, same),
+            None
+        );
+        // A symlink named innocently that resolves into a bundle, and a
+        // folder that cannot be resolved at all.
+        let into_bundle = |_: &Path| Some(PathBuf::from("/Apps/Evil.app/Contents"));
+        assert_eq!(
+            opener_target("file:///work/docs", |_| true, into_bundle),
+            None
+        );
+        assert_eq!(opener_target("file:///work/docs", |_| true, |_| None), None);
     }
 
     #[cfg(windows)]

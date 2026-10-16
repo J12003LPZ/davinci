@@ -891,7 +891,11 @@ impl Session {
         let Some(link) = super::links::at(&links, mouse.column) else {
             return false;
         };
-        let note = match super::links::opener_target(&link.url, |path| path.is_dir()) {
+        let note = match super::links::opener_target(
+            &link.url,
+            |path| path.is_dir(),
+            |path| std::fs::canonicalize(path).ok(),
+        ) {
             None => format!("could not open {}", link.url),
             Some(target) => match crate::open_browser::try_open_browser(&target) {
                 Ok(_) if link.url.starts_with("file://") => format!("opened folder {target}"),
