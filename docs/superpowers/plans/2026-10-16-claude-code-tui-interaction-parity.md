@@ -388,6 +388,12 @@ for T10; no classic renderer).
 | T4 | Done | Double-click word (paths and URLs whole), triple-click row, word/row drag, drag past the edge scrolls, Shift+arrows/Home/End extend, Ctrl+Shift+C copies, Ctrl+C copies instead of interrupting, Esc/PgUp/PgDn/modified motions keep the selection, other keys clear it. |
 | T5 | Done | `clipboard.rs`: OSC 52 over SSH (tmux/screen wrapped, skipped for VTE and non-TTY), `pbcopy`, `wl-copy`, `xclip`, `xsel` (+ PRIMARY), PowerShell `Set-Clipboard` before `clip` on Windows/WSL, tmux buffer. Footer toast names the path. `fullscreenCopyOnSelect` now reaches the live shell. `/copy` reports a failed copy. |
 | T6 | Done | The composer word-wraps at the window width using the shared editor's own visual-row map, so drawing and Up/Down agree. |
+| T7 | Partly done | `ComposedFrame.targets` records clickable rows; wired for the jump-to-bottom row, completion rows, history-search rows and the sticky prompt header. `DAVINCI_DISABLE_MOUSE` (no mouse) and `DAVINCI_DISABLE_MOUSE_CLICKS` (wheel only). Not yet: approval/select options, multi-select toggles, settings values, collapsed tool results, `↑ N more`, click-to-place in the composer. |
+| T8 | Done | `links.rs` finds URLs and existing paths per row; after each frame the runtime reprints those cells inside OSC 8 (`DAVINCI_DISABLE_HYPERLINKS` opts out). Ctrl/Cmd-click opens via `open_browser`. `//` and `\\` paths are never linked. |
+| T9 | Mostly done | `Jump to bottom · N new messages` row (clickable), sticky one-row header of the last prompt above the view (clickable), Ctrl+Home/End, `DAVINCI_SCROLL_SPEED` (0.25-20). Not done: the `autoScroll` setting and wheel acceleration. |
+| T10 | Not started | Waits for the keymap decision. Only change so far: Ctrl+O now opens the transcript viewer and in-place tool expansion moved to Alt+O. |
+| T11 | Mostly done | Per-project JSONL history (bounded by entries and bytes), loaded at startup; Ctrl+R search with Tab cycling session / project / all projects, first-word highlight, click or Enter to take. Pasted content is recalled as its expanded text, not as a chip. |
+| T12 | Done | Ctrl+O viewer over a snapshot with every tool call expanded: j/k, space/b, d/u, g/G, `/` with n/N, `{`/`}` prompts, `[` to scrollback, `v` to `$VISUAL`/`$EDITOR`, q/esc. |
 
 ## 6. Recommended order and sizing
 

@@ -1116,6 +1116,9 @@ pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) ->
         app::Target::JumpToBottom => {
             model.transcript_scroll.take();
         }
+        app::Target::Prompt(entry) => {
+            app::scroll_transcript_to_entry(model, entry);
+        }
         app::Target::HistoryMatch(index) => {
             model.history_search_accept(index);
         }

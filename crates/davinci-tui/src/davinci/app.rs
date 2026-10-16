@@ -12,7 +12,7 @@ use ratatui::text::Line;
 
 use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOwner};
 
-use super::model::{Choice, Model, Overlay, Screen};
+use super::model::{Choice, Entry, Model, Overlay, Screen};
 use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::scrollbar::{self, Scrollbar};
@@ -72,6 +72,8 @@ pub struct ComposedFrame {
 pub enum Target {
     /// The `↓ Jump to bottom` row of a scrolled-back conversation.
     JumpToBottom,
+    /// The prompt shown in the sticky header, as a transcript entry.
+    Prompt(usize),
     /// The completion item at this index.
     Suggestion(usize),
     /// The earlier prompt at this index of the history search's matches.
@@ -281,6 +283,15 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             target: Target::JumpToBottom,
         });
     }
+    if let Some(bar) = scrollbar.as_ref().filter(|bar| bar.offset > 0) {
+        let top = bar.total - usize::from(bar.height) - bar.offset;
+        if let Some(entry) = sticky_prompt(model, top) {
+            targets.push(HitTarget {
+                rows: bar.top..bar.top + 1,
+                target: Target::Prompt(entry),
+            });
+        }
+    }
     for (at, item) in offered_items.iter().enumerate() {
         let row = offered_start + at as u16;
         let target = match (searching, *item) {
@@ -409,6 +420,20 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         drawn,
     };
     let mut rows = rows_of(top..top + height);
+    if let Some(entry) = sticky_prompt(model, top) {
+        if let Entry::User(text) = &model.transcript[entry] {
+            let first = text.lines().next().unwrap_or_default();
+            let cc = model.theme.cc();
+            rows.insert(
+                0,
+                Line::from(ui::span(
+                    ui::clip_ellipsis(&format!("  ❯ {first}"), width),
+                    cc.inactive,
+                )),
+            );
+            rows.truncate(height);
+        }
+    }
     if offset > 0 {
         let cc = model.theme.cc();
         let fresh = model.transcript.len().saturating_sub(scroll.entries);
@@ -446,6 +471,61 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
     (rows, Some(bar))
 }
 
+/// Where each prompt starts in the conversation, for the entries as they are:
+/// worked out once and kept until the transcript, its width or its fold changes.
+fn prompt_rows(model: &Model, width: u16) -> std::rc::Rc<Vec<(usize, usize)>> {
+    use std::hash::{Hash, Hasher};
+    type PromptRows = std::rc::Rc<Vec<(usize, usize)>>;
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(u64, PromptRows)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (model.transcript.len(), width, model.show_tool_output).hash(&mut hasher);
+    for entry in model.transcript.iter() {
+        if let Entry::User(text) = entry {
+            text.hash(&mut hasher);
+        }
+    }
+    let key = hasher.finish();
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((cached, rows)) = cache.as_ref() {
+            if *cached == key {
+                return rows.clone();
+            }
+        }
+        let rows = std::rc::Rc::new(
+            model
+                .transcript
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry, Entry::User(_)))
+                .map(|(index, _)| (transcript::rows_before(model, index, width), index))
+                .collect::<Vec<_>>(),
+        );
+        *cache = Some((key, rows.clone()));
+        rows
+    })
+}
+
+/// The prompt whose own rows have scrolled off the top of the view, when the
+/// view is scrolled back: the newest one that starts above row `top`.
+fn sticky_prompt(model: &Model, top: usize) -> Option<usize> {
+    model.transcript_scroll.get().top?;
+    let width = if model.width >= scrollbar::MIN_WIDTH {
+        model.width - 1
+    } else {
+        model.width
+    };
+    let head = 2 + startup::banner(model, &model.startup).len();
+    prompt_rows(model, width)
+        .iter()
+        .rev()
+        .find(|(row, _)| head + row < top)
+        .map(|&(_, index)| index)
+}
+
 /// Scroll the conversation by `rows` (up is positive). `false` when there is
 /// nothing to scroll: another surface is open or everything already fits.
 pub fn scroll_transcript(model: &mut Model, rows: isize) -> bool {
@@ -457,14 +537,14 @@ pub fn scroll_transcript(model: &mut Model, rows: isize) -> bool {
     true
 }
 
-/// Scroll by whole screens of conversation. A page is two rows short of the
-/// view: one row of overlap, and one for the `↓ … below` line that covers
-/// the last row while scrolled back.
+/// Scroll by whole screens of conversation. A page is three rows short of the
+/// view: one row of overlap, one for the `↓ … below` line that covers the
+/// last row while scrolled back, and one for the prompt header on top.
 pub fn scroll_transcript_pages(model: &mut Model, pages: isize) -> bool {
     let Some(bar) = transcript_scrollbar(model) else {
         return false;
     };
-    let page = bar.height.saturating_sub(2).max(1) as isize;
+    let page = bar.height.saturating_sub(3).max(1) as isize;
     scroll_transcript(model, pages * page)
 }
 
@@ -4832,6 +4912,42 @@ mod scroll_to_entry_tests {
     }
 
     #[test]
+    fn scrolled_back_the_last_prompt_above_the_view_stays_on_top_and_clicks_back_to_it() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        assert!(
+            !rows(&m)[0].contains('❯'),
+            "following the newest has no header"
+        );
+        // Scroll partway so that earlier prompts are above the view.
+        let bar = transcript_scrollbar(&m).expect("overflowing transcript");
+        set_transcript_offset(&mut m, &bar, 12);
+        let shown = rows(&m);
+        assert!(shown[0].starts_with("  ❯ "), "{:?}", &shown[..2]);
+        let frame = compose_frame(&m, m.height);
+        let hit = frame
+            .targets
+            .iter()
+            .find(|hit| matches!(hit.target, Target::Prompt(_)))
+            .expect("the header is a target");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: hit.rows.start,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+        let Target::Prompt(entry) = hit.target else {
+            unreachable!()
+        };
+        let Entry::User(text) = &m.transcript[entry] else {
+            panic!("a prompt");
+        };
+        let top: String = rows(&m)[..2].join("\n");
+        assert!(top.contains(text.lines().next().unwrap()), "{top}");
+    }
+
+    #[test]
     fn ctrl_o_opens_the_transcript_viewer_and_q_closes_it() {
         let mut m = chat(24, 6);
         handle_key(
@@ -5019,7 +5135,9 @@ mod scroll_to_entry_tests {
             scroll_transcript_to_entry(&mut m, last)
         });
         let shown = rows(&m);
-        assert!(shown[0].contains("Context Usage"), "{:?}", &shown[..3]);
+        // The prompt that asked for the block stays on top of it.
+        assert!(shown[0].contains("/context"), "{:?}", &shown[..3]);
+        assert!(shown[1].contains("Context Usage"), "{:?}", &shown[..3]);
         assert!(shown.iter().any(|row| row.contains("Estimated usage")));
     }
 
@@ -5060,7 +5178,7 @@ mod scroll_to_entry_tests {
         for n in 0..6 {
             m.transcript.push(Entry::user(&format!("streamed {n}")));
         }
-        assert!(rows(&m)[0].contains("Context Usage"));
+        assert!(rows(&m)[1].contains("Context Usage"));
         let bar = transcript_scrollbar(&m).expect("overflowing transcript");
         set_transcript_offset(&mut m, &bar, 0);
         assert!(m.transcript_scroll.get().top.is_none());

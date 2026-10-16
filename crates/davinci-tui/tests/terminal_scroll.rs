@@ -155,8 +155,9 @@ fn page_keys_scroll_a_one_row_draft_but_not_a_longer_one() {
     m.composer.set_text("draft");
     press(&mut m, KeyCode::PageUp);
     let page = offset(&m);
-    // Two rows short of the view: one of overlap, one under the notice.
-    assert_eq!(page, usize::from(bar(&m).height) - 2);
+    // Three rows short of the view: one of overlap, one under the notice,
+    // one for the prompt header.
+    assert_eq!(page, usize::from(bar(&m).height) - 3);
     press(&mut m, KeyCode::PageDown);
     assert_eq!(offset(&m), 0);
     assert_eq!(m.composer.editor().get_text(), "draft");
