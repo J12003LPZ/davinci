@@ -1,7 +1,8 @@
 # Public Responses WebSocket transport
 
-Status: opt-in, off by default. Nothing here changes a default, a route or a header for users who do not set the
-transport value. HTTP stays the default on every route.
+Status: the default on the "Sign in with ChatGPT" route (`https://api.openai.com/v1`, provider `openai-codex`).
+Set `"transport": "sse"` (or `"http"`) to force plain HTTP. Every other route and provider is unchanged. A failure
+before any output falls back to HTTP for that request, so a network that blocks WebSocket costs one failed connect.
 
 ## What it is
 
@@ -13,8 +14,8 @@ bodies, headers (minus the ones that only describe an HTTP body), retries, budge
 
 | `transport` | Connection |
 |---|---|
-| `auto` and every other value (default) | a new HTTPS POST per request, unchanged |
-| `public-websocket` | one WebSocket per conversation, full input replayed on every request |
+| unset, `auto`, `public-websocket` (default) | one WebSocket per conversation, full input replayed on every request |
+| `sse`, `http` and every other value | a new HTTPS POST per request, unchanged |
 
 Only the public sign-in route (`https://api.openai.com/v1`, provider `openai-codex`) honours the value. The ChatGPT
 backend route and every other provider ignore it. No API key is used on this path, and nothing assumes that Codex's
@@ -66,8 +67,8 @@ then: tools execute on the client after the stream ends. The cost is at most a d
 
 ## Enabling it
 
-`settings.json`: `"transport": "public-websocket"`. Subscription-policy admission still requires HTTP/SSE, so the
-policy mode refuses this value.
+Nothing to set. To opt out, `settings.json`: `"transport": "sse"`. Subscription-policy admission requires an explicit
+`sse`, so policy mode is unaffected and refuses every other value.
 
 ## Exact changes
 
