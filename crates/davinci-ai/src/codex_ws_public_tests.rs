@@ -275,7 +275,10 @@ fn header_names(head: &str) -> Vec<String> {
 fn the_public_route_defaults_to_the_websocket_and_http_values_opt_out() {
     let public = public_model();
     for transport in [None, Some("auto"), Some(PUBLIC_WS_TRANSPORT)] {
-        assert!(public_websocket_selected(&public, transport), "{transport:?}");
+        assert!(
+            public_websocket_selected(&public, transport),
+            "{transport:?}"
+        );
     }
     for transport in [
         Some("sse"),
