@@ -80,11 +80,15 @@ fn trim_tail(token: &str) -> &str {
 /// `file://` address of an existing path, with an optional `:line[:col]`
 /// suffix left out of the address.
 fn path_url(token: &str, cwd: &Path, exists: &mut impl FnMut(&Path) -> bool) -> Option<String> {
-    let rooted = token.starts_with('/')
+    let drive = cfg!(windows) && has_drive(token);
+    let rooted = drive
+        || token.starts_with('/')
         || token.starts_with("./")
         || token.starts_with("../")
         || token.starts_with("~/");
-    if !rooted || token.starts_with("//") || token.contains('\\') {
+    // A drive path may use backslashes; anything else with one is a share or
+    // not a path at all.
+    if !rooted || token.starts_with("//") || (token.contains('\\') && !drive) {
         return None;
     }
     let mut path = token;
@@ -98,17 +102,59 @@ fn path_url(token: &str, cwd: &Path, exists: &mut impl FnMut(&Path) -> bool) -> 
         }
     }
     let full: PathBuf = if let Some(rest) = path.strip_prefix("~/") {
-        PathBuf::from(std::env::var_os("HOME")?).join(rest)
-    } else if path.starts_with('/') {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+        PathBuf::from(home?).join(rest)
+    } else if path.starts_with('/') || drive {
         PathBuf::from(path)
     } else {
         cwd.join(path)
     };
     let full = normalize(&full);
-    if !full.is_absolute() || !exists(&full) {
+    // `/work/app` has a root but no drive on Windows; both count as anchored.
+    if !(full.is_absolute() || full.has_root()) || !exists(&full) {
         return None;
     }
-    Some(format!("file://{}", encode(&full.to_string_lossy())))
+    file_url(&full)
+}
+
+/// `X:\` or `X:/` at the start of a token.
+fn has_drive(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+/// Build the address from path components so separators and drive letters
+/// come out as `file:///C:/dir/file` on every platform.
+fn file_url(path: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+    let mut out = String::from("file://");
+    let mut any = false;
+    for part in path.components() {
+        match part {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(letter) => {
+                    out.push('/');
+                    out.push(letter as char);
+                    out.push(':');
+                    any = true;
+                }
+                _ => return None,
+            },
+            Component::Normal(name) => {
+                out.push('/');
+                out.push_str(&encode(&name.to_string_lossy()));
+                any = true;
+            }
+            _ => {}
+        }
+    }
+    if !any {
+        out.push('/');
+    }
+    Some(out)
 }
 
 /// Resolve `.` and `..` without touching the disk.
@@ -130,7 +176,7 @@ fn encode(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(byte as char)
             }
             other => out.push_str(&format!("%{other:02X}")),
@@ -196,5 +242,19 @@ mod tests {
         let found = find("../app/src/a b.rs ../app/src/é.rs", cwd, &mut |_| true);
         assert_eq!(found[0].url, "file:///work/app/src/a");
         assert_eq!(found[1].url, "file:///work/app/src/%C3%A9.rs");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_path_links_with_forward_slashes_and_shares_stay_unlinked() {
+        let cwd = Path::new(r"C:\work\app");
+        let found = find(
+            r"see C:\work\app\src\a.rs:4 and C:/work/app/src/é.rs",
+            cwd,
+            &mut |_| true,
+        );
+        assert_eq!(found[0].url, "file:///C:/work/app/src/a.rs");
+        assert_eq!(found[1].url, "file:///C:/work/app/src/%C3%A9.rs");
+        assert!(find(r"\\server\share\x", cwd, &mut |_| true).is_empty());
     }
 }
