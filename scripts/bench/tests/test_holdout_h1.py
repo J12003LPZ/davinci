@@ -456,6 +456,13 @@ class LeakScanReviewTests(unittest.TestCase):
             self.put(json.dumps({"cmd": "ls " + spelling}))
             self.assertEqual(h1.leak_scan(self.root, self.suite)["status"], "LEAK", spelling)
 
+    def test_msys_form_is_derived_from_any_windows_path(self):
+        self.assertEqual(h1.msys_form("D:\\vault\\suite"), "/d/vault/suite")
+        self.assertEqual(h1.msys_form("c:/Users/x y/suite"), "/c/Users/x y/suite")
+        self.assertIsNone(h1.msys_form("/home/x/suite"))
+        self.assertIsNone(h1.msys_form("relative\\path"))
+        self.assertIn("/d/vault/suite", h1._path_variants(Path("D:\\vault\\suite")))
+
     def test_nothing_scanned_is_not_clean(self):
         empty = Path(self.tmp.name) / "empty"
         empty.mkdir()

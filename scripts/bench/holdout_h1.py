@@ -266,11 +266,17 @@ def _lines(path):
         return []
 
 
+def msys_form(text):
+    """Git Bash and MSYS spell D:\\x\\y as /d/x/y. None when the path has no drive letter."""
+    match = re.match(r"([A-Za-z]):[/\\](.*)", text)
+    return "/%s/%s" % (match.group(1).lower(), match.group(2).replace("\\", "/")) if match else None
+
+
 def _path_variants(suite):
-    posix = suite.as_posix()
-    variants = {str(suite), posix}
-    if suite.drive:  # Git Bash and MSYS spell D:/x as /d/x
-        variants.add("/" + suite.drive[0] + posix[2:])
+    variants = {str(suite), suite.as_posix()}
+    msys = msys_form(str(suite))
+    if msys:
+        variants.add(msys)
     return variants
 
 
