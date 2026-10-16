@@ -604,8 +604,12 @@ def execute(command, workdir, env, timeout, *, agent=False):
         launcher = agent_boundary.active_launcher()
     else:
         launcher = None
-    measured = (_execute_container(command, workdir, env, timeout, target) if target
-                else _execute_native(command, workdir, env, timeout, launcher))
+    if target:
+        measured = _execute_container(command, workdir, env, timeout, target)
+    elif launcher is None:
+        measured = _execute_native(command, workdir, env, timeout)
+    else:
+        measured = _execute_native(command, workdir, env, timeout, launcher)
     if owner is not None and measured["cleanup_complete"] is True:
         owner.complete(token)
     return {**measured, "wall_s": time.perf_counter() - started,

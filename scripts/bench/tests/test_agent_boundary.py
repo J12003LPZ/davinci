@@ -78,6 +78,34 @@ class EnvironmentTests(unittest.TestCase):
                 ab.active_launcher()
 
 
+class ExecuteRoutingTests(unittest.TestCase):
+    """execute() must stay compatible with four-argument replacements of _execute_native unless a launcher is set."""
+
+    def run_execute(self, **kwargs):
+        import runner
+        calls = []
+
+        def fake(*args):
+            calls.append(args)
+            return {"exit": 0, "stdout": "", "stderr": "", "cleanup_complete": True}
+        with mock.patch.object(runner, "_execute_native", fake), mock.patch.object(runner, "_container_target", return_value=None),                 mock.patch.object(runner, "_campaign_owner", None):
+            runner.execute(["x"], ".", {}, 5, **kwargs)
+        return calls
+
+    def test_ordinary_runs_pass_four_arguments(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop(ab.ENV_BOUNDARY, None)
+            self.assertEqual([len(c) for c in self.run_execute()], [4])
+            self.assertEqual([len(c) for c in self.run_execute(agent=True)], [4])  # no boundary configured
+
+    def test_a_configured_boundary_passes_the_launcher_only_for_the_agent(self):
+        with mock.patch.dict(os.environ, {ab.ENV_BOUNDARY: ab.MODE}), mock.patch.object(ab.sys, "platform", "win32"):
+            self.assertEqual([len(c) for c in self.run_execute()], [4])  # graders and checks
+            calls = self.run_execute(agent=True)
+        self.assertEqual([len(c) for c in calls], [5])
+        self.assertIs(calls[0][4], ab.launch)
+
+
 class PermissionTests(unittest.TestCase):
     def test_lock_removes_inheritance_before_it_grants(self):
         first, second = ab.lock_commands(r"C:\v", r"PC\op")
