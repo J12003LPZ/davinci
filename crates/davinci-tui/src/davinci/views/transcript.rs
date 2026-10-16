@@ -855,9 +855,14 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
         }
         if !tally.is_empty() {
             let hint = if hidden == 0 || model.show_tool_output {
-                ""
+                String::new()
             } else {
-                " (ctrl+t to expand)"
+                let key = model
+                    .keybindings
+                    .keys_for("davinci.tools.expand")
+                    .first()
+                    .map_or("alt+o", String::as_str);
+                format!(" ({key} to expand)")
             };
             out.push(line(
                 format!("{ELBOW_GAP}{}{hint}", tally.join(" · ")),
@@ -1716,7 +1721,7 @@ mod tests {
         assert!(rows[0].contains("⎿") && rows[0].ends_with("Search(\"auth\")"));
         assert!(rows[2].ends_with("Read(c.rs)"));
         assert!(
-            rows[3].contains("+4 more tool uses · 23.4k tokens (ctrl+t to expand)"),
+            rows[3].contains("+4 more tool uses · 23.4k tokens (alt+o to expand)"),
             "{rows:?}"
         );
     }
@@ -1735,7 +1740,7 @@ mod tests {
         );
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[1].trim_end().ends_with("23.4k tokens"), "{rows:?}");
-        assert!(!rows[1].contains("ctrl+t"), "nothing hidden to expand");
+        assert!(!rows[1].contains("to expand"), "nothing hidden to expand");
         let thinking = drawn(
             &m,
             vec![worker("map auth", SubagentRowState::Running, 0, &[])],

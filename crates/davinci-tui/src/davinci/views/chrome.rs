@@ -174,8 +174,17 @@ fn conversation_status(model: &Model) -> Line<'static> {
         let noun = if agents == 1 { "agent" } else { "agents" };
         left.push(span(format!(" · ← {agents} {noun}"), cc.inactive));
     }
-    if let Some(jobs) = jobs_note(model) {
-        left.push(span(format!(" · {jobs}"), cc.inactive));
+    for (index, (label, _)) in footer_items(model).into_iter().enumerate() {
+        left.push(span(" · ", cc.inactive));
+        let mut item = span(label, cc.inactive);
+        if model.footer_focus == Some(index) {
+            item = span(item.content.to_string(), cc.permission);
+            item.style = item.style.add_modifier(Modifier::REVERSED);
+        }
+        left.push(item);
+    }
+    if model.footer_focus.is_some() {
+        left.push(span("  ←/→ choose · enter open · esc back", cc.inactive));
     }
     if let Some(pr) = pr_span(model) {
         left.push(span(" · ", cc.inactive));
@@ -943,6 +952,27 @@ pub fn disabled_composer(model: &Model, text: &str) -> Vec<Line<'static>> {
 /// What runs in the background: `1 job · 2 agents · 1 workflow`, like
 /// claude code's `N agents` footer. Nothing when nothing runs, so the bar
 /// says it only when there is something to know.
+/// The footer's focusable items — what runs in the background — each with the
+/// command that opens it.
+pub fn footer_items(model: &Model) -> Vec<(String, &'static str)> {
+    let count = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    [
+        (count(model.jobs_running, "job", "jobs"), "/jobs"),
+        (count(model.agents_running, "agent", "agents"), "/agents"),
+        (
+            count(model.workflows_running, "workflow", "workflows"),
+            "/workflows",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, command)| label.map(|label| (label, command)))
+    .collect()
+}
+
 fn jobs_note(model: &Model) -> Option<String> {
     let count = |n: usize, one: &str, many: &str| match n {
         0 => None,

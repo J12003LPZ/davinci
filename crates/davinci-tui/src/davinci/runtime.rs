@@ -837,6 +837,43 @@ impl Session {
         true
     }
 
+    /// A click on a settings row focuses it and cycles its value as enter
+    /// would; a click on a folded tool result opens the tool output.
+    fn click_list_row(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use super::model::Screen;
+        use event::{MouseButton::Left, MouseEventKind};
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse.modifiers.is_empty()
+            || model.overlay.is_some()
+            || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
+        {
+            return false;
+        }
+        let Some(row) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        if model.screen == Screen::Settings && model.settings_tab == 1 && !model.settings_details {
+            let hit = settings_row_at(model, row);
+            if let Some(index) = hit {
+                model.settings_index = index;
+                model.section_offset = None;
+                model.dirty = true;
+                self.injected.push_back(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+                return true;
+            }
+            return false;
+        }
+        if model.screen == Screen::Agent && !model.show_tool_output && row.contains("to expand)") {
+            model.show_tool_output = true;
+            model.dirty = true;
+            return true;
+        }
+        false
+    }
+
     /// Open the link under a Ctrl- or Cmd-click. `true` when there was one.
     fn open_link_at(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
         use event::{MouseButton::Left, MouseEventKind};
@@ -875,7 +912,7 @@ impl Session {
         if !env_flag("DAVINCI_DISABLE_HYPERLINKS") && self.open_link_at(model, mouse) {
             return false;
         }
-        if self.click_ask_option(model, mouse) {
+        if self.click_ask_option(model, mouse) || self.click_list_row(model, mouse) {
             self.selector.clear();
             return false;
         }
@@ -1206,6 +1243,18 @@ fn write_hyperlink<W: Write>(
     write!(backend, "\x1b]8;;\x1b\\")
 }
 
+/// The visible settings row whose label a drawn row shows, the longest label
+/// winning so "Theme" does not take a click meant for "Theme extras".
+fn settings_row_at(model: &Model, row: &str) -> Option<usize> {
+    super::views::settings::visible_indices(model)
+        .into_iter()
+        .filter(|&i| {
+            let label = model.settings_rows[i].label.trim();
+            !label.is_empty() && row.contains(label)
+        })
+        .max_by_key(|&i| model.settings_rows[i].label.trim().len())
+}
+
 /// The option of an open question that a drawn row shows: the longest label
 /// found on it, so "Yes" does not win over "Yes, and don't ask again".
 fn ask_option_at(items: &[super::model::PickerItem], row: &str) -> Option<usize> {
@@ -1378,6 +1427,26 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_row_is_found_by_its_longest_label() {
+        use super::super::model::SettingRow;
+        let mut model = Model::new(
+            super::super::theme::Theme::da_vinci(super::super::theme::ColorDepth::TrueColor, false),
+            80,
+            24,
+            false,
+        );
+        let row = |label: &str, key: &str| SettingRow {
+            label: label.into(),
+            key: key.into(),
+            ..SettingRow::default()
+        };
+        model.settings_rows = vec![row("Theme", "theme"), row("Theme extras", "themeExtras")];
+        assert_eq!(settings_row_at(&model, "  Theme extras   on"), Some(1));
+        assert_eq!(settings_row_at(&model, "  Theme   dark"), Some(0));
+        assert_eq!(settings_row_at(&model, "  Unrelated"), None);
+    }
 
     #[test]
     fn with_auto_scroll_off_new_output_leaves_the_view_where_it_was() {

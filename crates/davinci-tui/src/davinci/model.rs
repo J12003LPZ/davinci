@@ -2970,6 +2970,8 @@ pub struct Model {
     pub history_store: Option<crate::history_store::HistoryStore>,
     /// The Ctrl+R search over earlier prompts, while it is open.
     pub history_search: Option<HistorySearch>,
+    /// The footer item holding keyboard focus (down from an empty prompt).
+    pub footer_focus: Option<usize>,
     /// The pull request for this branch, when `gh` found one.
     pub pr_badge: Option<PrBadge>,
     /// When ctrl+d was last pressed on an empty composer: a second press
@@ -3495,6 +3497,7 @@ impl Model {
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
             history_search: None,
+            footer_focus: None,
             pr_badge: None,
             quit_armed: None,
             terminal_task: None,

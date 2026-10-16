@@ -1029,6 +1029,49 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
 /// run and never the app (design.md §6).
+/// The footer as a focus owner: down from an empty prompt enters it, left
+/// and right choose among what runs in the background, enter opens it and
+/// esc (or up) goes back to the prompt. Any other key leaves and is handled
+/// as usual (`None`).
+fn handle_footer_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    let plain = key.modifiers.is_empty();
+    let items = chrome::footer_items(model);
+    let Some(focus) = model.footer_focus else {
+        let enters = plain
+            && key.code == KeyCode::Down
+            && !items.is_empty()
+            && model.screen == Screen::Agent
+            && model.overlay.is_none()
+            && model.composer.is_empty()
+            && model.suggestions.is_none()
+            && !model.shortcuts_open;
+        if enters {
+            model.footer_focus = Some(0);
+            return Some(Flow::Continue);
+        }
+        return None;
+    };
+    if items.is_empty() {
+        model.footer_focus = None;
+        return None;
+    }
+    let focus = focus.min(items.len() - 1);
+    match key.code {
+        KeyCode::Left if plain => model.footer_focus = Some(focus.saturating_sub(1)),
+        KeyCode::Right if plain => model.footer_focus = Some((focus + 1).min(items.len() - 1)),
+        KeyCode::Enter if plain => {
+            model.footer_focus = None;
+            return Some(Flow::Submit(items[focus].1.to_owned()));
+        }
+        KeyCode::Esc | KeyCode::Up => model.footer_focus = None,
+        _ => {
+            model.footer_focus = None;
+            return None;
+        }
+    }
+    Some(Flow::Continue)
+}
+
 /// Keys while the transcript viewer is open.
 fn handle_viewer_key(model: &mut Model, key: KeyEvent) -> Flow {
     use super::views::viewer::{self, Outcome};
@@ -1138,6 +1181,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     }
     if model.history_search.is_some() {
         return handle_history_search_key(model, key);
+    }
+    if let Some(flow) = handle_footer_key(model, key) {
+        return flow;
     }
     if key.code == KeyCode::Char('r')
         && key.modifiers == KeyModifiers::CONTROL
@@ -5099,6 +5145,41 @@ mod scroll_to_entry_tests {
         );
         let shown = rows(&m).join("\n");
         assert!(shown.contains("PR #42"), "{shown}");
+    }
+
+    #[test]
+    fn down_from_an_empty_prompt_walks_the_footer_and_enter_opens_the_item() {
+        let mut m = chat(24, 6);
+        // Nothing runs, so there is no footer item to enter.
+        assert_eq!(
+            handle_key(&mut m, KeyEvent::from(KeyCode::Down)),
+            Flow::Continue
+        );
+        assert_eq!(m.footer_focus, None);
+        m.jobs_running = 1;
+        m.agents_running = 2;
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        assert_eq!(m.footer_focus, Some(0));
+        let shown = rows(&m).join("\n");
+        assert!(
+            shown.contains("1 job") && shown.contains("2 agents"),
+            "{shown}"
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Right));
+        assert_eq!(m.footer_focus, Some(1));
+        assert_eq!(
+            handle_key(&mut m, KeyEvent::from(KeyCode::Enter)),
+            Flow::Submit("/agents".into())
+        );
+        assert_eq!(m.footer_focus, None);
+        // Esc goes back to the prompt; typing leaves and types.
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(m.footer_focus, None);
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(m.footer_focus, None);
+        assert_eq!(m.composer.editor().get_text(), "h");
     }
 
     #[test]
