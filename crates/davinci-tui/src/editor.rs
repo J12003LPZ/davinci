@@ -104,6 +104,15 @@ impl Editor {
         self.last_width.set(width.max(1));
     }
 
+    /// The buffer as visual rows at `width` cells, the same rows Up and Down
+    /// move between: `(logical line, first byte, byte length)` per row.
+    pub fn visual_rows(&self, width: usize) -> Vec<(usize, usize, usize)> {
+        self.build_visual_line_map(width.max(1))
+            .into_iter()
+            .map(|row| (row.logical_line, row.start_col, row.length))
+            .collect()
+    }
+
     pub fn get_text(&self) -> &str {
         &self.buffer
     }

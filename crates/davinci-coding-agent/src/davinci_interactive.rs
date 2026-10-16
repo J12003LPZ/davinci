@@ -1746,7 +1746,10 @@ fn run_turn(
             if worker.is_finished() {
                 break;
             }
-            if let Some(event) = session.poll_event(Duration::from_millis(40))? {
+            if let Some(event) = session
+                .poll_event(Duration::from_millis(40))?
+                .and_then(|event| session.claim_selection_key(model, event))
+            {
                 model.dirty = true;
                 match event {
                     crossterm::event::Event::Key(key)
@@ -3519,7 +3522,10 @@ fn resolve_scope_expansion_modal(
             session.draw(model)?;
             model.dirty = false;
         }
-        let Some(event) = session.poll_event(Duration::from_millis(40))? else {
+        let Some(event) = session
+            .poll_event(Duration::from_millis(40))?
+            .and_then(|event| session.claim_selection_key(model, event))
+        else {
             continue;
         };
         model.dirty = true;
@@ -4069,10 +4075,12 @@ pub fn perform(
             Ok(Done::Said(format!("imported {}", session_id(agent))))
         }
         SlashAction::Copy => match agent.last_assistant_text() {
-            Some(text) => {
-                davinci_tui::copy_text(&text);
-                Ok(Done::Said("copied the last reply to the clipboard".into()))
-            }
+            Some(text) => match davinci_tui::try_copy_text(&text) {
+                Ok(path) => Ok(Done::Said(format!(
+                    "copied the last reply to the clipboard ({path})"
+                ))),
+                Err(err) => Ok(Done::Note(format!("clipboard copy failed: {err}"))),
+            },
             None => Ok(Done::Note("no agent messages to copy yet".into())),
         },
         SlashAction::Share => Ok(Done::Said(crate::share_current_session(agent)?)),
@@ -4815,6 +4823,7 @@ pub fn run(
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
     terminal.set_native_cursor(stored_settings.show_hardware_cursor.unwrap_or(false));
+    terminal.set_copy_on_select(stored_settings.fullscreen_copy_on_select.unwrap_or(true));
     crate::startup_mark("shell: terminal open");
     let mut first_frame = true;
     // From here the alternate screen is ours, so a `println!` from shared code
@@ -5133,7 +5142,10 @@ pub fn run(
         } else {
             davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed())
         };
-        match terminal.poll_event(timeout) {
+        match terminal
+            .poll_event(timeout)
+            .map(|event| event.and_then(|event| terminal.claim_selection_key(&mut model, event)))
+        {
             Ok(Some(event)) => {
                 model.dirty = true;
                 match event {
@@ -8859,7 +8871,10 @@ impl Shell<'_> {
                 if worker.is_finished() {
                     break;
                 }
-                match terminal.poll_event(Duration::from_millis(40)) {
+                match terminal
+                    .poll_event(Duration::from_millis(40))
+                    .map(|event| event.and_then(|event| terminal.claim_selection_key(model, event)))
+                {
                     Ok(Some(crossterm::event::Event::Key(key)))
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {

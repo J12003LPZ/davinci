@@ -171,7 +171,16 @@ fn conversation_status(model: &Model) -> Line<'static> {
     if let Some(jobs) = jobs_note(model) {
         left.push(span(format!(" · {jobs}"), cc.inactive));
     }
-    let right = if model.context_fraction() >= 0.8 && model.width >= 80 {
+    let toast = model.toast.as_ref().filter(|(_, at)| {
+        at.elapsed() < std::time::Duration::from_secs(crate::davinci::model::TOAST_SECONDS)
+    });
+    let right = if let Some((note, _)) = toast {
+        let room = usize::from(model.width / 2);
+        vec![span(
+            format!("{} ", super::super::ui::clip_ellipsis(note, room as u16)),
+            cc.inactive,
+        )]
+    } else if model.context_fraction() >= 0.8 && model.width >= 80 {
         vec![span(
             format!("{}% context ", (model.context_fraction() * 100.0) as u32),
             cc.auto_mode,
@@ -524,7 +533,10 @@ pub fn composer_with_caret(
     let th = &model.theme;
     let cc = th.cc();
     let editor = model.composer.editor();
-    editor.set_layout_width(usize::MAX);
+    // Long lines wrap onto further rows rather than scrolling sideways, and
+    // the editor moves Up and Down across exactly these rows.
+    let wrap = usize::from(model.width.saturating_sub(4)).max(1);
+    editor.set_layout_width(wrap);
     editor.set_terminal_rows(model.height as usize);
 
     if model.screen == Screen::Memoria {
@@ -545,7 +557,6 @@ pub fn composer_with_caret(
     let owned = lines.map(<[String]>::to_vec);
     let entries: Vec<String> =
         owned.unwrap_or_else(|| model.composer.split('\n').map(str::to_string).collect());
-    let last = entries.len().saturating_sub(1);
     let overlaid = !model.composer_owns_focus();
     let shell_mode = model.screen == Screen::Agent && model.composer.starts_with('!');
     let border = if shell_mode {
@@ -585,6 +596,9 @@ pub fn composer_with_caret(
     } else {
         None
     };
+    let map = lines.is_none().then(|| editor.visual_rows(wrap));
+    let (entries, caret_at) = wrap_rows(&entries, wrap, caret_at, map);
+    let last = entries.len().saturating_sub(1);
     let caret_row = caret_at.map_or(last, |(row, _)| row.min(last));
     let mut caret_cell: Option<(usize, u16)> = None;
     let visible = (model.height as usize / 3).clamp(1, 8);
@@ -615,7 +629,9 @@ pub fn composer_with_caret(
         } else {
             raw_entry
         };
-        let (shown, column) = composer_view(&entry, column, model.width.saturating_sub(6));
+        // Rows already fit the wrap width; the clip only guards a single
+        // grapheme wider than the whole window.
+        let (shown, column) = composer_view(&entry, column, model.width.saturating_sub(3));
         let split = column.and_then(|col| split_at_caret(&shown, col));
         let caret_here = split.is_some();
         // The caret of an empty composer sits on the placeholder's first
@@ -715,6 +731,54 @@ pub fn composer_with_caret(
         rows.push(hint_line(model, hint, rows_typed));
     }
     (rows, caret_cell)
+}
+
+/// Logical lines as visual rows `width` cells wide, with the caret moved
+/// from `(logical line, byte)` to `(visual row, byte within it)`. `map` is
+/// the editor's own row map when the rows are its buffer; other text (queued
+/// messages above the draft) is word-wrapped here the same way.
+fn wrap_rows(
+    entries: &[String],
+    width: usize,
+    caret: Option<(usize, usize)>,
+    map: Option<Vec<(usize, usize, usize)>>,
+) -> (Vec<String>, Option<(usize, usize)>) {
+    let map = map.unwrap_or_else(|| {
+        entries
+            .iter()
+            .enumerate()
+            .flat_map(|(line, text)| {
+                crate::word_wrap::word_wrap_line(text, width, None)
+                    .into_iter()
+                    .map(move |chunk| {
+                        (line, chunk.start_index, chunk.end_index - chunk.start_index)
+                    })
+            })
+            .collect()
+    });
+    let rows = map
+        .iter()
+        .map(|&(line, start, len)| {
+            entries
+                .get(line)
+                .and_then(|text| text.get(start..start + len))
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let caret = caret.and_then(|(line, column)| {
+        let index = map
+            .iter()
+            .enumerate()
+            .position(|(index, &(at, start, len))| {
+                let last_of_line = map.get(index + 1).is_none_or(|next| next.0 != at);
+                at == line
+                    && column >= start
+                    && (column < start + len || (last_of_line && column == start + len))
+            })?;
+        Some((index, column - map[index].1))
+    });
+    (rows, caret)
 }
 
 fn known_command(model: &Model, entry: &str) -> Option<String> {
@@ -1697,6 +1761,67 @@ mod tests {
         assert_eq!(thousands(200_000), "200k");
         assert_eq!(thousands(1_200_000), "1.2m");
         assert_eq!(thousands(18_402_000), "18m");
+    }
+
+    #[test]
+    fn a_long_prompt_wraps_onto_rows_instead_of_scrolling_sideways() {
+        for width in [24u16, 40, 80] {
+            let mut m = model(width);
+            let words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+            m.type_char(words);
+            let (rows, caret) = composer_with_caret(&m, None, Hint::None);
+            let first = rows
+                .iter()
+                .position(|row| text(row).starts_with('❯'))
+                .unwrap();
+            let typed: Vec<String> = rows[first..]
+                .iter()
+                .map(text)
+                .take_while(|row| !row.starts_with('─'))
+                .collect();
+            assert!(typed.len() > 1 || width == 80, "{width}: {typed:?}");
+            assert!(rows.iter().all(|row| line_width(row) <= width), "{width}");
+            assert!(
+                !typed.iter().any(|row| row.contains('…')),
+                "{width}: {typed:?}"
+            );
+            let joined: Vec<&str> = typed
+                .iter()
+                .flat_map(|row| row.trim_start_matches('❯').split_whitespace())
+                .collect();
+            assert_eq!(joined.join(" "), words, "{width}");
+            let (row, _) = caret.expect("caret");
+            assert!(text(&rows[row]).trim_end().ends_with("mu"), "{width}");
+        }
+    }
+
+    #[test]
+    fn up_moves_within_a_wrapped_prompt_before_reaching_history() {
+        let mut m = model(24);
+        m.composer.editor_mut().add_to_history("earlier prompt");
+        m.type_char("alpha beta gamma delta epsilon zeta");
+        let _ = composer_with_caret(&m, None, Hint::None);
+        m.composer.editor_mut().cursor_up();
+        assert_eq!(
+            m.composer.editor().get_text(),
+            "alpha beta gamma delta epsilon zeta",
+            "the first Up stays in the prompt"
+        );
+        let (rows, caret) = composer_with_caret(&m, None, Hint::None);
+        let (row, _) = caret.unwrap();
+        assert!(text(&rows[row]).starts_with('❯'), "on the first row now");
+    }
+
+    #[test]
+    fn a_fresh_toast_takes_the_footer_corner_and_an_old_one_gives_it_back() {
+        let mut m = model(100);
+        m.toast = Some(("copied 7 chars · wl-copy".into(), std::time::Instant::now()));
+        assert!(text(&status(&m)).ends_with("copied 7 chars · wl-copy "));
+        m.toast = Some((
+            "copied 7 chars · wl-copy".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        ));
+        assert!(!text(&status(&m)).contains("copied"));
     }
 
     #[test]

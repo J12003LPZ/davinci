@@ -2682,6 +2682,9 @@ pub struct Startup {
 
 /// Where the session lives, and what it costs. Every field here is shown as a
 /// meter or a labelled unit, never as a bare number (design.md §9).
+/// How long a footer toast stays.
+pub const TOAST_SECONDS: u64 = 4;
+
 #[derive(Debug, Clone)]
 pub struct Model {
     pub width: u16,
@@ -2713,6 +2716,9 @@ pub struct Model {
     /// (`showHardwareCursor`, `DAVINCI_NATIVE_CURSOR`). Its shape and blink
     /// are then the terminal's settings, not ours.
     pub native_cursor: bool,
+    /// A short note in the footer's right corner, such as which way a copy
+    /// went. It shows for [`TOAST_SECONDS`] and then gives the corner back.
+    pub toast: Option<(String, std::time::Instant)>,
     /// The typewriter on the newest reply, when one is being written.
     pub reveal: Option<Reveal>,
     /// When the reveal last stepped; the step is sized from real time.
@@ -3201,6 +3207,7 @@ impl Model {
             caret_blink: false,
             terminal_focused: true,
             native_cursor: false,
+            toast: None,
             reveal: None,
             reveal_clock: None,
             reveal_floor: None,

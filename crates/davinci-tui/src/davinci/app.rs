@@ -257,6 +257,32 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     }
 }
 
+/// Plain text of conversation rows `range`, banner first, laid out exactly as
+/// [`conversation_body`] lays them out for a scrolling conversation. A
+/// selection held in conversation rows reads its text here, including rows
+/// scrolled out of view.
+pub fn conversation_text(model: &Model, range: std::ops::Range<usize>) -> Vec<String> {
+    let drawn = model.width >= scrollbar::MIN_WIDTH;
+    let width = if drawn { model.width - 1 } else { model.width };
+    let mut head = vec![blank()];
+    head.extend(startup::banner(model, &model.startup));
+    head.push(blank());
+    let conversation = transcript::conversation_rows(model, width);
+    let split = head.len();
+    let total = split + conversation.len();
+    let range = range.start.min(total)..range.end.min(total);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(range.len());
+    if range.start < split {
+        out.extend_from_slice(&head[range.start..range.end.min(split)]);
+    }
+    if range.end > split {
+        out.extend(conversation.slice(range.start.max(split) - split..range.end - split));
+    }
+    out.into_iter()
+        .map(|line| Line::from(ui::truncate_run(line.spans, width)).to_string())
+        .collect()
+}
+
 /// The conversation, scrolled to `model.transcript_scroll`, with its
 /// scrollbar in the last column once it outgrows `height`. The banner leads
 /// the conversation, so scrolling to the top reaches it, as in a terminal's

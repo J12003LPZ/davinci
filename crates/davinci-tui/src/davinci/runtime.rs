@@ -360,8 +360,7 @@ pub struct Session {
     keyboard: Keyboard,
     paste: PasteFilter,
     rendered_lines: Vec<String>,
-    selection_anchor: Option<(u16, u16)>,
-    selection_focus: Option<(u16, u16)>,
+    selector: super::selection::Selector,
     /// While the conversation's scrollbar is held: the thumb row grabbed.
     scrollbar_grab: Option<u16>,
     /// The conversation's scrollbar as last drawn, for hit-testing the
@@ -473,8 +472,7 @@ impl Session {
                 ..PasteFilter::default()
             },
             rendered_lines: Vec::new(),
-            selection_anchor: None,
-            selection_focus: None,
+            selector: super::selection::Selector::default(),
             scrollbar_grab: None,
             scrollbar: None,
             focused: true,
@@ -649,7 +647,8 @@ impl Session {
         let background = Style::default().bg(model.theme.background);
         let mut rendered_lines = Vec::new();
         let mut scrollbar = None;
-        let selection = self.selection_range();
+        let selection_bg = model.theme.cc().selection_bg;
+        let selector = &mut self.selector;
         self.terminal.draw(|frame| {
             let area: Rect = frame.area();
             let composed = app::compose_frame(model, area.height);
@@ -659,21 +658,22 @@ impl Session {
             if let Some(bar) = &scrollbar {
                 strip_scrollbar(&mut rendered_lines, bar);
             }
+            selector.view = scrollbar
+                .as_ref()
+                .map(super::selection::View::from_scrollbar);
             frame.render_widget(Paragraph::new(composed.lines).style(background), area);
-            if let Some((start, end)) = selection {
-                for row in start.1..=end.1.min(area.height.saturating_sub(1)) {
-                    let left = if row == start.1 { start.0 } else { 0 };
-                    let right = if row == end.1 {
-                        end.0.saturating_add(1).min(area.width)
-                    } else {
-                        area.width
-                    };
-                    if right > left {
-                        frame.buffer_mut().set_style(
-                            Rect::new(left, row, right.saturating_sub(left), 1),
-                            Style::default().add_modifier(Modifier::REVERSED),
-                        );
-                    }
+            // Selected cells keep their own ink over the selection ground;
+            // with no colour at all they are drawn reversed.
+            let style = if selection_bg == ratatui::style::Color::Reset {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().bg(selection_bg)
+            };
+            for (row, left, right) in selector.highlights(&rendered_lines, area.width) {
+                if row < area.height {
+                    frame
+                        .buffer_mut()
+                        .set_style(Rect::new(left, row, right - left, 1), style);
                 }
             }
         })?;
@@ -683,70 +683,61 @@ impl Session {
         Ok(())
     }
 
-    fn selection_range(&self) -> Option<((u16, u16), (u16, u16))> {
-        selection_span(self.selection_anchor?, self.selection_focus?)
+    /// Copy on release, as the reference terminal does: text selected with
+    /// the pointer is on the clipboard the moment the button comes up.
+    pub fn set_copy_on_select(&mut self, enabled: bool) {
+        self.selector.copy_on_select = enabled;
     }
 
-    /// Own left-drag selection while mouse reporting is enabled. Releasing the
-    /// button copies immediately, matching the upstream fullscreen terminal.
-    pub fn handle_mouse(&mut self, mouse: event::MouseEvent) -> bool {
-        use event::{MouseButton::Left, MouseEventKind};
-        let point = (mouse.column, mouse.row);
-        match mouse.kind {
-            MouseEventKind::Down(Left) => {
-                self.selection_anchor = Some(point);
-                self.selection_focus = Some(point);
-                false
-            }
-            MouseEventKind::Drag(Left) if self.selection_anchor.is_some() => {
-                self.selection_focus = Some(point);
-                false
-            }
-            MouseEventKind::Up(Left) if self.selection_anchor.is_some() => {
-                self.selection_focus = Some(point);
-                if let Some(text) = self.selected_text() {
-                    crate::open_browser::copy_text(&text);
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
-    /// Graph interaction shares the composed geometry while other surfaces retain native text selection.
+    /// Graph and scrollbar interaction take the pointer first; everything
+    /// else selects text.
     pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use event::MouseEventKind;
         if route_graph_mouse(model, mouse)
             || route_scroll_mouse(model, &mut self.scrollbar_grab, self.scrollbar, mouse)
         {
-            self.selection_anchor = None;
-            self.selection_focus = None;
+            // A selection held in conversation rows survives the wheel; one
+            // held in screen rows would now cover different text.
+            let wheel = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            let anchored = self
+                .selector
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.space == super::selection::Space::Conversation);
+            if !(wheel && anchored) {
+                self.selector.clear();
+            }
             return false;
         }
-        self.handle_mouse(mouse)
+        if let Some(text) = self
+            .selector
+            .mouse(model, &self.rendered_lines, mouse, Instant::now())
+        {
+            copy_to_clipboard(model, &text);
+        }
+        false
     }
 
-    fn selected_text(&self) -> Option<String> {
-        let (start, end) = self.selection_range()?;
-        if start == end {
-            return None;
+    /// Give a key to the selection first. Copy keys and shifted motions are
+    /// taken (`None`); any other key comes back for the shell, after clearing
+    /// the selection unless it is one that keeps it.
+    pub fn claim_selection_key(&mut self, model: &mut Model, event: Event) -> Option<Event> {
+        let Event::Key(key) = &event else {
+            return Some(event);
+        };
+        match self.selector.key(model, &self.rendered_lines, key) {
+            super::selection::KeyOutcome::Pass => Some(event),
+            super::selection::KeyOutcome::Taken(text) => {
+                if let Some(text) = text {
+                    copy_to_clipboard(model, &text);
+                }
+                model.dirty = true;
+                None
+            }
         }
-        let mut rows = Vec::new();
-        for row in start.1..=end.1 {
-            let line = self
-                .rendered_lines
-                .get(row as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            let from = if row == start.1 { start.0 as usize } else { 0 };
-            let to = if row == end.1 {
-                end.0.saturating_add(1) as usize
-            } else {
-                usize::MAX
-            };
-            rows.push(display_column_slice(line, from, to).trim_end().to_string());
-        }
-        let text = rows.join("\n");
-        (!text.is_empty()).then_some(text)
     }
 
     pub fn input_pending(&self) -> bool {
@@ -785,18 +776,21 @@ impl Drop for Session {
     }
 }
 
-/// The selected span, start first. A press that has not been dragged is a
-/// click, not a selection: nothing is highlighted, so a click does not leave
-/// a reversed cell behind that reads as a second cursor.
-fn selection_span(anchor: (u16, u16), focus: (u16, u16)) -> Option<((u16, u16), (u16, u16))> {
-    if anchor == focus {
-        return None;
-    }
-    Some(if (anchor.1, anchor.0) <= (focus.1, focus.0) {
-        (anchor, focus)
-    } else {
-        (focus, anchor)
-    })
+/// Put `text` on the clipboard and say, briefly, which way it went.
+fn copy_to_clipboard(model: &mut Model, text: &str) {
+    let note = match crate::open_browser::try_copy_text(text) {
+        Ok(path) => {
+            let chars = text.chars().count();
+            let path = path.strip_prefix("copied via ").unwrap_or("dry run");
+            format!(
+                "copied {chars} {} · {path}",
+                if chars == 1 { "char" } else { "chars" }
+            )
+        }
+        Err(err) => format!("copy failed: {err}"),
+    };
+    model.toast = Some((note, Instant::now()));
+    model.dirty = true;
 }
 
 /// The wheel scrolls the conversation, or steps a list like the arrow
@@ -906,7 +900,10 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
         }
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
-        if let Some(event) = session.poll_event(timeout)? {
+        if let Some(event) = session
+            .poll_event(timeout)?
+            .and_then(|event| session.claim_selection_key(model, event))
+        {
             model.dirty |= event_marks_dirty(&event);
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -1019,13 +1016,6 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::NONE,
         ))));
-    }
-
-    #[test]
-    fn a_click_without_a_drag_highlights_nothing() {
-        assert_eq!(selection_span((7, 3), (7, 3)), None);
-        assert_eq!(selection_span((7, 3), (9, 3)), Some(((7, 3), (9, 3))));
-        assert_eq!(selection_span((9, 4), (2, 3)), Some(((2, 3), (9, 4))));
     }
 
     #[test]

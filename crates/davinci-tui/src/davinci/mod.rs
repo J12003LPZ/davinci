@@ -13,6 +13,7 @@ pub mod model;
 mod paste_burst;
 pub mod runtime;
 pub mod sanitize;
+pub mod selection;
 pub mod term;
 pub mod theme;
 pub mod ui;

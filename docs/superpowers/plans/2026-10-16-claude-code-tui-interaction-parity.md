@@ -198,7 +198,7 @@ this audit:
 | Item | Reference [B] | DaVinci | Gap |
 | --- | --- | --- | --- |
 | Working glyph cycle | `· ✢ * ✶ ✻ ✽` forward then reversed (12 steps, ends doubled); on `TERM=xterm-ghostty` `✳` replaces `*` | `·✢*✶✻✽` ping-pong over 10 steps at 250 ms (`views/opera.rs:17`) | S |
-| Stall color | Spinner color blends toward `error` as a stall intensity rises; above 0.5 it switches to `error` | Not modeled | S |
+| Stall color | Spinner color blends toward `error` as a stall intensity rises; above 0.5 it switches to `error` | Already modeled: a quiet turn warms the spinner toward the error ink (`views/opera.rs`, test `a_quiet_turn_warms_the_spinner_toward_the_error_ink`) | — |
 | Breathing dot | Cosine pulse (`(1-cos 2πt/T)/2`) for idle/teammate dots, bold above half | `breath()` helper exists (`views/opera.rs:79`) | — |
 | Theme set | `dark`, `light`, `dark-daltonized`, `light-daltonized`, `dark-ansi`, `light-ansi`, `auto` (OSC 11 + mode 2031), custom themes | dark/light/vox/vox-classic, `NO_COLOR`, color-depth fallback (`davinci/term.rs`) | M (daltonized + ANSI-only + auto) |
 | Selection, user-message, bash-message backgrounds | `selectionBg`, `userMessageBackground` `rgb(55,55,55)`, `bashMessageBackgroundColor` `rgb(65,60,65)` (dark) | Partially in `Cc` | S |
@@ -373,6 +373,21 @@ of recomposing per wheel event, and add a frame-time debug counter.
 pipeline, and conflicts with DaVinci's pinned composer and graph surfaces.
 Revisit only if users ask for native scrollback; T12's `[` covers the main
 need. Screen-reader mode can reuse T2's native cursor instead.
+
+## 5a. Implementation status (branch `claude/dazzling-shannon-st9ndv`)
+
+Decisions taken on "go ahead" without explicit answers: the recommended
+defaults in section 8 (steady caret with a `caretBlink` setting; keymap left
+for T10; no classic renderer).
+
+| Task | Status | Notes |
+| --- | --- | --- |
+| T1 | Done, narrowed | Every frame is wrapped in mode 2026 (`DAVINCI_SYNC_OUTPUT=0` opts out). No startup DECRQM probe: terminals without the mode ignore it, and a probe reply would arrive through crossterm's input reader as stray keys. `DAVINCI_FULL_REPAINT=1` added. No new pacer: the host loops already draw at most once per 40 ms poll during a turn and immediately after a key. |
+| T2 | Done | Steady painted caret; `caretBlink` setting; focus events (1004) hide it in a background window; the hidden cursor is parked on the caret each frame; `showHardwareCursor` / `DAVINCI_NATIVE_CURSOR=1` show the terminal's own cursor instead. |
+| T3 | Done | `davinci/selection.rs`: selections started in the conversation are held in conversation rows, survive scrolling, copy rows scrolled out of view, and are painted with `Cc::selection_bg` (reversed under `NO_COLOR`). |
+| T4 | Done | Double-click word (paths and URLs whole), triple-click row, word/row drag, drag past the edge scrolls, Shift+arrows/Home/End extend, Ctrl+Shift+C copies, Ctrl+C copies instead of interrupting, Esc/PgUp/PgDn/modified motions keep the selection, other keys clear it. |
+| T5 | Done | `clipboard.rs`: OSC 52 over SSH (tmux/screen wrapped, skipped for VTE and non-TTY), `pbcopy`, `wl-copy`, `xclip`, `xsel` (+ PRIMARY), PowerShell `Set-Clipboard` before `clip` on Windows/WSL, tmux buffer. Footer toast names the path. `fullscreenCopyOnSelect` now reaches the live shell. `/copy` reports a failed copy. |
+| T6 | Done | The composer word-wraps at the window width using the shared editor's own visual-row map, so drawing and Up/Down agree. |
 
 ## 6. Recommended order and sizing
 

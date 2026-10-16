@@ -6,6 +6,7 @@ mod ansi;
 mod autocomplete;
 mod box_comp;
 mod chrome;
+pub mod clipboard;
 mod config_selector;
 mod container;
 mod custom_message;

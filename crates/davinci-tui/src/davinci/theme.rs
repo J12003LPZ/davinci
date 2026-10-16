@@ -450,6 +450,9 @@ pub struct Cc {
     /// alike in any theme. Reset on a palette with no colour, where each
     /// category's glyph tells them apart.
     pub category: [Color; 6],
+    /// Background under selected text. The foreground keeps its own ink.
+    /// Reset where there is no colour: the selection is drawn reversed.
+    pub selection_bg: Color,
 }
 
 const CC_DARK: Cc = Cc {
@@ -485,6 +488,7 @@ const CC_DARK: Cc = Cc {
         rgb(0x4DD0E1),
         rgb(0xD77757),
     ],
+    selection_bg: rgb(0x264F78),
 };
 
 const CC_DARK_256: Cc = Cc {
@@ -520,6 +524,7 @@ const CC_DARK_256: Cc = Cc {
         Color::Indexed(80),
         Color::Indexed(173),
     ],
+    selection_bg: Color::Indexed(24),
 };
 
 const CC_LIGHT: Cc = Cc {
@@ -555,6 +560,7 @@ const CC_LIGHT: Cc = Cc {
         rgb(0x0C8599),
         rgb(0xD9480F),
     ],
+    selection_bg: rgb(0xB4D5FF),
 };
 
 const CC_LIGHT_256: Cc = Cc {
@@ -590,6 +596,7 @@ const CC_LIGHT_256: Cc = Cc {
         Color::Indexed(31),
         Color::Indexed(166),
     ],
+    selection_bg: Color::Indexed(153),
 };
 
 /// Vox conversation colors: mustard identity, navy user strip, cyan and
@@ -627,6 +634,7 @@ const CC_VOX: Cc = Cc {
         rgb(0x20C9D6),
         rgb(0xE8604A),
     ],
+    selection_bg: rgb(0x264F78),
 };
 
 const CC_VOX_256: Cc = Cc {
@@ -662,6 +670,7 @@ const CC_VOX_256: Cc = Cc {
         Color::Indexed(44),
         Color::Indexed(203),
     ],
+    selection_bg: Color::Indexed(24),
 };
 
 const CC_BASIC: Cc = Cc {
@@ -697,6 +706,7 @@ const CC_BASIC: Cc = Cc {
         Color::Cyan,
         Color::LightRed,
     ],
+    selection_bg: Color::Blue,
 };
 
 const CC_NONE: Cc = Cc {
@@ -725,6 +735,7 @@ const CC_NONE: Cc = Cc {
     code_string: Color::Reset,
     code_macro: Color::Reset,
     category: [Color::Reset; 6],
+    selection_bg: Color::Reset,
 };
 
 impl Theme {
