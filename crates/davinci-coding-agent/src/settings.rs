@@ -436,6 +436,10 @@ pub struct Settings {
     /// Blink the painted composer caret. Off by default: a steady caret.
     #[serde(default, rename = "caretBlink")]
     pub caret_blink: Option<bool>,
+    /// Keep the conversation pinned to the newest output while a turn
+    /// streams. On by default; off leaves the view where it is.
+    #[serde(default, rename = "autoScroll")]
+    pub auto_scroll: Option<bool>,
     #[serde(default)]
     pub warnings: WarningSettings,
     #[serde(default, rename = "externalEditor")]

@@ -2709,6 +2709,9 @@ pub struct Model {
     /// The stored `caretBlink` setting. Off by default: the reference terminal
     /// draws a steady caret, and a blinking one costs a redraw every phase.
     pub caret_blink: bool,
+    /// The stored `autoScroll` setting: follow the newest output as it
+    /// arrives. When off, a view at the newest stays where it was.
+    pub auto_scroll: bool,
     /// Whether the terminal last reported focus (DEC mode 1004). A window in
     /// the background shows no caret, so the active window is unambiguous.
     pub terminal_focused: bool,
@@ -3355,6 +3358,7 @@ impl Model {
             section_notice: None,
             caret_moved_at: 0,
             caret_blink: false,
+            auto_scroll: true,
             terminal_focused: true,
             native_cursor: false,
             toast: None,

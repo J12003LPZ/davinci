@@ -380,6 +380,8 @@ pub struct Session {
     /// moving average in microseconds.
     frame_stats: bool,
     frame_micros: f64,
+    /// Entries in the conversation at the last draw, for `autoScroll`.
+    drawn_entries: usize,
     /// Keys the shell raises on the user's behalf (a click on an option is
     /// an enter), handed out ahead of the terminal's own events.
     injected: VecDeque<Event>,
@@ -489,6 +491,7 @@ impl Session {
             path_cache: std::collections::HashMap::new(),
             frame_stats: env_flag("DAVINCI_FRAME_STATS"),
             frame_micros: 0.0,
+            drawn_entries: 0,
             injected: VecDeque::new(),
             scrollbar: None,
             focused: true,
@@ -694,6 +697,8 @@ impl Session {
             }
             MOUSE.store(mouse, Ordering::SeqCst);
         }
+        pin_unless_auto_scroll(model, self.scrollbar, self.drawn_entries);
+        self.drawn_entries = model.transcript.len();
         model.terminal_focused = self.focused;
         model.native_cursor = self.output.native_cursor;
         let model: &Model = model;
@@ -1113,6 +1118,29 @@ fn open_in_editor(text: &str) -> Result<String, String> {
     }
 }
 
+/// autoScroll off: output that arrives while the view sits at the newest
+/// must not carry it along, so pin the view to the rows it last showed
+/// (`bar` is the scrollbar of that draw, `drawn` the entries it held).
+fn pin_unless_auto_scroll(model: &Model, bar: Option<Scrollbar>, drawn: usize) {
+    if model.auto_scroll
+        || model.transcript_scroll.get().top.is_some()
+        || drawn == 0
+        || model.transcript.len() <= drawn
+    {
+        return;
+    }
+    if let Some(bar) = bar.filter(|bar| bar.offset == 0) {
+        model
+            .transcript_scroll
+            .set(super::model::TranscriptScroll::at(
+                bar.total.saturating_sub(usize::from(bar.height)),
+                model.width,
+                model.show_tool_output,
+                &model.transcript,
+            ));
+    }
+}
+
 /// The footer's pull-request label and where it goes.
 fn pr_link(model: &Model) -> Option<(String, &str)> {
     let badge = model.pr_badge.as_ref()?;
@@ -1350,6 +1378,35 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_auto_scroll_off_new_output_leaves_the_view_where_it_was() {
+        use super::super::model::Entry;
+        let mut model = Model::new(
+            super::super::theme::Theme::da_vinci(super::super::theme::ColorDepth::TrueColor, false),
+            80,
+            12,
+            false,
+        );
+        for n in 0..30 {
+            model.transcript.push(Entry::user(&format!("row {n}")));
+        }
+        let bar = app::transcript_scrollbar(&model).expect("overflowing");
+        assert_eq!(bar.offset, 0);
+        let drawn = model.transcript.len();
+        model.transcript.push(Entry::user("arrives later"));
+
+        // Following the newest (the default): nothing is pinned.
+        pin_unless_auto_scroll(&model, Some(bar), drawn);
+        assert!(model.transcript_scroll.get().top.is_none());
+
+        model.auto_scroll = false;
+        pin_unless_auto_scroll(&model, Some(bar), drawn);
+        let top = model.transcript_scroll.get().top;
+        assert_eq!(top, Some(bar.total - usize::from(bar.height)));
+        let after = app::transcript_scrollbar(&model).expect("still overflowing");
+        assert!(after.offset > 0, "the new row is below the view");
+    }
 
     #[test]
     fn an_option_is_found_by_the_longest_label_on_its_row() {

@@ -4797,6 +4797,7 @@ pub fn run(
     }
     model.terminal_progress = stored_settings.show_terminal_progress();
     model.caret_blink = stored_settings.caret_blink.unwrap_or(false);
+    model.auto_scroll = stored_settings.auto_scroll.unwrap_or(true);
     if let Some(enabled) = stored_settings
         .enabled_models
         .clone()
