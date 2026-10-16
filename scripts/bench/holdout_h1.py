@@ -19,6 +19,7 @@ two-of-eighteen success margin is an operational tolerance, not a statistically 
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import statistics
@@ -106,22 +107,27 @@ def settings_errors(settings_dir, base):
     return errors
 
 
+def ps(value):
+    """A PowerShell single-quoted literal: no expansion, no word splitting."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def commands(root, settings_dir, suite, davinci, codex, stage=None, bench="scripts/bench/bench.py"):
     lines = []
     for unit in schedule():
         if stage is not None and unit["stage"] != stage:
             continue
-        env = '$env:BENCH_RUNS = "%s\\%s"; ' % (root, unit["name"])
+        env = "$env:BENCH_RUNS = %s; " % ps("%s\\%s" % (root, unit["name"]))
         if unit["arm"] == "C":
-            env += '$env:BENCH_CODEX = "%s"; ' % codex
+            env += "$env:BENCH_CODEX = %s; Remove-Item Env:BENCH_DAVINCI -ErrorAction SilentlyContinue; " % ps(codex)
             extra = ""
         else:
-            env += '$env:BENCH_DAVINCI = "%s"; ' % davinci
-            extra = " --settings %s\\%s.json" % (settings_dir, unit["arm"])
+            env += "$env:BENCH_DAVINCI = %s; Remove-Item Env:BENCH_CODEX -ErrorAction SilentlyContinue; " % ps(davinci)
+            extra = " --settings %s" % ps("%s\\%s.json" % (settings_dir, unit["arm"]))
         lines.append(
-            '%spython %s run --harness %s --private-suite %s --split %s --tasks all --reps 1 --rep-start %d '
-            '--variant %s%s --grading-timeout 120'
-            % (env, bench, ARM_HARNESS[unit["arm"]], suite, SPLIT, unit["rep"], unit["name"], extra))
+            "%spython %s run --harness %s --private-suite %s --split %s --tasks all --reps 1 --rep-start %d "
+            "--variant %s%s --grading-timeout 120"
+            % (env, ps(bench), ARM_HARNESS[unit["arm"]], ps(suite), SPLIT, unit["rep"], unit["name"], extra))
     return lines
 
 
@@ -260,19 +266,27 @@ def _lines(path):
         return []
 
 
+def _path_variants(suite):
+    posix = suite.as_posix()
+    variants = {str(suite), posix}
+    if suite.drive:  # Git Bash and MSYS spell D:/x as /d/x
+        variants.add("/" + suite.drive[0] + posix[2:])
+    return variants
+
+
 def needles(suite):
-    """Search strings that would prove an agent saw suite content: the suite path and distinctive hidden lines.
+    """Search strings that would prove an agent saw suite content: the suite path, distinctive hidden-test lines
+    and distinctive reference-solution lines.
 
     Returns {digest12: needle}. Only the digests ever leave this module.
     """
     suite = Path(suite).resolve()
-    found = {str(suite): "path", suite.as_posix(): "path"}
+    found = {text: "path" for text in _path_variants(suite)}
     for task_dir in sorted(p for p in suite.iterdir() if p.is_dir()):
         known = set()
-        for tree in ("repo",):
-            for file in (task_dir / tree).rglob("*"):
-                if file.is_file():
-                    known.update(_lines(file))
+        for file in (task_dir / "repo").rglob("*"):
+            if file.is_file():
+                known.update(_lines(file))
         spec = task_dir / "task.json"
         prompt = ""
         if spec.is_file():
@@ -280,11 +294,12 @@ def needles(suite):
                 prompt = json.loads(spec.read_text(encoding="utf-8")).get("prompt", "")
             except ValueError:
                 prompt = ""
-        for file in (task_dir / "hidden").rglob("*") if (task_dir / "hidden").is_dir() else []:
-            if file.is_file():
-                for line in _lines(file):
-                    if len(line) >= LEAK_MIN_LINE and line not in known and line not in prompt:
-                        found[line] = "hidden"
+        for tree in ("hidden", "solution"):
+            for file in (task_dir / tree).rglob("*") if (task_dir / tree).is_dir() else []:
+                if file.is_file():
+                    for line in _lines(file):
+                        if len(line) >= LEAK_MIN_LINE and line not in known and line not in prompt:
+                            found[line] = tree
     return {hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]: text for text in found}
 
 
@@ -296,22 +311,75 @@ def transcript_files(root):
     return sorted(out)
 
 
-def leak_scan(root, suite):
-    """Counts only. The report never carries a file name from the suite or any matched text."""
-    table = needles(suite)
-    hits = {}
+def _strings(value, out):
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _strings(key, out)
+            _strings(item, out)
+    elif isinstance(value, list):
+        for item in value:
+            _strings(item, out)
+
+
+def haystacks(text):
+    """The file as written, and the strings a JSON reader would decode from it, lowercased.
+
+    JSON escapes quotes, tabs, backslashes and non-ASCII characters, so a copied line reads differently on disk.
+    """
+    decoded = []
+    documents = [text] + text.splitlines()
+    for document in documents:
+        try:
+            _strings(json.loads(document), decoded)
+        except ValueError:
+            continue
+    raw = text.lower()
+    return [raw, raw.replace("\\\\", "\\"), "\n".join(decoded).lower()]
+
+
+def leak_scan(root, suite, expected_runs=None, expected_digest=None):
+    """Counts only. The report never carries a file name from the suite or any matched text.
+
+    CLEAN needs the right suite, a readable results root, and a transcript for every run that is expected.
+    """
+    result = {"status": "NOT_SCANNED", "files_scanned": 0, "needles": 0, "campaigns_with_hits": {}}
+    if expected_digest is not None:
+        import private_suite
+        try:
+            digest = private_suite.load_frozen(suite, SPLIT)[2]
+        except (OSError, ValueError):
+            return result
+        if digest != expected_digest:
+            return dict(result, status="WRONG_SUITE")
+    try:
+        table = needles(suite)
+    except OSError:
+        return result
     files = transcript_files(root)
+    hits = {}
     for path in files:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        flat = text.replace("\\\\", "\\")
+        pools = haystacks(text)
         for key, needle in table.items():
-            if needle in text or needle in flat or needle.replace("\\", "/") in text.replace("\\\\", "/"):
+            low = needle.lower()
+            escaped = json.dumps(needle)[1:-1].lower()
+            if any(low in pool or low.replace("\\", "/") in pool.replace("\\", "/") for pool in pools) or escaped in pools[0]:
                 hits.setdefault(path.relative_to(root).parts[0], set()).add(key)
-    return {"status": "LEAK" if hits else "CLEAN", "files_scanned": len(files), "needles": len(table),
-            "campaigns_with_hits": {name: len(keys) for name, keys in sorted(hits.items())}}
+    stdout_files = sum(1 for p in files if p.name.endswith(".stdout.jsonl"))
+    result.update(files_scanned=len(files), needles=len(table),
+                  campaigns_with_hits={name: len(keys) for name, keys in sorted(hits.items())})
+    if hits:
+        result["status"] = "LEAK"
+    elif not files or (expected_runs is not None and stdout_files < expected_runs):
+        result["status"] = "INCOMPLETE_SCAN" if files else "NOT_SCANNED"
+    else:
+        result["status"] = "CLEAN"
+    return result
 
 
 # ---------------------------------------------------------------- rows
@@ -325,11 +393,23 @@ def load_rows(root):
         if unit is None:
             errors.append("campaign directory %s is outside the schedule" % path.parent.name)
             continue
-        for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, ValueError):
+            errors.append("results of %s are unreadable" % unit["name"])
+            continue
+        for line in lines:
             if not line.strip():
                 continue
-            row = json.loads(line)
-            key = (unit["arm"], row.get("task"), row.get("rep"))
+            try:
+                row = json.loads(line)
+            except ValueError:
+                errors.append("unreadable row in %s" % unit["name"])
+                continue
+            if not isinstance(row, dict) or not isinstance(row.get("task"), str) or type(row.get("rep")) is not int:
+                errors.append("row with an invalid task or repetition in %s" % unit["name"])
+                continue
+            key = (unit["arm"], row["task"], row["rep"])
             if key in rows:
                 errors.append("duplicate row %s" % (key,))
             row["_unit"] = unit
@@ -337,12 +417,25 @@ def load_rows(root):
     return rows, errors
 
 
+def _count(value):
+    return type(value) is int and value >= 0
+
+
 def usage_known(row):
-    if row.get("input_tokens") is None or row.get("cached_tokens") is None or row.get("output_tokens") is None:
+    totals = (row.get("input_tokens"), row.get("cached_tokens"), row.get("output_tokens"))
+    if not all(_count(v) for v in totals) or row["cached_tokens"] > row["input_tokens"]:
         return False
     if row.get("harness") == "codex":
         return row.get("request_metrics_complete") is True
-    return row.get("usage_unknown_attempts") == 0
+    return type(row.get("usage_unknown_attempts")) is int and row["usage_unknown_attempts"] == 0
+
+
+def scorable(row):
+    """Everything `metric` reads must be present and well formed, or the run is unscorable (never zero)."""
+    wall = row.get("wall_s")
+    return (usage_known(row) and type(row.get("pass")) is bool and _count(row.get("requests"))
+            and isinstance(wall, (int, float)) and type(wall) is not bool and math.isfinite(wall) and wall > 0
+            and isinstance(row.get("unrelated"), list))
 
 
 def identity_errors(rows, pins):
@@ -388,17 +481,23 @@ def identity_errors(rows, pins):
                 elif rest != base_settings:
                     errors.append("%s: settings differ between A and B beyond transport" % tag)
             labels = row.get("provider_transports")
-            if not isinstance(labels, dict) or not labels:
-                errors.append("%s: provider transports not recorded" % tag)
-            elif arm == "A" and set(labels) != {"http"}:
+            if not isinstance(labels, dict) or not labels or not all(_count(v) for v in labels.values()):
+                errors.append("%s: provider transports not recorded as counts" % tag)
+            elif arm == "A" and (set(labels) != {"http"} or labels["http"] < 1):
                 errors.append("%s: arm A used %s" % (tag, sorted(labels)))
-            elif arm == "B" and (not set(labels) <= {"websocket", "http"} or "websocket" not in labels):
+            elif arm == "B" and (not set(labels) <= {"websocket", "http"} or labels.get("websocket", 0) < 1):
                 errors.append("%s: arm B used %s" % (tag, sorted(labels)))
+            elif _count(row.get("provider_attempts")) and sum(labels.values()) != row["provider_attempts"]:
+                errors.append("%s: transport counts do not add up to the provider attempts" % tag)
+        if type(row.get("pass")) is not bool:
+            errors.append("%s: pass is not a boolean" % tag)
+        elif row["pass"] and (row.get("exit") != 0 or row.get("unrelated") or row.get("cleanup_complete") is False):
+            errors.append("%s: pass is inconsistent with its exit code, unrelated edits or cleanup" % tag)
         if row.get("reasoning_included_in_output") is not True:
             errors.append("%s: reasoning tokens are not recorded as part of output" % tag)
         if row.get("fixture_hash") is None:
             errors.append("%s: fixture hash not recorded" % tag)
-        fixtures.add(row.get("fixture_hash"))
+        fixtures.add(json.dumps(row.get("fixture_hash"), sort_keys=True, default=str))
     if len(fixtures) > 1:
         errors.append("the suite fixture changed between campaigns")
     return errors
@@ -412,25 +511,27 @@ def paired_passes(rows, left, right):
     """Verified passes of two arms over the (task, rep) blocks where both have a row."""
     keys = sorted({(t, r) for (a, t, r) in rows if a == left} & {(t, r) for (a, t, r) in rows if a == right},
                   key=str)
-    return len(keys), sum(bool(rows[(left, t, r)]["pass"]) for t, r in keys), sum(
-        bool(rows[(right, t, r)]["pass"]) for t, r in keys)
+    return len(keys), sum(rows[(left, t, r)].get("pass") is True for t, r in keys), sum(
+        rows[(right, t, r)].get("pass") is True for t, r in keys)
 
 
 def run_stop(key, row, unknown_so_far, earlier):
     """Predefined stop for one finished run; None means continue. A stop ends the whole study."""
     arm, task, rep = key
     tag = "%s %s r%s" % (arm, task, rep)
-    if row.get("stop_reason"):
-        return "%s: harness stop: %s" % (tag, row["stop_reason"])
+    if row.get("stop_reason") is not None:
+        return "%s: harness stop: %s" % (tag, str(row["stop_reason"])[:60])
     unknown = row.get("usage_unknown_attempts")
-    if arm in DAVINCI_ARMS and type(unknown) is int:
+    if arm in DAVINCI_ARMS:
+        if not _count(unknown):
+            return "%s: attempts without usage not recorded as a count" % tag
         if unknown > MAX_UNKNOWN_ATTEMPTS_RUN:
             return "%s: %d attempts without usage" % (tag, unknown)
         if unknown_so_far + unknown > MAX_UNKNOWN_ATTEMPTS_TOTAL:
             return "%s: %d attempts without usage in total" % (tag, unknown_so_far + unknown)
-        if not row.get("pass") and unknown > 0:
+        if row.get("pass") is not True and unknown > 0:
             return "%s: failed verification with %d attempts without usage (cause not separable)" % (tag, unknown)
-    if arm == "B" and (row.get("input_tokens") is None or (type(unknown) is int and unknown > 0)):
+    if arm == "B" and (row.get("input_tokens") is None or unknown > 0):
         return "%s: usage incomplete on a WebSocket run" % tag
     if arm == "C" and row.get("request_metrics_complete") is not True:
         return "%s: codex request telemetry incomplete" % tag
@@ -455,8 +556,8 @@ def first_stop(rows, pins):
         if reason:
             return reason
         earlier[key] = row
-        value = row.get("usage_unknown_attempts")
-        unknown_total += value if type(value) is int else 0
+        if key[0] in DAVINCI_ARMS:
+            unknown_total += row["usage_unknown_attempts"]
     return None
 
 
@@ -468,10 +569,13 @@ def transcript_path(root, row):
 
 
 def tool_call_integrity(path):
-    """Duplicate or orphaned tool-call ids in a transcript. None when the transcript is unavailable."""
+    """Duplicated, unfinished or orphaned tool calls in a transcript. None when it cannot be verified.
+
+    A transcript without a single tool event proves nothing, so it is also None.
+    """
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
         return None
     starts, ends = {}, {}
     for line in text.splitlines():
@@ -479,12 +583,17 @@ def tool_call_integrity(path):
             event = json.loads(line)
         except ValueError:
             continue
-        kind, call = event.get("type"), event.get("toolCallId")
-        if kind == "tool_execution_start" and call is not None:
+        if not isinstance(event, dict) or not isinstance(event.get("toolCallId"), str):
+            continue
+        kind, call = event.get("type"), event["toolCallId"]
+        if kind == "tool_execution_start":
             starts[call] = starts.get(call, 0) + 1
-        elif kind == "tool_execution_end" and call is not None:
+        elif kind == "tool_execution_end":
             ends[call] = ends.get(call, 0) + 1
-    return {"duplicated": sum(1 for n in starts.values() if n > 1),
+    if not starts and not ends:
+        return None
+    return {"starts": sum(starts.values()),
+            "duplicated": sum(1 for n in starts.values() if n > 1) + sum(1 for n in ends.values() if n > 1),
             "unfinished": sum(1 for call in starts if call not in ends),
             "orphaned_ends": sum(1 for call in ends if call not in starts)}
 
@@ -498,18 +607,20 @@ def fallback_events(rows, root=None):
             continue
         integrity = tool_call_integrity(transcript_path(root, row)) if root is not None else None
         leaf, calls = row.get("executed_leaf_operations"), row.get("tool_calls")
-        counts_agree = type(leaf) is int and type(calls) is int and leaf == calls
-        if integrity is None or not (type(leaf) is int and type(calls) is int):
+        counts_agree = _count(leaf) and _count(calls) and leaf == calls
+        if integrity is None or not (_count(leaf) and _count(calls)) or integrity["starts"] != calls:
             kind = "UNVERIFIED"
-        elif integrity["duplicated"] or integrity["orphaned_ends"] or not counts_agree:
+        elif (integrity["duplicated"] or integrity["orphaned_ends"] or integrity["unfinished"]
+              or not counts_agree):
             kind = "LOST_OR_DUPLICATED"
         else:
             kind = "RECOVERABLE"
         events.append({"task": task, "rep": rep, "http_requests": labels["http"],
-                       "websocket_requests": labels.get("websocket", 0), "passed": bool(row.get("pass")),
-                       "provider_attempts": row.get("provider_attempts"),
-                       "logical_requests": row.get("logical_requests"), "classification": kind,
-                       "tool_call_integrity": integrity, "operation_counts_agree": counts_agree})
+                       "websocket_requests": labels.get("websocket", 0), "passed": row.get("pass") is True,
+                       "provider_attempts": row.get("provider_attempts") if _count(row.get("provider_attempts")) else None,
+                       "logical_requests": row.get("logical_requests") if _count(row.get("logical_requests")) else None,
+                       "classification": kind, "tool_call_integrity": integrity,
+                       "operation_counts_agree": counts_agree})
     return events
 
 
@@ -533,9 +644,9 @@ def fallback_verdict(events, b_runs):
 # ---------------------------------------------------------------- analysis
 
 def metric(row):
-    return {"pass": bool(row["pass"]), "wall": row["wall_s"], "requests": row["requests"],
+    return {"pass": row["pass"], "wall": row["wall_s"], "requests": row["requests"],
             "uncached": row["input_tokens"] - row["cached_tokens"], "output": row["output_tokens"],
-            "unrelated": bool(row.get("unrelated"))}
+            "unrelated": bool(row["unrelated"])}
 
 
 def _tokens(ms):
@@ -579,6 +690,8 @@ def compare(measured, arm, base):
 def success_label(c):
     guard = c["worst_task_pass_deficit"] <= MAX_TASK_PASS_DEFICIT
     base, mine = c["passes"]
+    if base == 0 and mine == 0:
+        return "NO_SIGNAL"
     if mine > base and guard:
         return "AHEAD"
     if mine >= base - SUCCESS_TOLERANCE and guard:
@@ -599,12 +712,15 @@ def vs_codex(measured, arm):
     c = compare(measured, arm, "C")
     label = success_label(c)
     out = {"success": label, "comparison": c}
-    if label == "BEHIND":
+    if label in ("BEHIND", "NO_SIGNAL"):
         out["efficiency"] = "NOT_SCORED"
-        out["outcome"] = "BEHIND"
+        out["outcome"] = label
     else:
         out["efficiency"] = efficiency(c)
-        out["outcome"] = ("%s_AND_EFFICIENT" % label) if out["efficiency"]["all"] else "%s_NOT_EFFICIENT" % label
+        if c["tokens_per_success_ratio"] is None:
+            out["outcome"] = "%s_EFFICIENCY_UNDEFINED" % label
+        else:
+            out["outcome"] = ("%s_AND_EFFICIENT" % label) if out["efficiency"]["all"] else "%s_NOT_EFFICIENT" % label
     return out
 
 
@@ -626,16 +742,17 @@ def evaluate(rows, pins, leak=None, root=None, load_errors=()):
     if errors:
         return {"verdict": "INVALID", "errors": errors}
     stop = first_stop(rows, pins)
+    if leak is not None and leak.get("status") != "CLEAN":
+        return {"verdict": "CONTAMINATION_REVIEW", "leak_scan": leak, "stop": stop,
+                "note": "the scan found suite content or could not vouch for the transcripts; a human reviews this "
+                        "before any use of the result"}
     if stop:
         return {"verdict": "STOPPED", "stop": stop, "runs_present": len(rows),
                 "note": "a stop ends the study; no reruns, no stitching"}
     if leak is None:
         return {"verdict": "NEEDS_LEAK_SCAN", "runs_present": len(rows),
                 "note": "results stay unread until the privacy scan has run"}
-    if leak.get("status") != "CLEAN":
-        return {"verdict": "CONTAMINATION_REVIEW", "leak_scan": leak,
-                "note": "any suite content in an agent transcript needs human review before any use of the result"}
-    measured = {key: metric(row) for key, row in rows.items() if usage_known(row)}
+    measured = {key: metric(row) for key, row in rows.items() if scorable(row)}
     unscorable = sorted("%s %s r%s" % (a, t, r) for (a, t, r) in rows if (a, t, r) not in measured)
     expected = {(arm, task, rep) for arm in ARMS for task in pins["task_ids"] for rep in range(REPS)}
     missing = sorted("%s %s r%s" % k for k in expected - set(rows))
@@ -709,7 +826,8 @@ def main(argv=None):
     else:
         pins = json.loads(Path(args.pins).read_text(encoding="utf-8"))
         rows, load_errors = load_rows(args.root)
-        leak = leak_scan(args.root, args.suite) if args.suite else None
+        leak = (leak_scan(args.root, args.suite, expected_runs=len(rows), expected_digest=pins.get("private_suite_digest"))
+                if args.suite and isinstance(pins, dict) else None)
         print(json.dumps(evaluate(rows, pins, leak, args.root, load_errors), indent=2, default=str))
 
 

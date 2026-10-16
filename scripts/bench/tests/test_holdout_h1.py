@@ -102,7 +102,7 @@ class CommandTests(unittest.TestCase):
 
     def test_every_line_runs_the_whole_split_of_the_private_suite(self):
         for line in self.lines():
-            self.assertIn("--private-suite D:\\suite --split holdout --tasks all --reps 1", line)
+            self.assertIn("--private-suite 'D:\\suite' --split holdout --tasks all --reps 1", line)
 
     def test_davinci_arms_pass_settings_and_codex_does_not(self):
         lines = self.lines()
@@ -114,8 +114,19 @@ class CommandTests(unittest.TestCase):
                 self.assertNotIn("--settings", line)
             else:
                 self.assertIn("--harness davinci", line)
-                self.assertIn("--settings C:\\s\\%s.json" % unit["arm"], line)
+                self.assertIn("--settings 'C:\\s\\%s.json'" % unit["arm"], line)
                 self.assertIn("BENCH_DAVINCI", line)
+
+    def test_paths_are_quoted_literals(self):
+        line = h1.commands("C:\\my results", "C:\\s", "D:\\my vault\\it's $x", "C:\\d.exe", "C:\\c.exe", 1)[0]
+        self.assertIn("--private-suite 'D:\\my vault\\it''s $x'", line)
+        self.assertIn("$env:BENCH_RUNS = 'C:\\my results\\h1-01-A-r0'", line)
+        self.assertNotIn('"', line)
+
+    def test_each_line_leaves_only_its_own_binary_variable(self):
+        for line, unit in zip(self.lines(), h1.schedule()):
+            other = "BENCH_DAVINCI" if unit["arm"] == "C" else "BENCH_CODEX"
+            self.assertIn("Remove-Item Env:%s" % other, line)
 
     def test_stage_filter(self):
         self.assertEqual(len(self.lines(2)), 3)
@@ -350,7 +361,8 @@ class DefaultGateTests(unittest.TestCase):
     def test_a_lost_operation_fails_the_gate_in_a_full_evaluation(self):
         with tempfile.TemporaryDirectory() as d:
             rows = study()
-            rows[("B", TASKS[0], 0)].update(provider_transports={"websocket": 10, "http": 4}, executed_leaf_operations=19)
+            rows[("B", TASKS[0], 0)].update(provider_transports={"websocket": 10, "http": 4}, executed_leaf_operations=19,
+                                            tool_calls=1)
             path = h1.transcript_path(d, rows[("B", TASKS[0], 0)])
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps({"type": "tool_execution_start", "toolCallId": "c"}) + chr(10)
@@ -409,6 +421,245 @@ class PreregistrationTests(unittest.TestCase):
                          "Change or create only these files"):
             self.assertIn(fragment, brief)
         self.assertNotIn(chr(0x2014), brief + self.text)  # no em dashes
+
+
+class LeakScanReviewTests(unittest.TestCase):
+    """Findings from an independent adversarial read of the scanner."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.suite = make_suite(self.tmp.name)
+        self.root = Path(self.tmp.name) / "results"
+        self.dir = self.root / "h1-01-A-r0" / "davinci"
+        self.dir.mkdir(parents=True)
+
+    def put(self, text, name="t-r0.stdout.jsonl"):
+        (self.dir / name).write_text(text, encoding="utf-8")
+
+    def test_lines_that_json_escapes_are_still_found(self):
+        for line in (QUOTED_LINE, TAB_LINE, ACCENT_LINE):
+            for ensure_ascii in (True, False):
+                self.put(json.dumps({"out": "cat: " + line.strip()}, ensure_ascii=ensure_ascii))
+                self.assertEqual(h1.leak_scan(self.root, self.suite)["status"], "LEAK", (line, ensure_ascii))
+
+    def test_a_reference_solution_line_is_found(self):
+        self.put(json.dumps({"out": SOLUTION_LINE.strip()}))
+        self.assertEqual(h1.leak_scan(self.root, self.suite)["status"], "LEAK")
+
+    def test_the_suite_path_is_found_in_any_case_and_in_msys_form(self):
+        resolved = self.suite.resolve()
+        spellings = [str(resolved).lower(), str(resolved).upper(), resolved.as_posix().lower()]
+        if resolved.drive:
+            spellings.append("/" + resolved.drive[0].lower() + resolved.as_posix()[2:])
+        for spelling in spellings:
+            self.put(json.dumps({"cmd": "ls " + spelling}))
+            self.assertEqual(h1.leak_scan(self.root, self.suite)["status"], "LEAK", spelling)
+
+    def test_nothing_scanned_is_not_clean(self):
+        empty = Path(self.tmp.name) / "empty"
+        empty.mkdir()
+        self.assertEqual(h1.leak_scan(empty, self.suite)["status"], "NOT_SCANNED")
+        self.assertEqual(h1.leak_scan(Path(self.tmp.name) / "absent", self.suite)["status"], "NOT_SCANNED")
+        self.put("clean text")
+        self.assertEqual(h1.leak_scan(self.root, Path(self.tmp.name) / "no-suite")["status"], "NOT_SCANNED")
+
+    def test_renamed_transcripts_are_not_scanned_and_not_clean(self):
+        self.put(HIDDEN_LINE, name="t-r0.stdout.txt")
+        self.assertEqual(h1.leak_scan(self.root, self.suite)["status"], "NOT_SCANNED")
+
+    def test_missing_transcripts_for_expected_runs_is_an_incomplete_scan(self):
+        self.put("clean text")
+        self.assertEqual(h1.leak_scan(self.root, self.suite, expected_runs=1)["status"], "CLEAN")
+        self.assertEqual(h1.leak_scan(self.root, self.suite, expected_runs=2)["status"], "INCOMPLETE_SCAN")
+
+    def test_a_hit_outranks_an_incomplete_scan(self):
+        self.put(HIDDEN_LINE)
+        self.assertEqual(h1.leak_scan(self.root, self.suite, expected_runs=9)["status"], "LEAK")
+
+    def test_a_digest_that_cannot_be_checked_is_not_clean(self):
+        self.put("clean text")
+        self.assertEqual(h1.leak_scan(self.root, self.suite, expected_digest="a" * 64)["status"], "NOT_SCANNED")
+
+
+class IntegrityReviewTests(unittest.TestCase):
+    def check(self, lines):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.stdout.jsonl"
+            path.write_text("\n".join(lines), encoding="utf-8")
+            return h1.tool_call_integrity(path)
+
+    @staticmethod
+    def event(kind, call):
+        return json.dumps({"type": kind, "toolCallId": call})
+
+    def test_unfinished_duplicate_end_and_orphan_are_counted(self):
+        out = self.check([self.event("tool_execution_start", "a")])
+        self.assertEqual((out["unfinished"], out["starts"]), (1, 1))
+        out = self.check([self.event("tool_execution_start", "a")] + [self.event("tool_execution_end", "a")] * 2)
+        self.assertEqual(out["duplicated"], 1)
+        out = self.check([self.event("tool_execution_end", "z")])
+        self.assertEqual(out["orphaned_ends"], 1)
+
+    def test_nothing_to_verify_is_none(self):
+        self.assertIsNone(self.check([]))
+        self.assertIsNone(self.check(["garbage", "[1, 2]", "42"]))
+        self.assertIsNone(self.check([json.dumps({"type": "tool_execution_start", "tool_call_id": "a"})]))
+        self.assertIsNone(h1.tool_call_integrity("no-such-file"))
+
+    def test_odd_events_do_not_crash(self):
+        out = self.check(["[1]", json.dumps({"type": "tool_execution_start", "toolCallId": ["x"]}),
+                          self.event("tool_execution_start", "a"), self.event("tool_execution_end", "a")])
+        self.assertEqual((out["starts"], out["unfinished"]), (1, 0))
+
+    def test_unfinished_call_makes_a_fallback_run_lost(self):
+        with tempfile.TemporaryDirectory() as d:
+            rows = FallbackTests().rows()
+            row_ = rows[("B", TASKS[0], 0)]
+            path = h1.transcript_path(d, row_)
+            path.parent.mkdir(parents=True)
+            path.write_text("\n".join([self.event("tool_execution_start", "a"), self.event("tool_execution_end", "a"),
+                                       self.event("tool_execution_start", "b")]), encoding="utf-8")
+            self.assertEqual(h1.fallback_events(rows, d)[0]["classification"], "LOST_OR_DUPLICATED")
+
+    def test_start_count_must_match_the_tool_call_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            rows = FallbackTests().rows(tool_calls=5, executed_leaf_operations=5)
+            path = h1.transcript_path(d, rows[("B", TASKS[0], 0)])
+            path.parent.mkdir(parents=True)
+            path.write_text("\n".join([self.event("tool_execution_start", "a"), self.event("tool_execution_end", "a")]),
+                            encoding="utf-8")
+            self.assertEqual(h1.fallback_events(rows, d)[0]["classification"], "UNVERIFIED")
+
+
+class MalformedRowTests(unittest.TestCase):
+    def incomplete(self, mutate):
+        out = verdict(study(mutate))
+        self.assertEqual(out["verdict"], "INCOMPLETE", out)
+        return out
+
+    def stopped(self, mutate):
+        out = verdict(study(mutate))
+        self.assertEqual(out["verdict"], "STOPPED", out)
+        return out["stop"]
+
+    def test_fields_the_metrics_read_are_required(self):
+        key = ("C", TASKS[0], 0)
+        for field, bad in (("wall_s", None), ("wall_s", 0), ("wall_s", True), ("wall_s", float("inf")),
+                           ("requests", None), ("requests", -1), ("unrelated", None), ("input_tokens", "9"),
+                           ("output_tokens", -1)):
+            out = self.incomplete(lambda r: r[key].update({field: bad}))
+            self.assertEqual(out["unscorable_runs"], ["C %s r0" % TASKS[0]], (field, bad))
+
+    def test_missing_keys_are_unscorable_not_a_crash(self):
+        for field in ("wall_s", "requests", "unrelated", "pass_x"):
+            if field == "pass_x":
+                continue
+            self.incomplete(lambda r: r[("A", TASKS[1], 1)].pop(field))
+
+    def test_cached_tokens_cannot_exceed_input_tokens(self):
+        self.incomplete(lambda r: r[("C", TASKS[0], 0)].update(input_tokens=10, cached_tokens=100_000))
+
+    def test_pass_must_be_a_boolean_that_agrees_with_its_parts(self):
+        for bad in ("False", 1, None):
+            self.assertIn("not a boolean", self.stopped(lambda r: r[("B", TASKS[0], 0)].update({"pass": bad})))
+        self.assertIn("inconsistent", self.stopped(lambda r: r[("C", TASKS[0], 0)].update(exit=1)))
+        self.assertIn("inconsistent", self.stopped(lambda r: r[("C", TASKS[0], 0)].update(unrelated=["x.py"])))
+        self.assertIn("inconsistent", self.stopped(lambda r: r[("A", TASKS[0], 0)].update(cleanup_complete=False)))
+
+    def test_a_failed_run_with_unrelated_edits_is_a_normal_failure(self):
+        out = verdict(study(lambda r: r[("C", TASKS[0], 0)].update({"pass": False, "unrelated": ["x.py"]})))
+        self.assertEqual(out["verdict"], "COMPLETE")
+        self.assertEqual(out["a_vs_codex"]["comparison"]["unrelated_edit_runs"], [1, 0])
+
+    def test_unknown_attempt_counts_must_be_counts(self):
+        for bad in (2.0, "2", True, -5, None):
+            self.assertIn("not recorded as a count", self.stopped(
+                lambda r: r[("A", TASKS[0], 0)].update(usage_unknown_attempts=bad)))
+
+    def test_codex_attempts_do_not_count_toward_the_davinci_total(self):
+        def mutate(rows):
+            for task in TASKS[:4]:
+                rows[("C", task, 0)]["usage_unknown_attempts"] = 1
+        self.assertEqual(verdict(study(mutate))["verdict"], "COMPLETE")
+
+    def test_any_stop_reason_that_is_not_none_is_a_stop(self):
+        for value in ("", 0, [], False, "x"):
+            self.assertIn("harness stop", self.stopped(lambda r: r[("A", TASKS[0], 0)].update(stop_reason=value)))
+
+    def test_transport_counts_must_be_counts_and_add_up(self):
+        err = lambda r: h1.identity_errors(r, PINS)
+        rows = study(lambda r: r[("B", TASKS[0], 0)].update(provider_transports={"websocket": 0, "http": 14}))
+        self.assertTrue(any("arm B used" in e for e in err(rows)))
+        rows = study(lambda r: r[("B", TASKS[0], 0)].update(provider_transports={"websocket": -1, "http": 15}))
+        self.assertTrue(any("as counts" in e for e in err(rows)))
+        rows = study(lambda r: r[("B", TASKS[0], 0)].update(provider_transports={"websocket": "14"}))
+        self.assertTrue(any("as counts" in e for e in err(rows)))
+        rows = study(lambda r: r[("B", TASKS[0], 0)].update(provider_transports={"websocket": 12}))
+        self.assertTrue(any("add up" in e for e in err(rows)))
+        rows = study(lambda r: r[("A", TASKS[0], 0)].update(provider_transports={"http": 0}, provider_attempts=0))
+        self.assertTrue(any("arm A used" in e for e in err(rows)))
+
+    def test_a_list_valued_fixture_hash_does_not_crash(self):
+        out = verdict(study(lambda r: r[("A", TASKS[0], 0)].update(fixture_hash=["x"])))
+        self.assertEqual(out["verdict"], "STOPPED")
+
+
+class RowFileTests(unittest.TestCase):
+    def load(self, text, raw=None):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "h1-01-A-r0").mkdir()
+            path = Path(d) / "h1-01-A-r0" / "results.jsonl"
+            if raw is not None:
+                path.write_bytes(raw)
+            else:
+                path.write_text(text, encoding="utf-8")
+            return h1.load_rows(d)
+
+    def test_truncated_non_object_and_odd_rows_are_errors_not_crashes(self):
+        good = json.dumps({"task": TASKS[0], "rep": 0})
+        for bad in ('{"task": "h1-01", "re', "[1]", "42", json.dumps({"task": ["x"], "rep": 0}),
+                    json.dumps({"task": TASKS[0], "rep": "0"}), json.dumps({"task": TASKS[0], "rep": True})):
+            rows, errors = self.load(good + "\n" + bad + "\n")
+            self.assertEqual(len(rows), 1, bad)
+            self.assertEqual(len(errors), 1, bad)
+
+    def test_invalid_utf8_is_an_error(self):
+        rows, errors = self.load("", raw=b"\xff\xfe not utf8\n")
+        self.assertEqual((rows, len(errors)), ({}, 1))
+
+    def test_load_errors_make_the_verdict_invalid(self):
+        self.assertEqual(verdict(study(), load_errors=["unreadable row in h1-01-A-r0"])["verdict"], "INVALID")
+
+
+class OutcomeReviewTests(unittest.TestCase):
+    def test_no_passes_anywhere_is_no_signal_not_a_match(self):
+        def nobody(rows):
+            for key in rows:
+                rows[key]["pass"] = False
+        out = verdict(study(nobody))
+        self.assertEqual(out["b_vs_codex"]["outcome"], "NO_SIGNAL")
+        self.assertEqual(out["b_vs_codex"]["efficiency"], "NOT_SCORED")
+
+    def test_ahead_of_a_codex_with_no_passes_has_undefined_efficiency(self):
+        def codex_fails(rows):
+            for key in [k for k in rows if k[0] == "C"]:
+                rows[key]["pass"] = False
+        out = verdict(study(codex_fails))
+        self.assertEqual(out["b_vs_codex"]["success"], "AHEAD")
+        self.assertEqual(out["b_vs_codex"]["outcome"], "AHEAD_EFFICIENCY_UNDEFINED")
+
+    def test_a_leak_outranks_a_stop(self):
+        leak = {"status": "LEAK", "files_scanned": 54, "needles": 9, "campaigns_with_hits": {"h1-01-A-r0": 1}}
+        out = verdict(study(lambda r: r[("A", TASKS[0], 0)].update(stop_reason="forbidden_artifact")), leak=leak)
+        self.assertEqual(out["verdict"], "CONTAMINATION_REVIEW")
+        self.assertIn("harness stop", out["stop"])
+
+    def test_every_non_clean_scan_status_blocks_the_numbers(self):
+        for status in ("NOT_SCANNED", "INCOMPLETE_SCAN", "WRONG_SUITE", "LEAK"):
+            out = verdict(study(), leak={"status": status, "files_scanned": 0, "needles": 0, "campaigns_with_hits": {}})
+            self.assertEqual(out["verdict"], "CONTAMINATION_REVIEW", status)
+            self.assertNotIn("passes", out)
 
 
 class UsageKnownTests(unittest.TestCase):
@@ -569,8 +820,10 @@ class FallbackTests(unittest.TestCase):
 
     def rows(self, **extra):
         rows = study()
-        rows[("B", TASKS[0], 0)].update(provider_transports={"websocket": 10, "http": 4}, provider_attempts=15,
-                                        **extra)
+        fields = dict(provider_transports={"websocket": 10, "http": 4}, provider_attempts=14, tool_calls=2,
+                      executed_leaf_operations=2)
+        fields.update(extra)
+        rows[("B", TASKS[0], 0)].update(fields)
         return rows
 
     def test_clean_transcript_is_recoverable(self):
@@ -593,7 +846,7 @@ class FallbackTests(unittest.TestCase):
     def test_operation_count_mismatch_is_lost_or_duplicated(self):
         with tempfile.TemporaryDirectory() as d:
             rows = self.rows(executed_leaf_operations=19)
-            self.write(d, rows[("B", TASKS[0], 0)], [("c1", 1, 1)])
+            self.write(d, rows[("B", TASKS[0], 0)], [("c1", 1, 1), ("c2", 1, 1)])
             self.assertEqual(h1.fallback_events(rows, d)[0]["classification"], "LOST_OR_DUPLICATED")
 
     def test_missing_transcript_or_counts_is_unverified(self):
@@ -608,7 +861,7 @@ class FallbackTests(unittest.TestCase):
     def test_failed_fallback_run_is_not_acceptable(self):
         with tempfile.TemporaryDirectory() as d:
             rows = self.rows(**{"pass": False})
-            self.write(d, rows[("B", TASKS[0], 0)], [("c1", 1, 1)])
+            self.write(d, rows[("B", TASKS[0], 0)], [("c1", 1, 1), ("c2", 1, 1)])
             self.assertEqual(h1.fallback_verdict(h1.fallback_events(rows, d), 18)["verdict"], "NOT_ACCEPTABLE")
 
     def test_no_fallback_states_the_bound_without_calling_it_acceptable(self):
@@ -625,7 +878,7 @@ class FallbackTests(unittest.TestCase):
     def test_full_evaluation_lists_fallback_events_without_transcript_content(self):
         with tempfile.TemporaryDirectory() as d:
             rows = self.rows()
-            self.write(d, rows[("B", TASKS[0], 0)], [("c1", 1, 1)])
+            self.write(d, rows[("B", TASKS[0], 0)], [("c1", 1, 1), ("c2", 1, 1)])
             out = verdict(rows, root=d)
             self.assertEqual(out["fallback"]["verdict"], "ACCEPTABLE_PENDING_REVIEW")
             self.assertEqual(out["fallback"]["event_count"], 1)
@@ -655,6 +908,12 @@ SHORT_LINE = "    assert True"
 PROMPT_LINE = "Implement the ledger normaliser with a tolerance of one half of one percent exactly as described"
 
 
+QUOTED_LINE = '    assert render("ledger", width=80) == "Quarter end balances reconcile to the cent"  # q'
+TAB_LINE = "    assert\tnormalise_ledger(entries,\ttolerance=0.005) == expected_balances_for_quarter_end_tab"
+ACCENT_LINE = "    assert titre(\"caf\u00e9 du march\u00e9 central\") == \"Caf\u00e9 Du March\u00e9 Central, ouvert\""
+SOLUTION_LINE = "        return sum(entry.amount for entry in sorted(entries, key=lambda e: e.posted_on)) / scale"
+
+
 def make_suite(base):
     suite = Path(base) / "vault" / "suite"
     task = suite / TASKS[0]
@@ -662,7 +921,10 @@ def make_suite(base):
         (task / sub).mkdir(parents=True)
     (task / "repo" / "ledger.py").write_text("def normalise_ledger():\n    pass\n", encoding="utf-8")
     (task / "hidden" / "test_ledger.py").write_text(
-        "\n".join([SHORT_LINE, HIDDEN_LINE, "    " + PROMPT_LINE]) + "\n", encoding="utf-8")
+        "\n".join([SHORT_LINE, HIDDEN_LINE, "    " + PROMPT_LINE, QUOTED_LINE, TAB_LINE, ACCENT_LINE]) + "\n",
+        encoding="utf-8")
+    (task / "solution").mkdir()
+    (task / "solution" / "ledger.py").write_text(SOLUTION_LINE + "\n", encoding="utf-8")
     (task / "task.json").write_text(json.dumps({"prompt": PROMPT_LINE}), encoding="utf-8")
     return suite
 
@@ -711,7 +973,7 @@ class LeakScanTests(unittest.TestCase):
         (agent / "auth.json").write_text(HIDDEN_LINE, encoding="utf-8")
         (agent / "x.stdout.jsonl").write_text(HIDDEN_LINE, encoding="utf-8")
         out = h1.leak_scan(self.root, self.suite)
-        self.assertEqual((out["status"], out["files_scanned"]), ("CLEAN", 0))
+        self.assertEqual((out["status"], out["files_scanned"]), ("NOT_SCANNED", 0))
 
     def test_result_carries_counts_and_never_content(self):
         self.transcript(json.dumps({"text": HIDDEN_LINE}))
@@ -801,7 +1063,8 @@ class CliTests(unittest.TestCase):
             self.assertEqual(json.loads(first)["verdict"], "NEEDS_LEAK_SCAN")
             _, second = self.run_main("report", "--root", str(root), "--pins", str(pins), "--suite", str(suite))
             report = json.loads(second)
-            self.assertEqual((report["verdict"], report["leak_scan"]["status"]), ("COMPLETE", "CLEAN"))
+            # the stand-in suite is not a frozen suite, so the scan cannot vouch for anything
+            self.assertEqual((report["verdict"], report["leak_scan"]["status"]), ("CONTAMINATION_REVIEW", "NOT_SCANNED"))
 
     def test_report_after_a_leak_withholds_the_numbers(self):
         with tempfile.TemporaryDirectory() as d:

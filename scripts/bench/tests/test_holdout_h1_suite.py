@@ -147,6 +147,66 @@ class MakePinsCliTests(unittest.TestCase):
             self.assertEqual((code, json.loads(out)["ok"]), (1, False))
 
 
+class RealReportTests(unittest.TestCase):
+    """The report command end to end: real frozen suite, pinned digest, 54 rows and 54 transcripts."""
+
+    def build(self, base, transcript_for=None):
+        from test_holdout_h1 import study
+        suite = real_suite(base)
+        pins, errors = h1.make_pins(suite, "e" * 40)
+        self.assertEqual(errors, [])
+        root = Path(base) / "results"
+        for (arm, task, rep), r in study().items():
+            r = dict(r, private_suite_digest=pins["private_suite_digest"])
+            unit = r.pop("_unit")
+            directory = root / unit["name"]
+            directory.mkdir(parents=True, exist_ok=True)
+            with open(directory / "results.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(r) + chr(10))
+            transcript = directory / r["harness"] / ("%s-r%d.stdout.jsonl" % (task, rep))
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            transcript.write_text(json.dumps({"t": (transcript_for or (lambda *a: "edited pkg/core.py"))(arm, task, rep)}),
+                                  encoding="utf-8")
+        pins_path = Path(base) / "pins.json"
+        pins_path.write_text(json.dumps(pins), encoding="utf-8")
+        return suite, root, pins_path
+
+    def report(self, root, pins_path, suite):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            h1.main(["report", "--root", str(root), "--pins", str(pins_path), "--suite", str(suite)])
+        return json.loads(out.getvalue())
+
+    def test_a_clean_complete_study(self):
+        with tempfile.TemporaryDirectory() as d:
+            suite, root, pins = self.build(d)
+            report = self.report(root, pins, suite)
+            self.assertEqual((report["verdict"], report["leak_scan"]["status"]), ("COMPLETE", "CLEAN"))
+            self.assertEqual(report["leak_scan"]["files_scanned"], 54)
+
+    def test_one_leaking_transcript_blocks_the_numbers(self):
+        with tempfile.TemporaryDirectory() as d:
+            suite, root, pins = self.build(d, lambda arm, task, rep: ("assert %r" % HIDDEN_LINE) if (arm, task, rep) == ("B", "h1-02", 1) else "ok")
+            report = self.report(root, pins, suite)
+            self.assertEqual(report["verdict"], "CONTAMINATION_REVIEW")
+            self.assertEqual(report["leak_scan"]["campaigns_with_hits"], {"h1-04-B-r1": 1})
+            self.assertNotIn("passes", report)
+
+    def test_a_missing_transcript_blocks_the_numbers(self):
+        with tempfile.TemporaryDirectory() as d:
+            suite, root, pins = self.build(d)
+            next(root.rglob("h1-01-r0.stdout.jsonl")).unlink()
+            self.assertEqual(self.report(root, pins, suite)["leak_scan"]["status"], "INCOMPLETE_SCAN")
+
+    def test_the_wrong_suite_blocks_the_numbers(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            suite, root, pins = self.build(d)
+            wrong = real_suite(other)  # a valid frozen suite, but not the pinned one
+            digest = json.loads(pins.read_text(encoding="utf-8"))["private_suite_digest"]
+            self.assertEqual(h1.leak_scan(root, wrong, expected_runs=54, expected_digest=digest)["status"], "WRONG_SUITE")
+            self.assertEqual(self.report(root, pins, wrong)["verdict"], "CONTAMINATION_REVIEW")
+
+
 class SuiteErrorTests(unittest.TestCase):
     def frozen(self, **changes):
         labels = {t: {"split": "holdout", "language": "Python", "size_class": "large", "repository_id": "r-" + t}

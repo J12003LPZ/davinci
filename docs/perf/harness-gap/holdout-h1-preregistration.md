@@ -80,6 +80,7 @@ Each DaVinci arm is compared with Codex over the 18 (task, repetition) blocks wh
 
 - `AHEAD`: `d > c` and no task has `c_task - d_task > 1`.
 - `MATCHES`: `d >= c - 2` and no task has `c_task - d_task > 1`.
+- `NO_SIGNAL`: both pass nothing (`d = c = 0`). Equal zeros are not a match. Efficiency is not scored.
 - `BEHIND`: otherwise. Efficiency is then not scored.
 
 **2. Efficiency**, scored only for `MATCHES` or `AHEAD`. All three must hold:
@@ -89,21 +90,23 @@ Each DaVinci arm is compared with Codex over the 18 (task, repetition) blocks wh
 - DaVinci is faster on at least 3 of the 6 tasks (task median wall time).
 
 Outcome labels: `MATCHES_AND_EFFICIENT`, `MATCHES_NOT_EFFICIENT`, `AHEAD_AND_EFFICIENT`,
-`AHEAD_NOT_EFFICIENT`, `BEHIND`.
+`AHEAD_NOT_EFFICIENT`, `BEHIND`, `NO_SIGNAL`. If Codex has no verified success, tokens per success has no Codex value
+and the label is `AHEAD_EFFICIENCY_UNDEFINED` (or `MATCHES_EFFICIENCY_UNDEFINED`): no efficiency claim is made.
 
 **3. B against A (default gate).** Gate `PASS` if B has at least as many verified passes as A over the paired blocks
 and the fallback evaluation (rule 4) is `NO_FALLBACK_OBSERVED` or `ACCEPTABLE_PENDING_REVIEW`. Gate `FAIL` if B has
 fewer passes or the fallback evaluation is `NOT_ACCEPTABLE`. Gate `UNVERIFIED` if the fallback evaluation is
-`UNVERIFIED`. The evaluator reports gate evidence only. It never makes the production decision: the result field
+`UNVERIFIED` and neither of the `FAIL` conditions holds (`FAIL` takes precedence). The evaluator reports gate evidence only. It never makes the production decision: the result field
 `decision` is always `HUMAN_REVIEW_REQUIRED`.
 
 **4. Fallback evaluation (arm B).** A fallback event is a B run with any request labeled `http`. For each event the
 report lists the run, the HTTP and WebSocket request counts, failed attempts, logical requests against provider
 attempts, whether the run passed, and a classification:
 
-- `LOST_OR_DUPLICATED`: a duplicated or orphaned tool-call id in the transcript, or executed operations different from
-  tool calls.
-- `UNVERIFIED`: the transcript or the operation counts are not available.
+- `LOST_OR_DUPLICATED`: a tool call that started twice, ended twice, never ended, or ended without starting, in the
+  transcript; or executed operations different from tool calls.
+- `UNVERIFIED`: the transcript is missing, holds no tool events, or its tool-call starts do not equal the row's tool
+  call count; or the operation counts are not available.
 - `RECOVERABLE`: none of the above, and the run passed.
 
 The verdict is `NOT_ACCEPTABLE` if any event is `LOST_OR_DUPLICATED` or any fallback run failed; `UNVERIFIED` if any
@@ -120,20 +123,32 @@ counts.
 A stop ends the study. No run is repeated, replaced or stitched in. The evaluator replays the stop rules over the
 rows in launch order, so a run that slipped past a live stop still produces a `STOPPED` verdict.
 
-- Any harness `stop_reason` (including a credential or refresh failure and a cleanup failure).
+- Any harness `stop_reason` that is not null (including a credential or refresh failure and a cleanup failure).
 - An identity mismatch: binary, source, model, effort, tier, suite digest, task id, split, language, variant,
   repetition, transport label for the arm, A/B settings difference, fixture change, Codex version or settings.
-- More than 1 DaVinci attempt without usage in a run, or more than 3 in total; a failed DaVinci run with any attempt
-  without usage; any B run with an attempt without usage.
+- A transport count that is not a non-negative integer, that does not add up to the row's provider attempts, or an arm
+  B run with no WebSocket request.
+- A `pass` flag that is not a boolean, or is true while the exit code is not 0, unrelated files changed or cleanup
+  failed.
+- A DaVinci attempts-without-usage value that is missing or not a non-negative integer. More than 1 DaVinci attempt
+  without usage in a run, or more than 3 in total (Codex rows do not count); a failed DaVinci run with any attempt
+  without usage; any B run with an attempt without usage or without input tokens.
 - A Codex run without complete request telemetry.
 - Missing output tokens.
 - Safety: B is 2 or more verified passes behind A over the paired blocks finished so far.
 
-Result states: `INVALID` (bad pins or file structure), `STOPPED`, `NEEDS_LEAK_SCAN`, `CONTAMINATION_REVIEW`,
-`INCOMPLETE` (missing or unscorable runs; no verdict, no dropped blocks), `COMPLETE`.
+Result states: `INVALID` (bad pins, unreadable or malformed result rows), `CONTAMINATION_REVIEW`, `STOPPED`,
+`NEEDS_LEAK_SCAN`, `INCOMPLETE` (missing or unscorable runs; no verdict, no dropped blocks), `COMPLETE`.
 
-The numbers stay unread until the leak scan has run. Any hit gives `CONTAMINATION_REVIEW`, and no use of the result
-until a human has reviewed it.
+A run is unscorable, never zero, when its wall time is missing or not above 0, its requests, token totals or unrelated
+list are missing or malformed, or cached tokens exceed input tokens.
+
+The numbers stay unread until the leak scan has run. The scan reports one of `CLEAN`, `LEAK`, `NOT_SCANNED` (nothing
+was scanned, or the suite cannot be read), `INCOMPLETE_SCAN` (fewer stdout transcripts than runs) or `WRONG_SUITE`
+(the suite digest differs from the pin). Only `CLEAN` lets the numbers through. Any other status gives
+`CONTAMINATION_REVIEW` and no use of the result until a human has reviewed it, even when a stop also occurred. A
+stop reason on its own is operational information and is shown at once; the safety stop names how many passes B
+trails A by.
 
 ## Privacy safeguards
 
@@ -142,9 +157,12 @@ until a human has reviewed it.
   overlap in either direction, and the launcher runs it before every stage.
 - The suite digest and the opaque task ids are the only suite facts in the pins file and the reports.
 - After the runs, the scanner searches agent transcripts, stderr and telemetry (never credentials or binaries) for the
-  suite path and for every hidden-test line of 60 characters or more that is absent from the starter and the prompt.
-  The authoring brief requires a canary line in each hidden test file. The report carries counts per campaign and no
-  matched text.
+  suite path (any case, Windows, POSIX and MSYS spellings) and for every hidden-test and reference-solution line
+  of 60 characters or more that is absent from the starter and the prompt. It compares the file as written and the strings a
+  JSON reader decodes from it, so escaped quotes, tabs and non-ASCII characters do not hide a line. The authoring brief
+  requires a canary line in each hidden test file. The report carries counts per campaign and no matched text.
+- Limit of the scan: it matches whole lines, case-insensitively. A transcript that quotes only part of a line, or
+  rewrites it, is not caught. The canary, the path check and the storage location are the other safeguards.
 - Reports are built from numbers and ids only. A test checks that no hidden line, prompt text, path or test output
   appears in a complete report.
 - Limit that no safeguard removes: the harness grades with `diagnostic-only` isolation, and an agent process can read
@@ -174,6 +192,9 @@ earlier stage. If the window cannot cover a stage, the stage waits. It is not sh
 - Independence of grading. See the privacy section.
 
 ## Launch readiness
+
+The frozen suite must have exactly six Python tasks, all in the holdout split, all marked large, each with its own
+repository id and an opaque id. `make-pins` refuses anything else.
 
 Not ready. Open items, none of which this document can close:
 
