@@ -532,6 +532,7 @@ pub fn composer_with_caret(
 ) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
     let th = &model.theme;
     let cc = th.cc();
+    model.composer_hit.set(None);
     let editor = model.composer.editor();
     // Long lines wrap onto further rows rather than scrolling sideways, and
     // the editor moves Up and Down across exactly these rows.
@@ -615,6 +616,17 @@ pub fn composer_with_caret(
         vec![composer_rule(model, border, start, "above")]
     };
 
+    if lines.is_none() && !overlaid {
+        model
+            .composer_hit
+            .set(Some(crate::davinci::model::ComposerHit {
+                first: rows.len(),
+                start,
+                end,
+                wrap,
+                shell: shell_mode,
+            }));
+    }
     for (index, raw_entry) in entries.into_iter().enumerate().take(end).skip(start) {
         let ink = th.text;
         let mut column = caret_at

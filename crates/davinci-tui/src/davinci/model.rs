@@ -2965,6 +2965,8 @@ pub struct Model {
     pub history_store: Option<crate::history_store::HistoryStore>,
     /// The Ctrl+R search over earlier prompts, while it is open.
     pub history_search: Option<HistorySearch>,
+    /// Where the composer drew its text, as of the last frame.
+    pub composer_hit: std::cell::Cell<Option<ComposerHit>>,
     /// Prompts sent in this run, newest first.
     pub session_history: Vec<String>,
     /// Every project's prompts, read when the search first asks for them.
@@ -3148,6 +3150,21 @@ impl<'a> IntoIterator for &'a EntryLog {
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
     }
+}
+
+/// Where the composer's text rows sit in what it last drew, so a click can
+/// find the visual row under the pointer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComposerHit {
+    /// Index, within the composer's rows, of the first text row drawn.
+    pub first: usize,
+    /// Visual row drawn first, and one past the last.
+    pub start: usize,
+    pub end: usize,
+    /// Cells the text wraps at.
+    pub wrap: usize,
+    /// A leading `!` is drawn as the prompt glyph, not as text.
+    pub shell: bool,
 }
 
 /// The reverse search over earlier prompts: what was typed, and which match
@@ -3394,6 +3411,7 @@ impl Model {
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
             history_search: None,
+            composer_hit: std::cell::Cell::new(None),
             session_history: Vec::new(),
             history_all: None,
             viewer: None,
@@ -4167,6 +4185,40 @@ impl Model {
         self.refresh_suggestions();
         self.mark_caret_moved();
         true
+    }
+
+    /// Put the caret on the cell a click landed on in visual row `row` of the
+    /// composer, `column` cells in from the left of the text.
+    pub fn place_caret(&mut self, row: usize, column: usize) {
+        let Some(hit) = self.composer_hit.get() else {
+            return;
+        };
+        let editor = self.composer.editor();
+        let Some(&(line, from, length)) = editor.visual_rows(hit.wrap).get(row) else {
+            return;
+        };
+        let buffer = editor.get_text();
+        let line_start: usize = buffer.split('\n').take(line).map(|l| l.len() + 1).sum();
+        let text = buffer.get(line_start..).unwrap_or_default();
+        let text = text.split('\n').next().unwrap_or_default();
+        let shown = text
+            .get(from..(from + length).min(text.len()))
+            .unwrap_or_default();
+        let skip = usize::from(hit.shell && line == 0 && from == 0 && shown.starts_with('!'));
+        let mut cells = 0;
+        let mut offset = skip;
+        for (at, grapheme) in
+            unicode_segmentation::UnicodeSegmentation::grapheme_indices(&shown[skip..], true)
+        {
+            let width = unicode_width::UnicodeWidthStr::width(grapheme);
+            if cells + width > column {
+                break;
+            }
+            cells += width;
+            offset = skip + at + grapheme.len();
+        }
+        self.mark_caret_moved();
+        self.composer.editor_mut().cursor = line_start + from + offset;
     }
 
     /// Open the search over earlier prompts (Ctrl+R). Only from a bare

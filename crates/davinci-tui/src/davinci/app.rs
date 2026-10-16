@@ -72,6 +72,8 @@ pub struct ComposedFrame {
 pub enum Target {
     /// The `↓ Jump to bottom` row of a scrolled-back conversation.
     JumpToBottom,
+    /// A visual row of the composer's text.
+    ComposerRow(usize),
     /// The prompt shown in the sticky header, as a transcript entry.
     Prompt(usize),
     /// The completion item at this index.
@@ -159,6 +161,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let conversation =
         model.screen == Screen::Agent && model.overlay.is_none() && !model.codex_open();
 
+    chrome_model.composer_hit.set(None);
     let (composer_rows, composer_caret) = composer_rows(chrome_model);
     // What the composer offers sits directly above it, inside the same stack,
     // so the list moves with the composer at any window height.
@@ -308,6 +311,17 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         .map(|(row, column)| (column, rows.len() + row))
         .filter(|&(_, row)| row < height)
         .map(|(column, row)| (column, row as u16));
+    if let Some(hit) = chrome_model.composer_hit.get() {
+        for visual in hit.start..hit.end {
+            let row = rows.len() + hit.first + (visual - hit.start);
+            if row < height {
+                targets.push(HitTarget {
+                    rows: row as u16..row as u16 + 1,
+                    target: Target::ComposerRow(visual),
+                });
+            }
+        }
+    }
     rows.extend(composer_rows);
     rows.extend(below);
     rows.extend(chrome::footer(chrome_model));
@@ -4948,6 +4962,47 @@ mod scroll_to_entry_tests {
     }
 
     #[test]
+    fn clicking_the_composer_places_the_caret_on_that_cell() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        m.composer.set_text("hello wide 日本 world\nsecond line");
+        let click = |m: &mut Model, row: u16, column: u16| {
+            let frame = compose_frame(m, m.height);
+            let targets: Vec<_> = frame
+                .targets
+                .iter()
+                .filter(|hit| matches!(hit.target, Target::ComposerRow(_)))
+                .collect();
+            assert_eq!(targets.len(), 2, "one target per text row");
+            let event = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: targets[usize::from(row)].rows.start,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(super::super::runtime::route_click_target(m, event));
+        };
+        // Two cells of prompt, then "hello".
+        click(&mut m, 0, 2 + 5);
+        assert_eq!(m.composer.editor().cursor, 5);
+        // "hello wide " is 11 cells; the wide glyph spans two, so a click on
+        // its second cell stays before it.
+        click(&mut m, 0, 2 + 12);
+        assert_eq!(m.composer.editor().cursor, "hello wide 日".len() - 3);
+        click(&mut m, 1, 2 + 3);
+        assert_eq!(
+            m.composer.editor().cursor,
+            "hello wide 日本 world\nsec".len()
+        );
+        // Past the end of a row lands on its end.
+        click(&mut m, 1, 60);
+        assert_eq!(
+            m.composer.editor().cursor,
+            m.composer.editor().get_text().len()
+        );
+    }
+
+    #[test]
     fn ctrl_o_opens_the_transcript_viewer_and_q_closes_it() {
         let mut m = chat(24, 6);
         handle_key(
@@ -5110,7 +5165,10 @@ mod scroll_to_entry_tests {
         };
         assert!(super::super::runtime::route_click_target(&mut m, click));
         assert!(m.transcript_scroll.get().top.is_none());
-        assert!(compose_frame(&m, m.height).targets.is_empty());
+        assert!(compose_frame(&m, m.height)
+            .targets
+            .iter()
+            .all(|hit| hit.target != Target::JumpToBottom));
     }
 
     #[test]

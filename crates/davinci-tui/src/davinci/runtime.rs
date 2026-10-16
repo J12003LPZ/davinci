@@ -1116,6 +1116,10 @@ pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) ->
         app::Target::JumpToBottom => {
             model.transcript_scroll.take();
         }
+        app::Target::ComposerRow(row) => {
+            // The text starts after the two-cell prompt.
+            model.place_caret(row, usize::from(mouse.column).saturating_sub(2));
+        }
         app::Target::Prompt(entry) => {
             app::scroll_transcript_to_entry(model, entry);
         }
