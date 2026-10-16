@@ -1471,10 +1471,10 @@ mod tests {
 
         editor.set_text("");
         editor.history.clear();
-        for i in 0..105 {
+        for i in 0..(HISTORY_LIMIT + 5) {
             editor.add_to_history(&format!("prompt {i}"));
         }
-        for _ in 0..100 {
+        for _ in 0..HISTORY_LIMIT {
             editor.cursor_up();
         }
         assert_eq!(editor.get_text(), "prompt 5");

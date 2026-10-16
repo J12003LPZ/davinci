@@ -78,7 +78,13 @@ impl HistoryStore {
 
     fn trim(&self) -> std::io::Result<()> {
         let mut kept = self.load();
-        kept.truncate(LOAD_LIMIT);
+        // Newest first: keep entries until half the byte budget is used, so a
+        // run of long prompts does not leave the file at the limit.
+        let mut bytes = 0;
+        kept.retain(|text| {
+            bytes += text.len() + 12;
+            bytes <= MAX_BYTES as usize / 2
+        });
         kept.reverse();
         let body: String = kept
             .iter()
