@@ -4803,7 +4803,10 @@ fn expired_signin_message_keeps_the_prefix_and_names_the_cause() {
         plain,
         "The openai-codex sign-in expired and could not be refreshed. Run /login openai-codex."
     );
-    assert_eq!(super::expired_signin_message("openai-codex", Some("")), plain);
+    assert_eq!(
+        super::expired_signin_message("openai-codex", Some("")),
+        plain
+    );
     let refused = super::expired_signin_message(
         "openai-codex",
         Some("OpenAI OAuth request failed: HTTP 400 invalid_grant"),
@@ -4819,7 +4822,12 @@ fn a_refresh_that_errors_is_reported_not_swallowed() {
     let dir = tempfile::tempdir().unwrap();
     let mut storage = super::AuthStorage::open(&dir.path().join("auth.json")).unwrap();
     storage
-        .login_oauth("openai-codex", "access", Some("refresh".into()), Some(1_000))
+        .login_oauth(
+            "openai-codex",
+            "access",
+            Some("refresh".into()),
+            Some(1_000),
+        )
         .unwrap();
     let cause = super::maybe_refresh_auth(&mut storage, "openai-codex", 2_000_000, 0, false);
     let cause = cause.expect("the refresh error is returned");

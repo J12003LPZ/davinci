@@ -211,9 +211,9 @@ use davinci_ai::{
     find_model, format_no_api_key_found_message, format_no_model_selected_message,
     format_no_models_available_message, format_oauth_auth_failed_message, fuzzy_models,
     get_supported_thinking_levels, live_complete_streaming_with_sink_envelope, load_builtin_models,
-    models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage, AuthStorageError,
-    ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
-    StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE, PROVIDER_SPECS,
+    models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
+    AuthStorageError, ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot,
+    ResolvedAuth, StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE, PROVIDER_SPECS,
 };
 use davinci_coding_agent::interactive_tui::{
     create_interactive_tui, handle_copy_command, remount_chrome_panes, stop_interactive_tui,
@@ -8382,8 +8382,9 @@ fn maybe_refresh_auth(
 /// The refresh error says whether the login was refused (HTTP status and OAuth code) or the
 /// network failed, which are different fixes; it carries no token.
 fn expired_signin_message(provider: &str, cause: Option<&str>) -> String {
-    let mut message =
-        format!("The {provider} sign-in expired and could not be refreshed. Run /login {provider}.");
+    let mut message = format!(
+        "The {provider} sign-in expired and could not be refreshed. Run /login {provider}."
+    );
     if let Some(cause) = cause.filter(|cause| !cause.is_empty()) {
         message.push_str(&format!(" Cause: {cause}"));
     }
