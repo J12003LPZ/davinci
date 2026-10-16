@@ -433,6 +433,9 @@ pub struct Settings {
     pub clear_on_shrink: Option<bool>,
     #[serde(default, rename = "showTerminalProgress")]
     pub show_terminal_progress: Option<bool>,
+    /// Blink the painted composer caret. Off by default: a steady caret.
+    #[serde(default, rename = "caretBlink")]
+    pub caret_blink: Option<bool>,
     #[serde(default)]
     pub warnings: WarningSettings,
     #[serde(default, rename = "externalEditor")]

@@ -10,15 +10,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::Show;
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -140,7 +142,7 @@ pub fn restore() -> io::Result<()> {
             let _ = execute!(io::stdout(), event::DisableMouseCapture);
         }
     }
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste);
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
     io::stdout().flush()
@@ -365,6 +367,69 @@ pub struct Session {
     /// The conversation's scrollbar as last drawn, for hit-testing the
     /// pointer against what is actually on screen.
     scrollbar: Option<Scrollbar>,
+    /// What the terminal last said about focus (mode 1004). Terminals that
+    /// never report focus leave it `true`.
+    focused: bool,
+    /// How frames reach the terminal, read once from the environment.
+    output: Output,
+}
+
+/// Frame delivery choices, fixed for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    /// Wrap each frame in DEC mode 2026 so the terminal shows it whole.
+    /// Terminals without the mode ignore it; `DAVINCI_SYNC_OUTPUT=0` stops it.
+    pub synchronized: bool,
+    /// Repaint every cell each frame, for ConPTY hosts that mis-coalesce
+    /// positioned writes and leave stale fragments (`DAVINCI_FULL_REPAINT=1`).
+    pub full_repaint: bool,
+    /// Show the terminal's cursor at the caret instead of painting a cell
+    /// (`DAVINCI_NATIVE_CURSOR=1`, or the `showHardwareCursor` setting).
+    pub native_cursor: bool,
+}
+
+impl Output {
+    /// Read from an environment lookup, so tests need not touch the process.
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        let flag = |name: &str| {
+            get(name).map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off"
+                )
+            })
+        };
+        Self {
+            synchronized: flag("DAVINCI_SYNC_OUTPUT").unwrap_or(true),
+            full_repaint: flag("DAVINCI_FULL_REPAINT").unwrap_or(false),
+            native_cursor: flag("DAVINCI_NATIVE_CURSOR").unwrap_or(false),
+        }
+    }
+}
+
+/// Open a frame: the terminal holds what follows until [`finish_frame`].
+fn begin_frame(out: &mut impl Write, output: Output) -> io::Result<()> {
+    if output.synchronized {
+        crossterm::queue!(out, BeginSynchronizedUpdate)?;
+    }
+    Ok(())
+}
+
+/// Close a frame: park the cursor on the caret, where an input method's
+/// candidate window and a magnifier will look for it. It stays hidden unless
+/// the terminal's own cursor is standing in for the painted caret.
+fn finish_frame(out: &mut impl Write, output: Output, caret: Option<(u16, u16)>) -> io::Result<()> {
+    match caret {
+        Some((column, row)) if output.native_cursor => {
+            crossterm::queue!(out, MoveTo(column, row), Show)?
+        }
+        Some((column, row)) => crossterm::queue!(out, Hide, MoveTo(column, row))?,
+        None => crossterm::queue!(out, Hide)?,
+    }
+    if output.synchronized {
+        crossterm::queue!(out, EndSynchronizedUpdate)?;
+    }
+    out.flush()
 }
 
 impl Session {
@@ -378,7 +443,7 @@ impl Session {
             HELD.store(true, Ordering::SeqCst);
             let mut out = io::stdout();
             execute!(out, EnterAlternateScreen)?;
-            let _ = execute!(out, EnableBracketedPaste);
+            let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
             let disambiguated = supports_keyboard_enhancement();
             if disambiguated {
                 execute!(
@@ -412,7 +477,16 @@ impl Session {
             selection_focus: None,
             scrollbar_grab: None,
             scrollbar: None,
+            focused: true,
+            output: Output::from_env(|name| std::env::var(name).ok()),
         })
+    }
+
+    /// Use the terminal's own cursor at the caret (the `showHardwareCursor`
+    /// setting); the environment can turn it on but a setting cannot turn
+    /// the environment's choice off.
+    pub fn set_native_cursor(&mut self, native: bool) {
+        self.output.native_cursor |= native;
     }
 
     /// Take the terminal again after something else gave it back — the panic
@@ -428,7 +502,7 @@ impl Session {
         HELD.store(true, Ordering::SeqCst);
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen)?;
-        let _ = execute!(out, EnableBracketedPaste);
+        let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
         if self.keyboard.disambiguated {
             let _ = execute!(
                 out,
@@ -451,6 +525,16 @@ impl Session {
     /// delivers as a burst of keys (Windows; see [`PasteFilter`]) is
     /// reassembled into the one [`Event::Paste`] the model expects.
     pub fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        let event = self.poll_event_inner(timeout)?;
+        match event {
+            Some(Event::FocusGained) => self.focused = true,
+            Some(Event::FocusLost) => self.focused = false,
+            _ => {}
+        }
+        Ok(event)
+    }
+
+    fn poll_event_inner(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
         // Dropped mouse-motion events must consume the caller's existing wait,
         // not start a fresh full timeout. Otherwise continuous motion on
         // Windows can prevent the turn loop from reaching its next tick.
@@ -531,7 +615,7 @@ impl Session {
     }
 
     /// Paint one frame.
-    pub fn draw(&mut self, model: &Model) -> io::Result<()> {
+    pub fn draw(&mut self, model: &mut Model) -> io::Result<()> {
         if !HELD.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -553,6 +637,15 @@ impl Session {
             }
             MOUSE.store(mouse, Ordering::SeqCst);
         }
+        model.terminal_focused = self.focused;
+        model.native_cursor = self.output.native_cursor;
+        let model: &Model = model;
+        let output = self.output;
+        if output.full_repaint {
+            self.terminal.clear()?;
+        }
+        begin_frame(self.terminal.backend_mut(), output)?;
+        let mut caret = None;
         let background = Style::default().bg(model.theme.background);
         let mut rendered_lines = Vec::new();
         let mut scrollbar = None;
@@ -562,6 +655,7 @@ impl Session {
             let composed = app::compose_frame(model, area.height);
             rendered_lines = composed.lines.iter().map(ToString::to_string).collect();
             scrollbar = composed.scrollbar;
+            caret = composed.caret;
             if let Some(bar) = &scrollbar {
                 strip_scrollbar(&mut rendered_lines, bar);
             }
@@ -583,6 +677,7 @@ impl Session {
                 }
             }
         })?;
+        finish_frame(self.terminal.backend_mut(), output, caret)?;
         self.rendered_lines = rendered_lines;
         self.scrollbar = scrollbar;
         Ok(())
@@ -852,6 +947,64 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn output_defaults_to_synchronized_incremental_painted_caret() {
+        let output = Output::from_env(env(&[]));
+        assert_eq!(
+            output,
+            Output {
+                synchronized: true,
+                full_repaint: false,
+                native_cursor: false,
+            }
+        );
+        let output = Output::from_env(env(&[
+            ("DAVINCI_SYNC_OUTPUT", "0"),
+            ("DAVINCI_FULL_REPAINT", "1"),
+            ("DAVINCI_NATIVE_CURSOR", "true"),
+        ]));
+        assert!(!output.synchronized && output.full_repaint && output.native_cursor);
+    }
+
+    #[test]
+    fn a_synchronized_frame_is_bracketed_and_parks_the_hidden_cursor() {
+        let output = Output::from_env(env(&[]));
+        let mut out = Vec::new();
+        begin_frame(&mut out, output).unwrap();
+        out.extend_from_slice(b"cells");
+        finish_frame(&mut out, output, Some((4, 9))).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "\x1b[?2026hcells\x1b[?25l\x1b[10;5H\x1b[?2026l");
+    }
+
+    #[test]
+    fn an_unsynchronized_native_cursor_frame_shows_the_cursor_at_the_caret() {
+        let output = Output::from_env(env(&[
+            ("DAVINCI_SYNC_OUTPUT", "off"),
+            ("DAVINCI_NATIVE_CURSOR", "1"),
+        ]));
+        let mut out = Vec::new();
+        begin_frame(&mut out, output).unwrap();
+        finish_frame(&mut out, output, Some((0, 0))).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[1;1H\x1b[?25h");
+        let mut out = Vec::new();
+        finish_frame(&mut out, output, None).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[?25l");
+    }
 
     #[test]
     fn mouse_motion_does_not_mark_the_frame_dirty() {

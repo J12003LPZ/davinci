@@ -61,6 +61,8 @@ pub struct ComposedFrame {
     /// The screen rows the completion list occupies, when one is open. The
     /// wheel steers the list only while the pointer is over these rows.
     pub suggestion_rows: Option<std::ops::Range<u16>>,
+    /// The composer's caret as `(column, row)` on screen, when one is drawn.
+    pub caret: Option<(u16, u16)>,
 }
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
@@ -71,6 +73,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             graph: None,
             scrollbar: None,
             suggestion_rows: None,
+            caret: None,
         };
     }
     if matches!(model.screen, Screen::Models | Screen::Settings) && model.overlay.is_none() {
@@ -94,6 +97,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             graph: None,
             scrollbar: None,
             suggestion_rows: None,
+            caret: None,
         };
     }
     // Command surfaces use the same bottom-anchored, unboxed language as the
@@ -106,6 +110,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
                 graph: None,
                 scrollbar: None,
                 suggestion_rows: None,
+                caret: None,
             };
         }
     }
@@ -119,7 +124,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let conversation =
         model.screen == Screen::Agent && model.overlay.is_none() && !model.codex_open();
 
-    let composer_rows = composer_rows(chrome_model);
+    let (composer_rows, composer_caret) = composer_rows(chrome_model);
     // What the composer offers sits directly above it, inside the same stack,
     // so the list moves with the composer at any window height.
     let offered = chrome::suggestions(chrome_model);
@@ -229,6 +234,10 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         start..(rows.len() + offered.len()).min(height) as u16
     });
     rows.extend(offered);
+    let caret = composer_caret
+        .map(|(row, column)| (column, rows.len() + row))
+        .filter(|&(_, row)| row < height)
+        .map(|(column, row)| (column, row as u16));
     rows.extend(composer_rows);
     rows.extend(below);
     rows.extend(chrome::footer(chrome_model));
@@ -244,6 +253,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         graph,
         scrollbar,
         suggestion_rows,
+        caret,
     }
 }
 
@@ -530,9 +540,9 @@ fn extension_rows(model: &Model, lines: &[String]) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn composer_rows(model: &Model) -> Vec<Line<'static>> {
+fn composer_rows(model: &Model) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
     if model.overlay.is_some() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     // Conversation hints stay close to the prompt and abbreviate on narrow
     // windows. Overlays and the Codex split own their keyboard guidance.
@@ -540,15 +550,15 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
     // row (design.md §11).
     if let Some(sheet) = sheet::chrome(model) {
         match sheet.composer {
-            Composer::Hidden => return Vec::new(),
-            Composer::Disabled(text) => return chrome::disabled_composer(model, text),
+            Composer::Hidden => return (Vec::new(), None),
+            Composer::Disabled(text) => return (chrome::disabled_composer(model, text), None),
             Composer::Prompt(_) | Composer::PromptOwned(_) => {
                 if model.queued.is_empty() {
-                    return chrome::composer(model, None, Hint::None);
+                    return chrome::composer_with_caret(model, None, Hint::None);
                 }
                 let mut rows: Vec<String> = model.queued.clone();
                 rows.extend(model.composer.split('\n').map(str::to_string));
-                return chrome::composer(model, Some(&rows), Hint::None);
+                return chrome::composer_with_caret(model, Some(&rows), Hint::None);
             }
         }
     }
@@ -572,12 +582,12 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
         }
     };
     if model.queued.is_empty() {
-        return chrome::composer(model, None, hint);
+        return chrome::composer_with_caret(model, None, hint);
     }
     // What is waiting sits above what is being typed, in the same box.
     let mut rows: Vec<String> = model.queued.clone();
     rows.extend(model.composer.split('\n').map(str::to_string));
-    chrome::composer(model, Some(&rows), hint)
+    chrome::composer_with_caret(model, Some(&rows), hint)
 }
 
 /// A short conversation starts under its welcome banner. As it fills the
@@ -2564,6 +2574,73 @@ mod tests {
                 assert_eq!(m.permission_mode, "ask");
             }
         }
+    }
+
+    /// The character drawn at display column `column` of `line`.
+    fn char_at_column(line: &Line<'_>, column: u16) -> Option<char> {
+        let mut at = 0u16;
+        for ch in row_text(line).chars() {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+            if at == column {
+                return Some(ch);
+            }
+            at += width;
+            if at > column {
+                return None;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_composed_frame_reports_the_caret_cell() {
+        let mut m = model(80, 24);
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.expect("an empty composer has a caret");
+        assert_eq!(column, 2, "on the placeholder's first character");
+        assert_eq!(
+            char_at_column(&frame.lines[row as usize], column),
+            Some('T')
+        );
+
+        for ch in "abc".chars() {
+            handle_key(&mut m, key(KeyCode::Char(ch)));
+        }
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.unwrap();
+        assert_eq!(column, 5, "past the last character");
+        assert!(row_text(&frame.lines[row as usize]).contains("abc"));
+
+        handle_key(&mut m, key(KeyCode::Left));
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.unwrap();
+        assert_eq!(
+            char_at_column(&frame.lines[row as usize], column),
+            Some('c')
+        );
+    }
+
+    #[test]
+    fn the_caret_cell_counts_wide_characters_by_width() {
+        let mut m = model(80, 24);
+        m.type_char("日本");
+        let frame = compose_frame(&m, 24);
+        assert_eq!(frame.caret.map(|(column, _)| column), Some(6));
+        handle_key(&mut m, key(KeyCode::Left));
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.unwrap();
+        assert_eq!(column, 4);
+        assert_eq!(
+            char_at_column(&frame.lines[row as usize], column),
+            Some('本')
+        );
+    }
+
+    #[test]
+    fn an_open_overlay_reports_no_caret() {
+        let mut m = model(80, 24);
+        m.toggle_overlay(Overlay::Instrumenta);
+        assert_eq!(compose_frame(&m, 24).caret, None);
     }
 
     #[test]

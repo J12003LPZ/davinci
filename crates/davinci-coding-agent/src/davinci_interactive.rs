@@ -4782,6 +4782,7 @@ pub fn run(
         model.suggestion_rows = rows.clamp(3, 20) as usize;
     }
     model.terminal_progress = stored_settings.show_terminal_progress();
+    model.caret_blink = stored_settings.caret_blink.unwrap_or(false);
     if let Some(enabled) = stored_settings
         .enabled_models
         .clone()
@@ -4813,6 +4814,7 @@ pub fn run(
     let mut image_status: Option<String> = None;
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    terminal.set_native_cursor(stored_settings.show_hardware_cursor.unwrap_or(false));
     crate::startup_mark("shell: terminal open");
     let mut first_frame = true;
     // From here the alternate screen is ours, so a `println!` from shared code
@@ -5120,7 +5122,7 @@ pub fn run(
             model.dirty = true;
         }
         if model.dirty {
-            if let Err(err) = terminal.draw(&model) {
+            if let Err(err) = terminal.draw(&mut model) {
                 break Err(err.to_string());
             }
             model.dirty = false;

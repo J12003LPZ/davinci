@@ -2703,6 +2703,16 @@ pub struct Model {
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
     pub caret_moved_at: u64,
+    /// The stored `caretBlink` setting. Off by default: the reference terminal
+    /// draws a steady caret, and a blinking one costs a redraw every phase.
+    pub caret_blink: bool,
+    /// Whether the terminal last reported focus (DEC mode 1004). A window in
+    /// the background shows no caret, so the active window is unambiguous.
+    pub terminal_focused: bool,
+    /// The terminal's own cursor sits at the caret instead of a painted cell
+    /// (`showHardwareCursor`, `DAVINCI_NATIVE_CURSOR`). Its shape and blink
+    /// are then the terminal's settings, not ours.
+    pub native_cursor: bool,
     /// The typewriter on the newest reply, when one is being written.
     pub reveal: Option<Reveal>,
     /// When the reveal last stepped; the step is sized from real time.
@@ -3188,6 +3198,9 @@ impl Model {
             overlay_offset: None,
             section_notice: None,
             caret_moved_at: 0,
+            caret_blink: false,
+            terminal_focused: true,
+            native_cursor: false,
             reveal: None,
             reveal_clock: None,
             reveal_floor: None,
@@ -3733,10 +3746,17 @@ impl Model {
     /// resumes blinking a full phase after the composer goes still. A caret
     /// that winks out mid-motion reads as a dropped keystroke.
     pub fn blink(&self) -> bool {
-        if !self.animate {
+        if !self.animate || !self.caret_blink {
             return true;
         }
         (self.tick.wrapping_sub(self.caret_moved_at) / 4) % 2 == 0
+    }
+
+    /// Whether the painted caret cell is drawn this frame: never under the
+    /// terminal's own cursor, never while the window is in the background,
+    /// and otherwise steady unless `caretBlink` asked for the blink phase.
+    pub fn caret_lit(&self) -> bool {
+        !self.native_cursor && self.terminal_focused && self.blink()
     }
 
     /// Restart the blink phase: the caret is somewhere new, so it is drawn
@@ -4547,8 +4567,23 @@ mod tests {
     }
 
     #[test]
+    fn the_caret_is_steady_by_default_and_hidden_when_unfocused_or_native() {
+        let mut m = model(120);
+        for tick in 0..9 {
+            m.tick = tick;
+            assert!(m.caret_lit(), "steady at tick {tick}");
+        }
+        m.terminal_focused = false;
+        assert!(!m.caret_lit(), "a background window shows no caret");
+        m.terminal_focused = true;
+        m.native_cursor = true;
+        assert!(!m.caret_lit(), "the terminal's cursor stands in for it");
+    }
+
+    #[test]
     fn the_caret_blinks_off_the_shared_clock_and_freezes_when_still() {
         let mut m = model(120);
+        m.caret_blink = true;
         let phases: Vec<bool> = (0..9)
             .map(|tick| {
                 m.tick = tick;
@@ -4568,6 +4603,7 @@ mod tests {
     #[test]
     fn a_caret_being_moved_does_not_blink() {
         let mut m = model(120);
+        m.caret_blink = true;
         m.type_char("hello");
         // Six ticks after the last keystroke would be the dark half of the
         // phase if the phase ran from zero.

@@ -510,6 +510,17 @@ pub fn effort_rule(model: &Model) -> Line<'static> {
 /// focus; under an open instrument the theme dims. Recall replaces the input
 /// with its own keys (`2b`).
 pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line<'static>> {
+    composer_with_caret(model, lines, hint).0
+}
+
+/// [`composer`], plus where its caret sits: `(row within the returned rows,
+/// display column)`. The runtime parks the terminal's cursor there, hidden or
+/// shown, so input-method candidate windows and magnifiers follow the caret.
+pub fn composer_with_caret(
+    model: &Model,
+    lines: Option<&[String]>,
+    hint: Hint,
+) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
     let th = &model.theme;
     let cc = th.cc();
     let editor = model.composer.editor();
@@ -522,12 +533,13 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         } else {
             "enter pin to context · f raise floor · r reindex · esc close"
         };
-        return Surface::new(model.width, th)
+        let rows = Surface::new(model.width, th)
             .row(vec![
                 span(format!("{} ", glyph::PROMPT), th.secondary),
                 span(keys, th.muted),
             ])
             .lines();
+        return (rows, None);
     }
 
     let owned = lines.map(<[String]>::to_vec);
@@ -557,7 +569,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
             })
         });
 
-    let lit = model.blink();
+    let lit = model.caret_lit();
     let caret_color = if th.text == Color::Reset {
         th.primary
     } else {
@@ -574,6 +586,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         None
     };
     let caret_row = caret_at.map_or(last, |(row, _)| row.min(last));
+    let mut caret_cell: Option<(usize, u16)> = None;
     let visible = (model.height as usize / 3).clamp(1, 8);
     let start = caret_row
         .saturating_sub(visible - 1)
@@ -612,6 +625,17 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
             && index == caret_row
             && !overlaid
             && placeholder.as_deref().is_some_and(|hint| !hint.is_empty());
+        if index == caret_row && !overlaid && caret_at.is_some() {
+            // Every prompt glyph (`❯`, `!`, or the two-space indent) is two cells.
+            let prompt_cells = 2;
+            let before = match &split {
+                _ if caret_on_hint => 0,
+                Some((before, _, _)) => UnicodeWidthStr::width(before.as_str()),
+                None => UnicodeWidthStr::width(shown.as_str()),
+            };
+            let column = (prompt_cells + before).min(usize::from(model.width.saturating_sub(1)));
+            caret_cell = Some((rows.len(), column as u16));
+        }
         let body = if caret_on_hint {
             let hint = placeholder.clone().unwrap_or_default();
             let mut chars = hint.chars();
@@ -690,7 +714,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     if hint != Hint::None {
         rows.push(hint_line(model, hint, rows_typed));
     }
-    rows
+    (rows, caret_cell)
 }
 
 fn known_command(model: &Model, entry: &str) -> Option<String> {
@@ -1512,6 +1536,7 @@ mod tests {
     #[test]
     fn the_caret_is_drawn_on_the_last_row_only_and_blinks() {
         let mut m = model(100);
+        m.caret_blink = true;
         let entered = vec!["one".to_string(), "two".to_string()];
         let rows = composer(&m, Some(&entered), Hint::Multiline);
         let caret = |line: &Line<'_>| {
