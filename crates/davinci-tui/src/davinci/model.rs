@@ -2965,6 +2965,10 @@ pub struct Model {
     pub history_store: Option<crate::history_store::HistoryStore>,
     /// The Ctrl+R search over earlier prompts, while it is open.
     pub history_search: Option<HistorySearch>,
+    /// The Ctrl+O transcript viewer, while it is open.
+    pub viewer: Option<super::views::viewer::TranscriptViewer>,
+    /// Terminal work the viewer asked for, done before the next frame.
+    pub viewer_task: Option<super::views::viewer::ViewerTask>,
     /// What the command sheets state about the session (design.md §11).
     pub facts: Facts,
 }
@@ -3355,6 +3359,8 @@ impl Model {
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
             history_search: None,
+            viewer: None,
+            viewer_task: None,
             facts: Facts::default(),
         }
     }

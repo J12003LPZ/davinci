@@ -32,6 +32,7 @@ use unicode_width::UnicodeWidthChar;
 use super::app::{self, Flow};
 use super::model::Model;
 use super::views::scrollbar::Scrollbar;
+use super::views::viewer::ViewerTask;
 
 /// One frame of the clock. Both animations are derived from it.
 pub const TICK: Duration = Duration::from_millis(250);
@@ -511,6 +512,27 @@ impl Session {
         self.terminal.clear()
     }
 
+    /// Terminal work the transcript viewer asked for: give the screen back,
+    /// do it, take the screen again.
+    fn run_viewer_task(&mut self, task: ViewerTask, model: &mut Model) -> io::Result<()> {
+        restore()?;
+        let note = match task {
+            ViewerTask::Scrollback(text) => {
+                scrollback_dump(&text).map(|()| "transcript written to scrollback".to_owned())
+            }
+            ViewerTask::Editor(text) => {
+                open_in_editor(&text).map(|editor| format!("closed {editor}"))
+            }
+        };
+        self.reacquire()?;
+        model.toast = Some((
+            note.unwrap_or_else(|err| format!("transcript: {err}")),
+            Instant::now(),
+        ));
+        model.dirty = true;
+        Ok(())
+    }
+
     /// Forget what is on screen so the next draw paints every cell: for when
     /// something wrote to the terminal behind the renderer's back.
     pub fn clear(&mut self) -> io::Result<()> {
@@ -616,6 +638,9 @@ impl Session {
     pub fn draw(&mut self, model: &mut Model) -> io::Result<()> {
         if !HELD.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        if let Some(task) = model.viewer_task.take() {
+            self.run_viewer_task(task, model)?;
         }
         let mouse = !env_flag("DAVINCI_DISABLE_MOUSE");
         if mouse != MOUSE.load(Ordering::SeqCst) {
@@ -811,6 +836,16 @@ pub fn route_scroll_mouse(
             // The completion list floats over the screen, so the pointer
             // decides which surface the wheel belongs to: over the list it
             // steps the selection, anywhere else it scrolls the conversation.
+            if let Some(viewer) = &mut model.viewer {
+                let rows = if up { -wheel_rows } else { wheel_rows };
+                let height = usize::from(model.height);
+                let max = viewer
+                    .lines
+                    .len()
+                    .saturating_sub(height.saturating_sub(2).max(1));
+                viewer.top = viewer.top.saturating_add_signed(rows).min(max);
+                return true;
+            }
             if over_suggestions(model, mouse.row) {
                 model.suggestion_move(if up { -1 } else { 1 });
                 return true;
@@ -856,6 +891,73 @@ pub fn route_scroll_mouse(
 
 /// Whether `row` falls on the open completion list. Nothing is composed
 /// unless a list is open.
+/// Print `text` onto the terminal's own screen, where its scrollback keeps
+/// it, and wait for esc, q or enter before the viewer comes back.
+fn scrollback_dump(text: &str) -> Result<(), String> {
+    let mut out = io::stdout();
+    out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(b"\n-- esc or q to return to davinci --\n")
+        .map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let waited = loop {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => break Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(err) => break Err(err.to_string()),
+        }
+    };
+    let _ = disable_raw_mode();
+    waited
+}
+
+/// Open `text` in `$VISUAL`, then `$EDITOR`, then `vi`, from a private
+/// temporary file that is removed afterwards. Returns the editor's name.
+fn open_in_editor(text: &str) -> Result<String, String> {
+    let command = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_owned());
+    let mut parts = command.split_whitespace();
+    let program = parts.next().ok_or("no editor")?.to_owned();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "davinci-transcript-{}-{nanos}.txt",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .map_err(|e| e.to_string())?;
+    let status = std::process::Command::new(&program)
+        .args(parts)
+        .arg(&path)
+        .status();
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(_) => Ok(program),
+        Err(err) => Err(format!("could not start {program}: {err}")),
+    }
+}
+
 /// A truthy environment flag (`1`, `true`, `yes`, `on`).
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {

@@ -97,6 +97,16 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             caret: None,
         };
     }
+    if let Some(viewer) = &model.viewer {
+        return ComposedFrame {
+            lines: pad_to(super::views::viewer::render(model, viewer, height), height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
+        };
+    }
     if matches!(model.screen, Screen::Models | Screen::Settings) && model.overlay.is_none() {
         let picker = if model.screen == Screen::Settings {
             settings::screen(model, settings::screen_height(model).min(height))
@@ -925,6 +935,31 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
 /// run and never the app (design.md §6).
+/// Keys while the transcript viewer is open.
+fn handle_viewer_key(model: &mut Model, key: KeyEvent) -> Flow {
+    use super::views::viewer::{self, Outcome};
+    let height = usize::from(model.height);
+    let Some(open) = &mut model.viewer else {
+        return Flow::Continue;
+    };
+    // A resize reflows every row, so the snapshot is taken again.
+    if open.width != model.width {
+        let top = open.top;
+        let mut fresh = viewer::TranscriptViewer::open(model);
+        fresh.top = top.min(fresh.lines.len().saturating_sub(1));
+        model.viewer = Some(fresh);
+    }
+    let Some(open) = &mut model.viewer else {
+        return Flow::Continue;
+    };
+    match viewer::handle_key(open, key, height) {
+        Outcome::Stay => {}
+        Outcome::Close => model.viewer = None,
+        Outcome::Task(task) => model.viewer_task = Some(task),
+    }
+    Flow::Continue
+}
+
 /// Keys while the history search is open: typing narrows it, the arrows and
 /// another Ctrl+R walk the matches, enter takes one, esc leaves the composer
 /// as it was.
@@ -1003,6 +1038,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         return Flow::Continue;
     }
 
+    if model.viewer.is_some() {
+        return handle_viewer_key(model, key);
+    }
     if model.history_search.is_some() {
         return handle_history_search_key(model, key);
     }
@@ -1257,6 +1295,10 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
     }
     if model.keybindings.matches(data, "davinci.codex.toggle") {
         model.toggle_codex();
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.transcript.open") && model.screen == Screen::Agent {
+        model.viewer = Some(super::views::viewer::TranscriptViewer::open(model));
         return Some(Flow::Continue);
     }
     if model.keybindings.matches(data, "davinci.tools.expand") {
@@ -4786,6 +4828,50 @@ mod scroll_to_entry_tests {
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_transcript_viewer_and_q_closes_it() {
+        let mut m = chat(24, 6);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert!(m.viewer.is_some());
+        let shown = rows(&m);
+        assert!(shown[0].contains("Transcript"), "{shown:?}");
+        // Pager keys steer the viewer, not the composer.
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(m.viewer.as_ref().map(|v| v.top), Some(0));
+        assert!(rows(&m).iter().any(|row| row.contains("question 0")));
+        assert_eq!(m.composer.editor().get_text(), "");
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('q')));
+        assert!(m.viewer.is_none());
+    }
+
+    #[test]
+    fn the_viewer_asks_for_the_terminal_to_dump_or_edit() {
+        use super::super::views::viewer::ViewerTask;
+        let mut m = chat(24, 6);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('[')));
+        assert!(
+            matches!(m.viewer_task.take(), Some(ViewerTask::Scrollback(t)) if t.contains("question 0"))
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('v')));
+        assert!(matches!(m.viewer_task.take(), Some(ViewerTask::Editor(_))));
+    }
+
+    #[test]
+    fn alt_o_still_expands_tool_output_in_place() {
+        let mut m = chat(24, 6);
+        assert!(!m.show_tool_output);
+        handle_key(&mut m, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
+        assert!(m.show_tool_output);
+        assert!(m.viewer.is_none());
     }
 
     fn searching() -> Model {
