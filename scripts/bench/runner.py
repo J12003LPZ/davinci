@@ -392,7 +392,7 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             "effort_policy": effort, "service_tier": service_tier(),
             "executables": executables, "identities": identities,
             "grading_isolation": isolations, "containers": containers,
-            "agent_account": os.environ.get("BENCH_AGENT_USER", "").strip() or None,
+            "agent_boundary": os.environ.get("BENCH_AGENT_BOUNDARY", "").strip() or None,
             "agent_dir": str((Path(root) / "_agent").resolve()),
             "os": platform.platform(), "cpu": platform.processor(), "python": sys.version,
             "tooling_preflight": tooling, "grader_preflight": grader,
@@ -591,8 +591,8 @@ def _execute_native(command, workdir, env, timeout, launcher=None):
 def execute(command, workdir, env, timeout, *, agent=False):
     """Measure through proven process-tree/container cleanup before any grading.
 
-    ``agent=True`` marks the model-driven process: when BENCH_AGENT_USER is set it runs under that
-    account. Graders and checks never pass it, so they keep the operator's access.
+    ``agent=True`` marks the model-driven process: when BENCH_AGENT_BOUNDARY is set it runs under a
+    restricted token. Graders and checks never pass it, so they keep the operator's access.
     """
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
@@ -600,8 +600,8 @@ def execute(command, workdir, env, timeout, *, agent=False):
     owner = _campaign_owner
     token = owner.begin(target, workdir) if owner is not None else None
     if agent and target is None:
-        import agent_account
-        launcher = agent_account.active_launcher()
+        import agent_boundary
+        launcher = agent_boundary.active_launcher()
     else:
         launcher = None
     measured = (_execute_container(command, workdir, env, timeout, target) if target

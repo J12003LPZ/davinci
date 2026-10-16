@@ -1,66 +1,72 @@
 # H1 access isolation: agents cannot read the private suite
 
 The transcript scan and the location check detect a leak after the fact. They are not access controls.
-This adds one: the two agents run under a separate, unprivileged Windows account, so the operating
+This adds one: the two agents run with a restricted copy of the operator's own token, so the operating
 system refuses their reads of the suite, the reference solutions and every finished run directory.
+No second account and no administrator rights are involved.
 
-Scope: this changes who the agent processes run as. It does not change the tasks, the schedule, the
-thresholds, the evaluator or the arms. Graders and checks still run as the operator.
+Scope: this changes how the agent processes are started. It does not change the tasks, the schedule,
+the thresholds, the evaluator or the arms. Graders and checks keep the ordinary token.
 
-## The boundary
+## How it works
 
-| Account | Runs | Can read |
+Windows checks every file access twice for a restricted token: once as usual, and once against the
+token's restricting SIDs only. The agent token restricts to Users, Everyone and the logon session.
+
+| Location | Grants Users or Everyone | Agent can read it |
 |---|---|---|
-| operator (your account) | harness, grading, evaluator | vault, results root, everything |
-| agent account (`h1agent`) | DaVinci and Codex processes only | its own run directory while the agent runs, the campaign agent directory, granted tool and binary directories |
+| suite vault, results base | no (inheritance removed, operator and SYSTEM only) | no |
+| operator profile (home, `.codex`, `.pi`, temp) | no | no |
+| a finished run directory | no (grant revoked before the hidden tests are copied in) | no |
+| the live run directory | yes, only while the agent runs | yes |
+| the campaign agent directory (login copy, stand-in home, temp) | yes | yes |
+| toolchain and pinned binaries | yes, read and execute, granted once | yes |
 
-Enforced by file permissions:
+The logon-session SID is not for files. Without it the process cannot open its own desktop and a
+program such as git dies with `0xC0000142`.
 
-1. The suite vault and the results base have inheritance removed and grant only the operator and
-   SYSTEM. The vault also carries an explicit deny for the agent account.
-2. Before each agent starts, the harness grants the agent account modify rights on that run
-   directory only. The grant is removed when the agent exits, before the hidden tests are copied in.
-   If the entry survives, the run fails. Finished run directories, which hold the hidden tests,
-   are therefore unreadable to every later agent.
-3. The agent gets its own profile variables and, if `BENCH_AGENT_PATH` is set, a PATH limited to the
-   granted tool directories. Nothing points into the operator's profile.
+Steps the harness takes when `BENCH_AGENT_BOUNDARY=restricted-token`:
 
-Not covered: the account is not a sandbox against a kernel or privilege escalation bug, the agent can
-use the network, and a task prompt that quotes a hidden test is the author's responsibility
-(the brief forbids it). Anything the agent writes into its own run directory is visible to the operator.
+1. Before each agent starts, grant Users modify rights on that run directory only.
+2. Start the agent suspended under the restricted token, inside the same job object as before.
+3. When it exits, remove the grant and read the access list back. If a Users or Everyone entry
+   survives, for example because the results base was not locked, the run fails.
+4. Only then copy the hidden tests in and grade, as the operator.
 
-## Setup (operator, once; steps 1 and 2 need an administrator prompt)
+The agent gets a stand-in home under the campaign agent directory (`home\AppData\Local\Temp`,
+`home\.codex`) and, if `BENCH_AGENT_PATH` is set, only that PATH. The command is looked up on that
+PATH, never on the operator's. The Codex arm reads its login from the stand-in `.codex`.
+
+Not covered: this is not a defence against a Windows privilege escalation bug, the agent can use the
+network, and a prompt that quotes a hidden test is the author's responsibility (the brief forbids
+it). The agent still runs as the operator, so anything the ordinary `Users` or `Everyone` entries
+expose elsewhere on the machine stays readable.
+
+## Setup (operator, once; no administrator prompt)
 
 ```powershell
-# 1. create the account, no admin rights; choose a long random password
-net user h1agent * /add /expires:never /passwordchg:no
-# 2. keep it out of the sign-in screen
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList" /v h1agent /t REG_DWORD /d 0 /f
-# 3. store the password for this operator account only (DPAPI), outside any repository
-$env:BENCH_AGENT_USER = "h1agent"
-python scripts\bench\agent_account.py store-credential --file "$env:LOCALAPPDATA\h1\agent.cred"
-# 4. lock the vault and the results base; the vault also gets an explicit deny
-python scripts\bench\agent_account.py lock --deny-agent C:\h1vault
-python scripts\bench\agent_account.py lock C:\h1results
-# 5. let the agent account use the toolchain and the pinned binaries, read and execute only
-python scripts\bench\agent_account.py grant-read <python dir> <python Scripts dir> <git dir> <davinci checkpoint dir> <codex dir>
-$env:BENCH_AGENT_CREDENTIAL = "$env:LOCALAPPDATA\h1\agent.cred"
-$env:BENCH_AGENT_PATH = "<system32>;<python dir>;<python Scripts dir>;<git cmd dir>"
+$b = "scripts\bench\agent_boundary.py"
+# 1. lock the vault and the results base: operator and SYSTEM only
+python $b lock C:\h1vault C:\h1results
+# 2. let the agent run the toolchain and the pinned binaries (read and execute only)
+python $b grant-read <python dir> <davinci checkpoint dir> <codex dir>
+# 3. select the boundary and the agent PATH
+$env:BENCH_AGENT_BOUNDARY = "restricted-token"
+$env:BENCH_AGENT_PATH = "C:\Windows\System32;C:\Windows;<python dir>;<python Scripts dir>;C:\Program Files\Git\cmd"
 ```
 
-The agent account needs its own Codex sign-in (Codex reads the profile it runs in). DaVinci needs none:
-the harness copies the operator's login into the per-campaign agent directory and grants only that
-directory to the agent account.
+Create the vault and results directories first, at a location outside your profile. A directory
+created at the drive root inherits permissions for Users, which is why step 1 removes inheritance.
 
 ## Proof before any model run
 
 ```powershell
-python scripts\bench\agent_account.py selftest --vault C:\h1vault --results C:\h1results `
+python $b selftest --vault C:\h1vault --results C:\h1results `
   --binary <davinci.exe> --binary <codex.exe> --tool python --tool pytest --tool git
 ```
 
-This starts stub commands under the agent account, inside the same job object the harness uses, and
-requires every one of these to hold:
+This starts stub commands under the restricted token, inside the harness job object. Every check
+must hold:
 
 | Check | Required |
 |---|---|
@@ -73,5 +79,12 @@ requires every one of these to hold:
 | read a run directory after its grant is revoked | denied |
 
 A command that fails to launch never counts as a denial: it must start, run and exit nonzero. The
-campaign manifest records `agent_account`. Run the self-test before each stage and keep its output
+campaign manifest records `agent_boundary`. Run the self-test before each stage and keep its output
 with the stage logs; a failing check blocks launch.
+
+## Still unproven offline
+
+Network and certificate loading in the DaVinci binary under this token. `--version` starts the binary
+but does not open a TLS connection, and that needs a model call. If the first approved stage shows
+a connection failure in the first run, it stops under the existing stop rules and nothing is
+re-run to compensate.
