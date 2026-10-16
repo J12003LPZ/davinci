@@ -212,8 +212,8 @@ use davinci_ai::{
     format_no_models_available_message, format_oauth_auth_failed_message, fuzzy_models,
     get_supported_thinking_levels, live_complete_streaming_with_sink_envelope, load_builtin_models,
     models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
-    ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
-    StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE, PROVIDER_SPECS,
+    AuthStorageError, ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot,
+    ResolvedAuth, StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE, PROVIDER_SPECS,
 };
 use davinci_coding_agent::interactive_tui::{
     create_interactive_tui, handle_copy_command, remount_chrome_panes, stop_interactive_tui,
@@ -2903,8 +2903,9 @@ fn complete_prompt_with_host(
     if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
         storage.set_runtime_override(&agent.provider, key);
     }
+    let mut refresh_error = None;
     if let Some(storage) = storage.as_mut() {
-        maybe_refresh_auth(
+        refresh_error = maybe_refresh_auth(
             storage,
             &agent.provider,
             now_ms(),
@@ -3499,9 +3500,9 @@ fn complete_prompt_with_host(
                     "No model matched {}/{}. Run /model to choose one, or check ~/.pi/agent/models.json.",
                     current.provider, current.model_id
                 )),
-                (false, Some(_), None, None) if expired_oauth => Err(format!(
-                    "The {provider} sign-in expired and could not be refreshed. Run /login {provider}.",
-                    provider = current.provider
+                (false, Some(_), None, None) if expired_oauth => Err(expired_signin_message(
+                    &current.provider,
+                    refresh_error.as_deref(),
                 )),
                 (false, Some(_), None, None) => Err(format!(
                     "No credential for {provider}. Run /login {provider}.",
@@ -8336,28 +8337,33 @@ fn maybe_refresh_auth(
     now: u64,
     min_expiry_ms: u64,
     no_refresh: bool,
-) {
+) -> Option<String> {
     if provider == "anthropic" {
-        return;
+        return None;
     }
-    if storage
-        .maybe_refresh(provider, now, min_expiry_ms, no_refresh)
-        .unwrap_or(false)
-        || no_refresh
-    {
-        return;
+    let refresh_error = match storage.maybe_refresh(provider, now, min_expiry_ms, no_refresh) {
+        Ok(true) => return None,
+        Ok(false) => None,
+        Err(
+            AuthStorageError::Read(cause)
+            | AuthStorageError::Write(cause)
+            | AuthStorageError::Invalid(cause),
+        ) => Some(cause),
+    };
+    if no_refresh {
+        return refresh_error;
     }
     let Some((path, name)) = login_js_oauth_provider(provider) else {
-        return;
+        return refresh_error;
     };
     let Some(cred) = storage.get(provider) else {
-        return;
+        return refresh_error;
     };
     if cred.kind != CredentialKind::Oauth {
-        return;
+        return refresh_error;
     }
     if !davinci_ai::credential_expires_by(cred, now.saturating_add(min_expiry_ms)) {
-        return;
+        return refresh_error;
     }
     if let Ok((access, refresh, expires)) = crate::js_host::run_js_oauth_refresh(
         Path::new(&path),
@@ -8367,7 +8373,22 @@ fn maybe_refresh_auth(
         cred.expires,
     ) {
         let _ = storage.login_oauth(provider, access, refresh, expires);
+        return None;
     }
+    refresh_error
+}
+
+/// The text shown when a stored sign-in is past its expiry and the refresh did not renew it.
+/// The refresh error says whether the login was refused (HTTP status and OAuth code) or the
+/// network failed, which are different fixes; it carries no token.
+fn expired_signin_message(provider: &str, cause: Option<&str>) -> String {
+    let mut message = format!(
+        "The {provider} sign-in expired and could not be refreshed. Run /login {provider}."
+    );
+    if let Some(cause) = cause.filter(|cause| !cause.is_empty()) {
+        message.push_str(&format!(" Cause: {cause}"));
+    }
+    message
 }
 
 fn apply_js_oauth_api_key(

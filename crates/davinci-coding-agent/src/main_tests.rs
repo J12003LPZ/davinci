@@ -4794,3 +4794,48 @@ fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     super::sync_codemode_from_settings(&mut agent).unwrap();
     assert!(!agent.has_staged_codemode());
 }
+
+#[test]
+fn expired_signin_message_keeps_the_prefix_and_names_the_cause() {
+    // The benchmark classifies "sign-in expired"; the cause is appended after the instruction.
+    let plain = super::expired_signin_message("openai-codex", None);
+    assert_eq!(
+        plain,
+        "The openai-codex sign-in expired and could not be refreshed. Run /login openai-codex."
+    );
+    assert_eq!(
+        super::expired_signin_message("openai-codex", Some("")),
+        plain
+    );
+    let refused = super::expired_signin_message(
+        "openai-codex",
+        Some("OpenAI OAuth request failed: HTTP 400 invalid_grant"),
+    );
+    assert!(refused.starts_with(&plain));
+    assert!(refused.ends_with("Cause: OpenAI OAuth request failed: HTTP 400 invalid_grant"));
+}
+
+#[test]
+fn a_refresh_that_errors_is_reported_not_swallowed() {
+    // An expired openai-codex login with a refresh token but no ChatGPT registration metadata
+    // fails before any network call; the failure must reach the caller.
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = super::AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+    storage
+        .login_oauth(
+            "openai-codex",
+            "access",
+            Some("refresh".into()),
+            Some(1_000),
+        )
+        .unwrap();
+    let cause = super::maybe_refresh_auth(&mut storage, "openai-codex", 2_000_000, 0, false);
+    let cause = cause.expect("the refresh error is returned");
+    assert!(!cause.is_empty());
+    assert!(!cause.contains("refresh"), "no token in the cause: {cause}");
+    // A skipped refresh has no error to report.
+    assert_eq!(
+        super::maybe_refresh_auth(&mut storage, "openai-codex", 2_000_000, 0, true),
+        None
+    );
+}
