@@ -4670,6 +4670,12 @@ pub fn run(
     crate::davinci_surfaces::dress_from_extensions(&mut model, &cwd, agent);
     model.model_name = agent.model_id.clone();
     model.active_provider = agent.provider.clone();
+    let history = davinci_tui::history_store::HistoryStore::for_cwd(
+        &crate::default_agent_dir(),
+        std::path::Path::new(&agent.cwd),
+    );
+    model.composer.editor_mut().load_history(history.load());
+    model.history_store = Some(history);
     model.config_path = crate::default_agent_dir()
         .join("config.json")
         .display()

@@ -2961,6 +2961,8 @@ pub struct Model {
     /// drop a scroll the conversation no longer supports (see
     /// [`TranscriptScroll`]) without every caller having to.
     pub transcript_scroll: std::cell::Cell<TranscriptScroll>,
+    /// Where sent prompts are kept between sessions, when a project has one.
+    pub history_store: Option<crate::history_store::HistoryStore>,
     /// What the command sheets state about the session (design.md §11).
     pub facts: Facts,
 }
@@ -3338,6 +3340,7 @@ impl Model {
             context_inspector: None,
             context_inspector_index: 0,
             transcript_scroll: std::cell::Cell::default(),
+            history_store: None,
             facts: Facts::default(),
         }
     }
@@ -4109,6 +4112,13 @@ impl Model {
         true
     }
 
+    /// Keep a sent prompt for later sessions in this project.
+    fn remember(&self, text: &str) {
+        if let Some(store) = &self.history_store {
+            store.append(text);
+        }
+    }
+
     /// Enter sends. An empty composer sends nothing.
     ///
     /// The line goes through [`Editor::submit`], which is what records it in
@@ -4120,6 +4130,7 @@ impl Model {
         }
         self.mark_caret_moved();
         let text = self.composer.editor_mut().submit();
+        self.remember(&text);
         self.dismiss_suggestions();
         // Sending a turn returns to the newest, where its answer lands.
         self.transcript_scroll.take();
@@ -4141,6 +4152,7 @@ impl Model {
         }
         self.mark_caret_moved();
         let text = self.composer.editor_mut().submit();
+        self.remember(&text);
         self.queued.push(text);
         self.dismiss_suggestions();
         true

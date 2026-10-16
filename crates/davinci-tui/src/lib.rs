@@ -7,6 +7,7 @@ mod autocomplete;
 mod box_comp;
 mod chrome;
 pub mod clipboard;
+pub mod history_store;
 mod config_selector;
 mod container;
 mod custom_message;

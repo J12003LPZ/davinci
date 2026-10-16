@@ -9,7 +9,7 @@ use crate::undo_stack::UndoStack;
 use crate::word_wrap::{grapheme_segments, word_wrap_line, Segment};
 use crate::CURSOR_MARKER;
 
-const HISTORY_LIMIT: usize = 100;
+const HISTORY_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LastAction {
@@ -123,6 +123,13 @@ impl Editor {
 
     pub fn get_cursor(&self) -> (usize, usize) {
         cursor_line_col(&self.buffer, self.cursor)
+    }
+
+    /// Replace the recalled history with `entries`, newest first.
+    pub fn load_history(&mut self, mut entries: Vec<String>) {
+        entries.truncate(HISTORY_LIMIT);
+        self.history = entries;
+        self.exit_history_browsing();
     }
 
     pub fn add_to_history(&mut self, text: &str) {
