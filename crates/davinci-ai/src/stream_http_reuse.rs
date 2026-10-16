@@ -61,7 +61,7 @@ impl Shared {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .cancellation
-            .check()
+            .check_unless_finished()
     }
     /// The in-flight (or last) request reached its own terminal event; only its tail is left.
     fn finished(&self) -> bool {
@@ -74,7 +74,10 @@ impl Shared {
     /// Idle limit for the next read. After the stream's own terminal event only the end of the
     /// body is left, so a server that does not finish it must not hold the connection long.
     fn idle(&self) -> Duration {
-        let current = self.current.lock().unwrap_or_else(|error| error.into_inner());
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if current.cancellation.is_finished() {
             current.idle.min(DRAIN_LIMIT)
         } else {
@@ -188,8 +191,10 @@ impl Plan {
     }
 }
 
-fn sessions() -> &'static Mutex<HashMap<(String, bool), Arc<Session>>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<(String, bool), Arc<Session>>>> = OnceLock::new();
+type SessionMap = HashMap<(String, bool), Arc<Session>>;
+
+fn sessions() -> &'static Mutex<SessionMap> {
+    static SESSIONS: OnceLock<Mutex<SessionMap>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -235,7 +240,11 @@ pub(crate) fn plan(conversation: Option<&str>) -> Plan {
         .unwrap_or_else(|error| error.into_inner())
         .is_some_and(|at| at.elapsed() < MAX_IDLE_AGE);
     Plan {
-        label: if expect_reuse { LABEL_REUSE } else { LABEL_OPEN },
+        label: if expect_reuse {
+            LABEL_REUSE
+        } else {
+            LABEL_OPEN
+        },
         lease: Some(Lease {
             session,
             clean: Arc::new(AtomicBool::new(false)),
@@ -281,7 +290,7 @@ impl<R: Read> Drop for LeasedReader<R> {
     /// connection can return to the pool; any other drop (cancel, abort, error) leaves the body
     /// unread and the connection is discarded.
     fn drop(&mut self) {
-        let Some((lease, flag)) = &self.lease else {
+        let Some((_, flag)) = &self.lease else {
             return;
         };
         if flag.load(Ordering::Relaxed) || !self.cancellation.is_finished() {

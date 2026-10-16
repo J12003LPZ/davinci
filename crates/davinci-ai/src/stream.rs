@@ -1119,8 +1119,7 @@ fn live_complete_streaming_with_sink_envelope_inner(
     if let Some(mode) = crate::codex_ws::PublicWsMode::select(model, options.transport.as_deref()) {
         return complete_public_websocket(model, &prepared, options, &headers, mode, on_event);
     }
-    let reuse_connection =
-        crate::stream_http_reuse::selected(model, options.transport.as_deref());
+    let reuse_connection = crate::stream_http_reuse::selected(model, options.transport.as_deref());
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd =
         model.api == "openai-codex-responses" && !crate::openai_siwc::is_public_plan_model(model);

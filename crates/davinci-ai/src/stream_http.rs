@@ -36,7 +36,18 @@ impl Cancellation {
     }
 
     pub(crate) fn check(&self) -> Result<(), ureq_stream::Error> {
-        if (self.closed.load(Ordering::Relaxed) && !self.finished.load(Ordering::Relaxed))
+        self.check_where(false)
+    }
+
+    /// Like `check`, but a stream that finished on its own may still be read to its end.
+    /// Only the connection-reuse transport uses this; the default path keeps `check`.
+    pub(crate) fn check_unless_finished(&self) -> Result<(), ureq_stream::Error> {
+        self.check_where(true)
+    }
+
+    fn check_where(&self, finished_excuses_close: bool) -> Result<(), ureq_stream::Error> {
+        let excused = finished_excuses_close && self.finished.load(Ordering::Relaxed);
+        if (self.closed.load(Ordering::Relaxed) && !excused)
             || self
                 .abort
                 .as_ref()
@@ -205,7 +216,15 @@ pub(crate) fn send(
         connector,
         ureq_stream::unversioned::resolver::DefaultResolver::default(),
     );
-    execute(&agent, cancellation, None, url, headers, body, compress_zstd)
+    execute(
+        &agent,
+        cancellation,
+        None,
+        url,
+        headers,
+        body,
+        compress_zstd,
+    )
 }
 
 /// Sends on the session connection chosen by `plan`; without a lease it is exactly `send`.
@@ -232,7 +251,15 @@ pub(crate) fn send_reusing(
     // Installed before the send so the pool's liveness probe judges this request, not the last.
     lease.install(cancellation.clone(), idle);
     let agent = lease.agent();
-    execute(&agent, cancellation, Some(lease), url, headers, body, compress_zstd)
+    execute(
+        &agent,
+        cancellation,
+        Some(lease),
+        url,
+        headers,
+        body,
+        compress_zstd,
+    )
 }
 
 fn execute(

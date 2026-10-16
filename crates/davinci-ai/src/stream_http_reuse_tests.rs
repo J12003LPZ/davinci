@@ -2,10 +2,10 @@
 //! HTTP/1.1 server plays the provider and counts the connections it accepts.
 use super::*;
 use crate::Model;
-use ureq_stream::unversioned::transport::{Buffers, NextTimeout, Transport};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::AtomicUsize;
+use ureq_stream::unversioned::transport::{Buffers, NextTimeout, Transport};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Reply {
@@ -426,7 +426,10 @@ fn a_transport_that_saw_a_cancellation_never_carries_a_later_request() {
         cancellation: Cancellation::default(),
         idle: Duration::from_secs(5),
     };
-    assert!(!transport.is_open(), "a cancelled socket was handed to a later request");
+    assert!(
+        !transport.is_open(),
+        "a cancelled socket was handed to a later request"
+    );
 }
 
 struct Endless(usize);
@@ -438,18 +441,20 @@ impl Read for Endless {
     }
 }
 
-fn leased(
-    name: &str,
-    finished: bool,
-    body: impl Read,
-) -> (LeasedReader<impl Read>, Arc<AtomicBool>, Arc<Session>) {
+type Leased<R> = (LeasedReader<R>, Arc<AtomicBool>, Arc<Session>);
+
+fn leased(name: &str, finished: bool, body: impl Read) -> Leased<impl Read> {
     let lease = plan(Some(&id(name))).lease.expect("fresh session");
     let (flag, session) = (lease.clean_flag(), lease.session());
     let cancellation = Cancellation::default();
     if finished {
         cancellation.mark_finished();
     }
-    (LeasedReader::new(body, Some(lease), cancellation), flag, session)
+    (
+        LeasedReader::new(body, Some(lease), cancellation),
+        flag,
+        session,
+    )
 }
 
 #[test]
@@ -461,7 +466,8 @@ fn a_finished_response_drains_its_tail_so_the_connection_can_return_to_the_pool(
 
 #[test]
 fn an_unfinished_response_is_never_drained_and_never_clean() {
-    let (reader, clean, session) = leased("no-drain", false, std::io::Cursor::new(b"more".to_vec()));
+    let (reader, clean, session) =
+        leased("no-drain", false, std::io::Cursor::new(b"more".to_vec()));
     drop(reader);
     assert!(!clean.load(Ordering::Relaxed));
     assert!(
@@ -474,7 +480,10 @@ fn an_unfinished_response_is_never_drained_and_never_clean() {
 fn draining_is_bounded_in_bytes() {
     let (mut reader, clean, _) = leased("bounded", true, Endless(0));
     let mut probe = [0u8; 1];
-    reader.read(&mut probe).unwrap();
+    assert_eq!(reader.read(&mut probe).unwrap(), 1);
     drop(reader);
-    assert!(!clean.load(Ordering::Relaxed), "an endless tail is not a clean end");
+    assert!(
+        !clean.load(Ordering::Relaxed),
+        "an endless tail is not a clean end"
+    );
 }
