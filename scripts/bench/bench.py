@@ -39,6 +39,7 @@ from runner import (create_campaign, isolate_settings, controlled_environment, s
                     campaign_lock, parent_identity, source_identity, bench_options,
                     campaign_slot, PYTHON_TEXT_ENV, GRADING_ENV_VERSION)
 from codex_otel import Collector, request_metrics
+import agent_account
 from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
 import subscription_campaign
@@ -571,7 +572,17 @@ def run_one(harness, tid, rep, campaign=None):
             for value in collector.overrides():
                 args[-1:-1] = ["-c", value]
         timeout = min(TIMEOUT, subscription_campaign.remaining_seconds(subscription)) if subscription else TIMEOUT
-        measured = execute(args, workdir, env, timeout)
+        account = agent_account.configured()
+        if account is None:
+            measured = execute(args, workdir, env, timeout)
+        else:
+            # The agent account may touch only this run's directory, and only while the agent runs:
+            # the hidden tests are copied into it afterwards.
+            agent_account.grant_run_directory(workdir, account)
+            try:
+                measured = execute(args, workdir, env, timeout, agent=True)
+            finally:
+                agent_account.revoke_run_directory(workdir, account)
     code, stdout, stderr = measured["exit"], measured["stdout"], measured["stderr"]
     stopped = ("cleanup_failed" if measured.get("cleanup_complete") is not True else None)
     stopped = stopped or stop_reason(stdout, stderr)
@@ -1093,6 +1104,8 @@ def main():
                 if pinned_models:
                     Path(manifest["agent_dir"], "models-store.json").write_text(
                         json.dumps(pinned_models, indent=2), encoding="utf-8")
+                if agent_account.configured():
+                    agent_account.grant(manifest["agent_dir"], agent_account.configured(), "M")
             for harness, tid, rep in order:
                 if source_identity(Path(HERE).parents[1]) != manifest["runner_source"]:
                     raise ValueError("runner source changed during campaign")

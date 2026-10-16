@@ -112,8 +112,18 @@ def _terminate_and_confirm(kernel32, job, timeout=10):
         time.sleep(0.02)
 
 
-def run(command, workdir, env, timeout):
-    """Run ``command`` inside a job; return the runner's measured-result shape."""
+def _popen(command, workdir, env, out, err):
+    return subprocess.Popen(
+        command, cwd=workdir, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+        creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP)
+
+
+def run(command, workdir, env, timeout, launcher=None):
+    """Run ``command`` inside a job; return the runner's measured-result shape.
+
+    ``launcher(command, workdir, env, out, err)`` starts the command suspended and returns a
+    Popen-like object; the default starts it as the current user.
+    """
     kernel32, ntdll = _api()
     job = _create_job(kernel32)
     process = None
@@ -127,10 +137,7 @@ def run(command, workdir, env, timeout):
         try:
             with open(out_path, "wb") as out, open(err_path, "wb") as err:
                 try:
-                    process = subprocess.Popen(
-                        command, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
-                        stdout=out, stderr=err,
-                        creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP)
+                    process = (launcher or _popen)(command, workdir, env, out, err)
                 except OSError as error:
                     stderr = type(error).__name__
                     clean = _terminate_and_confirm(kernel32, job)
