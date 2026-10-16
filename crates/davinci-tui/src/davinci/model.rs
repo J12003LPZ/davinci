@@ -2963,6 +2963,8 @@ pub struct Model {
     pub transcript_scroll: std::cell::Cell<TranscriptScroll>,
     /// Where sent prompts are kept between sessions, when a project has one.
     pub history_store: Option<crate::history_store::HistoryStore>,
+    /// The Ctrl+R search over earlier prompts, while it is open.
+    pub history_search: Option<HistorySearch>,
     /// What the command sheets state about the session (design.md §11).
     pub facts: Facts,
 }
@@ -3139,6 +3141,17 @@ impl<'a> IntoIterator for &'a EntryLog {
         self.entries.iter()
     }
 }
+
+/// The reverse search over earlier prompts: what was typed, and which match
+/// (newest first) is marked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorySearch {
+    pub query: String,
+    pub selected: usize,
+}
+
+/// Matches shown at once.
+pub const HISTORY_SHOWN: usize = 6;
 
 /// Where the conversation is scrolled to, anchored from the top: `top` is
 /// the first row drawn, and `None` follows the newest. Rows that arrive or
@@ -3341,6 +3354,7 @@ impl Model {
             context_inspector_index: 0,
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
+            history_search: None,
             facts: Facts::default(),
         }
     }
@@ -4109,6 +4123,71 @@ impl Model {
         }
         self.refresh_suggestions();
         self.mark_caret_moved();
+        true
+    }
+
+    /// Open the search over earlier prompts (Ctrl+R). Only from a bare
+    /// conversation composer, where nothing else claims the row above it.
+    pub fn open_history_search(&mut self) -> bool {
+        if self.screen != Screen::Agent
+            || self.overlay.is_some()
+            || self.history_search.is_some()
+            || self.composer.editor().history.is_empty()
+        {
+            return false;
+        }
+        self.dismiss_suggestions();
+        self.history_search = Some(HistorySearch::default());
+        true
+    }
+
+    /// Earlier prompts containing every word of the query, newest first.
+    pub fn history_matches(&self) -> Vec<&str> {
+        let Some(search) = &self.history_search else {
+            return Vec::new();
+        };
+        let words: Vec<String> = search
+            .query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        self.composer
+            .editor()
+            .history
+            .iter()
+            .filter(|entry| {
+                let lower = entry.to_lowercase();
+                words.iter().all(|word| lower.contains(word))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Move the mark through the matches (positive is older), staying inside.
+    pub fn history_search_move(&mut self, delta: isize) {
+        let count = self.history_matches().len();
+        if let Some(search) = &mut self.history_search {
+            search.selected = search
+                .selected
+                .saturating_add_signed(delta)
+                .min(count.saturating_sub(1));
+        }
+    }
+
+    /// Put match `index` into the composer and close the search.
+    pub fn history_search_accept(&mut self, index: usize) -> bool {
+        let Some(text) = self
+            .history_matches()
+            .get(index)
+            .map(|text| text.to_string())
+        else {
+            return false;
+        };
+        self.history_search = None;
+        self.mark_caret_moved();
+        self.composer.set_text(text);
+        let end = self.composer.editor().buffer.len();
+        self.composer.editor_mut().cursor = end;
         true
     }
 

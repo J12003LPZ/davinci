@@ -74,6 +74,8 @@ pub enum Target {
     JumpToBottom,
     /// The completion item at this index.
     Suggestion(usize),
+    /// The earlier prompt at this index of the history search's matches.
+    HistoryMatch(usize),
 }
 
 /// A clickable band of screen rows.
@@ -148,7 +150,12 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let (composer_rows, composer_caret) = composer_rows(chrome_model);
     // What the composer offers sits directly above it, inside the same stack,
     // so the list moves with the composer at any window height.
-    let (offered, offered_items) = chrome::suggestions_with_items(chrome_model);
+    let searching = model.history_search.is_some();
+    let (offered, offered_items) = if searching {
+        chrome::history_search_rows(chrome_model)
+    } else {
+        chrome::suggestions_with_items(chrome_model)
+    };
     let top = extension_rows(model, &model.extensions.header);
     let bottom = extension_rows(model, &model.extensions.footer);
     let above = extension_rows(model, &model.extensions.above());
@@ -266,9 +273,14 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     }
     for (at, item) in offered_items.iter().enumerate() {
         let row = offered_start + at as u16;
+        let target = match (searching, *item) {
+            (true, usize::MAX) => continue,
+            (true, item) => Target::HistoryMatch(item),
+            (false, item) => Target::Suggestion(item),
+        };
         targets.push(HitTarget {
             rows: row..row + 1,
-            target: Target::Suggestion(*item),
+            target,
         });
     }
     let caret = composer_caret
@@ -913,6 +925,41 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
 /// run and never the app (design.md §6).
+/// Keys while the history search is open: typing narrows it, the arrows and
+/// another Ctrl+R walk the matches, enter takes one, esc leaves the composer
+/// as it was.
+fn handle_history_search_key(model: &mut Model, key: KeyEvent) -> Flow {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => model.history_search = None,
+        KeyCode::Char('c' | 'g') if ctrl => model.history_search = None,
+        KeyCode::Enter | KeyCode::Tab => {
+            let selected = model.history_search.as_ref().map_or(0, |s| s.selected);
+            if !model.history_search_accept(selected) {
+                model.history_search = None;
+            }
+        }
+        KeyCode::Up => model.history_search_move(1),
+        KeyCode::Down => model.history_search_move(-1),
+        KeyCode::Char('r') if ctrl => model.history_search_move(1),
+        KeyCode::Char('s') if ctrl => model.history_search_move(-1),
+        KeyCode::Backspace => {
+            if let Some(search) = &mut model.history_search {
+                search.query.pop();
+                search.selected = 0;
+            }
+        }
+        KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(search) = &mut model.history_search {
+                search.query.push(ch);
+                search.selected = 0;
+            }
+        }
+        _ => {}
+    }
+    Flow::Continue
+}
+
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
@@ -956,6 +1003,15 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         return Flow::Continue;
     }
 
+    if model.history_search.is_some() {
+        return handle_history_search_key(model, key);
+    }
+    if key.code == KeyCode::Char('r')
+        && key.modifiers == KeyModifiers::CONTROL
+        && model.open_history_search()
+    {
+        return Flow::Continue;
+    }
     let data = key_event_bytes(&key);
     if key.kind != KeyEventKind::Release && key.code != KeyCode::Esc {
         model.clear_armed = None;
@@ -4730,6 +4786,69 @@ mod scroll_to_entry_tests {
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    fn searching() -> Model {
+        let mut m = chat(24, 6);
+        m.composer.editor_mut().load_history(vec![
+            "run the tests".into(),
+            "fix the parser".into(),
+            "explain the parser design".into(),
+        ]);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        m
+    }
+
+    #[test]
+    fn ctrl_r_searches_earlier_prompts_and_enter_takes_the_marked_one() {
+        let mut m = searching();
+        assert!(m.history_search.is_some());
+        for ch in "parser".chars() {
+            handle_key(&mut m, KeyEvent::from(KeyCode::Char(ch)));
+        }
+        let shown = rows(&m).join("\n");
+        assert!(shown.contains("search history: parser"), "{shown}");
+        assert!(shown.contains("1 of 2"), "{shown}");
+        // Newest first; another ctrl+r walks to the older match.
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Enter));
+        assert!(m.history_search.is_none());
+        assert_eq!(m.composer.editor().get_text(), "explain the parser design");
+    }
+
+    #[test]
+    fn escape_leaves_the_composer_as_it_was() {
+        let mut m = searching();
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('x')));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Esc));
+        assert!(m.history_search.is_none());
+        assert_eq!(m.composer.editor().get_text(), "");
+    }
+
+    #[test]
+    fn clicking_a_match_takes_it() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = searching();
+        let frame = compose_frame(&m, m.height);
+        let hit = frame
+            .targets
+            .iter()
+            .find(|hit| hit.target == Target::HistoryMatch(2))
+            .expect("a row per match");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: hit.rows.start,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+        assert_eq!(m.composer.editor().get_text(), "explain the parser design");
     }
 
     fn scrolled_back_with_news() -> Model {

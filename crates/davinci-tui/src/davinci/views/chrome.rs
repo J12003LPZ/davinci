@@ -1068,6 +1068,73 @@ pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>)
     (out, owners)
 }
 
+/// The search rows above the composer: the query, then the matches around
+/// the marked one. Each match row names its index in `history_matches`; the
+/// query row names `usize::MAX`.
+pub fn history_search_rows(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
+    let Some(search) = &model.history_search else {
+        return (Vec::new(), Vec::new());
+    };
+    let cc = model.theme.cc();
+    let matches = model.history_matches();
+    let mut rows = vec![Line::from(vec![
+        span("  search history: ", cc.inactive),
+        span(search.query.clone(), cc.permission),
+        span("▏", cc.permission),
+        span(
+            if matches.is_empty() {
+                "  no match".to_owned()
+            } else {
+                format!("  {} of {}", search.selected + 1, matches.len())
+            },
+            cc.inactive,
+        ),
+    ])];
+    let mut owners = vec![usize::MAX];
+    let selected = search.selected.min(matches.len().saturating_sub(1));
+    let first = selected.saturating_sub(crate::davinci::model::HISTORY_SHOWN - 1);
+    let words: Vec<String> = search
+        .query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    for (index, entry) in matches
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(crate::davinci::model::HISTORY_SHOWN)
+    {
+        let flat = entry.replace('\n', " ⏎ ");
+        let marked = index == selected;
+        let ink = if marked { cc.permission } else { cc.inactive };
+        let mut spans = vec![span(if marked { "  ❯ " } else { "    " }, ink)];
+        // The first query word shows where the entry matched.
+        let lower = flat.to_lowercase();
+        let hit = words
+            .first()
+            .and_then(|word| lower.find(word.as_str()).map(|at| (at, word.len())))
+            .filter(|&(at, len)| flat.is_char_boundary(at) && flat.is_char_boundary(at + len));
+        match hit {
+            Some((at, len)) => {
+                spans.push(span(flat[..at].to_owned(), ink));
+                spans.push(span_strong(
+                    flat[at..at + len].to_owned(),
+                    cc.permission,
+                    &model.theme,
+                ));
+                spans.push(span(flat[at + len..].to_owned(), ink));
+            }
+            None => spans.push(span(flat, ink)),
+        }
+        rows.push(Line::from(crate::davinci::ui::truncate_run(
+            spans,
+            model.width,
+        )));
+        owners.push(index);
+    }
+    (rows, owners)
+}
+
 fn suggestion_label(prefix: &str, model: &Model, label: &str) -> String {
     if prefix.starts_with('@') {
         let path = label.trim_start_matches('@');

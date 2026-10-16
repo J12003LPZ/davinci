@@ -905,6 +905,9 @@ pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) ->
         app::Target::JumpToBottom => {
             model.transcript_scroll.take();
         }
+        app::Target::HistoryMatch(index) => {
+            model.history_search_accept(index);
+        }
         app::Target::Suggestion(index) => {
             model.suggestion_index = index;
             model.suggestion_picked = true;
