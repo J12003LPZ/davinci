@@ -111,7 +111,11 @@ fn path_url(token: &str, cwd: &Path, exists: &mut impl FnMut(&Path) -> bool) -> 
     };
     let full = normalize(&full);
     // `/work/app` has a root but no drive on Windows; both count as anchored.
-    if !(full.is_absolute() || full.has_root()) || !exists(&full) {
+    // A bare `/` is a hint in the UI ("/ for commands"), not a link to the root.
+    let names_something = full
+        .components()
+        .any(|part| matches!(part, std::path::Component::Normal(_)));
+    if !names_something || !(full.is_absolute() || full.has_root()) || !exists(&full) {
         return None;
     }
     file_url(&full)
@@ -310,6 +314,8 @@ mod tests {
         assert!(links("//server/share/file").is_empty());
         assert!(links(r"\\server\share\src").is_empty());
         assert!(links("http://").is_empty());
+        let anything = find("/ for commands", Path::new("/work/app"), &mut |_| true);
+        assert!(anything.is_empty(), "a bare root is a hint, not a link");
     }
 
     #[test]
