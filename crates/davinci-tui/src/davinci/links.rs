@@ -211,8 +211,38 @@ pub fn opener_target(url: &str, is_dir: impl Fn(&Path) -> bool) -> Option<String
     } else {
         path.parent()?.to_path_buf()
     };
+    // A bundle is a folder the opener launches (`open Foo.app`), so neither
+    // it nor anything inside it is handed over.
+    let launches = folder.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(_, ext)| {
+                BUNDLE_EXTENSIONS
+                    .iter()
+                    .any(|bundle| ext.eq_ignore_ascii_case(bundle))
+            })
+    });
+    if launches {
+        return None;
+    }
     Some(folder.to_string_lossy().into_owned())
 }
+
+const BUNDLE_EXTENSIONS: [&str; 12] = [
+    "app",
+    "bundle",
+    "framework",
+    "plugin",
+    "prefpane",
+    "workflow",
+    "action",
+    "scpt",
+    "appex",
+    "kext",
+    "pkg",
+    "mpkg",
+];
 
 fn decode(encoded: &str) -> Option<String> {
     let bytes = encoded.as_bytes();
@@ -307,6 +337,9 @@ mod tests {
             Some(folder.as_str())
         );
         assert_eq!(opener_target("file:///work/%ZZ", is_dir), None);
+        // Bundles launch when opened, and so does anything inside one.
+        assert_eq!(opener_target("file:///Apps/Evil.APP", |_| true), None);
+        assert_eq!(opener_target("file:///Apps/Evil.app/x/y", |_| false), None);
     }
 
     #[cfg(windows)]
