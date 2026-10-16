@@ -185,6 +185,52 @@ fn encode(path: &str) -> String {
     out
 }
 
+/// What a click on `url` may hand to the operating system's opener. Web
+/// addresses go through unchanged. A `file://` address never does: the opener
+/// would run an executable, script or shortcut that model output merely
+/// names, so only a folder is opened (the file's own folder for a file).
+pub fn opener_target(url: &str, is_dir: impl Fn(&Path) -> bool) -> Option<String> {
+    let Some(rest) = url.strip_prefix("file://") else {
+        return Some(url.to_owned());
+    };
+    let path = decode(rest)?;
+    let path = if cfg!(windows) {
+        // `/C:/dir` -> `C:/dir`
+        let bytes = path.as_bytes();
+        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
+            path[1..].to_owned()
+        } else {
+            path
+        }
+    } else {
+        path
+    };
+    let path = PathBuf::from(path);
+    let folder = if is_dir(&path) {
+        path
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    Some(folder.to_string_lossy().into_owned())
+}
+
+fn decode(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = encoded.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The link covering column `column` of `row`.
 pub fn at(links: &[Link], column: u16) -> Option<&Link> {
     links
@@ -242,6 +288,25 @@ mod tests {
         let found = find("../app/src/a b.rs ../app/src/é.rs", cwd, &mut |_| true);
         assert_eq!(found[0].url, "file:///work/app/src/a");
         assert_eq!(found[1].url, "file:///work/app/src/%C3%A9.rs");
+    }
+
+    #[test]
+    fn a_file_link_opens_its_folder_never_the_file() {
+        let is_dir = |p: &Path| p == Path::new("/work/app/src");
+        assert_eq!(
+            opener_target("https://x.dev/y", is_dir).as_deref(),
+            Some("https://x.dev/y")
+        );
+        let folder = Path::new("/work/app/src").to_string_lossy().into_owned();
+        assert_eq!(
+            opener_target("file:///work/app/src", is_dir).as_deref(),
+            Some(folder.as_str())
+        );
+        assert_eq!(
+            opener_target("file:///work/app/src/evil%20run.exe", is_dir).as_deref(),
+            Some(folder.as_str())
+        );
+        assert_eq!(opener_target("file:///work/%ZZ", is_dir), None);
     }
 
     #[cfg(windows)]
