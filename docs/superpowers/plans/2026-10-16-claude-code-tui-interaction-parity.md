@@ -400,6 +400,26 @@ for T10; no classic renderer).
 | T11 | Mostly done | Per-project JSONL history (bounded by entries and bytes), loaded at startup; Ctrl+R search with Tab cycling session / project / all projects, first-word highlight, click or Enter to take. Pasted content is recalled as its expanded text, not as a chip. |
 | T12 | Done | Ctrl+O viewer over a snapshot with every tool call expanded: j/k, space/b, d/u, g/G, `/` with n/N, `{`/`}` prompts, `[` to scrollback, `v` to `$VISUAL`/`$EDITOR`, q/esc. |
 
+### Verified in a real pseudo-terminal (Windows 11, ConPTY 120x40, debug build)
+
+Driven with `pywinpty` + `pyte` (scripts kept out of the repo), with a scratch agent dir:
+mode set at startup (alt screen, 1004, 2004, 2026), 123 bytes/frame while a turn runs, no
+full-screen clears, every 2026 begin matched by an end; soft-wrapped composer; slash menu and
+row click; composer click places the caret; `?` shortcuts; Ctrl+R search (project/all/session
+scopes, filter, no-match state) and history kept across restarts; Ctrl+O viewer (position,
+`/` search); Ctrl+L; Ctrl+D twice; drag, double-click, triple-click and Ctrl+C-with-selection
+copy the right text to the real clipboard with a footer toast; wheel scroll, jump-to-bottom row
+(click returns), sticky prompt header; `/config` rows (first click focuses, second cycles);
+OSC 8 on existing paths and URLs only; Ctrl-click opens a URL, and a file's folder.
+
+Found and fixed: links never worked for Windows drive paths; a bare `/` was linked as the
+drive root; a `file://` click could launch an executable (now folder only, bundles refused).
+
+Not verified: footer focus (needs background jobs), PR badge (no PR on this branch), Alt+O on a
+real tool result, themes, IME caret position, real terminals other than ConPTY, streaming from a
+model (no credentials in the scratch dir). Observed, not changed: with the real config the first
+paint takes ~9 s because plugin MCP servers start before the first frame.
+
 ## 6. Recommended order and sizing
 
 | Order | Tasks | Rough size | Why first |
