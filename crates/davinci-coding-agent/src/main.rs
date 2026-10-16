@@ -1132,6 +1132,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .tool_registry
             .retain(|name| !davinci_agent::tools::is_managed_process_tool(name));
     }
+    startup_mark("agent: settings, prompt, sandbox ready");
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     if !parsed.no_mcp {
         let mcp_config = mcp::load(
@@ -1157,6 +1158,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             _ => davinci_agent::McpRegistry::connect(&mcp_config, cwd),
         };
         agent.attach_mcp(registry);
+        startup_mark("agent: mcp servers connected");
     }
     // Overflowing batch output is kept where the model can `read` it
     // back, under the agent dir so a fixture dir keeps tests contained.

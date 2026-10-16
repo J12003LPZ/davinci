@@ -79,10 +79,42 @@ impl McpRegistry {
         )>,
     ) -> Self {
         let registry = Self::default();
+        // Servers start at the same time: each handshake can take seconds
+        // (`npx` fetches a package), and one server's state never touches
+        // another's, so the parts are built apart and joined in config order.
+        let connect = |(name, server): (&String, &davinci_mcp::ServerConfig)| {
+            let mut part = Inner::default();
+            part.connect_one(name, server, cwd, executor);
+            part
+        };
+        let parts: Vec<Inner> = if config.mcp_servers.len() < 2 {
+            config.mcp_servers.iter().map(connect).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = config
+                    .mcp_servers
+                    .iter()
+                    .map(|entry| scope.spawn(move || connect(entry)))
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+                    .collect()
+            })
+        };
         {
             let mut inner = registry.lock();
-            for (name, server) in &config.mcp_servers {
-                inner.connect_one(name, server, cwd, executor);
+            for part in parts {
+                inner.clients.extend(part.clients);
+                inner.routes.extend(part.routes);
+                inner
+                    .trusted_read_only_servers
+                    .extend(part.trusted_read_only_servers);
+                inner.rows.extend(part.rows);
             }
         }
         registry
@@ -517,6 +549,53 @@ mod tests {
         ))
         .unwrap();
         (dir, config)
+    }
+
+    #[test]
+    fn several_servers_connect_together_and_keep_config_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = |tool: &str| {
+            json!({
+                "initialize": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "f", "version": "0"}},
+                "tools/list": {"tools": [{"name": tool, "inputSchema": {"type": "object"}}]}
+            })
+            .to_string()
+        };
+        let mut servers = Vec::new();
+        for (name, tool) in [("alpha", "one"), ("beta", "two"), ("gamma", "three")] {
+            let path = dir.path().join(format!("{name}.json"));
+            // A server whose script is missing must fail on its own row.
+            if name != "beta" {
+                std::fs::write(&path, body(tool)).unwrap();
+            }
+            let url = format!("fixture:{}", path.display());
+            servers.push(format!(
+                "{:?}:{{\"url\":{}}}",
+                name,
+                serde_json::to_string(&url).unwrap()
+            ));
+        }
+        let config =
+            davinci_mcp::parse_config(&format!(r#"{{"mcpServers":{{{}}}}}"#, servers.join(",")))
+                .unwrap();
+        let registry = McpRegistry::connect(&config, dir.path());
+        let rows = registry.rows();
+        let seen: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.status.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("alpha", "connected"),
+                ("beta", "error"),
+                ("gamma", "connected")
+            ]
+        );
+        let mut tools = registry.tool_names();
+        tools.sort();
+        assert_eq!(tools, ["mcp__alpha__one", "mcp__gamma__three"]);
     }
 
     #[test]
