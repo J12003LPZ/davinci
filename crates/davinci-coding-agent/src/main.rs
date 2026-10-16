@@ -638,6 +638,13 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
 
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
+    // `DAVINCI_MCP_BLOCKING=1` waits for the servers before the first frame.
+    BACKGROUND_MCP.store(
+        !print_mode
+            && parsed.mode != Some(Mode::Rpc)
+            && std::env::var_os("DAVINCI_MCP_BLOCKING").is_none(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let mut agent = match build_agent(&parsed, &session_dir, &cwd) {
         Err(err) if err == NO_SESSION_SELECTED => return Ok(0),
         other => other?,
@@ -820,6 +827,10 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
         error_message: None,
     }
 }
+
+/// Set by `run` when the live shell will own this process, so MCP servers may
+/// finish connecting after the first frame.
+static BACKGROUND_MCP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
     let graph_worker = crate::native_extensions::graph_worker_context();
@@ -1148,12 +1159,25 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
                 agent.withdraw_auto_sandbox("local project/plugin MCP may have unowned host descendants; restart directly in Auto to activate confinement");
             }
         }
+        // The live shell draws before the servers are up (an `npx` start
+        // takes seconds); every other mode needs the tools before it begins.
+        let background = BACKGROUND_MCP.load(std::sync::atomic::Ordering::SeqCst);
         let registry = match (
             agent.tool_context.foreground_supervisor.as_ref(),
             agent.tool_context.sandbox.as_ref(),
         ) {
+            (Some(host), Some(sandbox)) if background => {
+                davinci_agent::McpRegistry::connect_in_background(
+                    &mcp_config,
+                    cwd,
+                    Some((host.clone(), sandbox.clone())),
+                )
+            }
             (Some(host), Some(sandbox)) => {
                 davinci_agent::McpRegistry::connect_with_executor(&mcp_config, cwd, host, sandbox)
+            }
+            _ if background => {
+                davinci_agent::McpRegistry::connect_in_background(&mcp_config, cwd, None)
             }
             _ => davinci_agent::McpRegistry::connect(&mcp_config, cwd),
         };

@@ -5116,6 +5116,15 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        // Servers that were still connecting at the first frame: take their
+        // tools in between turns, then say how many came up.
+        if !model.running && agent.tool_context.mcp.take_ready() {
+            agent.refresh_mcp();
+            let rows = agent.tool_context.mcp.rows();
+            let up = rows.iter().filter(|row| row.status == "connected").count();
+            model.push_toast(format!("MCP: {up} of {} servers ready", rows.len()));
+            model.dirty = true;
+        }
         // Between turns the context bar follows what the next request holds.
         if !model.running {
             refresh_context_meter(agent, &mut model, false);
