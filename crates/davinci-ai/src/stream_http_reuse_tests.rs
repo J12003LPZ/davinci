@@ -2,6 +2,7 @@
 //! HTTP/1.1 server plays the provider and counts the connections it accepts.
 use super::*;
 use crate::Model;
+use ureq_stream::unversioned::transport::{Buffers, NextTimeout, Transport};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::AtomicUsize;
@@ -370,4 +371,60 @@ fn a_failed_send_releases_the_session_for_the_next_request() {
         "the lease was released by the failure"
     );
     consume(call(second, &server.url, None));
+}
+
+struct FakeTransport;
+
+impl std::fmt::Debug for FakeTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FakeTransport")
+    }
+}
+
+impl Transport for FakeTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        unreachable!("the guard never touches the buffers")
+    }
+    fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq_stream::Error> {
+        Ok(())
+    }
+    fn await_input(&mut self, _: NextTimeout) -> Result<bool, ureq_stream::Error> {
+        Ok(true)
+    }
+    fn is_open(&mut self) -> bool {
+        true
+    }
+    fn is_tls(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn a_transport_that_saw_a_cancellation_never_carries_a_later_request() {
+    let shared = Arc::new(Shared {
+        current: Mutex::new(Current {
+            cancellation: Cancellation::default(),
+            idle: Duration::from_secs(5),
+        }),
+        connects: AtomicU64::new(0),
+    });
+    let mut transport = ReuseTransport {
+        inner: FakeTransport,
+        shared: shared.clone(),
+        poisoned: false,
+    };
+    assert!(transport.is_open());
+    let cancelled = Cancellation::default();
+    cancelled.cancel();
+    *shared.current.lock().unwrap() = Current {
+        cancellation: cancelled,
+        idle: Duration::from_secs(5),
+    };
+    assert!(!transport.is_open());
+    // The next request installs a healthy cancellation; the old socket must stay unusable.
+    *shared.current.lock().unwrap() = Current {
+        cancellation: Cancellation::default(),
+        idle: Duration::from_secs(5),
+    };
+    assert!(!transport.is_open(), "a cancelled socket was handed to a later request");
 }
