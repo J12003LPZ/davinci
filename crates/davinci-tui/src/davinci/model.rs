@@ -2965,6 +2965,8 @@ pub struct Model {
     pub history_store: Option<crate::history_store::HistoryStore>,
     /// The Ctrl+R search over earlier prompts, while it is open.
     pub history_search: Option<HistorySearch>,
+    /// The last drawn frame's pointer targets; empty until the first draw.
+    pub hit_cache: std::cell::RefCell<Option<HitCache>>,
     /// Where the composer drew its text, as of the last frame.
     pub composer_hit: std::cell::Cell<Option<ComposerHit>>,
     /// Prompts sent in this run, newest first.
@@ -3165,6 +3167,15 @@ pub struct ComposerHit {
     pub wrap: usize,
     /// A leading `!` is drawn as the prompt glyph, not as text.
     pub shell: bool,
+}
+
+/// What the last drawn frame offered to the pointer, so a click or a wheel
+/// notch is tested against the screen as the user saw it rather than
+/// composing the whole frame again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HitCache {
+    pub targets: Vec<super::app::HitTarget>,
+    pub suggestion_rows: Option<std::ops::Range<u16>>,
 }
 
 /// The reverse search over earlier prompts: what was typed, and which match
@@ -3411,6 +3422,7 @@ impl Model {
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
             history_search: None,
+            hit_cache: std::cell::RefCell::new(None),
             composer_hit: std::cell::Cell::new(None),
             session_history: Vec::new(),
             history_all: None,

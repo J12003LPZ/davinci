@@ -5003,6 +5003,29 @@ mod scroll_to_entry_tests {
     }
 
     #[test]
+    fn a_click_is_tested_against_the_last_drawn_frame() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        // Nothing to click in a following conversation...
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!super::super::runtime::route_click_target(&mut m, click));
+        // ...until the frame on screen says there is.
+        *m.hit_cache.borrow_mut() = Some(super::super::model::HitCache {
+            targets: vec![HitTarget {
+                rows: 3..4,
+                target: Target::JumpToBottom,
+            }],
+            suggestion_rows: None,
+        });
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+    }
+
+    #[test]
     fn ctrl_o_opens_the_transcript_viewer_and_q_closes_it() {
         let mut m = chat(24, 6);
         handle_key(

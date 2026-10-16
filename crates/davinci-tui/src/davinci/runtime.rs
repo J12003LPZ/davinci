@@ -375,6 +375,10 @@ pub struct Session {
     /// Whether a path named on screen exists, so a frame does not stat the
     /// same files again: when it was asked, and the answer.
     path_cache: std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
+    /// Draw-time statistics: show them (`DAVINCI_FRAME_STATS=1`) and their
+    /// moving average in microseconds.
+    frame_stats: bool,
+    frame_micros: f64,
 }
 
 /// Frame delivery choices, fixed for the session.
@@ -479,6 +483,8 @@ impl Session {
             selector: super::selection::Selector::default(),
             scrollbar_grab: None,
             path_cache: std::collections::HashMap::new(),
+            frame_stats: env_flag("DAVINCI_FRAME_STATS"),
+            frame_micros: 0.0,
             scrollbar: None,
             focused: true,
             output: Output::from_env(|name| std::env::var(name).ok()),
@@ -678,6 +684,10 @@ impl Session {
         let mut scrollbar = None;
         let selection_bg = model.theme.cc().selection_bg;
         let selector = &mut self.selector;
+        let started = Instant::now();
+        let mut hits = None;
+        let show_stats = self.frame_stats;
+        let average = self.frame_micros;
         let hyperlinks = !env_flag("DAVINCI_DISABLE_HYPERLINKS");
         let mut linked: Vec<LinkedCells> = Vec::new();
         let path_cache = &mut self.path_cache;
@@ -687,6 +697,10 @@ impl Session {
             rendered_lines = composed.lines.iter().map(ToString::to_string).collect();
             scrollbar = composed.scrollbar;
             caret = composed.caret;
+            hits = Some(super::model::HitCache {
+                targets: composed.targets.clone(),
+                suggestion_rows: composed.suggestion_rows.clone(),
+            });
             if let Some(bar) = &scrollbar {
                 strip_scrollbar(&mut rendered_lines, bar);
             }
@@ -694,6 +708,16 @@ impl Session {
                 .as_ref()
                 .map(super::selection::View::from_scrollbar);
             frame.render_widget(Paragraph::new(composed.lines).style(background), area);
+            if show_stats {
+                let text = format!(" frame {:.1}ms ", average / 1000.0);
+                let x = area.width.saturating_sub(text.len() as u16);
+                frame.buffer_mut().set_string(
+                    x,
+                    0,
+                    text,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                );
+            }
             // Selected cells keep their own ink over the selection ground;
             // with no colour at all they are drawn reversed.
             let style = if selection_bg == ratatui::style::Color::Reset {
@@ -736,6 +760,15 @@ impl Session {
             write_hyperlink(self.terminal.backend_mut(), url, cells)?;
         }
         finish_frame(self.terminal.backend_mut(), output, caret)?;
+        // A moving average of how long a frame takes to compose and write,
+        // shown in the corner under DAVINCI_FRAME_STATS=1.
+        let micros = started.elapsed().as_secs_f64() * 1e6;
+        self.frame_micros = if self.frame_micros == 0.0 {
+            micros
+        } else {
+            self.frame_micros * 0.9 + micros * 0.1
+        };
+        *model.hit_cache.borrow_mut() = hits;
         self.rendered_lines = rendered_lines;
         self.scrollbar = scrollbar;
         Ok(())
@@ -1104,12 +1137,12 @@ pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) ->
     {
         return false;
     }
-    let frame = app::compose_frame(model, model.height);
-    let Some(hit) = frame
-        .targets
-        .iter()
-        .find(|hit| hit.rows.contains(&mouse.row))
-    else {
+    let cached = model.hit_cache.borrow().clone();
+    let targets = match cached {
+        Some(cache) => cache.targets,
+        None => app::compose_frame(model, model.height).targets,
+    };
+    let Some(hit) = targets.iter().find(|hit| hit.rows.contains(&mouse.row)) else {
         return false;
     };
     match hit.target {
@@ -1136,11 +1169,15 @@ pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) ->
 }
 
 fn over_suggestions(model: &Model, row: u16) -> bool {
-    model.overlay.is_none()
-        && model.suggestions.is_some()
-        && app::compose_frame(model, model.height)
-            .suggestion_rows
-            .is_some_and(|rows| rows.contains(&row))
+    if model.overlay.is_some() || model.suggestions.is_none() {
+        return false;
+    }
+    let cached = model.hit_cache.borrow().clone();
+    let rows = match cached {
+        Some(cache) => cache.suggestion_rows,
+        None => app::compose_frame(model, model.height).suggestion_rows,
+    };
+    rows.is_some_and(|rows| rows.contains(&row))
 }
 
 /// Copied text is the conversation's, not the scrollbar's: drop the bar's
