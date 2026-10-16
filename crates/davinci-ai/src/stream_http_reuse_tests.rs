@@ -428,3 +428,53 @@ fn a_transport_that_saw_a_cancellation_never_carries_a_later_request() {
     };
     assert!(!transport.is_open(), "a cancelled socket was handed to a later request");
 }
+
+struct Endless(usize);
+
+impl Read for Endless {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+}
+
+fn leased(
+    name: &str,
+    finished: bool,
+    body: impl Read,
+) -> (LeasedReader<impl Read>, Arc<AtomicBool>, Arc<Session>) {
+    let lease = plan(Some(&id(name))).lease.expect("fresh session");
+    let (flag, session) = (lease.clean_flag(), lease.session());
+    let cancellation = Cancellation::default();
+    if finished {
+        cancellation.mark_finished();
+    }
+    (LeasedReader::new(body, Some(lease), cancellation), flag, session)
+}
+
+#[test]
+fn a_finished_response_drains_its_tail_so_the_connection_can_return_to_the_pool() {
+    let (reader, clean, _) = leased("drain", true, std::io::Cursor::new(b"0\r\n\r\n".to_vec()));
+    drop(reader);
+    assert!(clean.load(Ordering::Relaxed));
+}
+
+#[test]
+fn an_unfinished_response_is_never_drained_and_never_clean() {
+    let (reader, clean, session) = leased("no-drain", false, std::io::Cursor::new(b"more".to_vec()));
+    drop(reader);
+    assert!(!clean.load(Ordering::Relaxed));
+    assert!(
+        session.last_clean.lock().unwrap().is_none(),
+        "the session must not expect a reusable connection"
+    );
+}
+
+#[test]
+fn draining_is_bounded_in_bytes() {
+    let (mut reader, clean, _) = leased("bounded", true, Endless(0));
+    let mut probe = [0u8; 1];
+    reader.read(&mut probe).unwrap();
+    drop(reader);
+    assert!(!clean.load(Ordering::Relaxed), "an endless tail is not a clean end");
+}
