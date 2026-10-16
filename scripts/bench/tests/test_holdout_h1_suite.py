@@ -20,7 +20,7 @@ def git(repo, *args):
     return done.stdout.strip()
 
 
-def real_suite(base, count=h1.TASK_COUNT, language="python", split="holdout", size="large", shared_repo=False):
+def real_suite(base, count=h1.TASK_COUNT, language="python", split="holdout", size="large", shared_repo=False, salt=""):
     """A frozen private suite built by the harness's own importer from tiny throwaway git repositories."""
     import private_suite
     base = Path(base)
@@ -35,7 +35,7 @@ def real_suite(base, count=h1.TASK_COUNT, language="python", split="holdout", si
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "starter")
         starter = git(repo, "rev-parse", "HEAD")
-        (repo / "pkg" / "core.py").write_bytes(("def value():\n    return %d\n" % (index + 1)).encode())
+        (repo / "pkg" / "core.py").write_bytes(("def value():\n    return %d\n%s" % (index + 1, salt)).encode())
         hidden_test = "from pkg.core import value\n\n\ndef test_value():\n    assert value() == %d\n    assert %r\n"
         (repo / "tests" / "test_hidden.py").write_bytes((hidden_test % (index + 1, HIDDEN_LINE)).encode())
         git(repo, "add", "-A")
@@ -201,7 +201,7 @@ class RealReportTests(unittest.TestCase):
     def test_the_wrong_suite_blocks_the_numbers(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
             suite, root, pins = self.build(d)
-            wrong = real_suite(other)  # a valid frozen suite, but not the pinned one
+            wrong = real_suite(other, salt="# another suite\n")  # a valid frozen suite, but not the pinned one
             digest = json.loads(pins.read_text(encoding="utf-8"))["private_suite_digest"]
             self.assertEqual(h1.leak_scan(root, wrong, expected_runs=54, expected_digest=digest)["status"], "WRONG_SUITE")
             self.assertEqual(self.report(root, pins, wrong)["verdict"], "CONTAMINATION_REVIEW")
