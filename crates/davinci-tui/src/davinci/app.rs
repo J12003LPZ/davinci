@@ -968,7 +968,8 @@ fn handle_history_search_key(model: &mut Model, key: KeyEvent) -> Flow {
     match key.code {
         KeyCode::Esc => model.history_search = None,
         KeyCode::Char('c' | 'g') if ctrl => model.history_search = None,
-        KeyCode::Enter | KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => model.history_search_scope(),
+        KeyCode::Enter => {
             let selected = model.history_search.as_ref().map_or(0, |s| s.selected);
             if !model.history_search_accept(selected) {
                 model.history_search = None;
@@ -4896,7 +4897,7 @@ mod scroll_to_entry_tests {
             handle_key(&mut m, KeyEvent::from(KeyCode::Char(ch)));
         }
         let shown = rows(&m).join("\n");
-        assert!(shown.contains("search history: parser"), "{shown}");
+        assert!(shown.contains("search project: parser"), "{shown}");
         assert!(shown.contains("1 of 2"), "{shown}");
         // Newest first; another ctrl+r walks to the older match.
         handle_key(
@@ -4906,6 +4907,22 @@ mod scroll_to_entry_tests {
         handle_key(&mut m, KeyEvent::from(KeyCode::Enter));
         assert!(m.history_search.is_none());
         assert_eq!(m.composer.editor().get_text(), "explain the parser design");
+    }
+
+    #[test]
+    fn tab_cycles_the_search_through_project_all_and_session() {
+        let mut m = searching();
+        m.session_history = vec!["only this run".into()];
+        m.history_all = Some(vec!["from another project".into()]);
+        let matches = |m: &Model| m.history_matches().len();
+        assert_eq!(matches(&m), 3, "project history");
+        handle_key(&mut m, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(m.history_matches(), ["from another project"]);
+        assert!(rows(&m).join("\n").contains("search all projects:"));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(m.history_matches(), ["only this run"]);
+        handle_key(&mut m, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(matches(&m), 3);
     }
 
     #[test]

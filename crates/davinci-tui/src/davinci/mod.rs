@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod fixtures;
+pub mod links;
 pub mod model;
 mod paste_burst;
 pub mod runtime;

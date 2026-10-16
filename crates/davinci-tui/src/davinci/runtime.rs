@@ -372,6 +372,9 @@ pub struct Session {
     focused: bool,
     /// How frames reach the terminal, read once from the environment.
     output: Output,
+    /// Whether a path named on screen exists, so a frame does not stat the
+    /// same files again: when it was asked, and the answer.
+    path_cache: std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
 }
 
 /// Frame delivery choices, fixed for the session.
@@ -475,6 +478,7 @@ impl Session {
             rendered_lines: Vec::new(),
             selector: super::selection::Selector::default(),
             scrollbar_grab: None,
+            path_cache: std::collections::HashMap::new(),
             scrollbar: None,
             focused: true,
             output: Output::from_env(|name| std::env::var(name).ok()),
@@ -674,6 +678,9 @@ impl Session {
         let mut scrollbar = None;
         let selection_bg = model.theme.cc().selection_bg;
         let selector = &mut self.selector;
+        let hyperlinks = !env_flag("DAVINCI_DISABLE_HYPERLINKS");
+        let mut linked: Vec<LinkedCells> = Vec::new();
+        let path_cache = &mut self.path_cache;
         self.terminal.draw(|frame| {
             let area: Rect = frame.area();
             let composed = app::compose_frame(model, area.height);
@@ -701,11 +708,63 @@ impl Session {
                         .set_style(Rect::new(left, row, right - left, 1), style);
                 }
             }
+            if hyperlinks {
+                for (row, text) in rendered_lines
+                    .iter()
+                    .enumerate()
+                    .take(usize::from(area.height))
+                {
+                    for link in row_links(path_cache, text) {
+                        let buffer = frame.buffer_mut();
+                        let mut cells = Vec::new();
+                        let mut column = link.start;
+                        while column < link.end.min(area.width) {
+                            let Some(cell) = buffer.cell((column, row as u16)) else {
+                                break;
+                            };
+                            // A wide glyph owns the cell after it.
+                            let width = unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1);
+                            cells.push((column, row as u16, cell.clone()));
+                            column += width as u16;
+                        }
+                        linked.push((link.url, cells));
+                    }
+                }
+            }
         })?;
+        for (url, cells) in &linked {
+            write_hyperlink(self.terminal.backend_mut(), url, cells)?;
+        }
         finish_frame(self.terminal.backend_mut(), output, caret)?;
         self.rendered_lines = rendered_lines;
         self.scrollbar = scrollbar;
         Ok(())
+    }
+
+    /// Open the link under a Ctrl- or Cmd-click. `true` when there was one.
+    fn open_link_at(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use event::{MouseButton::Left, MouseEventKind};
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            return false;
+        }
+        let Some(text) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        let links = row_links(&mut self.path_cache, text);
+        let Some(link) = super::links::at(&links, mouse.column) else {
+            return false;
+        };
+        let note = match crate::open_browser::try_open_browser(&link.url) {
+            Ok(_) => format!("opened {}", link.url),
+            Err(err) => format!("could not open {}: {err}", link.url),
+        };
+        model.toast = Some((note, Instant::now()));
+        model.dirty = true;
+        true
     }
 
     /// Copy on release, as the reference terminal does: text selected with
@@ -718,6 +777,9 @@ impl Session {
     /// else selects text.
     pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
         use event::MouseEventKind;
+        if !env_flag("DAVINCI_DISABLE_HYPERLINKS") && self.open_link_at(model, mouse) {
+            return false;
+        }
         if route_graph_mouse(model, mouse)
             || route_click_target(model, mouse)
             || route_scroll_mouse(model, &mut self.scrollbar_grab, self.scrollbar, mouse)
@@ -958,6 +1020,53 @@ fn open_in_editor(text: &str) -> Result<String, String> {
     }
 }
 
+/// The links in one rendered row, asking the disk about each path at most
+/// once every couple of seconds.
+fn row_links(
+    cache: &mut std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
+    text: &str,
+) -> Vec<super::links::Link> {
+    if !text.contains('/') {
+        return Vec::new();
+    }
+    if cache.len() > 4096 {
+        cache.clear();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    super::links::find(text, &cwd, &mut |path| {
+        let fresh = cache
+            .get(path)
+            .filter(|(asked, _)| asked.elapsed() < Duration::from_secs(2));
+        if let Some((_, found)) = fresh {
+            return *found;
+        }
+        let found = path.exists();
+        cache.insert(path.to_path_buf(), (Instant::now(), found));
+        found
+    })
+}
+
+/// A link's address and the screen cells it covers.
+type LinkedCells = (String, Vec<(u16, u16, ratatui::buffer::Cell)>);
+
+/// Print `cells` again inside an OSC 8 hyperlink to `url`. The terminal
+/// already shows exactly these cells, so this changes only what a click on
+/// them means.
+fn write_hyperlink<W: Write>(
+    backend: &mut CrosstermBackend<W>,
+    url: &str,
+    cells: &[(u16, u16, ratatui::buffer::Cell)],
+) -> io::Result<()> {
+    use ratatui::backend::Backend;
+    if cells.is_empty() {
+        return Ok(());
+    }
+    let url: String = url.chars().filter(|c| !c.is_control()).collect();
+    write!(backend, "\x1b]8;;{url}\x1b\\")?;
+    backend.draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+    write!(backend, "\x1b]8;;\x1b\\")
+}
+
 /// A truthy environment flag (`1`, `true`, `yes`, `on`).
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
@@ -1108,6 +1217,34 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_is_reprinted_between_hyperlink_open_and_close() {
+        #[derive(Clone, Default)]
+        struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let shared = Shared::default();
+        let mut backend = CrosstermBackend::new(shared.clone());
+        let mut cell = ratatui::buffer::Cell::default();
+        cell.set_symbol("h");
+        write_hyperlink(&mut backend, "https://a.io/\x1b[31m", &[(3, 1, cell)]).unwrap();
+        backend.flush().unwrap();
+        let out = String::from_utf8(shared.0.borrow().clone()).unwrap();
+        assert!(
+            out.starts_with("\x1b]8;;https://a.io/[31m\x1b\\"),
+            "{out:?}"
+        );
+        assert!(out.contains('h'));
+        assert!(out.ends_with("\x1b]8;;\x1b\\"), "{out:?}");
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let pairs: Vec<(String, String)> = pairs

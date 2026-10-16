@@ -52,6 +52,35 @@ impl HistoryStore {
         out
     }
 
+    /// Prompts from every project, newest file first and newest entry first
+    /// within it, without repeats.
+    pub fn load_all(&self) -> Vec<String> {
+        let Some(dir) = self.path.parent() else {
+            return Vec::new();
+        };
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+            .collect();
+        files.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (_, path) in files {
+            for text in (Self { path }).load() {
+                if seen.insert(text.clone()) {
+                    out.push(text);
+                }
+            }
+            if out.len() >= LOAD_LIMIT * 2 {
+                break;
+            }
+        }
+        out
+    }
+
     /// Record a sent prompt. Failures are ignored: history is a convenience.
     pub fn append(&self, text: &str) {
         let text = text.trim();
@@ -119,6 +148,19 @@ mod tests {
         store.append("second\nwith a line break");
         let again = HistoryStore::for_cwd(dir.path(), Path::new("/work/a"));
         assert_eq!(again.load(), ["second\nwith a line break", "first"]);
+    }
+
+    #[test]
+    fn all_projects_merge_without_repeats() {
+        let (dir, store) = store();
+        store.append("shared");
+        store.append("only a");
+        let other = HistoryStore::for_cwd(dir.path(), Path::new("/work/b"));
+        other.append("shared");
+        other.append("only b");
+        let mut all = store.load_all();
+        all.sort();
+        assert_eq!(all, ["only a", "only b", "shared"]);
     }
 
     #[test]

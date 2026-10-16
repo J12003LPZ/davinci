@@ -1078,14 +1078,18 @@ pub fn history_search_rows(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
     let cc = model.theme.cc();
     let matches = model.history_matches();
     let mut rows = vec![Line::from(vec![
-        span("  search history: ", cc.inactive),
+        span(format!("  search {}: ", search.scope.label()), cc.inactive),
         span(search.query.clone(), cc.permission),
         span("▏", cc.permission),
         span(
             if matches.is_empty() {
-                "  no match".to_owned()
+                "  no match · tab: wider".to_owned()
             } else {
-                format!("  {} of {}", search.selected + 1, matches.len())
+                format!(
+                    "  {} of {} · tab: scope",
+                    search.selected + 1,
+                    matches.len()
+                )
             },
             cc.inactive,
         ),

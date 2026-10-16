@@ -2965,6 +2965,10 @@ pub struct Model {
     pub history_store: Option<crate::history_store::HistoryStore>,
     /// The Ctrl+R search over earlier prompts, while it is open.
     pub history_search: Option<HistorySearch>,
+    /// Prompts sent in this run, newest first.
+    pub session_history: Vec<String>,
+    /// Every project's prompts, read when the search first asks for them.
+    pub history_all: Option<Vec<String>>,
     /// The Ctrl+O transcript viewer, while it is open.
     pub viewer: Option<super::views::viewer::TranscriptViewer>,
     /// Terminal work the viewer asked for, done before the next frame.
@@ -3152,6 +3156,37 @@ impl<'a> IntoIterator for &'a EntryLog {
 pub struct HistorySearch {
     pub query: String,
     pub selected: usize,
+    pub scope: HistoryScope,
+}
+
+/// Whose prompts the history search reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// Sent since davinci started.
+    Session,
+    /// Everything kept for this project.
+    #[default]
+    Project,
+    /// Every project.
+    All,
+}
+
+impl HistoryScope {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Session => Self::Project,
+            Self::Project => Self::All,
+            Self::All => Self::Session,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Project => "project",
+            Self::All => "all projects",
+        }
+    }
 }
 
 /// Matches shown at once.
@@ -3359,6 +3394,8 @@ impl Model {
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
             history_search: None,
+            session_history: Vec::new(),
+            history_all: None,
             viewer: None,
             viewer_task: None,
             facts: Facts::default(),
@@ -4138,7 +4175,7 @@ impl Model {
         if self.screen != Screen::Agent
             || self.overlay.is_some()
             || self.history_search.is_some()
-            || self.composer.editor().history.is_empty()
+            || (self.composer.editor().history.is_empty() && self.session_history.is_empty())
         {
             return false;
         }
@@ -4157,9 +4194,12 @@ impl Model {
             .split_whitespace()
             .map(str::to_lowercase)
             .collect();
-        self.composer
-            .editor()
-            .history
+        let source: &[String] = match search.scope {
+            HistoryScope::Session => &self.session_history,
+            HistoryScope::Project => &self.composer.editor().history,
+            HistoryScope::All => self.history_all.as_deref().unwrap_or_default(),
+        };
+        source
             .iter()
             .filter(|entry| {
                 let lower = entry.to_lowercase();
@@ -4167,6 +4207,18 @@ impl Model {
             })
             .map(String::as_str)
             .collect()
+    }
+
+    /// Search the next scope: session, project, every project.
+    pub fn history_search_scope(&mut self) {
+        let Some(search) = &mut self.history_search else {
+            return;
+        };
+        search.scope = search.scope.next();
+        search.selected = 0;
+        if search.scope == HistoryScope::All && self.history_all.is_none() {
+            self.history_all = self.history_store.as_ref().map(|store| store.load_all());
+        }
     }
 
     /// Move the mark through the matches (positive is older), staying inside.
@@ -4198,7 +4250,12 @@ impl Model {
     }
 
     /// Keep a sent prompt for later sessions in this project.
-    fn remember(&self, text: &str) {
+    fn remember(&mut self, text: &str) {
+        let text = text.trim();
+        if !text.is_empty() && self.session_history.first().map(String::as_str) != Some(text) {
+            self.session_history.insert(0, text.to_owned());
+        }
+        self.history_all = None;
         if let Some(store) = &self.history_store {
             store.append(text);
         }
