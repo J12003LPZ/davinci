@@ -2967,6 +2967,8 @@ pub struct Model {
     pub history_store: Option<crate::history_store::HistoryStore>,
     /// The Ctrl+R search over earlier prompts, while it is open.
     pub history_search: Option<HistorySearch>,
+    /// The pull request for this branch, when `gh` found one.
+    pub pr_badge: Option<PrBadge>,
     /// When ctrl+d was last pressed on an empty composer: a second press
     /// within [`QUIT_WINDOW`] leaves.
     pub quit_armed: Option<std::time::Instant>,
@@ -3174,6 +3176,52 @@ pub struct ComposerHit {
     pub wrap: usize,
     /// A leading `!` is drawn as the prompt glyph, not as text.
     pub shell: bool,
+}
+
+/// The pull request open for the current branch, as `gh pr view` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrBadge {
+    pub number: u64,
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    pub state: String,
+    /// `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED` or empty.
+    pub review: String,
+    pub draft: bool,
+    pub url: String,
+}
+
+impl PrBadge {
+    /// Read the JSON of `gh pr view --json number,state,reviewDecision,isDraft,url`.
+    pub fn parse(json: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Some(Self {
+            number: value.get("number")?.as_u64()?,
+            state: text("state"),
+            review: text("reviewDecision"),
+            draft: value
+                .get("isDraft")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            url: text("url"),
+        })
+    }
+
+    /// What the footer says: `PR #12`, with the state when it is not open.
+    pub fn label(&self) -> String {
+        match (self.state.as_str(), self.draft) {
+            ("MERGED", _) => format!("PR #{} merged", self.number),
+            ("CLOSED", _) => format!("PR #{} closed", self.number),
+            (_, true) => format!("PR #{} draft", self.number),
+            _ => format!("PR #{}", self.number),
+        }
+    }
 }
 
 /// How long after a first ctrl+d a second one still counts.
@@ -3443,6 +3491,7 @@ impl Model {
             transcript_scroll: std::cell::Cell::default(),
             history_store: None,
             history_search: None,
+            pr_badge: None,
             quit_armed: None,
             terminal_task: None,
             hit_cache: std::cell::RefCell::new(None),
@@ -4550,6 +4599,20 @@ pub fn wrap_index(index: usize, delta: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pull_request_reads_from_gh_json() {
+        let json = r#"{"number":42,"state":"OPEN","reviewDecision":"APPROVED","isDraft":false,"url":"https://github.com/a/b/pull/42"}"#;
+        let badge = PrBadge::parse(json).expect("a badge");
+        assert_eq!(badge.label(), "PR #42");
+        assert_eq!(badge.review, "APPROVED");
+        let merged = PrBadge::parse(r#"{"number":7,"state":"MERGED","url":""}"#).unwrap();
+        assert_eq!(merged.label(), "PR #7 merged");
+        let draft = PrBadge::parse(r#"{"number":8,"state":"OPEN","isDraft":true}"#).unwrap();
+        assert_eq!(draft.label(), "PR #8 draft");
+        assert!(PrBadge::parse("no pull requests found").is_none());
+        assert!(PrBadge::parse(r#"{"state":"OPEN"}"#).is_none());
+    }
 
     use crate::davinci::theme::ColorDepth;
 

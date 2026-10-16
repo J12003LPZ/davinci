@@ -306,6 +306,9 @@ pub fn startup(cwd: &Path, branch: &str, restored: bool) -> Startup {
 /// git subprocesses and a tree walk — can happen on a worker thread instead
 /// of the drawing one.
 pub struct WorkspaceDress {
+    /// What `gh` said about this branch's pull request, when the worker
+    /// asked it; `None` leaves the model's badge as it was.
+    pub pr: Option<Option<davinci_tui::davinci::model::PrBadge>>,
     pub cwd: String,
     pub branch: String,
     pub changes: (u32, u32, u32),
@@ -323,6 +326,7 @@ pub fn compute_workspace_dress(cwd: &Path, session_dir: &Path) -> WorkspaceDress
     let sessions = sessions(session_dir, davinci_session::now_ms());
     let startup = startup(cwd, &branch, !sessions.is_empty());
     WorkspaceDress {
+        pr: None,
         cwd: cwd.display().to_string(),
         branch,
         changes: git_delta(cwd, &changes),
@@ -336,6 +340,9 @@ pub fn compute_workspace_dress(cwd: &Path, session_dir: &Path) -> WorkspaceDress
 
 /// Put a computed dress on the model.
 pub fn apply_workspace_dress(model: &mut Model, dress: WorkspaceDress) {
+    if let Some(pr) = dress.pr {
+        model.pr_badge = pr;
+    }
     model.cwd = dress.cwd;
     model.branch = dress.branch;
     model.changes = dress.changes;
@@ -356,6 +363,53 @@ pub fn dress_from_workspace(model: &mut Model, cwd: &Path, session_dir: &Path) {
     apply_workspace_dress(model, compute_workspace_dress(cwd, session_dir));
 }
 
+/// When `gh` was last asked about which branch, and what it answered.
+#[derive(Default)]
+pub struct PrLookup {
+    asked: Option<(std::time::Instant, String)>,
+    answer: Option<davinci_tui::davinci::model::PrBadge>,
+}
+
+/// How long a `gh` answer is trusted before the next re-read asks again.
+const PR_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The pull request for `branch`, asking `gh` at most once a minute per
+/// branch (`None` between asks: the footer keeps what it has). A missing
+/// `gh`, no pull request or no network all read as no badge.
+fn pull_request_for(
+    cwd: &Path,
+    branch: &str,
+    last: &mut PrLookup,
+) -> Option<Option<davinci_tui::davinci::model::PrBadge>> {
+    if branch.is_empty() || std::env::var_os("DAVINCI_DISABLE_PR_BADGE").is_some() {
+        return None;
+    }
+    if let Some((at, asked)) = &last.asked {
+        if asked == branch && at.elapsed() < PR_TTL {
+            return None;
+        }
+    }
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            "--json",
+            "number,state,reviewDecision,isDraft,url",
+        ])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    last.asked = Some((std::time::Instant::now(), branch.to_owned()));
+    last.answer = output
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            davinci_tui::davinci::model::PrBadge::parse(&String::from_utf8_lossy(&out.stdout))
+        });
+    Some(last.answer.clone())
+}
+
 /// A worker that re-reads the workspace off the drawing thread.
 ///
 /// `redress()` used to spawn four git subprocesses and walk the tree from the
@@ -372,13 +426,13 @@ impl WorkspaceDresser {
         let (requests, incoming) = std::sync::mpsc::channel::<()>();
         let (outgoing, results) = std::sync::mpsc::channel::<WorkspaceDress>();
         std::thread::spawn(move || {
+            let mut last_pr = PrLookup::default();
             while incoming.recv().is_ok() {
                 // Coalesce the backlog: one read answers them all.
                 while incoming.try_recv().is_ok() {}
-                if outgoing
-                    .send(compute_workspace_dress(&cwd, &session_dir))
-                    .is_err()
-                {
+                let mut dress = compute_workspace_dress(&cwd, &session_dir);
+                dress.pr = pull_request_for(&cwd, &dress.branch, &mut last_pr);
+                if outgoing.send(dress).is_err() {
                     break;
                 }
             }

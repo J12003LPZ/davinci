@@ -5090,6 +5090,18 @@ mod scroll_to_entry_tests {
     }
 
     #[test]
+    fn the_footer_names_the_branchs_pull_request() {
+        let mut m = chat(24, 6);
+        m.branch = "feature".into();
+        assert!(!rows(&m).join("\n").contains("PR #"));
+        m.pr_badge = super::super::model::PrBadge::parse(
+            r#"{"number":42,"state":"OPEN","reviewDecision":"APPROVED","url":"https://github.com/a/b/pull/42"}"#,
+        );
+        let shown = rows(&m).join("\n");
+        assert!(shown.contains("PR #42"), "{shown}");
+    }
+
+    #[test]
     fn ctrl_o_opens_the_transcript_viewer_and_q_closes_it() {
         let mut m = chat(24, 6);
         handle_key(

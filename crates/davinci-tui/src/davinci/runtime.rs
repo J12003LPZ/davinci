@@ -762,7 +762,7 @@ impl Session {
                     .enumerate()
                     .take(usize::from(area.height))
                 {
-                    for link in row_links(path_cache, text) {
+                    for link in row_links(path_cache, text, pr_link(model)) {
                         let buffer = frame.buffer_mut();
                         let mut cells = Vec::new();
                         let mut column = link.start;
@@ -845,7 +845,7 @@ impl Session {
         let Some(text) = self.rendered_lines.get(usize::from(mouse.row)) else {
             return false;
         };
-        let links = row_links(&mut self.path_cache, text);
+        let links = row_links(&mut self.path_cache, text, pr_link(model));
         let Some(link) = super::links::at(&links, mouse.column) else {
             return false;
         };
@@ -1113,20 +1113,37 @@ fn open_in_editor(text: &str) -> Result<String, String> {
     }
 }
 
+/// The footer's pull-request label and where it goes.
+fn pr_link(model: &Model) -> Option<(String, &str)> {
+    let badge = model.pr_badge.as_ref()?;
+    Some((badge.label(), badge.url.as_str()))
+}
+
 /// The links in one rendered row, asking the disk about each path at most
 /// once every couple of seconds.
 fn row_links(
     cache: &mut std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
     text: &str,
+    pr: Option<(String, &str)>,
 ) -> Vec<super::links::Link> {
+    let mut found = Vec::new();
+    if let Some((label, url)) = pr.filter(|(_, url)| url.starts_with("https://")) {
+        if let Some(at) = text.find(&label) {
+            found.push(super::links::Link {
+                start: unicode_width::UnicodeWidthStr::width(&text[..at]) as u16,
+                end: unicode_width::UnicodeWidthStr::width(&text[..at + label.len()]) as u16,
+                url: url.to_owned(),
+            });
+        }
+    }
     if !text.contains('/') {
-        return Vec::new();
+        return found;
     }
     if cache.len() > 4096 {
         cache.clear();
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    super::links::find(text, &cwd, &mut |path| {
+    found.extend(super::links::find(text, &cwd, &mut |path| {
         let fresh = cache
             .get(path)
             .filter(|(asked, _)| asked.elapsed() < Duration::from_secs(2));
@@ -1136,7 +1153,8 @@ fn row_links(
         let found = path.exists();
         cache.insert(path.to_path_buf(), (Instant::now(), found));
         found
-    })
+    }));
+    found
 }
 
 /// A link's address and the screen cells it covers.

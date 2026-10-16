@@ -177,6 +177,10 @@ fn conversation_status(model: &Model) -> Line<'static> {
     if let Some(jobs) = jobs_note(model) {
         left.push(span(format!(" · {jobs}"), cc.inactive));
     }
+    if let Some(pr) = pr_span(model) {
+        left.push(span(" · ", cc.inactive));
+        left.push(pr);
+    }
     let toast = model.toast.as_ref().filter(|(_, at)| {
         at.elapsed() < std::time::Duration::from_secs(crate::davinci::model::TOAST_SECONDS)
     });
@@ -283,6 +287,20 @@ pub fn governor_notice(model: &Model) -> Vec<Line<'static>> {
     )]
 }
 
+/// The branch's pull request for the footer, inked by review state.
+fn pr_span(model: &Model) -> Option<Span<'static>> {
+    let badge = model.pr_badge.as_ref()?;
+    let th = &model.theme;
+    let ink = match (badge.state.as_str(), badge.review.as_str()) {
+        ("MERGED", _) => th.secondary,
+        ("CLOSED", _) => th.error,
+        (_, "APPROVED") => th.success,
+        (_, "CHANGES_REQUESTED") => th.error,
+        _ => th.muted,
+    };
+    Some(span(badge.label(), ink))
+}
+
 fn status_left(model: &Model) -> Vec<Span<'static>> {
     let th = &model.theme;
     let (delta, adds, dels) = model.changes;
@@ -360,6 +378,10 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
                 span(" · ", th.border),
                 span(model_run(model), th.muted),
             ];
+            if let Some(pr) = pr_span(model) {
+                left.push(span(" · ", th.border));
+                left.push(pr);
+            }
             if let Some(jobs) = jobs_note(model) {
                 left.push(span(" · ", th.border));
                 left.push(span(jobs, th.muted));
@@ -376,6 +398,10 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
                 span(format!("+{adds} "), th.success),
                 span(format!("-{dels}"), th.error),
             ];
+            if let Some(pr) = pr_span(model) {
+                left.push(span(" · ", th.border));
+                left.push(pr);
+            }
             if model.codex_open() {
                 left.push(span(" · ", th.border));
                 left.push(span("codex open", th.muted));
