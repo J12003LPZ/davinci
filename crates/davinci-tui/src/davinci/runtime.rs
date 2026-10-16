@@ -379,6 +379,9 @@ pub struct Session {
     /// moving average in microseconds.
     frame_stats: bool,
     frame_micros: f64,
+    /// Keys the shell raises on the user's behalf (a click on an option is
+    /// an enter), handed out ahead of the terminal's own events.
+    injected: VecDeque<Event>,
 }
 
 /// Frame delivery choices, fixed for the session.
@@ -485,6 +488,7 @@ impl Session {
             path_cache: std::collections::HashMap::new(),
             frame_stats: env_flag("DAVINCI_FRAME_STATS"),
             frame_micros: 0.0,
+            injected: VecDeque::new(),
             scrollbar: None,
             focused: true,
             output: Output::from_env(|name| std::env::var(name).ok()),
@@ -565,6 +569,9 @@ impl Session {
     }
 
     fn poll_event_inner(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        if let Some(event) = self.injected.pop_front() {
+            return Ok(Some(event));
+        }
         // Dropped mouse-motion events must consume the caller's existing wait,
         // not start a fresh full timeout. Otherwise continuous motion on
         // Windows can prevent the turn loop from reaching its next tick.
@@ -774,6 +781,40 @@ impl Session {
         Ok(())
     }
 
+    /// A click on an option of the open question focuses it, and chooses it
+    /// as enter would — except a tool approval, which a stray click must
+    /// never grant: that only moves the focus.
+    fn click_ask_option(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use super::model::Overlay;
+        use event::{MouseButton::Left, MouseEventKind};
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse.modifiers.is_empty()
+            || model.overlay != Some(Overlay::Ask)
+            || model.rewind_modal.is_some()
+            || model.decision_modal.is_some()
+            || model.approval_instructions.is_some()
+            || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
+        {
+            return false;
+        }
+        let Some(row) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        let Some(index) = ask_option_at(&model.ask.items, row) else {
+            return false;
+        };
+        model.ask_index = index;
+        model.overlay_offset = None;
+        model.dirty = true;
+        if model.ask.key != "/permissions" {
+            self.injected.push_back(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+        }
+        true
+    }
+
     /// Open the link under a Ctrl- or Cmd-click. `true` when there was one.
     fn open_link_at(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
         use event::{MouseButton::Left, MouseEventKind};
@@ -811,6 +852,10 @@ impl Session {
     pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
         use event::MouseEventKind;
         if !env_flag("DAVINCI_DISABLE_HYPERLINKS") && self.open_link_at(model, mouse) {
+            return false;
+        }
+        if self.click_ask_option(model, mouse) {
+            self.selector.clear();
             return false;
         }
         if route_graph_mouse(model, mouse)
@@ -1100,6 +1145,17 @@ fn write_hyperlink<W: Write>(
     write!(backend, "\x1b]8;;\x1b\\")
 }
 
+/// The option of an open question that a drawn row shows: the longest label
+/// found on it, so "Yes" does not win over "Yes, and don't ask again".
+fn ask_option_at(items: &[super::model::PickerItem], row: &str) -> Option<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !item.label.trim().is_empty() && row.contains(item.label.trim()))
+        .max_by_key(|(_, item)| item.label.trim().len())
+        .map(|(index, _)| index)
+}
+
 /// A truthy environment flag (`1`, `true`, `yes`, `on`).
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
@@ -1261,6 +1317,28 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_option_is_found_by_the_longest_label_on_its_row() {
+        use super::super::model::PickerItem;
+        let items = [
+            PickerItem::new("Yes", ""),
+            PickerItem::new("Yes, and don't ask again", ""),
+            PickerItem::new("No", ""),
+        ];
+        assert_eq!(
+            ask_option_at(&items, "│ ❯ Yes, and don't ask again │"),
+            Some(1)
+        );
+        assert_eq!(
+            ask_option_at(&items, "│   Yes                       │"),
+            Some(0)
+        );
+        assert_eq!(
+            ask_option_at(&items, "│   something else            │"),
+            None
+        );
+    }
 
     #[test]
     fn a_link_is_reprinted_between_hyperlink_open_and_close() {
