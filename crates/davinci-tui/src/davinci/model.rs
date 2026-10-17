@@ -2709,8 +2709,8 @@ pub struct Model {
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
     pub caret_moved_at: u64,
-    /// The stored `caretBlink` setting. Off by default: the reference terminal
-    /// draws a steady caret, and a blinking one costs a redraw every phase.
+    /// The stored `caretBlink` setting. On unless turned off, as in Claude Code; a steady caret
+    /// saves the redraw each phase costs.
     pub caret_blink: bool,
     /// The stored `autoScroll` setting: follow the newest output as it
     /// arrives. When off, a view at the newest stays where it was.

@@ -974,6 +974,33 @@ fn recolor_leading(spans: Vec<Span<'static>>, cells: usize, color: Color) -> Vec
     out
 }
 
+/// The branch to name on the composer's top rule: any branch but the
+/// default one, and only on the conversation itself.
+fn branch_label(model: &Model) -> Option<String> {
+    let branch = model.branch.trim();
+    let default = matches!(branch, "" | "main" | "master" | "HEAD");
+    (!default && model.screen == Screen::Agent && model.overlay.is_none())
+        .then(|| branch.to_string())
+}
+
+/// `──────── fix-permission-mode-footer-color ─`: the rule with the branch
+/// set into its right end, as Claude Code draws it.
+fn branch_rule(model: &Model, color: Color, branch: &str) -> Line<'static> {
+    let width = usize::from(model.width);
+    // Room for " name ─" and at least a few cells of rule before it.
+    let room = width.saturating_sub(9);
+    if room < 4 {
+        return Line::from(span("─".repeat(width), color));
+    }
+    let name = clip_ellipsis(branch, room as u16);
+    let tail = format!(" {name} ─");
+    let rule = "─".repeat(width.saturating_sub(UnicodeWidthStr::width(tail.as_str())));
+    Line::from(vec![
+        span(rule, color),
+        span(tail, model.theme.cc().inactive),
+    ])
+}
+
 fn composer_rule(
     model: &Model,
     color: ratatui::style::Color,
@@ -981,6 +1008,11 @@ fn composer_rule(
     direction: &str,
 ) -> Line<'static> {
     if hidden == 0 {
+        if direction == "above" {
+            if let Some(branch) = branch_label(model) {
+                return branch_rule(model, color, &branch);
+            }
+        }
         return Line::from(span("─".repeat(model.width as usize), color));
     }
     let label = if hidden > 0 {
@@ -1788,6 +1820,31 @@ mod tests {
 
         let drawn = text(&header(&m));
         assert!(drawn.contains("sonnet · high"), "{drawn}");
+    }
+
+    #[test]
+    fn a_branch_other_than_main_is_named_on_the_composers_top_rule() {
+        let mut m = model(100);
+        m.branch = "fix-permission-mode-footer-color".into();
+        let rows = composer(&m, None, Hint::None);
+        let top = rows
+            .iter()
+            .map(text)
+            .find(|row| row.contains("fix-permission"))
+            .expect("branch on a rule");
+        assert!(top.starts_with('─') && top.ends_with(" fix-permission-mode-footer-color ─"), "{top}");
+        assert_eq!(UnicodeWidthStr::width(top.as_str()), 100);
+        for quiet in ["main", "master", "", "HEAD"] {
+            m.branch = quiet.into();
+            let drawn: String = composer(&m, None, Hint::None).iter().map(text).collect();
+            assert!(!drawn.contains(quiet) || quiet.is_empty(), "{quiet} is not named");
+        }
+        // A long name is clipped, a tiny window keeps a bare rule.
+        m.branch = "x".repeat(200);
+        let top = composer(&m, None, Hint::None).iter().map(text).find(|r| r.contains('…')).expect("clipped");
+        assert_eq!(UnicodeWidthStr::width(top.as_str()), 100);
+        m.width = 8;
+        assert!(composer(&m, None, Hint::None).iter().all(|r| !text(r).contains('x')));
     }
 
     #[test]

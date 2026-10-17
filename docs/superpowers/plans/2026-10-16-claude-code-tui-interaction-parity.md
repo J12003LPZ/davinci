@@ -242,8 +242,8 @@ Terminal compatibility: tmux ≤3.6 and Apple Terminal ignore or are not asked.
 
 **T2. Caret parity and IME parking.**
 Files: `views/chrome.rs`, `model.rs`, `runtime.rs`, `app.rs`.
-Steady painted caret by default (setting `caretBlink`, default off, to keep
-today's behavior available). After each draw, `MoveTo` the hidden cursor to the
+Blinking painted caret by default (setting `caretBlink: false` keeps it steady;
+changed on 2026-10-17 to match Claude Code). After each draw, `MoveTo` the hidden cursor to the
 caret cell computed by `composer()` (return it from `compose_frame`). Request
 focus events (`EnableFocusChange`); on `FocusLost` do not paint the caret, on
 `FocusGained` repaint. Optional native cursor (`DAVINCI_NATIVE_CURSOR=1` or

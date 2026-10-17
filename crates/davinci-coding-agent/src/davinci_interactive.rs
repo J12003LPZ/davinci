@@ -4872,7 +4872,8 @@ pub fn run(
         model.suggestion_rows = rows.clamp(3, 20) as usize;
     }
     model.terminal_progress = stored_settings.show_terminal_progress();
-    model.caret_blink = stored_settings.caret_blink.unwrap_or(false);
+    // The caret blinks unless `caretBlink` is turned off, as in Claude Code.
+    model.caret_blink = stored_settings.caret_blink.unwrap_or(true);
     model.auto_scroll = stored_settings.auto_scroll.unwrap_or(true);
     if let Some(enabled) = stored_settings
         .enabled_models
