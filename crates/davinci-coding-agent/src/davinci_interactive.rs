@@ -4646,6 +4646,33 @@ impl Drop for HostedTuiGuard {
     }
 }
 
+/// What to tell someone running inside tmux, once: selection, copy and focus
+/// only reach the shell when tmux passes them on. Remembered in a marker file
+/// under the agent dir so it is said on the first launch and not again.
+fn terminal_hint(in_tmux: bool, agent_dir: &std::path::Path) -> Option<String> {
+    if !in_tmux {
+        return None;
+    }
+    let marker = agent_dir.join("hints").join("tmux");
+    if marker.exists() {
+        return None;
+    }
+    let _ = marker
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| {
+            std::fs::write(
+                &marker, b"shown
+",
+            )
+        });
+    Some(
+        "tmux: add `set -g mouse on`, `set -g set-clipboard on` and `set -g focus-events on` to ~/.tmux.conf for selection, copy and the caret"
+            .to_owned(),
+    )
+}
+
 /// Run the davinci TUI against a live agent until the user leaves.
 pub fn run(
     parsed: &crate::args::Args,
@@ -4829,6 +4856,12 @@ pub fn run(
     let mut image_status: Option<String> = None;
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    if let Some(hint) = terminal_hint(
+        std::env::var_os("TMUX").is_some(),
+        &crate::default_agent_dir(),
+    ) {
+        model.push_toast(hint);
+    }
     terminal.set_native_cursor(stored_settings.show_hardware_cursor.unwrap_or(false));
     terminal.set_copy_on_select(stored_settings.fullscreen_copy_on_select.unwrap_or(true));
     crate::startup_mark("shell: terminal open");

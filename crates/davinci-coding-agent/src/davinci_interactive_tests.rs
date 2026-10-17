@@ -3825,6 +3825,19 @@ fn agent_calls_are_named_like_claude_code() {
 }
 
 #[test]
+fn the_tmux_hint_is_said_once_and_only_inside_tmux() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(terminal_hint(false, dir.path()), None);
+    assert!(
+        !dir.path().join("hints").exists(),
+        "outside tmux nothing is written"
+    );
+    let first = terminal_hint(true, dir.path()).expect("said on the first launch");
+    assert!(first.contains("mouse on") && first.contains("set-clipboard"));
+    assert_eq!(terminal_hint(true, dir.path()), None, "not again");
+}
+
+#[test]
 fn background_counts_include_live_workers_only() {
     use davinci_agent::{
         AgentId, AgentKind, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeHandle,
