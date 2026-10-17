@@ -1065,9 +1065,10 @@ fn copy_to_clipboard(model: &mut Model, text: &str) {
     let note = match crate::open_browser::try_copy_text(text) {
         Ok(path) => {
             let chars = text.chars().count();
-            let path = path.strip_prefix("copied via ").unwrap_or("dry run");
+            // Which tool did it is not the reader's business, as in Claude Code.
+            let _ = path;
             format!(
-                "copied {chars} {} · {path}",
+                "copied {chars} {} to clipboard",
                 if chars == 1 { "char" } else { "chars" }
             )
         }

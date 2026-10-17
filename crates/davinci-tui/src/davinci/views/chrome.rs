@@ -193,19 +193,21 @@ fn conversation_status(model: &Model) -> Line<'static> {
         left.push(span(" · ", cc.inactive));
         left.push(pr);
     }
-    let toast = model.toast.as_ref().filter(|(_, at)| {
-        at.elapsed() < std::time::Duration::from_secs(crate::davinci::model::TOAST_SECONDS)
-    });
-    let right = if let Some((note, _)) = toast {
-        let room = usize::from(model.width / 2);
-        vec![span(
-            format!("{} ", super::super::ui::clip_ellipsis(note, room as u16)),
-            cc.inactive,
-        )]
-    } else {
-        context_fold(model, usize::from(run_width(&left)))
-    };
+    // Notes show on the row above the composer (`effort_line`), so the
+    // footer's right end keeps the context readout.
+    let right = context_fold(model, usize::from(run_width(&left)));
     spread(model.width, left, right)
+}
+
+/// The note still inside its [`crate::davinci::model::TOAST_SECONDS`].
+fn live_toast(model: &Model) -> Option<&str> {
+    model
+        .toast
+        .as_ref()
+        .filter(|(_, at)| {
+            at.elapsed() < std::time::Duration::from_secs(crate::davinci::model::TOAST_SECONDS)
+        })
+        .map(|(note, _)| note.as_str())
 }
 
 /// Pips in the footer's context gauge.
@@ -612,7 +614,21 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
 /// Claude-style effort affordance shared by the conversation composer and
 /// command sheets. The session's real effort label is preserved.
 pub fn effort_line(model: &Model) -> Line<'static> {
-    let quiet = model.theme.cc().inactive;
+    let cc = model.theme.cc();
+    let quiet = cc.inactive;
+    // A note ("copied 709 chars to clipboard") takes this row's right end in
+    // the permission blue while it lasts, then gives the effort label back.
+    if let Some(note) = live_toast(model) {
+        let room = model.width.saturating_sub(4);
+        return spread(
+            model.width,
+            Vec::new(),
+            vec![span(
+                format!("{}  ", clip_ellipsis(note, room)),
+                cc.permission,
+            )],
+        );
+    }
     spread(
         model.width,
         Vec::new(),
@@ -2297,15 +2313,30 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_toast_takes_the_footer_corner_and_an_old_one_gives_it_back() {
+    fn a_fresh_note_takes_the_effort_row_in_blue_and_an_old_one_gives_it_back() {
         let mut m = model(100);
-        m.toast = Some(("copied 7 chars · wl-copy".into(), std::time::Instant::now()));
-        assert!(text(&status(&m)).ends_with("copied 7 chars · wl-copy "));
         m.toast = Some((
-            "copied 7 chars · wl-copy".into(),
+            "copied 709 chars to clipboard".into(),
+            std::time::Instant::now(),
+        ));
+        let row = effort_line(&m);
+        assert!(text(&row).ends_with("copied 709 chars to clipboard  "), "{}", text(&row));
+        assert!(!text(&row).contains("/effort"));
+        let note = row
+            .spans
+            .iter()
+            .find(|s| s.content.contains("copied"))
+            .expect("note");
+        assert_eq!(note.style.fg, Some(m.theme.cc().permission));
+        assert_eq!(line_width(&row), 100);
+        // The footer keeps its own right end for the context readout.
+        assert!(!text(&status(&m)).contains("copied"));
+        m.toast = Some((
+            "copied 709 chars to clipboard".into(),
             std::time::Instant::now() - std::time::Duration::from_secs(60),
         ));
-        assert!(!text(&status(&m)).contains("copied"));
+        let row = effort_line(&m);
+        assert!(text(&row).contains("/effort") && !text(&row).contains("copied"));
     }
 
     #[test]
