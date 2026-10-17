@@ -1249,9 +1249,22 @@ fn enabled_codemode_tells_the_model_when_to_use_it_and_disabled_says_nothing() {
         "Prefer it to several separate",
         "tools.read(",
         "Not for a single lookup",
+        "no undefined fields",
+        "Output past 16 KB",
     ] {
         assert!(spec.description.contains(needle), "{}", spec.description);
     }
+}
+
+#[test]
+fn staged_codemode_is_announced_before_the_runtime_registers_it() {
+    // Print mode prepares the first prompt before `activate_staged_codemode`.
+    let mut agent = Agent::new("staged fixture");
+    assert!(!agent.runtime_prompt_state().codemode_available);
+    agent.stage_read_only_codemode(Arc::new(ReadOnlyFixtureHost));
+    assert!(agent.runtime_prompt_state().codemode_available);
+    agent.clear_codemode();
+    assert!(!agent.runtime_prompt_state().codemode_available);
 }
 
 #[test]
