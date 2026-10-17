@@ -360,7 +360,17 @@ pub fn pinned_rows(model: &Model) -> usize {
 
 /// The widest list column of the split view; the detail pane takes the rest.
 const LIST_WIDTH: u16 = 40;
-/// Narrower than this, or shorter than [`SPLIT_MIN_HEIGHT`], `/skills` keeps
+/// Plugin and server names carry a `@marketplace` or `owner/` qualifier.
+const WIDE_LIST_WIDTH: u16 = 46;
+
+fn list_width(tab: ExtensionTab) -> u16 {
+    if tab == ExtensionTab::Skills {
+        LIST_WIDTH
+    } else {
+        WIDE_LIST_WIDTH
+    }
+}
+/// Narrower than this, or shorter than [`SPLIT_MIN_HEIGHT`], the manager keeps
 /// the stacked cards: two panes need room to both read.
 const SPLIT_MIN_WIDTH: u16 = 90;
 const SPLIT_MIN_HEIGHT: u16 = 18;
@@ -369,11 +379,13 @@ const FRAME_ROWS: usize = 6;
 /// Description lines the detail pane shows before it clips.
 const DESCRIPTION_ROWS: usize = 8;
 
-/// `/skills` on the Installed view draws a list beside the selected skill's
-/// details when the window is big enough.
+/// The Installed view of `/skills`, `/plugins` and `/mcp` draws a list beside
+/// the selected row's details when the window is big enough.
 fn splits(model: &Model, sheet: &ExtensionsSheet) -> bool {
-    sheet.tab == ExtensionTab::Skills
-        && sheet.view == ExtensionView::Installed
+    sheet.view == ExtensionView::Installed
+        // A pending approval lists everything it asks you to trust, and that
+        // list must never be what falls off the pane; the cards scroll.
+        && !(sheet.armed_here().is_some() && sheet.tab != ExtensionTab::Skills)
         && width_of(model) >= SPLIT_MIN_WIDTH
         && model.height >= SPLIT_MIN_HEIGHT
         && !sheet.entries(sheet.tab).is_empty()
@@ -421,22 +433,43 @@ fn list_row(
         }
         ExtensionEntry::Row(at) => {
             let item = &sheet.current_rows()[*at];
-            let tokens = if item.tokens > 0 {
-                item.tokens.to_string()
+            let skills = sheet.tab == ExtensionTab::Skills;
+            // A skill's cost, or the first word of what a plugin or server
+            // reports (`enabled`, `connected`, `needs auth`).
+            let problem = Problem::of(item, sheet.tab);
+            let right = if skills {
+                if item.tokens > 0 {
+                    item.tokens.to_string()
+                } else {
+                    String::new()
+                }
+            } else if let Some(problem) = problem {
+                // `needs attention` is too long for the column.
+                match problem {
+                    Problem::Attention => "attention".to_string(),
+                    other => other.label().to_string(),
+                }
             } else {
-                String::new()
+                item.status
+                    .split(" · ")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
             };
-            let room = width.saturating_sub(2 + 2 + tokens.chars().count() as u16 + 1);
+            let right = clip_ellipsis(&right, 14);
+            let room = width.saturating_sub(2 + 2 + right.chars().count() as u16 + 1);
             // Skills are instructions: whatever a host reports, they are fine.
-            let (mark, color) = if matches!(item.state, State::Failed | State::Attention) {
-                ("●", th.success)
-            } else {
-                glyph(item, Kind::Installed, th)
+            let (mark, color) = match problem {
+                Some(problem) => (problem.glyph(), problem.color(th)),
+                None if skills && matches!(item.state, State::Failed | State::Attention) => {
+                    ("●", th.success)
+                }
+                None => glyph(item, Kind::Installed, th),
             };
             spans.push(span(mark, color));
             spans.push(pad(1, None));
             spans.extend(title_spans(&clip_ellipsis(&item.title, room), selected, th));
-            tokens
+            right
         }
     };
     let used = ui::run_width(&spans);
@@ -444,7 +477,18 @@ fn list_row(
         .saturating_sub(used + right.chars().count() as u16 + 1)
         .max(1);
     spans.push(pad(gap, None));
-    spans.push(span(right, th.muted));
+    let right_ink = match entry {
+        ExtensionEntry::Row(at) => {
+            let item = &sheet.current_rows()[*at];
+            match Problem::of(item, sheet.tab) {
+                Some(problem) => problem.color(th),
+                None if sheet.tab == ExtensionTab::Skills => th.muted,
+                None => status_color(right.as_str(), th),
+            }
+        }
+        ExtensionEntry::Group { .. } => th.muted,
+    };
+    spans.push(span(right, right_ink));
     spans.push(pad(1, None));
     Line::from(truncate_run(spans, width))
 }
@@ -522,11 +566,16 @@ fn detail_rows(model: &Model, sheet: &ExtensionsSheet, width: u16) -> Vec<Vec<Sp
                 th.text,
                 th,
             )]);
+            let noun = match sheet.tab {
+                ExtensionTab::Plugins => "plugin",
+                ExtensionTab::Skills => "skill",
+                ExtensionTab::Mcp => "server",
+            };
             out.push(vec![span(
                 if shown == total {
-                    format!("{total} skills")
+                    format!("{total} {noun}{}", if *total == 1 { "" } else { "s" })
                 } else {
-                    format!("{shown} of {total} skills match")
+                    format!("{shown} of {total} {noun}s match")
                 },
                 th.muted,
             )]);
@@ -556,12 +605,33 @@ fn detail_rows(model: &Model, sheet: &ExtensionsSheet, width: u16) -> Vec<Vec<Sp
                 th.text,
                 th,
             )]);
-            let mut meta = vec![span(source_label(&item.status).to_string(), th.muted)];
-            if item.tokens > 0 {
-                meta.push(span(
-                    format!("  ·  ~{} tokens in context", item.tokens),
-                    th.muted,
-                ));
+            let skills = sheet.tab == ExtensionTab::Skills;
+            let problem = Problem::of(item, sheet.tab);
+            let mut meta: Vec<Span<'static>> = Vec::new();
+            if skills {
+                meta.push(span(source_label(&item.status).to_string(), th.muted));
+                if item.tokens > 0 {
+                    meta.push(span(
+                        format!("  ·  ~{} tokens in context", item.tokens),
+                        th.muted,
+                    ));
+                }
+            } else {
+                // `enabled · v1.0.0 · from davinci`, the first word in its colour.
+                let mut parts = item.status.split(" · ").filter(|part| !part.is_empty());
+                if let Some(first) = parts.next() {
+                    meta.push(span(first.to_string(), status_color(first, th)));
+                }
+                for part in parts {
+                    meta.push(span(format!("  ·  {part}"), th.muted));
+                }
+                // The badge says what the status already says only when it adds the glyph.
+                if let Some(problem) = problem.filter(|p| item.status != p.label()) {
+                    meta.push(span(
+                        format!("   {} {}", problem.glyph(), problem.label()),
+                        problem.color(th),
+                    ));
+                }
             }
             out.push(meta);
             if let Some(action) = sheet.armed_here() {
@@ -577,17 +647,21 @@ fn detail_rows(model: &Model, sheet: &ExtensionsSheet, width: u16) -> Vec<Vec<Sp
                 out.push(Vec::new());
                 out.extend(wrapped(&item.detail, th.text, DESCRIPTION_ROWS));
             }
-            out.push(Vec::new());
-            out.push(label("PATH"));
-            out.push(vec![span(clip_start(&item.key, room), th.text)]);
+            if skills {
+                out.push(Vec::new());
+                out.push(label("PATH"));
+                out.push(vec![span(clip_start(&item.key, room), th.text)]);
+            }
+            // A skill's note is usually its own folder, which PATH already
+            // says; every other note is a warning, an error or who manages it.
             if let Some(note) = item
                 .note
                 .as_deref()
-                .filter(|note| !note.is_empty() && !item.key.starts_with(*note))
+                .filter(|note| !note.is_empty() && !(skills && item.key.starts_with(*note)))
             {
                 out.push(Vec::new());
-                out.push(label("NOTE"));
-                out.extend(wrapped(note, th.muted, 4));
+                out.push(label(if problem.is_some() { "PROBLEM" } else { "NOTE" }));
+                out.extend(wrapped(note, note_color(item, th), 6));
             }
             let mut actions: Vec<Vec<Span<'static>>> = Vec::new();
             if item.can_toggle {
@@ -603,14 +677,25 @@ fn detail_rows(model: &Model, sheet: &ExtensionsSheet, width: u16) -> Vec<Vec<Sp
             if item.can_update {
                 actions.push(key("u", "update"));
             }
+            if item.can_approve {
+                actions.push(key("a", "approve hooks"));
+            }
+            if item.can_revoke {
+                actions.push(key("r", "revoke hooks"));
+            }
             if item.can_delete {
-                actions.push(key("d", "move to trash"));
+                actions.push(key("d", if skills { "move to trash" } else { "delete" }));
             }
             if !actions.is_empty() {
                 out.push(Vec::new());
                 out.push(label("ACTIONS"));
+                // As many to a line as the pane holds.
                 let mut line: Vec<Span<'static>> = Vec::new();
                 for action in actions {
+                    let need = usize::from(ui::run_width(&action)) + 3;
+                    if !line.is_empty() && usize::from(ui::run_width(&line)) + need > room {
+                        out.push(std::mem::take(&mut line));
+                    }
                     if !line.is_empty() {
                         line.push(pad(3, None));
                     }
@@ -633,8 +718,9 @@ fn split_body(model: &Model, sheet: &ExtensionsSheet, header_rows: usize) -> Vec
     let height = usize::from(model.height)
         .saturating_sub(FRAME_ROWS + header_rows)
         .max(6);
-    let list = list_column(model, sheet, height, LIST_WIDTH);
-    let pane_width = width.saturating_sub(LIST_WIDTH + 4);
+    let list_width = list_width(sheet.tab);
+    let list = list_column(model, sheet, height, list_width);
+    let pane_width = width.saturating_sub(list_width + 4);
     let mut pane = detail_rows(model, sheet, pane_width);
     pane.truncate(height);
     (0..height)
@@ -644,7 +730,7 @@ fn split_body(model: &Model, sheet: &ExtensionsSheet, header_rows: usize) -> Vec
                 .map(|line| line.spans.clone())
                 .unwrap_or_default();
             let used = ui::run_width(&spans);
-            spans.push(pad(LIST_WIDTH.saturating_sub(used), None));
+            spans.push(pad(list_width.saturating_sub(used), None));
             spans.push(span(" │ ", th.cc().subtle));
             if let Some(detail) = pane.get(row) {
                 spans.extend(detail.clone());
@@ -1184,7 +1270,19 @@ mod tests {
 
     #[test]
     fn installed_view_draws_its_rows_and_the_views_of_its_kind() {
-        let m = model(100);
+        // Wide: a list beside the selected row's details.
+        let wide = text(&lines(&model(100)));
+        for value in [
+            "Installed (2)",
+            "caveman@caveman",
+            "detail of superpowers@superpowers-marketplace",
+            "│",
+        ] {
+            assert!(wide.contains(value), "missing {value}:
+{wide}");
+        }
+        // Narrow: the stacked cards, every row's description in view.
+        let m = model(80);
         let drawn = text(&lines(&m));
         for value in [
             "Installed (2)",
@@ -1197,6 +1295,7 @@ mod tests {
             assert!(drawn.contains(value), "missing {value}:\n{drawn}");
         }
         assert_eq!(ui::focused_row(&lines(&m)), Some(2));
+        assert_eq!(ui::focused_row(&lines(&model(100))), Some(2));
         let header: String = chrome(&m)
             .header_right
             .iter()

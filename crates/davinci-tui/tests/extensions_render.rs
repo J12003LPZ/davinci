@@ -160,7 +160,7 @@ fn a_failed_row_keeps_its_error_visible_when_not_selected() {
         ],
         ..ExtensionsSheet::default()
     };
-    let text = draw(&model(100, 24, sheet)).join("\n");
+    let text = draw(&model(80, 24, sheet)).join("\n");
     assert!(text.contains("executable not found"), "{text}");
     assert!(text.contains("connected · 4 tools"), "{text}");
 }
@@ -206,7 +206,7 @@ fn problem_sheet(tab: ExtensionTab) -> ExtensionsSheet {
 #[test]
 fn errors_and_missing_auth_are_badged_and_counted_for_mcp_and_plugins() {
     for tab in [ExtensionTab::Mcp, ExtensionTab::Plugins] {
-        let text = draw(&model(100, 40, problem_sheet(tab))).join(
+        let text = draw(&model(80, 40, problem_sheet(tab))).join(
             "
 ",
         );
@@ -465,5 +465,35 @@ fn the_details_stay_put_while_a_long_list_scrolls() {
 "));
         let pane_rows = rows.iter().filter(|r| r.contains(" │ ")).count();
         assert!(pane_rows >= 20, "{tokens}: the divider spans the body ({pane_rows})");
+    }
+}
+
+#[test]
+fn plugins_and_servers_split_like_skills_with_their_status_and_problem() {
+    for tab in [ExtensionTab::Mcp, ExtensionTab::Plugins] {
+        let mut sheet = problem_sheet(tab);
+        // `broken`, the second row, whichever tab holds it.
+        sheet.selected = [1, 1, 1];
+        let rows = draw(&model(110, 30, sheet));
+        let text = rows.join("
+");
+        if std::env::var_os("DUMP_EXTENSIONS").is_some() {
+            println!("{tab:?}:
+{text}");
+        }
+        // The list: a mark and the first word of each status, flush right.
+        assert!(rows.iter().any(|r| r.contains("× broken") && r.contains("error") && r.contains('│')), "{tab:?}:
+{text}");
+        assert!(rows.iter().any(|r| r.contains("! locked") && r.contains("needs auth")), "{tab:?}:
+{text}");
+        assert!(rows.iter().any(|r| r.contains("● fine") && r.contains("connected")), "{tab:?}:
+{text}");
+        // The pane: the selected row's status, problem, description and note.
+        assert!(text.contains("detail of broken"), "{tab:?}:
+{text}");
+        assert!(text.contains("PROBLEM") && text.contains("spawn ENOENT"), "{tab:?}:
+{text}");
+        assert!(!text.contains("PATH"), "{tab:?}: only skills show a path");
+        assert!(!text.contains("detail of fine"), "{tab:?}: the pane is for one row");
     }
 }
