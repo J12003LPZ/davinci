@@ -1701,6 +1701,27 @@ mod tests {
     }
 
     #[test]
+    fn each_permission_mode_label_has_its_own_color() {
+        let mut m = model(120);
+        let cc = m.theme.cc();
+        for (mode, ink) in [
+            ("edits", cc.accept_edits),
+            ("read-only", cc.plan_mode),
+            ("auto", cc.auto_mode),
+        ] {
+            m.permission_mode = mode.into();
+            let line = status(&m);
+            let label = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains("mode on") || s.content.contains("accept edits"))
+                .unwrap_or_else(|| panic!("{mode}: no label in {}", text(&line)));
+            assert_eq!(label.style.fg, Some(ink), "{mode}");
+            assert_ne!(label.style.fg, Some(cc.inactive), "{mode}");
+        }
+    }
+
+    #[test]
     fn the_header_distinguishes_auto_from_always_approve() {
         let mut m = model(120);
         m.thinking_level = "high".into();
