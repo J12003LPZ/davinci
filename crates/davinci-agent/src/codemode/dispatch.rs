@@ -336,13 +336,13 @@ impl CodeModeBroker for AgentCodeModeBroker {
         self.require_authorized(&call.tool)?;
         let capability = self.policy.resolve(&call.tool)?;
         let mutating = !capability.read_only;
-        let max_concurrency = if matches!(&self.context.mode, CodeModeMode::ReadOnly)
-            && capability.concurrency_policy == ConcurrencyPolicy::ParallelSafe
-        {
-            self.context.limits.parallelism.max(1)
-        } else {
-            1
-        };
+        // `None` means exclusive: a serial call must run alone, not merely
+        // under a limit of one that a parallel-safe call would step over.
+        let shared_limit = shared_limit(
+            &self.context.mode,
+            capability.concurrency_policy,
+            self.context.limits.parallelism,
+        );
         super::projection::validate_json(&call.args, self.context.limits.json_depth)?;
         if !call.args.is_object()
             || super::projection::serialized_size(&call.args, self.context.limits.argument_bytes)
@@ -379,15 +379,17 @@ impl CodeModeBroker for AgentCodeModeBroker {
         let _in_flight = InFlight(self);
         // A private leaf lane serializes effects without holding parent journal,
         // agent or admission-state locks while a child or approval waits.
-        let lane = self
-            .dispatch
-            .acquire(max_concurrency, || {
-                self.context.cancellation.is_cancelled()
-                    || self.agent.abort_requested()
-                    || super::remaining_root_wall_ms(self.context.root_budget.as_ref()).is_err()
-            })
-            .ok_or_else(|| CodeModeError::new("CANCELLED", "queued child cancelled"))
-            .and_then(|lane| self.live().map(|()| lane));
+        let cancelled = || {
+            self.context.cancellation.is_cancelled()
+                || self.agent.abort_requested()
+                || super::remaining_root_wall_ms(self.context.root_budget.as_ref()).is_err()
+        };
+        let lane = match shared_limit {
+            Some(limit) => self.dispatch.acquire(limit, cancelled),
+            None => self.dispatch.acquire_exclusive(cancelled),
+        }
+        .ok_or_else(|| CodeModeError::new("CANCELLED", "queued child cancelled"))
+        .and_then(|lane| self.live().map(|()| lane));
         let _lane = match lane {
             Ok(lane) => lane,
             Err(error) => {
@@ -402,6 +404,7 @@ impl CodeModeBroker for AgentCodeModeBroker {
                     } else {
                         CodeModeChildStatus::NotStarted
                     },
+                    incomplete: false,
                     error: Some(error.clone()),
                 });
                 return Err(error);
@@ -538,11 +541,50 @@ impl CodeModeBroker for AgentCodeModeBroker {
             } else {
                 CodeModeChildStatus::Succeeded
             },
+            incomplete: error.is_none() && value.as_ref().is_some_and(|value| !value.complete),
             error: error.clone(),
         });
         if let Some(error) = error {
             return Err(error);
         }
         value.ok_or_else(|| CodeModeError::new("TOOL_FAILED", "child projection unavailable"))
+    }
+}
+
+/// How a child call shares the dispatch lane: `Some(limit)` runs beside other
+/// parallel-safe reads up to `limit`; `None` runs alone.
+fn shared_limit(
+    mode: &CodeModeMode,
+    policy: ConcurrencyPolicy,
+    parallelism: usize,
+) -> Option<usize> {
+    (matches!(mode, CodeModeMode::ReadOnly) && policy == ConcurrencyPolicy::ParallelSafe)
+        .then(|| parallelism.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_parallel_safe_read_only_calls_share_the_lane() {
+        let shared = |mode, policy| shared_limit(&mode, policy, 4);
+        assert_eq!(
+            shared(CodeModeMode::ReadOnly, ConcurrencyPolicy::ParallelSafe),
+            Some(4)
+        );
+        // Serial calls must run alone, whatever the parallelism budget is.
+        assert_eq!(
+            shared(CodeModeMode::ReadOnly, ConcurrencyPolicy::SerialBarrier),
+            None
+        );
+        assert_eq!(
+            shared(CodeModeMode::Controlled, ConcurrencyPolicy::ParallelSafe),
+            None
+        );
+        assert_eq!(
+            shared_limit(&CodeModeMode::ReadOnly, ConcurrencyPolicy::ParallelSafe, 0),
+            Some(1)
+        );
     }
 }
