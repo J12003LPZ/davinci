@@ -309,6 +309,8 @@ pub struct WorkspaceDress {
     /// What `gh` said about this branch's pull request, when the worker
     /// asked it; `None` leaves the model's badge as it was.
     pub pr: Option<Option<davinci_tui::davinci::model::PrBadge>>,
+    /// Said once: why the pull request badge cannot show.
+    pub hint: Option<String>,
     pub cwd: String,
     pub branch: String,
     pub changes: (u32, u32, u32),
@@ -327,6 +329,7 @@ pub fn compute_workspace_dress(cwd: &Path, session_dir: &Path) -> WorkspaceDress
     let startup = startup(cwd, &branch, !sessions.is_empty());
     WorkspaceDress {
         pr: None,
+        hint: None,
         cwd: cwd.display().to_string(),
         branch,
         changes: git_delta(cwd, &changes),
@@ -340,6 +343,9 @@ pub fn compute_workspace_dress(cwd: &Path, session_dir: &Path) -> WorkspaceDress
 
 /// Put a computed dress on the model.
 pub fn apply_workspace_dress(model: &mut Model, dress: WorkspaceDress) {
+    if let Some(hint) = dress.hint {
+        model.push_toast(hint);
+    }
     if let Some(pr) = dress.pr {
         model.pr_badge = pr;
     }
@@ -368,6 +374,17 @@ pub fn dress_from_workspace(model: &mut Model, cwd: &Path, session_dir: &Path) {
 pub struct PrLookup {
     asked: Option<(std::time::Instant, String)>,
     answer: Option<davinci_tui::davinci::model::PrBadge>,
+    hinted: bool,
+    /// Set by the lookup that found `gh` missing; the worker takes it once.
+    hint: Option<String>,
+}
+
+/// What to tell the user when `gh` could not even start: only for a
+/// repository whose origin is on GitHub, where the badge would have shown.
+fn missing_gh_hint(error: &std::io::Error, origin: &str) -> Option<String> {
+    (error.kind() == std::io::ErrorKind::NotFound && origin.contains("github.com")).then(|| {
+        "install the GitHub CLI (gh) to show this branch's pull request in the footer".to_owned()
+    })
 }
 
 /// How long a `gh` answer is trusted before the next re-read asks again.
@@ -401,6 +418,18 @@ fn pull_request_for(
         .stderr(std::process::Stdio::null())
         .output();
     last.asked = Some((std::time::Instant::now(), branch.to_owned()));
+    if let (Err(error), false) = (&output, last.hinted) {
+        let origin = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        last.hint = missing_gh_hint(error, &origin);
+        last.hinted = last.hint.is_some();
+    }
     last.answer = output
         .ok()
         .filter(|out| out.status.success())
@@ -432,6 +461,7 @@ impl WorkspaceDresser {
                 while incoming.try_recv().is_ok() {}
                 let mut dress = compute_workspace_dress(&cwd, &session_dir);
                 dress.pr = pull_request_for(&cwd, &dress.branch, &mut last_pr);
+                dress.hint = last_pr.hint.take();
                 if outgoing.send(dress).is_err() {
                     break;
                 }
@@ -459,6 +489,16 @@ impl WorkspaceDresser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_gh_is_explained_only_for_a_github_origin() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(missing_gh_hint(&missing, "git@github.com:me/app.git").is_some());
+        assert!(missing_gh_hint(&missing, "https://gitlab.com/me/app").is_none());
+        assert!(missing_gh_hint(&missing, "").is_none());
+        assert!(missing_gh_hint(&denied, "git@github.com:me/app.git").is_none());
+    }
 
     #[test]
     fn porcelain_is_parsed_into_status_and_path() {

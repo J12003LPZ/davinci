@@ -184,7 +184,10 @@ fn conversation_status(model: &Model) -> Line<'static> {
         left.push(item);
     }
     if model.footer_focus.is_some() {
-        left.push(span("  ←/→ choose · enter open · esc back", cc.inactive));
+        left.push(span(
+            "  ←/→ choose · enter open · x stop · esc back",
+            cc.inactive,
+        ));
     }
     if let Some(pr) = pr_span(model) {
         left.push(span(" · ", cc.inactive));

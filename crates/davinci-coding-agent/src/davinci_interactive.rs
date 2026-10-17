@@ -10037,6 +10037,24 @@ fn todo_command(shell: &mut Shell<'_>, arg: &str) -> Next {
 /// kill <id>` stops one.
 fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     let jobs = shell.agent.tool_context.jobs.clone();
+    if arg
+        .strip_prefix("kill")
+        .is_some_and(|id| id.trim() == "all")
+    {
+        let mut manager = jobs.lock().unwrap_or_else(|err| err.into_inner());
+        let running = manager.running();
+        manager.kill_all();
+        drop(manager);
+        shell.model.running = false;
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::tool(
+            State::Done,
+            "manus",
+            &format!("stopped {running} running job(s)"),
+            None,
+        ));
+        return Next::Go;
+    }
     if let Some(id) = arg.strip_prefix("kill") {
         let Ok(id) = id.trim().parse::<u32>() else {
             shell.note("usage: /jobs kill <id>");
@@ -10057,7 +10075,7 @@ fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
         return Next::Go;
     }
     if !arg.is_empty() {
-        shell.note("usage: /jobs — the background jobs · /jobs kill <id>");
+        shell.note("usage: /jobs — the background jobs · /jobs kill <id|all>");
         return Next::Go;
     }
     let summaries = jobs
@@ -10734,6 +10752,23 @@ fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
     };
 
     let list = exec.list_workflows();
+    if id_str == "all" {
+        let running: Vec<_> = list
+            .iter()
+            .filter(|run| run.status == davinci_agent::runtime::WorkflowStatus::Running)
+            .map(|run| run.id)
+            .collect();
+        let stopped = running.iter().filter(|id| exec.cancel(id).is_ok()).count();
+        shell.model.running = false;
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::tool(
+            State::Done,
+            "opus",
+            &format!("stopped {stopped} of {} running workflows", running.len()),
+            None,
+        ));
+        return Next::Go;
+    }
     let target = list
         .iter()
         .find(|w| w.id.to_string().starts_with(id_str))

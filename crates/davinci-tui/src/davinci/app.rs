@@ -1056,7 +1056,30 @@ fn handle_footer_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
         return None;
     }
     let focus = focus.min(items.len() - 1);
+    let armed = model.footer_stop_armed.take();
     match key.code {
+        KeyCode::Char('x') if plain => {
+            let (label, command) = &items[focus];
+            let Some(stop) = footer_stop_command(command) else {
+                // Answers the key just pressed, so it replaces a waiting toast.
+                model.toast = Some((
+                    format!("open {command} to stop one of {label}"),
+                    std::time::Instant::now(),
+                ));
+                model.dirty = true;
+                return Some(Flow::Continue);
+            };
+            if armed == Some(focus) {
+                model.footer_focus = None;
+                return Some(Flow::Submit(stop.to_owned()));
+            }
+            model.footer_stop_armed = Some(focus);
+            model.toast = Some((
+                format!("press x again to stop {label}"),
+                std::time::Instant::now(),
+            ));
+            model.dirty = true;
+        }
         KeyCode::Left if plain => model.footer_focus = Some(focus.saturating_sub(1)),
         KeyCode::Right if plain => model.footer_focus = Some((focus + 1).min(items.len() - 1)),
         KeyCode::Enter if plain => {
@@ -1070,6 +1093,16 @@ fn handle_footer_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
         }
     }
     Some(Flow::Continue)
+}
+
+/// The command that stops everything a footer item counts, for the kinds
+/// that have one. Agents are stopped one at a time from their own sheet.
+fn footer_stop_command(open: &str) -> Option<&'static str> {
+    match open {
+        "/jobs" => Some("/jobs kill all"),
+        "/workflows" => Some("/workflow-stop all"),
+        _ => None,
+    }
 }
 
 /// Keys while the transcript viewer is open.
@@ -5145,6 +5178,40 @@ mod scroll_to_entry_tests {
         );
         let shown = rows(&m).join("\n");
         assert!(shown.contains("PR #42"), "{shown}");
+    }
+
+    #[test]
+    fn x_twice_stops_what_the_focused_footer_item_counts() {
+        let mut m = chat(60, 6);
+        m.jobs_running = 2;
+        m.agents_running = 1;
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        let x = || KeyEvent::from(KeyCode::Char('x'));
+        // The first press only asks; focus stays and nothing is sent.
+        assert_eq!(handle_key(&mut m, x()), Flow::Continue);
+        assert_eq!(m.footer_focus, Some(0));
+        assert_eq!(m.footer_stop_armed, Some(0));
+        assert!(m
+            .toast
+            .as_ref()
+            .is_some_and(|(note, _)| note.contains("press x again to stop 2 jobs")));
+        // Moving away disarms, so a later x asks again.
+        handle_key(&mut m, KeyEvent::from(KeyCode::Right));
+        assert_eq!(m.footer_stop_armed, None);
+        // Agents have no stop-all: the key points at their sheet.
+        assert_eq!(handle_key(&mut m, x()), Flow::Continue);
+        assert_eq!(m.footer_stop_armed, None);
+        assert!(m
+            .toast
+            .as_ref()
+            .is_some_and(|(note, _)| note.contains("/agents")));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Left));
+        handle_key(&mut m, x());
+        assert_eq!(
+            handle_key(&mut m, x()),
+            Flow::Submit("/jobs kill all".into())
+        );
+        assert_eq!(m.footer_focus, None);
     }
 
     #[test]
