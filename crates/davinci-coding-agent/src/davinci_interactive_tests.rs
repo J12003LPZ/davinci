@@ -84,6 +84,39 @@ fn security_sheet_preserves_grouped_occurrence_assessments() {
     assert!(sheet.findings[0].evidence.contains("second.rs:2-3"));
 }
 use super::*;
+
+/// Points `PI_CODING_AGENT_DIR` at a test directory for the guard's lifetime.
+/// Tests in this binary run in parallel and the variable is process-wide, so
+/// the shared env lock is held throughout: without it one test restoring the
+/// variable mid-run sent another to the real `~/.pi/agent`. Restored on drop,
+/// so a failing assertion cannot leak the override either.
+struct AgentDirEnv {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl AgentDirEnv {
+    fn set(path: std::path::PathBuf) -> Self {
+        let lock = crate::tests::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("PI_CODING_AGENT_DIR", path);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for AgentDirEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+}
 use serde_json::json;
 
 #[test]
@@ -162,14 +195,9 @@ fn the_keys_sheet_counts_its_bindings_and_surfaces() {
 #[test]
 fn the_login_sheet_names_the_auth_file() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let mut m = model();
     open_login_sheet(&crate::args::Args::default(), &mut m);
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
     assert_eq!(m.screen, Screen::Login);
     assert!(
         m.facts.auth_path.ends_with("auth.json"),
@@ -767,8 +795,7 @@ fn the_catalogue_opens_with_newer_models_before_the_current_older_model() {
 #[test]
 fn what_the_session_found_is_said_under_the_mark_not_in_the_transcript() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let mut agent = davinci_agent::Agent::new("test");
     agent.cwd = dir.path().to_path_buf();
     agent.context_files.push(davinci_agent::ContextFile {
@@ -782,10 +809,6 @@ fn what_the_session_found_is_said_under_the_mark_not_in_the_transcript() {
     assert!(!block
         .iter()
         .any(|entry| matches!(entry, Entry::Prose(text) if text.starts_with("loaded"))));
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
 }
 
 #[test]
@@ -2458,8 +2481,7 @@ fn first_run_asks_only_what_davinci_cannot_decide_for_itself() {
 #[test]
 fn an_untrusted_project_with_pi_resources_is_warned_about_by_glyph() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let project = dir.path().join("project");
     std::fs::create_dir_all(project.join(".pi").join("skills")).unwrap();
 
@@ -2472,18 +2494,12 @@ fn an_untrusted_project_with_pi_resources_is_warned_about_by_glyph() {
                 if *state == State::Attention && target.contains("not trusted"))
     });
     assert!(warned, "an untrusted project must say so");
-
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
 }
 
 #[test]
 fn a_trusted_project_opens_without_a_warning() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let project = dir.path().join("plain");
     std::fs::create_dir_all(&project).unwrap();
 
@@ -2493,11 +2509,6 @@ fn a_trusted_project_opens_without_a_warning() {
     assert!(!block.iter().any(|entry| {
         matches!(entry, Entry::Tool { target, .. } if target.contains("not trusted"))
     }));
-
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
 }
 
 #[test]
@@ -3664,8 +3675,7 @@ fn context_hangs_the_usage_grid_from_the_echoed_command() {
 #[test]
 fn autocompact_shows_sets_and_persists_when_the_context_compacts() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let mut agent = Agent::new("sys");
     agent.cwd = dir.path().to_path_buf();
     agent.context_window = 400_000;
@@ -3720,10 +3730,6 @@ fn autocompact_shows_sets_and_persists_when_the_context_compacts() {
     };
     assert!(note.contains("not auto, off, a token count"), "{note}");
     assert!(agent.auto_compaction, "a refusal changes nothing");
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
 }
 
 #[test]
