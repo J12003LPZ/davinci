@@ -73,19 +73,21 @@ fn startup_keeps_the_reference_identity_geometry_and_model_hint() {
     let mut m = model();
     m.model_name = "Actual provider model".into();
     let rows = views::startup::banner(&m, &m.startup);
-    assert_eq!(rows.len(), 5);
-    assert!(rows[4].to_string().contains("/model"));
-    let title = rows[0].to_string();
+    assert_eq!(rows.len(), 7);
+    assert!(rows[6].to_string().contains("/model"));
+    // The painter takes the first columns; the text lines up after it.
+    let column = views::startup::PET_TEXT_COLUMN as usize;
+    let title = rows[1].to_string();
     assert_eq!(
         unicode_width::UnicodeWidthStr::width(&title[..title.find("DaVinci").unwrap()]),
-        11
+        column
     );
-    let model = rows[1].to_string();
+    let model = rows[2].to_string();
     assert_eq!(
         unicode_width::UnicodeWidthStr::width(
             &model[..model.find("Actual provider model").unwrap()]
         ),
-        11
+        column
     );
 }
 #[test]
