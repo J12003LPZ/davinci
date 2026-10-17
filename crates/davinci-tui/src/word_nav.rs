@@ -4,7 +4,7 @@
 //! `WordSegmenter::new_dictionary` (the same dictionary model `Intl.Segmenter`
 //! uses for Chinese/Japanese), not per-character or pair-grouping.
 
-use icu_segmenter::WordSegmenter;
+use icu_segmenter::{options::WordBreakInvariantOptions, WordSegmenter};
 
 /// ASCII punctuation used as intra-word boundaries (`PUNCTUATION_REGEX`).
 const PUNCTUATION: &[char] = &[
@@ -93,7 +93,7 @@ fn dictionary_cjk_segments(run: &str) -> Vec<WordSegment> {
     if run.is_empty() {
         return Vec::new();
     }
-    let segmenter = WordSegmenter::new_dictionary();
+    let segmenter = WordSegmenter::new_dictionary(WordBreakInvariantOptions::default());
     let mut segments = Vec::new();
     let mut start = 0;
     for (end, word_type) in segmenter.segment_str(run).iter_with_word_type() {
