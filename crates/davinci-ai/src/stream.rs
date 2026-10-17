@@ -999,15 +999,16 @@ pub(crate) fn require_codex_subscription_route(
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or("OpenAI Codex subscription requests require a verified ChatGPT-plan access token")?;
-    if let Some((_, authorization)) = auth
+    // Every case variant is checked: header maps can hold both `Authorization`
+    // and `authorization`, and checking only the first one found lets the
+    // other through depending on hash order.
+    let expected = format!("Bearer {access}");
+    if auth
         .headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value != &expected)
     {
-        let expected = format!("Bearer {access}");
-        if authorization != &expected {
-            return Err("OpenAI Codex subscription Authorization header does not match the verified ChatGPT-plan access token; API-key/header overrides are disabled".into());
-        }
+        return Err("OpenAI Codex subscription Authorization header does not match the verified ChatGPT-plan access token; API-key/header overrides are disabled".into());
     }
     Ok(())
 }

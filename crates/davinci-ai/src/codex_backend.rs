@@ -185,6 +185,28 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_refuses_a_mismatched_authorization_header_in_any_case_variant() {
+        use crate::stream::require_codex_subscription_route as gate;
+        let mut backend_url = model("openai-codex");
+        backend_url.base_url = Some(BACKEND_BASE_URL.into());
+        // Each HashMap gets its own random seed, so iteration order varies per
+        // map. A check that reads only the first matching header passes about
+        // half the time; 64 fresh maps make that miss effectively impossible.
+        for _ in 0..64 {
+            let mut both = auth(AUTH_SOURCE);
+            both.headers
+                .insert("authorization".into(), "Bearer other".into());
+            assert!(gate(&backend_url, &both).is_err());
+        }
+        // Matching values under both spellings are still accepted.
+        let mut agreeing = auth(AUTH_SOURCE);
+        agreeing
+            .headers
+            .insert("authorization".into(), "Bearer tok".into());
+        assert!(gate(&backend_url, &agreeing).is_ok());
+    }
+
+    #[test]
     fn the_login_provider_has_its_own_oauth_requests_and_the_default_login_is_unchanged() {
         let pkce = crate::oauth_providers::generate_pkce(&[7u8; 32]);
         let request =
