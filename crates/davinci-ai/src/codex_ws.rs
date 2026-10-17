@@ -400,6 +400,7 @@ fn lock_live() -> std::sync::MutexGuard<'static, LiveSocketCache> {
 }
 
 pub(crate) fn close_live_sockets(session_id: Option<&str>) {
+    clear_public_ws_backoff(session_id);
     let mut cache = lock_live();
     if let Some(session_id) = session_id {
         cache.sessions.remove(session_id);
@@ -1204,6 +1205,379 @@ fn map_io_error(err: std::io::Error, idle_timeout_ms: Option<u64>) -> String {
     format!("WebSocket error: {err}")
 }
 
+/// The public Responses WebSocket transport. Opt-in only, selected by the explicit `transport`
+/// value `public-websocket`; never reached by `auto`, `websocket` or `websocket-cached`.
+///
+/// One socket per conversation. Every request carries the full `input` and no
+/// `previous_response_id`, so a request never depends on server-side state of an earlier one.
+pub(crate) const PUBLIC_RESPONSES_WS_URL: &str = "wss://api.openai.com/v1/responses";
+pub const PUBLIC_WS_TRANSPORT: &str = "public-websocket";
+/// The public route has no ChatGPT account id; one fixed slot keys its socket.
+const PUBLIC_WS_SLOT: &str = "public-plan";
+/// Attempt transport label of a public WebSocket request.
+pub const PUBLIC_WS_ATTEMPT: &str = "websocket";
+/// After a request fell back to HTTP, the conversation stays on HTTP for this long, so a network
+/// that blocks WebSocket costs one failed connect, not one per request.
+const PUBLIC_WS_BACKOFF_MS: u64 = 5 * 60 * 1000;
+const PUBLIC_WS_BACKOFF_MAX_SESSIONS: usize = 256;
+
+/// True on the documented public plan route unless the caller asked for plain HTTP.
+///
+/// The WebSocket is the default there: the confirmation study measured 0.244x the uncached input
+/// and 0.819x the wall time of HTTP, and a failure before output falls back to HTTP anyway.
+/// `sse` and `http` opt out. Values meant for the ChatGPT backend route (`websocket`,
+/// `websocket-cached`) and the unshipped continuation arm never select it.
+pub fn public_websocket_selected(model: &Model, transport: Option<&str>) -> bool {
+    crate::openai_siwc::is_public_plan_model(model)
+        && matches!(transport, None | Some("auto") | Some(PUBLIC_WS_TRANSPORT))
+}
+
+/// The endpoint. Tests may point it at a loopback server; production always uses the constant.
+pub(crate) fn public_ws_url() -> String {
+    #[cfg(test)]
+    if let Some(url) = test_url().lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return url;
+    }
+    PUBLIC_RESPONSES_WS_URL.to_string()
+}
+
+#[cfg(test)]
+fn test_url() -> &'static Mutex<Option<String>> {
+    static URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    URL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn set_public_ws_url_for_tests(url: Option<String>) {
+    *test_url().lock().unwrap_or_else(|e| e.into_inner()) = url;
+}
+
+/// Request-shape facts for one public WebSocket request, kept for the experiment report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicWsRequestShape {
+    pub socket_reused: bool,
+    pub input_items: usize,
+}
+
+/// A failed public WebSocket request. `http_fallback_safe` is true only when nothing from the
+/// response reached the caller, so replaying the request over HTTP cannot duplicate output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicWsFailure {
+    pub message: String,
+    pub http_fallback_safe: bool,
+}
+
+impl PublicWsFailure {
+    fn safe(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            http_fallback_safe: true,
+        }
+    }
+
+    fn unsafe_to_replay(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            http_fallback_safe: false,
+        }
+    }
+}
+
+fn backoff_state() -> &'static Mutex<HashMap<String, Instant>> {
+    static STATE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn backoff_expired(since: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(since).as_millis() as u64 >= PUBLIC_WS_BACKOFF_MS
+}
+
+fn backoff_active_at(session_id: &str, now: Instant) -> bool {
+    let mut state = backoff_state().lock().unwrap_or_else(|e| e.into_inner());
+    match state.get(session_id).copied() {
+        Some(since) if !backoff_expired(since, now) => true,
+        Some(_) => {
+            state.remove(session_id);
+            false
+        }
+        None => false,
+    }
+}
+
+fn note_fallback_at(session_id: &str, now: Instant) {
+    let mut state = backoff_state().lock().unwrap_or_else(|e| e.into_inner());
+    if state.len() >= PUBLIC_WS_BACKOFF_MAX_SESSIONS {
+        state.retain(|_, since| !backoff_expired(*since, now));
+        if state.len() >= PUBLIC_WS_BACKOFF_MAX_SESSIONS {
+            state.clear();
+        }
+    }
+    state.insert(session_id.to_string(), now);
+}
+
+/// True while this conversation is on HTTP after a WebSocket failure.
+pub fn public_ws_in_backoff(session_id: &str) -> bool {
+    backoff_active_at(session_id, Instant::now())
+}
+
+/// Record that a request of this conversation fell back to HTTP.
+pub fn note_public_ws_fallback(session_id: &str) {
+    note_fallback_at(session_id, Instant::now());
+}
+
+fn clear_public_ws_backoff(session_id: Option<&str>) {
+    let mut state = backoff_state().lock().unwrap_or_else(|e| e.into_inner());
+    match session_id {
+        Some(id) => {
+            state.remove(id);
+        }
+        None => state.clear(),
+    }
+}
+
+/// True when a cached socket has nothing waiting to be read and the peer has not closed it.
+/// Between responses a healthy socket is silent, so any readable byte, including EOF or a TLS
+/// close_notify, means it must not carry the next request.
+///
+/// On TLS the bytes can already sit inside rustls: a close_notify that arrived in the same read
+/// as the last frame is consumed there and is invisible to a TCP peek. The TLS state is checked
+/// too. A close that still slips through fails the write or the first read, which the caller
+/// retries once on a fresh socket.
+fn socket_is_quiet_and_open(stream: &mut WsStream) -> bool {
+    let tcp = match &mut stream.inner {
+        WsInner::Plain(inner) => inner,
+        WsInner::Tls(inner) => {
+            match inner.conn.process_new_packets() {
+                Ok(state) if !state.peer_has_closed() && state.plaintext_bytes_to_read() == 0 => {}
+                _ => return false,
+            }
+            &mut inner.sock
+        }
+        #[cfg(test)]
+        WsInner::Memory { .. } => return true,
+    };
+    if tcp.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    let quiet = matches!(
+        tcp.peek(&mut probe),
+        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock
+    );
+    quiet && tcp.set_nonblocking(false).is_ok()
+}
+
+enum Attempted {
+    Finished(Box<CodexWebsocketMessage>, PublicWsRequestShape),
+    /// A reused socket died before any response byte reached the caller; nothing was delivered.
+    DeadReusedSocket(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_public_websocket(
+    url: &str,
+    body: &Value,
+    headers: &[(String, String)],
+    model: &Model,
+    connect_timeout_ms: u64,
+    idle_timeout_ms: Option<u64>,
+    session_id: &str,
+    started: &mut bool,
+    abort: AbortFlag<'_>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<(CodexWebsocketMessage, PublicWsRequestShape), PublicWsFailure> {
+    if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        let mut message = ResponsesDecoder::new(model).finish(&mut Vec::new());
+        crate::stream::abort_message(&mut message);
+        on_event(&AssistantMessageEvent::Error {
+            reason: StopReason::Aborted,
+            error: message.clone(),
+        });
+        return Ok((
+            CodexWebsocketMessage {
+                message,
+                native_responses: None,
+            },
+            PublicWsRequestShape {
+                socket_reused: false,
+                input_items: 0,
+            },
+        ));
+    }
+    if std::env::var_os("PI_CODEX_WS_REPLY").is_some() {
+        return Err(PublicWsFailure::unsafe_to_replay(
+            "the public WebSocket transport never replays fixtures; unset PI_CODEX_WS_REPLY",
+        ));
+    }
+    if !allows_live_websocket(url) {
+        return Err(PublicWsFailure::safe(
+            "WebSocket transport is not available in this runtime",
+        ));
+    }
+    // The create event mirrors the Responses body except transport-only fields.
+    let mut logical = body.clone();
+    if let Value::Object(map) = &mut logical {
+        map.remove("stream");
+        map.remove("background");
+        map.remove("previous_response_id");
+    }
+    let delivered = std::cell::Cell::new(0usize);
+    let mut forward = |event: &AssistantMessageEvent| {
+        delivered.set(delivered.get() + 1);
+        on_event(event);
+    };
+    // At most two attempts: a dead reused socket is retried once. The retry always runs on a
+    // new socket, which cannot be reported as a dead reused one.
+    let mut run = |started: &mut bool| {
+        public_websocket_attempt(
+            url,
+            &logical,
+            headers,
+            model,
+            connect_timeout_ms,
+            idle_timeout_ms,
+            session_id,
+            started,
+            abort,
+            &delivered,
+            &mut forward,
+        )
+    };
+    match run(started)? {
+        Attempted::Finished(message, shape) => return Ok((*message, shape)),
+        Attempted::DeadReusedSocket(error) => crate::trace::log(&format!(
+            "public websocket: reused socket was dead ({error}); retrying once on a new socket"
+        )),
+    }
+    match run(started)? {
+        Attempted::Finished(message, shape) => Ok((*message, shape)),
+        Attempted::DeadReusedSocket(error) => Err(PublicWsFailure::safe(error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn public_websocket_attempt(
+    url: &str,
+    logical: &Value,
+    headers: &[(String, String)],
+    model: &Model,
+    connect_timeout_ms: u64,
+    idle_timeout_ms: Option<u64>,
+    session_id: &str,
+    started: &mut bool,
+    abort: AbortFlag<'_>,
+    delivered: &std::cell::Cell<usize>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<Attempted, PublicWsFailure> {
+    let mut acquired = acquire_live_socket(
+        url,
+        headers,
+        connect_timeout_ms,
+        Some(session_id),
+        PUBLIC_WS_SLOT,
+    )
+    .map_err(PublicWsFailure::safe)?;
+    if acquired.reused && !socket_is_quiet_and_open(&mut acquired.stream) {
+        // The server already closed this idle socket (or has unread frames on it). Replace it
+        // before any request is sent, so the dead connection costs no failed model attempt.
+        release_live_socket(acquired.key, acquired.stream, false);
+        acquired = acquire_live_socket(
+            url,
+            headers,
+            connect_timeout_ms,
+            Some(session_id),
+            PUBLIC_WS_SLOT,
+        )
+        .map_err(PublicWsFailure::safe)?;
+    }
+    let mut stream = acquired.stream;
+    let socket_reused = acquired.reused;
+    let (request_body, _) = build_cached_websocket_request_body(logical, None);
+    let shape = PublicWsRequestShape {
+        socket_reused,
+        input_items: request_body
+            .get("input")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+    };
+    record_websocket_request_stats(Some(session_id), socket_reused, false, &request_body);
+    let idle_timeout_ms = idle_timeout_ms
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS);
+    if let Err(err) = stream.set_read_timeout(Some(Duration::from_millis(idle_timeout_ms))) {
+        release_live_socket(acquired.key, stream, false);
+        return Err(PublicWsFailure::safe(format!("WebSocket timeout: {err}")));
+    }
+    let mut outgoing = request_body.clone();
+    if let Value::Object(map) = &mut outgoing {
+        map.insert("type".into(), Value::String("response.create".into()));
+    }
+    crate::wire_dump::write_current("wire", &outgoing);
+    let observation = crate::provider_observation::Attempt::try_start(PUBLIC_WS_ATTEMPT)
+        .map_err(PublicWsFailure::unsafe_to_replay)?;
+    if let Err(err) = write_text_frame(&mut stream, &outgoing.to_string()) {
+        observation.finish("failed", None, None);
+        release_live_socket(acquired.key, stream, false);
+        // Nothing was delivered. On a reused socket this is a stale connection: retry once.
+        return if socket_reused {
+            Ok(Attempted::DeadReusedSocket(err))
+        } else {
+            Err(PublicWsFailure::safe(err))
+        };
+    }
+    let mut decoder = ResponsesDecoder::new(model);
+    let (events, message, aborted) = match read_codex_events(
+        &mut stream,
+        Some(idle_timeout_ms),
+        started,
+        &mut decoder,
+        abort,
+        on_event,
+    ) {
+        Ok(read) => read,
+        Err(err) => {
+            observation.finish("failed", None, None);
+            release_live_socket(acquired.key, stream, false);
+            let nothing_delivered = delivered.get() == 0 && !*started;
+            return if socket_reused && nothing_delivered {
+                Ok(Attempted::DeadReusedSocket(err))
+            } else if nothing_delivered {
+                Err(PublicWsFailure::safe(err))
+            } else {
+                Err(PublicWsFailure::unsafe_to_replay(err))
+            };
+        }
+    };
+    if aborted || message.stop_reason == Some(StopReason::Error) {
+        let status = if message.stop_reason == Some(StopReason::Aborted) {
+            "aborted"
+        } else {
+            "failed"
+        };
+        observation.finish(status, None, message.usage.clone());
+        // Mid-response or rejected: the socket is unusable.
+        release_live_socket(acquired.key, stream, false);
+        return Ok(Attempted::Finished(
+            Box::new(CodexWebsocketMessage {
+                message,
+                native_responses: None,
+            }),
+            shape,
+        ));
+    }
+    let native_responses = NativeResponsesOutput::from_events(&events);
+    let keep = acquired.key.is_some() && native_responses.is_some();
+    release_live_socket(acquired.key, stream, keep);
+    observation.finish("completed", None, message.usage.clone());
+    Ok(Attempted::Finished(
+        Box::new(CodexWebsocketMessage {
+            message,
+            native_responses,
+        }),
+        shape,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn accept_key_for_tests(key: &str) -> String {
     accept_key(key)
@@ -1244,6 +1618,10 @@ pub(crate) fn write_unmasked_text(stream: &mut impl Write, text: &str) -> std::i
     stream.write_all(&frame)?;
     stream.flush()
 }
+
+#[cfg(test)]
+#[path = "codex_ws_public_tests.rs"]
+mod public_tests;
 
 #[cfg(test)]
 mod tests {
