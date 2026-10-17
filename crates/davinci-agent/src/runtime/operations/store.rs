@@ -21,8 +21,14 @@ use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an in-process caller waits for the journal writer before
-/// `WriterBusy`, and how often it checks.
-const WRITER_WAIT: Duration = Duration::from_secs(2);
+/// `WriterBusy`, and how often it checks. Sized for the worst routine queue,
+/// not the average: up to eight parallel read calls each commit a few
+/// transactions, and on Windows every commit pays a slow fsync while
+/// `thread::sleep(1ms)` really sleeps ~15ms and `try_lock` polling is unfair,
+/// so one waiter can sit behind the whole queue. 2s was exceeded there and
+/// turned parallel reads into tool errors. Still bounded, so a stuck writer
+/// surfaces as `WriterBusy` instead of an unbounded wait.
+const WRITER_WAIT: Duration = Duration::from_secs(30);
 const WRITER_WAIT_STEP: Duration = Duration::from_millis(1);
 const LEASE_DIRECTORY: &str = ".operation-journal-leases";
 const MIGRATION_LEASE_DIRECTORY: &str = "migration";
@@ -954,6 +960,21 @@ mod writer_wait_tests {
                 .recv_timeout(Duration::from_secs(120))
                 .unwrap()
                 .unwrap();
+        });
+    }
+
+    #[test]
+    fn a_write_outlasts_a_queue_longer_than_two_seconds() {
+        // The parallel-read queue on a slow Windows disk held the writer past
+        // the old 2s budget; a write behind it must wait, not fail.
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let guard = journal.state.lock().unwrap();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| journal.write(|_| Ok(())));
+            std::thread::sleep(Duration::from_secs(3));
+            drop(guard);
+            assert!(writer.join().unwrap().is_ok());
         });
     }
 
