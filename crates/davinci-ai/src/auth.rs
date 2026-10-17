@@ -172,6 +172,21 @@ impl AuthStorage {
         )
     }
 
+    /// Store a ChatGPT Codex backend login under `openai-codex` with the route marker.
+    pub fn login_codex_backend(
+        &mut self,
+        access: impl Into<String>,
+        refresh: Option<String>,
+        expires: Option<u64>,
+    ) -> Result<(), AuthStorageError> {
+        let mut credential =
+            Self::oauth_credential("openai-codex", access.into(), refresh, expires);
+        credential.env = crate::codex_backend::credential_env();
+        crate::codex_backend::validate_credential(&credential)
+            .map_err(AuthStorageError::Invalid)?;
+        self.set("openai-codex", credential)
+    }
+
     pub fn login_openai_siwc(
         &mut self,
         session: crate::openai_siwc::OpenAiSiwcSession,
@@ -246,6 +261,25 @@ impl AuthStorage {
         }
 
         let refresh = cred.refresh.clone().unwrap_or_default();
+        if provider == "openai-codex" && crate::codex_backend::is_backend_credential(&cred) {
+            crate::codex_backend::validate_credential(&cred).map_err(AuthStorageError::Invalid)?;
+            if refresh.is_empty() {
+                return Ok(false);
+            }
+            let tokens = crate::oauth_providers::refresh_oauth_token(
+                crate::codex_backend::LOGIN_PROVIDER,
+                &refresh,
+            )
+            .map_err(AuthStorageError::Read)?;
+            let expires = tokens
+                .expires
+                .or_else(|| crate::codex::jwt_expiry_ms(&tokens.access));
+            let mut credential =
+                Self::oauth_credential(provider, tokens.access, tokens.refresh, expires);
+            credential.env = cred.env.clone();
+            self.store_locked(provider, Some(credential))?;
+            return Ok(true);
+        }
         if provider == "openai-codex" {
             crate::openai_siwc::validate_credential(&cred).map_err(AuthStorageError::Invalid)?;
             if refresh.is_empty() {
@@ -466,6 +500,9 @@ pub(crate) fn oauth_credential_usable(provider: &str, credential: &Credential) -
         return false;
     }
     if provider == "openai-codex" {
+        if crate::codex_backend::is_backend_credential(credential) {
+            return crate::codex_backend::validate_credential(credential).is_ok();
+        }
         return crate::openai_siwc::validate_credential(credential).is_ok();
     }
     true
@@ -480,7 +517,11 @@ pub fn stored_credential_problem(provider: &str, storage: &AuthStorage) -> Optio
     let credential = storage.get(provider)?;
     match (provider, &credential.kind) {
         ("openai-codex", CredentialKind::Oauth) => {
-            crate::openai_siwc::validate_credential(credential).err()
+            if crate::codex_backend::is_backend_credential(credential) {
+                crate::codex_backend::validate_credential(credential).err()
+            } else {
+                crate::openai_siwc::validate_credential(credential).err()
+            }
         }
         ("openai-codex", CredentialKind::ApiKey) => {
             Some("an API key cannot use the ChatGPT plan; sign in again with ChatGPT".into())
@@ -549,10 +590,17 @@ pub fn resolve_provider_auth(
                 if let Some(access) = cred.access.clone().or_else(|| cred.key.clone()) {
                     let mut headers = HashMap::new();
                     headers.insert("Authorization".into(), format!("Bearer {access}"));
+                    let source = if provider == "openai-codex"
+                        && crate::codex_backend::is_backend_credential(cred)
+                    {
+                        crate::codex_backend::AUTH_SOURCE
+                    } else {
+                        "OAuth"
+                    };
                     return Some(ResolvedAuth {
                         api_key: Some(access),
                         headers,
-                        source: "OAuth".into(),
+                        source: source.into(),
                     });
                 }
             }
