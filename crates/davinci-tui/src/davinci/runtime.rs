@@ -836,14 +836,19 @@ impl Session {
                 }
             }
             // A link that is gone keeps its address on screen until its
-            // cells are written again without one.
-            for (_, cells) in painted.iter().filter(|old| !linked.contains(old)) {
-                for &(x, y, _) in cells {
-                    if let Some(cell) = frame.buffer_mut().cell((x, y)) {
-                        unlinked.push((x, y, cell.clone()));
-                    }
-                }
-            }
+            // cells are written again without one. The whole row is written,
+            // glyph by glyph from column 0: the old link's columns may now
+            // cut through a wide glyph, and writing its trailing cell would
+            // shift the rest of the row.
+            let mut rows: Vec<u16> = painted
+                .iter()
+                .filter(|old| !linked.contains(old))
+                .flat_map(|(_, cells)| cells.iter().map(|&(_, y, _)| y))
+                .filter(|&y| y < area.height)
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            unlinked.extend(row_cells(frame.buffer_mut(), &rows, area.width));
         })?;
         if !unlinked.is_empty() {
             use ratatui::backend::Backend;
@@ -1315,6 +1320,27 @@ fn pr_link(model: &Model) -> Option<(String, &str)> {
     Some((badge.label(), badge.url.as_str()))
 }
 
+/// Every glyph of `rows`, stepping by each glyph's width from column 0 so a
+/// wide glyph's trailing cell is never written on its own.
+fn row_cells(
+    buffer: &ratatui::buffer::Buffer,
+    rows: &[u16],
+    width: u16,
+) -> Vec<(u16, u16, ratatui::buffer::Cell)> {
+    let mut out = Vec::new();
+    for &y in rows {
+        let mut x = 0;
+        while x < width {
+            let Some(cell) = buffer.cell((x, y)) else {
+                break;
+            };
+            out.push((x, y, cell.clone()));
+            x += unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1) as u16;
+        }
+    }
+    out
+}
+
 /// The links in one rendered row; `exists` says which named paths are real.
 fn row_links(
     text: &str,
@@ -1347,7 +1373,9 @@ fn row_links(
 /// or a disconnected drive, which a frame cannot afford.
 struct PathProbe {
     shared: std::sync::Arc<std::sync::Mutex<ProbeState>>,
-    ask: std::sync::mpsc::Sender<std::path::PathBuf>,
+    /// `None` when the worker could not start: then the caller asks the
+    /// disk itself, slower but never silently linkless.
+    ask: Option<std::sync::mpsc::Sender<std::path::PathBuf>>,
 }
 
 #[derive(Default)]
@@ -1369,7 +1397,7 @@ impl PathProbe {
         let (ask, asked) = std::sync::mpsc::channel::<std::path::PathBuf>();
         let worker = shared.clone();
         // Ends when the session, and with it the sender, is dropped.
-        let _ = std::thread::Builder::new()
+        let started = std::thread::Builder::new()
             .name("davinci-path-probe".into())
             .spawn(move || {
                 for path in asked {
@@ -1379,22 +1407,34 @@ impl PathProbe {
                     state.known.insert(path, (Instant::now(), found));
                 }
             });
-        Self { shared, ask }
+        Self {
+            shared,
+            ask: started.is_ok().then_some(ask),
+        }
     }
 
     /// The last answer for `path`, asking again when there is none or it
     /// is stale. Never blocks on the disk.
     fn exists(&self, path: &std::path::Path) -> bool {
+        let Some(ask) = &self.ask else {
+            return path.exists();
+        };
         let mut state = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         if state.known.len() > 4096 {
-            state.known.clear();
+            // Only stale answers go, so the links on screen do not blink.
+            state
+                .known
+                .retain(|_, (asked, _)| asked.elapsed() < PATH_TTL);
+            if state.known.len() > 4096 {
+                state.known.clear();
+            }
         }
         let (answer, stale) = match state.known.get(path) {
             Some((asked, found)) => (*found, asked.elapsed() >= PATH_TTL),
             None => (false, true),
         };
         if stale && state.asking.insert(path.to_path_buf()) {
-            let _ = self.ask.send(path.to_path_buf());
+            let _ = ask.send(path.to_path_buf());
         }
         answer
     }
@@ -1694,6 +1734,26 @@ mod tests {
             1,
             "one question per path, not per frame"
         );
+    }
+
+    #[test]
+    fn a_row_is_rewritten_glyph_by_glyph_never_through_a_wide_one() {
+        use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        buffer.set_string(0, 1, "a中b", Style::default());
+        let cells = super::row_cells(&buffer, &[1], 8);
+        let columns: Vec<u16> = cells.iter().map(|(x, _, _)| *x).collect();
+        // 中 owns columns 1 and 2; column 2 alone is never written.
+        assert_eq!(columns, [0, 1, 3, 4, 5, 6, 7]);
+        assert_eq!(cells[1].2.symbol(), "中");
+        assert!(cells.iter().all(|(_, y, _)| *y == 1));
+    }
+
+    #[test]
+    fn a_probe_without_its_worker_still_finds_paths() {
+        let mut probe = super::PathProbe::with(|_| false);
+        probe.ask = None;
+        assert!(probe.exists(std::path::Path::new("Cargo.toml")));
     }
 
     #[test]

@@ -126,9 +126,6 @@ const ACTIVE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 /// once; an edit inside a plugin's own files shows within the TTL.
 pub fn active(agent_dir: &Path) -> ActivePlugins {
     use std::hash::{Hash, Hasher};
-    type Stamp = (PathBuf, Option<u64>, Option<String>);
-    static LAST: OnceLock<Mutex<Option<(Stamp, std::time::Instant, ActivePlugins)>>> =
-        OnceLock::new();
     // The registry's bytes, not its mtime: a rewrite inside one mtime tick
     // must still count as a change.
     let installed = std::fs::read(store::plugins_dir(agent_dir).join("installed.json"))
@@ -143,7 +140,7 @@ pub fn active(agent_dir: &Path) -> ActivePlugins {
         installed,
         std::env::var("DAVINCI_PLUGINS").ok(),
     );
-    let last = LAST.get_or_init(|| Mutex::new(None));
+    let last = last_active();
     if let Some((seen, at, plugins)) = last.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if *seen == stamp && at.elapsed() < ACTIVE_TTL {
             return plugins.clone();
@@ -153,6 +150,20 @@ pub fn active(agent_dir: &Path) -> ActivePlugins {
     *last.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((stamp, std::time::Instant::now(), plugins.clone()));
     plugins
+}
+
+type Stamp = (PathBuf, Option<u64>, Option<String>);
+
+fn last_active() -> &'static Mutex<Option<(Stamp, std::time::Instant, ActivePlugins)>> {
+    static LAST: OnceLock<Mutex<Option<(Stamp, std::time::Instant, ActivePlugins)>>> =
+        OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
+
+/// Forget the shared read, so the next [`active`] parses the plugins again:
+/// `/reload` promises a plugin edited in place is loaded.
+pub fn reload_active() {
+    *last_active().lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn read_active(agent_dir: &Path) -> ActivePlugins {
@@ -659,6 +670,48 @@ mod tests {
         pub(super) static APPROVAL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(super) static REGISTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(super) static DIGEST_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn commands_of(agent_dir: &Path) -> usize {
+        active(agent_dir)
+            .plugins
+            .iter()
+            .map(|active| active.plugin.command_files.len())
+            .sum()
+    }
+
+    #[test]
+    fn a_registry_change_is_read_at_once_and_reload_reads_edited_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("cmds");
+        write(&root.join("plugin.json"), r#"{"name":"cmds"}"#);
+        write(&root.join("commands/one.md"), "# one");
+        install_fixture(&agent_dir, &root, false);
+        assert_eq!(commands_of(&agent_dir), 1);
+        // Disabling rewrites installed.json: no waiting out the shared read.
+        store::update(&agent_dir, |file| {
+            file.plugins
+                .values_mut()
+                .for_each(|record| record.enabled = false);
+            Ok(())
+        })
+        .unwrap();
+        assert!(active(&agent_dir).plugins.is_empty());
+        store::update(&agent_dir, |file| {
+            file.plugins
+                .values_mut()
+                .for_each(|record| record.enabled = true);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(commands_of(&agent_dir), 1);
+        // An edit inside the plugin leaves the registry alone; /reload
+        // promises it is loaded.
+        write(&root.join("commands/two.md"), "# two");
+        reload_active();
+        assert_eq!(commands_of(&agent_dir), 2);
     }
 
     fn selection_fixture(agent_dir: &Path, root: &Path, name: &str) {

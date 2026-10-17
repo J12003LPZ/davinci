@@ -4193,6 +4193,7 @@ pub fn perform(
             }
         }
         SlashAction::Reload => {
+            davinci_coding_agent::plugins::reload_active();
             let keybindings_started = Instant::now();
             model.keybindings = davinci_tui::Keybindings::load(&agent_dir);
             let keybindings_ms = keybindings_started.elapsed().as_millis();
