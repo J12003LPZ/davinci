@@ -806,6 +806,47 @@ impl Session {
     /// A click on an option of the open question focuses it, and chooses it
     /// as enter would — except a tool approval, which a stray click must
     /// never grant: that only moves the focus.
+    /// A click on a row of the sessions or model picker chooses it. The row is
+    /// found by the name drawn on it, so a name the panel had to cut leaves
+    /// the click to do nothing rather than choose the wrong one.
+    fn click_overlay_row(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use super::model::Overlay;
+        use event::{MouseButton::Left, MouseEventKind};
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse.modifiers.is_empty()
+            || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
+        {
+            return false;
+        }
+        let Some(row) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        match model.overlay {
+            Some(Overlay::Sessions) => {
+                let Some(index) = label_at(model.sessions.iter().map(|s| s.name.as_str()), row)
+                else {
+                    return false;
+                };
+                model.session_index = index;
+            }
+            Some(Overlay::Cogitator) => {
+                let Some(index) = label_at(model.models.iter().map(|m| m.name.as_str()), row)
+                else {
+                    return false;
+                };
+                model.model_index = index;
+            }
+            _ => return false,
+        }
+        model.overlay_offset = None;
+        model.dirty = true;
+        self.injected.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        true
+    }
+
     fn click_ask_option(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
         use super::model::Overlay;
         use event::{MouseButton::Left, MouseEventKind};
@@ -920,7 +961,10 @@ impl Session {
         if !env_flag("DAVINCI_DISABLE_HYPERLINKS") && self.open_link_at(model, mouse) {
             return false;
         }
-        if self.click_ask_option(model, mouse) || self.click_list_row(model, mouse) {
+        if self.click_ask_option(model, mouse)
+            || self.click_overlay_row(model, mouse)
+            || self.click_list_row(model, mouse)
+        {
             self.selector.clear();
             return false;
         }
@@ -1266,11 +1310,15 @@ fn settings_row_at(model: &Model, row: &str) -> Option<usize> {
 /// The option of an open question that a drawn row shows: the longest label
 /// found on it, so "Yes" does not win over "Yes, and don't ask again".
 fn ask_option_at(items: &[super::model::PickerItem], row: &str) -> Option<usize> {
-    items
-        .iter()
+    label_at(items.iter().map(|item| item.label.as_str()), row)
+}
+
+/// The index of the longest non-empty label found on a drawn row.
+fn label_at<'a>(labels: impl Iterator<Item = &'a str>, row: &str) -> Option<usize> {
+    labels
         .enumerate()
-        .filter(|(_, item)| !item.label.trim().is_empty() && row.contains(item.label.trim()))
-        .max_by_key(|(_, item)| item.label.trim().len())
+        .filter(|(_, label)| !label.trim().is_empty() && row.contains(label.trim()))
+        .max_by_key(|(_, label)| label.trim().len())
         .map(|(index, _)| index)
 }
 
@@ -1472,6 +1520,18 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_picker_row_is_found_by_its_longest_name_and_a_cut_name_finds_nothing() {
+        let names = ["gpt", "gpt-5 mini", "claude", ""];
+        assert_eq!(
+            label_at(names.into_iter(), "  > gpt-5 mini   128k"),
+            Some(1)
+        );
+        assert_eq!(label_at(names.into_iter(), "  gpt   64k"), Some(0));
+        assert_eq!(label_at(names.into_iter(), "  gp… 64k"), None);
+        assert_eq!(label_at(names.into_iter(), ""), None);
+    }
+
     #[test]
     fn a_wheel_flick_speeds_up_and_a_pause_or_turn_starts_over() {
         let t0 = Instant::now();
