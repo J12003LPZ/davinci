@@ -28,7 +28,7 @@ repository = "https://github.com/J12003LPZ/davinci"
 rust-version = "1.88"
 
 [workspace.dependencies]
-base64 = "=0.22.1"
+base64 = "=0.23.1"
 crossterm = "=0.29.0"
 ratatui = { version = "=0.30.0", default-features = false, features = ["crossterm", "underline-color"] }
 pulldown-cmark = { version = "=0.13.4", default-features = false }
