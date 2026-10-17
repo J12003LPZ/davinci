@@ -9,7 +9,8 @@ pub(crate) fn mandatory_facts(result: &ToolResult) -> Option<Value> {
     let outcome = result.details.as_ref()?.get("codemode")?;
     let children = outcome.get("children")?.as_array()?.iter().take(64).map(|child| {
         json!({"requestId":child.get("requestId"),"ordinal":child.get("ordinal"),
-            "tool":child.get("tool"),"operationRef":child.get("operationRef"),"status":child.get("status")})
+            "tool":child.get("tool"),"operationRef":child.get("operationRef"),"status":child.get("status"),
+            "incomplete":child.get("incomplete").cloned().unwrap_or(json!(false))})
     }).collect::<Vec<_>>();
     Some(
         json!({"status":outcome.get("status"),"scriptCompleted":outcome.get("scriptCompleted"),
@@ -224,6 +225,18 @@ impl Agent {
                 }
             }
             outcome.operation_ref = parent.to_string();
+            let incomplete = outcome
+                .children
+                .iter()
+                .filter(|child| child.incomplete)
+                .count();
+            if incomplete > 0 {
+                // Not a failure: a script may page, or not need the rest. But
+                // a clean `completed` must not hide that the data was cut.
+                outcome.host_notes.push(format!(
+                    "{incomplete} child result(s) reached the script truncated or without image content (complete: false); the output may rest on partial data."
+                ));
+            }
             if outcome
                 .children
                 .iter()

@@ -1227,6 +1227,123 @@ fn read_only_broker_allows_bounded_parallel_children() {
 }
 
 #[test]
+fn truncated_child_result_is_recorded_as_incomplete_not_plain_success() {
+    use crate::codemode::*;
+    let (agent, workspace, _) = configured_agent();
+    let lines: String = (0..20_000)
+        .map(|n| {
+            format!(
+                "line {n}
+"
+            )
+        })
+        .collect();
+    std::fs::write(workspace.path().join("big.txt"), lines).unwrap();
+    let broker = AgentCodeModeBroker::new(agent.clone(), broker_context(&agent), None).unwrap();
+    let call = |request_id, path: &str| CodeModeCall {
+        request_id,
+        tool: "read".into(),
+        args: json!({"path":path}),
+    };
+    let whole = broker.call(call(1, "input.txt")).unwrap();
+    assert!(whole.complete);
+    let cut = broker.call(call(2, "big.txt")).unwrap();
+    assert!(!cut.complete, "fixture must produce a truncated read");
+    let children = broker.children();
+    assert!(matches!(children[1].status, CodeModeChildStatus::Succeeded));
+    assert!(!children[0].incomplete);
+    assert!(children[1].incomplete);
+    let wire = serde_json::to_value(&children).unwrap();
+    assert!(
+        wire[0].get("incomplete").is_none(),
+        "false stays off the wire"
+    );
+    assert_eq!(wire[1]["incomplete"], json!(true));
+}
+
+struct TruncatedReadHost;
+impl crate::codemode::CodeModeHost for TruncatedReadHost {
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        _: &crate::codemode::CodeModeRunContext,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        let read = |request_id, path: &str| {
+            broker
+                .call(CodeModeCall {
+                    request_id,
+                    tool: "read".into(),
+                    args: json!({"path":path}),
+                })
+                .unwrap()
+        };
+        assert!(read(1, "input.txt").complete);
+        assert!(!read(2, "big.txt").complete);
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: "summary".into(),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "forged".into(),
+            error: None,
+        }
+    }
+}
+
+#[test]
+fn parent_outcome_flags_truncated_children_and_survives_hook_rewrites() {
+    let (mut agent, workspace, _) = configured_agent();
+    let lines: String = (0..20_000).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(workspace.path().join("big.txt"), lines).unwrap();
+    agent
+        .enable_read_only_codemode(Arc::new(TruncatedReadHost))
+        .unwrap();
+    let message = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "incomplete-parent".into(),
+                "codemode".into(),
+                json!({"code":"return 1"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    let text = match &message.content[0] {
+        davinci_ai::MessageContent::Text { text } => text.clone(),
+        other => panic!("unexpected content {other:?}"),
+    };
+    let outcome: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let outcome = &outcome;
+    assert_eq!(outcome["status"], "completed", "{outcome}");
+    let children = outcome["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert!(children[0].get("incomplete").is_none());
+    assert_eq!(children[1]["incomplete"], true);
+    let notes = outcome["hostNotes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.as_str().unwrap().starts_with("1 child result(s)")),
+        "{notes:?}"
+    );
+    // A safety hook that rewrites the content keeps the flag as a mandatory fact.
+    let facts = crate::codemode::mandatory_facts(&crate::ToolResult {
+        content: "redacted".into(),
+        is_error: false,
+        details: Some(json!({ "codemode": outcome })),
+    })
+    .unwrap();
+    assert_eq!(facts["children"][0]["incomplete"], false);
+    assert_eq!(facts["children"][1]["incomplete"], true);
+}
+
+#[test]
 fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     use crate::codemode::*;
     let (agent, workspace, journal) = configured_agent();
