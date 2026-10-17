@@ -1250,6 +1250,7 @@ fn enabled_codemode_tells_the_model_when_to_use_it_and_disabled_says_nothing() {
         "tools.read(",
         "Not for a single lookup",
         "no undefined fields",
+        "parse `.text`",
         "Output past 16 KB",
     ] {
         assert!(spec.description.contains(needle), "{}", spec.description);
