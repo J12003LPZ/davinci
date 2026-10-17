@@ -92,12 +92,9 @@ impl HistoryStore {
 
     fn try_append(&self, text: &str) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
+            create_private_dir(dir)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = private_file(OpenOptions::new().create(true).append(true), &self.path)?;
         writeln!(file, "{}", serde_json::json!({ "text": text }))?;
         if file.metadata()?.len() > MAX_BYTES {
             self.trim()?;
@@ -120,8 +117,48 @@ impl HistoryStore {
             .map(|text| format!("{}\n", serde_json::json!({ "text": text })))
             .collect();
         let tmp = self.path.with_extension("jsonl.tmp");
-        fs::write(&tmp, body)?;
+        let mut file = private_file(
+            OpenOptions::new().write(true).create(true).truncate(true),
+            &tmp,
+        )?;
+        file.write_all(body.as_bytes())?;
+        drop(file);
         fs::rename(tmp, &self.path)
+    }
+}
+
+/// Prompt history can hold pasted secrets, so on unix it is owner-only like
+/// the other files under the agent directory: 0700 directories, 0600 files.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+/// Opens with mode 0600 on unix, and tightens a file an earlier version left
+/// readable by others (the mode only applies when the file is created).
+fn private_file(options: &mut OpenOptions, path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = options.mode(0o600).open(path)?;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
     }
 }
 
@@ -187,5 +224,27 @@ mod tests {
         }
         assert!(fs::metadata(&store.path).unwrap().len() <= MAX_BYTES + 16 * 1024);
         assert!(store.load()[0].starts_with("99 "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_is_owner_only_and_an_old_readable_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let (_dir, store) = store();
+        store.append("my token is hunter2");
+        assert_eq!(mode(store.path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&store.path), 0o600);
+
+        // A file an earlier version created with the default umask.
+        fs::set_permissions(&store.path, fs::Permissions::from_mode(0o644)).unwrap();
+        store.append("next");
+        assert_eq!(mode(&store.path), 0o600);
+
+        // The rewrite in trim() keeps the mode.
+        for i in 0..200 {
+            store.append(&format!("{i} {}", "x".repeat(4000)));
+        }
+        assert_eq!(mode(&store.path), 0o600);
     }
 }
