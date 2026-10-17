@@ -1123,6 +1123,13 @@ pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>)
         .collect();
     let heights: Vec<usize> = items.iter().map(Vec::len).collect();
     let selected = model.suggestion_index.min(items.len() - 1);
+    // Only a slash command name being typed is marked; paths and arguments
+    // are not.
+    let needle = if found.prefix.starts_with('/') && !model.composer.contains(' ') {
+        found.prefix.trim_start_matches('/').to_owned()
+    } else {
+        String::new()
+    };
     let (start, end) = visible_items(&heights, selected, 5);
     let mut out = Vec::new();
     let mut owners = Vec::new();
@@ -1132,10 +1139,14 @@ pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>)
         } else {
             cc.inactive
         };
+        // The typed command name is picked out wherever it occurs, in the
+        // name, its alias and the description alike: bold in the row's own
+        // color when selected, bold white otherwise.
+        let hit = if index == selected { cc.permission } else { cc.text };
         for (left, description) in rows {
-            let mut spans = vec![span(left.clone(), color)];
+            let mut spans = marked_spans(left, &needle, color, hit, &model.theme);
             if !description.is_empty() {
-                spans.push(span(description.clone(), color));
+                spans.extend(marked_spans(description, &needle, color, hit, &model.theme));
             }
             out.push(Line::from(crate::davinci::ui::truncate_run(
                 spans,
@@ -1276,6 +1287,41 @@ pub fn history_search_rows(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
         owners.push(index);
     }
     (rows, owners)
+}
+
+/// `text` in `base`, with every case-insensitive occurrence of `needle`
+/// bold in `hit`. An empty needle leaves one plain span.
+fn marked_spans(
+    text: &str,
+    needle: &str,
+    base: Color,
+    hit: Color,
+    theme: &crate::davinci::theme::Theme,
+) -> Vec<Span<'static>> {
+    if needle.is_empty() {
+        return vec![span(text.to_owned(), base)];
+    }
+    // ASCII lowering keeps byte offsets, so the cuts stay on char boundaries.
+    let haystack = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(found) = haystack[from..].find(&needle) {
+        let at = from + found;
+        let end = at + needle.len();
+        if !text.is_char_boundary(at) || !text.is_char_boundary(end) {
+            break;
+        }
+        if at > from {
+            spans.push(span(text[from..at].to_owned(), base));
+        }
+        spans.push(span_strong(text[at..end].to_owned(), hit, theme));
+        from = end;
+    }
+    if from < text.len() {
+        spans.push(span(text[from..].to_owned(), base));
+    }
+    spans
 }
 
 fn suggestion_label(prefix: &str, model: &Model, label: &str) -> String {
@@ -1499,6 +1545,26 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn the_typed_command_name_is_bold_wherever_it_occurs() {
+        let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
+        let (base, hit) = (Color::Gray, Color::Blue);
+        let spans = marked_spans("/resume (Continue) con", "con", base, hit, &theme);
+        let bold: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(hit))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bold, ["Con", "con"]);
+        assert!(spans
+            .iter()
+            .filter(|s| s.style.fg == Some(hit))
+            .all(|s| s.style.add_modifier.contains(theme.emphasis)));
+        let whole: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(whole, "/resume (Continue) con");
+        assert_eq!(marked_spans("é/con", "", base, hit, &theme).len(), 1);
     }
 
     #[test]

@@ -4853,7 +4853,6 @@ pub fn run(
     // Images pasted with ctrl+v, sent with the next prompt so a vision model
     // is reachable from this interface.
     let mut attached_images: Vec<davinci_ai::MessageContent> = Vec::new();
-    let mut image_status: Option<String> = None;
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
     if let Some(hint) = terminal_hint(
@@ -5180,15 +5179,6 @@ pub fn run(
             refresh_context_meter(agent, &mut model, false);
         }
         sync_plan_usage(agent, &mut model);
-        // The attachment line follows the chips left in the draft.
-        if !attached_images.is_empty() || image_status.is_some() {
-            let line = attachments::status(&model.composer.to_string(), &attached_images);
-            if line != image_status {
-                model.extensions.set_status("§images", line.as_deref());
-                image_status = line;
-                model.dirty = true;
-            }
-        }
         // A reply still being written after its turn ended finishes at the
         // typewriter's own pace, not the 250ms clock's.
         model.advance_reveal();
@@ -9291,7 +9281,6 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
     // own send.
     if !attachments::any_chip(&shell.model.composer.to_string(), shell.images) {
         shell.images.clear();
-        shell.model.extensions.set_status("§images", None);
     }
     let images = images.as_slice();
     // Extensions with an input handler get the line before the model does.

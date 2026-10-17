@@ -39,18 +39,6 @@ pub(super) fn spaced_chip(chip: &str, before_cursor: Option<char>) -> String {
     }
 }
 
-/// The status line under the composer while images wait for the next
-/// prompt, or `None` when no chip is left in the draft.
-pub(super) fn status(text: &str, images: &[MessageContent]) -> Option<String> {
-    let count = retained(text, images).len();
-    (count > 0).then(|| {
-        format!(
-            "{count} image{} attached · sent with the next prompt · delete [Image #N] to drop one",
-            if count == 1 { "" } else { "s" }
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,19 +80,5 @@ mod tests {
         assert!(any_chip("look [Image #1]", &images));
         assert!(!any_chip("look [Image #2]", &images));
         assert!(!any_chip("[Image #1]", &[]));
-    }
-
-    #[test]
-    fn the_status_counts_live_chips_and_disappears_with_them() {
-        let images = [image("a"), image("b")];
-        assert_eq!(
-            status("[Image #1] [Image #2] why?", &images).as_deref(),
-            Some("2 images attached · sent with the next prompt · delete [Image #N] to drop one")
-        );
-        assert!(status("[Image #2]", &images)
-            .unwrap()
-            .starts_with("1 image attached"));
-        assert_eq!(status("cleared", &images), None);
-        assert_eq!(status("[Image #1]", &[]), None);
     }
 }
