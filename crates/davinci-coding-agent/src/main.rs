@@ -338,7 +338,18 @@ fn main() {
 /// `DAVINCI_STARTUP_TRACE`, so a slow start can be split into stages without a
 /// profiler. Off, it costs one environment lookup per stage.
 pub(crate) fn startup_mark(stage: &str) {
-    davinci_coding_agent::startup_trace::mark(stage);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    let Some(path) = std::env::var_os("DAVINCI_STARTUP_TRACE") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{:>7} ms  {stage}", start.elapsed().as_millis());
+    }
 }
 
 fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), String> {
@@ -8758,12 +8769,6 @@ fn store_oauth_tokens(
 /// OAuth subset. Shared by the legacy chrome and the davinci shell so both
 /// offer the same list.
 fn interactive_login_providers(parsed: &Args) -> Vec<String> {
-    interactive_login_providers_from(&loaded_extension_host(parsed))
-}
-
-/// [`interactive_login_providers`] from a host already loaded with the same
-/// extensions, so a caller holding one does not build another.
-fn interactive_login_providers_from(host: &ExtensionHost) -> Vec<String> {
     let mut ids: Vec<String> = PROVIDER_SPECS
         .iter()
         .map(|spec| spec.id.to_string())
@@ -8771,7 +8776,7 @@ fn interactive_login_providers_from(host: &ExtensionHost) -> Vec<String> {
         .chain(std::iter::once(
             davinci_ai::codex_backend::LOGIN_PROVIDER.to_string(),
         ))
-        .chain(host.js_oauth_provider_names())
+        .chain(loaded_extension_host(parsed).js_oauth_provider_names())
         .collect();
     ids.sort();
     ids.dedup();
@@ -8779,13 +8784,7 @@ fn interactive_login_providers_from(host: &ExtensionHost) -> Vec<String> {
 }
 
 fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandSpec> {
-    interactive_slash_commands_from(agent, &loaded_extension_host(parsed))
-}
-
-/// [`interactive_slash_commands`] from a host already loaded with the same
-/// extensions. Loading one builds the whole native host (~300ms), so the
-/// shell's first frame reuses its own.
-fn interactive_slash_commands_from(agent: &Agent, host: &ExtensionHost) -> Vec<SlashCommandSpec> {
+    let host = loaded_extension_host(parsed);
     let mut commands: Vec<SlashCommandSpec> = slash::builtin_slash_commands()
         .into_iter()
         .map(|command| SlashCommandSpec {
@@ -8889,13 +8888,8 @@ fn append_native_invocable_commands(commands: &mut Vec<serde_json::Value>) {
 }
 
 fn interactive_extra_autocomplete(parsed: &Args) -> Vec<ExtraAutocompleteProvider> {
-    interactive_extra_autocomplete_from(&loaded_extension_host(parsed))
-}
-
-/// [`interactive_extra_autocomplete`] from a host already loaded with the
-/// same extensions.
-fn interactive_extra_autocomplete_from(host: &ExtensionHost) -> Vec<ExtraAutocompleteProvider> {
-    host.js
+    loaded_extension_host(parsed)
+        .js
         .iter()
         .flat_map(|ext| {
             ext.autocomplete_providers
