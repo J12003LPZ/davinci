@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-agent"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "base64 0.23.1",
  "davinci-ai",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-ai"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "base64 0.23.1",
  "davinci-ai",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-client"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "davinci-protocol",
  "serde",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-coding-agent"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "arboard",
  "base64 0.23.1",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-evals"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "clap",
  "davinci-agent",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-mcp"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "davinci-mcp",
  "davinci-sys",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-protocol"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-server"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "davinci-agent",
  "davinci-ai",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-session"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "davinci-protocol",
  "davinci-sys",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-session-sqlite"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "davinci-session",
  "davinci-sys",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-sys"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "libc",
  "tempfile",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-telemetry"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-tui"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "base64 0.23.1",
  "crossterm",
