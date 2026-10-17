@@ -668,6 +668,21 @@ impl Turn {
             Instant::now(),
             args.clone(),
         ));
+        let background = args
+            .get("background")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if matches!(tool_name, "bash" | "powershell") && !background {
+            if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+                model
+                    .shell_runs
+                    .push(davinci_tui::davinci::model::ShellRun {
+                        index,
+                        started: Instant::now(),
+                        command: command.to_string(),
+                    });
+            }
+        }
         if tool_name == "todo" {
             if let Ok(list) = davinci_agent::TodoList::from_args(args) {
                 self.take_ledger(model, &list);
@@ -715,6 +730,7 @@ impl Turn {
             return;
         };
         let (_, index, started, args) = self.open.remove(position);
+        model.shell_runs.retain(|run| run.index != index);
         let outcome = (!is_error)
             .then(|| summary_of(tool_name, &args, result))
             .flatten();
@@ -1924,6 +1940,7 @@ fn run_turn(
     ) {
         model.transcript.push(entry);
     }
+    model.shell_runs.clear();
     if !interrupted {
         if let Some(working) = finished_working {
             model.transcript.push(Entry::Gap);
@@ -5333,7 +5350,8 @@ pub fn run(
                                     "image/png",
                                 ) {
                                     Some(resized)
-                                        if resized.was_resized && resized.mime_type == "image/png" =>
+                                        if resized.was_resized
+                                            && resized.mime_type == "image/png" =>
                                     {
                                         resized.bytes
                                     }

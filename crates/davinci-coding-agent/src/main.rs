@@ -7747,7 +7747,8 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Autocompact(arg) => {
-            let text = davinci_interactive::run_autocompact(agent, &arg).unwrap_or_else(|note| note);
+            let text =
+                davinci_interactive::run_autocompact(agent, &arg).unwrap_or_else(|note| note);
             session.chrome.transcript.push("autocompact", &text);
             session.chrome.status = "autocompact".into();
             println!("{text}");

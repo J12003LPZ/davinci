@@ -705,7 +705,13 @@ pub fn composer_with_caret(
         })
         .or_else(|| screen_placeholder(model.screen).map(str::to_string))
         .or_else(|| {
-            (model.screen == Screen::Agent && lines.is_none()).then(|| {
+            // The suggestion belongs to a fresh conversation: once a message
+            // has been sent, the composer waits empty, as in Claude Code.
+            let fresh = !model
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, super::super::model::Entry::User(_)));
+            (model.screen == Screen::Agent && lines.is_none() && fresh).then(|| {
                 format!(
                     "Try \"{}\"",
                     PLACEHOLDERS[model.placeholder % PLACEHOLDERS.len()]
@@ -2244,8 +2250,22 @@ mod tests {
     }
 
     #[test]
+    fn the_suggestion_is_for_a_fresh_conversation_and_goes_once_a_message_is_sent() {
+        let mut m = model(100);
+        m.transcript.clear();
+        let drawn = |m: &Model| text(&composer(m, None, Hint::Default).remove(2));
+        assert!(drawn(&m).contains("Try \""));
+        m.transcript
+            .push(crate::davinci::model::Entry::user("hello"));
+        let after = drawn(&m);
+        assert!(!after.contains("Try \""), "{after}");
+        assert!(after.starts_with('❯'), "{after}");
+    }
+
+    #[test]
     fn the_caret_of_an_empty_composer_sits_before_the_placeholder_not_after_it() {
-        let m = model(100);
+        let mut m = model(100);
+        m.transcript.clear();
         let line = composer(&m, None, Hint::Default).remove(2);
         let drawn = text(&line);
         assert!(drawn.contains("Try \""), "placeholder is shown: {drawn}");

@@ -13,8 +13,8 @@ use crate::davinci::model::{
 };
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, detail_line, failure_line, indent, mix, run_width, span, tool_line,
-    truncate_run, wrap, MEASURE,
+    blank, clip_ellipsis, detail_line, failure_line, indent, mix, run_width, span, span_strong,
+    tool_line, truncate_run, wrap, MEASURE,
 };
 
 /// How many rows of live reasoning are shown while it streams.
@@ -349,16 +349,17 @@ fn rendered_blocks(
             while cursor < entries.len() {
                 match &entries[cursor] {
                     Entry::Gap if !calls.is_empty() => {
-                        let next_groupable = matches!(
-                            entries.get(cursor + 1),
-                            Some(Entry::Tool {
-                                state,
-                                instrument,
-                                target,
-                                ..
-                            }) if !matches!(state, State::Failed | State::Attention)
-                                && explore_kind(instrument, target).is_some()
-                        );
+                        let next_groupable = !live_shell(model, base, cursor + 1)
+                            && matches!(
+                                entries.get(cursor + 1),
+                                Some(Entry::Tool {
+                                    state,
+                                    instrument,
+                                    target,
+                                    ..
+                                }) if !matches!(state, State::Failed | State::Attention)
+                                    && explore_kind(instrument, target).is_some()
+                            );
                         if !next_groupable {
                             break;
                         }
@@ -371,7 +372,9 @@ fn rendered_blocks(
                         target,
                         duration,
                         ..
-                    } if !matches!(state, State::Failed | State::Attention) => {
+                    } if !matches!(state, State::Failed | State::Attention)
+                        && !live_shell(model, base, cursor) =>
+                    {
                         if let Some(kind) = explore_kind(instrument, target) {
                             calls.push((kind, target.as_str(), duration.is_some()));
                             cursor += 1;
@@ -393,6 +396,13 @@ fn rendered_blocks(
         // reached. Reveal indices are transcript positions, so only the
         // model's own transcript is cut.
         let at = base.map(|base| base + index);
+        if let (Entry::Tool { duration: None, .. }, Some(at)) = (&entries[index], at) {
+            if let Some(rows) = shell_running_lines(model, at, width) {
+                out.push(rows);
+                index += 1;
+                continue;
+            }
+        }
         match (&entries[index], at.and_then(|at| model.revealed(at))) {
             (Entry::Prose(text), Some(shown)) => {
                 let at = at.unwrap_or_default();
@@ -403,6 +413,102 @@ fn rendered_blocks(
         index += 1;
     }
     out
+}
+
+/// Command lines a running shell call shows before it says how many more.
+const SHELL_COMMAND_ROWS: usize = 4;
+
+/// Whether the transcript row `at` (an offset into the entries being drawn)
+/// is a shell call still running, which draws its own block.
+fn live_shell(model: &Model, base: Option<usize>, at: usize) -> bool {
+    model.running
+        && base.is_some_and(|base| model.shell_runs.iter().any(|run| run.index == base + at))
+}
+
+/// The command under its elbow, wrapped to the window and cut to
+/// [`SHELL_COMMAND_ROWS`] rows. A cut ends in `…` and says how many lines the
+/// command has, so a pasted script never takes over the screen.
+fn command_rows(command: &str, width: u16, ink: Color, quiet: Color) -> Vec<Line<'static>> {
+    let lead = u16::try_from(ELBOW.chars().count()).unwrap_or(5);
+    let room = width.saturating_sub(lead).max(1);
+    let mut wrapped: Vec<String> = Vec::new();
+    for (n, line) in command.lines().enumerate() {
+        let text = if n == 0 {
+            format!("$ {line}")
+        } else {
+            line.to_string()
+        };
+        wrapped.extend(wrap(&text, room));
+    }
+    if wrapped.is_empty() {
+        wrapped.push("$".to_string());
+    }
+    let total_lines = command.lines().count();
+    let cut = wrapped.len() > SHELL_COMMAND_ROWS;
+    wrapped.truncate(SHELL_COMMAND_ROWS);
+    let last = wrapped.len().saturating_sub(1);
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(n, text)| {
+            let mut spans = vec![span(
+                if n == 0 {
+                    ELBOW.to_string()
+                } else {
+                    " ".repeat(usize::from(lead))
+                },
+                quiet,
+            )];
+            if cut && n == last {
+                let tail = if total_lines > 1 {
+                    format!(" ({total_lines} lines)")
+                } else {
+                    String::new()
+                };
+                let keep = room.saturating_sub(u16::try_from(tail.chars().count()).unwrap_or(0));
+                spans.push(span(clip_ellipsis(&format!("{text}…"), keep), ink));
+                spans.push(span(tail, quiet));
+            } else {
+                spans.push(span(clip_ellipsis(&text, room), ink));
+            }
+            Line::from(truncate_run(spans, width))
+        })
+        .collect()
+}
+
+/// A shell command in flight, as Claude Code draws it: one header for all the
+/// commands running (`Running 2 shell commands · 1m 21s…`, the oldest one's
+/// clock), then each command under an elbow, clipped to a few lines. Only the
+/// oldest run draws the header, so parallel calls read as one block.
+fn shell_running_lines(model: &Model, at: usize, width: u16) -> Option<Vec<Line<'static>>> {
+    if !model.running {
+        return None;
+    }
+    let th = &model.theme;
+    let cc = th.cc();
+    let position = model.shell_runs.iter().position(|run| run.index == at)?;
+    let run = &model.shell_runs[position];
+    let mut rows = Vec::new();
+    if position == 0 {
+        let count = model.shell_runs.len();
+        let elapsed = duration_words(run.started.elapsed().as_secs());
+        rows.push(Line::from(truncate_run(
+            vec![
+                span_strong(
+                    format!(
+                        "Running {count} shell command{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    cc.text,
+                    th,
+                ),
+                span(format!(" · {elapsed}…"), cc.inactive),
+            ],
+            width,
+        )));
+    }
+    rows.extend(command_rows(&run.command, width, cc.text, cc.inactive));
+    Some(rows)
 }
 
 /// A reply mid-typewriter: the first `shown` characters through the same
@@ -1653,6 +1759,104 @@ mod tests {
             m.reveal.as_mut().unwrap().shown = shown;
             let _ = screen(&m);
         }
+    }
+
+    fn shell_model(commands: &[&str]) -> Model {
+        use crate::davinci::model::ShellRun;
+        let mut m = model(100);
+        m.running = true;
+        m.transcript.clear();
+        for (index, command) in commands.iter().enumerate() {
+            let first = command.lines().next().unwrap_or_default();
+            m.transcript
+                .push(Entry::tool(State::Active, "manus", first, None));
+            m.shell_runs.push(ShellRun {
+                index,
+                started: std::time::Instant::now() - std::time::Duration::from_secs(81),
+                command: (*command).to_string(),
+            });
+        }
+        m
+    }
+
+    fn shell_rows(m: &Model) -> Vec<String> {
+        lines(m, &m.transcript, 100)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_running_shell_command_shows_a_header_with_its_clock_and_its_command() {
+        let m = shell_model(&["cargo test -p davinci-tui"]);
+        let rows = shell_rows(&m);
+        assert_eq!(rows[0], "Running 1 shell command · 1m 21s…", "{rows:?}");
+        assert!(rows[1].contains("⎿") && rows[1].ends_with("$ cargo test -p davinci-tui"));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("Shell(")));
+    }
+
+    #[test]
+    fn a_long_command_shows_four_lines_then_says_how_many_there_are() {
+        let command = (1..=9)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let rows = shell_rows(&shell_model(&[command.as_str()]));
+        assert!(rows[1].ends_with("$ line 1"), "{rows:?}");
+        assert!(
+            rows[3].ends_with("line 3") && !rows[3].contains('$'),
+            "{rows:?}"
+        );
+        assert!(rows[4].ends_with("line 4… (9 lines)"), "{rows:?}");
+        assert_eq!(rows.len(), 5, "{rows:?}");
+    }
+
+    #[test]
+    fn one_very_long_line_wraps_to_the_window_and_is_cut_with_an_ellipsis() {
+        let command = format!(
+            "cd /c/Users/x && {}",
+            "grep -n pattern file.rs; ".repeat(40)
+        );
+        for width in [120u16, 80, 40, 20, 8, 3, 0] {
+            let mut m = shell_model(&[command.as_str()]);
+            m.width = width;
+            let rows: Vec<Line<'static>> = lines(&m, &m.transcript, width);
+            assert!(
+                rows.len() <= 1 + SHELL_COMMAND_ROWS,
+                "{width}: {}",
+                rows.len()
+            );
+            for row in &rows {
+                assert!(run_width(&row.spans) <= width, "{width}: {row}");
+            }
+            if width >= 20 {
+                let last = rows.last().map(ToString::to_string).unwrap_or_default();
+                assert!(last.ends_with('…'), "{width}: {last}");
+                assert!(rows[1].to_string().contains("$ cd"), "{width}");
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_commands_share_one_header_that_counts_them() {
+        let rows = shell_rows(&shell_model(&["sleep 1", "sleep 2"]));
+        assert_eq!(rows.iter().filter(|r| r.starts_with("Running")).count(), 1);
+        assert!(rows[0].starts_with("Running 2 shell commands"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.ends_with("$ sleep 2")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_finished_or_idle_shell_call_goes_back_to_its_tool_line() {
+        let mut m = shell_model(&["ls"]);
+        m.running = false;
+        assert!(!shell_rows(&m).iter().any(|r| r.starts_with("Running")));
+        let mut m = shell_model(&["ls"]);
+        m.transcript[0] = Entry::tool(State::Done, "manus", "ls", Some("1s"));
+        assert!(!shell_rows(&m).iter().any(|r| r.starts_with("Running")));
     }
 
     #[test]

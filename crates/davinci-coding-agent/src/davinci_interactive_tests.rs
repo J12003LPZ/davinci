@@ -3682,7 +3682,10 @@ fn autocompact_shows_sets_and_persists_when_the_context_compacts() {
     let Done::Said(text) = run(&mut agent, "") else {
         panic!("bare shows the state");
     };
-    assert!(text.starts_with("auto-compact on · compacts at 383.6k (auto)"), "{text}");
+    assert!(
+        text.starts_with("auto-compact on · compacts at 383.6k (auto)"),
+        "{text}"
+    );
     assert!(text.contains("/autocompact [auto|tokens|off]"));
 
     let Done::Said(text) = run(&mut agent, "150k") else {

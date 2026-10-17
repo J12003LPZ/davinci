@@ -682,6 +682,16 @@ pub enum Entry {
     Subagents(Vec<SubagentRow>),
 }
 
+/// A shell command that has been started and not yet come back.
+#[derive(Debug, Clone)]
+pub struct ShellRun {
+    /// The transcript row of its tool call.
+    pub index: usize,
+    pub started: std::time::Instant,
+    /// The command as written, every line of it.
+    pub command: String,
+}
+
 /// One delegated worker's progress, as drawn under its `agent` call.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SubagentRow {
@@ -2786,6 +2796,10 @@ pub struct Model {
     /// The working line's numbers while a turn is under way. `None` between
     /// turns, which is what takes the row off the window.
     pub working: Option<Working>,
+    /// Shell commands in flight, oldest first. The transcript row holds only
+    /// the first line of a command; the live "Running N shell commands" block
+    /// draws the rest from here.
+    pub shell_runs: Vec<ShellRun>,
 
     pub palette_index: usize,
     pub session_index: usize,
@@ -3405,6 +3419,7 @@ impl Model {
             exit_armed: false,
             clear_armed: None,
             working: None,
+            shell_runs: Vec::new(),
             palette_index: 0,
             session_index: 0,
             model_index: 0,
