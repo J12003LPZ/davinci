@@ -94,7 +94,15 @@ test("duplicate replies close transport after the first correlation is consumed"
     const reply = {type:"tool_result",runId:"duplicate",requestId:call.requestId,ok:true,value:{}};
     host.send(reply);
     host.send(reply);
-    assert.equal((await host.next()).type,"fatal");
+    // The first reply resumes the run, which may emit its second tool_call
+    // before the host reads the duplicate; either order is correct, but the
+    // duplicate must still end in fatal.
+    let message = await host.next();
+    if (message.type === "tool_call") {
+      assert.notEqual(message.requestId, call.requestId);
+      message = await host.next();
+    }
+    assert.equal(message.type,"fatal");
   } finally { host.child.kill(); }
 });
 
