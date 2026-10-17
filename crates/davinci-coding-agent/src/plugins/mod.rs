@@ -115,8 +115,47 @@ pub fn locate(key: &str, record: &InstalledPlugin) -> Result<PathBuf, String> {
     }
 }
 
+/// How long a read of the enabled plugins stands. Startup asks about five
+/// times in its first seconds, and each read parses every plugin's files.
+const ACTIVE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Enabled plugins from `<agent_dir>/plugins/installed.json`.
+///
+/// Reads are shared for [`ACTIVE_TTL`]. Installing, enabling, disabling or
+/// updating a plugin rewrites `installed.json`, which starts a fresh read at
+/// once; an edit inside a plugin's own files shows within the TTL.
 pub fn active(agent_dir: &Path) -> ActivePlugins {
+    use std::hash::{Hash, Hasher};
+    type Stamp = (PathBuf, Option<u64>, Option<String>);
+    static LAST: OnceLock<Mutex<Option<(Stamp, std::time::Instant, ActivePlugins)>>> =
+        OnceLock::new();
+    // The registry's bytes, not its mtime: a rewrite inside one mtime tick
+    // must still count as a change.
+    let installed = std::fs::read(store::plugins_dir(agent_dir).join("installed.json"))
+        .ok()
+        .map(|bytes| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        });
+    let stamp: Stamp = (
+        agent_dir.to_path_buf(),
+        installed,
+        std::env::var("DAVINCI_PLUGINS").ok(),
+    );
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    if let Some((seen, at, plugins)) = last.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *seen == stamp && at.elapsed() < ACTIVE_TTL {
+            return plugins.clone();
+        }
+    }
+    let plugins = read_active(agent_dir);
+    *last.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((stamp, std::time::Instant::now(), plugins.clone()));
+    plugins
+}
+
+fn read_active(agent_dir: &Path) -> ActivePlugins {
     let mut out = ActivePlugins::default();
     if disabled_by_env() {
         return out;

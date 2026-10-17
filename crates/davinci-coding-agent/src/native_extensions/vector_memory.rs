@@ -451,7 +451,30 @@ pub fn hash_to_uuid(hash: &str) -> String {
 
 pub use resolve_repo_id as repo_id;
 
+/// The repository identity memory and learning stores are keyed by: the
+/// origin remote, else the work-tree root, else the directory itself.
+///
+/// Asked once per directory per process. Each answer costs two `git`
+/// spawns (~70ms each on Windows), and every native host asks it twice
+/// while startup builds several hosts. A store key that stayed put for the
+/// whole session is also the safer one: a remote changed mid-session takes
+/// effect at the next start rather than splitting the session's records.
 pub fn resolve_repo_id(cwd: &Path) -> String {
+    static KNOWN: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, String>>> =
+        std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(id) = known.lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
+        return id.clone();
+    }
+    let id = repo_id_from_git(cwd);
+    known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cwd.to_path_buf(), id.clone());
+    id
+}
+
+fn repo_id_from_git(cwd: &Path) -> String {
     let remote =
         crate::native_extensions::graph::git::run(cwd, &["config", "--get", "remote.origin.url"])
             .ok()
@@ -2672,6 +2695,35 @@ pub(crate) mod tests {
             "every record is embedded"
         );
         assert_eq!(memory.status()["projectionLag"], 0);
+    }
+
+    #[test]
+    fn a_directory_keeps_its_repo_id_for_the_whole_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = resolve_repo_id(directory.path());
+        // Becoming a repository with a remote would change the identity; the
+        // running session keeps the key its stores were opened with.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory.path())
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        assert!(git(&["init", "-q"]), "git is needed for this test");
+        assert!(git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/other.git"
+        ]));
+        assert_ne!(
+            repo_id_from_git(directory.path()),
+            first,
+            "git now names it differently"
+        );
+        assert_eq!(resolve_repo_id(directory.path()), first);
     }
 
     #[test]
