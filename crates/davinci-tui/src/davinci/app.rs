@@ -688,6 +688,7 @@ fn command_panel_frame(
     // the list under them scrolls.
     let pinned = match model.screen {
         Screen::Extensions => extensions::pinned_rows(model),
+        Screen::Login => login::pinned_rows(model),
         _ => 0,
     };
     if pinned > 0 && rows_room > pinned + 2 && content.len() > pinned {
@@ -965,6 +966,7 @@ fn panel(
     });
     let pinned = match model.screen {
         Screen::Settings => settings::PINNED_DETAIL_ROWS,
+        Screen::Login => login::pinned_rows(model),
         _ => 0,
     };
     if pinned > 0 && room > pinned && rows.len() > pinned {
@@ -1970,18 +1972,26 @@ mod graph_input_tests {
 
 /// Search input belongs to the selector; it must never overwrite the chat draft.
 fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
-    if !matches!(model.screen, Screen::Models | Screen::Settings)
-        || key.kind == KeyEventKind::Release
+    if !matches!(
+        model.screen,
+        Screen::Models | Screen::Settings | Screen::Login
+    ) || key.kind == KeyEventKind::Release
         || key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return false;
     }
-    let query = if model.screen == Screen::Models {
-        &mut model.catalog_query
-    } else {
-        &mut model.settings_query
+    // The first esc over a filter clears it; the next one closes the sheet.
+    if model.screen == Screen::Login && key.code == KeyCode::Esc && !model.login_query.is_empty() {
+        model.login_query.clear();
+        model.section_offset = None;
+        return true;
+    }
+    let query = match model.screen {
+        Screen::Models => &mut model.catalog_query,
+        Screen::Login => &mut model.login_query,
+        _ => &mut model.settings_query,
     };
     match key.code {
         KeyCode::Char(ch) => query.push(ch),
@@ -1996,10 +2006,10 @@ fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
         }
         _ => return false,
     }
-    let (indices, selected) = if model.screen == Screen::Models {
-        (cogitator::visible_indices(model), &mut model.catalog_index)
-    } else {
-        (settings::visible_indices(model), &mut model.settings_index)
+    let (indices, selected) = match model.screen {
+        Screen::Models => (cogitator::visible_indices(model), &mut model.catalog_index),
+        Screen::Login => (login::visible_indices(model), &mut model.login_index),
+        _ => (settings::visible_indices(model), &mut model.settings_index),
     };
     if !indices.contains(selected) {
         if let Some(first) = indices.first() {
@@ -2033,7 +2043,11 @@ fn screen_move(model: &mut Model, delta: isize) {
                 wrap_index(model.thinking_index, delta, model.thinking_rows.len());
         }
         Screen::Login => {
-            model.login_index = wrap_index(model.login_index, delta, model.providers.len());
+            model.login_index = super::views::picker::step(
+                &login::visible_indices(model),
+                model.login_index,
+                delta,
+            );
         }
         Screen::Resume => {
             model.resume_index = wrap_index(model.resume_index, delta, model.resume_sessions.len());
@@ -2426,7 +2440,9 @@ fn screen_accept(model: &Model) -> Option<Choice> {
         Screen::Thinking => {
             pick(model.thinking_index, model.thinking_rows.len()).map(Choice::ThinkingLevel)
         }
-        Screen::Login => pick(model.login_index, model.providers.len()).map(Choice::Provider),
+        Screen::Login => login::visible_indices(model)
+            .contains(&model.login_index)
+            .then_some(Choice::Provider(model.login_index)),
         Screen::Resume => {
             pick(model.resume_index, model.resume_sessions.len()).map(Choice::ResumeSession)
         }
@@ -3840,7 +3856,9 @@ mod section_regressions {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                (!text.contains('╭') || id == "3b"),
+                // The extension manager and `/login` keep one framed box: the
+                // search field, shared so the two read as the same app.
+                (!text.contains('╭') || matches!(id, "3b" | "3d")),
                 "{id} still renders a framed command screen: {text}"
             );
             assert!(
@@ -4979,6 +4997,89 @@ mod workflows_view_keys {
         assert_eq!(m.screen, Screen::Workflows);
         press(&mut m, KeyCode::Esc);
         assert_ne!(m.screen, Screen::Workflows, "esc at the run list closes");
+    }
+}
+
+#[cfg(test)]
+mod login_search_tests {
+    use super::*;
+    use crate::davinci::model::{Credential, ProviderRow};
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    fn press(model: &mut Model, code: KeyCode) -> Flow {
+        handle_key(model, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_text(model: &mut Model, text: &str) {
+        for ch in text.chars() {
+            press(model, KeyCode::Char(ch));
+        }
+    }
+
+    fn model() -> Model {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            30,
+            false,
+        );
+        m.providers = ["alpha", "bravo", "alpine", "charlie"]
+            .iter()
+            .map(|name| ProviderRow {
+                name: (*name).into(),
+                method: "api key".into(),
+                source: "environment".into(),
+                state: Credential::Absent,
+            })
+            .collect();
+        m.screen = Screen::Login;
+        m
+    }
+
+    #[test]
+    fn typing_narrows_the_list_and_never_reaches_the_chat_draft() {
+        let mut m = model();
+        m.login_index = 1;
+        type_text(&mut m, "alp");
+        assert_eq!(m.login_query, "alp");
+        assert!(m.composer.is_empty(), "{:?}", m.composer);
+        // The selection moved off `bravo` onto the first provider left.
+        assert_eq!(m.login_index, 0);
+        press(&mut m, KeyCode::Down);
+        assert_eq!(m.login_index, 2);
+        press(&mut m, KeyCode::Down);
+        assert_eq!(m.login_index, 0, "wraps inside what the filter shows");
+        press(&mut m, KeyCode::Backspace);
+        assert_eq!(m.login_query, "al");
+    }
+
+    #[test]
+    fn enter_configures_the_filtered_provider_not_the_row_at_that_position() {
+        let mut m = model();
+        type_text(&mut m, "charlie");
+        assert_eq!(m.login_index, 3);
+        match press(&mut m, KeyCode::Enter) {
+            Flow::Choose(Choice::Provider(3)) => {}
+            other => panic!("expected provider 3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_with_no_match_chooses_nothing() {
+        let mut m = model();
+        type_text(&mut m, "zzz");
+        assert!(!matches!(press(&mut m, KeyCode::Enter), Flow::Choose(_)));
+    }
+
+    #[test]
+    fn the_first_esc_clears_the_filter_and_the_second_closes_the_sheet() {
+        let mut m = model();
+        type_text(&mut m, "br");
+        press(&mut m, KeyCode::Esc);
+        assert!(m.login_query.is_empty());
+        assert_eq!(m.screen, Screen::Login);
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(m.screen, Screen::Agent);
     }
 }
 

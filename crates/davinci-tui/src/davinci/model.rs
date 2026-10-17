@@ -2912,6 +2912,8 @@ pub struct Model {
     /// `3d` — provider credentials, and the grant in flight if any.
     pub providers: Vec<ProviderRow>,
     pub login_index: usize,
+    /// What `/login` narrows its providers to; typed with the list open.
+    pub login_query: String,
     pub device_code: Option<DeviceCode>,
     /// `3e` — the keymap, and how far it is scrolled.
     pub keymap: Vec<KeymapGroup>,
@@ -3473,6 +3475,7 @@ impl Model {
             thinking_index: 0,
             providers: Vec::new(),
             login_index: 0,
+            login_query: String::new(),
             device_code: None,
             keymap: Vec::new(),
             keys_offset: 0,

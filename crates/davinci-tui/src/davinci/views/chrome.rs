@@ -254,11 +254,7 @@ fn context_fold(model: &Model, left_width: usize) -> Vec<Span<'static>> {
     ];
     let mut limits: Vec<Span<'static>> = Vec::new();
     if model.plan_usage_enabled {
-        for window in model
-            .plan_usage
-            .iter()
-            .flat_map(|view| view.windows.iter())
-        {
+        for window in model.plan_usage.iter().flat_map(|view| view.windows.iter()) {
             let left = (100.0 - window.used_percent).clamp(0.0, 100.0);
             let tone = if left <= 10.0 {
                 th.error
@@ -1264,7 +1260,11 @@ pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>)
         // The typed command name is picked out wherever it occurs, in the
         // name, its alias and the description alike: bold in the row's own
         // color when selected, bold white otherwise.
-        let hit = if index == selected { cc.permission } else { cc.text };
+        let hit = if index == selected {
+            cc.permission
+        } else {
+            cc.text
+        };
         for (left, description) in rows {
             let mut spans = marked_spans(left, &needle, color, hit, &model.theme);
             if !description.is_empty() {
@@ -1832,19 +1832,31 @@ mod tests {
             .map(text)
             .find(|row| row.contains("fix-permission"))
             .expect("branch on a rule");
-        assert!(top.starts_with('─') && top.ends_with(" fix-permission-mode-footer-color ─"), "{top}");
+        assert!(
+            top.starts_with('─') && top.ends_with(" fix-permission-mode-footer-color ─"),
+            "{top}"
+        );
         assert_eq!(UnicodeWidthStr::width(top.as_str()), 100);
         for quiet in ["main", "master", "", "HEAD"] {
             m.branch = quiet.into();
             let drawn: String = composer(&m, None, Hint::None).iter().map(text).collect();
-            assert!(!drawn.contains(quiet) || quiet.is_empty(), "{quiet} is not named");
+            assert!(
+                !drawn.contains(quiet) || quiet.is_empty(),
+                "{quiet} is not named"
+            );
         }
         // A long name is clipped, a tiny window keeps a bare rule.
         m.branch = "x".repeat(200);
-        let top = composer(&m, None, Hint::None).iter().map(text).find(|r| r.contains('…')).expect("clipped");
+        let top = composer(&m, None, Hint::None)
+            .iter()
+            .map(text)
+            .find(|r| r.contains('…'))
+            .expect("clipped");
         assert_eq!(UnicodeWidthStr::width(top.as_str()), 100);
         m.width = 8;
-        assert!(composer(&m, None, Hint::None).iter().all(|r| !text(r).contains('x')));
+        assert!(composer(&m, None, Hint::None)
+            .iter()
+            .all(|r| !text(r).contains('x')));
     }
 
     #[test]
@@ -2377,7 +2389,11 @@ mod tests {
             std::time::Instant::now(),
         ));
         let row = effort_line(&m);
-        assert!(text(&row).ends_with("copied 709 chars to clipboard  "), "{}", text(&row));
+        assert!(
+            text(&row).ends_with("copied 709 chars to clipboard  "),
+            "{}",
+            text(&row)
+        );
         assert!(!text(&row).contains("/effort"));
         let note = row
             .spans

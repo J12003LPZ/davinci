@@ -6921,6 +6921,7 @@ fn open_login_sheet(parsed: &crate::args::Args, model: &mut Model) {
         })
         .collect();
     model.login_index = 0;
+    model.login_query.clear();
     model.device_code = None;
     model.facts.auth_path = home_label(&davinci_ai::default_auth_path());
     model.facts.auth_mode = if cfg!(unix) {

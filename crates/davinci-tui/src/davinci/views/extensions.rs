@@ -52,7 +52,7 @@ enum Kind {
     Marketplace,
 }
 
-fn width_of(model: &Model) -> u16 {
+pub(super) fn width_of(model: &Model) -> u16 {
     model.width.min(MAX_WIDTH)
 }
 
@@ -214,7 +214,7 @@ fn tab_bar(model: &Model, sheet: &ExtensionsSheet) -> Vec<Line<'static>> {
 }
 
 /// A rounded box with `inner` on the left and `right` flush right.
-fn boxed(
+pub(super) fn boxed(
     model: &Model,
     inner: Vec<Span<'static>>,
     right: Vec<Span<'static>>,
@@ -495,7 +495,12 @@ fn list_row(
 
 /// The list column: every entry one line, a blank before each group but the
 /// first, windowed around the selection.
-fn list_column(model: &Model, sheet: &ExtensionsSheet, height: usize, width: u16) -> Vec<Line<'static>> {
+fn list_column(
+    model: &Model,
+    sheet: &ExtensionsSheet,
+    height: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
     let entries = sheet.entries(sheet.tab);
     let selected = sheet.index();
     let mut rows = Vec::new();
@@ -596,7 +601,14 @@ fn detail_rows(model: &Model, sheet: &ExtensionsSheet, width: u16) -> Vec<Vec<Sp
             out.extend(wrapped(&members.join(", "), th.text, DESCRIPTION_ROWS));
             out.push(Vec::new());
             out.push(label("ACTIONS"));
-            out.push(key("enter", if *open { "fold this group" } else { "unfold this group" }));
+            out.push(key(
+                "enter",
+                if *open {
+                    "fold this group"
+                } else {
+                    "unfold this group"
+                },
+            ));
         }
         Some(ExtensionEntry::Row(at)) => {
             let item = &sheet.current_rows()[*at];
@@ -657,7 +669,7 @@ fn detail_rows(model: &Model, sheet: &ExtensionsSheet, width: u16) -> Vec<Vec<Sp
             if let Some(note) = item
                 .note
                 .as_deref()
-                .filter(|note| !note.is_empty() && !(skills && item.key.starts_with(*note)))
+                .filter(|note| !(note.is_empty() || skills && item.key.starts_with(*note)))
             {
                 out.push(Vec::new());
                 out.push(label(if problem.is_some() { "PROBLEM" } else { "NOTE" }));
@@ -1278,8 +1290,11 @@ mod tests {
             "detail of superpowers@superpowers-marketplace",
             "│",
         ] {
-            assert!(wide.contains(value), "missing {value}:
-{wide}");
+            assert!(
+                wide.contains(value),
+                "missing {value}:
+{wide}"
+            );
         }
         // Narrow: the stacked cards, every row's description in view.
         let m = model(80);

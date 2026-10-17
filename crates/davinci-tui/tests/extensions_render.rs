@@ -354,7 +354,10 @@ fn skills_are_filed_under_their_source_and_big_plugins_start_folded() {
     assert!(text.contains("▾ Your skills"), "{text}");
     assert!(text.contains("mine-a") && text.contains("mine-b"), "{text}");
     assert!(text.contains("▸ ecc@ecc") && text.contains("293"), "{text}");
-    assert!(text.contains("▸ superpowers") && text.contains("15"), "{text}");
+    assert!(
+        text.contains("▸ superpowers") && text.contains("15"),
+        "{text}"
+    );
     // A folded group lists nothing under it: 308 plugin skills never bury the screen.
     assert!(!text.contains("ecc-skill-000"), "{text}");
     // The pane beside the list describes the selected entry: the first group.
@@ -433,21 +436,35 @@ fn tokened_sheet() -> ExtensionsSheet {
 #[test]
 fn skills_split_into_a_list_and_the_selected_skills_details() {
     let rows = draw(&model(110, 30, tokened_sheet()));
-    let text = rows.join("
-");
+    let text = rows.join(
+        "
+",
+    );
     // The list shows each skill's cost; the pane shows the selection in full.
-    assert!(rows.iter().any(|r| r.contains("alpha") && r.contains("160") && r.contains('│')), "{text}");
-    assert!(rows.iter().any(|r| r.contains("beta") && r.contains("80")), "{text}");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("alpha") && r.contains("160") && r.contains('│')),
+        "{text}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("beta") && r.contains("80")),
+        "{text}"
+    );
     assert!(text.contains("~240 tokens in context"), "{text}");
     // Selection 1 is `alpha` (0 is the group heading).
     assert!(rows.iter().any(|r| r.starts_with("❯ ● alpha")), "{text}");
     assert!(text.contains("yours  ·  ~160 tokens in context"), "{text}");
     assert!(text.contains("Use when working with alpha."), "{text}");
-    assert!(text.contains("PATH") && text.contains("alpha/SKILL.md"), "{text}");
+    assert!(
+        text.contains("PATH") && text.contains("alpha/SKILL.md"),
+        "{text}"
+    );
     assert!(text.contains("d move to trash"), "{text}");
     // A narrow window keeps the stacked cards.
-    let narrow = draw(&model(80, 30, tokened_sheet())).join("
-");
+    let narrow = draw(&model(80, 30, tokened_sheet())).join(
+        "
+",
+    );
     assert!(!narrow.contains('│'), "{narrow}");
     assert!(narrow.contains("alpha"), "{narrow}");
 }
@@ -460,11 +477,20 @@ fn the_details_stay_put_while_a_long_list_scrolls() {
         let m = model(110, 30, sheet.clone());
         let rows = draw(&m);
         // The list scrolled; the pane still holds the details of what is selected.
-        assert!(rows.iter().any(|r| r.starts_with("❯ ")), "{tokens}:
-{}", rows.join("
-"));
+        assert!(
+            rows.iter().any(|r| r.starts_with("❯ ")),
+            "{tokens}:
+{}",
+            rows.join(
+                "
+"
+            )
+        );
         let pane_rows = rows.iter().filter(|r| r.contains(" │ ")).count();
-        assert!(pane_rows >= 20, "{tokens}: the divider spans the body ({pane_rows})");
+        assert!(
+            pane_rows >= 20,
+            "{tokens}: the divider spans the body ({pane_rows})"
+        );
     }
 }
 
@@ -475,25 +501,50 @@ fn plugins_and_servers_split_like_skills_with_their_status_and_problem() {
         // `broken`, the second row, whichever tab holds it.
         sheet.selected = [1, 1, 1];
         let rows = draw(&model(110, 30, sheet));
-        let text = rows.join("
-");
+        let text = rows.join(
+            "
+",
+        );
         if std::env::var_os("DUMP_EXTENSIONS").is_some() {
-            println!("{tab:?}:
-{text}");
+            println!(
+                "{tab:?}:
+{text}"
+            );
         }
         // The list: a mark and the first word of each status, flush right.
-        assert!(rows.iter().any(|r| r.contains("× broken") && r.contains("error") && r.contains('│')), "{tab:?}:
-{text}");
-        assert!(rows.iter().any(|r| r.contains("! locked") && r.contains("needs auth")), "{tab:?}:
-{text}");
-        assert!(rows.iter().any(|r| r.contains("● fine") && r.contains("connected")), "{tab:?}:
-{text}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("× broken") && r.contains("error") && r.contains('│')),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("! locked") && r.contains("needs auth")),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("● fine") && r.contains("connected")),
+            "{tab:?}:
+{text}"
+        );
         // The pane: the selected row's status, problem, description and note.
-        assert!(text.contains("detail of broken"), "{tab:?}:
-{text}");
-        assert!(text.contains("PROBLEM") && text.contains("spawn ENOENT"), "{tab:?}:
-{text}");
+        assert!(
+            text.contains("detail of broken"),
+            "{tab:?}:
+{text}"
+        );
+        assert!(
+            text.contains("PROBLEM") && text.contains("spawn ENOENT"),
+            "{tab:?}:
+{text}"
+        );
         assert!(!text.contains("PATH"), "{tab:?}: only skills show a path");
-        assert!(!text.contains("detail of fine"), "{tab:?}: the pane is for one row");
+        assert!(
+            !text.contains("detail of fine"),
+            "{tab:?}: the pane is for one row"
+        );
     }
 }
