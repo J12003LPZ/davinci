@@ -1188,6 +1188,7 @@ impl Agent {
                     .is_some_and(prompt::environment::visual_verification_requested),
             environment: self.runtime_environment.clone(),
             additional_directories: self.additional_directories(),
+            codemode_available: self.codemode_exposed(),
         }
     }
 

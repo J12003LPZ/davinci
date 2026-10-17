@@ -114,12 +114,24 @@ impl Agent {
             &schema,
             Some("1".into()),
         );
-        capability.description = "Run sandboxed JavaScript with authorized read-only tools. Use tools.<name>({...}), codemode.search, and codemode.describe; return a small result. Incomplete data must not be treated as complete.".into();
+        capability.description = "Run one sandboxed JavaScript program over authorized read-only tools and return a small result. Prefer it to several separate read, grep, find or ls calls: one script can list, read, grep, filter and count, and only its return value enters your context. Example: `const [a, b] = await Promise.all([tools.read({path: 'Cargo.toml'}), tools.read({path: 'README.md'})]); return {cargo: a.text.slice(0, 300), readme: b.text.slice(0, 300)};`. Use tools.<name>({...}) to call a tool, codemode.search and codemode.describe to find tools and their schemas. Not for a single lookup, edits, or shell commands. Each child result has a `complete` flag: incomplete data must not be treated as complete.".into();
         capability.declared_effects.clear();
         capability.replay_policy = ReplayPolicy::NeverAutoReplay;
         runtime.capability_registry.register(capability);
         self.bind_codemode(host);
         Ok(())
+    }
+
+    /// Codemode is bound and its tool is authorized for this agent, so the
+    /// model can actually call it.
+    pub(crate) fn codemode_exposed(&self) -> bool {
+        self.codemode.is_some()
+            && self
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains("codemode")
     }
 
     fn bind_codemode(&mut self, host: Arc<dyn CodeModeHost>) {

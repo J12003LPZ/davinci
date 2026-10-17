@@ -1227,6 +1227,34 @@ fn read_only_broker_allows_bounded_parallel_children() {
 }
 
 #[test]
+fn enabled_codemode_tells_the_model_when_to_use_it_and_disabled_says_nothing() {
+    let (mut agent, _workspace, _) = configured_agent();
+    let off = crate::prompt::runtime_state::runtime_state_text(&agent.runtime_prompt_state());
+    assert!(!agent.runtime_prompt_state().codemode_available);
+    assert!(!off.contains("Codemode is available"), "{off}");
+    agent
+        .enable_read_only_codemode(Arc::new(ReadOnlyFixtureHost))
+        .unwrap();
+    let state = agent.runtime_prompt_state();
+    assert!(state.codemode_available);
+    let on = crate::prompt::runtime_state::runtime_state_text(&state);
+    assert!(on.contains("Codemode is available"), "{on}");
+    assert!(on.contains("instead of separate read, grep, find or ls calls"));
+    let spec = agent
+        .provider_tool_specs()
+        .into_iter()
+        .find(|tool| tool.name == "codemode")
+        .unwrap();
+    for needle in [
+        "Prefer it to several separate",
+        "tools.read(",
+        "Not for a single lookup",
+    ] {
+        assert!(spec.description.contains(needle), "{}", spec.description);
+    }
+}
+
+#[test]
 fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     use crate::codemode::*;
     let (agent, workspace, journal) = configured_agent();
