@@ -91,6 +91,15 @@ fn path_url(token: &str, cwd: &Path, exists: &mut impl FnMut(&Path) -> bool) -> 
     if !rooted || token.starts_with("//") || (token.contains('\\') && !drive) {
         return None;
     }
+    // `/config` is a slash command, even where `C:\config` exists: one name
+    // after the root is never read as a path. `/etc/hosts` still is.
+    if !drive
+        && token
+            .strip_prefix('/')
+            .is_some_and(|rest| !rest.contains('/'))
+    {
+        return None;
+    }
     let mut path = token;
     // `src/lib.rs:12:3` names the file.
     for _ in 0..2 {
@@ -316,6 +325,18 @@ mod tests {
         assert!(links("http://").is_empty());
         let anything = find("/ for commands", Path::new("/work/app"), &mut |_| true);
         assert!(anything.is_empty(), "a bare root is a hint, not a link");
+    }
+
+    #[test]
+    fn a_slash_command_is_never_a_link_even_when_the_root_folder_exists() {
+        // On Windows `/config` resolves to `C:\config`, which may exist.
+        let every_path_exists = &mut |_: &Path| true;
+        let cwd = Path::new("/work/app");
+        for row in ["/config", "  /init  /model  /effort", "run /tree:12 now"] {
+            assert!(find(row, cwd, every_path_exists).is_empty(), "{row}");
+        }
+        assert_eq!(find("/etc/hosts", cwd, every_path_exists).len(), 1);
+        assert_eq!(find("./config", cwd, every_path_exists).len(), 1);
     }
 
     #[test]
