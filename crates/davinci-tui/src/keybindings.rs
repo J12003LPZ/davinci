@@ -127,6 +127,10 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("davinci.codex.toggle", &["ctrl+alt+e"]),
         ("davinci.tools.expand", &["alt+o"]),
         ("davinci.transcript.open", &["ctrl+o"]),
+        ("davinci.checklist.toggle", &["ctrl+t"]),
+        ("davinci.editor.open", &["ctrl+g"]),
+        ("davinci.editor.chordStart", &["ctrl+x"]),
+        ("davinci.editor.chordEnd", &["ctrl+e"]),
         (
             "davinci.composer.newLine",
             &["shift+enter", "alt+enter", "ctrl+j"],

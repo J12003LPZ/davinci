@@ -2974,6 +2974,13 @@ pub struct Model {
     pub footer_focus: Option<usize>,
     /// The footer item `x` has asked to stop; a second `x` confirms.
     pub footer_stop_armed: Option<usize>,
+    /// The checklist band above the composer (`ctrl+t`).
+    pub checklist_open: bool,
+    /// `ctrl+x` pressed: a following `ctrl+e` edits the draft in `$EDITOR`.
+    pub chord_x: Option<std::time::Instant>,
+    /// The draft is to be edited in `$VISUAL`/`$EDITOR`; the shell, which
+    /// owns the terminal, takes this and runs the editor.
+    pub external_edit_requested: bool,
     /// The pull request for this branch, when `gh` found one.
     pub pr_badge: Option<PrBadge>,
     /// When ctrl+d was last pressed on an empty composer: a second press
@@ -3501,6 +3508,9 @@ impl Model {
             history_search: None,
             footer_focus: None,
             footer_stop_armed: None,
+            checklist_open: false,
+            chord_x: None,
+            external_edit_requested: false,
             pr_badge: None,
             quit_armed: None,
             terminal_task: None,

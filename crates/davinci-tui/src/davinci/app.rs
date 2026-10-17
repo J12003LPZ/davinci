@@ -179,7 +179,8 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     // The context bar sits right above what the composer offers, as the
     // last thing read before typing.
     let meter = if conversation {
-        let mut meter = context_bar::lines(chrome_model, height);
+        let mut meter = chrome::checklist_rows(chrome_model, height);
+        meter.extend(context_bar::lines(chrome_model, height));
         meter.extend(plan_usage::lines(chrome_model, height));
         // A row of air above it: the last transcript line (an error, a
         // command's output) must not sit flush against the meter's header.
@@ -1432,7 +1433,32 @@ fn action_matches(model: &Model, data: Option<&str>, action: &str) -> bool {
     data.is_some_and(|data| model.keybindings.matches(data, action))
 }
 
+/// How long `ctrl+x` waits for its second key.
+const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
+    // The draft can be edited in `$EDITOR` from the conversation's composer:
+    // `ctrl+g`, or the readline chord `ctrl+x ctrl+e`.
+    let chord = model
+        .chord_x
+        .take()
+        .is_some_and(|at| at.elapsed() < CHORD_WINDOW);
+    let composing = model.screen == Screen::Agent
+        && model.overlay.is_none()
+        && model.viewer.is_none()
+        && model.history_search.is_none();
+    if composing {
+        if (chord && model.keybindings.matches(data, "davinci.editor.chordEnd"))
+            || model.keybindings.matches(data, "davinci.editor.open")
+        {
+            model.external_edit_requested = true;
+            return Some(Flow::Continue);
+        }
+        if model.keybindings.matches(data, "davinci.editor.chordStart") {
+            model.chord_x = Some(std::time::Instant::now());
+            return Some(Flow::Continue);
+        }
+    }
     if model.keybindings.matches(data, "davinci.quit") && model.composer.is_empty() {
         // One press arms; a second within the window leaves, so a stray
         // ctrl+d does not end the session.
@@ -1490,6 +1516,11 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
     }
     if model.keybindings.matches(data, "davinci.transcript.open") && model.screen == Screen::Agent {
         model.viewer = Some(super::views::viewer::TranscriptViewer::open(model));
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.checklist.toggle") && model.screen == Screen::Agent
+    {
+        model.checklist_open = !model.checklist_open;
         return Some(Flow::Continue);
     }
     if model.keybindings.matches(data, "davinci.tools.expand") {
@@ -5178,6 +5209,86 @@ mod scroll_to_entry_tests {
         );
         let shown = rows(&m).join("\n");
         assert!(shown.contains("PR #42"), "{shown}");
+    }
+
+    #[test]
+    fn ctrl_t_opens_a_checklist_band_of_five_rows_that_keeps_the_active_step_in_view() {
+        use crate::davinci::model::PlanStep;
+        use crate::davinci::theme::State;
+        let mut m = chat(30, 1);
+        let ctrl_t = || KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        m.plan = (0..8)
+            .map(|i| {
+                let state = match i {
+                    0..=2 => State::Done,
+                    3 => State::Active,
+                    _ => State::Queued,
+                };
+                PlanStep::new("", state, &format!("step {i}"), None)
+            })
+            .collect();
+        assert!(
+            !rows(&m)
+                .join(
+                    "
+"
+                )
+                .contains("checklist"),
+            "closed by default"
+        );
+        handle_key(&mut m, ctrl_t());
+        let shown = rows(&m).join(
+            "
+",
+        );
+        assert!(shown.contains("checklist · 3 of 8 done"), "{shown}");
+        assert!(
+            shown.contains("◉ step 3") && shown.contains("✓ step 2"),
+            "{shown}"
+        );
+        assert!(shown.contains("… 1 more"), "{shown}");
+        assert_eq!(shown.matches("step ").count(), 5, "{shown}");
+        // A short window has no rows to spare, and a second press hides it.
+        assert!(!rows(&chat(12, 1))
+            .join(
+                "
+"
+            )
+            .contains("checklist"));
+        handle_key(&mut m, ctrl_t());
+        assert!(!rows(&m)
+            .join(
+                "
+"
+            )
+            .contains("checklist"));
+    }
+
+    #[test]
+    fn ctrl_g_and_the_ctrl_x_ctrl_e_chord_ask_for_the_editor() {
+        let mut m = chat(24, 1);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        handle_key(&mut m, ctrl('g'));
+        assert!(std::mem::take(&mut m.external_edit_requested));
+        // The chord needs both keys, in order and in time.
+        handle_key(&mut m, ctrl('e'));
+        assert!(
+            !m.external_edit_requested,
+            "ctrl+e alone keeps its editing job"
+        );
+        handle_key(&mut m, ctrl('x'));
+        assert!(m.chord_x.is_some() && !m.external_edit_requested);
+        handle_key(&mut m, ctrl('e'));
+        assert!(std::mem::take(&mut m.external_edit_requested));
+        assert!(m.chord_x.is_none());
+        handle_key(&mut m, ctrl('x'));
+        m.chord_x = Some(std::time::Instant::now() - CHORD_WINDOW * 2);
+        handle_key(&mut m, ctrl('e'));
+        assert!(!m.external_edit_requested, "a stale ctrl+x is forgotten");
+        // Not while a panel owns the keys.
+        m.history_search = Some(Default::default());
+        handle_key(&mut m, ctrl('g'));
+        assert!(!m.external_edit_requested);
     }
 
     #[test]

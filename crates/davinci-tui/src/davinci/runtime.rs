@@ -562,6 +562,14 @@ impl Session {
         Ok(())
     }
 
+    /// Give the terminal to something else (an editor) and take it back.
+    pub fn run_external<R>(&mut self, job: impl FnOnce() -> R) -> io::Result<R> {
+        restore()?;
+        let out = job();
+        self.reacquire()?;
+        Ok(out)
+    }
+
     /// Forget what is on screen so the next draw paints every cell: for when
     /// something wrote to the terminal behind the renderer's back.
     pub fn clear(&mut self) -> io::Result<()> {

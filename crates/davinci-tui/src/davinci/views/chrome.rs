@@ -234,12 +234,14 @@ fn shortcut_rows(model: &Model) -> Vec<Line<'static>> {
     let spaced = |action: &str, text: &str| {
         key_label(model, action).map(|key| format!("{} {text}", key.replace('+', " + ")))
     };
+    let mut hints = vec![
+        "! for shell mode".to_string(),
+        "/ for commands".into(),
+        "@ for file paths".into(),
+    ];
+    hints.extend(spaced("davinci.checklist.toggle", "for checklist"));
     let columns: [Vec<String>; 3] = [
-        vec![
-            "! for shell mode".into(),
-            "/ for commands".into(),
-            "@ for file paths".into(),
-        ],
+        hints,
         [
             spaced("app.permissions.cycle", "to cycle modes"),
             spaced("davinci.tools.expand", "for verbose output"),
@@ -1148,6 +1150,66 @@ pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>)
 /// The search rows above the composer: the query, then the matches around
 /// the marked one. Each match row names its index in `history_matches`; the
 /// query row names `usize::MAX`.
+/// The model's checklist as a band of at most five rows above the composer
+/// (`ctrl+t`): finished steps ✓, the active one ◉, the rest ○. Rows beyond
+/// five fold into a count, with the active step kept in view. Nothing when
+/// it is closed, empty, or the window is too short to spare the rows.
+pub fn checklist_rows(model: &Model, height: usize) -> Vec<Line<'static>> {
+    use crate::davinci::theme::State as ChecklistState;
+    const SHOWN: usize = 5;
+    if !model.checklist_open || model.plan.is_empty() || height < 14 {
+        return Vec::new();
+    }
+    let cc = model.theme.cc();
+    let steps = &model.plan;
+    let done = steps
+        .iter()
+        .filter(|step| matches!(step.state, ChecklistState::Done))
+        .count();
+    // Lead with the last finished step, then the active one and what follows.
+    let focus = steps
+        .iter()
+        .position(|step| !matches!(step.state, ChecklistState::Done))
+        .unwrap_or(steps.len() - 1);
+    let first = focus
+        .saturating_sub(1)
+        .min(steps.len().saturating_sub(SHOWN));
+    let mut rows = vec![Line::from(vec![
+        span(
+            format!("  checklist · {done} of {} done", steps.len()),
+            cc.inactive,
+        ),
+        span("  ctrl+t hides", cc.subtle),
+    ])];
+    for step in steps.iter().skip(first).take(SHOWN) {
+        let (glyph, ink) = match step.state {
+            ChecklistState::Done => ("✓", cc.success),
+            ChecklistState::Active => ("◉", cc.permission),
+            ChecklistState::Failed => ("✗", cc.error),
+            _ => ("○", cc.inactive),
+        };
+        rows.push(Line::from(vec![
+            span(format!("  {glyph} "), ink),
+            span(
+                step.verb.clone(),
+                if matches!(step.state, ChecklistState::Done) {
+                    cc.inactive
+                } else {
+                    cc.text
+                },
+            ),
+        ]));
+    }
+    let hidden = steps.len().saturating_sub(first + SHOWN);
+    if hidden > 0 {
+        rows.push(Line::from(span(
+            format!("    … {hidden} more"),
+            cc.inactive,
+        )));
+    }
+    rows
+}
+
 pub fn history_search_rows(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
     let Some(search) = &model.history_search else {
         return (Vec::new(), Vec::new());

@@ -5116,6 +5116,23 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        // The draft goes to `$VISUAL`/`$EDITOR` and comes back as typed text.
+        if std::mem::take(&mut model.external_edit_requested) {
+            let draft = model.composer.to_string();
+            let edited = terminal.run_external(|| {
+                crate::external_editor::ExternalEditor::new(None, &draft)
+                    .and_then(|editor| editor.edit())
+            });
+            match edited {
+                Ok(Ok(text)) => {
+                    model.replace_composer(text.trim_end_matches(['\r', '\n']));
+                    model.push_toast("draft edited in your editor".into());
+                }
+                Ok(Err(err)) => model.push_toast(format!("editor: {err}")),
+                Err(err) => model.push_toast(format!("editor: {err}")),
+            }
+            model.dirty = true;
+        }
         // Servers that were still connecting at the first frame: take their
         // tools in between turns, then say how many came up.
         if !model.running && agent.tool_context.mcp.take_ready() {
