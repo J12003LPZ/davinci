@@ -5327,25 +5327,17 @@ pub fn run(
                             model.keybindings.matches(&data, "app.clipboard.pasteImage")
                         }) {
                             if let Some(png) = crate::external_editor::clipboard_image_png() {
-                                let (bytes, note) =
-                                    match crate::image_convert::resize_image_in_process(
-                                        &png,
-                                        "image/png",
-                                    ) {
-                                        Some(resized) => {
-                                            let note =
-                                                format!("{}x{}", resized.width, resized.height);
-                                            let bytes = if resized.was_resized
-                                                && resized.mime_type == "image/png"
-                                            {
-                                                resized.bytes
-                                            } else {
-                                                png
-                                            };
-                                            (bytes, note)
-                                        }
-                                        None => (png, "image".to_string()),
-                                    };
+                                let bytes = match crate::image_convert::resize_image_in_process(
+                                    &png,
+                                    "image/png",
+                                ) {
+                                    Some(resized)
+                                        if resized.was_resized && resized.mime_type == "image/png" =>
+                                    {
+                                        resized.bytes
+                                    }
+                                    _ => png,
+                                };
                                 let data = base64::Engine::encode(
                                     &base64::engine::general_purpose::STANDARD,
                                     bytes,
@@ -5362,11 +5354,8 @@ pub fn run(
                                     .and_then(|head| head.chars().next_back());
                                 let spaced = attachments::spaced_chip(&chip, before);
                                 model.paste(&spaced);
-                                if model.composer.to_string().contains(&chip) {
-                                    model
-                                        .transcript
-                                        .push(Entry::Detail(format!("Pasted {chip} ({note})")));
-                                } else {
+                                // The chip in the composer is the only sign of the paste.
+                                if !model.composer.to_string().contains(&chip) {
                                     // The composer is not taking input (a sheet or
                                     // selector has focus): no chip, no image.
                                     attached_images.pop();
