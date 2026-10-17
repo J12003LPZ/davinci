@@ -36,6 +36,9 @@ pub struct SharedCounters {
     pub process_startups: AtomicU64,
     pub process_reuses: AtomicU64,
     pub process_restarts: AtomicU64,
+    pub codemode_runs: AtomicU64,
+    pub codemode_unfinished: AtomicU64,
+    pub codemode_empty_results: AtomicU64,
 }
 
 impl SharedCounters {
@@ -64,6 +67,9 @@ impl SharedCounters {
         stats.process_startups += self.process_startups.load(Ordering::Relaxed);
         stats.process_reuses += self.process_reuses.load(Ordering::Relaxed);
         stats.process_restarts += self.process_restarts.load(Ordering::Relaxed);
+        stats.codemode_runs += self.codemode_runs.load(Ordering::Relaxed);
+        stats.codemode_unfinished += self.codemode_unfinished.load(Ordering::Relaxed);
+        stats.codemode_empty_results += self.codemode_empty_results.load(Ordering::Relaxed);
     }
 }
 
@@ -175,6 +181,15 @@ pub struct RunStats {
     pub parallel_groups: u64,
     /// Operations run underneath `batch` calls (not model-visible boundaries).
     pub batch_operations: u64,
+    /// Codemode scripts run.
+    #[serde(default)]
+    pub codemode_runs: u64,
+    /// Codemode runs whose status was not `completed` (failed, partial, cancelled).
+    #[serde(default)]
+    pub codemode_unfinished: u64,
+    /// Codemode runs that called tools yet returned an empty value.
+    #[serde(default)]
+    pub codemode_empty_results: u64,
     /// Nested workers started by the `agent` tool.
     pub subagents: u64,
     /// Wall time spent inside tools, summed per batch (overlap counted once).
@@ -390,6 +405,7 @@ mod tests {
         assert!(json.get("peakContextTokens").is_some());
         assert!(json.get("permissionPrompts").is_some());
         assert!(json.get("filesChangedCount").is_some());
+        assert!(json.get("codemodeRuns").is_some());
     }
 
     #[test]

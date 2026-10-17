@@ -84,11 +84,14 @@ over several read/grep/find/ls calls. Neither appears when Codemode is off, so
 the prompt is unchanged for sessions without it.
 
 Without that text the model never chose the tool: 0 calls in 72 unsteered
-benchmark sessions. To check adoption after a change, run a Codemode-on arm
-with no `appendSystemPrompt` and count `tool_execution_start` events whose
-tool is `codemode` in the per-run `*.stdout.jsonl` logs. Compare pass rate,
-tokens and wall time against the same arm with Codemode off before treating
-more calls as better.
+benchmark sessions. `scripts/bench/codemode_adoption.py` measures it:
+`run` asks six multi-lookup repo questions with Codemode on and off (no
+appended prompt), and `report` grades every answer against facts read from the
+repository and exits 1 when the Codemode-on arm falls below 50% adoption or 80%
+correct. `report` and its tests are offline; `run` uses model usage. Every
+`harness_stats` also carries `codemodeRuns`, `codemodeUnfinished` and
+`codemodeEmptyResults`. Compare pass rate, tokens and wall time against the
+same arm with Codemode off before treating more calls as better.
 
 ## Messages
 

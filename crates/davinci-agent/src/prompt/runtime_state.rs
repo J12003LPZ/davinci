@@ -31,6 +31,7 @@ pub struct RuntimePromptState {
 pub(crate) const CODEMODE_GUIDANCE: &str = "Codemode is available: one `codemode` call runs a short JavaScript program over your read-only tools (`tools.<name>({...})`; `codemode.search` and `codemode.describe` list them) and returns only what the script returns. \
 Use it instead of separate read, grep, find or ls calls whenever you need two or more lookups, or need to filter, join or count their output: survey the directories, read or grep the files you need, and return one compact summary. \
 Use the normal tools for a single lookup, for any edit or shell command, and when you need a file's full text in context. \
+It only reads, so it works in plan and read-only mode. \
 Check each child result's `complete` flag: a truncated read is not the whole file, so read the rest before relying on it.";
 
 pub fn runtime_state_text(state: &RuntimePromptState) -> String {
