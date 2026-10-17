@@ -4265,3 +4265,27 @@ fn login_rows_show_the_chatgpt_backend_login_as_ready_only_when_it_is_stored() {
         "{rows:?}"
     );
 }
+
+#[test]
+fn the_masthead_takes_the_catalog_title_and_the_provider_name() {
+    use davinci_tui::davinci::{
+        model::{Model, ModelItem},
+        theme::{ColorDepth, Theme},
+    };
+    let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 24, false);
+    model.models = vec![ModelItem::new("openai-codex / gpt-6-luna", "272,000")
+        .of("openai-codex", "gpt-6-luna", 272_000)
+        .titled("GPT-6-Luna")];
+    model.model_name = "gpt-6-luna".into();
+    model.active_provider = "openai-codex".into();
+    sync_model_titles(&mut model);
+    assert_eq!(model.model_title, "GPT-6-Luna");
+    assert_eq!(model.provider_title, "OpenAI Codex");
+
+    // An extension's model and provider keep their raw ids.
+    model.model_name = "local-7b".into();
+    model.active_provider = "my-router".into();
+    sync_model_titles(&mut model);
+    assert_eq!(model.model_title, "local-7b");
+    assert_eq!(model.provider_title, "my-router");
+}

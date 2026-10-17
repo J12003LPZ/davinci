@@ -1,6 +1,7 @@
 //! Behavioral contracts for the terminal rebuild. Shared 120x40 geometry and
 //! palette assertions are derived from the validated Claude Code 2.1.278 reference frames.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use davinci_tui::davinci::views::startup::{PET_TEXT_COLUMN, PET_W};
 use davinci_tui::davinci::{
     app, fixtures,
     model::{CatalogRow, Choice, Model, Screen, SettingRow},
@@ -197,9 +198,16 @@ fn rebuild_reference_shell_uses_claude_120x40_geometry() {
     m.permission_mode = "ask".into();
     let rows = app::compose(&m, 40);
     assert_eq!(rows.len(), 40);
-    assert!(rows[1].to_string().starts_with(" ██▀▀▀▜▄   DaVinci"));
-    assert!(rows[2].to_string().starts_with(" ██    █▌  "));
-    assert!(rows[3].to_string().starts_with(" ██▄▄▄▟▀   "));
+    // The painter fills rows 1..=5; the masthead text starts on its second.
+    let text_at = PET_TEXT_COLUMN as usize;
+    let name: String = rows[2].to_string().chars().skip(text_at).collect();
+    assert!(name.starts_with("DaVinci"), "{name:?}");
+    assert!(rows[1..6].iter().all(|row| row
+        .to_string()
+        .chars()
+        .skip(1)
+        .take(PET_W)
+        .all(|c| "▀▄█ ".contains(c))));
     assert!(rows[35].to_string().contains("● high · /effort"));
     assert_eq!(rows[36].to_string(), "─".repeat(120));
     assert!(rows[37].to_string().starts_with("❯"));
