@@ -55,4 +55,5 @@ pub mod transcript;
 pub mod tree;
 pub mod trust;
 pub mod vectors;
+pub mod viewer;
 pub mod workflows;

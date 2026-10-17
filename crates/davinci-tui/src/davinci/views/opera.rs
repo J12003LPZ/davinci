@@ -14,12 +14,35 @@ pub fn height(model: &Model) -> usize {
     usize::from(model.working.is_some())
 }
 
+/// Ghostty draws `✳` where other non-mac terminals' fonts fall back for it,
+/// so it gets the reference's own set (`✳` and a closing `*`).
+const GHOSTTY_FRAMES: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "*"];
+
+fn frames() -> &'static [&'static str; 6] {
+    use std::sync::OnceLock;
+    static SET: OnceLock<bool> = OnceLock::new();
+    let ghostty = *SET.get_or_init(|| {
+        std::env::var("TERM_PROGRAM").is_ok_and(|term| term.eq_ignore_ascii_case("ghostty"))
+    });
+    if ghostty {
+        &GHOSTTY_FRAMES
+    } else {
+        &SPINNER_FRAMES
+    }
+}
+
+/// Out and back over the glyphs, the last one dwelling for two ticks as in
+/// the reference's twelve-step loop.
+fn frame_of(set: &'static [&'static str; 6], tick: u64) -> &'static str {
+    let step = (tick % 12) as usize;
+    set[if step < 6 { step } else { 11 - step }]
+}
+
 fn frame(tick: u64, animate: bool) -> &'static str {
     if !animate {
         return "✻";
     }
-    let step = (tick % 10) as usize;
-    SPINNER_FRAMES[if step < 6 { step } else { 10 - step }]
+    frame_of(frames(), tick)
 }
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
@@ -210,6 +233,16 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_gets_its_own_glyph_set_and_both_loop_over_twelve_ticks() {
+        let ghost: Vec<&str> = (0..12).map(|t| frame_of(&GHOSTTY_FRAMES, t)).collect();
+        assert_eq!(
+            ghost,
+            ["·", "✢", "✳", "✶", "✻", "*", "*", "✻", "✶", "✳", "✢", "·"]
+        );
+        assert_eq!(frame_of(&GHOSTTY_FRAMES, 12), frame_of(&GHOSTTY_FRAMES, 0));
+    }
+
+    #[test]
     fn it_spins_on_the_shared_clock_and_freezes_without_animation() {
         let mut m = model(120);
         m.working = Some(working());
@@ -218,8 +251,11 @@ mod tests {
             (1, '✢'),
             (2, '*'),
             (3, '✶'),
-            (6, '✻'),
-            (9, '✢'),
+            (5, '✽'),
+            (6, '✽'),
+            (9, '*'),
+            (11, '·'),
+            (12, '·'),
         ] {
             m.tick = tick;
             assert!(text(&lines(&m)[0]).starts_with(frame), "{tick}");

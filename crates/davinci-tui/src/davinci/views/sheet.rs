@@ -134,7 +134,15 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         chrome.composer = Composer::Hidden;
     }
     chrome.echo = None;
+    // `/login` names its own keys, and what esc will do (clear, then close).
+    let own_escape = (model.screen == Screen::Login)
+        .then_some(chrome.escape)
+        .flatten();
     chrome.escape = Some("esc close");
+    if let Some(escape) = own_escape {
+        chrome.escape = Some(escape);
+        return Some(chrome);
+    }
     // The manager names the keys the selected row allows.
     if matches!(model.screen, Screen::GraphRun | Screen::Extensions) {
         return Some(chrome);

@@ -118,6 +118,46 @@ impl Variant {
     }
 }
 
+impl Cc {
+    /// Success and diff-add inks to blue, error and diff-del to orange.
+    fn daltonized(mut self, depth: ColorDepth) -> Self {
+        let (blue, orange, add_bg, del_bg) = match depth {
+            ColorDepth::TrueColor => (rgb(0x56B4E9), rgb(0xE69F00), rgb(0x00243A), rgb(0x3A2400)),
+            ColorDepth::Ansi256 => (
+                Color::Indexed(75),
+                Color::Indexed(208),
+                Color::Indexed(17),
+                Color::Indexed(94),
+            ),
+            ColorDepth::Basic => (
+                Color::Cyan,
+                Color::Yellow,
+                self.diff_add_bg,
+                self.diff_del_bg,
+            ),
+        };
+        self.success = blue;
+        self.diff_add = blue;
+        self.diff_add_bg = add_bg;
+        self.error = orange;
+        self.diff_del = orange;
+        self.diff_del_bg = del_bg;
+        self
+    }
+}
+
+/// `light` or `dark` from `COLORFGBG` (`foreground;background`, the
+/// background an ANSI colour number): 7 and 15 are light grounds.
+pub fn auto_variant_name(colorfgbg: Option<&str>) -> &'static str {
+    let background = colorfgbg
+        .and_then(|value| value.rsplit(';').next())
+        .and_then(|value| value.trim().parse::<u8>().ok());
+    match background {
+        Some(7 | 15) => "light",
+        _ => "dark",
+    }
+}
+
 /// One row of the §2 table, in whichever encoding the terminal understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
@@ -137,6 +177,9 @@ pub struct Theme {
     pub no_color: bool,
     pub dimmed: bool,
     pub variant: Variant,
+    /// Green and red are traded for blue and orange, which colour-blind
+    /// readers tell apart.
+    pub daltonized: bool,
 }
 
 /// The eleven tokens, before they are wrapped in a `Theme`.
@@ -450,6 +493,9 @@ pub struct Cc {
     /// alike in any theme. Reset on a palette with no colour, where each
     /// category's glyph tells them apart.
     pub category: [Color; 6],
+    /// Background under selected text. The foreground keeps its own ink.
+    /// Reset where there is no colour: the selection is drawn reversed.
+    pub selection_bg: Color,
 }
 
 const CC_DARK: Cc = Cc {
@@ -485,6 +531,7 @@ const CC_DARK: Cc = Cc {
         rgb(0x4DD0E1),
         rgb(0xD77757),
     ],
+    selection_bg: rgb(0x264F78),
 };
 
 const CC_DARK_256: Cc = Cc {
@@ -520,6 +567,7 @@ const CC_DARK_256: Cc = Cc {
         Color::Indexed(80),
         Color::Indexed(173),
     ],
+    selection_bg: Color::Indexed(24),
 };
 
 const CC_LIGHT: Cc = Cc {
@@ -555,6 +603,7 @@ const CC_LIGHT: Cc = Cc {
         rgb(0x0C8599),
         rgb(0xD9480F),
     ],
+    selection_bg: rgb(0xB4D5FF),
 };
 
 const CC_LIGHT_256: Cc = Cc {
@@ -590,6 +639,7 @@ const CC_LIGHT_256: Cc = Cc {
         Color::Indexed(31),
         Color::Indexed(166),
     ],
+    selection_bg: Color::Indexed(153),
 };
 
 /// Vox conversation colors: mustard identity, navy user strip, cyan and
@@ -627,6 +677,7 @@ const CC_VOX: Cc = Cc {
         rgb(0x20C9D6),
         rgb(0xE8604A),
     ],
+    selection_bg: rgb(0x264F78),
 };
 
 const CC_VOX_256: Cc = Cc {
@@ -662,6 +713,7 @@ const CC_VOX_256: Cc = Cc {
         Color::Indexed(44),
         Color::Indexed(203),
     ],
+    selection_bg: Color::Indexed(24),
 };
 
 const CC_BASIC: Cc = Cc {
@@ -697,6 +749,7 @@ const CC_BASIC: Cc = Cc {
         Color::Cyan,
         Color::LightRed,
     ],
+    selection_bg: Color::Blue,
 };
 
 const CC_NONE: Cc = Cc {
@@ -725,6 +778,7 @@ const CC_NONE: Cc = Cc {
     code_string: Color::Reset,
     code_macro: Color::Reset,
     category: [Color::Reset; 6],
+    selection_bg: Color::Reset,
 };
 
 impl Theme {
@@ -741,6 +795,11 @@ impl Theme {
             (ColorDepth::Ansi256, Variant::Light) => CC_LIGHT_256,
             (ColorDepth::Ansi256, Variant::Vox) => CC_VOX_256,
             (ColorDepth::Basic, _) => CC_BASIC,
+        };
+        let base = if self.daltonized && !self.no_color {
+            base.daltonized(self.depth_hint())
+        } else {
+            base
         };
         if !self.dimmed {
             return base;
@@ -775,6 +834,26 @@ impl Theme {
         }
     }
 
+    /// The same palette with its success, error and warning inks moved to a
+    /// blue, orange and yellow that stay apart for red-green colour blindness.
+    pub fn daltonize(self) -> Self {
+        if self.no_color {
+            return self;
+        }
+        let (blue, orange, yellow) = match self.depth_hint() {
+            ColorDepth::TrueColor => (rgb(0x56B4E9), rgb(0xE69F00), rgb(0xF0E442)),
+            ColorDepth::Ansi256 => (Color::Indexed(75), Color::Indexed(208), Color::Indexed(227)),
+            ColorDepth::Basic => (Color::Cyan, Color::Yellow, Color::LightYellow),
+        };
+        Self {
+            success: blue,
+            error: orange,
+            warning: yellow,
+            daltonized: true,
+            ..self
+        }
+    }
+
     /// The editorial collage palette is active.
     pub fn is_vox(&self) -> bool {
         self.variant == Variant::Vox
@@ -783,6 +862,22 @@ impl Theme {
     /// Apply the built-in setting while retaining terminal capabilities.
     /// Legacy/custom names retain the native dark palette.
     pub fn with_name(&self, name: &str) -> Self {
+        // `auto` follows the terminal's own light or dark setting as far as
+        // the environment reveals it; `ansi` keeps to the 16 named colours.
+        if name == "auto" {
+            return self.with_name(auto_variant_name(
+                std::env::var("COLORFGBG").ok().as_deref(),
+            ));
+        }
+        if name == "ansi" {
+            return Self::da_vinci(ColorDepth::Basic, self.no_color);
+        }
+        if name == "daltonized" {
+            return self.with_name("dark").daltonize();
+        }
+        if let Some(base) = name.strip_suffix("-daltonized") {
+            return self.with_name(base).daltonize();
+        }
         let depth = self.depth_hint();
         let variant = Variant::from_name(name);
         if variant == Variant::Vox {
@@ -994,6 +1089,7 @@ impl Theme {
             no_color,
             dimmed,
             variant: Variant::Dark,
+            daltonized: false,
         }
     }
 
@@ -1014,6 +1110,35 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_follows_colorfgbg_and_defaults_to_dark() {
+        assert_eq!(auto_variant_name(Some("0;15")), "light");
+        assert_eq!(auto_variant_name(Some("15;0")), "dark");
+        assert_eq!(auto_variant_name(Some("default;default")), "dark");
+        assert_eq!(auto_variant_name(None), "dark");
+    }
+
+    #[test]
+    fn a_daltonized_theme_trades_green_and_red_for_blue_and_orange() {
+        let base = Theme::da_vinci(ColorDepth::TrueColor, false);
+        let plain = base.cc();
+        let safe = base.with_name("daltonized");
+        assert!(safe.daltonized);
+        assert_ne!(safe.cc().success, plain.success);
+        assert_ne!(safe.cc().diff_del, plain.diff_del);
+        assert_ne!(safe.error, base.error);
+        // The light palette can be daltonized too, and NO_COLOR is left alone.
+        assert!(base.with_name("light-daltonized").daltonized);
+        let mono = Theme::da_vinci(ColorDepth::TrueColor, true);
+        assert_eq!(mono.with_name("daltonized").cc(), mono.cc());
+    }
+
+    #[test]
+    fn ansi_uses_only_the_named_sixteen() {
+        let theme = Theme::da_vinci(ColorDepth::TrueColor, false).with_name("ansi");
+        assert_eq!(theme.depth_hint(), ColorDepth::Basic);
+    }
 
     #[test]
     fn vox_switches_and_preserves_terminal_capabilities() {

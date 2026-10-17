@@ -682,6 +682,16 @@ pub enum Entry {
     Subagents(Vec<SubagentRow>),
 }
 
+/// A shell command that has been started and not yet come back.
+#[derive(Debug, Clone)]
+pub struct ShellRun {
+    /// The transcript row of its tool call.
+    pub index: usize,
+    pub started: std::time::Instant,
+    /// The command as written, every line of it.
+    pub command: String,
+}
+
 /// One delegated worker's progress, as drawn under its `agent` call.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SubagentRow {
@@ -1863,6 +1873,9 @@ pub struct ExtensionRow {
     /// What the row is filed under (a plugin key, `Your skills`). A tab whose
     /// rows carry one draws a collapsible heading per group; empty means none.
     pub group: String,
+    /// What the row costs the context window each turn, in estimated tokens;
+    /// 0 when the host does not say (only skills do).
+    pub tokens: u64,
     pub can_update: bool,
     pub can_toggle: bool,
     pub can_approve: bool,
@@ -2682,6 +2695,9 @@ pub struct Startup {
 
 /// Where the session lives, and what it costs. Every field here is shown as a
 /// meter or a labelled unit, never as a bare number (design.md §9).
+/// How long a footer toast stays.
+pub const TOAST_SECONDS: u64 = 4;
+
 #[derive(Debug, Clone)]
 pub struct Model {
     pub width: u16,
@@ -2703,6 +2719,24 @@ pub struct Model {
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
     pub caret_moved_at: u64,
+    /// The stored `caretBlink` setting. On unless turned off, as in Claude Code; a steady caret
+    /// saves the redraw each phase costs.
+    pub caret_blink: bool,
+    /// The stored `autoScroll` setting: follow the newest output as it
+    /// arrives. When off, a view at the newest stays where it was.
+    pub auto_scroll: bool,
+    /// Whether the terminal last reported focus (DEC mode 1004). A window in
+    /// the background shows no caret, so the active window is unambiguous.
+    pub terminal_focused: bool,
+    /// The terminal's own cursor sits at the caret instead of a painted cell
+    /// (`showHardwareCursor`, `DAVINCI_NATIVE_CURSOR`). Its shape and blink
+    /// are then the terminal's settings, not ours.
+    pub native_cursor: bool,
+    /// A short note in the footer's right corner, such as which way a copy
+    /// went. It shows for [`TOAST_SECONDS`] and then gives the corner back.
+    pub toast: Option<(String, std::time::Instant)>,
+    /// Notes waiting for the corner; each shows for [`TOAST_SECONDS`] in turn.
+    pub toast_queue: std::collections::VecDeque<String>,
     /// The typewriter on the newest reply, when one is being written.
     pub reveal: Option<Reveal>,
     /// When the reveal last stepped; the step is sized from real time.
@@ -2762,6 +2796,10 @@ pub struct Model {
     /// The working line's numbers while a turn is under way. `None` between
     /// turns, which is what takes the row off the window.
     pub working: Option<Working>,
+    /// Shell commands in flight, oldest first. The transcript row holds only
+    /// the first line of a command; the live "Running N shell commands" block
+    /// draws the rest from here.
+    pub shell_runs: Vec<ShellRun>,
 
     pub palette_index: usize,
     pub session_index: usize,
@@ -2888,6 +2926,8 @@ pub struct Model {
     /// `3d` — provider credentials, and the grant in flight if any.
     pub providers: Vec<ProviderRow>,
     pub login_index: usize,
+    /// What `/login` narrows its providers to; typed with the list open.
+    pub login_query: String,
     pub device_code: Option<DeviceCode>,
     /// `3e` — the keymap, and how far it is scrolled.
     pub keymap: Vec<KeymapGroup>,
@@ -2945,6 +2985,40 @@ pub struct Model {
     /// drop a scroll the conversation no longer supports (see
     /// [`TranscriptScroll`]) without every caller having to.
     pub transcript_scroll: std::cell::Cell<TranscriptScroll>,
+    /// Where sent prompts are kept between sessions, when a project has one.
+    pub history_store: Option<crate::history_store::HistoryStore>,
+    /// The Ctrl+R search over earlier prompts, while it is open.
+    pub history_search: Option<HistorySearch>,
+    /// The footer item holding keyboard focus (down from an empty prompt).
+    pub footer_focus: Option<usize>,
+    /// The footer item `x` has asked to stop; a second `x` confirms.
+    pub footer_stop_armed: Option<usize>,
+    /// The checklist band above the composer (`ctrl+t`).
+    pub checklist_open: bool,
+    /// `ctrl+x` pressed: a following `ctrl+e` edits the draft in `$EDITOR`.
+    pub chord_x: Option<std::time::Instant>,
+    /// The draft is to be edited in `$VISUAL`/`$EDITOR`; the shell, which
+    /// owns the terminal, takes this and runs the editor.
+    pub external_edit_requested: bool,
+    /// The pull request for this branch, when `gh` found one.
+    pub pr_badge: Option<PrBadge>,
+    /// When ctrl+d was last pressed on an empty composer: a second press
+    /// within [`QUIT_WINDOW`] leaves.
+    pub quit_armed: Option<std::time::Instant>,
+    /// Terminal work for the runtime to do before the next frame.
+    pub terminal_task: Option<TerminalTask>,
+    /// The last drawn frame's pointer targets; empty until the first draw.
+    pub hit_cache: std::cell::RefCell<Option<HitCache>>,
+    /// Where the composer drew its text, as of the last frame.
+    pub composer_hit: std::cell::Cell<Option<ComposerHit>>,
+    /// Prompts sent in this run, newest first.
+    pub session_history: Vec<String>,
+    /// Every project's prompts, read when the search first asks for them.
+    pub history_all: Option<Vec<String>>,
+    /// The Ctrl+O transcript viewer, while it is open.
+    pub viewer: Option<super::views::viewer::TranscriptViewer>,
+    /// Terminal work the viewer asked for, done before the next frame.
+    pub viewer_task: Option<super::views::viewer::ViewerTask>,
     /// What the command sheets state about the session (design.md §11).
     pub facts: Facts,
 }
@@ -3122,6 +3196,131 @@ impl<'a> IntoIterator for &'a EntryLog {
     }
 }
 
+/// Where the composer's text rows sit in what it last drew, so a click can
+/// find the visual row under the pointer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComposerHit {
+    /// Index, within the composer's rows, of the first text row drawn.
+    pub first: usize,
+    /// Visual row drawn first, and one past the last.
+    pub start: usize,
+    pub end: usize,
+    /// Cells the text wraps at.
+    pub wrap: usize,
+    /// A leading `!` is drawn as the prompt glyph, not as text.
+    pub shell: bool,
+}
+
+/// The pull request open for the current branch, as `gh pr view` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrBadge {
+    pub number: u64,
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    pub state: String,
+    /// `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED` or empty.
+    pub review: String,
+    pub draft: bool,
+    pub url: String,
+}
+
+impl PrBadge {
+    /// Read the JSON of `gh pr view --json number,state,reviewDecision,isDraft,url`.
+    pub fn parse(json: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Some(Self {
+            number: value.get("number")?.as_u64()?,
+            state: text("state"),
+            review: text("reviewDecision"),
+            draft: value
+                .get("isDraft")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            url: text("url"),
+        })
+    }
+
+    /// What the footer says: `PR #12`, with the state when it is not open.
+    pub fn label(&self) -> String {
+        match (self.state.as_str(), self.draft) {
+            ("MERGED", _) => format!("PR #{} merged", self.number),
+            ("CLOSED", _) => format!("PR #{} closed", self.number),
+            (_, true) => format!("PR #{} draft", self.number),
+            _ => format!("PR #{}", self.number),
+        }
+    }
+}
+
+/// How long after a first ctrl+d a second one still counts.
+pub const QUIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Something only the runtime can do to the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTask {
+    /// Repaint every cell (ctrl+l).
+    Redraw,
+    /// Hand the terminal back and stop the process until it is continued
+    /// (ctrl+z).
+    Suspend,
+}
+
+/// What the last drawn frame offered to the pointer, so a click or a wheel
+/// notch is tested against the screen as the user saw it rather than
+/// composing the whole frame again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HitCache {
+    pub targets: Vec<super::app::HitTarget>,
+    pub suggestion_rows: Option<std::ops::Range<u16>>,
+}
+
+/// The reverse search over earlier prompts: what was typed, and which match
+/// (newest first) is marked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorySearch {
+    pub query: String,
+    pub selected: usize,
+    pub scope: HistoryScope,
+}
+
+/// Whose prompts the history search reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// Sent since davinci started.
+    Session,
+    /// Everything kept for this project.
+    #[default]
+    Project,
+    /// Every project.
+    All,
+}
+
+impl HistoryScope {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Session => Self::Project,
+            Self::Project => Self::All,
+            Self::All => Self::Session,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Project => "project",
+            Self::All => "all projects",
+        }
+    }
+}
+
+/// Matches shown at once.
+pub const HISTORY_SHOWN: usize = 6;
+
 /// Where the conversation is scrolled to, anchored from the top: `top` is
 /// the first row drawn, and `None` follows the newest. Rows that arrive or
 /// settle below the view (a turn streaming in, a group of calls collapsing
@@ -3188,6 +3387,12 @@ impl Model {
             overlay_offset: None,
             section_notice: None,
             caret_moved_at: 0,
+            caret_blink: false,
+            auto_scroll: true,
+            terminal_focused: true,
+            native_cursor: false,
+            toast: None,
+            toast_queue: std::collections::VecDeque::new(),
             reveal: None,
             reveal_clock: None,
             reveal_floor: None,
@@ -3214,6 +3419,7 @@ impl Model {
             exit_armed: false,
             clear_armed: None,
             working: None,
+            shell_runs: Vec::new(),
             palette_index: 0,
             session_index: 0,
             model_index: 0,
@@ -3284,6 +3490,7 @@ impl Model {
             thinking_index: 0,
             providers: Vec::new(),
             login_index: 0,
+            login_query: String::new(),
             device_code: None,
             keymap: Vec::new(),
             keys_offset: 0,
@@ -3318,6 +3525,22 @@ impl Model {
             context_inspector: None,
             context_inspector_index: 0,
             transcript_scroll: std::cell::Cell::default(),
+            history_store: None,
+            history_search: None,
+            footer_focus: None,
+            footer_stop_armed: None,
+            checklist_open: false,
+            chord_x: None,
+            external_edit_requested: false,
+            pr_badge: None,
+            quit_armed: None,
+            terminal_task: None,
+            hit_cache: std::cell::RefCell::new(None),
+            composer_hit: std::cell::Cell::new(None),
+            session_history: Vec::new(),
+            history_all: None,
+            viewer: None,
+            viewer_task: None,
             facts: Facts::default(),
         }
     }
@@ -3514,8 +3737,34 @@ impl Model {
     /// One step of the shared 250ms clock. Besides bumping `tick`, it rolls
     /// the working line's token counter toward its real value while
     /// animation is on, so every event loop animates the number the same way.
+    /// Show `note` in the footer corner now, or after the one showing.
+    pub fn push_toast(&mut self, note: String) {
+        let showing = self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < std::time::Duration::from_secs(TOAST_SECONDS));
+        if showing {
+            // Repeats of the note already waiting add nothing.
+            if self.toast_queue.back() != Some(&note) {
+                self.toast_queue.push_back(note);
+            }
+        } else {
+            self.toast = Some((note, std::time::Instant::now()));
+        }
+        self.dirty = true;
+    }
+
     pub fn advance_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        let expired = self
+            .toast
+            .as_ref()
+            .is_none_or(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(TOAST_SECONDS));
+        if expired {
+            if let Some(next) = self.toast_queue.pop_front() {
+                self.toast = Some((next, std::time::Instant::now()));
+            }
+        }
         self.advance_reveal();
         // A running tool or an open prompt is work the token stream cannot
         // see; neither is a stall.
@@ -3733,10 +3982,17 @@ impl Model {
     /// resumes blinking a full phase after the composer goes still. A caret
     /// that winks out mid-motion reads as a dropped keystroke.
     pub fn blink(&self) -> bool {
-        if !self.animate {
+        if !self.animate || !self.caret_blink {
             return true;
         }
         (self.tick.wrapping_sub(self.caret_moved_at) / 4) % 2 == 0
+    }
+
+    /// Whether the painted caret cell is drawn this frame: never under the
+    /// terminal's own cursor, never while the window is in the background,
+    /// and otherwise steady unless `caretBlink` asked for the blink phase.
+    pub fn caret_lit(&self) -> bool {
+        !self.native_cursor && self.terminal_focused && self.blink()
     }
 
     /// Restart the blink phase: the caret is somewhere new, so it is drawn
@@ -4082,6 +4338,132 @@ impl Model {
         true
     }
 
+    /// Put the caret on the cell a click landed on in visual row `row` of the
+    /// composer, `column` cells in from the left of the text.
+    pub fn place_caret(&mut self, row: usize, column: usize) {
+        let Some(hit) = self.composer_hit.get() else {
+            return;
+        };
+        let editor = self.composer.editor();
+        let Some(&(line, from, length)) = editor.visual_rows(hit.wrap).get(row) else {
+            return;
+        };
+        let buffer = editor.get_text();
+        let line_start: usize = buffer.split('\n').take(line).map(|l| l.len() + 1).sum();
+        let text = buffer.get(line_start..).unwrap_or_default();
+        let text = text.split('\n').next().unwrap_or_default();
+        let shown = text
+            .get(from..(from + length).min(text.len()))
+            .unwrap_or_default();
+        let skip = usize::from(hit.shell && line == 0 && from == 0 && shown.starts_with('!'));
+        let mut cells = 0;
+        let mut offset = skip;
+        for (at, grapheme) in
+            unicode_segmentation::UnicodeSegmentation::grapheme_indices(&shown[skip..], true)
+        {
+            let width = unicode_width::UnicodeWidthStr::width(grapheme);
+            if cells + width > column {
+                break;
+            }
+            cells += width;
+            offset = skip + at + grapheme.len();
+        }
+        self.mark_caret_moved();
+        self.composer.editor_mut().cursor = line_start + from + offset;
+    }
+
+    /// Open the search over earlier prompts (Ctrl+R). Only from a bare
+    /// conversation composer, where nothing else claims the row above it.
+    pub fn open_history_search(&mut self) -> bool {
+        if self.screen != Screen::Agent
+            || self.overlay.is_some()
+            || self.history_search.is_some()
+            || (self.composer.editor().history.is_empty() && self.session_history.is_empty())
+        {
+            return false;
+        }
+        self.dismiss_suggestions();
+        self.history_search = Some(HistorySearch::default());
+        true
+    }
+
+    /// Earlier prompts containing every word of the query, newest first.
+    pub fn history_matches(&self) -> Vec<&str> {
+        let Some(search) = &self.history_search else {
+            return Vec::new();
+        };
+        let words: Vec<String> = search
+            .query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        let source: &[String] = match search.scope {
+            HistoryScope::Session => &self.session_history,
+            HistoryScope::Project => &self.composer.editor().history,
+            HistoryScope::All => self.history_all.as_deref().unwrap_or_default(),
+        };
+        source
+            .iter()
+            .filter(|entry| {
+                let lower = entry.to_lowercase();
+                words.iter().all(|word| lower.contains(word))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Search the next scope: session, project, every project.
+    pub fn history_search_scope(&mut self) {
+        let Some(search) = &mut self.history_search else {
+            return;
+        };
+        search.scope = search.scope.next();
+        search.selected = 0;
+        if search.scope == HistoryScope::All && self.history_all.is_none() {
+            self.history_all = self.history_store.as_ref().map(|store| store.load_all());
+        }
+    }
+
+    /// Move the mark through the matches (positive is older), staying inside.
+    pub fn history_search_move(&mut self, delta: isize) {
+        let count = self.history_matches().len();
+        if let Some(search) = &mut self.history_search {
+            search.selected = search
+                .selected
+                .saturating_add_signed(delta)
+                .min(count.saturating_sub(1));
+        }
+    }
+
+    /// Put match `index` into the composer and close the search.
+    pub fn history_search_accept(&mut self, index: usize) -> bool {
+        let Some(text) = self
+            .history_matches()
+            .get(index)
+            .map(|text| text.to_string())
+        else {
+            return false;
+        };
+        self.history_search = None;
+        self.mark_caret_moved();
+        self.composer.set_text(text);
+        let end = self.composer.editor().buffer.len();
+        self.composer.editor_mut().cursor = end;
+        true
+    }
+
+    /// Keep a sent prompt for later sessions in this project.
+    fn remember(&mut self, text: &str) {
+        let text = text.trim();
+        if !text.is_empty() && self.session_history.first().map(String::as_str) != Some(text) {
+            self.session_history.insert(0, text.to_owned());
+        }
+        self.history_all = None;
+        if let Some(store) = &self.history_store {
+            store.append(text);
+        }
+    }
+
     /// Enter sends. An empty composer sends nothing.
     ///
     /// The line goes through [`Editor::submit`], which is what records it in
@@ -4093,6 +4475,7 @@ impl Model {
         }
         self.mark_caret_moved();
         let text = self.composer.editor_mut().submit();
+        self.remember(&text);
         self.dismiss_suggestions();
         // Sending a turn returns to the newest, where its answer lands.
         self.transcript_scroll.take();
@@ -4114,6 +4497,7 @@ impl Model {
         }
         self.mark_caret_moved();
         let text = self.composer.editor_mut().submit();
+        self.remember(&text);
         self.queued.push(text);
         self.dismiss_suggestions();
         true
@@ -4256,6 +4640,20 @@ pub fn wrap_index(index: usize, delta: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pull_request_reads_from_gh_json() {
+        let json = r#"{"number":42,"state":"OPEN","reviewDecision":"APPROVED","isDraft":false,"url":"https://github.com/a/b/pull/42"}"#;
+        let badge = PrBadge::parse(json).expect("a badge");
+        assert_eq!(badge.label(), "PR #42");
+        assert_eq!(badge.review, "APPROVED");
+        let merged = PrBadge::parse(r#"{"number":7,"state":"MERGED","url":""}"#).unwrap();
+        assert_eq!(merged.label(), "PR #7 merged");
+        let draft = PrBadge::parse(r#"{"number":8,"state":"OPEN","isDraft":true}"#).unwrap();
+        assert_eq!(draft.label(), "PR #8 draft");
+        assert!(PrBadge::parse("no pull requests found").is_none());
+        assert!(PrBadge::parse(r#"{"state":"OPEN"}"#).is_none());
+    }
 
     use crate::davinci::theme::ColorDepth;
 
@@ -4547,8 +4945,23 @@ mod tests {
     }
 
     #[test]
+    fn the_caret_is_steady_by_default_and_hidden_when_unfocused_or_native() {
+        let mut m = model(120);
+        for tick in 0..9 {
+            m.tick = tick;
+            assert!(m.caret_lit(), "steady at tick {tick}");
+        }
+        m.terminal_focused = false;
+        assert!(!m.caret_lit(), "a background window shows no caret");
+        m.terminal_focused = true;
+        m.native_cursor = true;
+        assert!(!m.caret_lit(), "the terminal's cursor stands in for it");
+    }
+
+    #[test]
     fn the_caret_blinks_off_the_shared_clock_and_freezes_when_still() {
         let mut m = model(120);
+        m.caret_blink = true;
         let phases: Vec<bool> = (0..9)
             .map(|tick| {
                 m.tick = tick;
@@ -4568,6 +4981,7 @@ mod tests {
     #[test]
     fn a_caret_being_moved_does_not_blink() {
         let mut m = model(120);
+        m.caret_blink = true;
         m.type_char("hello");
         // Six ticks after the last keystroke would be the dark half of the
         // phase if the phase ran from zero.

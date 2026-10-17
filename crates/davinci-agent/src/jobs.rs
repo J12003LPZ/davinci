@@ -1404,6 +1404,28 @@ mod tests {
     }
 
     #[test]
+    fn kill_all_stops_every_running_job_and_leaves_finished_ones_alone() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let script = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        };
+        let first = book.lock().unwrap().register("one", spawn(script));
+        let second = book.lock().unwrap().register("two", spawn(script));
+        assert_eq!(book.lock().unwrap().running(), 2);
+        book.lock().unwrap().kill_all();
+        for id in [first, second] {
+            let status = book.lock().unwrap().get(id).unwrap().status();
+            assert!(
+                matches!(status, JobStatus::Killed | JobStatus::Exited(_)),
+                "{status:?}"
+            );
+        }
+        assert_eq!(book.lock().unwrap().running(), 0);
+    }
+
+    #[test]
     fn the_buffer_drops_its_head_past_the_cap_and_says_so() {
         let mut buffer = OutputBuffer::default();
         let line = "x".repeat(1023) + "\n";

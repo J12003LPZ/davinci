@@ -30,7 +30,7 @@ pub fn copy_text_dry_run() -> bool {
     ) || open_browser_dry_run()
 }
 
-/// Copy text without a shell, matching TS clipboard helpers (`pbcopy` / `xclip` / `clip`).
+/// Copy text without a shell, by [`crate::clipboard`]'s route for this session.
 /// Returns a description of what happened; a failure says so instead of
 /// claiming the clipboard holds the text.
 pub fn copy_text(text: &str) -> String {
@@ -44,33 +44,7 @@ pub fn try_copy_text(text: &str) -> Result<String, String> {
     if copy_text_dry_run() {
         return Ok(format!("copy:{text}"));
     }
-    let (cmd, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("pbcopy", vec![])
-    } else if cfg!(target_os = "windows") {
-        ("clip", vec![])
-    } else {
-        ("xclip", vec!["-selection", "clipboard"])
-    };
-    let mut child = Command::new(cmd)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("could not run {cmd}: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|err| format!("could not write to {cmd}: {err}"))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|err| format!("could not wait for {cmd}: {err}"))?;
-    if !status.success() {
-        return Err(format!("{cmd} exited with {status}"));
-    }
-    Ok(format!("{cmd} clipboard"))
+    crate::clipboard::copy(text).map(|path| format!("copied via {path}"))
 }
 
 /// Opens `target`; the returned text names the command, or says the launch

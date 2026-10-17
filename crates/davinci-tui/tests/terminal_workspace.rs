@@ -144,12 +144,17 @@ fn ctrl_e_is_a_line_motion_not_an_unrelated_panel() {
 }
 
 #[test]
-fn ctrl_o_expands_tool_output_instead_of_changing_models() {
+fn ctrl_o_opens_the_transcript_and_alt_o_expands_tool_output_in_place() {
     let mut m = model();
     let expanded = m.show_tool_output;
     control(&mut m, 'o');
-    assert_eq!(m.show_tool_output, !expanded);
+    assert!(m.viewer.is_some());
+    assert_eq!(m.show_tool_output, expanded);
     assert!(m.overlay.is_none());
+    key(&mut m, KeyCode::Char('q'));
+    assert!(m.viewer.is_none());
+    app::handle_key(&mut m, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
+    assert_eq!(m.show_tool_output, !expanded);
 }
 
 #[test]

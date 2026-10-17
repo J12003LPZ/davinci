@@ -9,7 +9,7 @@ use crate::undo_stack::UndoStack;
 use crate::word_wrap::{grapheme_segments, word_wrap_line, Segment};
 use crate::CURSOR_MARKER;
 
-const HISTORY_LIMIT: usize = 100;
+const HISTORY_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LastAction {
@@ -104,6 +104,15 @@ impl Editor {
         self.last_width.set(width.max(1));
     }
 
+    /// The buffer as visual rows at `width` cells, the same rows Up and Down
+    /// move between: `(logical line, first byte, byte length)` per row.
+    pub fn visual_rows(&self, width: usize) -> Vec<(usize, usize, usize)> {
+        self.build_visual_line_map(width.max(1))
+            .into_iter()
+            .map(|row| (row.logical_line, row.start_col, row.length))
+            .collect()
+    }
+
     pub fn get_text(&self) -> &str {
         &self.buffer
     }
@@ -114,6 +123,13 @@ impl Editor {
 
     pub fn get_cursor(&self) -> (usize, usize) {
         cursor_line_col(&self.buffer, self.cursor)
+    }
+
+    /// Replace the recalled history with `entries`, newest first.
+    pub fn load_history(&mut self, mut entries: Vec<String>) {
+        entries.truncate(HISTORY_LIMIT);
+        self.history = entries;
+        self.exit_history_browsing();
     }
 
     pub fn add_to_history(&mut self, text: &str) {
@@ -1455,10 +1471,10 @@ mod tests {
 
         editor.set_text("");
         editor.history.clear();
-        for i in 0..105 {
+        for i in 0..(HISTORY_LIMIT + 5) {
             editor.add_to_history(&format!("prompt {i}"));
         }
-        for _ in 0..100 {
+        for _ in 0..HISTORY_LIMIT {
             editor.cursor_up();
         }
         assert_eq!(editor.get_text(), "prompt 5");

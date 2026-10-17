@@ -116,6 +116,8 @@ fn a_conversation_that_fits_has_no_scrollbar_and_ignores_the_wheel() {
 
 #[test]
 fn the_wheel_scrolls_back_and_forth() {
+    // Notches here arrive at once; acceleration has its own test.
+    std::env::set_var("DAVINCI_SCROLL_ACCEL_OFF", "1");
     let mut m = model(60);
     assert!(shows(&m, "turn 059"));
     let mut grab = None;
@@ -155,8 +157,9 @@ fn page_keys_scroll_a_one_row_draft_but_not_a_longer_one() {
     m.composer.set_text("draft");
     press(&mut m, KeyCode::PageUp);
     let page = offset(&m);
-    // Two rows short of the view: one of overlap, one under the notice.
-    assert_eq!(page, usize::from(bar(&m).height) - 2);
+    // Three rows short of the view: one of overlap, one under the notice,
+    // one for the prompt header.
+    assert_eq!(page, usize::from(bar(&m).height) - 3);
     press(&mut m, KeyCode::PageDown);
     assert_eq!(offset(&m), 0);
     assert_eq!(m.composer.editor().get_text(), "draft");
@@ -378,6 +381,8 @@ fn over_a_list_the_wheel_moves_the_selection() {
 /// completion list floats over the conversation.
 #[test]
 fn the_wheel_over_the_completion_list_steps_it_and_elsewhere_scrolls_the_conversation() {
+    // Notches here arrive at once; acceleration has its own test.
+    std::env::set_var("DAVINCI_SCROLL_ACCEL_OFF", "1");
     let mut m = model(60);
     davinci_tui::davinci::fixtures::dress(&mut m);
     m.transcript.clear();

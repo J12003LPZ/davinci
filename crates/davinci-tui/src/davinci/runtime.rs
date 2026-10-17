@@ -10,15 +10,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::Show;
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -29,7 +31,9 @@ use unicode_width::UnicodeWidthChar;
 
 use super::app::{self, Flow};
 use super::model::Model;
+use super::model::TerminalTask;
 use super::views::scrollbar::Scrollbar;
+use super::views::viewer::ViewerTask;
 
 /// One frame of the clock. Both animations are derived from it.
 pub const TICK: Duration = Duration::from_millis(250);
@@ -140,7 +144,7 @@ pub fn restore() -> io::Result<()> {
             let _ = execute!(io::stdout(), event::DisableMouseCapture);
         }
     }
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste);
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
     io::stdout().flush()
@@ -358,13 +362,87 @@ pub struct Session {
     keyboard: Keyboard,
     paste: PasteFilter,
     rendered_lines: Vec<String>,
-    selection_anchor: Option<(u16, u16)>,
-    selection_focus: Option<(u16, u16)>,
+    selector: super::selection::Selector,
     /// While the conversation's scrollbar is held: the thumb row grabbed.
     scrollbar_grab: Option<u16>,
     /// The conversation's scrollbar as last drawn, for hit-testing the
     /// pointer against what is actually on screen.
     scrollbar: Option<Scrollbar>,
+    /// What the terminal last said about focus (mode 1004). Terminals that
+    /// never report focus leave it `true`.
+    focused: bool,
+    /// How frames reach the terminal, read once from the environment.
+    output: Output,
+    /// Whether a path named on screen exists, so a frame does not stat the
+    /// same files again: when it was asked, and the answer.
+    path_cache: std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
+    /// Draw-time statistics: show them (`DAVINCI_FRAME_STATS=1`) and their
+    /// moving average in microseconds.
+    frame_stats: bool,
+    frame_micros: f64,
+    /// Entries in the conversation at the last draw, for `autoScroll`.
+    drawn_entries: usize,
+    /// Keys the shell raises on the user's behalf (a click on an option is
+    /// an enter), handed out ahead of the terminal's own events.
+    injected: VecDeque<Event>,
+}
+
+/// Frame delivery choices, fixed for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    /// Wrap each frame in DEC mode 2026 so the terminal shows it whole.
+    /// Terminals without the mode ignore it; `DAVINCI_SYNC_OUTPUT=0` stops it.
+    pub synchronized: bool,
+    /// Repaint every cell each frame, for ConPTY hosts that mis-coalesce
+    /// positioned writes and leave stale fragments (`DAVINCI_FULL_REPAINT=1`).
+    pub full_repaint: bool,
+    /// Show the terminal's cursor at the caret instead of painting a cell
+    /// (`DAVINCI_NATIVE_CURSOR=1`, or the `showHardwareCursor` setting).
+    pub native_cursor: bool,
+}
+
+impl Output {
+    /// Read from an environment lookup, so tests need not touch the process.
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        let flag = |name: &str| {
+            get(name).map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off"
+                )
+            })
+        };
+        Self {
+            synchronized: flag("DAVINCI_SYNC_OUTPUT").unwrap_or(true),
+            full_repaint: flag("DAVINCI_FULL_REPAINT").unwrap_or(false),
+            native_cursor: flag("DAVINCI_NATIVE_CURSOR").unwrap_or(false),
+        }
+    }
+}
+
+/// Open a frame: the terminal holds what follows until [`finish_frame`].
+fn begin_frame(out: &mut impl Write, output: Output) -> io::Result<()> {
+    if output.synchronized {
+        crossterm::queue!(out, BeginSynchronizedUpdate)?;
+    }
+    Ok(())
+}
+
+/// Close a frame: park the cursor on the caret, where an input method's
+/// candidate window and a magnifier will look for it. It stays hidden unless
+/// the terminal's own cursor is standing in for the painted caret.
+fn finish_frame(out: &mut impl Write, output: Output, caret: Option<(u16, u16)>) -> io::Result<()> {
+    match caret {
+        Some((column, row)) if output.native_cursor => {
+            crossterm::queue!(out, MoveTo(column, row), Show)?
+        }
+        Some((column, row)) => crossterm::queue!(out, Hide, MoveTo(column, row))?,
+        None => crossterm::queue!(out, Hide)?,
+    }
+    if output.synchronized {
+        crossterm::queue!(out, EndSynchronizedUpdate)?;
+    }
+    out.flush()
 }
 
 impl Session {
@@ -378,7 +456,7 @@ impl Session {
             HELD.store(true, Ordering::SeqCst);
             let mut out = io::stdout();
             execute!(out, EnterAlternateScreen)?;
-            let _ = execute!(out, EnableBracketedPaste);
+            let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
             let disambiguated = supports_keyboard_enhancement();
             if disambiguated {
                 execute!(
@@ -408,11 +486,24 @@ impl Session {
                 ..PasteFilter::default()
             },
             rendered_lines: Vec::new(),
-            selection_anchor: None,
-            selection_focus: None,
+            selector: super::selection::Selector::default(),
             scrollbar_grab: None,
+            path_cache: std::collections::HashMap::new(),
+            frame_stats: env_flag("DAVINCI_FRAME_STATS"),
+            frame_micros: 0.0,
+            drawn_entries: 0,
+            injected: VecDeque::new(),
             scrollbar: None,
+            focused: true,
+            output: Output::from_env(|name| std::env::var(name).ok()),
         })
+    }
+
+    /// Use the terminal's own cursor at the caret (the `showHardwareCursor`
+    /// setting); the environment can turn it on but a setting cannot turn
+    /// the environment's choice off.
+    pub fn set_native_cursor(&mut self, native: bool) {
+        self.output.native_cursor |= native;
     }
 
     /// Take the terminal again after something else gave it back — the panic
@@ -428,7 +519,7 @@ impl Session {
         HELD.store(true, Ordering::SeqCst);
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen)?;
-        let _ = execute!(out, EnableBracketedPaste);
+        let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
         if self.keyboard.disambiguated {
             let _ = execute!(
                 out,
@@ -437,6 +528,46 @@ impl Session {
             DISAMBIGUATED.store(true, Ordering::SeqCst);
         }
         self.terminal.clear()
+    }
+
+    /// ctrl+z: give the terminal back, stop until the shell continues the
+    /// process, then take it again with every mode re-asserted.
+    fn suspend(&mut self) -> io::Result<()> {
+        restore()?;
+        #[cfg(unix)]
+        {
+            let pid = std::process::id().to_string();
+            // SIGSTOP returns control here once the job is continued.
+            let _ = std::process::Command::new("kill")
+                .args(["-STOP", &pid])
+                .status();
+        }
+        self.reacquire()
+    }
+
+    /// Terminal work the transcript viewer asked for: give the screen back,
+    /// do it, take the screen again.
+    fn run_viewer_task(&mut self, task: ViewerTask, model: &mut Model) -> io::Result<()> {
+        restore()?;
+        let note = match task {
+            ViewerTask::Scrollback(text) => {
+                scrollback_dump(&text).map(|()| "transcript written to scrollback".to_owned())
+            }
+            ViewerTask::Editor(text) => {
+                open_in_editor(&text).map(|editor| format!("closed {editor}"))
+            }
+        };
+        self.reacquire()?;
+        model.push_toast(note.unwrap_or_else(|err| format!("transcript: {err}")));
+        Ok(())
+    }
+
+    /// Give the terminal to something else (an editor) and take it back.
+    pub fn run_external<R>(&mut self, job: impl FnOnce() -> R) -> io::Result<R> {
+        restore()?;
+        let out = job();
+        self.reacquire()?;
+        Ok(out)
     }
 
     /// Forget what is on screen so the next draw paints every cell: for when
@@ -451,6 +582,19 @@ impl Session {
     /// delivers as a burst of keys (Windows; see [`PasteFilter`]) is
     /// reassembled into the one [`Event::Paste`] the model expects.
     pub fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        let event = self.poll_event_inner(timeout)?;
+        match event {
+            Some(Event::FocusGained) => self.focused = true,
+            Some(Event::FocusLost) => self.focused = false,
+            _ => {}
+        }
+        Ok(event)
+    }
+
+    fn poll_event_inner(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        if let Some(event) = self.injected.pop_front() {
+            return Ok(Some(event));
+        }
         // Dropped mouse-motion events must consume the caller's existing wait,
         // not start a fresh full timeout. Otherwise continuous motion on
         // Windows can prevent the turn loop from reaching its next tick.
@@ -531,11 +675,19 @@ impl Session {
     }
 
     /// Paint one frame.
-    pub fn draw(&mut self, model: &Model) -> io::Result<()> {
+    pub fn draw(&mut self, model: &mut Model) -> io::Result<()> {
         if !HELD.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let mouse = true;
+        if let Some(task) = model.viewer_task.take() {
+            self.run_viewer_task(task, model)?;
+        }
+        match model.terminal_task.take() {
+            Some(TerminalTask::Redraw) => self.terminal.clear()?,
+            Some(TerminalTask::Suspend) => self.suspend()?,
+            None => {}
+        }
+        let mouse = !env_flag("DAVINCI_DISABLE_MOUSE");
         if mouse != MOUSE.load(Ordering::SeqCst) {
             #[cfg(unix)]
             {
@@ -553,105 +705,323 @@ impl Session {
             }
             MOUSE.store(mouse, Ordering::SeqCst);
         }
+        pin_unless_auto_scroll(model, self.scrollbar, self.drawn_entries);
+        self.drawn_entries = model.transcript.len();
+        model.terminal_focused = self.focused;
+        model.native_cursor = self.output.native_cursor;
+        let model: &Model = model;
+        let output = self.output;
+        if output.full_repaint {
+            self.terminal.clear()?;
+        }
+        begin_frame(self.terminal.backend_mut(), output)?;
+        let mut caret = None;
         let background = Style::default().bg(model.theme.background);
         let mut rendered_lines = Vec::new();
         let mut scrollbar = None;
-        let selection = self.selection_range();
+        let selection_bg = model.theme.cc().selection_bg;
+        let selector = &mut self.selector;
+        let started = Instant::now();
+        let mut hits = None;
+        let show_stats = self.frame_stats;
+        let average = self.frame_micros;
+        let hyperlinks = !env_flag("DAVINCI_DISABLE_HYPERLINKS");
+        let mut linked: Vec<LinkedCells> = Vec::new();
+        let path_cache = &mut self.path_cache;
         self.terminal.draw(|frame| {
             let area: Rect = frame.area();
             let composed = app::compose_frame(model, area.height);
             rendered_lines = composed.lines.iter().map(ToString::to_string).collect();
             scrollbar = composed.scrollbar;
+            caret = composed.caret;
+            hits = Some(super::model::HitCache {
+                targets: composed.targets.clone(),
+                suggestion_rows: composed.suggestion_rows.clone(),
+            });
             if let Some(bar) = &scrollbar {
                 strip_scrollbar(&mut rendered_lines, bar);
             }
+            selector.view = scrollbar
+                .as_ref()
+                .map(super::selection::View::from_scrollbar);
             frame.render_widget(Paragraph::new(composed.lines).style(background), area);
-            if let Some((start, end)) = selection {
-                for row in start.1..=end.1.min(area.height.saturating_sub(1)) {
-                    let left = if row == start.1 { start.0 } else { 0 };
-                    let right = if row == end.1 {
-                        end.0.saturating_add(1).min(area.width)
-                    } else {
-                        area.width
-                    };
-                    if right > left {
-                        frame.buffer_mut().set_style(
-                            Rect::new(left, row, right.saturating_sub(left), 1),
-                            Style::default().add_modifier(Modifier::REVERSED),
-                        );
+            if show_stats {
+                let text = format!(" frame {:.1}ms ", average / 1000.0);
+                let x = area.width.saturating_sub(text.len() as u16);
+                frame.buffer_mut().set_string(
+                    x,
+                    0,
+                    text,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                );
+            }
+            // Selected cells keep their own ink over the selection ground;
+            // with no colour at all they are drawn reversed.
+            let style = if selection_bg == ratatui::style::Color::Reset {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().bg(selection_bg)
+            };
+            for (row, left, right) in selector.highlights(&rendered_lines, area.width) {
+                if row < area.height {
+                    frame
+                        .buffer_mut()
+                        .set_style(Rect::new(left, row, right - left, 1), style);
+                }
+            }
+            if hyperlinks {
+                for (row, text) in rendered_lines
+                    .iter()
+                    .enumerate()
+                    .take(usize::from(area.height))
+                {
+                    for link in row_links(path_cache, text, pr_link(model)) {
+                        let buffer = frame.buffer_mut();
+                        let mut cells = Vec::new();
+                        let mut column = link.start;
+                        while column < link.end.min(area.width) {
+                            let Some(cell) = buffer.cell((column, row as u16)) else {
+                                break;
+                            };
+                            // A wide glyph owns the cell after it.
+                            let width = unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1);
+                            cells.push((column, row as u16, cell.clone()));
+                            column += width as u16;
+                        }
+                        linked.push((link.url, cells));
                     }
                 }
             }
         })?;
+        for (url, cells) in &linked {
+            write_hyperlink(self.terminal.backend_mut(), url, cells)?;
+        }
+        finish_frame(self.terminal.backend_mut(), output, caret)?;
+        // A moving average of how long a frame takes to compose and write,
+        // shown in the corner under DAVINCI_FRAME_STATS=1.
+        let micros = started.elapsed().as_secs_f64() * 1e6;
+        self.frame_micros = if self.frame_micros == 0.0 {
+            micros
+        } else {
+            self.frame_micros * 0.9 + micros * 0.1
+        };
+        *model.hit_cache.borrow_mut() = hits;
         self.rendered_lines = rendered_lines;
         self.scrollbar = scrollbar;
         Ok(())
     }
 
-    fn selection_range(&self) -> Option<((u16, u16), (u16, u16))> {
-        selection_span(self.selection_anchor?, self.selection_focus?)
-    }
-
-    /// Own left-drag selection while mouse reporting is enabled. Releasing the
-    /// button copies immediately, matching the upstream fullscreen terminal.
-    pub fn handle_mouse(&mut self, mouse: event::MouseEvent) -> bool {
+    /// A click on an option of the open question focuses it, and chooses it
+    /// as enter would — except a tool approval, which a stray click must
+    /// never grant: that only moves the focus.
+    /// A click on a row of the sessions or model picker chooses it. The row is
+    /// found by the name drawn on it, so a name the panel had to cut leaves
+    /// the click to do nothing rather than choose the wrong one.
+    fn click_overlay_row(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use super::model::Overlay;
         use event::{MouseButton::Left, MouseEventKind};
-        let point = (mouse.column, mouse.row);
-        match mouse.kind {
-            MouseEventKind::Down(Left) => {
-                self.selection_anchor = Some(point);
-                self.selection_focus = Some(point);
-                false
-            }
-            MouseEventKind::Drag(Left) if self.selection_anchor.is_some() => {
-                self.selection_focus = Some(point);
-                false
-            }
-            MouseEventKind::Up(Left) if self.selection_anchor.is_some() => {
-                self.selection_focus = Some(point);
-                if let Some(text) = self.selected_text() {
-                    crate::open_browser::copy_text(&text);
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
-    /// Graph interaction shares the composed geometry while other surfaces retain native text selection.
-    pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
-        if route_graph_mouse(model, mouse)
-            || route_scroll_mouse(model, &mut self.scrollbar_grab, self.scrollbar, mouse)
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse.modifiers.is_empty()
+            || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
         {
-            self.selection_anchor = None;
-            self.selection_focus = None;
             return false;
         }
-        self.handle_mouse(mouse)
+        let Some(row) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        match model.overlay {
+            Some(Overlay::Sessions) => {
+                let Some(index) = label_at(model.sessions.iter().map(|s| s.name.as_str()), row)
+                else {
+                    return false;
+                };
+                model.session_index = index;
+            }
+            Some(Overlay::Cogitator) => {
+                let Some(index) = label_at(model.models.iter().map(|m| m.name.as_str()), row)
+                else {
+                    return false;
+                };
+                model.model_index = index;
+            }
+            _ => return false,
+        }
+        model.overlay_offset = None;
+        model.dirty = true;
+        self.injected.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        true
     }
 
-    fn selected_text(&self) -> Option<String> {
-        let (start, end) = self.selection_range()?;
-        if start == end {
-            return None;
+    fn click_ask_option(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use super::model::Overlay;
+        use event::{MouseButton::Left, MouseEventKind};
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse.modifiers.is_empty()
+            || model.overlay != Some(Overlay::Ask)
+            || model.rewind_modal.is_some()
+            || model.decision_modal.is_some()
+            || model.approval_instructions.is_some()
+            || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
+        {
+            return false;
         }
-        let mut rows = Vec::new();
-        for row in start.1..=end.1 {
-            let line = self
-                .rendered_lines
-                .get(row as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            let from = if row == start.1 { start.0 as usize } else { 0 };
-            let to = if row == end.1 {
-                end.0.saturating_add(1) as usize
-            } else {
-                usize::MAX
-            };
-            rows.push(display_column_slice(line, from, to).trim_end().to_string());
+        let Some(row) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        let Some(index) = ask_option_at(&model.ask.items, row) else {
+            return false;
+        };
+        model.ask_index = index;
+        model.overlay_offset = None;
+        model.dirty = true;
+        if model.ask.key != "/permissions" {
+            self.injected.push_back(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
         }
-        let text = rows.join("\n");
-        (!text.is_empty()).then_some(text)
+        true
+    }
+
+    /// A click on a settings row focuses it and cycles its value as enter
+    /// would; a click on a folded tool result opens the tool output.
+    fn click_list_row(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use super::model::Screen;
+        use event::{MouseButton::Left, MouseEventKind};
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse.modifiers.is_empty()
+            || model.overlay.is_some()
+            || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
+        {
+            return false;
+        }
+        let Some(row) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        if model.screen == Screen::Settings && model.settings_tab == 1 && !model.settings_details {
+            let hit = settings_row_at(model, row);
+            if let Some(index) = hit {
+                model.settings_index = index;
+                model.section_offset = None;
+                model.dirty = true;
+                self.injected.push_back(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+                return true;
+            }
+            return false;
+        }
+        if model.screen == Screen::Agent && !model.show_tool_output && row.contains("to expand)") {
+            model.show_tool_output = true;
+            model.dirty = true;
+            return true;
+        }
+        false
+    }
+
+    /// Open the link under a Ctrl- or Cmd-click. `true` when there was one.
+    fn open_link_at(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use event::{MouseButton::Left, MouseEventKind};
+        if mouse.kind != MouseEventKind::Down(Left)
+            || !mouse
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            return false;
+        }
+        let Some(text) = self.rendered_lines.get(usize::from(mouse.row)) else {
+            return false;
+        };
+        let links = row_links(&mut self.path_cache, text, pr_link(model));
+        let Some(link) = super::links::at(&links, mouse.column) else {
+            return false;
+        };
+        let note = match super::links::opener_target(
+            &link.url,
+            |path| path.is_dir(),
+            |path| std::fs::canonicalize(path).ok(),
+        ) {
+            None => format!("could not open {}", link.url),
+            Some(target) => match crate::open_browser::try_open_browser(&target) {
+                Ok(_) if link.url.starts_with("file://") => format!("opened folder {target}"),
+                Ok(_) => format!("opened {}", link.url),
+                Err(err) => format!("could not open {target}: {err}"),
+            },
+        };
+        model.push_toast(note);
+        true
+    }
+
+    /// Copy on release, as the reference terminal does: text selected with
+    /// the pointer is on the clipboard the moment the button comes up.
+    pub fn set_copy_on_select(&mut self, enabled: bool) {
+        self.selector.copy_on_select = enabled;
+    }
+
+    /// Graph and scrollbar interaction take the pointer first; everything
+    /// else selects text.
+    pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        use event::MouseEventKind;
+        if !env_flag("DAVINCI_DISABLE_HYPERLINKS") && self.open_link_at(model, mouse) {
+            return false;
+        }
+        if self.click_ask_option(model, mouse)
+            || self.click_overlay_row(model, mouse)
+            || self.click_list_row(model, mouse)
+        {
+            self.selector.clear();
+            return false;
+        }
+        if route_graph_mouse(model, mouse)
+            || route_click_target(model, mouse)
+            || route_scroll_mouse(model, &mut self.scrollbar_grab, self.scrollbar, mouse)
+        {
+            // A selection held in conversation rows survives the wheel; one
+            // held in screen rows would now cover different text.
+            let wheel = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            let anchored = self
+                .selector
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.space == super::selection::Space::Conversation);
+            if !(wheel && anchored) {
+                self.selector.clear();
+            }
+            return false;
+        }
+        if let Some(text) = self
+            .selector
+            .mouse(model, &self.rendered_lines, mouse, Instant::now())
+        {
+            copy_to_clipboard(model, &text);
+        }
+        false
+    }
+
+    /// Give a key to the selection first. Copy keys and shifted motions are
+    /// taken (`None`); any other key comes back for the shell, after clearing
+    /// the selection unless it is one that keeps it.
+    pub fn claim_selection_key(&mut self, model: &mut Model, event: Event) -> Option<Event> {
+        let Event::Key(key) = &event else {
+            return Some(event);
+        };
+        match self.selector.key(model, &self.rendered_lines, key) {
+            super::selection::KeyOutcome::Pass => Some(event),
+            super::selection::KeyOutcome::Taken(text) => {
+                if let Some(text) = text {
+                    copy_to_clipboard(model, &text);
+                }
+                model.dirty = true;
+                None
+            }
+        }
     }
 
     pub fn input_pending(&self) -> bool {
@@ -690,18 +1060,21 @@ impl Drop for Session {
     }
 }
 
-/// The selected span, start first. A press that has not been dragged is a
-/// click, not a selection: nothing is highlighted, so a click does not leave
-/// a reversed cell behind that reads as a second cursor.
-fn selection_span(anchor: (u16, u16), focus: (u16, u16)) -> Option<((u16, u16), (u16, u16))> {
-    if anchor == focus {
-        return None;
-    }
-    Some(if (anchor.1, anchor.0) <= (focus.1, focus.0) {
-        (anchor, focus)
-    } else {
-        (focus, anchor)
-    })
+/// Put `text` on the clipboard and say, briefly, which way it went.
+fn copy_to_clipboard(model: &mut Model, text: &str) {
+    let note = match crate::open_browser::try_copy_text(text) {
+        Ok(path) => {
+            let chars = text.chars().count();
+            // Which tool did it is not the reader's business, as in Claude Code.
+            let _ = path;
+            format!(
+                "copied {chars} {} to clipboard",
+                if chars == 1 { "char" } else { "chars" }
+            )
+        }
+        Err(err) => format!("copy failed: {err}"),
+    };
+    model.push_toast(note);
 }
 
 /// The wheel scrolls the conversation, or steps a list like the arrow
@@ -713,19 +1086,29 @@ pub fn route_scroll_mouse(
     drawn: Option<Scrollbar>,
     mouse: event::MouseEvent,
 ) -> bool {
-    use super::views::scrollbar::WHEEL_ROWS;
     use event::{MouseButton::Left, MouseEventKind};
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = mouse.kind == MouseEventKind::ScrollUp;
+            let wheel_rows = wheel_rows(up);
             // The completion list floats over the screen, so the pointer
             // decides which surface the wheel belongs to: over the list it
             // steps the selection, anywhere else it scrolls the conversation.
+            if let Some(viewer) = &mut model.viewer {
+                let rows = if up { -wheel_rows } else { wheel_rows };
+                let height = usize::from(model.height);
+                let max = viewer
+                    .lines
+                    .len()
+                    .saturating_sub(height.saturating_sub(2).max(1));
+                viewer.top = viewer.top.saturating_add_signed(rows).min(max);
+                return true;
+            }
             if over_suggestions(model, mouse.row) {
                 model.suggestion_move(if up { -1 } else { 1 });
                 return true;
             }
-            if app::scroll_transcript(model, if up { WHEEL_ROWS } else { -WHEEL_ROWS }) {
+            if app::scroll_transcript(model, if up { wheel_rows } else { -wheel_rows }) {
                 return true;
             }
             if model.screen != super::model::Screen::Agent || model.overlay.is_some() {
@@ -766,12 +1149,304 @@ pub fn route_scroll_mouse(
 
 /// Whether `row` falls on the open completion list. Nothing is composed
 /// unless a list is open.
+/// Print `text` onto the terminal's own screen, where its scrollback keeps
+/// it, and wait for esc, q or enter before the viewer comes back.
+fn scrollback_dump(text: &str) -> Result<(), String> {
+    let mut out = io::stdout();
+    out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    out.write_all(b"\n-- esc or q to return to davinci --\n")
+        .map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let waited = loop {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => break Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(err) => break Err(err.to_string()),
+        }
+    };
+    let _ = disable_raw_mode();
+    waited
+}
+
+/// Open `text` in `$VISUAL`, then `$EDITOR`, then `vi`, from a private
+/// temporary file that is removed afterwards. Returns the editor's name.
+fn open_in_editor(text: &str) -> Result<String, String> {
+    let command = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_owned());
+    let mut parts = command.split_whitespace();
+    let program = parts.next().ok_or("no editor")?.to_owned();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "davinci-transcript-{}-{nanos}.txt",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .map_err(|e| e.to_string())?;
+    let status = std::process::Command::new(&program)
+        .args(parts)
+        .arg(&path)
+        .status();
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(_) => Ok(program),
+        Err(err) => Err(format!("could not start {program}: {err}")),
+    }
+}
+
+/// autoScroll off: output that arrives while the view sits at the newest
+/// must not carry it along, so pin the view to the rows it last showed
+/// (`bar` is the scrollbar of that draw, `drawn` the entries it held).
+fn pin_unless_auto_scroll(model: &Model, bar: Option<Scrollbar>, drawn: usize) {
+    if model.auto_scroll
+        || model.transcript_scroll.get().top.is_some()
+        || drawn == 0
+        || model.transcript.len() <= drawn
+    {
+        return;
+    }
+    if let Some(bar) = bar.filter(|bar| bar.offset == 0) {
+        model
+            .transcript_scroll
+            .set(super::model::TranscriptScroll::at(
+                bar.total.saturating_sub(usize::from(bar.height)),
+                model.width,
+                model.show_tool_output,
+                &model.transcript,
+            ));
+    }
+}
+
+/// The footer's pull-request label and where it goes.
+fn pr_link(model: &Model) -> Option<(String, &str)> {
+    let badge = model.pr_badge.as_ref()?;
+    Some((badge.label(), badge.url.as_str()))
+}
+
+/// The links in one rendered row, asking the disk about each path at most
+/// once every couple of seconds.
+fn row_links(
+    cache: &mut std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
+    text: &str,
+    pr: Option<(String, &str)>,
+) -> Vec<super::links::Link> {
+    let mut found = Vec::new();
+    if let Some((label, url)) = pr.filter(|(_, url)| url.starts_with("https://")) {
+        if let Some(at) = text.find(&label) {
+            found.push(super::links::Link {
+                start: unicode_width::UnicodeWidthStr::width(&text[..at]) as u16,
+                end: unicode_width::UnicodeWidthStr::width(&text[..at + label.len()]) as u16,
+                url: url.to_owned(),
+            });
+        }
+    }
+    if !text.contains('/') {
+        return found;
+    }
+    if cache.len() > 4096 {
+        cache.clear();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    found.extend(super::links::find(text, &cwd, &mut |path| {
+        let fresh = cache
+            .get(path)
+            .filter(|(asked, _)| asked.elapsed() < Duration::from_secs(2));
+        if let Some((_, found)) = fresh {
+            return *found;
+        }
+        let found = path.exists();
+        cache.insert(path.to_path_buf(), (Instant::now(), found));
+        found
+    }));
+    found
+}
+
+/// A link's address and the screen cells it covers.
+type LinkedCells = (String, Vec<(u16, u16, ratatui::buffer::Cell)>);
+
+/// Print `cells` again inside an OSC 8 hyperlink to `url`. The terminal
+/// already shows exactly these cells, so this changes only what a click on
+/// them means.
+fn write_hyperlink<W: Write>(
+    backend: &mut CrosstermBackend<W>,
+    url: &str,
+    cells: &[(u16, u16, ratatui::buffer::Cell)],
+) -> io::Result<()> {
+    use ratatui::backend::Backend;
+    if cells.is_empty() {
+        return Ok(());
+    }
+    let url: String = url.chars().filter(|c| !c.is_control()).collect();
+    write!(backend, "\x1b]8;;{url}\x1b\\")?;
+    backend.draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+    write!(backend, "\x1b]8;;\x1b\\")
+}
+
+/// The visible settings row whose label a drawn row shows, the longest label
+/// winning so "Theme" does not take a click meant for "Theme extras".
+fn settings_row_at(model: &Model, row: &str) -> Option<usize> {
+    super::views::settings::visible_indices(model)
+        .into_iter()
+        .filter(|&i| {
+            let label = model.settings_rows[i].label.trim();
+            !label.is_empty() && row.contains(label)
+        })
+        .max_by_key(|&i| model.settings_rows[i].label.trim().len())
+}
+
+/// The option of an open question that a drawn row shows: the longest label
+/// found on it, so "Yes" does not win over "Yes, and don't ask again".
+fn ask_option_at(items: &[super::model::PickerItem], row: &str) -> Option<usize> {
+    label_at(items.iter().map(|item| item.label.as_str()), row)
+}
+
+/// The index of the longest non-empty label found on a drawn row.
+fn label_at<'a>(labels: impl Iterator<Item = &'a str>, row: &str) -> Option<usize> {
+    labels
+        .enumerate()
+        .filter(|(_, label)| !label.trim().is_empty() && row.contains(label.trim()))
+        .max_by_key(|(_, label)| label.trim().len())
+        .map(|(index, _)| index)
+}
+
+/// A truthy environment flag (`1`, `true`, `yes`, `on`).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Rows one wheel notch scrolls: `DAVINCI_SCROLL_SPEED` (0.25–20) times the
+/// default three, faster inside a quick burst in one direction.
+fn wheel_rows(up: bool) -> isize {
+    use std::sync::{Mutex, OnceLock};
+    static ROWS: OnceLock<isize> = OnceLock::new();
+    static BURST: Mutex<WheelBurst> = Mutex::new(WheelBurst::new());
+    let base = *ROWS.get_or_init(|| {
+        let speed = std::env::var("DAVINCI_SCROLL_SPEED")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|speed| speed.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.25, 20.0);
+        ((super::views::scrollbar::WHEEL_ROWS as f64 * speed).round() as isize).max(1)
+    });
+    if env_flag("DAVINCI_SCROLL_ACCEL_OFF") {
+        return base;
+    }
+    let multiplier = BURST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .notch(Instant::now(), up);
+    ((base as f64 * multiplier).round() as isize).max(1)
+}
+
+/// Notches that follow one another inside `GAP` in the same direction are a
+/// flick: from the third on each scrolls half a notch further than the last,
+/// up to four times the base. A pause or a turn starts again at one.
+struct WheelBurst {
+    last: Option<(Instant, bool)>,
+    streak: u32,
+}
+
+impl WheelBurst {
+    const GAP: Duration = Duration::from_millis(70);
+    const MAX: f64 = 4.0;
+
+    const fn new() -> Self {
+        Self {
+            last: None,
+            streak: 0,
+        }
+    }
+
+    fn notch(&mut self, now: Instant, up: bool) -> f64 {
+        let continues = self.last.is_some_and(|(at, was_up)| {
+            was_up == up && now.saturating_duration_since(at) <= Self::GAP
+        });
+        self.streak = if continues { self.streak + 1 } else { 1 };
+        self.last = Some((now, up));
+        (1.0 + f64::from(self.streak.saturating_sub(2)) * 0.5).min(Self::MAX)
+    }
+}
+
+/// A left click on a drawn target: jump back to the newest output, or take
+/// the completion under the pointer. `DAVINCI_DISABLE_MOUSE_CLICKS` leaves
+/// only the wheel.
+pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) -> bool {
+    use event::{MouseButton::Left, MouseEventKind};
+    if mouse.kind != MouseEventKind::Down(Left)
+        || model.overlay.is_some()
+        || env_flag("DAVINCI_DISABLE_MOUSE_CLICKS")
+    {
+        return false;
+    }
+    let cached = model.hit_cache.borrow().clone();
+    let targets = match cached {
+        Some(cache) => cache.targets,
+        None => app::compose_frame(model, model.height).targets,
+    };
+    let Some(hit) = targets.iter().find(|hit| hit.rows.contains(&mouse.row)) else {
+        return false;
+    };
+    match hit.target {
+        app::Target::JumpToBottom => {
+            model.transcript_scroll.take();
+        }
+        app::Target::ComposerRow(row) => {
+            // The text starts after the two-cell prompt.
+            model.place_caret(row, usize::from(mouse.column).saturating_sub(2));
+        }
+        app::Target::Prompt(entry) => {
+            app::scroll_transcript_to_entry(model, entry);
+        }
+        app::Target::HistoryMatch(index) => {
+            model.history_search_accept(index);
+        }
+        app::Target::Suggestion(index) => {
+            model.suggestion_index = index;
+            model.suggestion_picked = true;
+            model.accept_suggestion();
+        }
+    }
+    true
+}
+
 fn over_suggestions(model: &Model, row: u16) -> bool {
-    model.overlay.is_none()
-        && model.suggestions.is_some()
-        && app::compose_frame(model, model.height)
-            .suggestion_rows
-            .is_some_and(|rows| rows.contains(&row))
+    if model.overlay.is_some() || model.suggestions.is_none() {
+        return false;
+    }
+    let cached = model.hit_cache.borrow().clone();
+    let rows = match cached {
+        Some(cache) => cache.suggestion_rows,
+        None => app::compose_frame(model, model.height).suggestion_rows,
+    };
+    rows.is_some_and(|rows| rows.contains(&row))
 }
 
 /// Copied text is the conversation's, not the scrollbar's: drop the bar's
@@ -811,7 +1486,10 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
         }
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
-        if let Some(event) = session.poll_event(timeout)? {
+        if let Some(event) = session
+            .poll_event(timeout)?
+            .and_then(|event| session.claim_selection_key(model, event))
+        {
             model.dirty |= event_marks_dirty(&event);
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -851,7 +1529,193 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_picker_row_is_found_by_its_longest_name_and_a_cut_name_finds_nothing() {
+        let names = ["gpt", "gpt-5 mini", "claude", ""];
+        assert_eq!(
+            label_at(names.into_iter(), "  > gpt-5 mini   128k"),
+            Some(1)
+        );
+        assert_eq!(label_at(names.into_iter(), "  gpt   64k"), Some(0));
+        assert_eq!(label_at(names.into_iter(), "  gp… 64k"), None);
+        assert_eq!(label_at(names.into_iter(), ""), None);
+    }
+
+    #[test]
+    fn a_wheel_flick_speeds_up_and_a_pause_or_turn_starts_over() {
+        let t0 = Instant::now();
+        let step = Duration::from_millis(30);
+        let mut burst = WheelBurst::new();
+        let multipliers: Vec<f64> = (0..9).map(|i| burst.notch(t0 + step * i, true)).collect();
+        assert_eq!(&multipliers[..4], [1.0, 1.0, 1.5, 2.0]);
+        assert_eq!(*multipliers.last().unwrap(), 4.0, "capped at four");
+        // A pause longer than the gap, then a turn, each begin again.
+        let later = t0 + step * 8 + Duration::from_millis(300);
+        assert_eq!(burst.notch(later, true), 1.0);
+        assert_eq!(burst.notch(later + step, true), 1.0);
+        assert_eq!(burst.notch(later + step * 2, true), 1.5);
+        assert_eq!(burst.notch(later + step * 3, true), 2.0);
+        assert_eq!(burst.notch(later + step * 4, false), 1.0, "a turn resets");
+    }
+
     use super::*;
+
+    #[test]
+    fn a_settings_row_is_found_by_its_longest_label() {
+        use super::super::model::SettingRow;
+        let mut model = Model::new(
+            super::super::theme::Theme::da_vinci(super::super::theme::ColorDepth::TrueColor, false),
+            80,
+            24,
+            false,
+        );
+        let row = |label: &str, key: &str| SettingRow {
+            label: label.into(),
+            key: key.into(),
+            ..SettingRow::default()
+        };
+        model.settings_rows = vec![row("Theme", "theme"), row("Theme extras", "themeExtras")];
+        assert_eq!(settings_row_at(&model, "  Theme extras   on"), Some(1));
+        assert_eq!(settings_row_at(&model, "  Theme   dark"), Some(0));
+        assert_eq!(settings_row_at(&model, "  Unrelated"), None);
+    }
+
+    #[test]
+    fn with_auto_scroll_off_new_output_leaves_the_view_where_it_was() {
+        use super::super::model::Entry;
+        let mut model = Model::new(
+            super::super::theme::Theme::da_vinci(super::super::theme::ColorDepth::TrueColor, false),
+            80,
+            12,
+            false,
+        );
+        for n in 0..30 {
+            model.transcript.push(Entry::user(&format!("row {n}")));
+        }
+        let bar = app::transcript_scrollbar(&model).expect("overflowing");
+        assert_eq!(bar.offset, 0);
+        let drawn = model.transcript.len();
+        model.transcript.push(Entry::user("arrives later"));
+
+        // Following the newest (the default): nothing is pinned.
+        pin_unless_auto_scroll(&model, Some(bar), drawn);
+        assert!(model.transcript_scroll.get().top.is_none());
+
+        model.auto_scroll = false;
+        pin_unless_auto_scroll(&model, Some(bar), drawn);
+        let top = model.transcript_scroll.get().top;
+        assert_eq!(top, Some(bar.total - usize::from(bar.height)));
+        let after = app::transcript_scrollbar(&model).expect("still overflowing");
+        assert!(after.offset > 0, "the new row is below the view");
+    }
+
+    #[test]
+    fn an_option_is_found_by_the_longest_label_on_its_row() {
+        use super::super::model::PickerItem;
+        let items = [
+            PickerItem::new("Yes", ""),
+            PickerItem::new("Yes, and don't ask again", ""),
+            PickerItem::new("No", ""),
+        ];
+        assert_eq!(
+            ask_option_at(&items, "│ ❯ Yes, and don't ask again │"),
+            Some(1)
+        );
+        assert_eq!(
+            ask_option_at(&items, "│   Yes                       │"),
+            Some(0)
+        );
+        assert_eq!(
+            ask_option_at(&items, "│   something else            │"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_link_is_reprinted_between_hyperlink_open_and_close() {
+        #[derive(Clone, Default)]
+        struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let shared = Shared::default();
+        let mut backend = CrosstermBackend::new(shared.clone());
+        let mut cell = ratatui::buffer::Cell::default();
+        cell.set_symbol("h");
+        write_hyperlink(&mut backend, "https://a.io/\x1b[31m", &[(3, 1, cell)]).unwrap();
+        backend.flush().unwrap();
+        let out = String::from_utf8(shared.0.borrow().clone()).unwrap();
+        assert!(
+            out.starts_with("\x1b]8;;https://a.io/[31m\x1b\\"),
+            "{out:?}"
+        );
+        assert!(out.contains('h'));
+        assert!(out.ends_with("\x1b]8;;\x1b\\"), "{out:?}");
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn output_defaults_to_synchronized_incremental_painted_caret() {
+        let output = Output::from_env(env(&[]));
+        assert_eq!(
+            output,
+            Output {
+                synchronized: true,
+                full_repaint: false,
+                native_cursor: false,
+            }
+        );
+        let output = Output::from_env(env(&[
+            ("DAVINCI_SYNC_OUTPUT", "0"),
+            ("DAVINCI_FULL_REPAINT", "1"),
+            ("DAVINCI_NATIVE_CURSOR", "true"),
+        ]));
+        assert!(!output.synchronized && output.full_repaint && output.native_cursor);
+    }
+
+    #[test]
+    fn a_synchronized_frame_is_bracketed_and_parks_the_hidden_cursor() {
+        let output = Output::from_env(env(&[]));
+        let mut out = Vec::new();
+        begin_frame(&mut out, output).unwrap();
+        out.extend_from_slice(b"cells");
+        finish_frame(&mut out, output, Some((4, 9))).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "\x1b[?2026hcells\x1b[?25l\x1b[10;5H\x1b[?2026l");
+    }
+
+    #[test]
+    fn an_unsynchronized_native_cursor_frame_shows_the_cursor_at_the_caret() {
+        let output = Output::from_env(env(&[
+            ("DAVINCI_SYNC_OUTPUT", "off"),
+            ("DAVINCI_NATIVE_CURSOR", "1"),
+        ]));
+        let mut out = Vec::new();
+        begin_frame(&mut out, output).unwrap();
+        finish_frame(&mut out, output, Some((0, 0))).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[1;1H\x1b[?25h");
+        let mut out = Vec::new();
+        finish_frame(&mut out, output, None).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[?25l");
+    }
 
     #[test]
     fn mouse_motion_does_not_mark_the_frame_dirty() {
@@ -866,13 +1730,6 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::NONE,
         ))));
-    }
-
-    #[test]
-    fn a_click_without_a_drag_highlights_nothing() {
-        assert_eq!(selection_span((7, 3), (7, 3)), None);
-        assert_eq!(selection_span((7, 3), (9, 3)), Some(((7, 3), (9, 3))));
-        assert_eq!(selection_span((9, 4), (2, 3)), Some(((2, 3), (9, 4))));
     }
 
     #[test]

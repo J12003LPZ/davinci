@@ -4,7 +4,8 @@
 //! `docs/superpowers/specs/2026-09-01-native-mcp-design.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -46,6 +47,15 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct McpRegistry {
     inner: Arc<Mutex<Inner>>,
+    progress: Arc<Progress>,
+}
+
+/// Where a background connect stands: still running, or finished and not yet
+/// reported to the shell.
+#[derive(Default)]
+struct Progress {
+    running: AtomicBool,
+    unreported: AtomicBool,
 }
 
 impl std::fmt::Debug for McpRegistry {
@@ -79,13 +89,100 @@ impl McpRegistry {
         )>,
     ) -> Self {
         let registry = Self::default();
-        {
-            let mut inner = registry.lock();
-            for (name, server) in &config.mcp_servers {
-                inner.connect_one(name, server, cwd, executor);
-            }
-        }
+        registry.adopt(Self::connect_parts(config, cwd, executor));
         registry
+    }
+
+    /// Start every enabled server on a thread of its own and return at once
+    /// with an empty registry. The shell learns of the finished connect from
+    /// [`take_ready`](Self::take_ready); until then no MCP tool exists. A
+    /// slow `npx` handshake no longer holds up the first frame.
+    pub fn connect_in_background(
+        config: &davinci_mcp::ConfigFile,
+        cwd: &Path,
+        executor: Option<(
+            crate::jobs::supervisor::SupervisorCommand,
+            davinci_protocol::SandboxSpec,
+        )>,
+    ) -> Self {
+        let registry = Self::default();
+        if config.mcp_servers.is_empty() {
+            return registry;
+        }
+        registry.progress.running.store(true, Ordering::SeqCst);
+        let worker = registry.clone();
+        let config = config.clone();
+        let cwd: PathBuf = cwd.to_path_buf();
+        std::thread::spawn(move || {
+            let parts = Self::connect_parts(
+                &config,
+                &cwd,
+                executor.as_ref().map(|(host, sandbox)| (host, sandbox)),
+            );
+            worker.adopt(parts);
+            worker.progress.unreported.store(true, Ordering::SeqCst);
+            worker.progress.running.store(false, Ordering::SeqCst);
+        });
+        registry
+    }
+
+    /// Whether a background connect is still running.
+    pub fn connecting(&self) -> bool {
+        self.progress.running.load(Ordering::SeqCst)
+    }
+
+    /// `true` once, after a background connect finishes: the caller refreshes
+    /// whatever it derived from the registry's tools.
+    pub fn take_ready(&self) -> bool {
+        self.progress.unreported.swap(false, Ordering::SeqCst)
+    }
+
+    /// Servers start at the same time: each handshake can take seconds
+    /// (`npx` fetches a package), and one server's state never touches
+    /// another's, so the parts are built apart and joined in config order.
+    fn connect_parts(
+        config: &davinci_mcp::ConfigFile,
+        cwd: &Path,
+        executor: Option<(
+            &crate::jobs::supervisor::SupervisorCommand,
+            &davinci_protocol::SandboxSpec,
+        )>,
+    ) -> Vec<Inner> {
+        let connect = |(name, server): (&String, &davinci_mcp::ServerConfig)| {
+            let mut part = Inner::default();
+            part.connect_one(name, server, cwd, executor);
+            part
+        };
+        if config.mcp_servers.len() < 2 {
+            return config.mcp_servers.iter().map(connect).collect();
+        }
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = config
+                .mcp_servers
+                .iter()
+                .map(|entry| scope.spawn(move || connect(entry)))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        })
+    }
+
+    fn adopt(&self, parts: Vec<Inner>) {
+        let mut inner = self.lock();
+        for part in parts {
+            inner.clients.extend(part.clients);
+            inner.routes.extend(part.routes);
+            inner
+                .trusted_read_only_servers
+                .extend(part.trusted_read_only_servers);
+            inner.rows.extend(part.rows);
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -517,6 +614,80 @@ mod tests {
         ))
         .unwrap();
         (dir, config)
+    }
+
+    #[test]
+    fn a_background_connect_reports_ready_once_and_then_has_its_tools() {
+        let (dir, config) = http_fixture(
+            r#"{
+            "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+            "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+        }"#,
+        );
+        let registry = McpRegistry::connect_in_background(&config, dir.path(), None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !registry.take_ready() {
+            assert!(std::time::Instant::now() < deadline, "never reported ready");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!registry.connecting());
+        assert!(!registry.take_ready(), "ready is reported once");
+        assert_eq!(registry.tool_names(), ["mcp__memory__ping"]);
+        assert_eq!(registry.rows()[0].status, "connected");
+        // No servers configured: nothing to wait for, nothing to report.
+        let empty = McpRegistry::connect_in_background(
+            &davinci_mcp::ConfigFile::default(),
+            dir.path(),
+            None,
+        );
+        assert!(!empty.connecting() && !empty.take_ready());
+    }
+
+    #[test]
+    fn several_servers_connect_together_and_keep_config_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = |tool: &str| {
+            json!({
+                "initialize": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "f", "version": "0"}},
+                "tools/list": {"tools": [{"name": tool, "inputSchema": {"type": "object"}}]}
+            })
+            .to_string()
+        };
+        let mut servers = Vec::new();
+        for (name, tool) in [("alpha", "one"), ("beta", "two"), ("gamma", "three")] {
+            let path = dir.path().join(format!("{name}.json"));
+            // A server whose script is missing must fail on its own row.
+            if name != "beta" {
+                std::fs::write(&path, body(tool)).unwrap();
+            }
+            let url = format!("fixture:{}", path.display());
+            servers.push(format!(
+                "{:?}:{{\"url\":{}}}",
+                name,
+                serde_json::to_string(&url).unwrap()
+            ));
+        }
+        let config =
+            davinci_mcp::parse_config(&format!(r#"{{"mcpServers":{{{}}}}}"#, servers.join(",")))
+                .unwrap();
+        let registry = McpRegistry::connect(&config, dir.path());
+        let rows = registry.rows();
+        let seen: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.status.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("alpha", "connected"),
+                ("beta", "error"),
+                ("gamma", "connected")
+            ]
+        );
+        let mut tools = registry.tool_names();
+        tools.sort();
+        assert_eq!(tools, ["mcp__alpha__one", "mcp__gamma__three"]);
     }
 
     #[test]

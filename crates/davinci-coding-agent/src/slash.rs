@@ -93,6 +93,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Visualize current context usage as a colored grid",
             Some("[inspect]"),
         ),
+        (
+            "autocompact",
+            "Set when the context compacts itself",
+            Some("[auto|tokens|off]"),
+        ),
         ("resume", "Resume a different session", None),
         (
             "reload",
@@ -213,6 +218,9 @@ pub enum SlashAction {
     /// `/context`: the window by category; `/context inspect` opens the
     /// prepared-manifest inspector.
     Context(String),
+    /// `/autocompact [auto|tokens|off]`: show or change when the context
+    /// compacts itself.
+    Autocompact(String),
     Agents(String),
     Workflow(String),
     /// `/plugins [search | subcommand …]`.
@@ -304,6 +312,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "doctor" => SlashAction::ShowDoctor,
         "sandbox-status" => SlashAction::ShowSandboxStatus,
         "context" => SlashAction::Context(args.to_string()),
+        "autocompact" => SlashAction::Autocompact(args.to_string()),
         "workflow" | "workflows" => SlashAction::Workflow(args.to_string()),
         "agents" => SlashAction::Agents(args.to_string()),
         "plugins" => SlashAction::Plugins(args.to_string()),
@@ -608,6 +617,27 @@ mod tests {
             parse_line("/sandbox"),
             SlashAction::Prompt("/sandbox".into()),
             "the historical permission CLI alias must not become a slash-level OS sandbox claim"
+        );
+    }
+
+    #[test]
+    fn autocompact_is_advertised_and_parsed_with_its_argument() {
+        let command = builtin_slash_commands()
+            .into_iter()
+            .find(|c| c.name == "autocompact")
+            .expect("listed");
+        assert_eq!(command.argument_hint.as_deref(), Some("[auto|tokens|off]"));
+        assert_eq!(
+            parse_line("/autocompact"),
+            SlashAction::Autocompact(String::new())
+        );
+        assert_eq!(
+            parse_line("/autocompact 150k"),
+            SlashAction::Autocompact("150k".into())
+        );
+        assert_eq!(
+            parse_line("/autocompactx"),
+            SlashAction::Prompt("/autocompactx".into())
         );
     }
 

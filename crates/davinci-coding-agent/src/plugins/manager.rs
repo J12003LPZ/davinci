@@ -36,6 +36,9 @@ pub struct ManagedRow {
     pub note: Option<String>,
     /// What the row is filed under in a long list (a skill's plugin or source).
     pub group: String,
+    /// Estimated tokens the row adds to every request (skills: name and
+    /// description in the prompt); 0 when unknown.
+    pub tokens: u64,
     pub can_update: bool,
     pub can_toggle: bool,
     pub can_approve: bool,
@@ -225,6 +228,7 @@ pub fn skill_rows(
                 key: skill.path.display().to_string(),
                 title: skill.name.clone(),
                 detail: skill.description.clone(),
+                tokens: ((skill.name.len() + skill.description.len() + 4) as u64).div_ceil(4),
                 ..ManagedRow::default()
             };
             if let Some((plugin, _)) = plugin_roots.iter().find(|(_, root)| path.starts_with(root))

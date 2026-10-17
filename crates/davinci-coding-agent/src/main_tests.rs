@@ -362,7 +362,7 @@ fn attached_agents_keep_independent_language_intelligence_permissions() {
     host.native.lock().unwrap().language_intelligence.shutdown();
 }
 
-static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn nonpersistent_provider_loop_has_an_isolated_transport_session() {
