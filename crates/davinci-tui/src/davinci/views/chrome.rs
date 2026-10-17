@@ -202,15 +202,89 @@ fn conversation_status(model: &Model) -> Line<'static> {
             format!("{} ", super::super::ui::clip_ellipsis(note, room as u16)),
             cc.inactive,
         )]
-    } else if model.context_fraction() >= 0.8 && model.width >= 80 {
-        vec![span(
-            format!("{}% context ", (model.context_fraction() * 100.0) as u32),
-            cc.auto_mode,
-        )]
     } else {
-        Vec::new()
+        context_fold(model, usize::from(run_width(&left)))
     };
     spread(model.width, left, right)
+}
+
+/// Pips in the footer's context gauge.
+const FOLD_PIPS: usize = 8;
+
+/// The context and plan-limit readout at the footer's right end:
+/// `ctx ▰▱▱▱▱▱▱▱ 2% · 5h 23% left · wk 59% left`. It takes no row of its
+/// own. Parts drop from the right as the left run leaves less room: first
+/// the limits, then the gauge. `compact` only (`full` draws the rows).
+fn context_fold(model: &Model, left_width: usize) -> Vec<Span<'static>> {
+    use crate::davinci::model::ContextBarMode;
+    if model.context_bar != ContextBarMode::Compact {
+        return Vec::new();
+    }
+    let th = &model.theme;
+    let cc = th.cc();
+    let (fraction, pressure) = match model.context_meter.as_ref().filter(|v| v.window > 0) {
+        Some(view) => (
+            (view.used() as f64 / view.window as f64).clamp(0.0, 1.0),
+            super::context_bar::pressure(view),
+        ),
+        None if model.context.1 > 0 => (model.context_fraction(), model.context_fraction()),
+        None => return Vec::new(),
+    };
+    let ink = if pressure >= 1.0 {
+        th.error
+    } else if pressure >= 0.8 {
+        th.warning
+    } else {
+        cc.permission
+    };
+    let percent = (fraction * 100.0).round() as u32;
+    let lit = if fraction > 0.0 {
+        ((fraction * FOLD_PIPS as f64).round() as usize).clamp(1, FOLD_PIPS)
+    } else {
+        0
+    };
+    let gauge = format!("{}{}", "▰".repeat(lit), "▱".repeat(FOLD_PIPS - lit));
+    let dim = cc.inactive;
+    let head = vec![
+        span("ctx ", dim),
+        span(gauge, ink),
+        span(format!(" {percent}%"), ink),
+    ];
+    let mut limits: Vec<Span<'static>> = Vec::new();
+    if model.plan_usage_enabled {
+        for window in model
+            .plan_usage
+            .iter()
+            .flat_map(|view| view.windows.iter())
+        {
+            let left = (100.0 - window.used_percent).clamp(0.0, 100.0);
+            let tone = if left <= 10.0 {
+                th.error
+            } else if left <= 20.0 {
+                th.warning
+            } else {
+                dim
+            };
+            let name = match window.minutes {
+                300 => "5h".to_string(),
+                10_080 => "wk".to_string(),
+                _ => window.label.clone(),
+            };
+            limits.push(span("  ·  ", dim));
+            limits.push(span(format!("{name} {left:.0}% left"), tone));
+        }
+    }
+    let tail = span(" ", dim);
+    let room = usize::from(model.width).saturating_sub(left_width + 2);
+    let tight = vec![span(format!("ctx {percent}%"), ink)];
+    [
+        [head.clone(), limits.clone(), vec![tail.clone()]].concat(),
+        [head, vec![tail.clone()]].concat(),
+        [tight, vec![tail]].concat(),
+    ]
+    .into_iter()
+    .find(|spans| usize::from(run_width(spans)) <= room)
+    .unwrap_or_default()
 }
 
 fn key_label(model: &Model, action: &str) -> Option<String> {
@@ -1806,9 +1880,108 @@ mod tests {
         let drawn = text(&status(&m));
         assert!(drawn.starts_with("  ⏸ manual mode on"));
         assert!(drawn.contains("? for shortcuts"));
-        assert!(!drawn.contains("23% context"));
+        assert!(drawn.contains("ctx ▰▰▱▱▱▱▱▱ 24%"), "{drawn}");
+        m.context = (0, 0);
+        assert!(!text(&status(&m)).contains("ctx"), "no reading, no gauge");
         m.context = (180_000, 200_000);
-        assert!(text(&status(&m)).contains("90% context"));
+        assert!(text(&status(&m)).contains("ctx ▰▰▰▰▰▰▰▱ 90%"));
+    }
+
+    fn folded(width: u16) -> Model {
+        use crate::davinci::model::{
+            ContextCategory, ContextKind, ContextUsageView, PlanUsageView, PlanWindow,
+        };
+        let mut m = model(width);
+        m.context_meter = Some(ContextUsageView {
+            model: "gpt-6-luna".into(),
+            window: 272_000,
+            categories: vec![ContextCategory {
+                kind: ContextKind::Messages,
+                label: "Messages".into(),
+                tokens: 6_200,
+            }],
+            free: 130_000,
+            buffer: 16_400,
+            sections: Vec::new(),
+        });
+        m.plan_usage = Some(PlanUsageView {
+            plan: None,
+            windows: vec![
+                PlanWindow {
+                    label: "5h".into(),
+                    minutes: 300,
+                    used_percent: 77.0,
+                    resets_in: Some(7_320),
+                },
+                PlanWindow {
+                    label: "week".into(),
+                    minutes: 10_080,
+                    used_percent: 41.0,
+                    resets_in: None,
+                },
+            ],
+            note: None,
+        });
+        m
+    }
+
+    #[test]
+    fn the_footer_folds_context_and_plan_limits_into_its_right_end() {
+        let m = folded(120);
+        let row = text(&status(&m));
+        assert!(row.starts_with("  ⏸ manual mode on"), "{row}");
+        assert!(
+            row.trim_end()
+                .ends_with("ctx ▰▱▱▱▱▱▱▱ 2%  ·  5h 23% left  ·  wk 59% left"),
+            "{row}"
+        );
+        assert_eq!(line_width(&status(&m)), 120);
+    }
+
+    #[test]
+    fn the_fold_gives_up_limits_then_the_gauge_before_the_mode() {
+        let wide = text(&status(&folded(120)));
+        assert!(wide.contains("wk 59% left"));
+        // Wide enough for the gauge, not the limits.
+        let mid = text(&status(&folded(75)));
+        assert!(mid.contains("ctx ▰") && !mid.contains("5h"), "{mid}");
+        let tight = text(&status(&folded(50)));
+        assert!(tight.contains("ctx 2%") && !tight.contains('▰'), "{tight}");
+        for width in [20u16, 40, 50, 58, 75, 120] {
+            let row = status(&folded(width));
+            assert!(line_width(&row) <= width, "{width}");
+            assert!(text(&row).contains("manual mode on") || width < 24);
+        }
+    }
+
+    #[test]
+    fn the_fold_warns_near_compaction_and_is_off_for_other_bar_modes() {
+        use crate::davinci::model::{ContextBarMode, ContextCategory, ContextKind};
+        let mut m = folded(120);
+        if let Some(view) = m.context_meter.as_mut() {
+            view.categories = vec![ContextCategory {
+                kind: ContextKind::Messages,
+                label: "Messages".into(),
+                tokens: 230_000,
+            }];
+        }
+        let row = status(&m);
+        let gauge = row
+            .spans
+            .iter()
+            .find(|s| s.content.contains('▰'))
+            .expect("gauge");
+        assert_eq!(gauge.style.fg, Some(m.theme.warning));
+        let low = row
+            .spans
+            .iter()
+            .find(|s| s.content.contains("5h"))
+            .expect("5h");
+        assert_eq!(low.style.fg, Some(m.theme.cc().inactive));
+        for mode in [ContextBarMode::Off, ContextBarMode::Full] {
+            m.context_bar = mode;
+            assert!(!text(&status(&m)).contains("ctx"), "{mode:?}");
+        }
     }
 
     #[test]

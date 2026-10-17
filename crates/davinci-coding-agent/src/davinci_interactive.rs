@@ -4444,6 +4444,14 @@ pub fn perform(
             open_task_board_sheet(agent, model);
             Ok(Done::Opened)
         }
+        SlashAction::Autocompact(arg) => match run_autocompact(agent, &arg) {
+            Ok(text) => {
+                // The footer and the context bar read the threshold from the meter.
+                refresh_context_meter(agent, model, true);
+                Ok(Done::Said(text))
+            }
+            Err(note) => Ok(Done::Note(note)),
+        },
         SlashAction::Context(args) => match args.as_str() {
             "" => {
                 push_context_usage(agent, model);
@@ -4459,6 +4467,47 @@ pub fn perform(
             )),
         },
     }
+}
+
+/// `/autocompact [auto|tokens|off]`: with no argument, say what it is doing;
+/// otherwise store the change, apply it to the running agent, and say what it
+/// is doing now. `Err` is a refusal worded for the user.
+pub(crate) fn run_autocompact(agent: &mut Agent, arg: &str) -> Result<String, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Ok(autocompact_summary(agent, true));
+    }
+    let dir = crate::default_agent_dir();
+    let mut stored = crate::load_settings(&dir);
+    crate::settings::apply_autocompact_arg(&mut stored, arg)
+        .map_err(|err| format!("{err} · usage: /autocompact [auto|tokens|off]"))?;
+    crate::save_settings(&dir, &stored)?;
+    crate::sync_agent_from_settings(agent);
+    Ok(autocompact_summary(agent, false))
+}
+
+/// What auto-compact is doing for this agent, as one line: off, or on and
+/// the token count it fires at, and whether that is the model's own point or
+/// one chosen with `/autocompact`. `with_usage` adds the command's usage.
+fn autocompact_summary(agent: &Agent, with_usage: bool) -> String {
+    use davinci_tui::davinci::views::context_usage::format_tokens;
+    let mut text = if !agent.auto_compaction {
+        "auto-compact off".to_string()
+    } else {
+        let chosen = agent.compaction.threshold.is_some();
+        match davinci_agent::compaction_threshold(agent.context_window, &agent.compaction) {
+            Some(at) => format!(
+                "auto-compact on · compacts at {} ({})",
+                format_tokens(at),
+                if chosen { "your setting" } else { "auto" }
+            ),
+            None => "auto-compact on".to_string(),
+        }
+    };
+    if with_usage {
+        text.push_str(" · /autocompact [auto|tokens|off], tokens like 150k or 60%");
+    }
+    text
 }
 
 /// Context VM notices from the finished turn (first failure, shadow

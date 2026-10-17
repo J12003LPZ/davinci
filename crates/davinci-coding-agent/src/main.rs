@@ -7746,6 +7746,13 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
+        SlashAction::Autocompact(arg) => {
+            let text = davinci_interactive::run_autocompact(agent, &arg).unwrap_or_else(|note| note);
+            session.chrome.transcript.push("autocompact", &text);
+            session.chrome.status = "autocompact".into();
+            println!("{text}");
+            Ok(true)
+        }
         SlashAction::Context(_) => {
             let view = davinci_surfaces::context_usage_view(&agent.context_usage());
             let text =

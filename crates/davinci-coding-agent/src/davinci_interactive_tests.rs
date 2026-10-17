@@ -3662,6 +3662,68 @@ fn context_hangs_the_usage_grid_from_the_echoed_command() {
 }
 
 #[test]
+fn autocompact_shows_sets_and_persists_when_the_context_compacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let mut agent = Agent::new("sys");
+    agent.cwd = dir.path().to_path_buf();
+    agent.context_window = 400_000;
+    let mut m = model();
+    let mut run = |agent: &mut Agent, arg: &str| {
+        perform(
+            &crate::args::Args::default(),
+            agent,
+            &mut m,
+            crate::slash::SlashAction::Autocompact(arg.into()),
+        )
+        .expect("autocompact answers")
+    };
+    let Done::Said(text) = run(&mut agent, "") else {
+        panic!("bare shows the state");
+    };
+    assert!(text.starts_with("auto-compact on · compacts at 383.6k (auto)"), "{text}");
+    assert!(text.contains("/autocompact [auto|tokens|off]"));
+
+    let Done::Said(text) = run(&mut agent, "150k") else {
+        panic!("tokens set");
+    };
+    assert_eq!(text, "auto-compact on · compacts at 150k (your setting)");
+    assert_eq!(
+        agent.compaction.threshold,
+        Some(davinci_agent::CompactionThreshold::Tokens(150_000))
+    );
+    // Stored, so the next session starts the same way.
+    let stored = crate::load_settings(&crate::default_agent_dir());
+    assert_eq!(
+        stored.compaction_threshold(),
+        Some(davinci_agent::CompactionThreshold::Tokens(150_000))
+    );
+
+    let Done::Said(text) = run(&mut agent, "off") else {
+        panic!("off");
+    };
+    assert_eq!(text, "auto-compact off");
+    assert!(!agent.auto_compaction);
+
+    let Done::Said(text) = run(&mut agent, "auto") else {
+        panic!("auto");
+    };
+    assert!(text.ends_with("(auto)"), "{text}");
+    assert!(agent.auto_compaction && agent.compaction.threshold.is_none());
+
+    let Done::Note(note) = run(&mut agent, "soon") else {
+        panic!("a bad value is refused");
+    };
+    assert!(note.contains("not auto, off, a token count"), "{note}");
+    assert!(agent.auto_compaction, "a refusal changes nothing");
+    match previous {
+        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+    }
+}
+
+#[test]
 fn context_inspect_opens_the_manifest_sheet() {
     let mut agent = Agent::new("sys");
     let mut m = model();

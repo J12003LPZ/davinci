@@ -12,7 +12,7 @@ use ratatui::text::Line;
 
 use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOwner};
 
-use super::model::{Choice, Entry, Model, Overlay, Screen};
+use super::model::{Choice, ContextBarMode, Entry, Model, Overlay, Screen};
 use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::scrollbar::{self, Scrollbar};
@@ -180,8 +180,12 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     // last thing read before typing.
     let meter = if conversation {
         let mut meter = chrome::checklist_rows(chrome_model, height);
-        meter.extend(context_bar::lines(chrome_model, height));
-        meter.extend(plan_usage::lines(chrome_model, height));
+        // `compact` keeps these in the footer's right end (chrome::status);
+        // only `full` gives them rows.
+        if chrome_model.context_bar == ContextBarMode::Full {
+            meter.extend(context_bar::lines(chrome_model, height));
+            meter.extend(plan_usage::lines(chrome_model, height));
+        }
         // A row of air above it: the last transcript line (an error, a
         // command's output) must not sit flush against the meter's header.
         if !meter.is_empty() {
@@ -4994,6 +4998,7 @@ mod working_line_spacing_tests {
     fn model_with_bar() -> Model {
         let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
         model.working = Some(Working::new());
+        model.context_bar = ContextBarMode::Full;
         model.context_meter = Some(ContextUsageView {
             model: "gpt-6-luna".into(),
             window: 200_000,

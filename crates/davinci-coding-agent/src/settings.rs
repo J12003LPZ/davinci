@@ -673,6 +673,44 @@ pub fn clear_compaction_threshold(settings: &mut Settings) {
     }
 }
 
+/// Switch auto-compact on or off in both places that decide it: the
+/// top-level `autoCompact` and, when one exists, `compaction.enabled`, which
+/// wins over it. Setting only the first would leave a stored `enabled` in
+/// charge.
+pub fn set_auto_compact(settings: &mut Settings, enabled: bool) {
+    settings.auto_compact = Some(enabled);
+    if let Some(compaction) = settings.compaction.as_mut() {
+        if compaction.enabled.is_some() {
+            compaction.enabled = Some(enabled);
+        }
+    }
+}
+
+/// What `/autocompact <arg>` stores. `auto` (also `on`, `default`) turns it on
+/// at the model's own threshold; `off` turns it off; anything else is a
+/// token count or percent (`150k`, `200,000`, `60%`) that turns it on at that
+/// point. An empty argument is the caller's to answer, not ours.
+pub fn apply_autocompact_arg(settings: &mut Settings, arg: &str) -> Result<(), String> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "auto" | "on" | "default" => {
+            set_auto_compact(settings, true);
+            clear_compaction_threshold(settings);
+            Ok(())
+        }
+        "off" => {
+            set_auto_compact(settings, false);
+            Ok(())
+        }
+        other => {
+            set_compaction_threshold(settings, other).map_err(|_| {
+                format!("{arg} is not auto, off, a token count (150k) or a percent (60%)")
+            })?;
+            set_auto_compact(settings, true);
+            Ok(())
+        }
+    }
+}
+
 pub fn format_compaction_threshold(
     threshold: Option<davinci_agent::CompactionThreshold>,
 ) -> String {
@@ -2854,6 +2892,49 @@ mod tests {
         for value in ["", "banana", "500", "0%", "101%", "-5000"] {
             assert_eq!(normalize_compaction_threshold_input(value), None, "{value}");
         }
+    }
+
+    #[test]
+    fn autocompact_arg_turns_it_on_at_a_point_off_or_back_to_auto() {
+        let mut settings = Settings::default();
+        apply_autocompact_arg(&mut settings, "150k").expect("tokens");
+        assert!(settings.compaction_enabled());
+        assert_eq!(
+            settings.compaction_threshold(),
+            Some(davinci_agent::CompactionThreshold::Tokens(150_000))
+        );
+        apply_autocompact_arg(&mut settings, " 60% ").expect("percent");
+        assert_eq!(
+            settings.compaction_threshold(),
+            Some(davinci_agent::CompactionThreshold::Percent(60))
+        );
+        apply_autocompact_arg(&mut settings, "off").expect("off");
+        assert!(!settings.compaction_enabled());
+        // Off keeps the chosen point for when it is turned back on.
+        assert_eq!(
+            settings.compaction_threshold(),
+            Some(davinci_agent::CompactionThreshold::Percent(60))
+        );
+        apply_autocompact_arg(&mut settings, "AUTO").expect("auto");
+        assert!(settings.compaction_enabled());
+        assert_eq!(settings.compaction_threshold(), None);
+        for bad in ["soon", "0%", "101%", "500", "12x"] {
+            let before = settings.auto_compact;
+            assert!(apply_autocompact_arg(&mut settings, bad).is_err(), "{bad}");
+            assert_eq!(settings.auto_compact, before, "{bad} changed the switch");
+        }
+    }
+
+    #[test]
+    fn a_stored_compaction_enabled_cannot_overrule_the_slash_command() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"compaction":{"enabled":false},"autoCompact":false}"#)
+                .expect("settings");
+        assert!(!settings.compaction_enabled());
+        apply_autocompact_arg(&mut settings, "auto").expect("auto");
+        assert!(settings.compaction_enabled());
+        apply_autocompact_arg(&mut settings, "off").expect("off");
+        assert!(!settings.compaction_enabled());
     }
 
     #[test]
