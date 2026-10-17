@@ -373,13 +373,23 @@ pub struct Session {
     focused: bool,
     /// How frames reach the terminal, read once from the environment.
     output: Output,
-    /// Whether a path named on screen exists, so a frame does not stat the
-    /// same files again: when it was asked, and the answer.
-    path_cache: std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
+    /// Whether a path named on screen exists, answered off the drawing
+    /// thread so a frame never waits on the disk.
+    paths: PathProbe,
+    /// The hyperlinks the terminal is showing and the area they were drawn
+    /// in. A link whose cells did not change is still on screen and is not
+    /// written again; a clear or a resize forgets them all.
+    painted_links: Vec<LinkedCells>,
+    painted_area: Rect,
     /// Draw-time statistics: show them (`DAVINCI_FRAME_STATS=1`) and their
     /// moving average in microseconds.
     frame_stats: bool,
     frame_micros: f64,
+    /// `DAVINCI_INPUT_TRACE=<file>`: one line per key, the microseconds from
+    /// reading it to the end of the frame that shows it, and that frame's own
+    /// draw time. Typing lag is the first number.
+    input_trace: Option<std::fs::File>,
+    key_read_at: Option<Instant>,
     /// Entries in the conversation at the last draw, for `autoScroll`.
     drawn_entries: usize,
     /// Keys the shell raises on the user's behalf (a click on an option is
@@ -488,9 +498,19 @@ impl Session {
             rendered_lines: Vec::new(),
             selector: super::selection::Selector::default(),
             scrollbar_grab: None,
-            path_cache: std::collections::HashMap::new(),
+            paths: PathProbe::start(),
+            painted_links: Vec::new(),
+            painted_area: Rect::default(),
             frame_stats: env_flag("DAVINCI_FRAME_STATS"),
             frame_micros: 0.0,
+            input_trace: std::env::var_os("DAVINCI_INPUT_TRACE").and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            }),
+            key_read_at: None,
             drawn_entries: 0,
             injected: VecDeque::new(),
             scrollbar: None,
@@ -527,7 +547,7 @@ impl Session {
             );
             DISAMBIGUATED.store(true, Ordering::SeqCst);
         }
-        self.terminal.clear()
+        self.forget_screen()
     }
 
     /// ctrl+z: give the terminal back, stop until the shell continues the
@@ -573,6 +593,12 @@ impl Session {
     /// Forget what is on screen so the next draw paints every cell: for when
     /// something wrote to the terminal behind the renderer's back.
     pub fn clear(&mut self) -> io::Result<()> {
+        self.forget_screen()
+    }
+
+    /// Clear the screen and everything known about what is on it.
+    fn forget_screen(&mut self) -> io::Result<()> {
+        self.painted_links.clear();
         self.terminal.clear()
     }
 
@@ -583,6 +609,13 @@ impl Session {
     /// reassembled into the one [`Event::Paste`] the model expects.
     pub fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
         let event = self.poll_event_inner(timeout)?;
+        if self.input_trace.is_some() && self.key_read_at.is_none() {
+            if let Some(Event::Key(key)) = &event {
+                if key.kind != KeyEventKind::Release {
+                    self.key_read_at = Some(Instant::now());
+                }
+            }
+        }
         match event {
             Some(Event::FocusGained) => self.focused = true,
             Some(Event::FocusLost) => self.focused = false,
@@ -683,7 +716,7 @@ impl Session {
             self.run_viewer_task(task, model)?;
         }
         match model.terminal_task.take() {
-            Some(TerminalTask::Redraw) => self.terminal.clear()?,
+            Some(TerminalTask::Redraw) => self.forget_screen()?,
             Some(TerminalTask::Suspend) => self.suspend()?,
             None => {}
         }
@@ -712,7 +745,7 @@ impl Session {
         let model: &Model = model;
         let output = self.output;
         if output.full_repaint {
-            self.terminal.clear()?;
+            self.forget_screen()?;
         }
         begin_frame(self.terminal.backend_mut(), output)?;
         let mut caret = None;
@@ -727,9 +760,17 @@ impl Session {
         let average = self.frame_micros;
         let hyperlinks = !env_flag("DAVINCI_DISABLE_HYPERLINKS");
         let mut linked: Vec<LinkedCells> = Vec::new();
-        let path_cache = &mut self.path_cache;
+        let mut unlinked: Vec<(u16, u16, ratatui::buffer::Cell)> = Vec::new();
+        let paths = &self.paths;
+        // A resize repaints every cell without its link.
+        if self.terminal.size().ok().map(Rect::from) != Some(self.painted_area) {
+            self.painted_links.clear();
+        }
+        let painted = &self.painted_links;
+        let mut drawn_area = Rect::default();
         self.terminal.draw(|frame| {
             let area: Rect = frame.area();
+            drawn_area = area;
             let composed = app::compose_frame(model, area.height);
             rendered_lines = composed.lines.iter().map(ToString::to_string).collect();
             scrollbar = composed.scrollbar;
@@ -770,12 +811,14 @@ impl Session {
                 }
             }
             if hyperlinks {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let pr = pr_link(model);
                 for (row, text) in rendered_lines
                     .iter()
                     .enumerate()
                     .take(usize::from(area.height))
                 {
-                    for link in row_links(path_cache, text, pr_link(model)) {
+                    for link in row_links(text, pr.clone(), &cwd, &mut |path| paths.exists(path)) {
                         let buffer = frame.buffer_mut();
                         let mut cells = Vec::new();
                         let mut column = link.start;
@@ -792,14 +835,39 @@ impl Session {
                     }
                 }
             }
+            // A link that is gone keeps its address on screen until its
+            // cells are written again without one.
+            for (_, cells) in painted.iter().filter(|old| !linked.contains(old)) {
+                for &(x, y, _) in cells {
+                    if let Some(cell) = frame.buffer_mut().cell((x, y)) {
+                        unlinked.push((x, y, cell.clone()));
+                    }
+                }
+            }
         })?;
-        for (url, cells) in &linked {
+        if !unlinked.is_empty() {
+            use ratatui::backend::Backend;
+            self.terminal
+                .backend_mut()
+                .draw(unlinked.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+        }
+        // Unchanged cells are not written again by the diff, so a link
+        // drawn last frame over the same cells is still there.
+        for (url, cells) in linked
+            .iter()
+            .filter(|link| !self.painted_links.contains(link))
+        {
             write_hyperlink(self.terminal.backend_mut(), url, cells)?;
         }
+        self.painted_links = linked;
+        self.painted_area = drawn_area;
         finish_frame(self.terminal.backend_mut(), output, caret)?;
         // A moving average of how long a frame takes to compose and write,
         // shown in the corner under DAVINCI_FRAME_STATS=1.
         let micros = started.elapsed().as_secs_f64() * 1e6;
+        if let (Some(file), Some(read)) = (self.input_trace.as_mut(), self.key_read_at.take()) {
+            let _ = writeln!(file, "{} {}", read.elapsed().as_micros(), micros as u64);
+        }
         self.frame_micros = if self.frame_micros == 0.0 {
             micros
         } else {
@@ -936,7 +1004,9 @@ impl Session {
         let Some(text) = self.rendered_lines.get(usize::from(mouse.row)) else {
             return false;
         };
-        let links = row_links(&mut self.path_cache, text, pr_link(model));
+        // A click asks the disk directly: it is one row, once.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let links = row_links(text, pr_link(model), &cwd, &mut |path| path.exists());
         let Some(link) = super::links::at(&links, mouse.column) else {
             return false;
         };
@@ -1245,12 +1315,12 @@ fn pr_link(model: &Model) -> Option<(String, &str)> {
     Some((badge.label(), badge.url.as_str()))
 }
 
-/// The links in one rendered row, asking the disk about each path at most
-/// once every couple of seconds.
+/// The links in one rendered row; `exists` says which named paths are real.
 fn row_links(
-    cache: &mut std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
     text: &str,
     pr: Option<(String, &str)>,
+    cwd: &std::path::Path,
+    exists: &mut impl FnMut(&std::path::Path) -> bool,
 ) -> Vec<super::links::Link> {
     let mut found = Vec::new();
     if let Some((label, url)) = pr.filter(|(_, url)| url.starts_with("https://")) {
@@ -1265,22 +1335,69 @@ fn row_links(
     if !text.contains('/') {
         return found;
     }
-    if cache.len() > 4096 {
-        cache.clear();
-    }
-    let cwd = std::env::current_dir().unwrap_or_default();
-    found.extend(super::links::find(text, &cwd, &mut |path| {
-        let fresh = cache
-            .get(path)
-            .filter(|(asked, _)| asked.elapsed() < Duration::from_secs(2));
-        if let Some((_, found)) = fresh {
-            return *found;
-        }
-        let found = path.exists();
-        cache.insert(path.to_path_buf(), (Instant::now(), found));
-        found
-    }));
+    found.extend(super::links::find(text, cwd, exists));
     found
+}
+
+/// Whether paths named on screen exist, without the drawing thread touching
+/// the disk: a path not yet known draws unlinked and is asked on a worker,
+/// and a stale answer is kept while it is asked again. The answer shows on
+/// the next frame, which the shell's tick brings within a quarter second.
+/// On Windows one `exists` can take milliseconds behind an antivirus filter
+/// or a disconnected drive, which a frame cannot afford.
+struct PathProbe {
+    shared: std::sync::Arc<std::sync::Mutex<ProbeState>>,
+    ask: std::sync::mpsc::Sender<std::path::PathBuf>,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    known: std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
+    asking: std::collections::HashSet<std::path::PathBuf>,
+}
+
+/// How long an answer stands before it is asked again.
+const PATH_TTL: Duration = Duration::from_secs(2);
+
+impl PathProbe {
+    fn start() -> Self {
+        Self::with(|path| path.exists())
+    }
+
+    fn with(check: impl Fn(&std::path::Path) -> bool + Send + 'static) -> Self {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(ProbeState::default()));
+        let (ask, asked) = std::sync::mpsc::channel::<std::path::PathBuf>();
+        let worker = shared.clone();
+        // Ends when the session, and with it the sender, is dropped.
+        let _ = std::thread::Builder::new()
+            .name("davinci-path-probe".into())
+            .spawn(move || {
+                for path in asked {
+                    let found = check(&path);
+                    let mut state = worker.lock().unwrap_or_else(|e| e.into_inner());
+                    state.asking.remove(&path);
+                    state.known.insert(path, (Instant::now(), found));
+                }
+            });
+        Self { shared, ask }
+    }
+
+    /// The last answer for `path`, asking again when there is none or it
+    /// is stale. Never blocks on the disk.
+    fn exists(&self, path: &std::path::Path) -> bool {
+        let mut state = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if state.known.len() > 4096 {
+            state.known.clear();
+        }
+        let (answer, stale) = match state.known.get(path) {
+            Some((asked, found)) => (*found, asked.elapsed() >= PATH_TTL),
+            None => (false, true),
+        };
+        if stale && state.asking.insert(path.to_path_buf()) {
+            let _ = self.ask.send(path.to_path_buf());
+        }
+        answer
+    }
 }
 
 /// A link's address and the screen cells it covers.
@@ -1529,6 +1646,68 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Wait for the probe's worker, which answers on its own thread.
+    fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn a_slow_disk_never_holds_up_the_frame_that_names_a_path() {
+        let asks = Arc::new(AtomicUsize::new(0));
+        let counted = asks.clone();
+        let caller = std::thread::current().id();
+        let probe = super::PathProbe::with(move |_| {
+            assert_ne!(
+                std::thread::current().id(),
+                caller,
+                "checked on the drawing thread"
+            );
+            counted.fetch_add(1, Ordering::SeqCst);
+            // An antivirus-filtered stat on Windows.
+            std::thread::sleep(Duration::from_millis(300));
+            true
+        });
+        let path = std::path::Path::new("crates/x.rs");
+        let started = Instant::now();
+        // Every frame until the answer lands asks again; none of them waits.
+        for _ in 0..50 {
+            assert!(!probe.exists(path), "unknown paths draw unlinked");
+        }
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(
+            eventually(|| probe.exists(path)),
+            "the answer shows on a later frame"
+        );
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            1,
+            "one question per path, not per frame"
+        );
+    }
+
+    #[test]
+    fn a_missing_path_stays_unlinked_once_answered() {
+        let probe = super::PathProbe::with(|_| false);
+        let path = std::path::Path::new("nowhere/x.rs");
+        assert!(!probe.exists(path));
+        assert!(eventually(|| {
+            let state = probe.shared.lock().unwrap();
+            state.known.contains_key(path) && state.asking.is_empty()
+        }));
+        assert!(!probe.exists(path));
+    }
+
     #[test]
     fn a_picker_row_is_found_by_its_longest_name_and_a_cut_name_finds_nothing() {
         let names = ["gpt", "gpt-5 mini", "claude", ""];
