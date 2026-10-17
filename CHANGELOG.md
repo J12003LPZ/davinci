@@ -2,11 +2,19 @@
 
 ## Unreleased
 
+## 1.1.7
+
+Changes since `v1.1.6`.
+
+### Added
+- `/autocompact [auto|tokens|off]` shows, sets and persists the auto-compact point, applied live. The footer folds context and plan limits into its right end (`ctx ▰▱▱▱▱▱▱▱ 2% · 5h 23% left · wk 59% left`).
+- Claude Code interaction parity in the TUI: synchronized output, mouse selection with multi-click, click-to-place caret, wheel acceleration, Ctrl+O viewer, Ctrl+R history search, Ctrl+T checklist, Ctrl+G / Ctrl+X Ctrl+E external editor, OSC 8 links, auto/ansi/daltonized themes, per-project prompt history, blinking caret (`caretBlink: false` keeps it steady). `/skills`, `/plugins`, `/mcp` and `/login` show a list beside the selected row's details. MCP servers connect in parallel after the first frame.
+
 ### Changed
 - The "Sign in with ChatGPT" route now sends model requests over one WebSocket per conversation by default (`transport` unset, `auto` or `public-websocket`); `sse` or `http` keeps plain HTTPS. In the 39-run confirmation study WebSocket used 0.244x the uncached input and 0.819x the wall time of HTTP with 12/12 passes per arm on four public task families. A failure before output falls back to HTTP; a failure after output is returned, never replayed. Subscription-policy mode still requires `sse`. See `docs/cache/public-websocket.md`.
 
 ### Added
-- Opt-in ChatGPT Codex backend route for `openai-codex`: `/login openai-codex-backend` signs in with the Codex CLI OAuth client and stores the login under `openai-codex` with a route marker; requests made with it go to `https://chatgpt.com/backend-api`, everything else keeps the documented `api.openai.com/v1` route. Motivation: the documented route generated 35 to 45 tokens per second against 122 to 136 for Codex CLI's route in a 6-call probe. Not the default, not live-tested from DaVinci, refused by subscription-policy mode, no API-key fallback, Fast tier untouched. The login presents the Codex CLI OAuth client, which is a risk to the ChatGPT account. See `docs/cache/chatgpt-backend-route.md`.
+- Opt-in ChatGPT Codex backend route for `openai-codex`: `/login openai-codex-backend` signs in with the Codex CLI OAuth client and stores the login under `openai-codex` with a route marker; requests made with it go to `https://chatgpt.com/backend-api/codex/responses` (the endpoint Codex CLI uses), everything else keeps the documented `api.openai.com/v1` route. Motivation: the documented route generated 35 to 45 tokens per second against 122 to 136 for Codex CLI's route in a 6-call probe. Not the default, not live-tested from DaVinci, refused by subscription-policy mode, no API-key fallback, Fast tier untouched. The login presents the Codex CLI OAuth client, which is a risk to the ChatGPT account. See `docs/cache/chatgpt-backend-route.md`.
 - Hybrid Context VM mode (`DAVINCI_CONTEXT_VM=hybrid` or the `context-vm` setting; off stays the default). Requests are the off-mode transcript, append-only with native items. The Context VM keeps the task ledger every turn and supplies it at compaction, with the newest messages kept verbatim. Compaction follows the provider-reported request size, and a provider refusing the input as too long gets one compaction and a retry. In a scripted 300-turn session it matched off mode's prefix reuse (98.3% vs 98.4%), sent half the summarizer bytes, and kept every stated requirement through two compactions with a summarizer that added nothing. Offline structural measurement; no provider cache or quality claim. A compaction commits only a replacement under the threshold, keeps the transcript when the ledger cannot follow it, and keeps every cited source retrievable through repeated compactions; a provider count is adjusted for system prompt and tool changes and dropped on a model change.
 - `/plugins`, `/skills` and `/mcp` are redesigned for reading. Tabs are one row with the open one as a filled pill, plus a live `n/total` position; the tabs and the rounded search box stay pinned while the list scrolls. Each entry is a name with `· status · source` after it on the same line, one clipped description under it, and a blank row between entries. The selected entry shows two description lines and its note. Plugins and MCP servers that fail, need authentication (401/403/login in the status or note) or need attention are badged on their row (`× error`, `! needs auth`) and counted at the right of the tab bar, including from Discover. Skills never show a problem.
 - `/skills` is filed by source instead of one flat list of hundreds: your own skills first, then one heading per plugin (`▸ ecc@ecc · 293 skills`). A plugin with more than 8 skills starts folded and shows a one-line preview of what is inside; enter or space on a heading folds and unfolds it. `/` filters by name, description or plugin, opens every group it matches and says `n of total`; esc clears it.
@@ -21,6 +29,12 @@
 - The requirement review is not sent when a check already passed on the latest change. In the 36-run gpt-6-luna baseline the review fired in 35 runs and the requests after it carried 61% of uncached input. Unverified, partly verified and failed changes still get the review. A workspace-wide `cargo check` or `cargo clippy` counts as a passing check, as it does for the verification gate. `RunStats` gains `completionRequirementReviewsSkipped`. `requirementReview: false` still turns the review off.
 
 ### Fixed
+- The ChatGPT backend route (`/login openai-codex-backend`) sent requests to `https://chatgpt.com/backend-api/responses`; it now uses `.../backend-api/codex/responses`. Still not live-tested from DaVinci.
+- The Codex subscription gate checks every case variant of the `Authorization` header. With both `Authorization` and `authorization` present, a mismatched override passed or failed depending on hash order.
+- `/login` shows the ChatGPT backend login as ready once stored, instead of "never configured" (it is stored under `openai-codex`).
+- Parallel reads in session mode no longer fail with "journal writer is busy" on Windows. The journal writer wait is 30s instead of 2s; a stuck writer still surfaces as `WriterBusy`.
+- Prompt history is owner-only on unix (0600 file, 0700 directory); it can hold pasted secrets and was world-readable. A file left readable by an earlier version is tightened on the next append.
+- Dependencies: base64 0.23.1, serde_json 1.0.152, zeroize 1.9.1, zstd 0.14.2, icu_segmenter 2.3.0 (CJK word navigation unchanged); GitHub Actions setup-node 7.1.0, upload-artifact 7.0.2, download-artifact 8.0.2.
 - A click in the conversation no longer leaves a white block behind. A press without a drag selected one cell and painted it in reverse video until the next click, which read as a second cursor; now only a drag highlights, and wheel scrolling is unchanged.
 - A provider stream cut inside a tool call is retried like any other cut stream. The error text `Stream ended before the tool call was complete` matched no retryable pattern, so the run ended with exit code 1 and three retries unused (4 of the 288 DaVinci runs in the benchmark). Nothing from a cut response executes, so a retry cannot repeat a tool call. The same wording comes from the Chat Completions and Anthropic decoders, so a cut tool call is retried there too.
 - A Responses tool call whose stream repeats itself for 8,192 fragments in a row (one fragment, or a cycle of up to four) is abandoned with an error instead of being read until the provider closes the stream, over HTTPS and WebSocket. Two benchmark runs streamed an escaped newline about 49,600 times over 15 minutes each. This error is not retried. A real argument made of one short pattern that long, such as an array of several thousand identical numbers, is abandoned too.
@@ -47,7 +61,7 @@
 
 ## 1.1.6
 
-Changes since `v1.1.5`.
+Changes since `v1.1.5`. Tagged `v1.1.6` at `6e527da3`.
 
 ### Added
 - Installed skills and plugin commands are slash commands, named as in Claude Code: `/<skill>` for your own, `/<plugin>:<name>` for a plugin's (`/superpowers:writing-plans`), listed with their descriptions when you type `/`. An install from `/plugins` (manager or typed `/plugins install …`) loads them at once; no `/reload`. Built-in and native commands keep their names; `/skill:<name>` still works.
