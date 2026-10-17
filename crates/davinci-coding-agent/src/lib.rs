@@ -27,7 +27,6 @@ pub mod self_update;
 pub mod semantic;
 pub mod session_diagnostics;
 pub mod settings;
-pub mod startup_trace;
 pub mod trust;
 
 pub use sdk::{
