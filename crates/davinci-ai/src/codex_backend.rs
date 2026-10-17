@@ -141,6 +141,18 @@ mod tests {
             resolve_provider_auth("openai-codex", &storage, &HashMap::new(), true).unwrap();
         assert_eq!(resolved.source, AUTH_SOURCE);
         assert!(crate::stored_credential_problem("openai-codex", &storage).is_none());
+        // Status views (/login, /model) report the same source request-time resolution does.
+        let check = crate::model_runtime::check_auth(
+            "openai-codex",
+            &crate::ModelConfig::empty(),
+            &storage,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (check.kind.as_str(), check.source.as_str()),
+            ("oauth", AUTH_SOURCE)
+        );
 
         // A legacy-shaped login without the marker is still refused, as before.
         let mut legacy = AuthStorage::in_memory();

@@ -6788,28 +6788,47 @@ fn refresh_thinking_sheet(agent: &Agent, model: &mut Model) {
     model.facts.thinking_output_share = share;
 }
 
+/// One `/login` row per offered provider. The ChatGPT backend login has no
+/// credential of its own: it is stored under `openai-codex` with a route
+/// marker, so its row reads that credential and is ready only when the stored
+/// login is the backend one.
+fn login_provider_rows(
+    names: &[String],
+    auth: &std::collections::BTreeMap<String, davinci_ai::AuthCheck>,
+) -> Vec<ProviderRow> {
+    names
+        .iter()
+        .map(|name| {
+            let check = if name == davinci_ai::codex_backend::LOGIN_PROVIDER {
+                auth.get("openai-codex")
+                    .filter(|check| check.source == davinci_ai::codex_backend::AUTH_SOURCE)
+            } else {
+                auth.get(name)
+            };
+            match check {
+                Some(check) => ProviderRow {
+                    name: name.clone(),
+                    method: check.kind.clone(),
+                    source: check.source.clone(),
+                    state: Credential::Ready,
+                },
+                None => ProviderRow {
+                    name: name.clone(),
+                    method: "api key or oauth".into(),
+                    source: "never configured".into(),
+                    state: Credential::Absent,
+                },
+            }
+        })
+        .collect()
+}
+
 /// `3d` — provider credentials: every provider `/login` offers, with where
 /// its credential came from, from the same auth resolution `/model` uses.
 fn open_login_sheet(parsed: &crate::args::Args, model: &mut Model) {
     let snapshot = crate::load_model_runtime(parsed);
     let names = crate::interactive_login_providers(parsed);
-    model.providers = names
-        .iter()
-        .map(|name| match snapshot.auth.get(name) {
-            Some(check) => ProviderRow {
-                name: name.clone(),
-                method: check.kind.clone(),
-                source: check.source.clone(),
-                state: Credential::Ready,
-            },
-            None => ProviderRow {
-                name: name.clone(),
-                method: "api key or oauth".into(),
-                source: "never configured".into(),
-                state: Credential::Absent,
-            },
-        })
-        .collect();
+    model.providers = login_provider_rows(&names, &snapshot.auth);
     model.login_index = 0;
     model.device_code = None;
     model.facts.auth_path = home_label(&davinci_ai::default_auth_path());

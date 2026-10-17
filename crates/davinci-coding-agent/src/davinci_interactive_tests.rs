@@ -4137,3 +4137,47 @@ fn keys_during_compaction_type_but_never_interrupt_or_submit() {
     assert_eq!(working.verb(), "Compacting conversation");
     assert!(m.transcript.is_empty(), "nothing was submitted or queued");
 }
+
+#[test]
+fn login_rows_show_the_chatgpt_backend_login_as_ready_only_when_it_is_stored() {
+    use davinci_ai::{codex_backend, AuthCheck};
+    use davinci_tui::davinci::model::Credential;
+    use std::collections::BTreeMap;
+    let names = vec![
+        "openai-codex".to_string(),
+        codex_backend::LOGIN_PROVIDER.to_string(),
+    ];
+    let check = |source: &str| AuthCheck {
+        kind: "oauth".into(),
+        source: source.into(),
+    };
+    let states = |auth: &BTreeMap<String, AuthCheck>| {
+        super::login_provider_rows(&names, auth)
+            .into_iter()
+            .map(|row| (row.name, row.state, row.source))
+            .collect::<Vec<_>>()
+    };
+
+    // Backend login: stored under openai-codex, so both rows read it.
+    let backend = BTreeMap::from([(
+        "openai-codex".to_string(),
+        check(codex_backend::AUTH_SOURCE),
+    )]);
+    let rows = states(&backend);
+    assert_eq!(rows[0].1, Credential::Ready);
+    assert_eq!(rows[1].1, Credential::Ready, "{rows:?}");
+    assert_eq!(rows[1].2, codex_backend::AUTH_SOURCE);
+
+    // Documented Sign in with ChatGPT login: the backend row stays absent.
+    let documented = BTreeMap::from([("openai-codex".to_string(), check("OAuth"))]);
+    let rows = states(&documented);
+    assert_eq!(rows[0].1, Credential::Ready);
+    assert_eq!(rows[1].1, Credential::Absent, "{rows:?}");
+
+    // Nothing stored: both absent.
+    let rows = states(&BTreeMap::new());
+    assert!(
+        rows.iter().all(|row| row.1 == Credential::Absent),
+        "{rows:?}"
+    );
+}
