@@ -350,14 +350,16 @@ fn skills_are_filed_under_their_source_and_big_plugins_start_folded() {
         text.contains("Skills (310)") || text.contains("Installed (310)"),
         "{text}"
     );
-    assert!(text.contains("▾ Your skills · 2 skills"), "{text}");
-    assert!(text.contains("mine-a"), "{text}");
-    assert!(text.contains("▸ ecc@ecc · 293 skills"), "{text}");
-    assert!(text.contains("▸ superpowers · 15 skills"), "{text}");
-    // A folded group says what is inside, in one clipped line.
-    assert!(text.contains("ecc-skill-000, ecc-skill-001"), "{text}");
-    // 308 plugin cards would bury the screen; only the two of the open group show.
-    assert_eq!(text.matches("does a thing").count(), 2, "{text}");
+    // The list names each group with its count flush right.
+    assert!(text.contains("▾ Your skills"), "{text}");
+    assert!(text.contains("mine-a") && text.contains("mine-b"), "{text}");
+    assert!(text.contains("▸ ecc@ecc") && text.contains("293"), "{text}");
+    assert!(text.contains("▸ superpowers") && text.contains("15"), "{text}");
+    // A folded group lists nothing under it: 308 plugin skills never bury the screen.
+    assert!(!text.contains("ecc-skill-000"), "{text}");
+    // The pane beside the list describes the selected entry: the first group.
+    assert!(text.contains("2 skills"), "{text}");
+    assert!(text.contains("mine-a, mine-b"), "{text}");
 }
 
 #[test]
@@ -378,7 +380,8 @@ fn a_filter_opens_every_group_it_matches_and_counts_them() {
     sheet.filter = "sp-0".into();
     let text = draw(&model(100, 40, sheet)).join("\n");
     assert!(text.contains("10 of 310"), "{text}");
-    assert!(text.contains("▾ superpowers · 10 of 15 skills"), "{text}");
+    assert!(text.contains("▾ superpowers"), "{text}");
+    assert!(text.contains("10/15"), "{text}");
     assert!(!text.contains("ecc@ecc"), "{text}");
     let mut none = skill_sheet();
     none.filter = "zzzz".into();
@@ -402,5 +405,65 @@ fn grouped_rows_are_never_wider_than_the_terminal() {
                 }
             }
         }
+    }
+}
+
+fn tokened_sheet() -> ExtensionsSheet {
+    let skill = |title: &str, group: &str, tokens: u64| ExtensionRow {
+        key: format!("C:/skills/{title}/SKILL.md"),
+        title: title.into(),
+        status: "user".into(),
+        detail: format!("Use when working with {title}."),
+        group: group.into(),
+        tokens,
+        can_delete: true,
+        ..ExtensionRow::default()
+    };
+    ExtensionsSheet {
+        tab: ExtensionTab::Skills,
+        skills: vec![
+            skill("alpha", "Your skills", 160),
+            skill("beta", "Your skills", 80),
+        ],
+        selected: [0, 1, 0],
+        ..ExtensionsSheet::default()
+    }
+}
+
+#[test]
+fn skills_split_into_a_list_and_the_selected_skills_details() {
+    let rows = draw(&model(110, 30, tokened_sheet()));
+    let text = rows.join("
+");
+    // The list shows each skill's cost; the pane shows the selection in full.
+    assert!(rows.iter().any(|r| r.contains("alpha") && r.contains("160") && r.contains('│')), "{text}");
+    assert!(rows.iter().any(|r| r.contains("beta") && r.contains("80")), "{text}");
+    assert!(text.contains("~240 tokens in context"), "{text}");
+    // Selection 1 is `alpha` (0 is the group heading).
+    assert!(rows.iter().any(|r| r.starts_with("❯ ● alpha")), "{text}");
+    assert!(text.contains("yours  ·  ~160 tokens in context"), "{text}");
+    assert!(text.contains("Use when working with alpha."), "{text}");
+    assert!(text.contains("PATH") && text.contains("alpha/SKILL.md"), "{text}");
+    assert!(text.contains("d move to trash"), "{text}");
+    // A narrow window keeps the stacked cards.
+    let narrow = draw(&model(80, 30, tokened_sheet())).join("
+");
+    assert!(!narrow.contains('│'), "{narrow}");
+    assert!(narrow.contains("alpha"), "{narrow}");
+}
+
+#[test]
+fn the_details_stay_put_while_a_long_list_scrolls() {
+    let mut sheet = skill_sheet();
+    for tokens in [0usize, 150, 300] {
+        sheet.selected[1] = tokens;
+        let m = model(110, 30, sheet.clone());
+        let rows = draw(&m);
+        // The list scrolled; the pane still holds the details of what is selected.
+        assert!(rows.iter().any(|r| r.starts_with("❯ ")), "{tokens}:
+{}", rows.join("
+"));
+        let pane_rows = rows.iter().filter(|r| r.contains(" │ ")).count();
+        assert!(pane_rows >= 20, "{tokens}: the divider spans the body ({pane_rows})");
     }
 }

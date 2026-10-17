@@ -191,6 +191,18 @@ fn tab_bar(model: &Model, sheet: &ExtensionsSheet) -> Vec<Line<'static>> {
         }
     }
     let mut right = problem_summary(model, sheet);
+    if sheet.tab == ExtensionTab::Skills && sheet.view == ExtensionView::Installed {
+        let total: u64 = sheet.current_rows().iter().map(|row| row.tokens).sum();
+        if total > 0 {
+            right.push(span(
+                format!(
+                    "~{} tokens in context",
+                    super::context_usage::format_tokens(total)
+                ),
+                th.muted,
+            ));
+        }
+    }
     if let Some(text) = position(sheet) {
         if !right.is_empty() {
             right.push(span("  ", th.muted));
@@ -346,12 +358,313 @@ pub fn pinned_rows(model: &Model) -> usize {
         .map_or(0, |sheet| header(model, sheet).len().min(MAX_PINNED))
 }
 
+/// The widest list column of the split view; the detail pane takes the rest.
+const LIST_WIDTH: u16 = 40;
+/// Narrower than this, or shorter than [`SPLIT_MIN_HEIGHT`], `/skills` keeps
+/// the stacked cards: two panes need room to both read.
+const SPLIT_MIN_WIDTH: u16 = 90;
+const SPLIT_MIN_HEIGHT: u16 = 18;
+/// Rows the sheet frame spends around its content (rule, title, blank, hint).
+const FRAME_ROWS: usize = 6;
+/// Description lines the detail pane shows before it clips.
+const DESCRIPTION_ROWS: usize = 8;
+
+/// `/skills` on the Installed view draws a list beside the selected skill's
+/// details when the window is big enough.
+fn splits(model: &Model, sheet: &ExtensionsSheet) -> bool {
+    sheet.tab == ExtensionTab::Skills
+        && sheet.view == ExtensionView::Installed
+        && width_of(model) >= SPLIT_MIN_WIDTH
+        && model.height >= SPLIT_MIN_HEIGHT
+        && !sheet.entries(sheet.tab).is_empty()
+}
+
+/// One list line: the bar, the fold or state mark, the name, and what it
+/// costs (a skill's tokens, a group's count) flush right.
+fn list_row(
+    model: &Model,
+    sheet: &ExtensionsSheet,
+    entry: &ExtensionEntry,
+    selected: bool,
+    width: u16,
+) -> Line<'static> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let mut spans = vec![span(
+        if selected {
+            SELECTION_BAR
+        } else {
+            UNSELECTED_BAR
+        },
+        if selected { cc.permission } else { cc.inactive },
+    )];
+    let right = match entry {
+        ExtensionEntry::Group {
+            shown,
+            total,
+            name,
+            open,
+        } => {
+            let count = if shown == total {
+                total.to_string()
+            } else {
+                format!("{shown}/{total}")
+            };
+            let room = width.saturating_sub(2 + 2 + count.chars().count() as u16 + 1);
+            spans.push(span(if *open { "▾ " } else { "▸ " }, th.primary));
+            spans.push(ui::span_strong(
+                clip_ellipsis(name, room),
+                if selected { cc.permission } else { th.muted },
+                th,
+            ));
+            count
+        }
+        ExtensionEntry::Row(at) => {
+            let item = &sheet.current_rows()[*at];
+            let tokens = if item.tokens > 0 {
+                item.tokens.to_string()
+            } else {
+                String::new()
+            };
+            let room = width.saturating_sub(2 + 2 + tokens.chars().count() as u16 + 1);
+            // Skills are instructions: whatever a host reports, they are fine.
+            let (mark, color) = if matches!(item.state, State::Failed | State::Attention) {
+                ("●", th.success)
+            } else {
+                glyph(item, Kind::Installed, th)
+            };
+            spans.push(span(mark, color));
+            spans.push(pad(1, None));
+            spans.extend(title_spans(&clip_ellipsis(&item.title, room), selected, th));
+            tokens
+        }
+    };
+    let used = ui::run_width(&spans);
+    let gap = width
+        .saturating_sub(used + right.chars().count() as u16 + 1)
+        .max(1);
+    spans.push(pad(gap, None));
+    spans.push(span(right, th.muted));
+    spans.push(pad(1, None));
+    Line::from(truncate_run(spans, width))
+}
+
+/// The list column: every entry one line, a blank before each group but the
+/// first, windowed around the selection.
+fn list_column(model: &Model, sheet: &ExtensionsSheet, height: usize, width: u16) -> Vec<Line<'static>> {
+    let entries = sheet.entries(sheet.tab);
+    let selected = sheet.index();
+    let mut rows = Vec::new();
+    let mut anchor = 0;
+    for (i, entry) in entries.iter().enumerate() {
+        if matches!(entry, ExtensionEntry::Group { .. }) && !rows.is_empty() {
+            rows.push(Line::default());
+        }
+        if i == selected {
+            anchor = rows.len();
+        }
+        rows.push(list_row(model, sheet, entry, i == selected, width));
+    }
+    ui::window(rows, height, anchor, &model.theme)
+}
+
+/// `…/skills/pdf/SKILL.md` kept from its end, where the name is.
+fn clip_start(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let tail: String = text.chars().skip(count - keep).collect();
+    format!("…{tail}")
+}
+
+fn source_label(status: &str) -> &str {
+    match status {
+        "plugin" => "from a plugin",
+        "user" => "yours",
+        "project" => "this project",
+        "other" => "from settings or a package",
+        other => other,
+    }
+}
+
+/// The detail pane for the selected entry, one span run per line.
+fn detail_rows(model: &Model, sheet: &ExtensionsSheet, width: u16) -> Vec<Vec<Span<'static>>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let room = usize::from(width);
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let label = |text: &str| vec![span(text.to_string(), th.muted)];
+    let key = |k: &str, what: &str| {
+        vec![
+            span(k.to_string(), cc.permission),
+            span(format!(" {what}"), th.muted),
+        ]
+    };
+    let wrapped = |text: &str, ink: Color, limit: usize| -> Vec<Vec<Span<'static>>> {
+        text.lines()
+            .flat_map(|line| wrap(line, width))
+            .take(limit)
+            .map(|line| vec![span(line, ink)])
+            .collect()
+    };
+    let entries = sheet.entries(sheet.tab);
+    match entries.get(sheet.index()) {
+        Some(ExtensionEntry::Group {
+            name,
+            shown,
+            total,
+            open,
+        }) => {
+            out.push(vec![ui::span_strong(
+                clip_ellipsis(name, width),
+                th.text,
+                th,
+            )]);
+            out.push(vec![span(
+                if shown == total {
+                    format!("{total} skills")
+                } else {
+                    format!("{shown} of {total} skills match")
+                },
+                th.muted,
+            )]);
+            out.push(Vec::new());
+            let members: Vec<&str> = sheet
+                .current_rows()
+                .iter()
+                .filter(|row| {
+                    let group = if row.group.is_empty() {
+                        "Other"
+                    } else {
+                        row.group.as_str()
+                    };
+                    group == name
+                })
+                .map(|row| row.title.as_str())
+                .collect();
+            out.extend(wrapped(&members.join(", "), th.text, DESCRIPTION_ROWS));
+            out.push(Vec::new());
+            out.push(label("ACTIONS"));
+            out.push(key("enter", if *open { "fold this group" } else { "unfold this group" }));
+        }
+        Some(ExtensionEntry::Row(at)) => {
+            let item = &sheet.current_rows()[*at];
+            out.push(vec![ui::span_strong(
+                clip_ellipsis(&item.title, width),
+                th.text,
+                th,
+            )]);
+            let mut meta = vec![span(source_label(&item.status).to_string(), th.muted)];
+            if item.tokens > 0 {
+                meta.push(span(
+                    format!("  ·  ~{} tokens in context", item.tokens),
+                    th.muted,
+                ));
+            }
+            out.push(meta);
+            if let Some(action) = sheet.armed_here() {
+                out.push(Vec::new());
+                out.extend(wrapped(
+                    &confirm_warning(sheet.tab, action, item),
+                    th.warning,
+                    usize::MAX,
+                ));
+                out.push(key("y", "confirm"));
+            }
+            if !item.detail.is_empty() {
+                out.push(Vec::new());
+                out.extend(wrapped(&item.detail, th.text, DESCRIPTION_ROWS));
+            }
+            out.push(Vec::new());
+            out.push(label("PATH"));
+            out.push(vec![span(clip_start(&item.key, room), th.text)]);
+            if let Some(note) = item
+                .note
+                .as_deref()
+                .filter(|note| !note.is_empty() && !item.key.starts_with(*note))
+            {
+                out.push(Vec::new());
+                out.push(label("NOTE"));
+                out.extend(wrapped(note, th.muted, 4));
+            }
+            let mut actions: Vec<Vec<Span<'static>>> = Vec::new();
+            if item.can_toggle {
+                actions.push(key(
+                    "e",
+                    if item.status == "disabled" {
+                        "enable"
+                    } else {
+                        "disable"
+                    },
+                ));
+            }
+            if item.can_update {
+                actions.push(key("u", "update"));
+            }
+            if item.can_delete {
+                actions.push(key("d", "move to trash"));
+            }
+            if !actions.is_empty() {
+                out.push(Vec::new());
+                out.push(label("ACTIONS"));
+                let mut line: Vec<Span<'static>> = Vec::new();
+                for action in actions {
+                    if !line.is_empty() {
+                        line.push(pad(3, None));
+                    }
+                    line.extend(action);
+                }
+                out.push(line);
+            }
+        }
+        None => {}
+    }
+    out
+}
+
+/// The split view's body: the list on the left, a rule, the selected entry's
+/// details on the right, each exactly `height` rows so the sheet's own
+/// scrolling never moves the details away from the list.
+fn split_body(model: &Model, sheet: &ExtensionsSheet, header_rows: usize) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let width = width_of(model);
+    let height = usize::from(model.height)
+        .saturating_sub(FRAME_ROWS + header_rows)
+        .max(6);
+    let list = list_column(model, sheet, height, LIST_WIDTH);
+    let pane_width = width.saturating_sub(LIST_WIDTH + 4);
+    let mut pane = detail_rows(model, sheet, pane_width);
+    pane.truncate(height);
+    (0..height)
+        .map(|row| {
+            let mut spans = list
+                .get(row)
+                .map(|line| line.spans.clone())
+                .unwrap_or_default();
+            let used = ui::run_width(&spans);
+            spans.push(pad(LIST_WIDTH.saturating_sub(used), None));
+            spans.push(span(" │ ", th.cc().subtle));
+            if let Some(detail) = pane.get(row) {
+                spans.extend(detail.clone());
+            }
+            fit(spans, width)
+        })
+        .collect()
+}
+
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let Some(sheet) = &model.extension_manager else {
         return indented(model, "Nothing to manage.", th.muted);
     };
     let mut rows = header(model, sheet);
+    if splits(model, sheet) {
+        let head = rows.len().min(MAX_PINNED);
+        rows.extend(split_body(model, sheet, head));
+        return rows;
+    }
     match sheet.view {
         ExtensionView::Installed => installed_lines(model, sheet, &mut rows),
         ExtensionView::Discover => discover_lines(model, sheet, &mut rows),

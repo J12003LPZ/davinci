@@ -6402,6 +6402,7 @@ fn extension_rows(
             detail: row.detail,
             note: row.note,
             group: row.group,
+            tokens: row.tokens,
             can_update: row.can_update,
             can_toggle: row.can_toggle,
             can_approve: row.can_approve,

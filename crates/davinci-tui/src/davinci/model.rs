@@ -1863,6 +1863,9 @@ pub struct ExtensionRow {
     /// What the row is filed under (a plugin key, `Your skills`). A tab whose
     /// rows carry one draws a collapsible heading per group; empty means none.
     pub group: String,
+    /// What the row costs the context window each turn, in estimated tokens;
+    /// 0 when the host does not say (only skills do).
+    pub tokens: u64,
     pub can_update: bool,
     pub can_toggle: bool,
     pub can_approve: bool,
