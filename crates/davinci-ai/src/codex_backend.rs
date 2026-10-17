@@ -14,8 +14,12 @@ use std::collections::HashMap;
 
 use crate::{Credential, CredentialKind, Model, ResolvedAuth};
 
-/// Backend base URL, the same value the pre-migration catalog used.
-pub const BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
+/// Backend base URL. Requests go to `{base}/responses`, so it carries the
+/// `/codex` segment Codex CLI uses (`https://chatgpt.com/backend-api/codex/responses`).
+/// The pre-migration resolver appended `/codex/responses` to `.../backend-api`; the
+/// current one appends only `/responses`, so the bare `.../backend-api` sent requests
+/// to `.../backend-api/responses`.
+pub const BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// `Credential::env` key and value that mark a backend login.
 pub const ROUTE_ENV_KEY: &str = "OPENAI_CODEX_ROUTE";
 pub const ROUTE_ENV_VALUE: &str = "chatgpt-backend";
@@ -113,6 +117,30 @@ mod tests {
         assert_eq!(
             route_model(&other, &auth(AUTH_SOURCE)).base_url.as_deref(),
             Some("https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
+    fn a_backend_login_requests_the_codex_responses_endpoint() {
+        // Pins the full URLs, not just the base: the base alone passed while
+        // requests went to .../backend-api/responses.
+        let backend = auth(AUTH_SOURCE);
+        let codex = model("openai-codex");
+        let routed = route_model(&codex, &backend);
+        assert_eq!(
+            crate::stream::request_url(&routed, &backend),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            crate::codex::resolve_codex_websocket_url(routed.base_url.as_deref()),
+            "wss://chatgpt.com/backend-api/codex/responses"
+        );
+        // The documented route is unchanged.
+        let documented = auth("OAuth");
+        let kept = route_model(&codex, &documented);
+        assert_eq!(
+            crate::stream::request_url(&kept, &documented),
+            "https://api.openai.com/v1/responses"
         );
     }
 

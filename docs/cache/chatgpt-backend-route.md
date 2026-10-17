@@ -20,7 +20,8 @@ wall-time gap is the route, not DaVinci's own code. Evidence: `C:\bench\pubcmp\r
 
 The route follows the credential. A login made with `openai-codex-backend` carries `OPENAI_CODEX_ROUTE=chatgpt-backend`
 in its stored `env`; `resolve_provider_auth` reports its source as `OAuth (ChatGPT backend)`; the stream layer
-(`codex_backend::route_model`) then moves the model's base URL to `https://chatgpt.com/backend-api`. Nothing else
+(`codex_backend::route_model`) then moves the model's base URL to `https://chatgpt.com/backend-api/codex`, so requests
+go to `https://chatgpt.com/backend-api/codex/responses` (HTTP) or the `wss://` form of it, the endpoint Codex CLI uses. Nothing else
 changes: no catalog entry, no setting, no other provider.
 
 ## Risks you accept by using it
