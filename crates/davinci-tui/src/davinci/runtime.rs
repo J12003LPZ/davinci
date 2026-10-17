@@ -1033,11 +1033,11 @@ pub fn route_scroll_mouse(
     drawn: Option<Scrollbar>,
     mouse: event::MouseEvent,
 ) -> bool {
-    let wheel_rows = wheel_rows();
     use event::{MouseButton::Left, MouseEventKind};
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = mouse.kind == MouseEventKind::ScrollUp;
+            let wheel_rows = wheel_rows(up);
             // The completion list floats over the screen, so the pointer
             // decides which surface the wheel belongs to: over the list it
             // steps the selection, anywhere else it scrolls the conversation.
@@ -1285,11 +1285,12 @@ fn env_flag(name: &str) -> bool {
 }
 
 /// Rows one wheel notch scrolls: `DAVINCI_SCROLL_SPEED` (0.25–20) times the
-/// default three.
-fn wheel_rows() -> isize {
-    use std::sync::OnceLock;
+/// default three, faster inside a quick burst in one direction.
+fn wheel_rows(up: bool) -> isize {
+    use std::sync::{Mutex, OnceLock};
     static ROWS: OnceLock<isize> = OnceLock::new();
-    *ROWS.get_or_init(|| {
+    static BURST: Mutex<WheelBurst> = Mutex::new(WheelBurst::new());
+    let base = *ROWS.get_or_init(|| {
         let speed = std::env::var("DAVINCI_SCROLL_SPEED")
             .ok()
             .and_then(|value| value.trim().parse::<f64>().ok())
@@ -1297,7 +1298,44 @@ fn wheel_rows() -> isize {
             .unwrap_or(1.0)
             .clamp(0.25, 20.0);
         ((super::views::scrollbar::WHEEL_ROWS as f64 * speed).round() as isize).max(1)
-    })
+    });
+    if env_flag("DAVINCI_SCROLL_ACCEL_OFF") {
+        return base;
+    }
+    let multiplier = BURST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .notch(Instant::now(), up);
+    ((base as f64 * multiplier).round() as isize).max(1)
+}
+
+/// Notches that follow one another inside `GAP` in the same direction are a
+/// flick: from the third on each scrolls half a notch further than the last,
+/// up to four times the base. A pause or a turn starts again at one.
+struct WheelBurst {
+    last: Option<(Instant, bool)>,
+    streak: u32,
+}
+
+impl WheelBurst {
+    const GAP: Duration = Duration::from_millis(70);
+    const MAX: f64 = 4.0;
+
+    const fn new() -> Self {
+        Self {
+            last: None,
+            streak: 0,
+        }
+    }
+
+    fn notch(&mut self, now: Instant, up: bool) -> f64 {
+        let continues = self.last.is_some_and(|(at, was_up)| {
+            was_up == up && now.saturating_duration_since(at) <= Self::GAP
+        });
+        self.streak = if continues { self.streak + 1 } else { 1 };
+        self.last = Some((now, up));
+        (1.0 + f64::from(self.streak.saturating_sub(2)) * 0.5).min(Self::MAX)
+    }
 }
 
 /// A left click on a drawn target: jump back to the newest output, or take
@@ -1434,6 +1472,23 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_wheel_flick_speeds_up_and_a_pause_or_turn_starts_over() {
+        let t0 = Instant::now();
+        let step = Duration::from_millis(30);
+        let mut burst = WheelBurst::new();
+        let multipliers: Vec<f64> = (0..9).map(|i| burst.notch(t0 + step * i, true)).collect();
+        assert_eq!(&multipliers[..4], [1.0, 1.0, 1.5, 2.0]);
+        assert_eq!(*multipliers.last().unwrap(), 4.0, "capped at four");
+        // A pause longer than the gap, then a turn, each begin again.
+        let later = t0 + step * 8 + Duration::from_millis(300);
+        assert_eq!(burst.notch(later, true), 1.0);
+        assert_eq!(burst.notch(later + step, true), 1.0);
+        assert_eq!(burst.notch(later + step * 2, true), 1.5);
+        assert_eq!(burst.notch(later + step * 3, true), 2.0);
+        assert_eq!(burst.notch(later + step * 4, false), 1.0, "a turn resets");
+    }
+
     use super::*;
 
     #[test]
