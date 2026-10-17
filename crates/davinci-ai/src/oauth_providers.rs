@@ -4,6 +4,12 @@ use sha2::{Digest, Sha256};
 
 use crate::oauth::DevicePollStatus;
 
+const CODEX_BACKEND_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_BACKEND_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+const CODEX_BACKEND_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_BACKEND_REDIRECT: &str = "http://localhost:1455/auth/callback";
+const CODEX_BACKEND_SCOPE: &str = "openid profile email offline_access";
+
 const OPENROUTER_AUTHORIZE_URL: &str = "https://openrouter.ai/auth";
 const OPENROUTER_TOKEN_URL: &str = "https://openrouter.ai/api/v1/auth/keys";
 
@@ -266,6 +272,29 @@ pub fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>
 pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<AuthorizeRequest> {
     match provider {
         "openai-codex" => None,
+        crate::codex_backend::LOGIN_PROVIDER => {
+            let mut url = url::Url::parse(CODEX_BACKEND_AUTHORIZE_URL).ok()?;
+            url.query_pairs_mut()
+                .append_pair("response_type", "code")
+                .append_pair("client_id", CODEX_BACKEND_CLIENT_ID)
+                .append_pair("redirect_uri", CODEX_BACKEND_REDIRECT)
+                .append_pair("scope", CODEX_BACKEND_SCOPE)
+                .append_pair("code_challenge", &pkce.challenge)
+                .append_pair("code_challenge_method", "S256")
+                .append_pair("state", state)
+                .append_pair("id_token_add_organizations", "true")
+                .append_pair("codex_cli_simplified_flow", "true")
+                .append_pair("originator", "pi");
+            Some(AuthorizeRequest {
+                provider: provider.into(),
+                url: url.to_string(),
+                token_url: CODEX_BACKEND_TOKEN_URL.into(),
+                instructions: "Complete login in your browser, or paste the authorization code / redirect URL here. This signs in with the Codex CLI client to use the ChatGPT Codex backend.".into(),
+                pkce: Some(pkce.clone()),
+                state: Some(state.to_string()),
+                openai_siwc: None,
+            })
+        }
         "openrouter" => {
             let mut url = url::Url::parse(OPENROUTER_AUTHORIZE_URL).ok()?;
             url.query_pairs_mut()
@@ -350,6 +379,21 @@ pub fn token_exchange_request(
     let verifier = pkce.map(|p| p.verifier.as_str()).unwrap_or("");
     match provider {
         "openai-codex" => None,
+        crate::codex_backend::LOGIN_PROVIDER => {
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("grant_type", "authorization_code")
+                .append_pair("client_id", CODEX_BACKEND_CLIENT_ID)
+                .append_pair("code", code)
+                .append_pair("code_verifier", verifier)
+                .append_pair("redirect_uri", CODEX_BACKEND_REDIRECT)
+                .finish();
+            Some(TokenExchangeRequest {
+                url: CODEX_BACKEND_TOKEN_URL.into(),
+                content_type: "application/x-www-form-urlencoded".into(),
+                body,
+                redirect_uri: CODEX_BACKEND_REDIRECT.into(),
+            })
+        }
         "openrouter" => {
             let body = serde_json::json!({
                 "code": code,
@@ -425,6 +469,10 @@ pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExcha
     };
     match provider {
         "openai-codex" => None,
+        crate::codex_backend::LOGIN_PROVIDER => Some(form(
+            CODEX_BACKEND_TOKEN_URL.into(),
+            CODEX_BACKEND_CLIENT_ID,
+        )),
         "xai" => Some(form(XAI_TOKEN_URL.into(), XAI_CLIENT_ID)),
         "kimi-coding" => Some(form(
             format!("{KIMI_OAUTH_HOST}/api/oauth/token"),
@@ -586,6 +634,7 @@ fn describe_token_body(body: &str) -> String {
 pub fn oauth_providers() -> &'static [&'static str] {
     &[
         "openai-codex",
+        crate::codex_backend::LOGIN_PROVIDER,
         "openrouter",
         "xai",
         "kimi-coding",

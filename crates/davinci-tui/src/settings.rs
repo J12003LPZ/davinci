@@ -562,7 +562,15 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 label: "Theme".into(),
                 description: Some("Color theme for the interface".into()),
                 current_value: config.theme.clone(),
-                values: vec!["dark".into(), "light".into(), "vox".into(), "pi".into()],
+                values: vec![
+                    "dark".into(),
+                    "light".into(),
+                    "vox".into(),
+                    "auto".into(),
+                    "ansi".into(),
+                    "daltonized".into(),
+                    "pi".into(),
+                ],
             },
             SettingItem {
                 id: "warnings".into(),

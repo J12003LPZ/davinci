@@ -638,6 +638,13 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
 
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
+    // `DAVINCI_MCP_BLOCKING=1` waits for the servers before the first frame.
+    BACKGROUND_MCP.store(
+        !print_mode
+            && parsed.mode != Some(Mode::Rpc)
+            && std::env::var_os("DAVINCI_MCP_BLOCKING").is_none(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let mut agent = match build_agent(&parsed, &session_dir, &cwd) {
         Err(err) if err == NO_SESSION_SELECTED => return Ok(0),
         other => other?,
@@ -820,6 +827,10 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
         error_message: None,
     }
 }
+
+/// Set by `run` when the live shell will own this process, so MCP servers may
+/// finish connecting after the first frame.
+static BACKGROUND_MCP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
     let graph_worker = crate::native_extensions::graph_worker_context();
@@ -1132,6 +1143,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .tool_registry
             .retain(|name| !davinci_agent::tools::is_managed_process_tool(name));
     }
+    startup_mark("agent: settings, prompt, sandbox ready");
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     if !parsed.no_mcp {
         let mcp_config = mcp::load(
@@ -1147,16 +1159,30 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
                 agent.withdraw_auto_sandbox("local project/plugin MCP may have unowned host descendants; restart directly in Auto to activate confinement");
             }
         }
+        // The live shell draws before the servers are up (an `npx` start
+        // takes seconds); every other mode needs the tools before it begins.
+        let background = BACKGROUND_MCP.load(std::sync::atomic::Ordering::SeqCst);
         let registry = match (
             agent.tool_context.foreground_supervisor.as_ref(),
             agent.tool_context.sandbox.as_ref(),
         ) {
+            (Some(host), Some(sandbox)) if background => {
+                davinci_agent::McpRegistry::connect_in_background(
+                    &mcp_config,
+                    cwd,
+                    Some((host.clone(), sandbox.clone())),
+                )
+            }
             (Some(host), Some(sandbox)) => {
                 davinci_agent::McpRegistry::connect_with_executor(&mcp_config, cwd, host, sandbox)
+            }
+            _ if background => {
+                davinci_agent::McpRegistry::connect_in_background(&mcp_config, cwd, None)
             }
             _ => davinci_agent::McpRegistry::connect(&mcp_config, cwd),
         };
         agent.attach_mcp(registry);
+        startup_mark("agent: mcp servers connected");
     }
     // Overflowing batch output is kept where the model can `read` it
     // back, under the agent dir so a fixture dir keeps tests contained.
@@ -7721,6 +7747,14 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
+        SlashAction::Autocompact(arg) => {
+            let text =
+                davinci_interactive::run_autocompact(agent, &arg).unwrap_or_else(|note| note);
+            session.chrome.transcript.push("autocompact", &text);
+            session.chrome.status = "autocompact".into();
+            println!("{text}");
+            Ok(true)
+        }
         SlashAction::Context(_) => {
             let view = davinci_surfaces::context_usage_view(&agent.context_usage());
             let text =
@@ -8716,6 +8750,14 @@ fn store_oauth_tokens(
     let expires = tokens
         .expires
         .or_else(|| davinci_ai::jwt_expiry_ms(&tokens.access));
+    if provider == davinci_ai::codex_backend::LOGIN_PROVIDER {
+        // Stored under openai-codex with the route marker; requests then use the ChatGPT backend.
+        storage
+            .login_codex_backend(tokens.access, tokens.refresh, expires)
+            .map_err(|err| err.to_string())?;
+        println!("stored ChatGPT backend login for openai-codex");
+        return Ok(true);
+    }
     storage
         .login_oauth(provider, tokens.access, tokens.refresh, expires)
         .map_err(|err| err.to_string())?;
@@ -8731,6 +8773,9 @@ fn interactive_login_providers(parsed: &Args) -> Vec<String> {
         .iter()
         .map(|spec| spec.id.to_string())
         .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
+        .chain(std::iter::once(
+            davinci_ai::codex_backend::LOGIN_PROVIDER.to_string(),
+        ))
         .chain(loaded_extension_host(parsed).js_oauth_provider_names())
         .collect();
     ids.sort();

@@ -160,9 +160,18 @@ pub fn check_auth(
                 return None;
             }
             return if provider_supports_oauth(provider, config) {
+                // Same source label request-time resolution reports, so status
+                // views can tell a ChatGPT backend login from a documented one.
+                let source = if provider == "openai-codex"
+                    && crate::codex_backend::is_backend_credential(cred)
+                {
+                    crate::codex_backend::AUTH_SOURCE
+                } else {
+                    "OAuth"
+                };
                 Some(AuthCheck {
                     kind: "oauth".into(),
-                    source: "OAuth".into(),
+                    source: source.into(),
                 })
             } else {
                 None
@@ -348,7 +357,7 @@ fn env_nonempty(value: Option<&String>) -> bool {
 }
 
 fn auth_check_from_resolved(resolved: ResolvedAuth) -> AuthCheck {
-    let kind = if resolved.source == "OAuth" || resolved.source.contains("oauth") {
+    let kind = if resolved.source.to_ascii_lowercase().contains("oauth") {
         "oauth"
     } else {
         "api_key"

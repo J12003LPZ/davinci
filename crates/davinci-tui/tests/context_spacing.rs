@@ -33,7 +33,7 @@ fn a_blank_row_separates_the_last_message_from_the_context_meter() {
         );
         m.width = 100;
         m.height = height;
-        m.context_bar = ContextBarMode::Compact;
+        m.context_bar = ContextBarMode::Full;
         m.context_meter = Some(meter());
         // Enough history that the last message fills the row above the meter.
         for n in 0..80 {

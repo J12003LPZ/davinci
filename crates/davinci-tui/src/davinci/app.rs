@@ -12,7 +12,7 @@ use ratatui::text::Line;
 
 use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOwner};
 
-use super::model::{Choice, Model, Overlay, Screen};
+use super::model::{Choice, ContextBarMode, Entry, Model, Overlay, Screen};
 use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::scrollbar::{self, Scrollbar};
@@ -54,6 +54,8 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
 }
 
 pub struct ComposedFrame {
+    /// Screen rows that react to a click, in draw order.
+    pub targets: Vec<HitTarget>,
     pub lines: Vec<Line<'static>>,
     pub graph: Option<super::views::graph_nav::GraphFrame>,
     /// The conversation's scrollbar, when it has more rows than fit.
@@ -61,6 +63,30 @@ pub struct ComposedFrame {
     /// The screen rows the completion list occupies, when one is open. The
     /// wheel steers the list only while the pointer is over these rows.
     pub suggestion_rows: Option<std::ops::Range<u16>>,
+    /// The composer's caret as `(column, row)` on screen, when one is drawn.
+    pub caret: Option<(u16, u16)>,
+}
+
+/// What a click lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The `↓ Jump to bottom` row of a scrolled-back conversation.
+    JumpToBottom,
+    /// A visual row of the composer's text.
+    ComposerRow(usize),
+    /// The prompt shown in the sticky header, as a transcript entry.
+    Prompt(usize),
+    /// The completion item at this index.
+    Suggestion(usize),
+    /// The earlier prompt at this index of the history search's matches.
+    HistoryMatch(usize),
+}
+
+/// A clickable band of screen rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitTarget {
+    pub rows: std::ops::Range<u16>,
+    pub target: Target,
 }
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
@@ -71,6 +97,18 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             graph: None,
             scrollbar: None,
             suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
+        };
+    }
+    if let Some(viewer) = &model.viewer {
+        return ComposedFrame {
+            lines: pad_to(super::views::viewer::render(model, viewer, height), height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
         };
     }
     if matches!(model.screen, Screen::Models | Screen::Settings) && model.overlay.is_none() {
@@ -94,6 +132,8 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             graph: None,
             scrollbar: None,
             suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
         };
     }
     // Command surfaces use the same bottom-anchored, unboxed language as the
@@ -106,6 +146,8 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
                 graph: None,
                 scrollbar: None,
                 suggestion_rows: None,
+                targets: Vec::new(),
+                caret: None,
             };
         }
     }
@@ -119,10 +161,16 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let conversation =
         model.screen == Screen::Agent && model.overlay.is_none() && !model.codex_open();
 
-    let composer_rows = composer_rows(chrome_model);
+    chrome_model.composer_hit.set(None);
+    let (composer_rows, composer_caret) = composer_rows(chrome_model);
     // What the composer offers sits directly above it, inside the same stack,
     // so the list moves with the composer at any window height.
-    let offered = chrome::suggestions(chrome_model);
+    let searching = model.history_search.is_some();
+    let (offered, offered_items) = if searching {
+        chrome::history_search_rows(chrome_model)
+    } else {
+        chrome::suggestions_with_items(chrome_model)
+    };
     let top = extension_rows(model, &model.extensions.header);
     let bottom = extension_rows(model, &model.extensions.footer);
     let above = extension_rows(model, &model.extensions.above());
@@ -131,8 +179,13 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     // The context bar sits right above what the composer offers, as the
     // last thing read before typing.
     let meter = if conversation {
-        let mut meter = context_bar::lines(chrome_model, height);
-        meter.extend(plan_usage::lines(chrome_model, height));
+        let mut meter = chrome::checklist_rows(chrome_model, height);
+        // `compact` keeps these in the footer's right end (chrome::status);
+        // only `full` gives them rows.
+        if chrome_model.context_bar == ContextBarMode::Full {
+            meter.extend(context_bar::lines(chrome_model, height));
+            meter.extend(plan_usage::lines(chrome_model, height));
+        }
         // A row of air above it: the last transcript line (an error, a
         // command's output) must not sit flush against the meter's header.
         if !meter.is_empty() {
@@ -228,7 +281,52 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         let start = rows.len().min(height) as u16;
         start..(rows.len() + offered.len()).min(height) as u16
     });
+    let offered_start = rows.len().min(height) as u16;
     rows.extend(offered);
+    let mut targets = Vec::new();
+    if let Some(bar) = scrollbar.as_ref().filter(|bar| bar.offset > 0) {
+        let last = bar.top + bar.height.saturating_sub(1);
+        targets.push(HitTarget {
+            rows: last..last + 1,
+            target: Target::JumpToBottom,
+        });
+    }
+    if let Some(bar) = scrollbar.as_ref().filter(|bar| bar.offset > 0) {
+        let top = bar.total - usize::from(bar.height) - bar.offset;
+        if let Some(entry) = sticky_prompt(model, top) {
+            targets.push(HitTarget {
+                rows: bar.top..bar.top + 1,
+                target: Target::Prompt(entry),
+            });
+        }
+    }
+    for (at, item) in offered_items.iter().enumerate() {
+        let row = offered_start + at as u16;
+        let target = match (searching, *item) {
+            (true, usize::MAX) => continue,
+            (true, item) => Target::HistoryMatch(item),
+            (false, item) => Target::Suggestion(item),
+        };
+        targets.push(HitTarget {
+            rows: row..row + 1,
+            target,
+        });
+    }
+    let caret = composer_caret
+        .map(|(row, column)| (column, rows.len() + row))
+        .filter(|&(_, row)| row < height)
+        .map(|(column, row)| (column, row as u16));
+    if let Some(hit) = chrome_model.composer_hit.get() {
+        for visual in hit.start..hit.end {
+            let row = rows.len() + hit.first + (visual - hit.start);
+            if row < height {
+                targets.push(HitTarget {
+                    rows: row as u16..row as u16 + 1,
+                    target: Target::ComposerRow(visual),
+                });
+            }
+        }
+    }
     rows.extend(composer_rows);
     rows.extend(below);
     rows.extend(chrome::footer(chrome_model));
@@ -244,7 +342,35 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         graph,
         scrollbar,
         suggestion_rows,
+        targets,
+        caret,
     }
+}
+
+/// Plain text of conversation rows `range`, banner first, laid out exactly as
+/// [`conversation_body`] lays them out for a scrolling conversation. A
+/// selection held in conversation rows reads its text here, including rows
+/// scrolled out of view.
+pub fn conversation_text(model: &Model, range: std::ops::Range<usize>) -> Vec<String> {
+    let drawn = model.width >= scrollbar::MIN_WIDTH;
+    let width = if drawn { model.width - 1 } else { model.width };
+    let mut head = vec![blank()];
+    head.extend(startup::banner(model, &model.startup));
+    head.push(blank());
+    let conversation = transcript::conversation_rows(model, width);
+    let split = head.len();
+    let total = split + conversation.len();
+    let range = range.start.min(total)..range.end.min(total);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(range.len());
+    if range.start < split {
+        out.extend_from_slice(&head[range.start..range.end.min(split)]);
+    }
+    if range.end > split {
+        out.extend(conversation.slice(range.start.max(split) - split..range.end - split));
+    }
+    out.into_iter()
+        .map(|line| Line::from(ui::truncate_run(line.spans, width)).to_string())
+        .collect()
 }
 
 /// The conversation, scrolled to `model.transcript_scroll`, with its
@@ -313,10 +439,30 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         drawn,
     };
     let mut rows = rows_of(top..top + height);
+    if let Some(entry) = sticky_prompt(model, top) {
+        if let Entry::User(text) = &model.transcript[entry] {
+            let first = text.lines().next().unwrap_or_default();
+            let cc = model.theme.cc();
+            rows.insert(
+                0,
+                Line::from(ui::span(
+                    ui::clip_ellipsis(&format!("  ❯ {first}"), width),
+                    cc.inactive,
+                )),
+            );
+            rows.truncate(height);
+        }
+    }
     if offset > 0 {
         let cc = model.theme.cc();
+        let fresh = model.transcript.len().saturating_sub(scroll.entries);
         let below = format!(
-            "  ↓ {offset} {} below · scroll down or pgdn to return",
+            "  ↓ Jump to bottom · {}{offset} {} below · click, End or pgdn",
+            match fresh {
+                0 => String::new(),
+                1 => "1 new message · ".to_owned(),
+                n => format!("{n} new messages · "),
+            },
             if offset == 1 { "line" } else { "lines" }
         );
         if let Some(last) = rows.last_mut() {
@@ -344,6 +490,61 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
     (rows, Some(bar))
 }
 
+/// Where each prompt starts in the conversation, for the entries as they are:
+/// worked out once and kept until the transcript, its width or its fold changes.
+fn prompt_rows(model: &Model, width: u16) -> std::rc::Rc<Vec<(usize, usize)>> {
+    use std::hash::{Hash, Hasher};
+    type PromptRows = std::rc::Rc<Vec<(usize, usize)>>;
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(u64, PromptRows)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (model.transcript.len(), width, model.show_tool_output).hash(&mut hasher);
+    for entry in model.transcript.iter() {
+        if let Entry::User(text) = entry {
+            text.hash(&mut hasher);
+        }
+    }
+    let key = hasher.finish();
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((cached, rows)) = cache.as_ref() {
+            if *cached == key {
+                return rows.clone();
+            }
+        }
+        let rows = std::rc::Rc::new(
+            model
+                .transcript
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry, Entry::User(_)))
+                .map(|(index, _)| (transcript::rows_before(model, index, width), index))
+                .collect::<Vec<_>>(),
+        );
+        *cache = Some((key, rows.clone()));
+        rows
+    })
+}
+
+/// The prompt whose own rows have scrolled off the top of the view, when the
+/// view is scrolled back: the newest one that starts above row `top`.
+fn sticky_prompt(model: &Model, top: usize) -> Option<usize> {
+    model.transcript_scroll.get().top?;
+    let width = if model.width >= scrollbar::MIN_WIDTH {
+        model.width - 1
+    } else {
+        model.width
+    };
+    let head = 2 + startup::banner(model, &model.startup).len();
+    prompt_rows(model, width)
+        .iter()
+        .rev()
+        .find(|(row, _)| head + row < top)
+        .map(|&(_, index)| index)
+}
+
 /// Scroll the conversation by `rows` (up is positive). `false` when there is
 /// nothing to scroll: another surface is open or everything already fits.
 pub fn scroll_transcript(model: &mut Model, rows: isize) -> bool {
@@ -355,14 +556,14 @@ pub fn scroll_transcript(model: &mut Model, rows: isize) -> bool {
     true
 }
 
-/// Scroll by whole screens of conversation. A page is two rows short of the
-/// view: one row of overlap, and one for the `↓ … below` line that covers
-/// the last row while scrolled back.
+/// Scroll by whole screens of conversation. A page is three rows short of the
+/// view: one row of overlap, one for the `↓ … below` line that covers the
+/// last row while scrolled back, and one for the prompt header on top.
 pub fn scroll_transcript_pages(model: &mut Model, pages: isize) -> bool {
     let Some(bar) = transcript_scrollbar(model) else {
         return false;
     };
-    let page = bar.height.saturating_sub(2).max(1) as isize;
+    let page = bar.height.saturating_sub(3).max(1) as isize;
     scroll_transcript(model, pages * page)
 }
 
@@ -487,6 +688,7 @@ fn command_panel_frame(
     // the list under them scrolls.
     let pinned = match model.screen {
         Screen::Extensions => extensions::pinned_rows(model),
+        Screen::Login => login::pinned_rows(model),
         _ => 0,
     };
     if pinned > 0 && rows_room > pinned + 2 && content.len() > pinned {
@@ -530,9 +732,9 @@ fn extension_rows(model: &Model, lines: &[String]) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn composer_rows(model: &Model) -> Vec<Line<'static>> {
+fn composer_rows(model: &Model) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
     if model.overlay.is_some() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     // Conversation hints stay close to the prompt and abbreviate on narrow
     // windows. Overlays and the Codex split own their keyboard guidance.
@@ -540,15 +742,15 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
     // row (design.md §11).
     if let Some(sheet) = sheet::chrome(model) {
         match sheet.composer {
-            Composer::Hidden => return Vec::new(),
-            Composer::Disabled(text) => return chrome::disabled_composer(model, text),
+            Composer::Hidden => return (Vec::new(), None),
+            Composer::Disabled(text) => return (chrome::disabled_composer(model, text), None),
             Composer::Prompt(_) | Composer::PromptOwned(_) => {
                 if model.queued.is_empty() {
-                    return chrome::composer(model, None, Hint::None);
+                    return chrome::composer_with_caret(model, None, Hint::None);
                 }
                 let mut rows: Vec<String> = model.queued.clone();
                 rows.extend(model.composer.split('\n').map(str::to_string));
-                return chrome::composer(model, Some(&rows), Hint::None);
+                return chrome::composer_with_caret(model, Some(&rows), Hint::None);
             }
         }
     }
@@ -572,12 +774,12 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
         }
     };
     if model.queued.is_empty() {
-        return chrome::composer(model, None, hint);
+        return chrome::composer_with_caret(model, None, hint);
     }
     // What is waiting sits above what is being typed, in the same box.
     let mut rows: Vec<String> = model.queued.clone();
     rows.extend(model.composer.split('\n').map(str::to_string));
-    chrome::composer(model, Some(&rows), hint)
+    chrome::composer_with_caret(model, Some(&rows), hint)
 }
 
 /// A short conversation starts under its welcome banner. As it fills the
@@ -764,6 +966,7 @@ fn panel(
     });
     let pinned = match model.screen {
         Screen::Settings => settings::PINNED_DETAIL_ROWS,
+        Screen::Login => login::pinned_rows(model),
         _ => 0,
     };
     if pinned > 0 && room > pinned && rows.len() > pinned {
@@ -833,6 +1036,143 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
 /// run and never the app (design.md §6).
+/// The footer as a focus owner: down from an empty prompt enters it, left
+/// and right choose among what runs in the background, enter opens it and
+/// esc (or up) goes back to the prompt. Any other key leaves and is handled
+/// as usual (`None`).
+fn handle_footer_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    let plain = key.modifiers.is_empty();
+    let items = chrome::footer_items(model);
+    let Some(focus) = model.footer_focus else {
+        let enters = plain
+            && key.code == KeyCode::Down
+            && !items.is_empty()
+            && model.screen == Screen::Agent
+            && model.overlay.is_none()
+            && model.composer.is_empty()
+            && model.suggestions.is_none()
+            && !model.shortcuts_open;
+        if enters {
+            model.footer_focus = Some(0);
+            return Some(Flow::Continue);
+        }
+        return None;
+    };
+    if items.is_empty() {
+        model.footer_focus = None;
+        return None;
+    }
+    let focus = focus.min(items.len() - 1);
+    let armed = model.footer_stop_armed.take();
+    match key.code {
+        KeyCode::Char('x') if plain => {
+            let (label, command) = &items[focus];
+            let Some(stop) = footer_stop_command(command) else {
+                // Answers the key just pressed, so it replaces a waiting toast.
+                model.toast = Some((
+                    format!("open {command} to stop one of {label}"),
+                    std::time::Instant::now(),
+                ));
+                model.dirty = true;
+                return Some(Flow::Continue);
+            };
+            if armed == Some(focus) {
+                model.footer_focus = None;
+                return Some(Flow::Submit(stop.to_owned()));
+            }
+            model.footer_stop_armed = Some(focus);
+            model.toast = Some((
+                format!("press x again to stop {label}"),
+                std::time::Instant::now(),
+            ));
+            model.dirty = true;
+        }
+        KeyCode::Left if plain => model.footer_focus = Some(focus.saturating_sub(1)),
+        KeyCode::Right if plain => model.footer_focus = Some((focus + 1).min(items.len() - 1)),
+        KeyCode::Enter if plain => {
+            model.footer_focus = None;
+            return Some(Flow::Submit(items[focus].1.to_owned()));
+        }
+        KeyCode::Esc | KeyCode::Up => model.footer_focus = None,
+        _ => {
+            model.footer_focus = None;
+            return None;
+        }
+    }
+    Some(Flow::Continue)
+}
+
+/// The command that stops everything a footer item counts, for the kinds
+/// that have one. Agents are stopped one at a time from their own sheet.
+fn footer_stop_command(open: &str) -> Option<&'static str> {
+    match open {
+        "/jobs" => Some("/jobs kill all"),
+        "/workflows" => Some("/workflow-stop all"),
+        _ => None,
+    }
+}
+
+/// Keys while the transcript viewer is open.
+fn handle_viewer_key(model: &mut Model, key: KeyEvent) -> Flow {
+    use super::views::viewer::{self, Outcome};
+    let height = usize::from(model.height);
+    let Some(open) = &mut model.viewer else {
+        return Flow::Continue;
+    };
+    // A resize reflows every row, so the snapshot is taken again.
+    if open.width != model.width {
+        let top = open.top;
+        let mut fresh = viewer::TranscriptViewer::open(model);
+        fresh.top = top.min(fresh.lines.len().saturating_sub(1));
+        model.viewer = Some(fresh);
+    }
+    let Some(open) = &mut model.viewer else {
+        return Flow::Continue;
+    };
+    match viewer::handle_key(open, key, height) {
+        Outcome::Stay => {}
+        Outcome::Close => model.viewer = None,
+        Outcome::Task(task) => model.viewer_task = Some(task),
+    }
+    Flow::Continue
+}
+
+/// Keys while the history search is open: typing narrows it, the arrows and
+/// another Ctrl+R walk the matches, enter takes one, esc leaves the composer
+/// as it was.
+fn handle_history_search_key(model: &mut Model, key: KeyEvent) -> Flow {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => model.history_search = None,
+        KeyCode::Char('c' | 'g') if ctrl => model.history_search = None,
+        KeyCode::Tab | KeyCode::BackTab => model.history_search_scope(),
+        KeyCode::Enter => {
+            let selected = model.history_search.as_ref().map_or(0, |s| s.selected);
+            if !model.history_search_accept(selected) {
+                model.history_search = None;
+            }
+        }
+        KeyCode::Up => model.history_search_move(1),
+        KeyCode::Down => model.history_search_move(-1),
+        KeyCode::Char('r') if ctrl => model.history_search_move(1),
+        KeyCode::Char('s') if ctrl => model.history_search_move(-1),
+        KeyCode::Backspace => {
+            if let Some(search) = &mut model.history_search {
+                search.query.pop();
+                search.selected = 0;
+            }
+        }
+        KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(search) = &mut model.history_search {
+                search.query.push(ch);
+                search.selected = 0;
+            }
+        }
+        _ => {}
+    }
+    Flow::Continue
+}
+
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
@@ -857,6 +1197,37 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         && model.overlay.is_none()
         && key.kind != KeyEventKind::Release
         && super::views::graph_nav::handle_command_center_key(model, key)
+    {
+        return Flow::Continue;
+    }
+    if matches!(key.code, KeyCode::Home | KeyCode::End)
+        && key.modifiers == KeyModifiers::CONTROL
+        && model.screen == Screen::Agent
+        && model.overlay.is_none()
+        && scroll_transcript(
+            model,
+            if key.code == KeyCode::Home {
+                isize::MAX / 2
+            } else {
+                isize::MIN / 2
+            },
+        )
+    {
+        return Flow::Continue;
+    }
+
+    if model.viewer.is_some() {
+        return handle_viewer_key(model, key);
+    }
+    if model.history_search.is_some() {
+        return handle_history_search_key(model, key);
+    }
+    if let Some(flow) = handle_footer_key(model, key) {
+        return flow;
+    }
+    if key.code == KeyCode::Char('r')
+        && key.modifiers == KeyModifiers::CONTROL
+        && model.open_history_search()
     {
         return Flow::Continue;
     }
@@ -1068,9 +1439,51 @@ fn action_matches(model: &Model, data: Option<&str>, action: &str) -> bool {
     data.is_some_and(|data| model.keybindings.matches(data, action))
 }
 
+/// How long `ctrl+x` waits for its second key.
+const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
+    // The draft can be edited in `$EDITOR` from the conversation's composer:
+    // `ctrl+g`, or the readline chord `ctrl+x ctrl+e`.
+    let chord = model
+        .chord_x
+        .take()
+        .is_some_and(|at| at.elapsed() < CHORD_WINDOW);
+    let composing = model.screen == Screen::Agent
+        && model.overlay.is_none()
+        && model.viewer.is_none()
+        && model.history_search.is_none();
+    if composing {
+        if (chord && model.keybindings.matches(data, "davinci.editor.chordEnd"))
+            || model.keybindings.matches(data, "davinci.editor.open")
+        {
+            model.external_edit_requested = true;
+            return Some(Flow::Continue);
+        }
+        if model.keybindings.matches(data, "davinci.editor.chordStart") {
+            model.chord_x = Some(std::time::Instant::now());
+            return Some(Flow::Continue);
+        }
+    }
     if model.keybindings.matches(data, "davinci.quit") && model.composer.is_empty() {
-        return Some(Flow::Quit);
+        // One press arms; a second within the window leaves, so a stray
+        // ctrl+d does not end the session.
+        let armed = model
+            .quit_armed
+            .is_some_and(|at| at.elapsed() < super::model::QUIT_WINDOW);
+        if armed {
+            return Some(Flow::Quit);
+        }
+        model.quit_armed = Some(std::time::Instant::now());
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.redraw") {
+        model.terminal_task = Some(super::model::TerminalTask::Redraw);
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.suspend") && cfg!(unix) {
+        model.terminal_task = Some(super::model::TerminalTask::Suspend);
+        return Some(Flow::Continue);
     }
     if model
         .keybindings
@@ -1105,6 +1518,15 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
     }
     if model.keybindings.matches(data, "davinci.codex.toggle") {
         model.toggle_codex();
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.transcript.open") && model.screen == Screen::Agent {
+        model.viewer = Some(super::views::viewer::TranscriptViewer::open(model));
+        return Some(Flow::Continue);
+    }
+    if model.keybindings.matches(data, "davinci.checklist.toggle") && model.screen == Screen::Agent
+    {
+        model.checklist_open = !model.checklist_open;
         return Some(Flow::Continue);
     }
     if model.keybindings.matches(data, "davinci.tools.expand") {
@@ -1550,18 +1972,26 @@ mod graph_input_tests {
 
 /// Search input belongs to the selector; it must never overwrite the chat draft.
 fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
-    if !matches!(model.screen, Screen::Models | Screen::Settings)
-        || key.kind == KeyEventKind::Release
+    if !matches!(
+        model.screen,
+        Screen::Models | Screen::Settings | Screen::Login
+    ) || key.kind == KeyEventKind::Release
         || key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return false;
     }
-    let query = if model.screen == Screen::Models {
-        &mut model.catalog_query
-    } else {
-        &mut model.settings_query
+    // The first esc over a filter clears it; the next one closes the sheet.
+    if model.screen == Screen::Login && key.code == KeyCode::Esc && !model.login_query.is_empty() {
+        model.login_query.clear();
+        model.section_offset = None;
+        return true;
+    }
+    let query = match model.screen {
+        Screen::Models => &mut model.catalog_query,
+        Screen::Login => &mut model.login_query,
+        _ => &mut model.settings_query,
     };
     match key.code {
         KeyCode::Char(ch) => query.push(ch),
@@ -1576,10 +2006,10 @@ fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
         }
         _ => return false,
     }
-    let (indices, selected) = if model.screen == Screen::Models {
-        (cogitator::visible_indices(model), &mut model.catalog_index)
-    } else {
-        (settings::visible_indices(model), &mut model.settings_index)
+    let (indices, selected) = match model.screen {
+        Screen::Models => (cogitator::visible_indices(model), &mut model.catalog_index),
+        Screen::Login => (login::visible_indices(model), &mut model.login_index),
+        _ => (settings::visible_indices(model), &mut model.settings_index),
     };
     if !indices.contains(selected) {
         if let Some(first) = indices.first() {
@@ -1613,7 +2043,11 @@ fn screen_move(model: &mut Model, delta: isize) {
                 wrap_index(model.thinking_index, delta, model.thinking_rows.len());
         }
         Screen::Login => {
-            model.login_index = wrap_index(model.login_index, delta, model.providers.len());
+            model.login_index = super::views::picker::step(
+                &login::visible_indices(model),
+                model.login_index,
+                delta,
+            );
         }
         Screen::Resume => {
             model.resume_index = wrap_index(model.resume_index, delta, model.resume_sessions.len());
@@ -2006,7 +2440,9 @@ fn screen_accept(model: &Model) -> Option<Choice> {
         Screen::Thinking => {
             pick(model.thinking_index, model.thinking_rows.len()).map(Choice::ThinkingLevel)
         }
-        Screen::Login => pick(model.login_index, model.providers.len()).map(Choice::Provider),
+        Screen::Login => login::visible_indices(model)
+            .contains(&model.login_index)
+            .then_some(Choice::Provider(model.login_index)),
         Screen::Resume => {
             pick(model.resume_index, model.resume_sessions.len()).map(Choice::ResumeSession)
         }
@@ -2566,6 +3002,73 @@ mod tests {
         }
     }
 
+    /// The character drawn at display column `column` of `line`.
+    fn char_at_column(line: &Line<'_>, column: u16) -> Option<char> {
+        let mut at = 0u16;
+        for ch in row_text(line).chars() {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+            if at == column {
+                return Some(ch);
+            }
+            at += width;
+            if at > column {
+                return None;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_composed_frame_reports_the_caret_cell() {
+        let mut m = model(80, 24);
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.expect("an empty composer has a caret");
+        assert_eq!(column, 2, "on the placeholder's first character");
+        assert_eq!(
+            char_at_column(&frame.lines[row as usize], column),
+            Some('T')
+        );
+
+        for ch in "abc".chars() {
+            handle_key(&mut m, key(KeyCode::Char(ch)));
+        }
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.unwrap();
+        assert_eq!(column, 5, "past the last character");
+        assert!(row_text(&frame.lines[row as usize]).contains("abc"));
+
+        handle_key(&mut m, key(KeyCode::Left));
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.unwrap();
+        assert_eq!(
+            char_at_column(&frame.lines[row as usize], column),
+            Some('c')
+        );
+    }
+
+    #[test]
+    fn the_caret_cell_counts_wide_characters_by_width() {
+        let mut m = model(80, 24);
+        m.type_char("日本");
+        let frame = compose_frame(&m, 24);
+        assert_eq!(frame.caret.map(|(column, _)| column), Some(6));
+        handle_key(&mut m, key(KeyCode::Left));
+        let frame = compose_frame(&m, 24);
+        let (column, row) = frame.caret.unwrap();
+        assert_eq!(column, 4);
+        assert_eq!(
+            char_at_column(&frame.lines[row as usize], column),
+            Some('本')
+        );
+    }
+
+    #[test]
+    fn an_open_overlay_reports_no_caret() {
+        let mut m = model(80, 24);
+        m.toggle_overlay(Overlay::Instrumenta);
+        assert_eq!(compose_frame(&m, 24).caret, None);
+    }
+
     #[test]
     fn composer_inserts_at_the_cursor_instead_of_appending_only() {
         let mut m = model(120, 30);
@@ -2995,7 +3498,36 @@ mod tests {
         assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Continue);
         assert_eq!(m.composer, "qxQ");
         m.composer.clear();
+        // The first press only arms; the second, soon after, leaves.
+        assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Continue);
+        let shown: String = compose(&m, m.height)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("Press Ctrl-D again to exit"), "{shown}");
         assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Quit);
+    }
+
+    #[test]
+    fn a_late_second_ctrl_d_only_arms_again() {
+        let mut m = model(100, 24);
+        m.quit_armed = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Continue);
+        assert!(m.quit_armed.is_some_and(|at| at.elapsed().as_secs() < 1));
+    }
+
+    #[test]
+    fn ctrl_l_asks_for_a_repaint_and_ctrl_z_for_a_suspend() {
+        use super::super::model::TerminalTask;
+        let mut m = model(100, 24);
+        handle_key(&mut m, ctrl('l'));
+        assert_eq!(m.terminal_task.take(), Some(TerminalTask::Redraw));
+        handle_key(&mut m, ctrl('z'));
+        assert_eq!(
+            m.terminal_task.take(),
+            cfg!(unix).then_some(TerminalTask::Suspend)
+        );
     }
 
     /// Every state the shell can be in, so the responsive and NO_COLOR audits
@@ -3324,7 +3856,9 @@ mod section_regressions {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                (!text.contains('╭') || id == "3b"),
+                // The extension manager and `/login` keep one framed box: the
+                // search field, shared so the two read as the same app.
+                (!text.contains('╭') || matches!(id, "3b" | "3d")),
                 "{id} still renders a framed command screen: {text}"
             );
             assert!(
@@ -4467,6 +5001,89 @@ mod workflows_view_keys {
 }
 
 #[cfg(test)]
+mod login_search_tests {
+    use super::*;
+    use crate::davinci::model::{Credential, ProviderRow};
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    fn press(model: &mut Model, code: KeyCode) -> Flow {
+        handle_key(model, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_text(model: &mut Model, text: &str) {
+        for ch in text.chars() {
+            press(model, KeyCode::Char(ch));
+        }
+    }
+
+    fn model() -> Model {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            30,
+            false,
+        );
+        m.providers = ["alpha", "bravo", "alpine", "charlie"]
+            .iter()
+            .map(|name| ProviderRow {
+                name: (*name).into(),
+                method: "api key".into(),
+                source: "environment".into(),
+                state: Credential::Absent,
+            })
+            .collect();
+        m.screen = Screen::Login;
+        m
+    }
+
+    #[test]
+    fn typing_narrows_the_list_and_never_reaches_the_chat_draft() {
+        let mut m = model();
+        m.login_index = 1;
+        type_text(&mut m, "alp");
+        assert_eq!(m.login_query, "alp");
+        assert!(m.composer.is_empty(), "{:?}", m.composer);
+        // The selection moved off `bravo` onto the first provider left.
+        assert_eq!(m.login_index, 0);
+        press(&mut m, KeyCode::Down);
+        assert_eq!(m.login_index, 2);
+        press(&mut m, KeyCode::Down);
+        assert_eq!(m.login_index, 0, "wraps inside what the filter shows");
+        press(&mut m, KeyCode::Backspace);
+        assert_eq!(m.login_query, "al");
+    }
+
+    #[test]
+    fn enter_configures_the_filtered_provider_not_the_row_at_that_position() {
+        let mut m = model();
+        type_text(&mut m, "charlie");
+        assert_eq!(m.login_index, 3);
+        match press(&mut m, KeyCode::Enter) {
+            Flow::Choose(Choice::Provider(3)) => {}
+            other => panic!("expected provider 3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_with_no_match_chooses_nothing() {
+        let mut m = model();
+        type_text(&mut m, "zzz");
+        assert!(!matches!(press(&mut m, KeyCode::Enter), Flow::Choose(_)));
+    }
+
+    #[test]
+    fn the_first_esc_clears_the_filter_and_the_second_closes_the_sheet() {
+        let mut m = model();
+        type_text(&mut m, "br");
+        press(&mut m, KeyCode::Esc);
+        assert!(m.login_query.is_empty());
+        assert_eq!(m.screen, Screen::Login);
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(m.screen, Screen::Agent);
+    }
+}
+
+#[cfg(test)]
 mod working_line_spacing_tests {
     use super::*;
     use crate::davinci::model::{ContextCategory, ContextKind, ContextUsageView, Working};
@@ -4482,6 +5099,7 @@ mod working_line_spacing_tests {
     fn model_with_bar() -> Model {
         let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
         model.working = Some(Working::new());
+        model.context_bar = ContextBarMode::Full;
         model.context_meter = Some(ContextUsageView {
             model: "gpt-6-luna".into(),
             window: 200_000,
@@ -4570,6 +5188,466 @@ mod scroll_to_entry_tests {
     }
 
     #[test]
+    fn scrolled_back_the_last_prompt_above_the_view_stays_on_top_and_clicks_back_to_it() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        assert!(
+            !rows(&m)[0].contains('❯'),
+            "following the newest has no header"
+        );
+        // Scroll partway so that earlier prompts are above the view.
+        let bar = transcript_scrollbar(&m).expect("overflowing transcript");
+        set_transcript_offset(&mut m, &bar, 12);
+        let shown = rows(&m);
+        assert!(shown[0].starts_with("  ❯ "), "{:?}", &shown[..2]);
+        let frame = compose_frame(&m, m.height);
+        let hit = frame
+            .targets
+            .iter()
+            .find(|hit| matches!(hit.target, Target::Prompt(_)))
+            .expect("the header is a target");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: hit.rows.start,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+        let Target::Prompt(entry) = hit.target else {
+            unreachable!()
+        };
+        let Entry::User(text) = &m.transcript[entry] else {
+            panic!("a prompt");
+        };
+        let top: String = rows(&m)[..2].join("\n");
+        assert!(top.contains(text.lines().next().unwrap()), "{top}");
+    }
+
+    #[test]
+    fn clicking_the_composer_places_the_caret_on_that_cell() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        m.composer.set_text("hello wide 日本 world\nsecond line");
+        let click = |m: &mut Model, row: u16, column: u16| {
+            let frame = compose_frame(m, m.height);
+            let targets: Vec<_> = frame
+                .targets
+                .iter()
+                .filter(|hit| matches!(hit.target, Target::ComposerRow(_)))
+                .collect();
+            assert_eq!(targets.len(), 2, "one target per text row");
+            let event = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: targets[usize::from(row)].rows.start,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(super::super::runtime::route_click_target(m, event));
+        };
+        // Two cells of prompt, then "hello".
+        click(&mut m, 0, 2 + 5);
+        assert_eq!(m.composer.editor().cursor, 5);
+        // "hello wide " is 11 cells; the wide glyph spans two, so a click on
+        // its second cell stays before it.
+        click(&mut m, 0, 2 + 12);
+        assert_eq!(m.composer.editor().cursor, "hello wide 日".len() - 3);
+        click(&mut m, 1, 2 + 3);
+        assert_eq!(
+            m.composer.editor().cursor,
+            "hello wide 日本 world\nsec".len()
+        );
+        // Past the end of a row lands on its end.
+        click(&mut m, 1, 60);
+        assert_eq!(
+            m.composer.editor().cursor,
+            m.composer.editor().get_text().len()
+        );
+    }
+
+    #[test]
+    fn a_click_is_tested_against_the_last_drawn_frame() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        // Nothing to click in a following conversation...
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!super::super::runtime::route_click_target(&mut m, click));
+        // ...until the frame on screen says there is.
+        *m.hit_cache.borrow_mut() = Some(super::super::model::HitCache {
+            targets: vec![HitTarget {
+                rows: 3..4,
+                target: Target::JumpToBottom,
+            }],
+            suggestion_rows: None,
+        });
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+    }
+
+    #[test]
+    fn toasts_wait_their_turn_instead_of_replacing_each_other() {
+        let mut m = chat(24, 6);
+        m.push_toast("first".into());
+        m.push_toast("second".into());
+        m.push_toast("second".into());
+        assert_eq!(m.toast.as_ref().map(|t| t.0.as_str()), Some("first"));
+        assert_eq!(m.toast_queue.len(), 1, "a repeat is not queued twice");
+        // Once the first has had its time, the next tick brings the second.
+        m.toast = Some((
+            "first".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(10),
+        ));
+        m.advance_tick();
+        assert_eq!(m.toast.as_ref().map(|t| t.0.as_str()), Some("second"));
+        assert!(m.toast_queue.is_empty());
+    }
+
+    #[test]
+    fn the_footer_names_the_branchs_pull_request() {
+        let mut m = chat(24, 6);
+        m.branch = "feature".into();
+        assert!(!rows(&m).join("\n").contains("PR #"));
+        m.pr_badge = super::super::model::PrBadge::parse(
+            r#"{"number":42,"state":"OPEN","reviewDecision":"APPROVED","url":"https://github.com/a/b/pull/42"}"#,
+        );
+        let shown = rows(&m).join("\n");
+        assert!(shown.contains("PR #42"), "{shown}");
+    }
+
+    #[test]
+    fn ctrl_t_opens_a_checklist_band_of_five_rows_that_keeps_the_active_step_in_view() {
+        use crate::davinci::model::PlanStep;
+        use crate::davinci::theme::State;
+        let mut m = chat(30, 1);
+        let ctrl_t = || KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        m.plan = (0..8)
+            .map(|i| {
+                let state = match i {
+                    0..=2 => State::Done,
+                    3 => State::Active,
+                    _ => State::Queued,
+                };
+                PlanStep::new("", state, &format!("step {i}"), None)
+            })
+            .collect();
+        assert!(
+            !rows(&m)
+                .join(
+                    "
+"
+                )
+                .contains("checklist"),
+            "closed by default"
+        );
+        handle_key(&mut m, ctrl_t());
+        let shown = rows(&m).join(
+            "
+",
+        );
+        assert!(shown.contains("checklist · 3 of 8 done"), "{shown}");
+        assert!(
+            shown.contains("◉ step 3") && shown.contains("✓ step 2"),
+            "{shown}"
+        );
+        assert!(shown.contains("… 1 more"), "{shown}");
+        assert_eq!(shown.matches("step ").count(), 5, "{shown}");
+        // A short window has no rows to spare, and a second press hides it.
+        assert!(!rows(&chat(12, 1))
+            .join(
+                "
+"
+            )
+            .contains("checklist"));
+        handle_key(&mut m, ctrl_t());
+        assert!(!rows(&m)
+            .join(
+                "
+"
+            )
+            .contains("checklist"));
+    }
+
+    #[test]
+    fn ctrl_g_and_the_ctrl_x_ctrl_e_chord_ask_for_the_editor() {
+        let mut m = chat(24, 1);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        handle_key(&mut m, ctrl('g'));
+        assert!(std::mem::take(&mut m.external_edit_requested));
+        // The chord needs both keys, in order and in time.
+        handle_key(&mut m, ctrl('e'));
+        assert!(
+            !m.external_edit_requested,
+            "ctrl+e alone keeps its editing job"
+        );
+        handle_key(&mut m, ctrl('x'));
+        assert!(m.chord_x.is_some() && !m.external_edit_requested);
+        handle_key(&mut m, ctrl('e'));
+        assert!(std::mem::take(&mut m.external_edit_requested));
+        assert!(m.chord_x.is_none());
+        handle_key(&mut m, ctrl('x'));
+        m.chord_x = Some(std::time::Instant::now() - CHORD_WINDOW * 2);
+        handle_key(&mut m, ctrl('e'));
+        assert!(!m.external_edit_requested, "a stale ctrl+x is forgotten");
+        // Not while a panel owns the keys.
+        m.history_search = Some(Default::default());
+        handle_key(&mut m, ctrl('g'));
+        assert!(!m.external_edit_requested);
+    }
+
+    #[test]
+    fn x_twice_stops_what_the_focused_footer_item_counts() {
+        let mut m = chat(60, 6);
+        m.jobs_running = 2;
+        m.agents_running = 1;
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        let x = || KeyEvent::from(KeyCode::Char('x'));
+        // The first press only asks; focus stays and nothing is sent.
+        assert_eq!(handle_key(&mut m, x()), Flow::Continue);
+        assert_eq!(m.footer_focus, Some(0));
+        assert_eq!(m.footer_stop_armed, Some(0));
+        assert!(m
+            .toast
+            .as_ref()
+            .is_some_and(|(note, _)| note.contains("press x again to stop 2 jobs")));
+        // Moving away disarms, so a later x asks again.
+        handle_key(&mut m, KeyEvent::from(KeyCode::Right));
+        assert_eq!(m.footer_stop_armed, None);
+        // Agents have no stop-all: the key points at their sheet.
+        assert_eq!(handle_key(&mut m, x()), Flow::Continue);
+        assert_eq!(m.footer_stop_armed, None);
+        assert!(m
+            .toast
+            .as_ref()
+            .is_some_and(|(note, _)| note.contains("/agents")));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Left));
+        handle_key(&mut m, x());
+        assert_eq!(
+            handle_key(&mut m, x()),
+            Flow::Submit("/jobs kill all".into())
+        );
+        assert_eq!(m.footer_focus, None);
+    }
+
+    #[test]
+    fn down_from_an_empty_prompt_walks_the_footer_and_enter_opens_the_item() {
+        let mut m = chat(24, 6);
+        // Nothing runs, so there is no footer item to enter.
+        assert_eq!(
+            handle_key(&mut m, KeyEvent::from(KeyCode::Down)),
+            Flow::Continue
+        );
+        assert_eq!(m.footer_focus, None);
+        m.jobs_running = 1;
+        m.agents_running = 2;
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        assert_eq!(m.footer_focus, Some(0));
+        let shown = rows(&m).join("\n");
+        assert!(
+            shown.contains("1 job") && shown.contains("2 agents"),
+            "{shown}"
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Right));
+        assert_eq!(m.footer_focus, Some(1));
+        assert_eq!(
+            handle_key(&mut m, KeyEvent::from(KeyCode::Enter)),
+            Flow::Submit("/agents".into())
+        );
+        assert_eq!(m.footer_focus, None);
+        // Esc goes back to the prompt; typing leaves and types.
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(m.footer_focus, None);
+        handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(m.footer_focus, None);
+        assert_eq!(m.composer.editor().get_text(), "h");
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_transcript_viewer_and_q_closes_it() {
+        let mut m = chat(24, 6);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert!(m.viewer.is_some());
+        let shown = rows(&m);
+        assert!(shown[0].contains("Transcript"), "{shown:?}");
+        // Pager keys steer the viewer, not the composer.
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(m.viewer.as_ref().map(|v| v.top), Some(0));
+        assert!(rows(&m).iter().any(|row| row.contains("question 0")));
+        assert_eq!(m.composer.editor().get_text(), "");
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('q')));
+        assert!(m.viewer.is_none());
+    }
+
+    #[test]
+    fn the_viewer_asks_for_the_terminal_to_dump_or_edit() {
+        use super::super::views::viewer::ViewerTask;
+        let mut m = chat(24, 6);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('[')));
+        assert!(
+            matches!(m.viewer_task.take(), Some(ViewerTask::Scrollback(t)) if t.contains("question 0"))
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('v')));
+        assert!(matches!(m.viewer_task.take(), Some(ViewerTask::Editor(_))));
+    }
+
+    #[test]
+    fn alt_o_still_expands_tool_output_in_place() {
+        let mut m = chat(24, 6);
+        assert!(!m.show_tool_output);
+        handle_key(&mut m, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
+        assert!(m.show_tool_output);
+        assert!(m.viewer.is_none());
+    }
+
+    fn searching() -> Model {
+        let mut m = chat(24, 6);
+        m.composer.editor_mut().load_history(vec![
+            "run the tests".into(),
+            "fix the parser".into(),
+            "explain the parser design".into(),
+        ]);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        m
+    }
+
+    #[test]
+    fn ctrl_r_searches_earlier_prompts_and_enter_takes_the_marked_one() {
+        let mut m = searching();
+        assert!(m.history_search.is_some());
+        for ch in "parser".chars() {
+            handle_key(&mut m, KeyEvent::from(KeyCode::Char(ch)));
+        }
+        let shown = rows(&m).join("\n");
+        assert!(shown.contains("search project: parser"), "{shown}");
+        assert!(shown.contains("1 of 2"), "{shown}");
+        // Newest first; another ctrl+r walks to the older match.
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut m, KeyEvent::from(KeyCode::Enter));
+        assert!(m.history_search.is_none());
+        assert_eq!(m.composer.editor().get_text(), "explain the parser design");
+    }
+
+    #[test]
+    fn tab_cycles_the_search_through_project_all_and_session() {
+        let mut m = searching();
+        m.session_history = vec!["only this run".into()];
+        m.history_all = Some(vec!["from another project".into()]);
+        let matches = |m: &Model| m.history_matches().len();
+        assert_eq!(matches(&m), 3, "project history");
+        handle_key(&mut m, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(m.history_matches(), ["from another project"]);
+        assert!(rows(&m).join("\n").contains("search all projects:"));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(m.history_matches(), ["only this run"]);
+        handle_key(&mut m, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(matches(&m), 3);
+    }
+
+    #[test]
+    fn escape_leaves_the_composer_as_it_was() {
+        let mut m = searching();
+        handle_key(&mut m, KeyEvent::from(KeyCode::Char('x')));
+        handle_key(&mut m, KeyEvent::from(KeyCode::Esc));
+        assert!(m.history_search.is_none());
+        assert_eq!(m.composer.editor().get_text(), "");
+    }
+
+    #[test]
+    fn clicking_a_match_takes_it() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = searching();
+        let frame = compose_frame(&m, m.height);
+        let hit = frame
+            .targets
+            .iter()
+            .find(|hit| hit.target == Target::HistoryMatch(2))
+            .expect("a row per match");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: hit.rows.start,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+        assert_eq!(m.composer.editor().get_text(), "explain the parser design");
+    }
+
+    fn scrolled_back_with_news() -> Model {
+        let mut m = chat(24, 6);
+        let last = m.transcript.len() - 1;
+        scroll_transcript_to_entry(&mut m, last);
+        for n in 0..2 {
+            m.transcript.push(Entry::user(&format!("streamed {n}")));
+        }
+        m
+    }
+
+    #[test]
+    fn the_jump_row_counts_what_arrived_while_scrolled_back() {
+        let m = scrolled_back_with_news();
+        let shown = rows(&m);
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.contains("Jump to bottom · 2 new messages")),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_the_jump_row_follows_the_newest_again() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut m = scrolled_back_with_news();
+        let frame = compose_frame(&m, m.height);
+        let hit = frame
+            .targets
+            .iter()
+            .find(|hit| hit.target == Target::JumpToBottom)
+            .expect("a jump target while scrolled back");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: hit.rows.start,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::super::runtime::route_click_target(&mut m, click));
+        assert!(m.transcript_scroll.get().top.is_none());
+        assert!(compose_frame(&m, m.height)
+            .targets
+            .iter()
+            .all(|hit| hit.target != Target::JumpToBottom));
+    }
+
+    #[test]
+    fn ctrl_home_and_ctrl_end_reach_the_ends_of_the_conversation() {
+        let mut m = chat(24, 6);
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        handle_key(&mut m, ctrl(KeyCode::Home));
+        assert!(rows(&m).iter().any(|row| row.contains("↓ Jump to bottom")));
+        let bar = transcript_scrollbar(&m).expect("bar");
+        assert_eq!(bar.offset, bar.max_offset());
+        handle_key(&mut m, ctrl(KeyCode::End));
+        assert!(m.transcript_scroll.get().top.is_none());
+    }
+
+    #[test]
     fn a_tall_block_opens_on_its_first_line_not_its_last() {
         let mut m = chat(24, 6);
         // Following the newest hides the heading above the fold.
@@ -4579,7 +5657,9 @@ mod scroll_to_entry_tests {
             scroll_transcript_to_entry(&mut m, last)
         });
         let shown = rows(&m);
-        assert!(shown[0].contains("Context Usage"), "{:?}", &shown[..3]);
+        // The prompt that asked for the block stays on top of it.
+        assert!(shown[0].contains("/context"), "{:?}", &shown[..3]);
+        assert!(shown[1].contains("Context Usage"), "{:?}", &shown[..3]);
         assert!(shown.iter().any(|row| row.contains("Estimated usage")));
     }
 
@@ -4620,7 +5700,7 @@ mod scroll_to_entry_tests {
         for n in 0..6 {
             m.transcript.push(Entry::user(&format!("streamed {n}")));
         }
-        assert!(rows(&m)[0].contains("Context Usage"));
+        assert!(rows(&m)[1].contains("Context Usage"));
         let bar = transcript_scrollbar(&m).expect("overflowing transcript");
         set_transcript_offset(&mut m, &bar, 0);
         assert!(m.transcript_scroll.get().top.is_none());

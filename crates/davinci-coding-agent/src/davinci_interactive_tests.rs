@@ -84,6 +84,39 @@ fn security_sheet_preserves_grouped_occurrence_assessments() {
     assert!(sheet.findings[0].evidence.contains("second.rs:2-3"));
 }
 use super::*;
+
+/// Points `PI_CODING_AGENT_DIR` at a test directory for the guard's lifetime.
+/// Tests in this binary run in parallel and the variable is process-wide, so
+/// the shared env lock is held throughout: without it one test restoring the
+/// variable mid-run sent another to the real `~/.pi/agent`. Restored on drop,
+/// so a failing assertion cannot leak the override either.
+struct AgentDirEnv {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl AgentDirEnv {
+    fn set(path: std::path::PathBuf) -> Self {
+        let lock = crate::tests::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("PI_CODING_AGENT_DIR", path);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for AgentDirEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+}
 use serde_json::json;
 
 #[test]
@@ -162,14 +195,9 @@ fn the_keys_sheet_counts_its_bindings_and_surfaces() {
 #[test]
 fn the_login_sheet_names_the_auth_file() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let mut m = model();
     open_login_sheet(&crate::args::Args::default(), &mut m);
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
     assert_eq!(m.screen, Screen::Login);
     assert!(
         m.facts.auth_path.ends_with("auth.json"),
@@ -767,8 +795,7 @@ fn the_catalogue_opens_with_newer_models_before_the_current_older_model() {
 #[test]
 fn what_the_session_found_is_said_under_the_mark_not_in_the_transcript() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let mut agent = davinci_agent::Agent::new("test");
     agent.cwd = dir.path().to_path_buf();
     agent.context_files.push(davinci_agent::ContextFile {
@@ -782,10 +809,6 @@ fn what_the_session_found_is_said_under_the_mark_not_in_the_transcript() {
     assert!(!block
         .iter()
         .any(|entry| matches!(entry, Entry::Prose(text) if text.starts_with("loaded"))));
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
 }
 
 #[test]
@@ -2458,8 +2481,7 @@ fn first_run_asks_only_what_davinci_cannot_decide_for_itself() {
 #[test]
 fn an_untrusted_project_with_pi_resources_is_warned_about_by_glyph() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let project = dir.path().join("project");
     std::fs::create_dir_all(project.join(".pi").join("skills")).unwrap();
 
@@ -2472,18 +2494,12 @@ fn an_untrusted_project_with_pi_resources_is_warned_about_by_glyph() {
                 if *state == State::Attention && target.contains("not trusted"))
     });
     assert!(warned, "an untrusted project must say so");
-
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
 }
 
 #[test]
 fn a_trusted_project_opens_without_a_warning() {
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-    std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
     let project = dir.path().join("plain");
     std::fs::create_dir_all(&project).unwrap();
 
@@ -2493,11 +2509,6 @@ fn a_trusted_project_opens_without_a_warning() {
     assert!(!block.iter().any(|entry| {
         matches!(entry, Entry::Tool { target, .. } if target.contains("not trusted"))
     }));
-
-    match previous {
-        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-    }
 }
 
 #[test]
@@ -3662,6 +3673,66 @@ fn context_hangs_the_usage_grid_from_the_echoed_command() {
 }
 
 #[test]
+fn autocompact_shows_sets_and_persists_when_the_context_compacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
+    let mut agent = Agent::new("sys");
+    agent.cwd = dir.path().to_path_buf();
+    agent.context_window = 400_000;
+    let mut m = model();
+    let mut run = |agent: &mut Agent, arg: &str| {
+        perform(
+            &crate::args::Args::default(),
+            agent,
+            &mut m,
+            crate::slash::SlashAction::Autocompact(arg.into()),
+        )
+        .expect("autocompact answers")
+    };
+    let Done::Said(text) = run(&mut agent, "") else {
+        panic!("bare shows the state");
+    };
+    assert!(
+        text.starts_with("auto-compact on · compacts at 383.6k (auto)"),
+        "{text}"
+    );
+    assert!(text.contains("/autocompact [auto|tokens|off]"));
+
+    let Done::Said(text) = run(&mut agent, "150k") else {
+        panic!("tokens set");
+    };
+    assert_eq!(text, "auto-compact on · compacts at 150k (your setting)");
+    assert_eq!(
+        agent.compaction.threshold,
+        Some(davinci_agent::CompactionThreshold::Tokens(150_000))
+    );
+    // Stored, so the next session starts the same way.
+    let stored = crate::load_settings(&crate::default_agent_dir());
+    assert_eq!(
+        stored.compaction_threshold(),
+        Some(davinci_agent::CompactionThreshold::Tokens(150_000))
+    );
+
+    let Done::Said(text) = run(&mut agent, "off") else {
+        panic!("off");
+    };
+    assert_eq!(text, "auto-compact off");
+    assert!(!agent.auto_compaction);
+
+    let Done::Said(text) = run(&mut agent, "auto") else {
+        panic!("auto");
+    };
+    assert!(text.ends_with("(auto)"), "{text}");
+    assert!(agent.auto_compaction && agent.compaction.threshold.is_none());
+
+    let Done::Note(note) = run(&mut agent, "soon") else {
+        panic!("a bad value is refused");
+    };
+    assert!(note.contains("not auto, off, a token count"), "{note}");
+    assert!(agent.auto_compaction, "a refusal changes nothing");
+}
+
+#[test]
 fn context_inspect_opens_the_manifest_sheet() {
     let mut agent = Agent::new("sys");
     let mut m = model();
@@ -3822,6 +3893,19 @@ fn agent_calls_are_named_like_claude_code() {
         ),
         "agent teammate ux · review copy"
     );
+}
+
+#[test]
+fn the_tmux_hint_is_said_once_and_only_inside_tmux() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(terminal_hint(false, dir.path()), None);
+    assert!(
+        !dir.path().join("hints").exists(),
+        "outside tmux nothing is written"
+    );
+    let first = terminal_hint(true, dir.path()).expect("said on the first launch");
+    assert!(first.contains("mouse on") && first.contains("set-clipboard"));
+    assert_eq!(terminal_hint(true, dir.path()), None, "not again");
 }
 
 #[test]
@@ -4136,4 +4220,48 @@ fn keys_during_compaction_type_but_never_interrupt_or_submit() {
     assert!(!working.interrupting);
     assert_eq!(working.verb(), "Compacting conversation");
     assert!(m.transcript.is_empty(), "nothing was submitted or queued");
+}
+
+#[test]
+fn login_rows_show_the_chatgpt_backend_login_as_ready_only_when_it_is_stored() {
+    use davinci_ai::{codex_backend, AuthCheck};
+    use davinci_tui::davinci::model::Credential;
+    use std::collections::BTreeMap;
+    let names = vec![
+        "openai-codex".to_string(),
+        codex_backend::LOGIN_PROVIDER.to_string(),
+    ];
+    let check = |source: &str| AuthCheck {
+        kind: "oauth".into(),
+        source: source.into(),
+    };
+    let states = |auth: &BTreeMap<String, AuthCheck>| {
+        super::login_provider_rows(&names, auth)
+            .into_iter()
+            .map(|row| (row.name, row.state, row.source))
+            .collect::<Vec<_>>()
+    };
+
+    // Backend login: stored under openai-codex, so both rows read it.
+    let backend = BTreeMap::from([(
+        "openai-codex".to_string(),
+        check(codex_backend::AUTH_SOURCE),
+    )]);
+    let rows = states(&backend);
+    assert_eq!(rows[0].1, Credential::Ready);
+    assert_eq!(rows[1].1, Credential::Ready, "{rows:?}");
+    assert_eq!(rows[1].2, codex_backend::AUTH_SOURCE);
+
+    // Documented Sign in with ChatGPT login: the backend row stays absent.
+    let documented = BTreeMap::from([("openai-codex".to_string(), check("OAuth"))]);
+    let rows = states(&documented);
+    assert_eq!(rows[0].1, Credential::Ready);
+    assert_eq!(rows[1].1, Credential::Absent, "{rows:?}");
+
+    // Nothing stored: both absent.
+    let rows = states(&BTreeMap::new());
+    assert!(
+        rows.iter().all(|row| row.1 == Credential::Absent),
+        "{rows:?}"
+    );
 }

@@ -935,31 +935,10 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
-    if model.provider == "openai-codex" {
-        if !crate::openai_siwc::is_public_plan_model(model) {
-            return Err("OpenAI Codex subscription requests must use the documented https://api.openai.com/v1 Responses route".into());
-        }
-        if !auth.source.eq_ignore_ascii_case("oauth") {
-            return Err("OpenAI Codex subscription requests require verified Sign in with ChatGPT OAuth; API-key fallback is disabled".into());
-        }
-        let access = auth
-            .api_key
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .ok_or(
-                "OpenAI Codex subscription requests require a verified ChatGPT-plan access token",
-            )?;
-        if let Some((_, authorization)) = auth
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        {
-            let expected = format!("Bearer {access}");
-            if authorization != &expected {
-                return Err("OpenAI Codex subscription Authorization header does not match the verified ChatGPT-plan access token; API-key/header overrides are disabled".into());
-            }
-        }
-    }
+    // A ChatGPT backend login (opt-in, `/login openai-codex-backend`) moves the request to the backend;
+    // every other credential keeps the documented route and the gate.
+    let model = &*crate::codex_backend::route_model(model, auth);
+    require_codex_subscription_route(model, auth)?;
     options
         .service_tier
         .unwrap_or_default()
@@ -986,6 +965,52 @@ pub fn live_complete_streaming_with_sink_envelope(
         );
     }
     result
+}
+
+/// The subscription gate for `openai-codex`: the documented route with verified Sign in with ChatGPT OAuth,
+/// or, for an opt-in backend login only, the ChatGPT backend. Never an API key, never a mismatched header.
+pub(crate) fn require_codex_subscription_route(
+    model: &Model,
+    auth: &ResolvedAuth,
+) -> Result<(), String> {
+    if model.provider != "openai-codex" {
+        return Ok(());
+    }
+    let backend_login = auth.source == crate::codex_backend::AUTH_SOURCE;
+    if backend_login {
+        if model
+            .base_url
+            .as_deref()
+            .map(|url| url.trim_end_matches('/'))
+            != Some(crate::codex_backend::BACKEND_BASE_URL)
+        {
+            return Err("a ChatGPT backend login must be sent to the ChatGPT backend route".into());
+        }
+    } else {
+        if !crate::openai_siwc::is_public_plan_model(model) {
+            return Err("OpenAI Codex subscription requests must use the documented https://api.openai.com/v1 Responses route".into());
+        }
+        if !auth.source.eq_ignore_ascii_case("oauth") {
+            return Err("OpenAI Codex subscription requests require verified Sign in with ChatGPT OAuth; API-key fallback is disabled".into());
+        }
+    }
+    let access = auth
+        .api_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or("OpenAI Codex subscription requests require a verified ChatGPT-plan access token")?;
+    // Every case variant is checked: header maps can hold both `Authorization`
+    // and `authorization`, and checking only the first one found lets the
+    // other through depending on hash order.
+    let expected = format!("Bearer {access}");
+    if auth
+        .headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value != &expected)
+    {
+        return Err("OpenAI Codex subscription Authorization header does not match the verified ChatGPT-plan access token; API-key/header overrides are disabled".into());
+    }
+    Ok(())
 }
 
 fn live_complete_streaming_with_sink_envelope_inner(

@@ -668,6 +668,21 @@ impl Turn {
             Instant::now(),
             args.clone(),
         ));
+        let background = args
+            .get("background")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if matches!(tool_name, "bash" | "powershell") && !background {
+            if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+                model
+                    .shell_runs
+                    .push(davinci_tui::davinci::model::ShellRun {
+                        index,
+                        started: Instant::now(),
+                        command: command.to_string(),
+                    });
+            }
+        }
         if tool_name == "todo" {
             if let Ok(list) = davinci_agent::TodoList::from_args(args) {
                 self.take_ledger(model, &list);
@@ -715,6 +730,7 @@ impl Turn {
             return;
         };
         let (_, index, started, args) = self.open.remove(position);
+        model.shell_runs.retain(|run| run.index != index);
         let outcome = (!is_error)
             .then(|| summary_of(tool_name, &args, result))
             .flatten();
@@ -1746,7 +1762,10 @@ fn run_turn(
             if worker.is_finished() {
                 break;
             }
-            if let Some(event) = session.poll_event(Duration::from_millis(40))? {
+            if let Some(event) = session
+                .poll_event(Duration::from_millis(40))?
+                .and_then(|event| session.claim_selection_key(model, event))
+            {
                 model.dirty = true;
                 match event {
                     crossterm::event::Event::Key(key)
@@ -1921,6 +1940,7 @@ fn run_turn(
     ) {
         model.transcript.push(entry);
     }
+    model.shell_runs.clear();
     if !interrupted {
         if let Some(working) = finished_working {
             model.transcript.push(Entry::Gap);
@@ -3519,7 +3539,10 @@ fn resolve_scope_expansion_modal(
             session.draw(model)?;
             model.dirty = false;
         }
-        let Some(event) = session.poll_event(Duration::from_millis(40))? else {
+        let Some(event) = session
+            .poll_event(Duration::from_millis(40))?
+            .and_then(|event| session.claim_selection_key(model, event))
+        else {
             continue;
         };
         model.dirty = true;
@@ -4069,10 +4092,12 @@ pub fn perform(
             Ok(Done::Said(format!("imported {}", session_id(agent))))
         }
         SlashAction::Copy => match agent.last_assistant_text() {
-            Some(text) => {
-                davinci_tui::copy_text(&text);
-                Ok(Done::Said("copied the last reply to the clipboard".into()))
-            }
+            Some(text) => match davinci_tui::try_copy_text(&text) {
+                Ok(path) => Ok(Done::Said(format!(
+                    "copied the last reply to the clipboard ({path})"
+                ))),
+                Err(err) => Ok(Done::Note(format!("clipboard copy failed: {err}"))),
+            },
             None => Ok(Done::Note("no agent messages to copy yet".into())),
         },
         SlashAction::Share => Ok(Done::Said(crate::share_current_session(agent)?)),
@@ -4436,6 +4461,14 @@ pub fn perform(
             open_task_board_sheet(agent, model);
             Ok(Done::Opened)
         }
+        SlashAction::Autocompact(arg) => match run_autocompact(agent, &arg) {
+            Ok(text) => {
+                // The footer and the context bar read the threshold from the meter.
+                refresh_context_meter(agent, model, true);
+                Ok(Done::Said(text))
+            }
+            Err(note) => Ok(Done::Note(note)),
+        },
         SlashAction::Context(args) => match args.as_str() {
             "" => {
                 push_context_usage(agent, model);
@@ -4451,6 +4484,47 @@ pub fn perform(
             )),
         },
     }
+}
+
+/// `/autocompact [auto|tokens|off]`: with no argument, say what it is doing;
+/// otherwise store the change, apply it to the running agent, and say what it
+/// is doing now. `Err` is a refusal worded for the user.
+pub(crate) fn run_autocompact(agent: &mut Agent, arg: &str) -> Result<String, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Ok(autocompact_summary(agent, true));
+    }
+    let dir = crate::default_agent_dir();
+    let mut stored = crate::load_settings(&dir);
+    crate::settings::apply_autocompact_arg(&mut stored, arg)
+        .map_err(|err| format!("{err} · usage: /autocompact [auto|tokens|off]"))?;
+    crate::save_settings(&dir, &stored)?;
+    crate::sync_agent_from_settings(agent);
+    Ok(autocompact_summary(agent, false))
+}
+
+/// What auto-compact is doing for this agent, as one line: off, or on and
+/// the token count it fires at, and whether that is the model's own point or
+/// one chosen with `/autocompact`. `with_usage` adds the command's usage.
+fn autocompact_summary(agent: &Agent, with_usage: bool) -> String {
+    use davinci_tui::davinci::views::context_usage::format_tokens;
+    let mut text = if !agent.auto_compaction {
+        "auto-compact off".to_string()
+    } else {
+        let chosen = agent.compaction.threshold.is_some();
+        match davinci_agent::compaction_threshold(agent.context_window, &agent.compaction) {
+            Some(at) => format!(
+                "auto-compact on · compacts at {} ({})",
+                format_tokens(at),
+                if chosen { "your setting" } else { "auto" }
+            ),
+            None => "auto-compact on".to_string(),
+        }
+    };
+    if with_usage {
+        text.push_str(" · /autocompact [auto|tokens|off], tokens like 150k or 60%");
+    }
+    text
 }
 
 /// Context VM notices from the finished turn (first failure, shadow
@@ -4638,6 +4712,33 @@ impl Drop for HostedTuiGuard {
     }
 }
 
+/// What to tell someone running inside tmux, once: selection, copy and focus
+/// only reach the shell when tmux passes them on. Remembered in a marker file
+/// under the agent dir so it is said on the first launch and not again.
+fn terminal_hint(in_tmux: bool, agent_dir: &std::path::Path) -> Option<String> {
+    if !in_tmux {
+        return None;
+    }
+    let marker = agent_dir.join("hints").join("tmux");
+    if marker.exists() {
+        return None;
+    }
+    let _ = marker
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| {
+            std::fs::write(
+                &marker, b"shown
+",
+            )
+        });
+    Some(
+        "tmux: add `set -g mouse on`, `set -g set-clipboard on` and `set -g focus-events on` to ~/.tmux.conf for selection, copy and the caret"
+            .to_owned(),
+    )
+}
+
 /// Run the davinci TUI against a live agent until the user leaves.
 pub fn run(
     parsed: &crate::args::Args,
@@ -4662,6 +4763,12 @@ pub fn run(
     crate::davinci_surfaces::dress_from_extensions(&mut model, &cwd, agent);
     model.model_name = agent.model_id.clone();
     model.active_provider = agent.provider.clone();
+    let history = davinci_tui::history_store::HistoryStore::for_cwd(
+        &crate::default_agent_dir(),
+        std::path::Path::new(&agent.cwd),
+    );
+    model.composer.editor_mut().load_history(history.load());
+    model.history_store = Some(history);
     model.config_path = crate::default_agent_dir()
         .join("config.json")
         .display()
@@ -4782,6 +4889,9 @@ pub fn run(
         model.suggestion_rows = rows.clamp(3, 20) as usize;
     }
     model.terminal_progress = stored_settings.show_terminal_progress();
+    // The caret blinks unless `caretBlink` is turned off, as in Claude Code.
+    model.caret_blink = stored_settings.caret_blink.unwrap_or(true);
+    model.auto_scroll = stored_settings.auto_scroll.unwrap_or(true);
     if let Some(enabled) = stored_settings
         .enabled_models
         .clone()
@@ -4810,9 +4920,16 @@ pub fn run(
     // Images pasted with ctrl+v, sent with the next prompt so a vision model
     // is reachable from this interface.
     let mut attached_images: Vec<davinci_ai::MessageContent> = Vec::new();
-    let mut image_status: Option<String> = None;
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    if let Some(hint) = terminal_hint(
+        std::env::var_os("TMUX").is_some(),
+        &crate::default_agent_dir(),
+    ) {
+        model.push_toast(hint);
+    }
+    terminal.set_native_cursor(stored_settings.show_hardware_cursor.unwrap_or(false));
+    terminal.set_copy_on_select(stored_settings.fullscreen_copy_on_select.unwrap_or(true));
     crate::startup_mark("shell: terminal open");
     let mut first_frame = true;
     // From here the alternate screen is ours, so a `println!` from shared code
@@ -5098,20 +5215,37 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        // The draft goes to `$VISUAL`/`$EDITOR` and comes back as typed text.
+        if std::mem::take(&mut model.external_edit_requested) {
+            let draft = model.composer.to_string();
+            let edited = terminal.run_external(|| {
+                crate::external_editor::ExternalEditor::new(None, &draft)
+                    .and_then(|editor| editor.edit())
+            });
+            match edited {
+                Ok(Ok(text)) => {
+                    model.replace_composer(text.trim_end_matches(['\r', '\n']));
+                    model.push_toast("draft edited in your editor".into());
+                }
+                Ok(Err(err)) => model.push_toast(format!("editor: {err}")),
+                Err(err) => model.push_toast(format!("editor: {err}")),
+            }
+            model.dirty = true;
+        }
+        // Servers that were still connecting at the first frame: take their
+        // tools in between turns, then say how many came up.
+        if !model.running && agent.tool_context.mcp.take_ready() {
+            agent.refresh_mcp();
+            let rows = agent.tool_context.mcp.rows();
+            let up = rows.iter().filter(|row| row.status == "connected").count();
+            model.push_toast(format!("MCP: {up} of {} servers ready", rows.len()));
+            model.dirty = true;
+        }
         // Between turns the context bar follows what the next request holds.
         if !model.running {
             refresh_context_meter(agent, &mut model, false);
         }
         sync_plan_usage(agent, &mut model);
-        // The attachment line follows the chips left in the draft.
-        if !attached_images.is_empty() || image_status.is_some() {
-            let line = attachments::status(&model.composer.to_string(), &attached_images);
-            if line != image_status {
-                model.extensions.set_status("§images", line.as_deref());
-                image_status = line;
-                model.dirty = true;
-            }
-        }
         // A reply still being written after its turn ended finishes at the
         // typewriter's own pace, not the 250ms clock's.
         model.advance_reveal();
@@ -5120,7 +5254,7 @@ pub fn run(
             model.dirty = true;
         }
         if model.dirty {
-            if let Err(err) = terminal.draw(&model) {
+            if let Err(err) = terminal.draw(&mut model) {
                 break Err(err.to_string());
             }
             model.dirty = false;
@@ -5131,7 +5265,10 @@ pub fn run(
         } else {
             davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed())
         };
-        match terminal.poll_event(timeout) {
+        match terminal
+            .poll_event(timeout)
+            .map(|event| event.and_then(|event| terminal.claim_selection_key(&mut model, event)))
+        {
             Ok(Some(event)) => {
                 model.dirty = true;
                 match event {
@@ -5208,25 +5345,18 @@ pub fn run(
                             model.keybindings.matches(&data, "app.clipboard.pasteImage")
                         }) {
                             if let Some(png) = crate::external_editor::clipboard_image_png() {
-                                let (bytes, note) =
-                                    match crate::image_convert::resize_image_in_process(
-                                        &png,
-                                        "image/png",
-                                    ) {
-                                        Some(resized) => {
-                                            let note =
-                                                format!("{}x{}", resized.width, resized.height);
-                                            let bytes = if resized.was_resized
-                                                && resized.mime_type == "image/png"
-                                            {
-                                                resized.bytes
-                                            } else {
-                                                png
-                                            };
-                                            (bytes, note)
-                                        }
-                                        None => (png, "image".to_string()),
-                                    };
+                                let bytes = match crate::image_convert::resize_image_in_process(
+                                    &png,
+                                    "image/png",
+                                ) {
+                                    Some(resized)
+                                        if resized.was_resized
+                                            && resized.mime_type == "image/png" =>
+                                    {
+                                        resized.bytes
+                                    }
+                                    _ => png,
+                                };
                                 let data = base64::Engine::encode(
                                     &base64::engine::general_purpose::STANDARD,
                                     bytes,
@@ -5243,11 +5373,8 @@ pub fn run(
                                     .and_then(|head| head.chars().next_back());
                                 let spaced = attachments::spaced_chip(&chip, before);
                                 model.paste(&spaced);
-                                if model.composer.to_string().contains(&chip) {
-                                    model
-                                        .transcript
-                                        .push(Entry::Detail(format!("Pasted {chip} ({note})")));
-                                } else {
+                                // The chip in the composer is the only sign of the paste.
+                                if !model.composer.to_string().contains(&chip) {
                                     // The composer is not taking input (a sheet or
                                     // selector has focus): no chip, no image.
                                     attached_images.pop();
@@ -6294,6 +6421,7 @@ fn extension_rows(
             detail: row.detail,
             note: row.note,
             group: row.group,
+            tokens: row.tokens,
             can_update: row.can_update,
             can_toggle: row.can_toggle,
             can_approve: row.can_approve,
@@ -6788,29 +6916,49 @@ fn refresh_thinking_sheet(agent: &Agent, model: &mut Model) {
     model.facts.thinking_output_share = share;
 }
 
+/// One `/login` row per offered provider. The ChatGPT backend login has no
+/// credential of its own: it is stored under `openai-codex` with a route
+/// marker, so its row reads that credential and is ready only when the stored
+/// login is the backend one.
+fn login_provider_rows(
+    names: &[String],
+    auth: &std::collections::BTreeMap<String, davinci_ai::AuthCheck>,
+) -> Vec<ProviderRow> {
+    names
+        .iter()
+        .map(|name| {
+            let check = if name == davinci_ai::codex_backend::LOGIN_PROVIDER {
+                auth.get("openai-codex")
+                    .filter(|check| check.source == davinci_ai::codex_backend::AUTH_SOURCE)
+            } else {
+                auth.get(name)
+            };
+            match check {
+                Some(check) => ProviderRow {
+                    name: name.clone(),
+                    method: check.kind.clone(),
+                    source: check.source.clone(),
+                    state: Credential::Ready,
+                },
+                None => ProviderRow {
+                    name: name.clone(),
+                    method: "api key or oauth".into(),
+                    source: "never configured".into(),
+                    state: Credential::Absent,
+                },
+            }
+        })
+        .collect()
+}
+
 /// `3d` — provider credentials: every provider `/login` offers, with where
 /// its credential came from, from the same auth resolution `/model` uses.
 fn open_login_sheet(parsed: &crate::args::Args, model: &mut Model) {
     let snapshot = crate::load_model_runtime(parsed);
     let names = crate::interactive_login_providers(parsed);
-    model.providers = names
-        .iter()
-        .map(|name| match snapshot.auth.get(name) {
-            Some(check) => ProviderRow {
-                name: name.clone(),
-                method: check.kind.clone(),
-                source: check.source.clone(),
-                state: Credential::Ready,
-            },
-            None => ProviderRow {
-                name: name.clone(),
-                method: "api key or oauth".into(),
-                source: "never configured".into(),
-                state: Credential::Absent,
-            },
-        })
-        .collect();
+    model.providers = login_provider_rows(&names, &snapshot.auth);
     model.login_index = 0;
+    model.login_query.clear();
     model.device_code = None;
     model.facts.auth_path = home_label(&davinci_ai::default_auth_path());
     model.facts.auth_mode = if cfg!(unix) {
@@ -8857,7 +9005,10 @@ impl Shell<'_> {
                 if worker.is_finished() {
                     break;
                 }
-                match terminal.poll_event(Duration::from_millis(40)) {
+                match terminal
+                    .poll_event(Duration::from_millis(40))
+                    .map(|event| event.and_then(|event| terminal.claim_selection_key(model, event)))
+                {
                     Ok(Some(crossterm::event::Event::Key(key)))
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {
@@ -9208,7 +9359,6 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
     // own send.
     if !attachments::any_chip(&shell.model.composer.to_string(), shell.images) {
         shell.images.clear();
-        shell.model.extensions.set_status("§images", None);
     }
     let images = images.as_slice();
     // Extensions with an input handler get the line before the model does.
@@ -10004,6 +10154,24 @@ fn todo_command(shell: &mut Shell<'_>, arg: &str) -> Next {
 /// kill <id>` stops one.
 fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     let jobs = shell.agent.tool_context.jobs.clone();
+    if arg
+        .strip_prefix("kill")
+        .is_some_and(|id| id.trim() == "all")
+    {
+        let mut manager = jobs.lock().unwrap_or_else(|err| err.into_inner());
+        let running = manager.running();
+        manager.kill_all();
+        drop(manager);
+        shell.model.running = false;
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::tool(
+            State::Done,
+            "manus",
+            &format!("stopped {running} running job(s)"),
+            None,
+        ));
+        return Next::Go;
+    }
     if let Some(id) = arg.strip_prefix("kill") {
         let Ok(id) = id.trim().parse::<u32>() else {
             shell.note("usage: /jobs kill <id>");
@@ -10024,7 +10192,7 @@ fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
         return Next::Go;
     }
     if !arg.is_empty() {
-        shell.note("usage: /jobs — the background jobs · /jobs kill <id>");
+        shell.note("usage: /jobs — the background jobs · /jobs kill <id|all>");
         return Next::Go;
     }
     let summaries = jobs
@@ -10701,6 +10869,23 @@ fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
     };
 
     let list = exec.list_workflows();
+    if id_str == "all" {
+        let running: Vec<_> = list
+            .iter()
+            .filter(|run| run.status == davinci_agent::runtime::WorkflowStatus::Running)
+            .map(|run| run.id)
+            .collect();
+        let stopped = running.iter().filter(|id| exec.cancel(id).is_ok()).count();
+        shell.model.running = false;
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::tool(
+            State::Done,
+            "opus",
+            &format!("stopped {stopped} of {} running workflows", running.len()),
+            None,
+        ));
+        return Next::Go;
+    }
     let target = list
         .iter()
         .find(|w| w.id.to_string().starts_with(id_str))

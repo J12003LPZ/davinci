@@ -132,6 +132,12 @@ fn conversation_status(model: &Model) -> Line<'static> {
     if model.exit_armed {
         return Line::from(span("  Press Ctrl-C again to exit", cc.inactive));
     }
+    if model
+        .quit_armed
+        .is_some_and(|at| at.elapsed() < crate::davinci::model::QUIT_WINDOW)
+    {
+        return Line::from(span("  Press Ctrl-D again to exit", cc.inactive));
+    }
     if model.clear_pending() {
         return Line::from(span("  Esc again to clear", cc.inactive));
     }
@@ -168,18 +174,115 @@ fn conversation_status(model: &Model) -> Line<'static> {
         let noun = if agents == 1 { "agent" } else { "agents" };
         left.push(span(format!(" · ← {agents} {noun}"), cc.inactive));
     }
-    if let Some(jobs) = jobs_note(model) {
-        left.push(span(format!(" · {jobs}"), cc.inactive));
+    for (index, (label, _)) in footer_items(model).into_iter().enumerate() {
+        left.push(span(" · ", cc.inactive));
+        let mut item = span(label, cc.inactive);
+        if model.footer_focus == Some(index) {
+            item = span(item.content.to_string(), cc.permission);
+            item.style = item.style.add_modifier(Modifier::REVERSED);
+        }
+        left.push(item);
     }
-    let right = if model.context_fraction() >= 0.8 && model.width >= 80 {
-        vec![span(
-            format!("{}% context ", (model.context_fraction() * 100.0) as u32),
-            cc.auto_mode,
-        )]
-    } else {
-        Vec::new()
-    };
+    if model.footer_focus.is_some() {
+        left.push(span(
+            "  ←/→ choose · enter open · x stop · esc back",
+            cc.inactive,
+        ));
+    }
+    if let Some(pr) = pr_span(model) {
+        left.push(span(" · ", cc.inactive));
+        left.push(pr);
+    }
+    // Notes show on the row above the composer (`effort_line`), so the
+    // footer's right end keeps the context readout.
+    let right = context_fold(model, usize::from(run_width(&left)));
     spread(model.width, left, right)
+}
+
+/// The note still inside its [`crate::davinci::model::TOAST_SECONDS`].
+fn live_toast(model: &Model) -> Option<&str> {
+    model
+        .toast
+        .as_ref()
+        .filter(|(_, at)| {
+            at.elapsed() < std::time::Duration::from_secs(crate::davinci::model::TOAST_SECONDS)
+        })
+        .map(|(note, _)| note.as_str())
+}
+
+/// Pips in the footer's context gauge.
+const FOLD_PIPS: usize = 8;
+
+/// The context and plan-limit readout at the footer's right end:
+/// `ctx ▰▱▱▱▱▱▱▱ 2% · 5h 23% left · wk 59% left`. It takes no row of its
+/// own. Parts drop from the right as the left run leaves less room: first
+/// the limits, then the gauge. `compact` only (`full` draws the rows).
+fn context_fold(model: &Model, left_width: usize) -> Vec<Span<'static>> {
+    use crate::davinci::model::ContextBarMode;
+    if model.context_bar != ContextBarMode::Compact {
+        return Vec::new();
+    }
+    let th = &model.theme;
+    let cc = th.cc();
+    let (fraction, pressure) = match model.context_meter.as_ref().filter(|v| v.window > 0) {
+        Some(view) => (
+            (view.used() as f64 / view.window as f64).clamp(0.0, 1.0),
+            super::context_bar::pressure(view),
+        ),
+        None if model.context.1 > 0 => (model.context_fraction(), model.context_fraction()),
+        None => return Vec::new(),
+    };
+    let ink = if pressure >= 1.0 {
+        th.error
+    } else if pressure >= 0.8 {
+        th.warning
+    } else {
+        cc.permission
+    };
+    let percent = (fraction * 100.0).round() as u32;
+    let lit = if fraction > 0.0 {
+        ((fraction * FOLD_PIPS as f64).round() as usize).clamp(1, FOLD_PIPS)
+    } else {
+        0
+    };
+    let gauge = format!("{}{}", "▰".repeat(lit), "▱".repeat(FOLD_PIPS - lit));
+    let dim = cc.inactive;
+    let head = vec![
+        span("ctx ", dim),
+        span(gauge, ink),
+        span(format!(" {percent}%"), ink),
+    ];
+    let mut limits: Vec<Span<'static>> = Vec::new();
+    if model.plan_usage_enabled {
+        for window in model.plan_usage.iter().flat_map(|view| view.windows.iter()) {
+            let left = (100.0 - window.used_percent).clamp(0.0, 100.0);
+            let tone = if left <= 10.0 {
+                th.error
+            } else if left <= 20.0 {
+                th.warning
+            } else {
+                dim
+            };
+            let name = match window.minutes {
+                300 => "5h".to_string(),
+                10_080 => "wk".to_string(),
+                _ => window.label.clone(),
+            };
+            limits.push(span("  ·  ", dim));
+            limits.push(span(format!("{name} {left:.0}% left"), tone));
+        }
+    }
+    let tail = span(" ", dim);
+    let room = usize::from(model.width).saturating_sub(left_width + 2);
+    let tight = vec![span(format!("ctx {percent}%"), ink)];
+    [
+        [head.clone(), limits.clone(), vec![tail.clone()]].concat(),
+        [head, vec![tail.clone()]].concat(),
+        [tight, vec![tail]].concat(),
+    ]
+    .into_iter()
+    .find(|spans| usize::from(run_width(spans)) <= room)
+    .unwrap_or_default()
 }
 
 fn key_label(model: &Model, action: &str) -> Option<String> {
@@ -203,12 +306,14 @@ fn shortcut_rows(model: &Model) -> Vec<Line<'static>> {
     let spaced = |action: &str, text: &str| {
         key_label(model, action).map(|key| format!("{} {text}", key.replace('+', " + ")))
     };
+    let mut hints = vec![
+        "! for shell mode".to_string(),
+        "/ for commands".into(),
+        "@ for file paths".into(),
+    ];
+    hints.extend(spaced("davinci.checklist.toggle", "for checklist"));
     let columns: [Vec<String>; 3] = [
-        vec![
-            "! for shell mode".into(),
-            "/ for commands".into(),
-            "@ for file paths".into(),
-        ],
+        hints,
         [
             spaced("app.permissions.cycle", "to cycle modes"),
             spaced("davinci.tools.expand", "for verbose output"),
@@ -266,6 +371,20 @@ pub fn governor_notice(model: &Model) -> Vec<Line<'static>> {
             Vec::new()
         },
     )]
+}
+
+/// The branch's pull request for the footer, inked by review state.
+fn pr_span(model: &Model) -> Option<Span<'static>> {
+    let badge = model.pr_badge.as_ref()?;
+    let th = &model.theme;
+    let ink = match (badge.state.as_str(), badge.review.as_str()) {
+        ("MERGED", _) => th.secondary,
+        ("CLOSED", _) => th.error,
+        (_, "APPROVED") => th.success,
+        (_, "CHANGES_REQUESTED") => th.error,
+        _ => th.muted,
+    };
+    Some(span(badge.label(), ink))
 }
 
 fn status_left(model: &Model) -> Vec<Span<'static>> {
@@ -345,6 +464,10 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
                 span(" · ", th.border),
                 span(model_run(model), th.muted),
             ];
+            if let Some(pr) = pr_span(model) {
+                left.push(span(" · ", th.border));
+                left.push(pr);
+            }
             if let Some(jobs) = jobs_note(model) {
                 left.push(span(" · ", th.border));
                 left.push(span(jobs, th.muted));
@@ -361,6 +484,10 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
                 span(format!("+{adds} "), th.success),
                 span(format!("-{dels}"), th.error),
             ];
+            if let Some(pr) = pr_span(model) {
+                left.push(span(" · ", th.border));
+                left.push(pr);
+            }
             if model.codex_open() {
                 left.push(span(" · ", th.border));
                 left.push(span("codex open", th.muted));
@@ -483,7 +610,21 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
 /// Claude-style effort affordance shared by the conversation composer and
 /// command sheets. The session's real effort label is preserved.
 pub fn effort_line(model: &Model) -> Line<'static> {
-    let quiet = model.theme.cc().inactive;
+    let cc = model.theme.cc();
+    let quiet = cc.inactive;
+    // A note ("copied 709 chars to clipboard") takes this row's right end in
+    // the permission blue while it lasts, then gives the effort label back.
+    if let Some(note) = live_toast(model) {
+        let room = model.width.saturating_sub(4);
+        return spread(
+            model.width,
+            Vec::new(),
+            vec![span(
+                format!("{}  ", clip_ellipsis(note, room)),
+                cc.permission,
+            )],
+        );
+    }
     spread(
         model.width,
         Vec::new(),
@@ -510,10 +651,25 @@ pub fn effort_rule(model: &Model) -> Line<'static> {
 /// focus; under an open instrument the theme dims. Recall replaces the input
 /// with its own keys (`2b`).
 pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line<'static>> {
+    composer_with_caret(model, lines, hint).0
+}
+
+/// [`composer`], plus where its caret sits: `(row within the returned rows,
+/// display column)`. The runtime parks the terminal's cursor there, hidden or
+/// shown, so input-method candidate windows and magnifiers follow the caret.
+pub fn composer_with_caret(
+    model: &Model,
+    lines: Option<&[String]>,
+    hint: Hint,
+) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
     let th = &model.theme;
     let cc = th.cc();
+    model.composer_hit.set(None);
     let editor = model.composer.editor();
-    editor.set_layout_width(usize::MAX);
+    // Long lines wrap onto further rows rather than scrolling sideways, and
+    // the editor moves Up and Down across exactly these rows.
+    let wrap = usize::from(model.width.saturating_sub(4)).max(1);
+    editor.set_layout_width(wrap);
     editor.set_terminal_rows(model.height as usize);
 
     if model.screen == Screen::Memoria {
@@ -522,18 +678,18 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         } else {
             "enter pin to context · f raise floor · r reindex · esc close"
         };
-        return Surface::new(model.width, th)
+        let rows = Surface::new(model.width, th)
             .row(vec![
                 span(format!("{} ", glyph::PROMPT), th.secondary),
                 span(keys, th.muted),
             ])
             .lines();
+        return (rows, None);
     }
 
     let owned = lines.map(<[String]>::to_vec);
     let entries: Vec<String> =
         owned.unwrap_or_else(|| model.composer.split('\n').map(str::to_string).collect());
-    let last = entries.len().saturating_sub(1);
     let overlaid = !model.composer_owns_focus();
     let shell_mode = model.screen == Screen::Agent && model.composer.starts_with('!');
     let border = if shell_mode {
@@ -549,7 +705,13 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         })
         .or_else(|| screen_placeholder(model.screen).map(str::to_string))
         .or_else(|| {
-            (model.screen == Screen::Agent && lines.is_none()).then(|| {
+            // The suggestion belongs to a fresh conversation: once a message
+            // has been sent, the composer waits empty, as in Claude Code.
+            let fresh = !model
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, super::super::model::Entry::User(_)));
+            (model.screen == Screen::Agent && lines.is_none() && fresh).then(|| {
                 format!(
                     "Try \"{}\"",
                     PLACEHOLDERS[model.placeholder % PLACEHOLDERS.len()]
@@ -557,7 +719,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
             })
         });
 
-    let lit = model.blink();
+    let lit = model.caret_lit();
     let caret_color = if th.text == Color::Reset {
         th.primary
     } else {
@@ -573,7 +735,11 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     } else {
         None
     };
+    let map = lines.is_none().then(|| editor.visual_rows(wrap));
+    let (entries, caret_at) = wrap_rows(&entries, wrap, caret_at, map);
+    let last = entries.len().saturating_sub(1);
     let caret_row = caret_at.map_or(last, |(row, _)| row.min(last));
+    let mut caret_cell: Option<(usize, u16)> = None;
     let visible = (model.height as usize / 3).clamp(1, 8);
     let start = caret_row
         .saturating_sub(visible - 1)
@@ -588,6 +754,17 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         vec![composer_rule(model, border, start, "above")]
     };
 
+    if lines.is_none() && !overlaid {
+        model
+            .composer_hit
+            .set(Some(crate::davinci::model::ComposerHit {
+                first: rows.len(),
+                start,
+                end,
+                wrap,
+                shell: shell_mode,
+            }));
+    }
     for (index, raw_entry) in entries.into_iter().enumerate().take(end).skip(start) {
         let ink = th.text;
         let mut column = caret_at
@@ -602,7 +779,9 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         } else {
             raw_entry
         };
-        let (shown, column) = composer_view(&entry, column, model.width.saturating_sub(6));
+        // Rows already fit the wrap width; the clip only guards a single
+        // grapheme wider than the whole window.
+        let (shown, column) = composer_view(&entry, column, model.width.saturating_sub(3));
         let split = column.and_then(|col| split_at_caret(&shown, col));
         let caret_here = split.is_some();
         // The caret of an empty composer sits on the placeholder's first
@@ -612,6 +791,17 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
             && index == caret_row
             && !overlaid
             && placeholder.as_deref().is_some_and(|hint| !hint.is_empty());
+        if index == caret_row && !overlaid && caret_at.is_some() {
+            // Every prompt glyph (`❯`, `!`, or the two-space indent) is two cells.
+            let prompt_cells = 2;
+            let before = match &split {
+                _ if caret_on_hint => 0,
+                Some((before, _, _)) => UnicodeWidthStr::width(before.as_str()),
+                None => UnicodeWidthStr::width(shown.as_str()),
+            };
+            let column = (prompt_cells + before).min(usize::from(model.width.saturating_sub(1)));
+            caret_cell = Some((rows.len(), column as u16));
+        }
         let body = if caret_on_hint {
             let hint = placeholder.clone().unwrap_or_default();
             let mut chars = hint.chars();
@@ -690,7 +880,55 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     if hint != Hint::None {
         rows.push(hint_line(model, hint, rows_typed));
     }
-    rows
+    (rows, caret_cell)
+}
+
+/// Logical lines as visual rows `width` cells wide, with the caret moved
+/// from `(logical line, byte)` to `(visual row, byte within it)`. `map` is
+/// the editor's own row map when the rows are its buffer; other text (queued
+/// messages above the draft) is word-wrapped here the same way.
+fn wrap_rows(
+    entries: &[String],
+    width: usize,
+    caret: Option<(usize, usize)>,
+    map: Option<Vec<(usize, usize, usize)>>,
+) -> (Vec<String>, Option<(usize, usize)>) {
+    let map = map.unwrap_or_else(|| {
+        entries
+            .iter()
+            .enumerate()
+            .flat_map(|(line, text)| {
+                crate::word_wrap::word_wrap_line(text, width, None)
+                    .into_iter()
+                    .map(move |chunk| {
+                        (line, chunk.start_index, chunk.end_index - chunk.start_index)
+                    })
+            })
+            .collect()
+    });
+    let rows = map
+        .iter()
+        .map(|&(line, start, len)| {
+            entries
+                .get(line)
+                .and_then(|text| text.get(start..start + len))
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let caret = caret.and_then(|(line, column)| {
+        let index = map
+            .iter()
+            .enumerate()
+            .position(|(index, &(at, start, len))| {
+                let last_of_line = map.get(index + 1).is_none_or(|next| next.0 != at);
+                at == line
+                    && column >= start
+                    && (column < start + len || (last_of_line && column == start + len))
+            })?;
+        Some((index, column - map[index].1))
+    });
+    (rows, caret)
 }
 
 fn known_command(model: &Model, entry: &str) -> Option<String> {
@@ -738,6 +976,33 @@ fn recolor_leading(spans: Vec<Span<'static>>, cells: usize, color: Color) -> Vec
     out
 }
 
+/// The branch to name on the composer's top rule: any branch but the
+/// default one, and only on the conversation itself.
+fn branch_label(model: &Model) -> Option<String> {
+    let branch = model.branch.trim();
+    let default = matches!(branch, "" | "main" | "master" | "HEAD");
+    (!default && model.screen == Screen::Agent && model.overlay.is_none())
+        .then(|| branch.to_string())
+}
+
+/// `──────── fix-permission-mode-footer-color ─`: the rule with the branch
+/// set into its right end, as Claude Code draws it.
+fn branch_rule(model: &Model, color: Color, branch: &str) -> Line<'static> {
+    let width = usize::from(model.width);
+    // Room for " name ─" and at least a few cells of rule before it.
+    let room = width.saturating_sub(9);
+    if room < 4 {
+        return Line::from(span("─".repeat(width), color));
+    }
+    let name = clip_ellipsis(branch, room as u16);
+    let tail = format!(" {name} ─");
+    let rule = "─".repeat(width.saturating_sub(UnicodeWidthStr::width(tail.as_str())));
+    Line::from(vec![
+        span(rule, color),
+        span(tail, model.theme.cc().inactive),
+    ])
+}
+
 fn composer_rule(
     model: &Model,
     color: ratatui::style::Color,
@@ -745,6 +1010,11 @@ fn composer_rule(
     direction: &str,
 ) -> Line<'static> {
     if hidden == 0 {
+        if direction == "above" {
+            if let Some(branch) = branch_label(model) {
+                return branch_rule(model, color, &branch);
+            }
+        }
         return Line::from(span("─".repeat(model.width as usize), color));
     }
     let label = if hidden > 0 {
@@ -811,6 +1081,27 @@ pub fn disabled_composer(model: &Model, text: &str) -> Vec<Line<'static>> {
 /// What runs in the background: `1 job · 2 agents · 1 workflow`, like
 /// claude code's `N agents` footer. Nothing when nothing runs, so the bar
 /// says it only when there is something to know.
+/// The footer's focusable items — what runs in the background — each with the
+/// command that opens it.
+pub fn footer_items(model: &Model) -> Vec<(String, &'static str)> {
+    let count = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    [
+        (count(model.jobs_running, "job", "jobs"), "/jobs"),
+        (count(model.agents_running, "agent", "agents"), "/agents"),
+        (
+            count(model.workflows_running, "workflow", "workflows"),
+            "/workflows",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, command)| label.map(|label| (label, command)))
+    .collect()
+}
+
 fn jobs_note(model: &Model) -> Option<String> {
     let count = |n: usize, one: &str, many: &str| match n {
         0 => None,
@@ -926,11 +1217,17 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
 /// selection reads without color (design.md §6). Nothing is drawn when there is
 /// nothing on offer.
 pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
+    suggestions_with_items(model).0
+}
+
+/// The completion rows, and the item each row belongs to (an item may take
+/// several), so a click on a row can pick its item.
+pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
     let Some(found) = &model.suggestions else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if found.items.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let cc = model.theme.cc();
@@ -950,26 +1247,209 @@ pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
         .collect();
     let heights: Vec<usize> = items.iter().map(Vec::len).collect();
     let selected = model.suggestion_index.min(items.len() - 1);
+    // Only a slash command name being typed is marked; paths and arguments
+    // are not.
+    let needle = if found.prefix.starts_with('/') && !model.composer.contains(' ') {
+        found.prefix.trim_start_matches('/').to_owned()
+    } else {
+        String::new()
+    };
     let (start, end) = visible_items(&heights, selected, 5);
     let mut out = Vec::new();
+    let mut owners = Vec::new();
     for (index, rows) in items.iter().enumerate().take(end).skip(start) {
         let color = if index == selected {
             cc.permission
         } else {
             cc.inactive
         };
+        // The typed command name is picked out wherever it occurs, in the
+        // name, its alias and the description alike: bold in the row's own
+        // color when selected, bold white otherwise.
+        let hit = if index == selected {
+            cc.permission
+        } else {
+            cc.text
+        };
         for (left, description) in rows {
-            let mut spans = vec![span(left.clone(), color)];
+            let mut spans = marked_spans(left, &needle, color, hit, &model.theme);
             if !description.is_empty() {
-                spans.push(span(description.clone(), color));
+                spans.extend(marked_spans(description, &needle, color, hit, &model.theme));
             }
             out.push(Line::from(crate::davinci::ui::truncate_run(
                 spans,
                 model.width,
             )));
+            owners.push(index);
         }
     }
-    out
+    (out, owners)
+}
+
+/// The search rows above the composer: the query, then the matches around
+/// the marked one. Each match row names its index in `history_matches`; the
+/// query row names `usize::MAX`.
+/// The model's checklist as a band of at most five rows above the composer
+/// (`ctrl+t`): finished steps ✓, the active one ◉, the rest ○. Rows beyond
+/// five fold into a count, with the active step kept in view. Nothing when
+/// it is closed, empty, or the window is too short to spare the rows.
+pub fn checklist_rows(model: &Model, height: usize) -> Vec<Line<'static>> {
+    use crate::davinci::theme::State as ChecklistState;
+    const SHOWN: usize = 5;
+    if !model.checklist_open || model.plan.is_empty() || height < 14 {
+        return Vec::new();
+    }
+    let cc = model.theme.cc();
+    let steps = &model.plan;
+    let done = steps
+        .iter()
+        .filter(|step| matches!(step.state, ChecklistState::Done))
+        .count();
+    // Lead with the last finished step, then the active one and what follows.
+    let focus = steps
+        .iter()
+        .position(|step| !matches!(step.state, ChecklistState::Done))
+        .unwrap_or(steps.len() - 1);
+    let first = focus
+        .saturating_sub(1)
+        .min(steps.len().saturating_sub(SHOWN));
+    let mut rows = vec![Line::from(vec![
+        span(
+            format!("  checklist · {done} of {} done", steps.len()),
+            cc.inactive,
+        ),
+        span("  ctrl+t hides", cc.subtle),
+    ])];
+    for step in steps.iter().skip(first).take(SHOWN) {
+        let (glyph, ink) = match step.state {
+            ChecklistState::Done => ("✓", cc.success),
+            ChecklistState::Active => ("◉", cc.permission),
+            ChecklistState::Failed => ("✗", cc.error),
+            _ => ("○", cc.inactive),
+        };
+        rows.push(Line::from(vec![
+            span(format!("  {glyph} "), ink),
+            span(
+                step.verb.clone(),
+                if matches!(step.state, ChecklistState::Done) {
+                    cc.inactive
+                } else {
+                    cc.text
+                },
+            ),
+        ]));
+    }
+    let hidden = steps.len().saturating_sub(first + SHOWN);
+    if hidden > 0 {
+        rows.push(Line::from(span(
+            format!("    … {hidden} more"),
+            cc.inactive,
+        )));
+    }
+    rows
+}
+
+pub fn history_search_rows(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
+    let Some(search) = &model.history_search else {
+        return (Vec::new(), Vec::new());
+    };
+    let cc = model.theme.cc();
+    let matches = model.history_matches();
+    let mut rows = vec![Line::from(vec![
+        span(format!("  search {}: ", search.scope.label()), cc.inactive),
+        span(search.query.clone(), cc.permission),
+        span("▏", cc.permission),
+        span(
+            if matches.is_empty() {
+                "  no match · tab: wider".to_owned()
+            } else {
+                format!(
+                    "  {} of {} · tab: scope",
+                    search.selected + 1,
+                    matches.len()
+                )
+            },
+            cc.inactive,
+        ),
+    ])];
+    let mut owners = vec![usize::MAX];
+    let selected = search.selected.min(matches.len().saturating_sub(1));
+    let first = selected.saturating_sub(crate::davinci::model::HISTORY_SHOWN - 1);
+    let words: Vec<String> = search
+        .query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    for (index, entry) in matches
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(crate::davinci::model::HISTORY_SHOWN)
+    {
+        let flat = entry.replace('\n', " ⏎ ");
+        let marked = index == selected;
+        let ink = if marked { cc.permission } else { cc.inactive };
+        let mut spans = vec![span(if marked { "  ❯ " } else { "    " }, ink)];
+        // The first query word shows where the entry matched.
+        let lower = flat.to_lowercase();
+        let hit = words
+            .first()
+            .and_then(|word| lower.find(word.as_str()).map(|at| (at, word.len())))
+            .filter(|&(at, len)| flat.is_char_boundary(at) && flat.is_char_boundary(at + len));
+        match hit {
+            Some((at, len)) => {
+                spans.push(span(flat[..at].to_owned(), ink));
+                spans.push(span_strong(
+                    flat[at..at + len].to_owned(),
+                    cc.permission,
+                    &model.theme,
+                ));
+                spans.push(span(flat[at + len..].to_owned(), ink));
+            }
+            None => spans.push(span(flat, ink)),
+        }
+        rows.push(Line::from(crate::davinci::ui::truncate_run(
+            spans,
+            model.width,
+        )));
+        owners.push(index);
+    }
+    (rows, owners)
+}
+
+/// `text` in `base`, with every case-insensitive occurrence of `needle`
+/// bold in `hit`. An empty needle leaves one plain span.
+fn marked_spans(
+    text: &str,
+    needle: &str,
+    base: Color,
+    hit: Color,
+    theme: &crate::davinci::theme::Theme,
+) -> Vec<Span<'static>> {
+    if needle.is_empty() {
+        return vec![span(text.to_owned(), base)];
+    }
+    // ASCII lowering keeps byte offsets, so the cuts stay on char boundaries.
+    let haystack = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(found) = haystack[from..].find(&needle) {
+        let at = from + found;
+        let end = at + needle.len();
+        if !text.is_char_boundary(at) || !text.is_char_boundary(end) {
+            break;
+        }
+        if at > from {
+            spans.push(span(text[from..at].to_owned(), base));
+        }
+        spans.push(span_strong(text[at..end].to_owned(), hit, theme));
+        from = end;
+    }
+    if from < text.len() {
+        spans.push(span(text[from..].to_owned(), base));
+    }
+    spans
 }
 
 fn suggestion_label(prefix: &str, model: &Model, label: &str) -> String {
@@ -1055,6 +1535,12 @@ fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
     let th = &model.theme;
     if model.exit_armed {
         return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
+    }
+    if model
+        .quit_armed
+        .is_some_and(|at| at.elapsed() < crate::davinci::model::QUIT_WINDOW)
+    {
+        return Line::from(vec![span("ctrl+d again to exit", th.primary)]);
     }
     if model.clear_pending() {
         return Line::from(vec![span("esc again to clear", th.primary)]);
@@ -1187,6 +1673,26 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn the_typed_command_name_is_bold_wherever_it_occurs() {
+        let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
+        let (base, hit) = (Color::Gray, Color::Blue);
+        let spans = marked_spans("/resume (Continue) con", "con", base, hit, &theme);
+        let bold: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(hit))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bold, ["Con", "con"]);
+        assert!(spans
+            .iter()
+            .filter(|s| s.style.fg == Some(hit))
+            .all(|s| s.style.add_modifier.contains(theme.emphasis)));
+        let whole: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(whole, "/resume (Continue) con");
+        assert_eq!(marked_spans("é/con", "", base, hit, &theme).len(), 1);
     }
 
     #[test]
@@ -1323,6 +1829,64 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_other_than_main_is_named_on_the_composers_top_rule() {
+        let mut m = model(100);
+        m.branch = "fix-permission-mode-footer-color".into();
+        let rows = composer(&m, None, Hint::None);
+        let top = rows
+            .iter()
+            .map(text)
+            .find(|row| row.contains("fix-permission"))
+            .expect("branch on a rule");
+        assert!(
+            top.starts_with('─') && top.ends_with(" fix-permission-mode-footer-color ─"),
+            "{top}"
+        );
+        assert_eq!(UnicodeWidthStr::width(top.as_str()), 100);
+        for quiet in ["main", "master", "", "HEAD"] {
+            m.branch = quiet.into();
+            let drawn: String = composer(&m, None, Hint::None).iter().map(text).collect();
+            assert!(
+                !drawn.contains(quiet) || quiet.is_empty(),
+                "{quiet} is not named"
+            );
+        }
+        // A long name is clipped, a tiny window keeps a bare rule.
+        m.branch = "x".repeat(200);
+        let top = composer(&m, None, Hint::None)
+            .iter()
+            .map(text)
+            .find(|r| r.contains('…'))
+            .expect("clipped");
+        assert_eq!(UnicodeWidthStr::width(top.as_str()), 100);
+        m.width = 8;
+        assert!(composer(&m, None, Hint::None)
+            .iter()
+            .all(|r| !text(r).contains('x')));
+    }
+
+    #[test]
+    fn each_permission_mode_label_has_its_own_color() {
+        let mut m = model(120);
+        let cc = m.theme.cc();
+        for (mode, ink) in [
+            ("edits", cc.accept_edits),
+            ("read-only", cc.plan_mode),
+            ("auto", cc.auto_mode),
+        ] {
+            m.permission_mode = mode.into();
+            let line = status(&m);
+            let label = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains("mode on") || s.content.contains("accept edits"))
+                .unwrap_or_else(|| panic!("{mode}: no label in {}", text(&line)));
+            assert_eq!(label.style.fg, Some(ink), "{mode}");
+            assert_ne!(label.style.fg, Some(cc.inactive), "{mode}");
+        }
+    }
+
+    #[test]
     fn the_header_distinguishes_auto_from_always_approve() {
         let mut m = model(120);
         m.thinking_level = "high".into();
@@ -1407,9 +1971,108 @@ mod tests {
         let drawn = text(&status(&m));
         assert!(drawn.starts_with("  ⏸ manual mode on"));
         assert!(drawn.contains("? for shortcuts"));
-        assert!(!drawn.contains("23% context"));
+        assert!(drawn.contains("ctx ▰▰▱▱▱▱▱▱ 24%"), "{drawn}");
+        m.context = (0, 0);
+        assert!(!text(&status(&m)).contains("ctx"), "no reading, no gauge");
         m.context = (180_000, 200_000);
-        assert!(text(&status(&m)).contains("90% context"));
+        assert!(text(&status(&m)).contains("ctx ▰▰▰▰▰▰▰▱ 90%"));
+    }
+
+    fn folded(width: u16) -> Model {
+        use crate::davinci::model::{
+            ContextCategory, ContextKind, ContextUsageView, PlanUsageView, PlanWindow,
+        };
+        let mut m = model(width);
+        m.context_meter = Some(ContextUsageView {
+            model: "gpt-6-luna".into(),
+            window: 272_000,
+            categories: vec![ContextCategory {
+                kind: ContextKind::Messages,
+                label: "Messages".into(),
+                tokens: 6_200,
+            }],
+            free: 130_000,
+            buffer: 16_400,
+            sections: Vec::new(),
+        });
+        m.plan_usage = Some(PlanUsageView {
+            plan: None,
+            windows: vec![
+                PlanWindow {
+                    label: "5h".into(),
+                    minutes: 300,
+                    used_percent: 77.0,
+                    resets_in: Some(7_320),
+                },
+                PlanWindow {
+                    label: "week".into(),
+                    minutes: 10_080,
+                    used_percent: 41.0,
+                    resets_in: None,
+                },
+            ],
+            note: None,
+        });
+        m
+    }
+
+    #[test]
+    fn the_footer_folds_context_and_plan_limits_into_its_right_end() {
+        let m = folded(120);
+        let row = text(&status(&m));
+        assert!(row.starts_with("  ⏸ manual mode on"), "{row}");
+        assert!(
+            row.trim_end()
+                .ends_with("ctx ▰▱▱▱▱▱▱▱ 2%  ·  5h 23% left  ·  wk 59% left"),
+            "{row}"
+        );
+        assert_eq!(line_width(&status(&m)), 120);
+    }
+
+    #[test]
+    fn the_fold_gives_up_limits_then_the_gauge_before_the_mode() {
+        let wide = text(&status(&folded(120)));
+        assert!(wide.contains("wk 59% left"));
+        // Wide enough for the gauge, not the limits.
+        let mid = text(&status(&folded(75)));
+        assert!(mid.contains("ctx ▰") && !mid.contains("5h"), "{mid}");
+        let tight = text(&status(&folded(50)));
+        assert!(tight.contains("ctx 2%") && !tight.contains('▰'), "{tight}");
+        for width in [20u16, 40, 50, 58, 75, 120] {
+            let row = status(&folded(width));
+            assert!(line_width(&row) <= width, "{width}");
+            assert!(text(&row).contains("manual mode on") || width < 24);
+        }
+    }
+
+    #[test]
+    fn the_fold_warns_near_compaction_and_is_off_for_other_bar_modes() {
+        use crate::davinci::model::{ContextBarMode, ContextCategory, ContextKind};
+        let mut m = folded(120);
+        if let Some(view) = m.context_meter.as_mut() {
+            view.categories = vec![ContextCategory {
+                kind: ContextKind::Messages,
+                label: "Messages".into(),
+                tokens: 230_000,
+            }];
+        }
+        let row = status(&m);
+        let gauge = row
+            .spans
+            .iter()
+            .find(|s| s.content.contains('▰'))
+            .expect("gauge");
+        assert_eq!(gauge.style.fg, Some(m.theme.warning));
+        let low = row
+            .spans
+            .iter()
+            .find(|s| s.content.contains("5h"))
+            .expect("5h");
+        assert_eq!(low.style.fg, Some(m.theme.cc().inactive));
+        for mode in [ContextBarMode::Off, ContextBarMode::Full] {
+            m.context_bar = mode;
+            assert!(!text(&status(&m)).contains("ctx"), "{mode:?}");
+        }
     }
 
     #[test]
@@ -1512,6 +2175,7 @@ mod tests {
     #[test]
     fn the_caret_is_drawn_on_the_last_row_only_and_blinks() {
         let mut m = model(100);
+        m.caret_blink = true;
         let entered = vec!["one".to_string(), "two".to_string()];
         let rows = composer(&m, Some(&entered), Hint::Multiline);
         let caret = |line: &Line<'_>| {
@@ -1586,8 +2250,22 @@ mod tests {
     }
 
     #[test]
+    fn the_suggestion_is_for_a_fresh_conversation_and_goes_once_a_message_is_sent() {
+        let mut m = model(100);
+        m.transcript.clear();
+        let drawn = |m: &Model| text(&composer(m, None, Hint::Default).remove(2));
+        assert!(drawn(&m).contains("Try \""));
+        m.transcript
+            .push(crate::davinci::model::Entry::user("hello"));
+        let after = drawn(&m);
+        assert!(!after.contains("Try \""), "{after}");
+        assert!(after.starts_with('❯'), "{after}");
+    }
+
+    #[test]
     fn the_caret_of_an_empty_composer_sits_before_the_placeholder_not_after_it() {
-        let m = model(100);
+        let mut m = model(100);
+        m.transcript.clear();
         let line = composer(&m, None, Hint::Default).remove(2);
         let drawn = text(&line);
         assert!(drawn.contains("Try \""), "placeholder is shown: {drawn}");
@@ -1672,6 +2350,86 @@ mod tests {
         assert_eq!(thousands(200_000), "200k");
         assert_eq!(thousands(1_200_000), "1.2m");
         assert_eq!(thousands(18_402_000), "18m");
+    }
+
+    #[test]
+    fn a_long_prompt_wraps_onto_rows_instead_of_scrolling_sideways() {
+        for width in [24u16, 40, 80] {
+            let mut m = model(width);
+            let words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+            m.type_char(words);
+            let (rows, caret) = composer_with_caret(&m, None, Hint::None);
+            let first = rows
+                .iter()
+                .position(|row| text(row).starts_with('❯'))
+                .unwrap();
+            let typed: Vec<String> = rows[first..]
+                .iter()
+                .map(text)
+                .take_while(|row| !row.starts_with('─'))
+                .collect();
+            assert!(typed.len() > 1 || width == 80, "{width}: {typed:?}");
+            assert!(rows.iter().all(|row| line_width(row) <= width), "{width}");
+            assert!(
+                !typed.iter().any(|row| row.contains('…')),
+                "{width}: {typed:?}"
+            );
+            let joined: Vec<&str> = typed
+                .iter()
+                .flat_map(|row| row.trim_start_matches('❯').split_whitespace())
+                .collect();
+            assert_eq!(joined.join(" "), words, "{width}");
+            let (row, _) = caret.expect("caret");
+            assert!(text(&rows[row]).trim_end().ends_with("mu"), "{width}");
+        }
+    }
+
+    #[test]
+    fn up_moves_within_a_wrapped_prompt_before_reaching_history() {
+        let mut m = model(24);
+        m.composer.editor_mut().add_to_history("earlier prompt");
+        m.type_char("alpha beta gamma delta epsilon zeta");
+        let _ = composer_with_caret(&m, None, Hint::None);
+        m.composer.editor_mut().cursor_up();
+        assert_eq!(
+            m.composer.editor().get_text(),
+            "alpha beta gamma delta epsilon zeta",
+            "the first Up stays in the prompt"
+        );
+        let (rows, caret) = composer_with_caret(&m, None, Hint::None);
+        let (row, _) = caret.unwrap();
+        assert!(text(&rows[row]).starts_with('❯'), "on the first row now");
+    }
+
+    #[test]
+    fn a_fresh_note_takes_the_effort_row_in_blue_and_an_old_one_gives_it_back() {
+        let mut m = model(100);
+        m.toast = Some((
+            "copied 709 chars to clipboard".into(),
+            std::time::Instant::now(),
+        ));
+        let row = effort_line(&m);
+        assert!(
+            text(&row).ends_with("copied 709 chars to clipboard  "),
+            "{}",
+            text(&row)
+        );
+        assert!(!text(&row).contains("/effort"));
+        let note = row
+            .spans
+            .iter()
+            .find(|s| s.content.contains("copied"))
+            .expect("note");
+        assert_eq!(note.style.fg, Some(m.theme.cc().permission));
+        assert_eq!(line_width(&row), 100);
+        // The footer keeps its own right end for the context readout.
+        assert!(!text(&status(&m)).contains("copied"));
+        m.toast = Some((
+            "copied 709 chars to clipboard".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        ));
+        let row = effort_line(&m);
+        assert!(text(&row).contains("/effort") && !text(&row).contains("copied"));
     }
 
     #[test]

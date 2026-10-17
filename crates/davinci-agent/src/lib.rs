@@ -3319,6 +3319,13 @@ impl Agent {
             .mcp_read_only = read_only;
     }
 
+    /// Re-derive what was taken from the MCP registry (tool names, read-only
+    /// hints, capabilities) after a background connect filled it in.
+    pub fn refresh_mcp(&mut self) {
+        let registry = self.tool_context.mcp.clone();
+        self.attach_mcp(registry);
+    }
+
     /// Built-in specs plus live MCP tools, filtered by `self.tools`.
     pub fn builtin_and_mcp_specs(&self) -> Vec<AgentTool> {
         let mut specs: Vec<AgentTool> = tool_specs()

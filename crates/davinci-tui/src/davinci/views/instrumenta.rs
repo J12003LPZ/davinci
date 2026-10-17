@@ -26,7 +26,7 @@ pub(crate) fn all_lines(model: &Model) -> Vec<Line<'static>> {
     let inner = model.width.saturating_sub(inset * 2).saturating_sub(4);
     let hits = model.filtered_corpus();
     let selected = model.selection(hits.len());
-    let caret = if model.blink() {
+    let caret = if model.caret_lit() {
         Style::default().fg(th.background).bg(th.primary)
     } else {
         Style::default()
