@@ -1221,9 +1221,15 @@ pub const PUBLIC_WS_ATTEMPT: &str = "websocket";
 const PUBLIC_WS_BACKOFF_MS: u64 = 5 * 60 * 1000;
 const PUBLIC_WS_BACKOFF_MAX_SESSIONS: usize = 256;
 
-/// True only for the documented public plan route and the explicit transport value.
+/// True on the documented public plan route unless the caller asked for plain HTTP.
+///
+/// The WebSocket is the default there: the confirmation study measured 0.244x the uncached input
+/// and 0.819x the wall time of HTTP, and a failure before output falls back to HTTP anyway.
+/// `sse` and `http` opt out. Values meant for the ChatGPT backend route (`websocket`,
+/// `websocket-cached`) and the unshipped continuation arm never select it.
 pub fn public_websocket_selected(model: &Model, transport: Option<&str>) -> bool {
-    crate::openai_siwc::is_public_plan_model(model) && transport == Some(PUBLIC_WS_TRANSPORT)
+    crate::openai_siwc::is_public_plan_model(model)
+        && matches!(transport, None | Some("auto") | Some(PUBLIC_WS_TRANSPORT))
 }
 
 /// The endpoint. Tests may point it at a loopback server; production always uses the constant.

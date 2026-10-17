@@ -272,12 +272,17 @@ fn header_names(head: &str) -> Vec<String> {
 }
 
 #[test]
-fn only_the_explicit_value_on_the_public_route_selects_the_transport() {
+fn the_public_route_defaults_to_the_websocket_and_http_values_opt_out() {
     let public = public_model();
+    for transport in [None, Some("auto"), Some(PUBLIC_WS_TRANSPORT)] {
+        assert!(
+            public_websocket_selected(&public, transport),
+            "{transport:?}"
+        );
+    }
     for transport in [
-        None,
-        Some("auto"),
         Some("sse"),
+        Some("http"),
         Some("websocket"),
         Some("websocket-cached"),
         Some(""),
@@ -290,21 +295,13 @@ fn only_the_explicit_value_on_the_public_route_selects_the_transport() {
             "{transport:?}"
         );
     }
-    assert!(public_websocket_selected(
-        &public,
-        Some(PUBLIC_WS_TRANSPORT)
-    ));
-    // Never the ChatGPT backend route, and never another provider.
-    assert!(!public_websocket_selected(
-        &backend_model(),
-        Some(PUBLIC_WS_TRANSPORT)
-    ));
-    let mut other = public_model();
-    other.provider = "openai".into();
-    assert!(!public_websocket_selected(
-        &other,
-        Some(PUBLIC_WS_TRANSPORT)
-    ));
+    // Never the ChatGPT backend route, and never another provider, whatever the value.
+    for transport in [None, Some("auto"), Some(PUBLIC_WS_TRANSPORT)] {
+        assert!(!public_websocket_selected(&backend_model(), transport));
+        let mut other = public_model();
+        other.provider = "openai".into();
+        assert!(!public_websocket_selected(&other, transport));
+    }
 }
 
 #[test]
