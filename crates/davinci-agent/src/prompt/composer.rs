@@ -167,6 +167,7 @@ pub fn compose_with_mutations(
             visual_verification_relevant: true,
             environment: None,
             additional_directories: Vec::new(),
+            codemode_available: false,
         },
     ));
 

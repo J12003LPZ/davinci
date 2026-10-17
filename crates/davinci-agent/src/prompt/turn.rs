@@ -162,6 +162,7 @@ mod tests {
             visual_verification_relevant: true,
             environment: None,
             additional_directories: Vec::new(),
+            codemode_available: false,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();
@@ -213,6 +214,7 @@ mod tests {
             visual_verification_relevant: true,
             environment: None,
             additional_directories: Vec::new(),
+            codemode_available: false,
         };
 
         let result = compose_turn_prompt(&session, &ctx, &capabilities, &state);
@@ -246,6 +248,7 @@ mod tests {
             visual_verification_relevant: true,
             environment: None,
             additional_directories: Vec::new(),
+            codemode_available: false,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();

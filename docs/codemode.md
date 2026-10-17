@@ -75,6 +75,21 @@ On Linux and macOS use the matching `node-v24.21.0-<os>-<arch>.tar.xz` from
 
 Rebuild the bundle after upgrading DaVinci if its manifest changed.
 
+## How the model learns to use it
+
+When Codemode is on, two things tell the model about it: the `codemode` tool
+description (what it does, a worked example, when not to use it) and a short
+paragraph in the per-turn `<runtime_state>` block saying to prefer one script
+over several read/grep/find/ls calls. Neither appears when Codemode is off, so
+the prompt is unchanged for sessions without it.
+
+Without that text the model never chose the tool: 0 calls in 72 unsteered
+benchmark sessions. To check adoption after a change, run a Codemode-on arm
+with no `appendSystemPrompt` and count `tool_execution_start` events whose
+tool is `codemode` in the per-run `*.stdout.jsonl` logs. Compare pass rate,
+tokens and wall time against the same arm with Codemode off before treating
+more calls as better.
+
 ## Messages
 
 | Message | Meaning |
