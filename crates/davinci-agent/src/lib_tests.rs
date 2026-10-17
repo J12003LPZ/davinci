@@ -1365,16 +1365,31 @@ fn repeated_output_limit_truncation_ends_the_run() {
 
 #[test]
 fn parallel_workers_in_one_message_overlap_and_answer_in_order() {
-    use std::time::{Duration, Instant};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
     let mut agent = Agent::new(default_system_prompt());
     agent.set_permission_mode(PermissionMode::Ask);
     agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::AllowOnce)));
-    agent.subagent_runner = Some(SubagentRunner::new(|req| {
-        std::thread::sleep(Duration::from_millis(80));
+    // Rendezvous instead of a wall-clock budget: each worker waits until all
+    // three are inside the runner. Concurrent workers meet at once; workers
+    // run one after another never do, and the first one times out. A timing
+    // threshold failed on loaded runners even when the workers did overlap.
+    let arrived = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let gate = Arc::clone(&arrived);
+    agent.subagent_runner = Some(SubagentRunner::new(move |req| {
+        let (count, all_in) = &*gate;
+        let mut count = count.lock().unwrap();
+        *count += 1;
+        all_in.notify_all();
+        let (count, timeout) = all_in
+            .wait_timeout_while(count, Duration::from_secs(30), |count| *count < 3)
+            .unwrap();
+        if timeout.timed_out() {
+            return Ok(format!("serial:{}:{}", req.prompt, *count));
+        }
         Ok(format!("answer:{}", req.prompt))
     }));
     agent.prompt("go");
-    let start = Instant::now();
     let events = agent
         .run_loop(scripted_batches(vec![vec![
             ("agent", serde_json::json!({"prompt": "one"})),
@@ -1382,11 +1397,6 @@ fn parallel_workers_in_one_message_overlap_and_answer_in_order() {
             ("agent", serde_json::json!({"prompt": "three"})),
         ]]))
         .unwrap();
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(200),
-        "three 80 ms workers took {elapsed:?}: they ran one after another"
-    );
     let results: Vec<String> = agent
         .messages
         .iter()

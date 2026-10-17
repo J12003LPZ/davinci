@@ -2125,12 +2125,15 @@ mod tests {
                 Some(&hold),
                 Some(&interrupt),
             );
+            // Generous: a cold child process on a loaded Windows runner took
+            // over 15s to reach the hold. An early exit is caught below, so
+            // the bound only costs time when the test is already failing.
             let started = std::time::Instant::now();
             while !waiting.exists() {
                 if let Ok(Some(status)) = child.try_wait() {
                     panic!("davinci exited before hold {status:?}");
                 }
-                if started.elapsed() >= std::time::Duration::from_secs(15) {
+                if started.elapsed() >= std::time::Duration::from_secs(60) {
                     let _ = child.kill();
                     let output = child.wait_with_output().unwrap();
                     panic!(
