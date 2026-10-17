@@ -31,6 +31,7 @@ pub mod cache;
 mod catalog;
 mod cloud_auth;
 mod codex;
+pub mod codex_backend;
 pub mod codex_capabilities;
 pub mod codex_flags;
 mod codex_models;

@@ -8716,6 +8716,14 @@ fn store_oauth_tokens(
     let expires = tokens
         .expires
         .or_else(|| davinci_ai::jwt_expiry_ms(&tokens.access));
+    if provider == davinci_ai::codex_backend::LOGIN_PROVIDER {
+        // Stored under openai-codex with the route marker; requests then use the ChatGPT backend.
+        storage
+            .login_codex_backend(tokens.access, tokens.refresh, expires)
+            .map_err(|err| err.to_string())?;
+        println!("stored ChatGPT backend login for openai-codex");
+        return Ok(true);
+    }
     storage
         .login_oauth(provider, tokens.access, tokens.refresh, expires)
         .map_err(|err| err.to_string())?;
@@ -8731,6 +8739,9 @@ fn interactive_login_providers(parsed: &Args) -> Vec<String> {
         .iter()
         .map(|spec| spec.id.to_string())
         .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
+        .chain(std::iter::once(
+            davinci_ai::codex_backend::LOGIN_PROVIDER.to_string(),
+        ))
         .chain(loaded_extension_host(parsed).js_oauth_provider_names())
         .collect();
     ids.sort();
