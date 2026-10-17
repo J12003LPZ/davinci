@@ -7791,6 +7791,7 @@ fn reload_interactive_resources(
     agent: &mut Agent,
     session: &mut InteractiveSession,
 ) {
+    davinci_coding_agent::plugins::reload_active();
     session.keybindings = Keybindings::load(&default_agent_dir());
     apply_discovered_resources(parsed, agent);
     clear_model_runtime_cache();
