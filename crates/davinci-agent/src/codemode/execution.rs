@@ -4,6 +4,9 @@ use crate::{Agent, ToolResult};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// Added to a run whose script called tools but returned an empty value.
+pub(crate) const EMPTY_RESULT_NOTE: &str = "The script returned an empty value after calling tools. Each tool call resolves to {text, structuredContent, complete}: read `.text` (find, ls and grep give one match per line); a guessed field name such as .matches or .files is undefined.";
+
 /// Preserve lineage and status without restoring text that a safety hook redacted.
 pub(crate) fn mandatory_facts(result: &ToolResult) -> Option<Value> {
     let outcome = result.details.as_ref()?.get("codemode")?;
@@ -251,6 +254,18 @@ impl Agent {
                     "{incomplete} child result(s) reached the script truncated or without image content (complete: false); the output may rest on partial data."
                 ));
             }
+            // A script that called tools and returned nothing usually guessed a
+            // field name; say what the real shape is rather than let the model
+            // read "[]" as "nothing exists".
+            let empty = outcome.script_completed
+                && !outcome.children.is_empty()
+                && matches!(
+                    outcome.output_text.trim(),
+                    "" | "[]" | "{}" | "null" | "\"\""
+                );
+            if empty {
+                outcome.host_notes.push(EMPTY_RESULT_NOTE.into());
+            }
             if outcome
                 .children
                 .iter()
@@ -265,16 +280,34 @@ impl Agent {
             {
                 outcome.status = CodeModeStatus::Partial;
             }
+            if empty {
+                self.counters
+                    .codemode_empty_results
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok((outcome, authority))
         };
+        // Every terminal outcome counts once, including requests refused
+        // before a script ran, so attempts and failures are never undercounted.
+        let finish = |completed: bool| {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.counters.codemode_runs.fetch_add(1, Relaxed);
+            if !completed {
+                self.counters.codemode_unfinished.fetch_add(1, Relaxed);
+            }
+        };
         match run() {
-            Ok((outcome, authority)) => ToolResult {
-                content: serde_json::to_string(&outcome)
-                    .unwrap_or_else(|_| "Codemode outcome serialization failed".into()),
-                is_error: !matches!(outcome.status, CodeModeStatus::Completed),
-                details: Some(json!({"codemode":outcome,"_codemode_authority":authority})),
-            },
+            Ok((outcome, authority)) => {
+                finish(matches!(outcome.status, CodeModeStatus::Completed));
+                ToolResult {
+                    content: serde_json::to_string(&outcome)
+                        .unwrap_or_else(|_| "Codemode outcome serialization failed".into()),
+                    is_error: !matches!(outcome.status, CodeModeStatus::Completed),
+                    details: Some(json!({"codemode":outcome,"_codemode_authority":authority})),
+                }
+            }
             Err(mut error) => {
+                finish(false);
                 error.operation_ref = parent.map(|parent| parent.to_string());
                 let outcome = CodeModeOutcome {
                     status: match error.code.as_str() {
