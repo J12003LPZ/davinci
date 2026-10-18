@@ -457,11 +457,13 @@ pub use resolve_repo_id as repo_id;
 /// Each answer costs two `git` spawns (~70ms each on Windows), and every
 /// native host asks it twice while startup builds several hosts, so answers
 /// are cached per directory. The cache entry carries a stamp of the git
-/// config that decides the answer (one `stat`, no spawn): a remote added or
-/// changed, or a directory that becomes a repository, changes the stamp, so
-/// a new session in the same process sees the new identity instead of a
-/// stale one. Within one stamp the key stays put, so hosts built during one
-/// startup agree.
+/// config that decides the answer (a few `stat`s, no spawn), including every
+/// file the config `include`s: a remote added or changed, or a directory that
+/// becomes a repository, changes the stamp, so a new session in the same
+/// process sees the new identity instead of a stale one. Within one stamp the
+/// key stays put, so hosts built during one startup agree. A remote edited
+/// mid-session is picked up by the next lookup: the identity follows the
+/// repository rather than being frozen with the first session that asked.
 pub fn resolve_repo_id(cwd: &Path) -> String {
     static KNOWN: std::sync::OnceLock<
         Mutex<std::collections::HashMap<PathBuf, (Option<GitConfigStamp>, String)>>,
@@ -481,10 +483,12 @@ pub fn resolve_repo_id(cwd: &Path) -> String {
     id
 }
 
-type GitConfigStamp = (PathBuf, std::time::SystemTime, u64);
+/// Each watched file with its modification time and length (`None` when it
+/// is missing, so creating it changes the stamp too).
+type GitConfigStamp = Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>;
 
-/// Path, modification time and length of the config file git reads for
-/// `cwd`'s repository, or `None` outside one. Follows a linked worktree's
+/// The config file git reads for `cwd`'s repository and every file it
+/// includes, or `None` outside a repository. Follows a linked worktree's
 /// `.git` file to the shared config.
 fn git_config_stamp(cwd: &Path) -> Option<GitConfigStamp> {
     let dot_git = cwd
@@ -507,8 +511,65 @@ fn git_config_stamp(cwd: &Path) -> Option<GitConfigStamp> {
         dot_git
     };
     let config = git_dir.join("config");
-    let meta = std::fs::metadata(&config).ok()?;
-    Some((config, meta.modified().ok()?, meta.len()))
+    std::fs::metadata(&config).ok()?;
+    let mut files = Vec::new();
+    collect_config_files(&config, &mut files, 0);
+    Some(
+        files
+            .into_iter()
+            .map(|path| {
+                let meta = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+                (path, meta)
+            })
+            .collect(),
+    )
+}
+
+/// `config` and, transitively, the targets of its `[include]` and
+/// `[includeIf ...]` `path =` entries. An `includeIf` condition is not
+/// evaluated: watching a file that git ends up skipping only costs a spare
+/// `stat`.
+fn collect_config_files(config: &Path, files: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 10 || files.iter().any(|seen| seen == config) {
+        return;
+    }
+    files.push(config.to_path_buf());
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return;
+    };
+    let mut in_include = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(section) = line.strip_prefix('[') {
+            let name = section
+                .split(|c: char| c == ']' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            in_include =
+                name.eq_ignore_ascii_case("include") || name.eq_ignore_ascii_case("includeIf");
+        } else if in_include {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("path") {
+                continue;
+            }
+            let value = value.trim().trim_matches('"');
+            let target = if let Some(rest) = value.strip_prefix("~/") {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|home| PathBuf::from(home).join(rest))
+            } else if Path::new(value).is_absolute() {
+                Some(PathBuf::from(value))
+            } else {
+                config.parent().map(|dir| dir.join(value))
+            };
+            if let Some(target) = target {
+                collect_config_files(&target, files, depth + 1);
+            }
+        }
+    }
 }
 
 fn repo_id_from_git(cwd: &Path) -> String {
@@ -2768,6 +2829,37 @@ pub(crate) mod tests {
             second,
             "and is stable again"
         );
+    }
+
+    #[test]
+    fn a_remote_set_in_an_included_config_file_changes_the_repo_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory.path())
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        assert!(git(&["init", "-q"]), "git is needed for this test");
+        let extra = directory.path().join(".git").join("extra.cfg");
+        std::fs::write(
+            &extra,
+            "[remote \"origin\"]\n\turl = https://example.com/one.git\n",
+        )
+        .unwrap();
+        assert!(git(&["config", "include.path", "extra.cfg"]));
+        let first = resolve_repo_id(directory.path());
+        assert_eq!(first, repo_id_from_git(directory.path()));
+        std::fs::write(
+            &extra,
+            "[remote \"origin\"]\n\turl = https://example.com/another-two.git\n",
+        )
+        .unwrap();
+        let second = resolve_repo_id(directory.path());
+        assert_ne!(second, first, "the included file changed the remote");
+        assert_eq!(second, repo_id_from_git(directory.path()));
     }
 
     #[test]

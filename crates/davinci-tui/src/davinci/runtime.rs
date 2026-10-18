@@ -1373,43 +1373,60 @@ fn row_links(
 /// or a disconnected drive, which a frame cannot afford.
 struct PathProbe {
     shared: std::sync::Arc<std::sync::Mutex<ProbeState>>,
-    /// `None` when the worker could not start: then the caller asks the
-    /// disk itself, slower but never silently linkless.
-    ask: Option<std::sync::mpsc::Sender<std::path::PathBuf>>,
+    /// `None` when no worker could start: then the caller asks the disk
+    /// itself, slower but never silently linkless. The queue is bounded: a
+    /// question that does not fit is dropped and asked again on a later frame.
+    ask: Option<std::sync::mpsc::SyncSender<std::path::PathBuf>>,
 }
 
 #[derive(Default)]
 struct ProbeState {
     known: std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
-    asking: std::collections::HashSet<std::path::PathBuf>,
+    /// Paths with a question out, and since when.
+    asking: std::collections::HashMap<std::path::PathBuf, Instant>,
 }
 
 /// How long an answer stands before it is asked again.
 const PATH_TTL: Duration = Duration::from_secs(2);
+/// A question unanswered this long is presumed stuck on a dead drive: it
+/// stops blocking a new one for the same path.
+const PATH_STUCK: Duration = Duration::from_secs(10);
+/// Workers sharing the queue: a few stuck stats cannot starve every other path.
+const PROBE_WORKERS: usize = 4;
+/// Questions waiting for a worker.
+const PROBE_QUEUE: usize = 64;
 
 impl PathProbe {
     fn start() -> Self {
         Self::with(|path| path.exists())
     }
 
-    fn with(check: impl Fn(&std::path::Path) -> bool + Send + 'static) -> Self {
+    fn with(check: impl Fn(&std::path::Path) -> bool + Send + Sync + 'static) -> Self {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(ProbeState::default()));
-        let (ask, asked) = std::sync::mpsc::channel::<std::path::PathBuf>();
-        let worker = shared.clone();
-        // Ends when the session, and with it the sender, is dropped.
-        let started = std::thread::Builder::new()
-            .name("davinci-path-probe".into())
-            .spawn(move || {
-                for path in asked {
+        let (ask, asked) = std::sync::mpsc::sync_channel::<std::path::PathBuf>(PROBE_QUEUE);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(asked));
+        let check = std::sync::Arc::new(check);
+        let mut started = 0;
+        for index in 0..PROBE_WORKERS {
+            let (worker, asked, check) = (shared.clone(), asked.clone(), check.clone());
+            // Ends when the session, and with it the sender, is dropped.
+            let spawned = std::thread::Builder::new()
+                .name(format!("davinci-path-probe-{index}"))
+                .spawn(move || loop {
+                    // The queue lock is held only while waiting for work,
+                    // never while the disk is being asked.
+                    let next = asked.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(path) = next else { break };
                     let found = check(&path);
                     let mut state = worker.lock().unwrap_or_else(|e| e.into_inner());
                     state.asking.remove(&path);
                     state.known.insert(path, (Instant::now(), found));
-                }
-            });
+                });
+            started += usize::from(spawned.is_ok());
+        }
         Self {
             shared,
-            ask: started.is_ok().then_some(ask),
+            ask: (started > 0).then_some(ask),
         }
     }
 
@@ -1433,8 +1450,16 @@ impl PathProbe {
             Some((asked, found)) => (*found, asked.elapsed() >= PATH_TTL),
             None => (false, true),
         };
-        if stale && state.asking.insert(path.to_path_buf()) {
-            let _ = ask.send(path.to_path_buf());
+        let outstanding = state
+            .asking
+            .get(path)
+            .is_some_and(|since| since.elapsed() < PATH_STUCK);
+        if stale && !outstanding {
+            state.asking.insert(path.to_path_buf(), Instant::now());
+            if ask.try_send(path.to_path_buf()).is_err() {
+                // Queue full or workers gone: draw unlinked, ask next frame.
+                state.asking.remove(path);
+            }
         }
         answer
     }
@@ -1747,6 +1772,32 @@ mod tests {
         assert_eq!(columns, [0, 1, 3, 4, 5, 6, 7]);
         assert_eq!(cells[1].2.symbol(), "中");
         assert!(cells.iter().all(|(_, y, _)| *y == 1));
+    }
+
+    #[test]
+    fn a_path_check_stuck_on_a_dead_drive_does_not_starve_the_others() {
+        let stuck = std::path::Path::new("Z:/dead/drive.rs");
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = std::sync::Mutex::new(hold);
+        let probe = super::PathProbe::with(move |path| {
+            if path == std::path::Path::new("Z:/dead/drive.rs") {
+                // Blocks until the test ends: a disconnected network share.
+                let _ = hold.lock().unwrap().recv();
+                return false;
+            }
+            true
+        });
+        assert!(!probe.exists(stuck));
+        let others: Vec<std::path::PathBuf> =
+            (0..3).map(|i| format!("crates/ok{i}.rs").into()).collect();
+        for other in &others {
+            assert!(!probe.exists(other), "unknown draws unlinked");
+        }
+        assert!(
+            eventually(|| others.iter().all(|other| probe.exists(other))),
+            "other paths are still answered while one check hangs"
+        );
+        drop(release);
     }
 
     #[test]
