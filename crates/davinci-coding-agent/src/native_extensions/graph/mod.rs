@@ -1390,7 +1390,8 @@ impl GraphController {
         let mut current = load_run(&self.cwd, &latest.run_id)
             .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
 
-        let commands = config::detect_verify_commands(&self.cwd);
+        let commands =
+            controller::trusted_detected_verify_commands(self.project_trusted, &self.cwd);
         let abort = Arc::new(AtomicBool::new(false));
         let exec = verify::default_verify_exec;
         let source_before = operations::source_manifest_for_run(&current, &self.cwd)?;
@@ -1400,7 +1401,11 @@ impl GraphController {
             .map(|bundle| operations::verification_source_current(bundle, source_before.as_ref()))
             .unwrap_or(source_before.is_none());
 
-        let policy_mode = load_config(&self.cwd).config.security_verification;
+        let policy_mode = if self.project_trusted {
+            load_config(&self.cwd).config.security_verification
+        } else {
+            Default::default()
+        };
         let security_available = match policy_mode {
             SecurityPolicyMode::Off => true,
             SecurityPolicyMode::Risk | SecurityPolicyMode::Always => {

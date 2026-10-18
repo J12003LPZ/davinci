@@ -102,6 +102,32 @@ fn coordinator_task_tools(
         .collect()
 }
 
+/// Verification commands inferred from the project's `Cargo.toml` or
+/// `package.json`. They run project-defined build scripts and test scripts, so
+/// an untrusted project gets none, the same as its `graph.json` commands.
+pub(super) fn trusted_detected_verify_commands(
+    project_trusted: bool,
+    cwd: &std::path::Path,
+) -> Vec<super::types::VerifyCommandSpec> {
+    if project_trusted {
+        detect_verify_commands(cwd)
+    } else {
+        Vec::new()
+    }
+}
+
+fn no_verification_command_message(project_trusted: bool) -> String {
+    let mut message = "no verification command to run: add verifyCommands to .pi/graph.json \
+         (or a Cargo.toml / package.json test script) so the change can be checked"
+        .to_string();
+    if !project_trusted {
+        message.push_str(
+            "; this project is not trusted, so its verification commands are ignored (trust it with /trust)",
+        );
+    }
+    message
+}
+
 pub struct ControllerDeps {
     pub runner: Arc<WorkerRunner>,
     pub verify_exec: Arc<VerifyExec>,
@@ -2415,14 +2441,13 @@ fn drive_compiled_saved_graph(
             let budgets = execution.snapshot().budgets;
             let commands = collect_verify_commands(&CollectInput {
                 config_commands: &execution.deps.config.verify_commands,
-                detected: &detect_verify_commands(&cwd),
+                detected: &trusted_detected_verify_commands(execution.deps.project_trusted, &cwd),
                 plan: None,
             });
             if commands.is_empty() && !execution.options.dry_run {
-                execution.blocked(
-                    "no verification command to run: add verifyCommands to .pi/graph.json                      (or a Cargo.toml / package.json test script) so the change can be checked"
-                        .to_string(),
-                );
+                execution.blocked(no_verification_command_message(
+                    execution.deps.project_trusted,
+                ));
                 return execution.snapshot();
             }
             let mut verification =
@@ -3324,7 +3349,7 @@ fn deliver_goal(
         let cwd = execution.options.cwd.clone();
         let commands = collect_verify_commands(&CollectInput {
             config_commands: &execution.deps.config.verify_commands,
-            detected: &detect_verify_commands(&cwd),
+            detected: &trusted_detected_verify_commands(execution.deps.project_trusted, &cwd),
             plan: plan.as_ref(),
         });
         let verification_inputs = match execution.verification_inputs(&commands) {
@@ -3345,11 +3370,9 @@ fn deliver_goal(
         // An unverified change is never delivered. With nothing to run there
         // is nothing to revise either, so this blocks rather than looping.
         if commands.is_empty() && !execution.options.dry_run {
-            execution.blocked(
-                "no verification command to run: add verifyCommands to .pi/graph.json \
-                 (or a Cargo.toml / package.json test script) so the change can be checked"
-                    .to_string(),
-            );
+            execution.blocked(no_verification_command_message(
+                execution.deps.project_trusted,
+            ));
             return Delivery::Stop;
         }
         let mut verification: VerificationResult =
@@ -6974,5 +6997,35 @@ mod tests {
         assert_eq!(snapshot.governor_bytes_omitted, 4_096 * workers);
         assert_eq!(snapshot.governor_retrievals, workers);
         assert_eq!(snapshot.prunings, workers);
+    }
+}
+
+#[cfg(test)]
+mod untrusted_verify_detection_tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_projects_get_no_detected_verification_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node steal.js","lint":"node steal.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert!(trusted_detected_verify_commands(false, dir.path()).is_empty());
+        let trusted = trusted_detected_verify_commands(true, dir.path());
+        assert!(trusted.iter().any(|spec| spec.command == "npm test"));
+        assert!(trusted
+            .iter()
+            .any(|spec| spec.command == "cargo fmt --check"));
+    }
+
+    #[test]
+    fn the_blocked_message_says_why_when_the_project_is_untrusted() {
+        let trusted = no_verification_command_message(true);
+        assert!(trusted.starts_with("no verification command to run"));
+        assert!(!trusted.contains("not trusted"));
+        assert!(no_verification_command_message(false).contains("not trusted"));
     }
 }

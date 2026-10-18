@@ -87,7 +87,6 @@ impl ProjectTrustStore {
         })
     }
 
-    #[allow(dead_code)]
     pub fn set(&self, cwd: &Path, decision: Option<bool>) -> Result<(), String> {
         self.set_many(&[ProjectTrustUpdate {
             path: canonicalize_trust_path(cwd),
@@ -117,6 +116,25 @@ impl ProjectTrustStore {
     }
 }
 
+/// Trust that global (user-owned) settings grant without a stored decision:
+/// a `trustedProjects` entry or `defaultProjectTrust: always`. A project cannot
+/// set either, so both count as the explicit trusted-host override.
+fn host_configured_trust(
+    cwd: &Path,
+    default_project_trust: Option<&str>,
+    trusted_projects: &[String],
+) -> bool {
+    let canonical = canonicalize_trust_path(cwd);
+    let display = cwd.to_string_lossy();
+    if trusted_projects
+        .iter()
+        .any(|path| path == &canonical || path.as_str() == display.as_ref())
+    {
+        return true;
+    }
+    matches!(default_project_trust.unwrap_or("ask"), "always")
+}
+
 /// TS `resolveProjectTrusted` without the interactive ask / extension hook.
 pub fn resolve_project_trusted(
     agent_dir: &Path,
@@ -138,15 +156,120 @@ pub fn resolve_project_trusted(
         // `defaultProjectTrust` or `trustedProjects`.
         Err(_) => return false,
     }
-    let canonical = canonicalize_trust_path(cwd);
-    let display = cwd.to_string_lossy();
-    if trusted_projects
-        .iter()
-        .any(|path| path == &canonical || path.as_str() == display.as_ref())
-    {
-        return true;
+    host_configured_trust(cwd, default_project_trust, trusted_projects)
+}
+
+/// Stable machine-readable code for "project resources were not loaded because
+/// the folder is not trusted". Headless callers match on this string.
+pub const UNTRUSTED_PROJECT: &str = "UNTRUSTED_PROJECT";
+
+/// Who can answer a trust question for this launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMode {
+    /// A terminal user can be asked.
+    Interactive,
+    /// `--print`, `--mode json|rpc`, the SDK: nobody can be asked.
+    Headless,
+}
+
+/// What startup must do about project trust before any project-controlled
+/// resource (hooks, MCP servers, extensions, skills, packages) loads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustGateDecision {
+    /// Nothing to ask: no trust-requiring resources, a stored grant, a CLI
+    /// override, or a trusted-host setting. Project resources may load.
+    Preapproved,
+    /// An explicit denial is stored (or `--no-approve`). No prompt; project
+    /// resources stay unloaded.
+    Declined,
+    /// Interactive launch with trust-requiring resources and no stored
+    /// decision: ask `No - Exit DaVinci` / `Yes, I trust this folder`.
+    Prompt,
+    /// Headless launch with trust-requiring resources and no grant: nobody can
+    /// be asked, so project resources stay unloaded and the caller reports
+    /// [`UNTRUSTED_PROJECT`].
+    Unavailable,
+    /// The trust store could not be read. Fails closed; the message names the
+    /// file and the parse or IO error.
+    StoreUnreadable(String),
+}
+
+/// Host-owned inputs to the trust decision. None of them can come from the
+/// project: the override is a CLI flag and the rest is global settings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustPolicy<'a> {
+    pub override_trust: Option<bool>,
+    pub default_project_trust: Option<&'a str>,
+    pub trusted_projects: &'a [String],
+}
+
+/// Decide, without side effects, whether startup must ask about `cwd`.
+pub fn preflight_project_trust(
+    agent_dir: &Path,
+    cwd: &Path,
+    policy: &TrustPolicy<'_>,
+    mode: HostMode,
+) -> TrustGateDecision {
+    if let Some(value) = policy.override_trust {
+        return if value {
+            TrustGateDecision::Preapproved
+        } else {
+            TrustGateDecision::Declined
+        };
     }
-    matches!(default_project_trust.unwrap_or("ask"), "always")
+    if !has_trust_requiring_project_resources(cwd) {
+        return TrustGateDecision::Preapproved;
+    }
+    match ProjectTrustStore::open(agent_dir).try_get(cwd) {
+        Ok(Some(true)) => return TrustGateDecision::Preapproved,
+        Ok(Some(false)) => return TrustGateDecision::Declined,
+        Ok(None) => {}
+        Err(message) => return TrustGateDecision::StoreUnreadable(message),
+    }
+    if host_configured_trust(cwd, policy.default_project_trust, policy.trusted_projects) {
+        return TrustGateDecision::Preapproved;
+    }
+    match mode {
+        HostMode::Interactive => TrustGateDecision::Prompt,
+        HostMode::Headless => TrustGateDecision::Unavailable,
+    }
+}
+
+/// The answer to the startup question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustGateChoice {
+    /// `No - Exit DaVinci`. The default.
+    Exit,
+    /// `Yes, I trust this folder`.
+    Trust,
+}
+
+/// Persist the startup answer to the canonical trust store (the same store
+/// `/trust` and `/setup trust` write), keyed by the canonical project path.
+pub fn record_gate_choice(
+    agent_dir: &Path,
+    cwd: &Path,
+    choice: TrustGateChoice,
+) -> Result<(), String> {
+    ProjectTrustStore::open(agent_dir).set(cwd, Some(choice == TrustGateChoice::Trust))
+}
+
+/// One-line, copy-safe diagnostic for a headless launch that left project
+/// resources unloaded. The code comes first so callers can match on it.
+pub fn untrusted_project_message(cwd: &Path) -> String {
+    format!(
+        "{UNTRUSTED_PROJECT}: {} has project hooks, MCP servers, extensions, skills or packages that were not loaded because the folder is not trusted. Trust it once from an interactive session, pass --approve, or set defaultProjectTrust to \"always\" in the global settings.",
+        canonicalize_trust_path(cwd)
+    )
+}
+
+/// The same diagnostic as a JSON object for machine consumers.
+pub fn untrusted_project_json(cwd: &Path) -> Value {
+    serde_json::json!({
+        "code": UNTRUSTED_PROJECT,
+        "path": canonicalize_trust_path(cwd),
+        "message": untrusted_project_message(cwd),
+    })
 }
 
 pub fn canonicalize_trust_path(path: &Path) -> String {
@@ -520,5 +643,182 @@ mod tests {
             Some("always"),
             &[]
         ));
+    }
+
+    fn project_with_hooks(root: &Path) -> PathBuf {
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(project.join(".pi").join("hooks.json"), "{}").unwrap();
+        project
+    }
+
+    fn policy<'a>(
+        override_trust: Option<bool>,
+        default: Option<&'a str>,
+        trusted: &'a [String],
+    ) -> TrustPolicy<'a> {
+        TrustPolicy {
+            override_trust,
+            default_project_trust: default,
+            trusted_projects: trusted,
+        }
+    }
+
+    #[test]
+    fn preflight_asks_only_when_resources_exist_and_no_decision_is_stored() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        let none = policy(None, None, &[]);
+        assert_eq!(
+            preflight_project_trust(&agent, &plain, &none, HostMode::Interactive),
+            TrustGateDecision::Preapproved
+        );
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Interactive),
+            TrustGateDecision::Prompt
+        );
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Headless),
+            TrustGateDecision::Unavailable
+        );
+    }
+
+    #[test]
+    fn preflight_honors_stored_grants_and_denials_without_asking() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let none = policy(None, None, &[]);
+        let store = ProjectTrustStore::open(&agent);
+        store.set(&project, Some(true)).unwrap();
+        for mode in [HostMode::Interactive, HostMode::Headless] {
+            assert_eq!(
+                preflight_project_trust(&agent, &project, &none, mode),
+                TrustGateDecision::Preapproved
+            );
+        }
+        store.set(&project, Some(false)).unwrap();
+        for mode in [HostMode::Interactive, HostMode::Headless] {
+            assert_eq!(
+                preflight_project_trust(&agent, &project, &none, mode),
+                TrustGateDecision::Declined
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_host_overrides_only_come_from_host_inputs() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(Some(true), None, &[]),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Preapproved
+        );
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(Some(false), Some("always"), &[]),
+                HostMode::Interactive
+            ),
+            TrustGateDecision::Declined
+        );
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(None, Some("always"), &[]),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Preapproved
+        );
+        let listed = [canonicalize_trust_path(&project)];
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(None, Some("ask"), &listed),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Preapproved
+        );
+    }
+
+    #[test]
+    fn preflight_stored_denial_beats_default_always() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(None, Some("always"), &[]),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Declined
+        );
+    }
+
+    #[test]
+    fn preflight_reports_an_unreadable_store_instead_of_asking() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json"), "{ not json").unwrap();
+        let decision = preflight_project_trust(
+            &agent,
+            &project,
+            &policy(None, Some("always"), &[]),
+            HostMode::Interactive,
+        );
+        match decision {
+            TrustGateDecision::StoreUnreadable(message) => {
+                assert!(message.contains("trust store"), "{message}");
+                assert!(message.contains("trust.json"), "{message}");
+            }
+            other => panic!("expected StoreUnreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recorded_gate_choices_persist_and_feed_the_next_preflight() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let none = policy(None, None, &[]);
+        record_gate_choice(&agent, &project, TrustGateChoice::Exit).unwrap();
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Interactive),
+            TrustGateDecision::Declined
+        );
+        record_gate_choice(&agent, &project, TrustGateChoice::Trust).unwrap();
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Interactive),
+            TrustGateDecision::Preapproved
+        );
+    }
+
+    #[test]
+    fn untrusted_project_diagnostic_leads_with_the_stable_code() {
+        let dir = tempdir().unwrap();
+        let project = project_with_hooks(dir.path());
+        assert!(untrusted_project_message(&project).starts_with("UNTRUSTED_PROJECT: "));
+        let json = untrusted_project_json(&project);
+        assert_eq!(json["code"], "UNTRUSTED_PROJECT");
+        assert_eq!(json["path"], canonicalize_trust_path(&project));
     }
 }
