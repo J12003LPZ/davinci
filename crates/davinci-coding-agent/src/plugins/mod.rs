@@ -497,6 +497,78 @@ pub fn session_start_context(
     output
 }
 
+/// The id `SessionStart` hooks see: the session file's id, or one id for the
+/// life of this process when there is no session (`--no-session`), so hooks
+/// never receive an empty id.
+pub fn plugin_hook_session_id(agent: &davinci_agent::Agent) -> String {
+    static EPHEMERAL: OnceLock<String> = OnceLock::new();
+    match agent.session.as_ref() {
+        Some(store) => store.header.id.clone(),
+        None => EPHEMERAL
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                format!("ephemeral-{}-{nanos}", std::process::id())
+            })
+            .clone(),
+    }
+}
+
+/// Replace the `SessionStart` contexts in `agent.context_files` with those of
+/// the agent's current session. Hook output is cached per (cwd, session id,
+/// approved hooks), so calling this again for the same session costs a map
+/// lookup and a changed session id runs the hooks again.
+///
+/// Two callers keep it true: [`load_session`] runs it at every session
+/// switch (`/new`, `/resume`, fork, clone, import, RPC), so no stale context
+/// outlives the session it came from; and each prompt runs it again so a
+/// plugin enabled or approved mid-session takes effect.
+pub fn refresh_session_context(agent: &mut davinci_agent::Agent, plugins: &ActivePlugins) {
+    agent
+        .context_files
+        .retain(|file| !file.path.to_string_lossy().starts_with("plugin:"));
+    if plugins.plugins.is_empty() {
+        return;
+    }
+    let session_id = plugin_hook_session_id(agent);
+    // Hook warnings are queued for the next notice drain ([`take_notices`]);
+    // only the contexts reach the model.
+    for (plugin, body) in session_start_context(plugins, &agent.cwd, &session_id).contexts {
+        agent.context_files.push(davinci_agent::ContextFile {
+            path: PathBuf::from(format!("plugin:{plugin}")),
+            name: format!("plugin:{plugin} (SessionStart hook)"),
+            body,
+        });
+    }
+}
+
+/// [`load_session`] against an explicit plugin set.
+pub fn load_session_with(
+    agent: &mut davinci_agent::Agent,
+    session: davinci_session::JsonlSession,
+    plugins: &ActivePlugins,
+) -> Result<(), String> {
+    agent.load_from_session(session)?;
+    refresh_session_context(agent, plugins);
+    Ok(())
+}
+
+/// Make `session` the agent's session and re-run `SessionStart` for it: the
+/// one entry point every session switch goes through, so the previous
+/// session's plugin context never leaks into the next.
+pub fn load_session(
+    agent: &mut davinci_agent::Agent,
+    session: davinci_session::JsonlSession,
+) -> Result<(), String> {
+    load_session_with(
+        agent,
+        session,
+        &active(&davinci_session::default_agent_dir()),
+    )
+}
+
 fn pending_notices() -> &'static Mutex<Vec<String>> {
     static PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(Vec::new()))

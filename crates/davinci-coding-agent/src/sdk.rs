@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use davinci_agent::{
-    discover_prompt_templates, discover_skills, expand_user_text, load_context_files, Agent,
-    CompactionResult, CustomToolExecutor, ToolError, BUILTIN_TOOLS,
+    discover_prompt_templates, discover_skills, expand_user_text, Agent, CompactionResult,
+    CustomToolExecutor, ToolError, BUILTIN_TOOLS,
 };
 use davinci_ai::{
     find_model, load_builtin_models, snapshot_availability, AuthStorage, ModelConfig,

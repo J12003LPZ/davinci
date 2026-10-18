@@ -4031,6 +4031,35 @@ fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
 }
 
 #[test]
+fn interactive_session_commands_replace_the_plugin_session_start_context() {
+    use crate::slash::SlashAction;
+    use crate::tests::SessionStartPlugin;
+    let Some(_plugin) = SessionStartPlugin::install() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new("session start fixture");
+    agent.cwd = dir.path().into();
+    let first =
+        davinci_session::JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None)
+            .unwrap();
+    davinci_coding_agent::plugins::load_session(&mut agent, first).unwrap();
+    let mut m = model();
+    let mut seen = vec![SessionStartPlugin::session_id(&agent)];
+    for action in [SlashAction::NewSession, SlashAction::Clone] {
+        perform(&crate::Args::default(), &mut agent, &mut m, action).unwrap();
+        let id = SessionStartPlugin::session_id(&agent);
+        assert!(!seen.contains(&id), "{id} is a new session");
+        assert_eq!(
+            SessionStartPlugin::context_session_ids(&agent),
+            [id.clone()],
+            "stale plugin context survived the switch"
+        );
+        seen.push(id);
+    }
+}
+
+#[test]
 fn prompt_rewind_command_opens_recent_prompt_picker_with_shell_limitation() {
     let mut m = model();
     let mut agent = Agent::new("offline rewind picker fixture");
