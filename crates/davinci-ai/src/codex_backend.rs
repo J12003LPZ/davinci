@@ -1,13 +1,13 @@
-//! Opt-in ChatGPT Codex backend route for the `openai-codex` provider.
+//! ChatGPT Codex backend route for the `openai-codex` provider.
 //!
-//! Default behavior is unchanged: a Sign in with ChatGPT login uses the documented
-//! `https://api.openai.com/v1` route. A login made with `/login openai-codex-backend` is stored under the
-//! same provider with a route marker, and requests made with it go to the ChatGPT Codex backend instead.
-//! The route is chosen by the credential alone, so no other provider, model catalog entry or setting changes.
+//! `/login openai-codex` is the only OAuth login. It uses the Codex CLI OAuth client and stores the login
+//! under `openai-codex` with a route marker, and requests made with it go to the ChatGPT Codex backend,
+//! the endpoint Codex CLI uses. The route is chosen by the credential alone, so no other provider, model
+//! catalog entry or setting changes. A login stored before this change without the marker keeps the
+//! documented `https://api.openai.com/v1` route until `/login openai-codex` replaces it.
 //!
-//! This route is private to the Codex CLI product. The login uses the Codex CLI OAuth client, so it is
-//! opt-in, it is refused by subscription-policy admission, and it has no API-key fallback. See
-//! `docs/cache/chatgpt-backend-route.md`.
+//! This route is private to the Codex CLI product, it is refused by subscription-policy admission, and it
+//! has no API-key fallback. See `docs/cache/chatgpt-backend-route.md`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -24,9 +24,9 @@ pub const BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const ROUTE_ENV_KEY: &str = "OPENAI_CODEX_ROUTE";
 pub const ROUTE_ENV_VALUE: &str = "chatgpt-backend";
 /// `ResolvedAuth::source` for a backend login, so the route can follow the credential into the stream layer.
-pub const AUTH_SOURCE: &str = "OAuth (ChatGPT backend)";
-/// Login-only provider id. Tokens are stored under `openai-codex`.
-pub const LOGIN_PROVIDER: &str = "openai-codex-backend";
+pub const AUTH_SOURCE: &str = "OAuth (Codex CLI)";
+/// OAuth login provider id. The Codex CLI login is the only OAuth login for `openai-codex`.
+pub const LOGIN_PROVIDER: &str = "openai-codex";
 
 pub fn is_backend_credential(credential: &Credential) -> bool {
     credential.kind == CredentialKind::Oauth
@@ -39,14 +39,11 @@ pub fn validate_credential(credential: &Credential) -> Result<(), String> {
         .access
         .as_deref()
         .filter(|token| !token.is_empty())
-        .ok_or(
-            "stored ChatGPT backend login has no access token; run /login openai-codex-backend",
-        )?;
+        .ok_or("stored ChatGPT backend login has no access token; run /login openai-codex")?;
     crate::codex::extract_account_id(access)
         .map(|_| ())
         .map_err(|_| {
-            "stored ChatGPT backend login has no account id; run /login openai-codex-backend"
-                .to_string()
+            "stored ChatGPT backend login has no account id; run /login openai-codex".to_string()
         })
 }
 
@@ -247,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn the_login_provider_has_its_own_oauth_requests_and_the_default_login_is_unchanged() {
+    fn the_login_provider_has_its_own_oauth_requests() {
         let pkce = crate::oauth_providers::generate_pkce(&[7u8; 32]);
         let request =
             crate::oauth_providers::authorize_request(LOGIN_PROVIDER, &pkce, "state1").unwrap();
@@ -259,7 +256,6 @@ mod tests {
             .contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
         assert!(request.url.contains("code_challenge_method=S256"));
         assert!(request.url.contains("state=state1"));
-        assert!(request.openai_siwc.is_none());
         let exchange = crate::oauth_providers::token_exchange_request(
             LOGIN_PROVIDER,
             "code1",
@@ -271,8 +267,5 @@ mod tests {
         assert!(exchange.body.contains("code=code1"));
         let refresh = crate::oauth_providers::token_refresh_request(LOGIN_PROVIDER, "rt").unwrap();
         assert!(refresh.body.contains("grant_type=refresh_token"));
-        // The documented login still has no generic authorize or refresh request.
-        assert!(crate::oauth_providers::authorize_request("openai-codex", &pkce, "s").is_none());
-        assert!(crate::oauth_providers::token_refresh_request("openai-codex", "rt").is_none());
     }
 }

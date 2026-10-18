@@ -8542,20 +8542,11 @@ fn login_provider_with_wait(
                         "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
                     )
                 })?;
-            if let (Some(expected), Some(got)) =
-                (pending.state.as_deref(), callback.state.as_deref())
-            {
-                if expected != got {
-                    return Err(
-                        "The pasted login does not match the one started here (state mismatch)."
-                            .into(),
-                    );
-                }
-            }
+            check_pasted_state(pending.state.as_deref(), callback.state.as_deref())?;
             return exchange_and_store_oauth(&mut storage, provider, &pending, callback);
         }
         if provider == "openai-codex" {
-            return Err("OpenAI Codex is subscription-only in this build. Use /login openai-codex and Continue with ChatGPT; API keys are not accepted for this provider.".into());
+            return Err("OpenAI Codex is subscription-only in this build. Use /login openai-codex to sign in with the Codex CLI login; API keys are not accepted for this provider (use the openai provider for an API key).".into());
         }
         storage
             .login_api_key(provider, key)
@@ -8582,11 +8573,6 @@ fn login_provider_with_wait(
             let callback = davinci_ai::AuthorizationCallbackInput {
                 code: Some(code),
                 state: request.state.clone(),
-                client_id: request
-                    .openai_siwc
-                    .as_ref()
-                    .filter(|context| context.dynamic_registration)
-                    .map(|_| "oaiapp_fixture".to_string()),
                 ..Default::default()
             };
             return exchange_and_store_oauth(&mut storage, provider, &request, callback);
@@ -8594,15 +8580,16 @@ fn login_provider_with_wait(
         let should_wait = wait_for_oauth_callback || std::env::var("PI_OAUTH_WAIT").is_ok();
         if should_wait {
             if let Some(kind) = davinci_ai::CallbackProvider::parse(provider) {
-                let (host, port) = if provider == "openai-codex" {
+                // The Codex CLI client's redirect URI is fixed at localhost:1455, so the
+                // callback server cannot follow the host/port overrides other providers allow.
+                let (host, port) = if provider == davinci_ai::codex_backend::LOGIN_PROVIDER {
                     ("127.0.0.1".to_string(), kind.default_port())
                 } else {
-                    let host = davinci_ai::callback_host();
                     let port = std::env::var("PI_OAUTH_CALLBACK_PORT")
                         .ok()
                         .and_then(|value| value.parse().ok())
                         .unwrap_or_else(|| kind.default_port());
-                    (host, port)
+                    (davinci_ai::callback_host(), port)
                 };
                 let expected = request
                     .state
@@ -8634,9 +8621,6 @@ fn login_provider_with_wait(
         println!("{}", request.instructions);
         return Ok(false);
     }
-    if provider == "openai-codex" && std::env::var("PI_OAUTH_ACCESS").is_ok() {
-        return Err("Direct OAuth-token injection is disabled for openai-codex because it cannot prove the issued client, identity, nonce and granted ChatGPT-plan scope. Sign in through DaVinci instead.".into());
-    }
     if let (Ok(access), refresh) = (
         std::env::var("PI_OAUTH_ACCESS"),
         std::env::var("PI_OAUTH_REFRESH").ok(),
@@ -8667,66 +8651,30 @@ fn exchange_and_store_oauth(
     let code = callback
         .code
         .ok_or_else(|| "Missing authorization code.".to_string())?;
-    if provider != "openai-codex" {
-        let tokens = davinci_ai::exchange_authorization_code(
-            provider,
-            &code,
-            pending.pkce.as_ref(),
-            pending.state.as_deref(),
-        )?;
-        return store_oauth_tokens(storage, provider, tokens);
-    }
-
-    let context = pending
-        .openai_siwc
-        .as_ref()
-        .ok_or("Missing Sign in with ChatGPT transaction context; start login again.")?;
-    let issued_client_id = if context.dynamic_registration {
-        let issued = callback
-            .client_id
-            .as_deref()
-            .or_else(|| {
-                (davinci_ai::fixtures::enabled() && code.starts_with("pi-fixture-"))
-                    .then_some("oaiapp_fixture")
-            })
-            .ok_or(
-                "The first ChatGPT registration must return its issued client_id. Paste the complete redirect URL or use the loopback callback.",
-            )?;
-        davinci_ai::openai_siwc::save_issued_client_id(&default_agent_dir(), issued)?;
-        issued
-    } else {
-        if callback
-            .client_id
-            .as_deref()
-            .is_some_and(|client_id| client_id != context.client_id)
-        {
-            return Err(
-                "The ChatGPT callback returned a different client registration; login was rejected."
-                    .into(),
-            );
-        }
-        &context.client_id
-    };
-    let verifier = pending
-        .pkce
-        .as_ref()
-        .map(|pkce| pkce.verifier.as_str())
-        .ok_or("Missing PKCE verifier; start ChatGPT login again.")?;
-    let session = davinci_ai::exchange_openai_siwc_authorization_code(
+    let tokens = davinci_ai::exchange_authorization_code(
+        provider,
         &code,
-        issued_client_id,
-        verifier,
-        &context.redirect_uri,
-        &context.nonce,
-        &context.ext_agent_host_id,
-        context.expected_subject.as_deref(),
+        pending.pkce.as_ref(),
+        pending.state.as_deref(),
     )?;
-    storage
-        .login_openai_siwc(session)
-        .map_err(|err| err.to_string())?;
-    davinci_ai::openai_siwc::clear_issued_client_id(&default_agent_dir());
-    println!("stored verified ChatGPT-plan login for openai-codex");
-    Ok(true)
+    store_oauth_tokens(storage, provider, tokens)
+}
+
+/// A pasted redirect must carry the `state` this login started with. A
+/// callback with no `state` is refused, not waved through: otherwise anyone
+/// who can get a URL pasted skips the one check that ties it to this login.
+fn check_pasted_state(expected: Option<&str>, got: Option<&str>) -> Result<(), String> {
+    match (expected, got) {
+        (Some(expected), Some(got)) if expected == got => Ok(()),
+        (Some(_), Some(_)) => Err(
+            "The pasted login does not match the one started here (state mismatch).".into(),
+        ),
+        (Some(_), None) => Err(
+            "The pasted login has no state, so it cannot be tied to the login started here. Paste the complete redirect URL."
+                .into(),
+        ),
+        (None, _) => Ok(()),
+    }
 }
 
 /// Write an exchanged or refreshed OAuth credential. The expiry is what makes
@@ -8745,7 +8693,7 @@ fn store_oauth_tokens(
         storage
             .login_codex_backend(tokens.access, tokens.refresh, expires)
             .map_err(|err| err.to_string())?;
-        println!("stored ChatGPT backend login for openai-codex");
+        println!("stored Codex CLI login for openai-codex");
         return Ok(true);
     }
     storage
@@ -8769,9 +8717,6 @@ fn interactive_login_providers_from(host: &ExtensionHost) -> Vec<String> {
         .iter()
         .map(|spec| spec.id.to_string())
         .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
-        .chain(std::iter::once(
-            davinci_ai::codex_backend::LOGIN_PROVIDER.to_string(),
-        ))
         .chain(host.js_oauth_provider_names())
         .collect();
     ids.sort();
@@ -12923,7 +12868,13 @@ fn start_login(
         davinci_ai::save_pending_login(&default_agent_dir(), provider, &request)?;
         if let Some(dialog) = &mut session.chrome.login_dialog {
             dialog.show_auth(&request.url, Some(request.instructions.as_str()));
-            dialog.show_manual_input("Paste the redirect URL or authorization code");
+            // The state in a redirect URL is what ties a paste to this login, so
+            // openai-codex takes the complete URL only; a bare code would carry none.
+            dialog.show_manual_input(if provider == "openai-codex" {
+                "Paste the complete redirect URL"
+            } else {
+                "Paste the redirect URL or authorization code"
+            });
         }
         println!("{}", request.url);
         println!("{}", request.instructions);

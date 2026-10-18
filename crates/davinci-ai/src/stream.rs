@@ -935,7 +935,7 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
-    // A ChatGPT backend login (opt-in, `/login openai-codex-backend`) moves the request to the backend;
+    // A ChatGPT backend login (`/login openai-codex`) moves the request to the backend;
     // every other credential keeps the documented route and the gate.
     let model = &*crate::codex_backend::route_model(model, auth);
     require_codex_subscription_route(model, auth)?;

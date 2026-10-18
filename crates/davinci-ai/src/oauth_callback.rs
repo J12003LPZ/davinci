@@ -52,7 +52,7 @@ impl CallbackProvider {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "anthropic" => Some(Self::Anthropic),
-            "openai-codex" | crate::codex_backend::LOGIN_PROVIDER => Some(Self::OpenAiCodex),
+            crate::codex_backend::LOGIN_PROVIDER => Some(Self::OpenAiCodex),
             "openrouter" => Some(Self::OpenRouter),
             "radius" => Some(Self::Radius),
             _ => None,
