@@ -2240,23 +2240,7 @@ impl Agent {
         // broker items: they reach the provider as messages, as in legacy mode.
         let mut native_ephemeral = Vec::new();
         for (index, message) in selected.ephemeral_messages.iter().enumerate() {
-            if message
-                .content
-                .iter()
-                .any(|part| !matches!(part, MessageContent::Text { .. }))
-            {
-                // Extension-supplied evidence: text parts are wrapped as
-                // untrusted data like text-only ephemeral messages; images
-                // are kept.
-                let mut message = message.clone();
-                for part in &mut message.content {
-                    if let MessageContent::Text { text } = part {
-                        *text = runtime::wrap_untrusted_data(
-                            &format!("ephemeral_context::{index}"),
-                            text,
-                        );
-                    }
-                }
+            if let Some(message) = native_ephemeral_message(index, message) {
                 native_ephemeral.push((index, message));
                 continue;
             }
@@ -2415,15 +2399,10 @@ impl Agent {
             .unwrap_or_default()
     }
 
-    /// End of the tool exchange proper. Nested instructions are appended
-    /// right after the tool results, on the request that delivers them. They
-    /// ride in the live suffix after the pair (a user-side message, so the
-    /// cached system prefix is untouched) and do not unpair the exchange,
-    /// which would fall back to evidence text. Being in the suffix they stay
-    /// out of the ledger's events with the pair, so the next request, where
-    /// the pair is history, only appends. The host's other boundary
-    /// injections are not skipped here.
-    fn live_tool_exchange_end(&self) -> usize {
+    /// Where the trailing nested-instructions messages begin. They are
+    /// appended right after the tool results, on the request that delivers
+    /// them.
+    fn nested_tail_start(&self) -> usize {
         self.messages
             .iter()
             .rposition(|m| {
@@ -2433,10 +2412,63 @@ impl Agent {
             .map_or(0, |last| last + 1)
     }
 
+    /// End of the tool exchange proper. Nested instructions ride in the live
+    /// suffix after the pair (a user-side message, so the cached system prefix
+    /// is untouched) and do not unpair the exchange, which would fall back to
+    /// evidence text. Being in the suffix they stay out of the ledger's events
+    /// with the pair, so the next request, where the pair is history, only
+    /// appends. The suffix is reserved outside the compile, though, so when
+    /// it would not fit the window they are left to the history as ordinary
+    /// events (the exchange then loses its native pairing for that request)
+    /// rather than failing a request that compiles without them. The host's
+    /// other boundary injections are not skipped here.
+    fn live_tool_exchange_end(&self) -> usize {
+        let end = self.nested_tail_start();
+        if end == self.messages.len() || self.live_suffix_fits(end) {
+            end
+        } else {
+            self.messages.len()
+        }
+    }
+
+    /// Whether the live suffix with its nested tail leaves room in the window.
+    fn live_suffix_fits(&self, end: usize) -> bool {
+        let Some(start) = self.live_tool_exchange_start_at(end) else {
+            return true;
+        };
+        let live = convert_to_llm_for_provider(&self.messages[start..], self.block_images)
+            .iter()
+            .map(provider_budget::message_token_ceiling)
+            .fold(0u64, u64::saturating_add);
+        let completion = self
+            .completion_context
+            .iter()
+            .map(|overlay| provider_budget::message_token_ceiling(&overlay.message))
+            .fold(0u64, u64::saturating_add);
+        let ephemeral = self
+            .select_root_context(self.context_window)
+            .ephemeral_messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| native_ephemeral_message(index, message))
+            .map(|message| provider_budget::message_token_ceiling(&message))
+            .fold(0u64, u64::saturating_add);
+        let budget = self.provider_context_budget();
+        budget
+            .reserved()
+            .saturating_add(live)
+            .saturating_add(completion)
+            .saturating_add(ephemeral)
+            < budget.window
+    }
+
     /// Index of the assistant message that opens a complete, well-formed
     /// trailing tool exchange, if the transcript ends with one.
     fn live_tool_exchange_start(&self) -> Option<usize> {
-        let end = self.live_tool_exchange_end();
+        self.live_tool_exchange_start_at(self.live_tool_exchange_end())
+    }
+
+    fn live_tool_exchange_start_at(&self, end: usize) -> Option<usize> {
         if self.messages[..end]
             .last()
             .is_none_or(|m| m.role != "toolResult")
@@ -4950,6 +4982,27 @@ fn drop_live_exchange_events(
     {
         events.truncate(tail);
     }
+}
+
+/// An ephemeral message with non-text parts (images), wrapped for the
+/// provider. Extension-supplied evidence: text parts are wrapped as untrusted
+/// data like text-only ephemeral messages; images are kept. None for a
+/// text-only message, which becomes a broker item instead.
+fn native_ephemeral_message(index: usize, message: &ChatMessage) -> Option<ChatMessage> {
+    if message
+        .content
+        .iter()
+        .all(|part| matches!(part, MessageContent::Text { .. }))
+    {
+        return None;
+    }
+    let mut message = message.clone();
+    for part in &mut message.content {
+        if let MessageContent::Text { text } = part {
+            *text = runtime::wrap_untrusted_data(&format!("ephemeral_context::{index}"), text);
+        }
+    }
+    Some(message)
 }
 
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {

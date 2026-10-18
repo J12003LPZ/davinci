@@ -222,6 +222,80 @@ fn a_delivery_does_not_cost_the_active_ledger_an_extra_rebuild() {
 }
 
 #[test]
+fn a_nested_delivery_never_fails_a_request_that_fits_without_it() {
+    use davinci_agent::runtime::context_vm::ContextVmMode;
+    use davinci_agent::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    use davinci_ai::{ChatMessage, MessageContent};
+
+    // The request right after a tool batch with a large result, with or
+    // without a small delivered nested block, at a given window.
+    let compiles = |window: u64, nested: bool| {
+        let mut agent = Agent::new("base prompt");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(ContextVmMode::Active);
+        agent.context_window = window;
+        agent.messages.push(ChatMessage::text("user", "go"));
+        let mut call = ChatMessage::text("assistant", "");
+        call.content = vec![MessageContent::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "sub/x.rs"}),
+        }];
+        agent.messages.push(call);
+        let mut result = ChatMessage::text(
+            "toolResult",
+            "fn x() {}
+"
+            .repeat(4_000),
+        );
+        result.tool_call_id = Some("call-1".into());
+        agent.messages.push(result);
+        if nested {
+            agent.record_custom_message(&serde_json::json!({
+                "customType": "davinci.nested_instructions",
+                "content": "rule ".repeat(40),
+                "display": false,
+                "details": {"files": []},
+            }));
+        }
+        match agent.prepared_context_image() {
+            Ok(_) => true,
+            Err(error) => {
+                assert!(
+                    error.contains("exceeds the compilation token budget"),
+                    "{error}"
+                );
+                false
+            }
+        }
+    };
+    let smallest = |nested: bool| {
+        let (mut low, mut high) = (1_000u64, 400_000u64);
+        assert!(compiles(high, nested) && !compiles(low, nested));
+        while low + 1 < high {
+            let middle = (low + high) / 2;
+            if compiles(middle, nested) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        high
+    };
+    // The nested block is reserved with the native pair only while that fits;
+    // it must never need a larger window than the request without it.
+    let (without, with) = (smallest(false), smallest(true));
+    assert!(
+        with <= without,
+        "the nested block raised the smallest working window from {without} to {with}"
+    );
+}
+
+#[test]
 fn delivery_leaves_the_cached_prefix_untouched() {
     let repo = repository();
     let mut agent = agent_in(repo.path(), true);
