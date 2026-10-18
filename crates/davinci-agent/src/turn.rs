@@ -478,6 +478,7 @@ impl Agent {
             {
                 self.append_turn_context(None);
             }
+            self.refresh_instruction_context();
 
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
             let hybrid_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Hybrid;

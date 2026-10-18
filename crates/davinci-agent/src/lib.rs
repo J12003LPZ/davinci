@@ -25,6 +25,7 @@ mod events;
 mod evidence;
 mod file_mutation_queue;
 mod images;
+mod instruction_files;
 pub mod jobs;
 pub mod mcp;
 pub mod notebook;
@@ -517,6 +518,11 @@ pub struct Agent {
     pub agent_profiles: Vec<(String, String)>,
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
+    /// Set by `load_instruction_files`: the host loaded `context_files` from
+    /// disk, so edits and nested files are kept current (false under
+    /// `--no-context-files`, and for files a caller assigned by hand).
+    pub instruction_files_enabled: bool,
+    pub(crate) context_file_stamps: std::collections::HashMap<PathBuf, context::FileStamp>,
     pub session: Option<JsonlSession>,
     pub(crate) prompt_rewind: runtime::rewind::PromptRewindState,
     pub cwd: PathBuf,
@@ -727,6 +733,8 @@ impl Agent {
             agent_profiles: Vec::new(),
             templates: Vec::new(),
             context_files: Vec::new(),
+            instruction_files_enabled: false,
+            context_file_stamps: std::collections::HashMap::new(),
             session: None,
             prompt_rewind: runtime::rewind::PromptRewindState::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

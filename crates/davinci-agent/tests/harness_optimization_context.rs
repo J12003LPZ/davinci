@@ -65,6 +65,14 @@ fn scoped_context_files_follow_target_ancestors() {
     assert!(bodies.contains(&"root authority"));
     assert!(bodies.contains(&"crates authority"));
     assert!(!bodies.contains(&"unrelated b authority"));
+
+    // The prompt keeps each nested file under its own scope.
+    let mut agent = Agent::new("base authority");
+    agent.cwd = root.to_path_buf();
+    agent.context_files = files;
+    let prompt = agent.provider_system_prompt();
+    assert!(prompt.contains("crates/AGENTS.md"), "{prompt}");
+    assert!(!prompt.contains("unrelated b authority"));
 }
 
 #[test]

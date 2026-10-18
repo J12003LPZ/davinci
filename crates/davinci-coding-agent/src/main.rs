@@ -9881,7 +9881,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             template.namespace = plugins.owner_of(&template.path).map(str::to_string);
         }
     }
-    agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
+    agent.load_instruction_files(!parsed.no_context_files);
     apply_plugin_session_start(agent, &plugins);
 }
 
