@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use davinci_agent::{
-    discover_prompt_templates, discover_skills, expand_user_text, load_context_files, Agent,
-    CompactionResult, CustomToolExecutor, ToolError, BUILTIN_TOOLS,
+    discover_prompt_templates, discover_skills, expand_user_text, Agent, CompactionResult,
+    CustomToolExecutor, ToolError, BUILTIN_TOOLS,
 };
 use davinci_ai::{
     find_model, load_builtin_models, snapshot_availability, AuthStorage, ModelConfig,
@@ -523,7 +523,7 @@ pub fn create_agent_session(
     let mut agent = Agent::new_builtin(resolved_profile);
     agent.service_tier = settings.resolved_service_tier();
     agent.cwd = cwd.clone();
-    agent.context_files = load_context_files(&cwd, true);
+    agent.load_instruction_files(true);
     let mut skill_roots = project_resource_roots(&cwd, trusted, "skills");
     skill_roots.push(agent_dir.join("skills"));
     agent.skills = discover_skills(&skill_roots);

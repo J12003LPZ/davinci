@@ -1080,7 +1080,11 @@ fn create_session(runtime: &mut RpcRuntime, parent: Option<&str>) -> Result<bool
     next.permissions = runtime.agent.permissions.clone();
     next.approver = runtime.agent.approver.clone();
     next.approval_responder = runtime.agent.approval_responder.clone();
-    next.load_from_session(session)?;
+    // A fresh Agent starts with no repository instructions. Load them the way
+    // the session being replaced did (its `--no-context-files` choice
+    // included); `load_session` below adds this session's plugin context.
+    next.load_instruction_files(runtime.agent.instruction_files_enabled);
+    davinci_coding_agent::plugins::load_session(&mut next, session)?;
     runtime.agent.reset_session_approvals();
     runtime.agent = next;
     Ok(false)
@@ -1093,7 +1097,7 @@ fn clone_session(runtime: &mut RpcRuntime) -> Result<bool, String> {
     let cloned = session
         .clone_session(&runtime.session_dir)
         .map_err(|err| err.to_string())?;
-    runtime.agent.load_from_session(cloned)?;
+    davinci_coding_agent::plugins::load_session(&mut runtime.agent, cloned)?;
     Ok(false)
 }
 
@@ -1108,7 +1112,7 @@ fn fork_session(runtime: &mut RpcRuntime, entry_id: Option<&str>) -> Result<Valu
     let forked = session
         .fork(&entry_id, &runtime.session_dir)
         .map_err(|err| err.to_string())?;
-    runtime.agent.load_from_session(forked)?;
+    davinci_coding_agent::plugins::load_session(&mut runtime.agent, forked)?;
     Ok(serde_json::json!({
         "text": runtime.agent.last_assistant_text().unwrap_or_default(),
         "cancelled": false,
@@ -1121,7 +1125,7 @@ fn switch_session(runtime: &mut RpcRuntime, session_path: Option<&str>) -> Resul
     };
     let path = Path::new(session_path);
     let session = JsonlSession::open(path).map_err(|err| err.to_string())?;
-    runtime.agent.load_from_session(session)?;
+    davinci_coding_agent::plugins::load_session(&mut runtime.agent, session)?;
     Ok(false)
 }
 
@@ -1497,6 +1501,52 @@ mod tests {
         );
         assert_eq!(approval_host_result(true, false, true), "denied");
         assert_eq!(approval_host_result(true, true, false), "resolved");
+    }
+
+    #[test]
+    fn rpc_session_switches_rerun_session_start_and_keep_repository_instructions() {
+        use crate::tests::SessionStartPlugin;
+        let Some(_plugin) = SessionStartPlugin::install() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "repo rules").unwrap();
+        let mut agent = Agent::new("fixture");
+        agent.cwd = repo.clone();
+        agent.load_instruction_files(true);
+        let first = JsonlSession::create(dir.path(), &repo.to_string_lossy(), None).unwrap();
+        let first_path = first.path.clone();
+        davinci_coding_agent::plugins::load_session(&mut agent, first).unwrap();
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), repo.clone());
+        let current = |runtime: &RpcRuntime| {
+            let id = SessionStartPlugin::session_id(&runtime.agent);
+            assert_eq!(
+                SessionStartPlugin::context_session_ids(&runtime.agent),
+                [id.clone()]
+            );
+            id
+        };
+        let first_id = current(&runtime);
+
+        // A new RPC session is a fresh Agent: it must still carry the
+        // repository instructions, and its own plugin context.
+        assert!(!create_session(&mut runtime, None).unwrap());
+        let created = current(&runtime);
+        assert_ne!(created, first_id);
+        assert!(runtime
+            .agent
+            .context_files
+            .iter()
+            .any(|file| file.body == "repo rules"));
+
+        assert!(!clone_session(&mut runtime).unwrap());
+        let cloned = current(&runtime);
+        assert_ne!(cloned, created);
+
+        assert!(!switch_session(&mut runtime, first_path.to_str()).unwrap());
+        assert_eq!(current(&runtime), first_id);
     }
 
     #[test]

@@ -198,7 +198,6 @@ fn plugin_completion_dispatch_and_post_tool_feedback_reach_host() {
             record,
             plugin,
             data_dir: dir.path().join("data"),
-            agent_dir,
         }],
         errors: Vec::new(),
     };
@@ -4080,9 +4079,12 @@ fn json_prompt_manifest_event_exposes_identity_without_prompt_text() {
 fn sessionless_plugin_hooks_get_a_stable_nonempty_session_id() {
     let agent = Agent::new("x");
     assert!(agent.session.is_none());
-    let first = plugin_hook_session_id(&agent);
+    let first = davinci_coding_agent::plugins::plugin_hook_session_id(&agent);
     assert!(first.starts_with("ephemeral-"), "{first}");
-    assert_eq!(first, plugin_hook_session_id(&Agent::new("y")));
+    assert_eq!(
+        first,
+        davinci_coding_agent::plugins::plugin_hook_session_id(&Agent::new("y"))
+    );
 }
 
 #[test]
@@ -4108,6 +4110,118 @@ fn plugin_session_start_contexts_are_replaced_not_accumulated() {
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["AGENTS.md".to_string()]);
+}
+
+/// An approved plugin whose `SessionStart` hook echoes its input (which
+/// carries the session id), with the agent dir and plugin homes pointed at a
+/// temp tree. Holds the process env lock for its lifetime. `None` without bash.
+pub(crate) struct SessionStartPlugin {
+    _dir: tempfile::TempDir,
+    _env: Vec<EnvRestore>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SessionStartPlugin {
+    pub(crate) fn install() -> Option<Self> {
+        let lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if std::process::Command::new("bash")
+            .args(["-c", "true"])
+            .status()
+            .is_err()
+        {
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("greeter");
+        std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(root.join("hooks")).unwrap();
+        std::fs::write(
+            root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"greeter"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hooks/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sed 's/^/got: /'"}]}]}}"#,
+        )
+        .unwrap();
+        let plugin = davinci_coding_agent::plugins::manifest::load_plugin(&root).unwrap();
+        davinci_coding_agent::plugins::store::update(&agent_dir, |file| {
+            file.plugins.insert(
+                "greeter@local".into(),
+                davinci_coding_agent::plugins::store::InstalledPlugin {
+                    origin: davinci_coding_agent::plugins::store::Origin::Davinci,
+                    install_path: Some(plugin.root.clone()),
+                    version: None,
+                    enabled: true,
+                    hooks_approved: plugin.hooks_digest.clone(),
+                    installed_at: 0,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        let env = vec![
+            EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &path(&agent_dir)),
+            EnvRestore::set("PI_CODING_AGENT_DIR", &path(&agent_dir)),
+            EnvRestore::set("CLAUDE_CONFIG_DIR", &path(&dir.path().join("claude"))),
+            EnvRestore::set("CODEX_HOME", &path(&dir.path().join("codex"))),
+        ];
+        Some(Self {
+            _dir: dir,
+            _env: env,
+            _lock: lock,
+        })
+    }
+
+    /// Session ids named by the agent's `plugin:` contexts.
+    pub(crate) fn context_session_ids(agent: &Agent) -> Vec<String> {
+        agent
+            .context_files
+            .iter()
+            .filter(|file| file.path.to_string_lossy().starts_with("plugin:"))
+            .filter_map(|file| {
+                let rest = file.body.split("\"session_id\":\"").nth(1)?;
+                Some(rest.split('"').next()?.to_string())
+            })
+            .collect()
+    }
+
+    pub(crate) fn session_id(agent: &Agent) -> String {
+        agent.session.as_ref().unwrap().header.id.clone()
+    }
+}
+
+#[test]
+fn switching_sessions_replaces_the_plugin_context_with_the_new_sessions() {
+    let Some(_plugin) = SessionStartPlugin::install() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new("x");
+    agent.cwd = dir.path().to_path_buf();
+    agent.context_files.push(davinci_agent::ContextFile {
+        path: PathBuf::from("AGENTS.md"),
+        name: "AGENTS.md".into(),
+        body: "keep".into(),
+    });
+    let first = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+    let second = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+    davinci_coding_agent::plugins::load_session(&mut agent, first).unwrap();
+    let first_id = SessionStartPlugin::session_id(&agent);
+    assert_eq!(
+        SessionStartPlugin::context_session_ids(&agent),
+        [first_id.clone()]
+    );
+
+    davinci_coding_agent::plugins::load_session(&mut agent, second).unwrap();
+    let second_id = SessionStartPlugin::session_id(&agent);
+    assert_ne!(first_id, second_id);
+    // Right after the switch, before any prompt: only the new session's context.
+    assert_eq!(SessionStartPlugin::context_session_ids(&agent), [second_id]);
+    assert!(agent.context_files.iter().any(|file| file.body == "keep"));
 }
 
 #[test]

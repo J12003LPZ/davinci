@@ -202,9 +202,8 @@ macro_rules! eprintln {
 }
 
 use davinci_agent::{
-    discover_prompt_templates, discover_skills, env_summarizer, load_context_files, Agent,
-    AgentEvent, CompleteOutput, CustomToolExecutor, EventSink, SummarizeRequest, SummarizeResponse,
-    Summarizer,
+    discover_prompt_templates, discover_skills, env_summarizer, Agent, AgentEvent, CompleteOutput,
+    CustomToolExecutor, EventSink, SummarizeRequest, SummarizeResponse, Summarizer,
 };
 use davinci_ai::{
     apply_config_auth_with_shell, apply_models_config, check_auth, complete_simple, content_text,
@@ -6675,7 +6674,7 @@ fn apply_session_action(
                 resolve_session_ref(&session_dir, Some(&agent.cwd.to_string_lossy()), &id)
                     .map_err(|err| err.to_string())?;
             let next = JsonlSession::open(&summary.path).map_err(|err| err.to_string())?;
-            agent.load_from_session(next)?;
+            davinci_coding_agent::plugins::load_session(agent, next)?;
             session.chrome.status = format!(
                 "session={}",
                 agent
@@ -7410,7 +7409,7 @@ fn handle_user_line(
             let session_dir = resolved_session_dir(parsed, &agent.cwd);
             let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
-            agent.load_from_session(store)?;
+            davinci_coding_agent::plugins::load_session(agent, store)?;
             println!("Started new session");
             refresh_chrome_footer(session, agent);
             apply_terminal_title(session, agent, tui);
@@ -7502,7 +7501,7 @@ fn handle_user_line(
                         &session_dir,
                     )
                     .map_err(|e| e.to_string())?;
-                agent.load_from_session(next)?;
+                davinci_coding_agent::plugins::load_session(agent, next)?;
                 println!("session={}", agent.session.as_ref().unwrap().header.id);
             }
             refresh_chrome_footer(session, agent);
@@ -7515,7 +7514,7 @@ fn handle_user_line(
                 let next = session
                     .clone_session(&session_dir)
                     .map_err(|e| e.to_string())?;
-                agent.load_from_session(next)?;
+                davinci_coding_agent::plugins::load_session(agent, next)?;
                 println!("session={}", agent.session.as_ref().unwrap().header.id);
             }
             refresh_chrome_footer(session, agent);
@@ -7596,7 +7595,7 @@ fn handle_user_line(
             }
             let expanded = davinci_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
-            agent.load_from_session(next)?;
+            davinci_coding_agent::plugins::load_session(agent, next)?;
             session.chrome.status = format!(
                 "imported {}",
                 agent
@@ -9888,56 +9887,18 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             template.namespace = plugins.owner_of(&template.path).map(str::to_string);
         }
     }
-    agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
+    agent.load_instruction_files(!parsed.no_context_files);
     apply_plugin_session_start(agent, &plugins);
 }
 
-/// The id `SessionStart` hooks see: the session file's id, or one id for the
-/// life of this process when there is no session (`--no-session`), so hooks
-/// never receive an empty id.
-fn plugin_hook_session_id(agent: &Agent) -> String {
-    static EPHEMERAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    match agent.session.as_ref() {
-        Some(store) => store.header.id.clone(),
-        None => EPHEMERAL
-            .get_or_init(|| {
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_nanos())
-                    .unwrap_or_default();
-                format!("ephemeral-{}-{nanos}", std::process::id())
-            })
-            .clone(),
-    }
-}
-
-/// Replace the `SessionStart` contexts in `agent.context_files` with those of
-/// the current session. The hooks run once per session (cached by id), so
-/// calling this before every prompt starts them after `/new`, `/resume`,
-/// fork or an RPC session switch without re-running them on ordinary turns.
+/// Re-run `SessionStart` for the agent's current session. Session switches
+/// do it themselves through `plugins::load_session`; this is the per-prompt
+/// pass, so a plugin enabled or approved mid-session takes effect.
 fn apply_plugin_session_start(
     agent: &mut Agent,
     plugins: &davinci_coding_agent::plugins::ActivePlugins,
 ) {
-    agent
-        .context_files
-        .retain(|file| !file.path.to_string_lossy().starts_with("plugin:"));
-    if plugins.plugins.is_empty() {
-        return;
-    }
-    let session_id = plugin_hook_session_id(agent);
-    // Hook warnings are queued for the next notice drain
-    // (`plugins::take_notices`); only the contexts reach the model.
-    for (plugin, body) in
-        davinci_coding_agent::plugins::session_start_context(plugins, &agent.cwd, &session_id)
-            .contexts
-    {
-        agent.context_files.push(davinci_agent::ContextFile {
-            path: PathBuf::from(format!("plugin:{plugin}")),
-            name: format!("plugin:{plugin} (SessionStart hook)"),
-            body,
-        });
-    }
+    davinci_coding_agent::plugins::refresh_session_context(agent, plugins);
 }
 
 /// Print queued plugin warnings (failed `SessionStart` hooks) on stderr for
@@ -11366,7 +11327,9 @@ fn apply_session_calls(
                             JsonlSession::open(Path::new(path)).map_err(|error| error.to_string())
                         }),
                 };
-                if let Err(error) = next.and_then(|next| agent.load_from_session(next)) {
+                if let Err(error) =
+                    next.and_then(|next| davinci_coding_agent::plugins::load_session(agent, next))
+                {
                     let error = if error.starts_with("Runtime recovery required:")
                         || error.starts_with(davinci_agent::runtime::session::SESSION_IN_USE)
                     {

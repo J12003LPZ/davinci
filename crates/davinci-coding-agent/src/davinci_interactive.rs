@@ -3943,7 +3943,7 @@ pub fn perform(
             let session_dir = crate::resolved_session_dir(parsed, &agent.cwd);
             let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
-            agent.load_from_session(store)?;
+            davinci_coding_agent::plugins::load_session(agent, store)?;
             reload_goal_path(agent, model);
             model.transcript.clear();
             Ok(Done::Said("started a new session".into()))
@@ -4062,7 +4062,7 @@ pub fn perform(
                     &session_dir,
                 )
                 .map_err(|err| err.to_string())?;
-            agent.load_from_session(next)?;
+            davinci_coding_agent::plugins::load_session(agent, next)?;
             reload_goal_path(agent, model);
             model.transcript = transcript_from(&agent.messages).into();
             Ok(Done::Said(format!("forked to {}", session_id(agent))))
@@ -4075,7 +4075,7 @@ pub fn perform(
             let next = store
                 .clone_session(&session_dir)
                 .map_err(|err| err.to_string())?;
-            agent.load_from_session(next)?;
+            davinci_coding_agent::plugins::load_session(agent, next)?;
             reload_goal_path(agent, model);
             model.transcript = transcript_from(&agent.messages).into();
             Ok(Done::Said(format!("cloned to {}", session_id(agent))))
@@ -4086,7 +4086,7 @@ pub fn perform(
             }
             let expanded = davinci_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
-            agent.load_from_session(next)?;
+            davinci_coding_agent::plugins::load_session(agent, next)?;
             reload_goal_path(agent, model);
             model.transcript = transcript_from(&agent.messages).into();
             Ok(Done::Said(format!("imported {}", session_id(agent))))
@@ -4213,10 +4213,8 @@ pub fn perform(
             model.corpus_total = model.corpus.len();
 
             // The `6b` workshop sheet: what loaded, what failed, what it costs.
-            let context_tokens: usize = agent
-                .context_files
+            let context_tokens: u64 = davinci_agent::context_file_charges(&agent.context_files)
                 .iter()
-                .map(|file| file.body.len() / 4)
                 .sum();
             let reload = vec![
                 (
@@ -9149,7 +9147,7 @@ impl Shell<'_> {
         }
         match davinci_session::JsonlSession::open(std::path::Path::new(path)) {
             Ok(store) => {
-                if let Err(error) = self.agent.load_from_session(store) {
+                if let Err(error) = davinci_coding_agent::plugins::load_session(self.agent, store) {
                     self.note(&error);
                     return Next::Go;
                 }
