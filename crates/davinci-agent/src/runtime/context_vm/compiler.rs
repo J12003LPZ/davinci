@@ -66,9 +66,20 @@ impl ContextCompiler {
             .rev()
             .find(|event| event.kind == ContextEventKind::User);
         let newest = request.hot_events.last();
-        let required = |event: &ContextEvent| {
+        // The newest harness reminder is not a user turn, but the completion
+        // overlay looks for it: admit it like the latest user turn, without
+        // marking it mandatory in the image.
+        let latest_reminder = request
+            .hot_events
+            .iter()
+            .rev()
+            .find(|event| event.kind == ContextEventKind::HarnessReminder);
+        let pinned = |event: &ContextEvent| {
             latest_user.is_some_and(|last| last.source_ref == event.source_ref)
                 || newest.is_some_and(|last| last.source_ref == event.source_ref)
+        };
+        let required = |event: &ContextEvent| {
+            pinned(event) || latest_reminder.is_some_and(|last| last.source_ref == event.source_ref)
         };
         let mut selected_hot = request
             .hot_events
@@ -195,7 +206,7 @@ impl ContextCompiler {
             .collect::<HashSet<_>>();
         for event in selected_from_tail {
             let mut entry = event_entry(event);
-            entry.mandatory |= required(event);
+            entry.mandatory |= pinned(event);
             messages.push(event_message(event));
             entries.push(entry);
         }

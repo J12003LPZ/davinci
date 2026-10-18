@@ -376,6 +376,57 @@ fn latest_user_request_is_mandatory_after_many_tool_events() {
 }
 
 #[test]
+fn newest_harness_reminder_is_admitted_under_a_tight_budget() {
+    use davinci_agent::runtime::context_vm::{ContextVmConfig, ContextVmRuntime};
+    let vm = ContextVmRuntime::new(
+        ContextVmConfig {
+            hot_event_tokens: 64,
+            ..Default::default()
+        },
+        CacheRuntime::default(),
+    );
+    let mut messages = vec![ChatMessage::text("user", "fix the parser")];
+    for n in 0..40 {
+        messages.push(ChatMessage::tool_result(
+            format!("early-{n}"),
+            "read",
+            "evidence ".repeat(40),
+            false,
+        ));
+    }
+    let mut reminder = ChatMessage::text("user", "Completion check: run the tests.");
+    reminder
+        .extra
+        .insert(davinci_agent::COMPLETION_REMINDER_FIELD.into(), true.into());
+    messages.push(reminder);
+    for n in 0..40 {
+        messages.push(ChatMessage::tool_result(
+            format!("late-{n}"),
+            "read",
+            "evidence ".repeat(40),
+            false,
+        ));
+    }
+    let events = events_from_messages(&messages);
+    let image = vm
+        .compile(&events, &ContextPacket::empty(), 100_000)
+        .unwrap();
+    assert!(
+        image
+            .messages
+            .iter()
+            .any(|m| davinci_ai::content_text(&m.content)
+                .contains("Completion check: run the tests.")),
+        "the newest reminder was dropped: {:#?}",
+        image
+            .entries
+            .iter()
+            .map(|e| (&e.id, &e.category))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn unrecoverable_context_vm_cannot_dispatch_an_unbounded_legacy_fallback() {
     // An Active VM that cannot compile for a reason other than the budget must
     // block dispatch rather than quietly send the unbounded legacy history.
