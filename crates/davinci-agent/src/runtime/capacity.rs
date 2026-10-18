@@ -198,7 +198,18 @@ pub struct WorkerSlotCapacity {
 
 struct WorkerCounts {
     active: usize,
+    /// An exclusive permit is held: nothing else may be admitted beside it.
+    exclusive: bool,
     waiters: VecDeque<Weak<()>>,
+}
+
+/// How a permit shares the pool with others.
+#[derive(Clone, Copy)]
+enum WorkerAccess {
+    /// May run beside other shared permits, up to the caller's limit.
+    Shared(usize),
+    /// Runs alone: admitted only when the pool is idle, and keeps it idle.
+    Exclusive,
 }
 
 impl Default for WorkerSlotCapacity {
@@ -212,12 +223,15 @@ impl WorkerSlotCapacity {
         Self {
             active: Mutex::new(WorkerCounts {
                 active: 0,
+                exclusive: false,
                 waiters: VecDeque::new(),
             }),
             changed: Condvar::new(),
         }
     }
 
+    /// Shared access: runs beside other shared permits, up to `max_concurrency`,
+    /// and never beside an exclusive permit.
     pub fn acquire(
         &self,
         max_concurrency: usize,
@@ -226,6 +240,22 @@ impl WorkerSlotCapacity {
         if max_concurrency == 0 {
             return None;
         }
+        self.acquire_with(WorkerAccess::Shared(max_concurrency), cancelled)
+    }
+
+    /// Exclusive access: waits for every other permit to drop, and holds off
+    /// later arrivals until this one drops. A shared permit with limit 1 does
+    /// not give this guarantee: a shared request with a higher limit still
+    /// sees `active < limit` and is admitted beside it.
+    pub fn acquire_exclusive(&self, cancelled: impl Fn() -> bool) -> Option<WorkerSlotPermit<'_>> {
+        self.acquire_with(WorkerAccess::Exclusive, cancelled)
+    }
+
+    fn acquire_with(
+        &self,
+        access: WorkerAccess,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<WorkerSlotPermit<'_>> {
         let ticket = Arc::new(());
         let weak = Arc::downgrade(&ticket);
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -237,7 +267,12 @@ impl WorkerSlotCapacity {
                 self.changed.notify_all();
                 return None;
             }
-            if active.active < max_concurrency
+            let fits = !active.exclusive
+                && match access {
+                    WorkerAccess::Shared(limit) => active.active < limit,
+                    WorkerAccess::Exclusive => active.active == 0,
+                };
+            if fits
                 && active
                     .waiters
                     .front()
@@ -245,8 +280,13 @@ impl WorkerSlotCapacity {
             {
                 active.waiters.pop_front();
                 active.active += 1;
+                let exclusive = matches!(access, WorkerAccess::Exclusive);
+                active.exclusive = exclusive;
                 self.changed.notify_all();
-                return Some(WorkerSlotPermit { pool: self });
+                return Some(WorkerSlotPermit {
+                    pool: self,
+                    exclusive,
+                });
             }
             let (next_active, _timeout) = self
                 .changed
@@ -263,12 +303,16 @@ impl WorkerSlotCapacity {
 
 pub struct WorkerSlotPermit<'a> {
     pool: &'a WorkerSlotCapacity,
+    exclusive: bool,
 }
 
 impl Drop for WorkerSlotPermit<'_> {
     fn drop(&mut self) {
         let mut active = self.pool.active.lock().unwrap_or_else(|e| e.into_inner());
         active.active = active.active.saturating_sub(1);
+        if self.exclusive {
+            active.exclusive = false;
+        }
         self.pool.changed.notify_all();
     }
 }
@@ -552,6 +596,100 @@ mod tests {
 
         drop(slot2);
         drop(slot3);
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    /// Whether `acquire` is admitted before `wait` runs out.
+    fn admitted_within<T>(
+        wait: Duration,
+        acquire: impl FnOnce(&dyn Fn() -> bool) -> Option<T>,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        acquire(&|| std::time::Instant::now() >= deadline).is_some()
+    }
+
+    #[test]
+    fn exclusive_permit_is_not_joined_by_a_higher_limit_shared_request() {
+        let pool = WorkerSlotCapacity::new();
+        let serial = pool.acquire_exclusive(|| false).unwrap();
+        // The audited bug: `acquire(4)` only tested `active (1) < 4`.
+        assert!(!admitted_within(Duration::from_millis(150), |cancelled| {
+            pool.acquire(4, cancelled)
+        }));
+        assert_eq!(pool.active_count(), 1);
+        drop(serial);
+        assert!(pool.acquire(4, || false).is_some());
+    }
+
+    #[test]
+    fn exclusive_waits_for_shared_permits_and_blocks_later_arrivals() {
+        let pool = WorkerSlotCapacity::new();
+        let first = pool.acquire(4, || false).unwrap();
+        let second = pool.acquire(4, || false).unwrap();
+        std::thread::scope(|scope| {
+            let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let pool = &pool;
+            scope.spawn(move || {
+                let announced = std::cell::Cell::new(false);
+                let permit = pool
+                    .acquire_exclusive(|| {
+                        if !announced.replace(true) {
+                            queued_tx.send(()).unwrap();
+                        }
+                        false
+                    })
+                    .unwrap();
+                done_tx.send(pool.active_count()).unwrap();
+                drop(permit);
+            });
+            queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // A later shared request queues behind the exclusive waiter (FIFO)
+            // instead of slipping past it and starving it.
+            assert!(!admitted_within(Duration::from_millis(100), |cancelled| {
+                pool.acquire(4, cancelled)
+            }));
+            assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+            drop(first);
+            assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+            drop(second);
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        });
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    #[test]
+    fn cancelled_exclusive_waiter_releases_its_place_in_line() {
+        let pool = WorkerSlotCapacity::new();
+        let shared = pool.acquire(2, || false).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+            let (pool, cancel) = (&pool, &cancel);
+            let waiter = scope.spawn(move || {
+                let announced = std::cell::Cell::new(false);
+                pool.acquire_exclusive(|| {
+                    if !announced.replace(true) {
+                        queued_tx.send(()).unwrap();
+                    }
+                    cancel.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .is_none()
+            });
+            queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Queued behind a held permit, the exclusive waiter blocks others.
+            assert!(!admitted_within(Duration::from_millis(100), |cancelled| {
+                pool.acquire(2, cancelled)
+            }));
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(waiter.join().unwrap(), "waiter reports cancellation");
+            // Its place in line is gone: a shared request is admitted again
+            // while the first shared permit is still held.
+            let other = pool.acquire(2, || false).expect("shared admitted");
+            assert_eq!(pool.active_count(), 2);
+            drop(other);
+        });
+        drop(shared);
         assert_eq!(pool.active_count(), 0);
     }
 }
