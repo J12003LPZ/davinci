@@ -341,3 +341,163 @@ fn strict_trust_unreadable_store_is_reported_and_nothing_is_trusted() {
     assert!(!fx.mcp_marker.exists());
     assert!(!fx.hook_marker.exists());
 }
+
+// ---- Task 3: canonical identity, explicit deny, fail closed -------------
+
+mod store {
+    use davinci_coding_agent::trust::{
+        canonicalize_trust_path, get_project_trust_options, resolve_project_trusted,
+        ProjectTrustStore,
+    };
+    use std::{fs, path::Path};
+
+    fn project_with_hooks(path: &Path) {
+        fs::create_dir_all(path.join(".pi")).unwrap();
+        fs::write(path.join(".pi").join("hooks.json"), "{}").unwrap();
+    }
+
+    /// A directory alias: a symlink, or a junction where Windows refuses
+    /// symlinks to unprivileged users. `false` when neither can be made.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+                || std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+        }
+    }
+
+    fn resolve(agent: &Path, cwd: &Path) -> bool {
+        resolve_project_trusted(agent, cwd, None, None, &[])
+    }
+
+    #[test]
+    fn strict_trust_canonical_path_and_explicit_deny() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let parent = root.path().join("work");
+        let child = parent.join("repo");
+        project_with_hooks(&child);
+        let store = ProjectTrustStore::open(&agent);
+
+        // An explicit child denial survives choosing "Trust parent folder".
+        store.set(&child, Some(false)).unwrap();
+        let options = get_project_trust_options(&child, false);
+        let parent_option = options
+            .iter()
+            .find(|option| option.label.starts_with("Trust parent folder"))
+            .expect("parent option");
+        store.set_many(&parent_option.updates).unwrap();
+        assert_eq!(
+            store.try_get(&parent).unwrap(),
+            Some(true),
+            "parent granted"
+        );
+        assert_eq!(
+            store.try_get(&child).unwrap(),
+            Some(false),
+            "child deny kept"
+        );
+        assert!(!resolve(&agent, &child));
+
+        // Without a child entry the parent grant applies as before.
+        store.set(&child, None).unwrap();
+        assert!(resolve(&agent, &child));
+
+        // ...and the denial also survives a relaunch: a new store handle on
+        // the same directory sees it.
+        store.set(&child, Some(false)).unwrap();
+        assert!(!resolve(&agent, &child));
+        assert_eq!(
+            ProjectTrustStore::open(&agent).try_get(&child).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn strict_trust_alias_and_real_path_share_one_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let real = root.path().join("real");
+        project_with_hooks(&real);
+        let alias = root.path().join("alias");
+        if !link_dir(&real, &alias) {
+            eprintln!("skipped: this host cannot create a directory symlink or junction");
+            return;
+        }
+        let store = ProjectTrustStore::open(&agent);
+        store.set(&alias, Some(false)).unwrap();
+        assert_eq!(store.try_get(&real).unwrap(), Some(false));
+        assert!(!resolve(&agent, &real));
+        assert!(!resolve(&agent, &alias));
+        assert_eq!(
+            canonicalize_trust_path(&alias),
+            canonicalize_trust_path(&real)
+        );
+        // One key, not one per spelling.
+        let text = fs::read_to_string(agent.join("trust.json")).unwrap();
+        let keys = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+        assert_eq!(keys.as_object().unwrap().len(), 1, "{text}");
+        // Trust given through either spelling replaces the one entry.
+        store.set(&real, Some(true)).unwrap();
+        assert!(resolve(&agent, &alias));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn strict_trust_drive_letter_case_is_one_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let project = root.path().join("repo");
+        project_with_hooks(&project);
+        let text = project.to_string_lossy().into_owned();
+        let mut chars = text.chars();
+        let drive = chars.next().unwrap();
+        let swapped = if drive.is_ascii_uppercase() {
+            drive.to_ascii_lowercase()
+        } else {
+            drive.to_ascii_uppercase()
+        };
+        let other_case = std::path::PathBuf::from(format!("{swapped}{}", chars.as_str()));
+        let store = ProjectTrustStore::open(&agent);
+        store.set(&other_case, Some(false)).unwrap();
+        assert_eq!(store.try_get(&project).unwrap(), Some(false));
+        assert!(!resolve(&agent, &project));
+    }
+
+    #[test]
+    fn strict_trust_corrupt_store_fails_closed_with_an_actionable_error() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let project = root.path().join("repo");
+        project_with_hooks(&project);
+        fs::create_dir_all(&agent).unwrap();
+        for corrupt in ["{ not json", "[1,2]", r#"{"x": "yes"}"#] {
+            fs::write(agent.join("trust.json"), corrupt).unwrap();
+            let store = ProjectTrustStore::open(&agent);
+            let error = store.try_get(&project).unwrap_err();
+            assert!(error.contains("trust.json"), "names the file: {error}");
+            assert!(!resolve_project_trusted(
+                &agent,
+                &project,
+                None,
+                Some("always"),
+                &[]
+            ));
+            // A write must not paper over the damage either.
+            assert!(store.set(&project, Some(true)).is_err());
+            assert_eq!(
+                fs::read_to_string(agent.join("trust.json")).unwrap(),
+                corrupt
+            );
+        }
+    }
+}

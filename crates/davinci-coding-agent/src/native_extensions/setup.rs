@@ -723,7 +723,17 @@ pub fn trust_step(agent_dir: &Path, cwd: &Path) -> Step {
             "you chose not to trust this project; its .davinci/.pi resources stay off".into(),
         )
         .with_action("/setup trust to change that"),
-        _ => Step::new(
+        // The store may hold a decision we cannot read. Say so with the
+        // reader's own message (it names the file) instead of the generic
+        // "not trusted" text, and do not offer a grant that cannot be saved.
+        Err(error) => Step::new(
+            ID,
+            TITLE,
+            StepState::Action,
+            format!("the trust store cannot be read, so this project stays untrusted: {error}"),
+        )
+        .with_action("fix or remove that file, then /setup trust"),
+        Ok(_) => Step::new(
             ID,
             TITLE,
             StepState::Action,
@@ -1050,6 +1060,29 @@ mod tests {
             trust_step(agent.path(), project.path()).state,
             StepState::Ready
         );
+    }
+
+    #[test]
+    fn an_unreadable_trust_store_is_reported_not_swallowed() {
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".davinci")).unwrap();
+        std::fs::write(project.path().join(".davinci").join("hooks.json"), "{}").unwrap();
+        std::fs::write(agent.path().join("trust.json"), "{ not json").unwrap();
+
+        let step = trust_step(agent.path(), project.path());
+        assert_eq!(step.state, StepState::Action, "{}", step.detail);
+        assert!(step.detail.contains("trust.json"), "{}", step.detail);
+        assert!(step.detail.contains("cannot be read"), "{}", step.detail);
+        // The damaged file is left for the user to inspect.
+        assert_eq!(
+            std::fs::read_to_string(agent.path().join("trust.json")).unwrap(),
+            "{ not json"
+        );
+        // Granting trust cannot paper over it either.
+        let granted = trust_project(agent.path(), project.path());
+        assert_eq!(granted.state, StepState::Action);
+        assert!(granted.detail.contains("trust.json"), "{}", granted.detail);
     }
 
     #[test]

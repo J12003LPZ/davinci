@@ -311,16 +311,13 @@ pub fn get_project_trust_options(
         options.push(ProjectTrustOption {
             label: format!("Trust parent folder ({parent_path})"),
             trusted: true,
-            updates: vec![
-                ProjectTrustUpdate {
-                    path: parent_path.clone(),
-                    decision: Some(true),
-                },
-                ProjectTrustUpdate {
-                    path: trust_path.clone(),
-                    decision: None,
-                },
-            ],
+            // Only the parent is written. Clearing the folder's own entry
+            // here used to erase a saved "Do not trust", which must outlive
+            // a broader grant above it.
+            updates: vec![ProjectTrustUpdate {
+                path: parent_path.clone(),
+                decision: Some(true),
+            }],
             saved_path: Some(parent_path),
         });
     }
@@ -537,6 +534,15 @@ mod tests {
         assert!(!options
             .iter()
             .any(|option| option.label.contains("session only")));
+        // Choosing the parent writes only the parent: the folder's own saved
+        // decision, if any, is never cleared by a broader grant.
+        let parent_option = options
+            .iter()
+            .find(|option| option.label.starts_with("Trust parent folder"))
+            .unwrap();
+        assert_eq!(parent_option.updates.len(), 1);
+        assert_eq!(parent_option.updates[0].decision, Some(true));
+        assert!(parent_option.updates.iter().all(|u| u.decision.is_some()));
         let with_session = get_project_trust_options(Path::new("/parent/project"), true);
         assert!(with_session
             .iter()
