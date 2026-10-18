@@ -4786,12 +4786,16 @@ fn wor32_abandoned_branch_summary_does_not_seed_the_active_branch() {
             .lines()
             .filter(|line| line.contains("MARKER") || line.contains("previous-summary"))
             .collect::<Vec<_>>()
-            .join("
-");
+            .join(
+                "
+",
+            );
         Ok(crate::compaction::SummarizeResponse {
-            text: format!("## Goal
+            text: format!(
+                "## Goal
 checkpoint
-{echoed}"),
+{echoed}"
+            ),
             usage: Default::default(),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,

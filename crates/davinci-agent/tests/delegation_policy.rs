@@ -120,7 +120,9 @@ fn delegation_refusal_survives_rewind_after_compaction_with_or_without_a_session
         if !forbidden {
             agent.prompt("You can use subagents again.");
         }
-        agent.record_assistant("I will work directly.");
+        // Bulky enough that the summary shrinks the context: a fold that does
+        // not shrink it is not committed.
+        agent.record_assistant(&"I will work directly. ".repeat(100));
         agent.prompt("Continue checking the parser.");
         agent.record_assistant(&"Investigation evidence. ".repeat(100));
         agent.compaction.keep_recent_tokens = 0;
