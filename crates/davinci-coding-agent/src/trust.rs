@@ -352,6 +352,32 @@ pub fn get_project_trust_options(
     options
 }
 
+/// Names of the project resources that make `cwd` ask for trust, for the
+/// startup question. Same list as [`has_trust_requiring_project_resources`].
+pub fn trust_requiring_project_resource_names(cwd: &Path) -> Vec<String> {
+    let current = PathBuf::from(canonicalize_trust_path(cwd));
+    let mut names: Vec<String> = TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES
+        .iter()
+        .filter(|name| crate::project_config::any_exists(&current, &[name]))
+        .map(|name| (*name).to_string())
+        .collect();
+    let home = davinci_session::home_dir()
+        .map(|path| canonicalize_trust_path(&path))
+        .unwrap_or_default();
+    let user_agents_skills =
+        canonicalize_trust_path(&PathBuf::from(&home).join(".agents").join("skills"));
+    let mut dir = Some(current.as_path());
+    while let Some(candidate) = dir {
+        let agents_skills = canonicalize_trust_path(&candidate.join(".agents").join("skills"));
+        if agents_skills != user_agents_skills && Path::new(&agents_skills).exists() {
+            names.push(".agents/skills".to_string());
+            break;
+        }
+        dir = candidate.parent().filter(|parent| *parent != candidate);
+    }
+    names
+}
+
 /// TS `hasTrustRequiringProjectResources`.
 pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
     let home = davinci_session::home_dir()

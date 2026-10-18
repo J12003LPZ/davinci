@@ -127,6 +127,7 @@ mod slash;
 mod startup;
 mod tools_manager;
 use davinci_coding_agent::trust;
+mod trust_gate;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -581,6 +582,22 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     let stdin_tty = io::stdin().is_terminal() || force_interactive;
     let stdout_tty = io::stdout().is_terminal() || force_interactive;
     let print_mode = parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty;
+    // Before the session directory, migrations or the agent: nothing the
+    // project controls (hooks, MCP servers, extensions, skills) loads until
+    // trust is settled.
+    let gate_mode = if print_mode || parsed.mode == Some(Mode::Rpc) {
+        trust::HostMode::Headless
+    } else {
+        trust::HostMode::Interactive
+    };
+    if let trust_gate::GateOutcome::Exit(code) = trust_gate::enforce_startup_trust(
+        &default_agent_dir(),
+        &cwd,
+        parsed.project_trust_override,
+        gate_mode,
+    ) {
+        return Ok(code);
+    }
     let last_message_path = match parsed.output_last_message.as_deref() {
         None => None,
         Some(_) if parsed.mode == Some(Mode::Rpc) => {
