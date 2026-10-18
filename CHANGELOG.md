@@ -5,6 +5,9 @@
 ### Added
 - Strict project trust. Before any project hook, MCP server, extension, skill or package loads, an interactive launch in a folder with such resources and no stored decision asks `No - Exit DaVinci` (default) or `Yes, I trust this folder`. No stores a denial and exits cleanly. Headless launches (print, json, RPC, SDK) do not prompt: they load project resources only with a stored grant, `--approve`, or the global `defaultProjectTrust: always` / `trustedProjects`, and report `UNTRUSTED_PROJECT` otherwise (stderr, an RPC notify event plus `get_state`, `CreateAgentSessionResult::project_trust_diagnostic`). `davinci update` and `davinci install -l` and graph verification respect trust. See `docs/project-trust.md`.
 
+### Changed
+- A trusted project's `permissions.mode` can tighten the approval mode but no longer loosen it past the mode in your own settings (warning at startup, row in `/permissions`). `/setup` ignores relative `PATH` entries when looking for `ollama`.
+
 ### Fixed
 - "Trust parent folder" no longer erases a folder's saved "Do not trust". `/setup` shows an unreadable trust store's error instead of "not trusted".
 

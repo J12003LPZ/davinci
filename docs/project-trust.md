@@ -63,6 +63,22 @@ code. `davinci install -l` refuses an untrusted project. A graph run in an
 untrusted project gets no `verifyCommands` and no commands inferred from
 `Cargo.toml` or `package.json`.
 
+## What trust does not grant
+
+- **Tool approvals.** A trusted project's settings file may tighten the
+  permission mode (Plan Mode over Manual) but not loosen it: `permissions.mode`
+  from a project is ignored when it is looser than the mode your own settings
+  give (Manual by default), with a warning at startup and a row in
+  `/permissions`. `--permission-mode` and your own settings still win. Project
+  `permissions.allow` / `deny` rules still apply, since "Always allow in this
+  project" writes them; review them in `/permissions`, which lists each by
+  source. The sandbox is not relaxed by trust.
+- **Services.** Trusting a folder starts nothing and installs nothing. `/setup`
+  is what starts a local Ollama or pulls a model, memory settings come from the
+  global `vector-memory.json` only, and `/setup` looks for `ollama` only in
+  absolute `PATH` directories, so a project cannot plant the executable.
+  Consent receipts for automatic service start are a later phase.
+
 ## Rollback and opt-out
 
 Revert the phase 1 commits to return to the previous behaviour (silent

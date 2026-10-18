@@ -992,6 +992,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         for warning in warnings {
             eprintln!("Warning: {warning}");
         }
+        if let Some(ignored) = permission_sources
+            .ignored_project_mode()
+            .filter(|_| parsed.permission_mode.is_none())
+        {
+            eprintln!(
+                "Warning: this project asks for {} approvals; a project can tighten the permission mode but not loosen it, so it is ignored",
+                ignored.label()
+            );
+        }
         policy.filesystem_boundary.extra_roots = roots;
     }
     // A profile's `model:` picks the worker's model, so the cross-model gate

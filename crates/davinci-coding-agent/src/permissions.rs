@@ -87,15 +87,36 @@ impl PermissionSources {
         (roots, warnings)
     }
 
-    /// The mode in force before any flag: the project's word, then the
-    /// user's, then `ask`.
-    pub fn mode(&self) -> PermissionMode {
+    /// The mode a trusted project asked for, when it is looser than the user's
+    /// own and so not applied.
+    pub fn ignored_project_mode(&self) -> Option<PermissionMode> {
+        let requested = self.project_mode()?;
+        (looseness(requested) > looseness(self.user_mode())).then_some(requested)
+    }
+
+    fn user_mode(&self) -> PermissionMode {
+        self.user
+            .mode
+            .as_deref()
+            .and_then(PermissionMode::parse)
+            .unwrap_or_default()
+    }
+
+    fn project_mode(&self) -> Option<PermissionMode> {
         self.project
             .as_ref()
             .and_then(|project| project.mode.as_deref())
-            .or(self.user.mode.as_deref())
             .and_then(PermissionMode::parse)
-            .unwrap_or_default()
+    }
+
+    /// The mode in force before any flag. Trusting a folder lets its settings
+    /// file *tighten* the user's mode (Plan Mode over Manual, Manual over Auto)
+    /// but never loosen it: a checked-in file cannot switch approvals off.
+    pub fn mode(&self) -> PermissionMode {
+        match self.project_mode() {
+            Some(project) if self.ignored_project_mode().is_none() => project,
+            _ => self.user_mode(),
+        }
     }
 
     /// Assemble the policy. `flag_mode` is `--permission-mode` / `--sandbox`
@@ -259,6 +280,17 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     davinci_sys::fs::atomic_write(path, text.as_bytes()).map_err(|err| err.to_string())
 }
 
+/// How much a mode lets a run do without asking, lowest first.
+fn looseness(mode: PermissionMode) -> u8 {
+    match mode {
+        PermissionMode::ReadOnly => 0,
+        PermissionMode::Ask => 1,
+        PermissionMode::Edits => 2,
+        PermissionMode::Auto => 3,
+        PermissionMode::AlwaysApprove => 4,
+    }
+}
+
 /// The rows `/permissions` says: the mode, then every rule by source.
 /// Kept for `/permissions` text dumps and tests; the davinci sheet builds
 /// structured rows instead.
@@ -282,6 +314,12 @@ pub fn describe(sources: &PermissionSources, policy: &PermissionPolicy) -> Vec<S
         None => {
             rows.push("project rules ignored · the project is not trusted (/setup trust)".into())
         }
+    }
+    if let Some(ignored) = sources.ignored_project_mode() {
+        rows.push(format!(
+            "project mode {} ignored · a project can tighten the approval mode but not loosen it",
+            ignored.label()
+        ));
     }
     let session: Vec<String> = policy
         .session_allow
@@ -434,6 +472,85 @@ mod tests {
             sources.policy(Some(PermissionMode::Auto)).mode,
             PermissionMode::Auto
         );
+    }
+
+    #[test]
+    fn folder_trust_does_not_grant_tool_execution() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".pi")).unwrap();
+        let load = |user: Option<&str>, project_mode: &str| {
+            let agent_dir = user_dir_with(block(user, &[], &[]), &[]);
+            std::fs::write(
+                project_settings_path(project.path()),
+                format!(r#"{{"permissions": {{"mode": "{project_mode}"}}}}"#),
+            )
+            .unwrap();
+            PermissionSources::load(agent_dir.path(), project.path(), Some(true))
+        };
+        // A checked-in settings file cannot switch approvals off or widen
+        // them, however the folder was trusted.
+        for loosening in ["always-approve", "auto", "edits"] {
+            let sources = load(None, loosening);
+            assert!(sources.project.is_some(), "the project is trusted");
+            assert_eq!(
+                sources.mode(),
+                PermissionMode::Ask,
+                "project mode {loosening}"
+            );
+            assert_eq!(sources.policy(None).mode, PermissionMode::Ask);
+        }
+        assert_eq!(load(Some("edits"), "auto").mode(), PermissionMode::Edits);
+        assert_eq!(
+            load(Some("always-approve"), "always-approve").mode(),
+            PermissionMode::AlwaysApprove,
+            "the user's own choice still stands"
+        );
+        // Tightening is the project's to do.
+        assert_eq!(load(None, "read-only").mode(), PermissionMode::ReadOnly);
+        assert_eq!(load(Some("auto"), "ask").mode(), PermissionMode::Ask);
+        // The shell still asks in a trusted project that tries to open it.
+        let sources = load(None, "always-approve");
+        let verdict = sources.policy(None).decide(
+            "c1",
+            "bash",
+            &serde_json::json!({"command": "echo hi"}),
+            project.path(),
+        );
+        assert!(
+            matches!(verdict, davinci_agent::PermissionVerdict::Ask { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_ignored_project_mode_is_reported_to_the_user() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".pi")).unwrap();
+        std::fs::write(
+            project_settings_path(project.path()),
+            r#"{"permissions": {"mode": "always-approve"}}"#,
+        )
+        .unwrap();
+        let agent_dir = user_dir_with(block(None, &[], &[]), &[]);
+        let sources = PermissionSources::load(agent_dir.path(), project.path(), Some(true));
+        assert_eq!(
+            sources.ignored_project_mode(),
+            Some(PermissionMode::AlwaysApprove)
+        );
+        let rows = describe(&sources, &sources.policy(None));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("project mode") && row.contains("ignored")),
+            "{rows:?}"
+        );
+        // A tightening project mode is applied, not ignored.
+        std::fs::write(
+            project_settings_path(project.path()),
+            r#"{"permissions": {"mode": "read-only"}}"#,
+        )
+        .unwrap();
+        let sources = PermissionSources::load(agent_dir.path(), project.path(), Some(true));
+        assert_eq!(sources.ignored_project_mode(), None);
     }
 
     #[test]
