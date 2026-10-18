@@ -2227,7 +2227,19 @@ impl Agent {
                 .iter()
                 .any(|part| !matches!(part, MessageContent::Text { .. }))
             {
-                native_ephemeral.push((index, message.clone()));
+                // Extension-supplied evidence: text parts are wrapped as
+                // untrusted data like text-only ephemeral messages; images
+                // are kept.
+                let mut message = message.clone();
+                for part in &mut message.content {
+                    if let MessageContent::Text { text } = part {
+                        *text = runtime::wrap_untrusted_data(
+                            &format!("ephemeral_context::{index}"),
+                            text,
+                        );
+                    }
+                }
+                native_ephemeral.push((index, message));
                 continue;
             }
             let content = davinci_ai::content_text(&message.content);
