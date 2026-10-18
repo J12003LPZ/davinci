@@ -4693,8 +4693,29 @@ fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model)
         .unwrap_or(model.model_index);
     model.model_name = agent.model_id.clone();
     model.active_provider = agent.provider.clone();
+    sync_model_titles(model);
     model.context.1 = agent.context_window;
     sync_thinking_state(agent, model);
+}
+
+/// The masthead's names for the model in hand: the catalog's title and the
+/// provider's registered name. A model or provider the catalog does not know,
+/// such as one an extension adds, keeps its raw id.
+fn sync_model_titles(model: &mut Model) {
+    model.model_title = model
+        .models
+        .iter()
+        .find(|item| item.provider == model.active_provider && item.id == model.model_name)
+        .map(|item| item.title.clone())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| model.model_name.clone());
+    model.provider_title = davinci_ai::PROVIDER_SPECS
+        .iter()
+        .find(|spec| spec.id == model.active_provider)
+        .map_or_else(
+            || model.active_provider.clone(),
+            |spec| spec.name.to_string(),
+        );
 }
 
 struct HostedTuiGuard;
@@ -4763,6 +4784,7 @@ pub fn run(
     crate::davinci_surfaces::dress_from_extensions(&mut model, &cwd, agent);
     model.model_name = agent.model_id.clone();
     model.active_provider = agent.provider.clone();
+    sync_model_titles(&mut model);
     let history = davinci_tui::history_store::HistoryStore::for_cwd(
         &crate::default_agent_dir(),
         std::path::Path::new(&agent.cwd),
@@ -4782,8 +4804,10 @@ pub fn run(
                 &davinci_tui::davinci::views::chrome::thousands(entry.context_window),
             )
             .of(&entry.provider, &entry.id, entry.context_window)
+            .titled(&entry.name)
         })
         .collect();
+    sync_model_titles(&mut model);
     // What the composer completes: the same slash corpus, extension providers
     // and `/login` list the legacy chrome offers, through the same engine.
     crate::startup_mark("shell: models listed");
@@ -11094,6 +11118,7 @@ fn refresh_context(model: &mut Model, agent: &Agent) {
     );
     model.model_name = agent.model_id.clone();
     model.active_provider = agent.provider.clone();
+    sync_model_titles(model);
 }
 
 #[cfg(test)]

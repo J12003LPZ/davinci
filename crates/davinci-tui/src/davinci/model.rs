@@ -878,6 +878,8 @@ pub struct ModelItem {
     pub id: String,
     /// The context window in tokens, for the meter after a switch.
     pub window_tokens: u64,
+    /// The catalog's display name (`GPT-6-Luna`); empty for the fixtures.
+    pub title: String,
 }
 
 impl ModelItem {
@@ -888,7 +890,14 @@ impl ModelItem {
             provider: String::new(),
             id: String::new(),
             window_tokens: 0,
+            title: String::new(),
         }
+    }
+
+    /// The catalog's own name for the model, for the masthead.
+    pub fn titled(mut self, title: &str) -> Self {
+        self.title = title.to_string();
+        self
     }
 
     pub fn of(mut self, provider: &str, id: &str, window_tokens: u64) -> Self {
@@ -2719,6 +2728,9 @@ pub struct Model {
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
     pub caret_moved_at: u64,
+    /// Whether the caret has moved at all: `caret_moved_at` starts at tick
+    /// zero, so zero alone cannot tell "never" from "a key at the first tick".
+    pub caret_moved: bool,
     /// The stored `caretBlink` setting. On unless turned off, as in Claude Code; a steady caret
     /// saves the redraw each phase costs.
     pub caret_blink: bool,
@@ -2820,6 +2832,11 @@ pub struct Model {
     pub branch: String,
     pub model_name: String,
     pub active_provider: String,
+    /// The masthead's names for the model in hand: the catalog's title
+    /// (`GPT-6-Luna`) and the provider's (`OpenAI Codex`). Empty until the
+    /// shell resolves them; the masthead then shows the raw ids.
+    pub model_title: String,
+    pub provider_title: String,
     /// Active thinking/reasoning level for the model in hand (`off`, `high`, ...).
     pub thinking_level: String,
     pub speed_mode: String,
@@ -3387,6 +3404,7 @@ impl Model {
             overlay_offset: None,
             section_notice: None,
             caret_moved_at: 0,
+            caret_moved: false,
             caret_blink: false,
             auto_scroll: true,
             terminal_focused: true,
@@ -3433,6 +3451,8 @@ impl Model {
             branch: String::new(),
             model_name: String::new(),
             active_provider: String::new(),
+            model_title: String::new(),
+            provider_title: String::new(),
             thinking_level: "off".into(),
             speed_mode: String::new(),
             permission_mode: "ask".into(),
@@ -3999,6 +4019,7 @@ impl Model {
     /// solid from here. `tick` wraps, so the phase arithmetic wraps with it.
     pub fn mark_caret_moved(&mut self) {
         self.caret_moved_at = self.tick;
+        self.caret_moved = true;
     }
 
     pub fn context_fraction(&self) -> f64 {

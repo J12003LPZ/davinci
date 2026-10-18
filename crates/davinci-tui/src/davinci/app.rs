@@ -2812,7 +2812,8 @@ mod tests {
         let mut m = model(100, 20);
         m.transcript = vec![Entry::user("run the tests")].into();
         let rows = compose(&m, 20);
-        assert!(text(&rows[1]).contains("DaVinci"));
+        // A blank row, then the painter's beret row, then the name.
+        assert!(text(&rows[2]).contains("DaVinci"));
         let turn = rows
             .iter()
             .position(|row| text(row).contains("❯ run the tests"))
@@ -3665,7 +3666,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_two_things_move_when_animation_is_on() {
+    fn only_the_spinner_caret_and_painter_move_when_animation_is_on() {
         use crate::davinci::fixtures;
 
         let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 120, 40, true);
@@ -3676,15 +3677,24 @@ mod tests {
             m.tick = 0;
             compose(&m, 40).iter().map(|row| text(row)).collect()
         };
+        // The painter beside the masthead plays its own loop; its box is
+        // tested in views::startup, so only cells outside it are read here.
+        let name = base.iter().position(|row| row.contains("DaVinci"));
+        let painter = |y: usize, x: usize| {
+            name.is_some_and(|name| {
+                (name - 1..name - 1 + startup::PET_ROWS).contains(&y)
+                    && (1..1 + startup::PET_W).contains(&x)
+            })
+        };
         for tick in 1..8u64 {
             m.tick = tick;
             let frame: Vec<String> = compose(&m, 40).iter().map(|row| text(row)).collect();
-            for (before, after) in base.iter().zip(&frame) {
+            for (y, (before, after)) in base.iter().zip(&frame).enumerate() {
                 if before == after {
                     continue;
                 }
-                for (a, b) in before.chars().zip(after.chars()) {
-                    if a != b {
+                for (x, (a, b)) in before.chars().zip(after.chars()).enumerate() {
+                    if a != b && !painter(y, x) {
                         moving.push(a);
                         moving.push(b);
                     }
@@ -3693,7 +3703,7 @@ mod tests {
         }
         moving.sort_unstable();
         moving.dedup();
-        // The reference spinner and caret are the only moving glyphs.
+        // The reference spinner and caret are the only other moving glyphs.
         for ch in &moving {
             assert!(
                 "◜◝◞◟·✢*✶✻✽ ".contains(*ch),
