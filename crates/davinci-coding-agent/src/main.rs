@@ -8541,16 +8541,7 @@ fn login_provider_with_wait(
                         "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
                     )
                 })?;
-            if let (Some(expected), Some(got)) =
-                (pending.state.as_deref(), callback.state.as_deref())
-            {
-                if expected != got {
-                    return Err(
-                        "The pasted login does not match the one started here (state mismatch)."
-                            .into(),
-                    );
-                }
-            }
+            check_pasted_state(pending.state.as_deref(), callback.state.as_deref())?;
             return exchange_and_store_oauth(&mut storage, provider, &pending, callback);
         }
         if provider == "openai-codex" {
@@ -8666,6 +8657,23 @@ fn exchange_and_store_oauth(
         pending.state.as_deref(),
     )?;
     store_oauth_tokens(storage, provider, tokens)
+}
+
+/// A pasted redirect must carry the `state` this login started with. A
+/// callback with no `state` is refused, not waved through: otherwise anyone
+/// who can get a URL pasted skips the one check that ties it to this login.
+fn check_pasted_state(expected: Option<&str>, got: Option<&str>) -> Result<(), String> {
+    match (expected, got) {
+        (Some(expected), Some(got)) if expected == got => Ok(()),
+        (Some(_), Some(_)) => Err(
+            "The pasted login does not match the one started here (state mismatch).".into(),
+        ),
+        (Some(_), None) => Err(
+            "The pasted login has no state, so it cannot be tied to the login started here. Paste the complete redirect URL."
+                .into(),
+        ),
+        (None, _) => Ok(()),
+    }
 }
 
 /// Write an exchanged or refreshed OAuth credential. The expiry is what makes

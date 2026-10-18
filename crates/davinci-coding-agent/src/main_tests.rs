@@ -3047,6 +3047,20 @@ fn list_models_table_matches_ts_columns() {
 }
 
 #[test]
+fn a_pasted_login_must_carry_the_state_it_started_with() {
+    assert!(check_pasted_state(Some("abc"), Some("abc")).is_ok());
+    assert!(check_pasted_state(Some("abc"), Some("xyz"))
+        .unwrap_err()
+        .contains("state mismatch"));
+    assert!(check_pasted_state(Some("abc"), None)
+        .unwrap_err()
+        .contains("no state"));
+    // A login that started without a state has nothing to compare.
+    assert!(check_pasted_state(None, None).is_ok());
+    assert!(check_pasted_state(None, Some("anything")).is_ok());
+}
+
+#[test]
 fn f01_new_session_hosts_revoke_consent_only_after_creation() {
     for host in ["native", "legacy", "extension"] {
         for fail_creation in [false, true] {
