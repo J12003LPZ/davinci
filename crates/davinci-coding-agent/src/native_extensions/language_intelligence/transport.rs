@@ -935,13 +935,22 @@ mod tests {
     }
 
     fn fixture(mode: &str) -> Transport {
+        fixture_booting_in(mode, Duration::ZERO)
+    }
+
+    /// A fixture that blocks for `boot` before reading its first message.
+    fn fixture_booting_in(mode: &str, boot: Duration) -> Transport {
         let mut command = std::process::Command::new("node");
         command
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/language-server.cjs"
             ))
-            .arg(mode);
+            .arg(mode)
+            .env(
+                "DAVINCI_LSP_FIXTURE_BOOT_DELAY_MS",
+                boot.as_millis().to_string(),
+            );
         Transport::spawn(&mut command).unwrap()
     }
 
@@ -954,12 +963,14 @@ mod tests {
                 let transport = transport.clone();
                 std::thread::spawn(move || {
                     let params = json!({"n": n, "delay": (8-n)*5, "uri":"file:///fixture.ts"});
+                    // The budget also covers node starting up, which can take
+                    // seconds on a loaded runner; it is a hang guard only.
                     assert_eq!(
                         transport
                             .request(
                                 "fixture/echo",
                                 params.clone(),
-                                std::time::Duration::from_secs(3)
+                                std::time::Duration::from_secs(30)
                             )
                             .unwrap(),
                         params
@@ -1027,22 +1038,41 @@ mod tests {
 
     #[test]
     fn timeout_exit_and_protocol_failure_are_structured() {
-        for (mode, code) in [
-            ("timeout", "request_timeout"),
-            ("exit", "server_exited"),
-            ("malformed", "protocol_error"),
+        // `exit` and `malformed` fail only once the server reads the request,
+        // so their budget must outlast a slow server start or the timeout
+        // wins the race (as it did on loaded Windows runners). They start
+        // 750ms late on purpose: longer than the 500ms budget that raced.
+        let slow_boot = Duration::from_millis(750);
+        for (mode, code, boot, budget) in [
+            (
+                "timeout",
+                "request_timeout",
+                Duration::ZERO,
+                Duration::from_millis(500),
+            ),
+            ("exit", "server_exited", slow_boot, Duration::from_secs(30)),
+            (
+                "malformed",
+                "protocol_error",
+                slow_boot,
+                Duration::from_secs(30),
+            ),
         ] {
-            let transport = fixture(mode);
-            let started = std::time::Instant::now();
+            let transport = fixture_booting_in(mode, boot);
+            let started = Instant::now();
             let error = transport
-                .request(
-                    "fixture/echo",
-                    json!({}),
-                    std::time::Duration::from_millis(500),
-                )
+                .request("fixture/echo", json!({}), budget)
                 .unwrap_err();
-            assert_eq!(error.code, code);
-            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+            assert_eq!(error.code, code, "{mode}");
+            let limit = if mode == "timeout" {
+                // The deadline itself, plus room for a loaded machine.
+                Duration::from_secs(10)
+            } else {
+                // Structured failures arrive when they happen, well before
+                // the deadline.
+                budget / 2
+            };
+            assert!(started.elapsed() < limit, "{mode}");
         }
     }
 }
