@@ -637,6 +637,10 @@ pub struct Agent {
     /// Context supplied by extensions for the next provider request only.
     /// These messages never enter the persisted session history.
     ephemeral_context: Vec<ChatMessage>,
+    /// User-owned pin/exclude/correction preferences for broker context.
+    /// Hosts set it with [`Agent::set_context_overlay`]; it is part of the
+    /// prepared-image revision.
+    context_overlay: Option<runtime::ContextOverlay>,
     /// Tests and hosts may force a placement; `None` follows the route family.
     pub turn_context_placement_override: Option<turn_context::TurnContextPlacement>,
     /// Per-turn prompt state prepared for the next `commit_turn_context`.
@@ -805,6 +809,7 @@ impl Agent {
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
+            context_overlay: None,
             turn_context_placement_override: None,
             turn_state_pending: None,
             provider_context_overhead_tokens: None,
@@ -1693,6 +1698,20 @@ impl Agent {
         self.ephemeral_context = messages;
     }
 
+    /// Install the user-owned context overlay applied to broker context in the
+    /// active Context VM path and recorded in the context manifest. The
+    /// prepared image is invalidated so the next request recompiles.
+    pub fn set_context_overlay(&mut self, overlay: Option<runtime::ContextOverlay>) {
+        if self.context_overlay != overlay {
+            self.context_overlay = overlay;
+            self.invalidate_context_image();
+        }
+    }
+
+    pub fn context_overlay(&self) -> Option<&runtime::ContextOverlay> {
+        self.context_overlay.as_ref()
+    }
+
     pub fn turn_context_placement(&self) -> turn_context::TurnContextPlacement {
         self.turn_context_placement_override
             .unwrap_or_else(|| turn_context::default_placement(&self.provider, &self.model_id))
@@ -2190,7 +2209,18 @@ impl Agent {
         // cached prefix. A copy in the image sent every one twice and, at
         // optional priority, could be paged out from under the system copy.
         let mut items = Vec::new();
+        // Ephemeral messages with non-text parts (images) cannot become text
+        // broker items: they reach the provider as messages, as in legacy mode.
+        let mut native_ephemeral = Vec::new();
         for (index, message) in selected.ephemeral_messages.iter().enumerate() {
+            if message
+                .content
+                .iter()
+                .any(|part| !matches!(part, MessageContent::Text { .. }))
+            {
+                native_ephemeral.push((index, message.clone()));
+                continue;
+            }
             let content = davinci_ai::content_text(&message.content);
             items.push(runtime::ContextItem {
                 source: format!("ephemeral_context::{index}"),
@@ -2224,7 +2254,13 @@ impl Agent {
             .iter()
             .map(|overlay| provider_budget::message_token_ceiling(&overlay.message))
             .fold(0u64, u64::saturating_add);
-        let transient_tokens = live_tokens.saturating_add(completion_tokens);
+        let ephemeral_tokens = native_ephemeral
+            .iter()
+            .map(|(_, message)| provider_budget::message_token_ceiling(message))
+            .fold(0u64, u64::saturating_add);
+        let transient_tokens = live_tokens
+            .saturating_add(completion_tokens)
+            .saturating_add(ephemeral_tokens);
         if budget.reserved().saturating_add(transient_tokens) >= budget.window {
             return Err(runtime::context_vm::CONTEXT_BUDGET_EXCEEDED.into());
         }
@@ -2254,7 +2290,9 @@ impl Agent {
             max_tokens.saturating_sub(direct_tokens),
             runtime::AgentKind::Main,
         );
-        let (broker_packet, ledger) = runtime.context_broker.build_context_with_ledger(&request);
+        let (broker_packet, ledger) = runtime
+            .context_broker
+            .build_context_with_overlay(&request, self.context_overlay.as_ref());
         let mut all_items = items;
         all_items.extend(broker_packet.items);
         // The legacy broker remains bounded. Mandatory candidates omitted by
@@ -2275,6 +2313,36 @@ impl Agent {
         if self.block_images {
             image.messages = apply_block_images(&image.messages);
         }
+        // Splice before the latest user message, where legacy mode places them.
+        let insertion = image
+            .messages
+            .iter()
+            .rposition(|message| message.role == "user")
+            .unwrap_or(image.messages.len());
+        let mut spliced = Vec::new();
+        for (index, message) in &native_ephemeral {
+            let converted =
+                convert_to_llm_for_provider(std::slice::from_ref(message), self.block_images);
+            for message in converted {
+                let content = serde_json::to_string(&message).map_err(|e| e.to_string())?;
+                let tokens = provider_budget::message_token_ceiling(&message);
+                image.entries.push(runtime::ContextImageEntry {
+                    id: format!("ephemeral-native:{index}"),
+                    source_ref: format!("ephemeral_context::{index}"),
+                    category: "ephemeral_native".into(),
+                    // Extension-supplied evidence; never user or policy authority.
+                    provenance_kind: runtime::context_manifest::ProvenanceKind::ToolEvidence,
+                    content_hash: runtime::cache::digest(content.as_bytes()),
+                    estimated_tokens: tokens,
+                    content,
+                    mandatory: false,
+                    stable_for_cache: false,
+                });
+                image.estimated_tokens = image.estimated_tokens.saturating_add(tokens);
+                spliced.push(message);
+            }
+        }
+        image.messages.splice(insertion..insertion, spliced);
         // The most recent, complete tool exchange remains protocol data. Older
         // exchanges are evidence only. Reserve this suffix before compilation.
         for (index, message) in live.iter().enumerate() {
@@ -2693,6 +2761,12 @@ impl Agent {
         use runtime::context_manifest::{
             ContextManifestEntry, PreparedContextManifest, ProvenanceKind,
         };
+        // The installed overlay is the one the image is compiled with, so its
+        // revision is the one the manifest reports and invalidates on.
+        let overlay_revision = self
+            .context_overlay
+            .as_ref()
+            .map_or(overlay_revision, |overlay| overlay.revision);
         if self.prepared_manifest_revisions != (source_revision, overlay_revision) {
             self.prepared_manifest_revisions = (source_revision, overlay_revision);
             self.invalidate_context_image();
