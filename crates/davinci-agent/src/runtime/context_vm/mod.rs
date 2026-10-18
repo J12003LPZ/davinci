@@ -88,6 +88,8 @@ pub struct ContextVmRuntime {
     /// Text of sources the state still cites that a rewritten sessionless
     /// transcript no longer holds; see [`Self::rebase`].
     retained_sources: Arc<RwLock<HashMap<String, String>>>,
+    /// Image bytes of sessionless sources, within a byte bound.
+    source_images: Arc<RwLock<sources::SourceImages>>,
     session_source: Arc<RwLock<Option<sources::SessionSource>>>,
     source_index: Arc<std::sync::Mutex<sources::SourceIndex>>,
     metrics: Arc<RwLock<ContextVmMetrics>>,
@@ -113,6 +115,7 @@ impl ContextVmRuntime {
             events: Arc::new(RwLock::new(Vec::new())),
             source_contents: Arc::new(RwLock::new(HashMap::new())),
             retained_sources: Arc::default(),
+            source_images: Arc::default(),
             session_source: Arc::new(RwLock::new(None)),
             source_index: Arc::default(),
             metrics,
@@ -555,6 +558,13 @@ impl ContextVmRuntime {
                 cited.extend(episode.source_refs);
             }
         }
+        let retained_images =
+            self.source_images
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .subset(cited.iter().filter(|source_ref| {
+                    !events.iter().any(|event| &&event.source_ref == source_ref)
+                }));
         let retained = {
             let contents = self
                 .source_contents
@@ -583,6 +593,10 @@ impl ContextVmRuntime {
         state.through_seq = through;
         let checkpoint = self.save_page(&ContextObject::Checkpoint(state))?;
         self.record_events(events);
+        self.source_images
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .absorb(retained_images);
         *self
             .retained_sources
             .write()
@@ -801,11 +815,17 @@ impl ContextVmRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
         contents.clear();
+        let mut images = sources::SourceImages::default();
         for event in events {
             if !disk_backed || !event.source_ref.starts_with("session:") {
                 contents.insert(event.source_ref.clone(), event.visible_text.clone());
+                images.insert(&event.source_ref, &event.images);
             }
         }
+        *self
+            .source_images
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = images;
         diverged
     }
 

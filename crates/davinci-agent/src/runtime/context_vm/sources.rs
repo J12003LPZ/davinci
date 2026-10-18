@@ -1,6 +1,9 @@
-use super::{events::event_from_session_entry, ContextVmRuntime};
+use super::{
+    events::{event_from_session_entry, EventImage},
+    ContextVmRuntime,
+};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::PathBuf,
@@ -62,6 +65,65 @@ fn read_record(
 
 fn oversized(id: &str) -> String {
     format!("context source {id} exceeds {MAX_SOURCE_RECORD_BYTES} bytes")
+}
+
+/// The most image data (base64 bytes) a sessionless VM keeps in memory so
+/// `retrieve_context` can hand images back. A bound session reads them from
+/// its JSONL instead and needs none of this.
+pub(crate) const MAX_SESSIONLESS_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Image bytes of sources a sessionless VM holds, within a byte bound. A
+/// source whose images did not fit is remembered so retrieval can say the
+/// images are gone rather than imply the text is all there was.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SourceImages {
+    kept: HashMap<String, Vec<EventImage>>,
+    dropped: HashSet<String>,
+    bytes: usize,
+}
+
+impl SourceImages {
+    pub(crate) fn insert(&mut self, source_ref: &str, images: &[EventImage]) {
+        if images.is_empty() || self.kept.contains_key(source_ref) {
+            return;
+        }
+        let size: usize = images.iter().map(|image| image.data.len()).sum();
+        if self.bytes.saturating_add(size) > MAX_SESSIONLESS_IMAGE_BYTES {
+            self.dropped.insert(source_ref.to_string());
+            return;
+        }
+        self.bytes += size;
+        self.kept.insert(source_ref.to_string(), images.to_vec());
+    }
+
+    /// The entries for `refs`, to survive a rewrite of the transcript.
+    pub(crate) fn subset<'a>(&self, refs: impl Iterator<Item = &'a String>) -> Self {
+        let mut out = Self::default();
+        for source_ref in refs {
+            if let Some(images) = self.kept.get(source_ref) {
+                out.insert(source_ref, images);
+            } else if self.dropped.contains(source_ref) {
+                out.dropped.insert(source_ref.clone());
+            }
+        }
+        out
+    }
+
+    pub(crate) fn absorb(&mut self, other: Self) {
+        for (source_ref, images) in other.kept {
+            self.insert(&source_ref, &images);
+        }
+        self.dropped.extend(other.dropped);
+    }
+}
+
+/// What a source holds: its text, and the images it carried.
+pub(crate) struct SourceMaterial {
+    pub text: String,
+    pub images: Vec<EventImage>,
+    /// The source had images that this VM no longer holds (sessionless, past
+    /// the in-memory bound).
+    pub images_not_retained: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +188,13 @@ impl ContextVmRuntime {
             .sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn source_content(&self, source_ref: &str) -> Result<String, String> {
+        self.source_material(source_ref)
+            .map(|material| material.text)
+    }
+
+    pub(crate) fn source_material(&self, source_ref: &str) -> Result<SourceMaterial, String> {
         let binding = self
             .session_source
             .read()
@@ -141,22 +209,34 @@ impl ContextVmRuntime {
                 .find(|event| event.source_ref == source_ref)
                 .map(|e| e.content_hash.clone())
                 .ok_or("unknown context source_ref")?;
-            return self.session_source_text(&binding, id, &expected);
+            let (text, images) = self.session_source_text(&binding, id, &expected)?;
+            return Ok(SourceMaterial {
+                text,
+                images,
+                images_not_retained: false,
+            });
         }
-        if let Some(text) = self
+        let text = match self
             .source_contents
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(source_ref)
         {
-            return Ok(text.clone());
-        }
-        self.retained_sources
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(source_ref)
-            .cloned()
-            .ok_or_else(|| "unknown context source_ref".into())
+            Some(text) => text.clone(),
+            None => self
+                .retained_sources
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(source_ref)
+                .cloned()
+                .ok_or("unknown context source_ref")?,
+        };
+        let held = self.source_images.read().unwrap_or_else(|e| e.into_inner());
+        Ok(SourceMaterial {
+            text,
+            images: held.kept.get(source_ref).cloned().unwrap_or_default(),
+            images_not_retained: held.dropped.contains(source_ref),
+        })
     }
 
     fn session_source_text(
@@ -164,7 +244,7 @@ impl ContextVmRuntime {
         binding: &SessionSource,
         id: &str,
         expected_hash: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<EventImage>), String> {
         let mut index = self.source_index.lock().unwrap_or_else(|e| e.into_inner());
         if index.path.as_ref() != Some(&binding.path) || index.session_id != binding.id {
             index.reset_for(binding);
@@ -203,7 +283,7 @@ impl ContextVmRuntime {
                         if event.content_hash != expected_hash {
                             return Err("context source integrity check failed".into());
                         }
-                        return Ok(event.visible_text);
+                        return Ok((event.visible_text, event.images));
                     }
                     None if !rebuilt => {
                         // Stale offset (file rewritten in place): rebuild from the header.

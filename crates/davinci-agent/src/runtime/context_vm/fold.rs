@@ -24,10 +24,14 @@ fn excerpt(text: &str, cap: usize) -> (String, bool) {
 
 fn fold_record(event: &super::ContextEvent, cap: usize) -> String {
     let (text, truncated) = excerpt(&event.visible_text, cap);
-    serde_json::json!({"source_ref":event.source_ref,"seq":event.seq,
+    let mut record = serde_json::json!({"source_ref":event.source_ref,"seq":event.seq,
         "kind":event.kind,"provenance_kind":event.provenance_kind,"text":text,
-        "excerpt":truncated})
-    .to_string()
+        "excerpt":truncated});
+    // The image bytes stay in the session; the model sees a durable pointer.
+    if !event.images.is_empty() {
+        record["images"] = event.image_references().into();
+    }
+    record.to_string()
 }
 
 pub(crate) fn fold_request(
@@ -240,6 +244,23 @@ mod request_tests {
         fold_request(&CheckpointState::default(), events, None, window, "p", "m")
             .expect("fold request fits")
             .prompt
+    }
+
+    #[test]
+    fn fold_record_keeps_a_durable_image_reference() {
+        let mut shot = event(1, ContextEventKind::User, "");
+        shot.source_ref = "session:shot".into();
+        shot.images = vec![crate::runtime::context_vm::EventImage {
+            mime_type: "image/png".into(),
+            data: "AAAA".into(),
+        }];
+        let prompt = prompt(&[shot], 32_000);
+        assert!(prompt.contains("sha256:"), "{prompt}");
+        assert!(prompt.contains("retrieve_context session:shot"), "{prompt}");
+        assert!(
+            !prompt.contains("AAAA"),
+            "image bytes must not enter the fold prompt"
+        );
     }
 
     #[test]

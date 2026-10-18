@@ -13,6 +13,10 @@ pub enum ContextEventKind {
     Assistant,
     ToolResult,
     Custom,
+    /// A capability or completion reminder the harness queued in the user
+    /// role. The model must read it as an instruction in the user turn, but it
+    /// is not a user requirement: no goal, not mandatory, no user budget.
+    HarnessReminder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +41,37 @@ pub struct EventImage {
     pub data: String,
 }
 
+impl EventImage {
+    /// Digest of the image data; the same one `content_hash` folds in.
+    pub fn digest(&self) -> String {
+        digest(self.data.as_bytes())
+    }
+
+    /// The durable pointer to this image that outlives its bytes in the hot
+    /// window: media type, a digest prefix and the way back to the source.
+    pub fn reference(&self, source_ref: &str) -> String {
+        let digest = self.digest();
+        format!(
+            "[image {} sha256:{}... - recover with retrieve_context {source_ref}]",
+            self.mime_type,
+            &digest[..digest.len().min(IMAGE_DIGEST_CHARS)]
+        )
+    }
+}
+
+/// Hex characters of an image digest shown in a reference.
+const IMAGE_DIGEST_CHARS: usize = 16;
+
 impl ContextEvent {
+    /// One reference line per image the event carries (see
+    /// [`EventImage::reference`]); empty for a text-only event.
+    pub fn image_references(&self) -> Vec<String> {
+        self.images
+            .iter()
+            .map(|image| image.reference(&self.source_ref))
+            .collect()
+    }
+
     /// The provider content of a user event: its text, then its images.
     pub fn user_content(&self) -> Vec<MessageContent> {
         let text = (!self.visible_text.is_empty()).then(|| MessageContent::Text {
@@ -112,6 +146,10 @@ pub(super) fn event_from_message(
         || visible_text.starts_with(crate::BRANCH_SUMMARY_PREFIX);
     let (kind, provenance_kind) = match message.role.as_str() {
         "user" if !summary => match internal_user_message(message) {
+            Some(InternalUserMessage::Reminder) => (
+                ContextEventKind::HarnessReminder,
+                ProvenanceKind::AgentInference,
+            ),
             Some(internal) => (ContextEventKind::Custom, internal.provenance_kind()),
             None => (ContextEventKind::User, ProvenanceKind::UserDecision),
         },
@@ -278,6 +316,21 @@ mod tests {
     }
 
     #[test]
+    fn image_reference_names_mime_digest_and_source() {
+        let image = EventImage {
+            mime_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let line = image.reference("session:e1");
+        assert!(line.starts_with("[image image/png sha256:"), "{line}");
+        assert!(line.contains(&image.digest()[..16]), "{line}");
+        assert!(
+            line.ends_with("recover with retrieve_context session:e1]"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn plain_user_message_is_a_user_decision() {
         assert_eq!(
             classify(&ChatMessage::text("user", "fix the bug")),
@@ -303,7 +356,10 @@ mod tests {
             let message = user_with(json!({ field: "verification_required" }));
             assert_eq!(
                 classify(&message),
-                (ContextEventKind::Custom, ProvenanceKind::AgentInference),
+                (
+                    ContextEventKind::HarnessReminder,
+                    ProvenanceKind::AgentInference
+                ),
                 "{field}"
             );
         }
