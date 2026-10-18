@@ -398,6 +398,17 @@ pub(crate) fn reload_changed_context_files(
 /// Custom-message type of the appended nested-instruction delivery.
 pub const NESTED_INSTRUCTIONS_CUSTOM_TYPE: &str = "davinci.nested_instructions";
 
+/// Directories whose `AGENTS.md` is never delivered as nested instructions.
+const EXCLUDED_INSTRUCTION_DIRS: [&str; 7] = [
+    "node_modules",
+    "vendor",
+    "target",
+    ".git",
+    "dist",
+    "build",
+    "third_party",
+];
+
 /// Every `AGENTS.md` that governs `target`: the repository root's down to the
 /// nearest existing directory of the target, outermost first. Empty when the
 /// target is outside the checkout of `cwd`. Paths are canonical.
@@ -443,8 +454,24 @@ pub(crate) fn governing_instruction_files(cwd: &Path, target: &Path) -> Vec<Cont
     chain.reverse();
     chain
         .into_iter()
+        // Vendored, dependency and build trees hold other people's files: the
+        // chain stops at the first such directory (a fixed list, not
+        // `.gitignore`, so no git process runs per tool call).
+        .take_while(|dir| {
+            dir.strip_prefix(&root).is_ok_and(|relative| {
+                !relative.components().any(|part| {
+                    EXCLUDED_INSTRUCTION_DIRS
+                        .iter()
+                        .any(|name| part.as_os_str() == *name)
+                })
+            })
+        })
         .filter_map(|dir| {
             let path = dir.join(INSTRUCTION_FILE);
+            // A symlinked AGENTS.md that leaves the checkout is not ours to read.
+            if !fs::canonicalize(&path).ok()?.starts_with(&root) {
+                return None;
+            }
             let body = fs::read_to_string(&path).ok()?;
             Some(ContextFile {
                 path,

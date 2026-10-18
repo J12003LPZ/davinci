@@ -318,3 +318,74 @@ fn without_an_edit_the_system_prompt_is_byte_identical() {
         .all(|request| request.system == requests[0].system));
     assert!(requests[0].system.contains("root rules"));
 }
+
+#[test]
+fn vendored_and_build_directories_never_deliver_instructions() {
+    let repo = repository();
+    for dir in [
+        "node_modules/pkg",
+        "sub/vendor/lib",
+        "target/debug",
+        "sub/build",
+    ] {
+        fs::create_dir_all(repo.path().join(dir)).unwrap();
+        fs::write(repo.path().join(dir).join("AGENTS.md"), "vendored rules").unwrap();
+        fs::write(repo.path().join(dir).join("index.js"), "").unwrap();
+    }
+    let mut agent = agent_in(repo.path(), true);
+    let read = |path: &str| ("read", serde_json::json!({"path": path}));
+    let requests = run(
+        &mut agent,
+        vec![
+            read("node_modules/pkg/index.js"),
+            read("sub/vendor/lib/index.js"),
+            read("target/debug/index.js"),
+            read("sub/build/index.js"),
+        ],
+        |_| {},
+    );
+    for request in &requests {
+        assert!(
+            !request.messages.join("\n").contains("vendored rules"),
+            "{:#?}",
+            request.messages
+        );
+    }
+    // `sub/` itself still governs what sits inside its vendored tree.
+    assert_eq!(nested(requests.last().unwrap()).len(), 1);
+    assert!(nested(requests.last().unwrap())[0].contains("sub rules"));
+}
+
+#[test]
+fn a_symlink_leaving_the_checkout_is_not_followed() {
+    let repo = repository();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("AGENTS.md"), "outside rules").unwrap();
+    fs::write(outside.path().join("f.rs"), "").unwrap();
+    let link_dir = repo.path().join("escape");
+    let link_file = repo.path().join("other/AGENTS.md");
+    fs::remove_file(&link_file).unwrap();
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(outside.path(), &link_dir).is_ok()
+        && std::os::unix::fs::symlink(outside.path().join("AGENTS.md"), &link_file).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_dir(outside.path(), &link_dir).is_ok()
+        && std::os::windows::fs::symlink_file(outside.path().join("AGENTS.md"), &link_file).is_ok();
+    if !linked {
+        return; // symlinks need privilege on some hosts
+    }
+    let mut agent = agent_in(repo.path(), true);
+    let read = |path: &str| ("read", serde_json::json!({"path": path}));
+    let requests = run(
+        &mut agent,
+        vec![read("escape/f.rs"), read("other/z.rs")],
+        |_| {},
+    );
+    for request in &requests {
+        assert!(
+            !request.messages.join("\n").contains("outside rules"),
+            "{:#?}",
+            request.messages
+        );
+    }
+}
