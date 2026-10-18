@@ -462,7 +462,7 @@ pub(crate) fn governing_instruction_files(cwd: &Path, target: &Path) -> Vec<Cont
                 !relative.components().any(|part| {
                     EXCLUDED_INSTRUCTION_DIRS
                         .iter()
-                        .any(|name| part.as_os_str() == *name)
+                        .any(|name| part.as_os_str().eq_ignore_ascii_case(name))
                 })
             })
         })

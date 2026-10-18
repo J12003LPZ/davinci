@@ -357,6 +357,35 @@ fn vendored_and_build_directories_never_deliver_instructions() {
 }
 
 #[test]
+fn excluded_directory_names_match_case_insensitively() {
+    // Windows and macOS filesystems are case-insensitive: `Node_Modules` is
+    // the same directory as `node_modules` there.
+    let repo = repository();
+    for dir in ["Node_Modules/pkg", "sub/VENDOR/lib"] {
+        fs::create_dir_all(repo.path().join(dir)).unwrap();
+        fs::write(repo.path().join(dir).join("AGENTS.md"), "vendored rules").unwrap();
+        fs::write(repo.path().join(dir).join("index.js"), "").unwrap();
+    }
+    let mut agent = agent_in(repo.path(), true);
+    let read = |path: &str| ("read", serde_json::json!({"path": path}));
+    let requests = run(
+        &mut agent,
+        vec![
+            read("Node_Modules/pkg/index.js"),
+            read("sub/VENDOR/lib/index.js"),
+        ],
+        |_| {},
+    );
+    for request in &requests {
+        assert!(
+            !request.messages.join("\n").contains("vendored rules"),
+            "{:#?}",
+            request.messages
+        );
+    }
+}
+
+#[test]
 fn a_symlink_leaving_the_checkout_is_not_followed() {
     let repo = repository();
     let outside = tempfile::tempdir().unwrap();

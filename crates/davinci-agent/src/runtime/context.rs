@@ -156,9 +156,7 @@ impl ContextPacket {
 /// neither close nor open a wrapper. All other content is left as written.
 pub fn wrap_untrusted_data(source: &str, content: &str) -> String {
     format!(
-        "<context_data source=\"{}\">
-{}
-</context_data>",
+        "<context_data source=\"{}\">\n{}\n</context_data>",
         escape_attribute(source),
         neutralize_wrapper_tags(content)
     )
