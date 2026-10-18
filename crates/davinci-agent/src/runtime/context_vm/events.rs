@@ -111,8 +111,8 @@ pub(super) fn event_from_message(
     let summary = visible_text.starts_with(crate::COMPACTION_SUMMARY_PREFIX)
         || visible_text.starts_with(crate::BRANCH_SUMMARY_PREFIX);
     let (kind, provenance_kind) = match message.role.as_str() {
-        "user" if !summary => match internal_user_role_provenance(message) {
-            Some(provenance_kind) => (ContextEventKind::Custom, provenance_kind),
+        "user" if !summary => match internal_user_message(message) {
+            Some(internal) => (ContextEventKind::Custom, internal.provenance_kind()),
             None => (ContextEventKind::User, ProvenanceKind::UserDecision),
         },
         "assistant" => (ContextEventKind::Assistant, ProvenanceKind::AgentInference),
@@ -137,15 +137,35 @@ pub(super) fn event_from_message(
 /// blocks completion (`queue_capability_reminder` in turn.rs).
 pub(crate) const CAPABILITY_REMINDER_FIELD: &str = "davinciCapabilityReminder";
 
-/// Provenance of a user-role message the harness wrote, or `None` for words a
-/// person typed. Job notices, capability and completion reminders and any
-/// other `customType` message ride in the user role so the model reads them,
-/// but they are never user requirements: they must not become goals, be
-/// mandatory in the image, or get the user excerpt budget. A message marked
-/// with `REAL_USER_ORIGIN_FIELD` is a person's whatever else it carries;
-/// unmarked plain messages stay user messages (`prompt_with` creates them).
-fn internal_user_role_provenance(message: &ChatMessage) -> Option<ProvenanceKind> {
-    if message.extra_bool(crate::REAL_USER_ORIGIN_FIELD) {
+/// A user-role message the harness wrote rather than a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InternalUserMessage {
+    /// A finished background job (`customType: backgroundJob`).
+    JobNotice,
+    /// A capability or completion reminder.
+    Reminder,
+    /// Any other `customType`.
+    Custom(String),
+}
+
+impl InternalUserMessage {
+    pub(crate) fn provenance_kind(&self) -> ProvenanceKind {
+        match self {
+            Self::JobNotice => ProvenanceKind::ToolEvidence,
+            Self::Reminder | Self::Custom(_) => ProvenanceKind::AgentInference,
+        }
+    }
+}
+
+/// Whether a user-role message came from the harness. Job notices, capability
+/// and completion reminders and any other `customType` message ride in the
+/// user role so the model reads them, but they are never user requirements:
+/// they must not become goals, be mandatory in the image, or get the user
+/// excerpt budget. A message marked with `REAL_USER_ORIGIN_FIELD` is a
+/// person's whatever else it carries; unmarked plain messages stay user
+/// messages (`prompt_with` creates them).
+pub(crate) fn internal_user_message(message: &ChatMessage) -> Option<InternalUserMessage> {
+    if message.role != "user" || message.extra_bool(crate::REAL_USER_ORIGIN_FIELD) {
         return None;
     }
     if message.extra.contains_key(CAPABILITY_REMINDER_FIELD)
@@ -153,11 +173,11 @@ fn internal_user_role_provenance(message: &ChatMessage) -> Option<ProvenanceKind
             .extra
             .contains_key(crate::completion::COMPLETION_REMINDER_FIELD)
     {
-        return Some(ProvenanceKind::AgentInference);
+        return Some(InternalUserMessage::Reminder);
     }
     match message.extra.get("customType").and_then(Value::as_str) {
-        Some(crate::JOB_NOTICE_TYPE) => Some(ProvenanceKind::ToolEvidence),
-        Some(_) => Some(ProvenanceKind::AgentInference),
+        Some(crate::JOB_NOTICE_TYPE) => Some(InternalUserMessage::JobNotice),
+        Some(other) => Some(InternalUserMessage::Custom(other.to_string())),
         None => None,
     }
 }

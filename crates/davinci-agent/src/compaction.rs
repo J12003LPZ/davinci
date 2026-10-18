@@ -625,7 +625,7 @@ fn generate_turn_prefix_summary(
     summarizer: &Summarizer,
 ) -> Result<(String, Usage), String> {
     let max_tokens = (reserve_tokens as f64 * 0.5).floor() as u64;
-    let conversation = serialize_conversation(&convert_to_llm(messages));
+    let conversation = serialize_conversation(&convert_to_llm_for_summary(messages));
     let prompt = format!(
         "<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
     );
@@ -651,7 +651,7 @@ pub fn build_history_prompt(
         base.push_str("\n\nAdditional focus: ");
         base.push_str(instructions);
     }
-    let conversation = serialize_conversation(&convert_to_llm(messages));
+    let conversation = serialize_conversation(&convert_to_llm_for_summary(messages));
     let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
     if let Some(previous) = previous_summary {
         prompt.push_str("<previous-summary>\n");
@@ -929,6 +929,58 @@ pub fn convert_to_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
+/// `extra` key `convert_to_llm_for_summary` sets so `serialize_conversation`
+/// can name a message the harness wrote. It never reaches a provider.
+const SUMMARY_LABEL_KEY: &str = "davinciSummaryLabel";
+
+/// `convert_to_llm` for the summarizer input only. A `custom` message becomes
+/// a user-role message in `convert_to_llm` (the live provider path), which
+/// drops its `customType`; here it keeps a label, so only a person's words
+/// are serialized as `[User]`.
+pub fn convert_to_llm_for_summary(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .flat_map(|source| {
+            let label = (source.role == "custom").then(|| {
+                match source.extra_str("customType").filter(|t| !t.is_empty()) {
+                    Some(kind) => format!("Harness context ({kind})"),
+                    None => "Harness context".to_string(),
+                }
+            });
+            convert_to_llm(std::slice::from_ref(source))
+                .into_iter()
+                .map(move |mut converted| {
+                    if let Some(label) = &label {
+                        converted
+                            .extra
+                            .insert(SUMMARY_LABEL_KEY.into(), label.clone().into());
+                    }
+                    converted
+                })
+        })
+        .collect()
+}
+
+/// The serialization label of a user-role message: `User` only for words a
+/// person typed.
+fn user_role_label(message: &ChatMessage) -> String {
+    if let Some(label) = message.extra_str(SUMMARY_LABEL_KEY) {
+        return label.to_string();
+    }
+    match crate::runtime::context_vm::internal_user_message(message) {
+        Some(crate::runtime::context_vm::InternalUserMessage::JobNotice) => {
+            "Background job notice".into()
+        }
+        Some(crate::runtime::context_vm::InternalUserMessage::Reminder) => {
+            "Harness reminder".into()
+        }
+        Some(crate::runtime::context_vm::InternalUserMessage::Custom(kind)) => {
+            format!("Harness context ({kind})")
+        }
+        None => "User".into(),
+    }
+}
+
 fn bash_execution_to_text(message: &ChatMessage) -> String {
     let command = message.extra_str("command").unwrap_or("");
     let output = message.extra_str("output").unwrap_or("");
@@ -974,7 +1026,7 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
             "user" => {
                 let content = content_text(&message.content);
                 if !content.is_empty() {
-                    parts.push(format!("[User]: {content}"));
+                    parts.push(format!("[{}]: {content}", user_role_label(message)));
                 }
             }
             "assistant" => {
@@ -1237,6 +1289,51 @@ mod tests {
         let text = content_text(&converted[0].content);
         assert!(text.contains("Ran `ls`"));
         assert!(text.contains("[Output truncated. Full output: C:/tmp/full-output.txt]"));
+    }
+
+    #[test]
+    fn only_genuine_user_text_is_labelled_user_in_summarizer_input() {
+        let mut job = ChatMessage::text("user", "Job 3 finished.");
+        job.extra
+            .insert("customType".into(), "backgroundJob".into());
+        let mut reminder = ChatMessage::text("user", "Run the tests.");
+        reminder.extra.insert(
+            "davinciCapabilityReminder".into(),
+            "verification_required".into(),
+        );
+        let mut completion = ChatMessage::text("user", "Completion check.");
+        completion
+            .extra
+            .insert(crate::COMPLETION_REMINDER_FIELD.into(), true.into());
+        let mut custom = ChatMessage::text("custom", "extension said hi");
+        custom.extra.insert("customType".into(), "ext-note".into());
+        let messages = [
+            ChatMessage::text("user", "Please fix the parser."),
+            job,
+            reminder,
+            completion,
+            custom,
+        ];
+        let out = serialize_conversation(&convert_to_llm_for_summary(&messages));
+        assert!(out.contains("[User]: Please fix the parser."), "{out}");
+        assert!(
+            out.contains("[Background job notice]: Job 3 finished."),
+            "{out}"
+        );
+        assert!(out.contains("[Harness reminder]: Run the tests."), "{out}");
+        assert!(
+            out.contains("[Harness reminder]: Completion check."),
+            "{out}"
+        );
+        assert!(
+            out.contains("[Harness context (ext-note)]: extension said hi"),
+            "{out}"
+        );
+        assert_eq!(out.matches("[User]:").count(), 1, "{out}");
+        // The summarizer-only label never reaches the provider conversion.
+        assert!(convert_to_llm(&messages)
+            .iter()
+            .all(|m| !m.extra.contains_key(SUMMARY_LABEL_KEY)));
     }
 
     #[test]

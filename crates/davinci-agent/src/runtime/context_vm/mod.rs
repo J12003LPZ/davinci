@@ -18,6 +18,7 @@ pub use diagnostics::ContextVmFailure;
 pub use events::{
     events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind, EventImage,
 };
+pub(crate) use events::{internal_user_message, InternalUserMessage};
 pub(crate) use fold::fold_request;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
 pub use metrics::ContextVmMetrics;
