@@ -417,6 +417,7 @@ fn compiler_orders_pages_broker_context_and_hot_events() {
             estimated_tokens: 4,
             priority: 10,
             stable_for_cache: true,
+            authority: Default::default(),
             provenance: serde_json::json!({"provenance_kind":"repository_fact"}),
         }],
         estimated_tokens: 4,

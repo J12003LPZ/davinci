@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::events::AgentEvent;
 use crate::tools::execute_tool_with;
 use crate::Agent;
+use crate::InternalPromptOrigin;
 use crate::ToolExecutionMode;
 
 /// Corrective turns allowed per run after a tool call is cut off by the
@@ -478,6 +479,7 @@ impl Agent {
             {
                 self.append_turn_context(None);
             }
+            self.refresh_instruction_context();
 
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
             let hybrid_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Hybrid;
@@ -1166,8 +1168,13 @@ impl Agent {
 
         let maybe_runtime = self.tool_context.runtime.clone();
         if let Some(runtime) = maybe_runtime {
-            for text in runtime.take_labeled_messages(10) {
-                let message = self.prompt_with(&text, &[]);
+            for (text, from_agent) in runtime.take_labeled_deliveries(10) {
+                // Agent reports are evidence; host steering is the user's.
+                let message = if from_agent {
+                    self.prompt_internal(&text, InternalPromptOrigin::ToolEvidence)
+                } else {
+                    self.prompt_with(&text, &[])
+                };
                 let _ = self.pending_prompt_messages.pop();
                 new_messages.push(message.clone());
                 self.push_event(

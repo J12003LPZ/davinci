@@ -153,15 +153,30 @@ impl ContextStateReducer {
             match event.kind {
                 // The exact user text is authoritative. Keeping it as a goal preserves the
                 // prompt reference without asking the deterministic path to infer intent.
-                // An image-only message has no words to keep as a goal.
-                ContextEventKind::User if event.visible_text.trim().is_empty() => {}
-                ContextEventKind::User => push_unique(
-                    &mut state.goals,
-                    StateValue {
-                        value: user_excerpt(&event.visible_text),
-                        provenance: vec![provenance(event, ProvenanceKind::UserDecision)],
-                    },
-                ),
+                // An image-only message has no words to keep, so its goal is the
+                // reference that says how to get the image back.
+                ContextEventKind::User
+                    if event.visible_text.trim().is_empty() && event.images.is_empty() => {}
+                ContextEventKind::User => {
+                    let mut value = if event.visible_text.trim().is_empty() {
+                        String::new()
+                    } else {
+                        user_excerpt(&event.visible_text)
+                    };
+                    for reference in event.image_references() {
+                        if !value.is_empty() {
+                            value.push('\n');
+                        }
+                        value.push_str(&reference);
+                    }
+                    push_unique(
+                        &mut state.goals,
+                        StateValue {
+                            value,
+                            provenance: vec![provenance(event, ProvenanceKind::UserDecision)],
+                        },
+                    )
+                }
                 ContextEventKind::ToolResult
                     if contains_verification_marker(&event.visible_text) =>
                 {
@@ -360,11 +375,15 @@ fn provenance_matches(
         ProvenanceKind::UserDecision => event_kind == ContextEventKind::User,
         ProvenanceKind::ToolEvidence | ProvenanceKind::RepositoryFact => {
             event_kind == ContextEventKind::ToolResult
+                || (event_kind == ContextEventKind::Custom
+                    && event_provenance == ProvenanceKind::ToolEvidence)
         }
         ProvenanceKind::AgentInference => {
             matches!(
                 event_kind,
-                ContextEventKind::Assistant | ContextEventKind::Custom
+                ContextEventKind::Assistant
+                    | ContextEventKind::Custom
+                    | ContextEventKind::HarnessReminder
             )
         }
         ProvenanceKind::MandatoryPolicy => event_provenance == ProvenanceKind::MandatoryPolicy,
@@ -1040,6 +1059,49 @@ mod ledger_tests {
         assert!(goal.starts_with("Design note:"), "{goal}");
         assert!(goal.ends_with("[excerpt; retrieve source]"));
         assert!(goal.len() <= EXCERPT_BYTES);
+    }
+
+    #[test]
+    fn internal_user_role_messages_never_become_goals() {
+        let mut job = ChatMessage::text("user", "Background job 3 finished: cargo test passed.");
+        job.extra.insert(
+            "customType".into(),
+            serde_json::Value::String(crate::JOB_NOTICE_TYPE.into()),
+        );
+        let mut reminder = ChatMessage::text("user", "Run the tests before finishing.");
+        reminder.extra.insert(
+            "davinciCapabilityReminder".into(),
+            serde_json::Value::String("verification_required".into()),
+        );
+        let messages = [
+            ChatMessage::text("user", "Refactor the parser."),
+            job,
+            reminder,
+        ];
+        let events = events_from_messages(&messages);
+        let state = ContextStateReducer::deterministic_delta(&CheckpointState::default(), &events)
+            .checkpoint_patch;
+        let goals: Vec<&str> = state.goals.iter().map(|g| g.value.as_str()).collect();
+        assert_eq!(goals.len(), 1, "{goals:?}");
+        assert!(goals[0].contains("Refactor the parser."));
+    }
+
+    #[test]
+    fn image_only_user_message_leaves_a_reference_goal() {
+        let mut event = events_from_messages(&[ChatMessage::text("user", "x")]).remove(0);
+        event.visible_text.clear();
+        event.source_ref = "session:shot".into();
+        event.images = vec![crate::runtime::context_vm::EventImage::new(
+            "image/png",
+            "AAAA",
+        )];
+        let state = ContextStateReducer::deterministic_delta(&CheckpointState::default(), &[event])
+            .checkpoint_patch;
+        assert_eq!(state.goals.len(), 1);
+        let goal = &state.goals[0].value;
+        assert!(goal.starts_with("[image image/png sha256:"), "{goal}");
+        assert!(goal.contains("retrieve_context session:shot"), "{goal}");
+        assert_eq!(state.goals[0].provenance[0].source_refs, ["session:shot"]);
     }
 
     #[test]

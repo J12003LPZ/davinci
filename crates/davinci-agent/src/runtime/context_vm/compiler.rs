@@ -66,9 +66,20 @@ impl ContextCompiler {
             .rev()
             .find(|event| event.kind == ContextEventKind::User);
         let newest = request.hot_events.last();
-        let required = |event: &ContextEvent| {
+        // The newest harness reminder is not a user turn, but the completion
+        // overlay looks for it: admit it like the latest user turn, without
+        // marking it mandatory in the image.
+        let latest_reminder = request
+            .hot_events
+            .iter()
+            .rev()
+            .find(|event| event.kind == ContextEventKind::HarnessReminder);
+        let pinned = |event: &ContextEvent| {
             latest_user.is_some_and(|last| last.source_ref == event.source_ref)
                 || newest.is_some_and(|last| last.source_ref == event.source_ref)
+        };
+        let required = |event: &ContextEvent| {
+            pinned(event) || latest_reminder.is_some_and(|last| last.source_ref == event.source_ref)
         };
         let mut selected_hot = request
             .hot_events
@@ -195,7 +206,7 @@ impl ContextCompiler {
             .collect::<HashSet<_>>();
         for event in selected_from_tail {
             let mut entry = event_entry(event);
-            entry.mandatory |= required(event);
+            entry.mandatory |= pinned(event);
             messages.push(event_message(event));
             entries.push(entry);
         }
@@ -320,6 +331,7 @@ fn event_entry(event: &ContextEvent) -> ContextImageEntry {
         ContextEventKind::Assistant => "hot_assistant",
         ContextEventKind::ToolResult => "hot_tool_result",
         ContextEventKind::Custom => "hot_custom",
+        ContextEventKind::HarnessReminder => "hot_harness_reminder",
     };
     ContextImageEntry {
         id: event.source_ref.clone(),
@@ -327,7 +339,10 @@ fn event_entry(event: &ContextEvent) -> ContextImageEntry {
         provenance_kind: event.provenance_kind,
         source_ref: event.source_ref.clone(),
         content_hash: event.content_hash.clone(),
-        content: wrap_untrusted_data(&event.source_ref, &event.visible_text),
+        content: match event.kind {
+            ContextEventKind::HarnessReminder => event.visible_text.clone(),
+            _ => wrap_untrusted_data(&event.source_ref, &event.visible_text),
+        },
         estimated_tokens: hot_entry_tokens(event),
         mandatory: matches!(event.kind, ContextEventKind::User),
         stable_for_cache: false,
@@ -340,6 +355,8 @@ fn event_message(event: &ContextEvent) -> ChatMessage {
         ContextEventKind::Assistant => "assistant",
         ContextEventKind::ToolResult => "custom",
         ContextEventKind::Custom => "custom",
+        // Stays in the user turn so user/assistant turns keep alternating.
+        ContextEventKind::HarnessReminder => "user",
     };
     if matches!(
         event.kind,
@@ -538,7 +555,10 @@ fn broker_provenance(item: &ContextItem) -> ProvenanceKind {
             "user_decision" => Some(ProvenanceKind::UserDecision),
             "repository_fact" => Some(ProvenanceKind::RepositoryFact),
             "tool_evidence" => Some(ProvenanceKind::ToolEvidence),
-            "mandatory_policy" => Some(ProvenanceKind::MandatoryPolicy),
+            // A label a source can write; only host-assigned authority earns it.
+            "mandatory_policy" => item
+                .is_mandatory()
+                .then_some(ProvenanceKind::MandatoryPolicy),
             "agent_inference" => Some(ProvenanceKind::AgentInference),
             _ => None,
         })

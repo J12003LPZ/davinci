@@ -25,6 +25,7 @@ mod events;
 mod evidence;
 mod file_mutation_queue;
 mod images;
+mod instruction_files;
 pub mod jobs;
 pub mod mcp;
 pub mod notebook;
@@ -78,9 +79,9 @@ pub use compaction::{
 };
 pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
-    load_context_files, load_context_files_for_targets, repository_root, ContextBudgetReport,
-    ContextContribution, ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
-    INSTRUCTION_FILE,
+    context_file_charges, load_context_files, load_context_files_for_targets, repository_root,
+    ContextBudgetReport, ContextContribution, ContextFile, ContextPriority, RootContextAccount,
+    SelectedRootContext, INSTRUCTION_FILE,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
@@ -153,8 +154,8 @@ pub use runtime::{
     AgentId, AgentKind, AgentLaunchDisposition, AgentOperationAdapter, AgentOperationError,
     AgentOperationHandle, AgentRecord, AgentState, CacheIdentity, CacheMissReason,
     CancellationToken, CapabilitySource, ChildExecutionContext, ChildExecutionKind,
-    ConcurrencyPolicy, ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource,
-    ContextVmMode, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
+    ConcurrencyPolicy, ContextAuthority, ContextBroker, ContextItem, ContextPacket, ContextRequest,
+    ContextSource, ContextVmMode, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
     ExecutorCapabilities, OperationAttempt, OperationSpec, OperationState, OutputPolicy,
     PhaseStatus, PreparedAction, RegistryError, ReplayPolicy, RunId, RuntimeBus, RuntimeCapability,
     RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle,
@@ -517,6 +518,14 @@ pub struct Agent {
     pub agent_profiles: Vec<(String, String)>,
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
+    /// Set by `load_instruction_files`: the host loaded `context_files` from
+    /// disk, so edits and nested files are kept current (false under
+    /// `--no-context-files`, and for files a caller assigned by hand).
+    pub instruction_files_enabled: bool,
+    pub(crate) context_file_stamps: std::collections::HashMap<PathBuf, context::FileStamp>,
+    /// Where an `AGENTS.md` could sit from the repository root to `cwd`, set
+    /// at load, so one created mid-session is noticed.
+    pub(crate) instruction_chain: Vec<PathBuf>,
     pub session: Option<JsonlSession>,
     pub(crate) prompt_rewind: runtime::rewind::PromptRewindState,
     pub cwd: PathBuf,
@@ -637,6 +646,10 @@ pub struct Agent {
     /// Context supplied by extensions for the next provider request only.
     /// These messages never enter the persisted session history.
     ephemeral_context: Vec<ChatMessage>,
+    /// User-owned pin/exclude/correction preferences for broker context.
+    /// Hosts set it with [`Agent::set_context_overlay`]; it is part of the
+    /// prepared-image revision.
+    context_overlay: Option<runtime::ContextOverlay>,
     /// Tests and hosts may force a placement; `None` follows the route family.
     pub turn_context_placement_override: Option<turn_context::TurnContextPlacement>,
     /// Per-turn prompt state prepared for the next `commit_turn_context`.
@@ -727,6 +740,9 @@ impl Agent {
             agent_profiles: Vec::new(),
             templates: Vec::new(),
             context_files: Vec::new(),
+            instruction_files_enabled: false,
+            context_file_stamps: std::collections::HashMap::new(),
+            instruction_chain: Vec::new(),
             session: None,
             prompt_rewind: runtime::rewind::PromptRewindState::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -805,6 +821,7 @@ impl Agent {
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
+            context_overlay: None,
             turn_context_placement_override: None,
             turn_state_pending: None,
             provider_context_overhead_tokens: None,
@@ -1694,6 +1711,20 @@ impl Agent {
         self.ephemeral_context = messages;
     }
 
+    /// Install the user-owned context overlay applied to broker context in the
+    /// active Context VM path and recorded in the context manifest. The
+    /// prepared image is invalidated so the next request recompiles.
+    pub fn set_context_overlay(&mut self, overlay: Option<runtime::ContextOverlay>) {
+        if self.context_overlay != overlay {
+            self.context_overlay = overlay;
+            self.invalidate_context_image();
+        }
+    }
+
+    pub fn context_overlay(&self) -> Option<&runtime::ContextOverlay> {
+        self.context_overlay.as_ref()
+    }
+
     pub fn turn_context_placement(&self) -> turn_context::TurnContextPlacement {
         self.turn_context_placement_override
             .unwrap_or_else(|| turn_context::default_placement(&self.provider, &self.model_id))
@@ -2019,7 +2050,7 @@ impl Agent {
         } else {
             self.begin_completion_prompt(text);
         }
-        let message = self.prompt_with_origin(text, images, true, correction);
+        let message = self.prompt_with_origin(text, images, true, correction, None);
         if let (Some(runtime), Some(budget)) = (&self.runtime, &self.root_budget) {
             let admitted = budget.snapshot().is_ok_and(|snapshot| {
                 !snapshot.halted
@@ -2043,7 +2074,14 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
-        self.prompt_with_origin(text, images, false, false)
+        self.prompt_with_origin(text, images, false, false, None)
+    }
+
+    /// A user-role prompt the harness wrote (agent mailbox text, validator
+    /// repair prompts). It is marked at creation, so the Context VM never
+    /// treats it as a user goal or mandatory entry.
+    pub fn prompt_internal(&mut self, text: &str, origin: InternalPromptOrigin) -> ChatMessage {
+        self.prompt_with_origin(text, &[], false, false, Some(origin))
     }
 
     fn prompt_with_origin(
@@ -2052,6 +2090,7 @@ impl Agent {
         images: &[davinci_ai::MessageContent],
         real_user_origin: bool,
         correction: bool,
+        internal: Option<InternalPromptOrigin>,
     ) -> ChatMessage {
         self.flush_pending_bash_messages();
         // A job that finished while the user was typing is in context
@@ -2080,6 +2119,12 @@ impl Agent {
             content,
             ..ChatMessage::default()
         };
+        if let Some(origin) = internal {
+            message.extra.insert(
+                INTERNAL_PROMPT_FIELD.into(),
+                Value::String(origin.as_str().into()),
+            );
+        }
         if real_user_origin {
             message.extra.insert(
                 "davinciRequirementCorrection".into(),
@@ -2191,7 +2236,14 @@ impl Agent {
         // cached prefix. A copy in the image sent every one twice and, at
         // optional priority, could be paged out from under the system copy.
         let mut items = Vec::new();
+        // Ephemeral messages with non-text parts (images) cannot become text
+        // broker items: they reach the provider as messages, as in legacy mode.
+        let mut native_ephemeral = Vec::new();
         for (index, message) in selected.ephemeral_messages.iter().enumerate() {
+            if let Some(message) = native_ephemeral_message(index, message) {
+                native_ephemeral.push((index, message));
+                continue;
+            }
             let content = davinci_ai::content_text(&message.content);
             items.push(runtime::ContextItem {
                 source: format!("ephemeral_context::{index}"),
@@ -2199,6 +2251,7 @@ impl Agent {
                 content,
                 priority: 200,
                 stable_for_cache: false,
+                authority: Default::default(),
                 provenance: serde_json::json!({"provenance_kind":"tool_evidence"}),
             });
         }
@@ -2209,6 +2262,7 @@ impl Agent {
                 content: plan,
                 priority: 500,
                 stable_for_cache: true,
+                authority: Default::default(),
                 provenance: serde_json::json!({"provenance_kind":"user_decision"}),
             });
         }
@@ -2223,7 +2277,13 @@ impl Agent {
             .iter()
             .map(|overlay| provider_budget::message_token_ceiling(&overlay.message))
             .fold(0u64, u64::saturating_add);
-        let transient_tokens = live_tokens.saturating_add(completion_tokens);
+        let ephemeral_tokens = native_ephemeral
+            .iter()
+            .map(|(_, message)| provider_budget::message_token_ceiling(message))
+            .fold(0u64, u64::saturating_add);
+        let transient_tokens = live_tokens
+            .saturating_add(completion_tokens)
+            .saturating_add(ephemeral_tokens);
         if budget.reserved().saturating_add(transient_tokens) >= budget.window {
             return Err(runtime::context_vm::CONTEXT_BUDGET_EXCEEDED.into());
         }
@@ -2253,7 +2313,9 @@ impl Agent {
             max_tokens.saturating_sub(direct_tokens),
             runtime::AgentKind::Main,
         );
-        let (broker_packet, ledger) = runtime.context_broker.build_context_with_ledger(&request);
+        let (broker_packet, ledger) = runtime
+            .context_broker
+            .build_context_with_overlay(&request, self.context_overlay.as_ref());
         let mut all_items = items;
         all_items.extend(broker_packet.items);
         // The legacy broker remains bounded. Mandatory candidates omitted by
@@ -2274,6 +2336,41 @@ impl Agent {
         if self.block_images {
             image.messages = apply_block_images(&image.messages);
         }
+        // Splice before the latest user message, where legacy mode places them.
+        let insertion = image
+            .messages
+            .iter()
+            .rposition(|message| message.role == "user")
+            .unwrap_or(image.messages.len());
+        // Entries and messages stay index-aligned: a completion reminder
+        // replaces `messages[i]` where it finds the marker at `entries[i]`.
+        debug_assert_eq!(image.entries.len(), image.messages.len());
+        let mut spliced = Vec::new();
+        let mut spliced_entries = Vec::new();
+        for (index, message) in &native_ephemeral {
+            let converted =
+                convert_to_llm_for_provider(std::slice::from_ref(message), self.block_images);
+            for message in converted {
+                let content = serde_json::to_string(&message).map_err(|e| e.to_string())?;
+                let tokens = provider_budget::message_token_ceiling(&message);
+                spliced_entries.push(runtime::ContextImageEntry {
+                    id: format!("ephemeral-native:{index}"),
+                    source_ref: format!("ephemeral_context::{index}"),
+                    category: "ephemeral_native".into(),
+                    // Extension-supplied evidence; never user or policy authority.
+                    provenance_kind: runtime::context_manifest::ProvenanceKind::ToolEvidence,
+                    content_hash: runtime::cache::digest(content.as_bytes()),
+                    estimated_tokens: tokens,
+                    content,
+                    mandatory: false,
+                    stable_for_cache: false,
+                });
+                image.estimated_tokens = image.estimated_tokens.saturating_add(tokens);
+                spliced.push(message);
+            }
+        }
+        image.messages.splice(insertion..insertion, spliced);
+        image.entries.splice(insertion..insertion, spliced_entries);
         // The most recent, complete tool exchange remains protocol data. Older
         // exchanges are evidence only. Reserve this suffix before compilation.
         for (index, message) in live.iter().enumerate() {
@@ -2302,13 +2399,85 @@ impl Agent {
             .unwrap_or_default()
     }
 
+    /// Where the trailing nested-instructions messages begin. They are
+    /// appended right after the tool results, on the request that delivers
+    /// them.
+    fn nested_tail_start(&self) -> usize {
+        self.messages
+            .iter()
+            .rposition(|m| {
+                m.role != "custom"
+                    || m.extra_str("customType") != Some(context::NESTED_INSTRUCTIONS_CUSTOM_TYPE)
+            })
+            .map_or(0, |last| last + 1)
+    }
+
+    /// End of the tool exchange proper. Nested instructions ride in the live
+    /// suffix after the pair (a user-side message, so the cached system prefix
+    /// is untouched) and do not unpair the exchange, which would fall back to
+    /// evidence text. Being in the suffix they stay out of the ledger's events
+    /// with the pair, so the next request, where the pair is history, only
+    /// appends. The suffix is reserved outside the compile, though, so when
+    /// it would not fit the window they are left to the history as ordinary
+    /// events (the exchange then loses its native pairing for that request)
+    /// rather than failing a request that compiles without them. The host's
+    /// other boundary injections are not skipped here.
+    fn live_tool_exchange_end(&self) -> usize {
+        let end = self.nested_tail_start();
+        if end == self.messages.len() || self.live_suffix_fits(end) {
+            end
+        } else {
+            self.messages.len()
+        }
+    }
+
+    /// Whether the live suffix with its nested tail leaves room in the window.
+    fn live_suffix_fits(&self, end: usize) -> bool {
+        let Some(start) = self.live_tool_exchange_start_at(end) else {
+            return true;
+        };
+        let live = convert_to_llm_for_provider(&self.messages[start..], self.block_images)
+            .iter()
+            .map(provider_budget::message_token_ceiling)
+            .fold(0u64, u64::saturating_add);
+        let completion = self
+            .completion_context
+            .iter()
+            .map(|overlay| provider_budget::message_token_ceiling(&overlay.message))
+            .fold(0u64, u64::saturating_add);
+        let ephemeral = self
+            .select_root_context(self.context_window)
+            .ephemeral_messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| native_ephemeral_message(index, message))
+            .map(|message| provider_budget::message_token_ceiling(&message))
+            .fold(0u64, u64::saturating_add);
+        let budget = self.provider_context_budget();
+        budget
+            .reserved()
+            .saturating_add(live)
+            .saturating_add(completion)
+            .saturating_add(ephemeral)
+            < budget.window
+    }
+
     /// Index of the assistant message that opens a complete, well-formed
     /// trailing tool exchange, if the transcript ends with one.
     fn live_tool_exchange_start(&self) -> Option<usize> {
-        if self.messages.last().is_none_or(|m| m.role != "toolResult") {
+        self.live_tool_exchange_start_at(self.live_tool_exchange_end())
+    }
+
+    fn live_tool_exchange_start_at(&self, end: usize) -> Option<usize> {
+        if self.messages[..end]
+            .last()
+            .is_none_or(|m| m.role != "toolResult")
+        {
             return None;
         }
-        let start = self.messages.iter().rposition(|m| m.role == "assistant")?;
+        let start = self.messages[..end]
+            .iter()
+            .rposition(|m| m.role == "assistant")?;
         let mut calls = std::collections::HashSet::new();
         for content in &self.messages[start].content {
             if let MessageContent::ToolCall { id, .. } = content {
@@ -2317,7 +2486,7 @@ impl Agent {
                 }
             }
         }
-        let results = &self.messages[start + 1..];
+        let results = &self.messages[start + 1..end];
         let ids = results
             .iter()
             .filter_map(|m| m.tool_call_id.as_deref())
@@ -2692,6 +2861,12 @@ impl Agent {
         use runtime::context_manifest::{
             ContextManifestEntry, PreparedContextManifest, ProvenanceKind,
         };
+        // The installed overlay is the one the image is compiled with, so its
+        // revision is the one the manifest reports and invalidates on.
+        let overlay_revision = self
+            .context_overlay
+            .as_ref()
+            .map_or(overlay_revision, |overlay| overlay.revision);
         if self.prepared_manifest_revisions != (source_revision, overlay_revision) {
             self.prepared_manifest_revisions = (source_revision, overlay_revision);
             self.invalidate_context_image();
@@ -4809,6 +4984,27 @@ fn drop_live_exchange_events(
     }
 }
 
+/// An ephemeral message with non-text parts (images), wrapped for the
+/// provider. Extension-supplied evidence: text parts are wrapped as untrusted
+/// data like text-only ephemeral messages; images are kept. None for a
+/// text-only message, which becomes a broker item instead.
+fn native_ephemeral_message(index: usize, message: &ChatMessage) -> Option<ChatMessage> {
+    if message
+        .content
+        .iter()
+        .all(|part| matches!(part, MessageContent::Text { .. }))
+    {
+        return None;
+    }
+    let mut message = message.clone();
+    for part in &mut message.content {
+        if let MessageContent::Text { text } = part {
+            *text = runtime::wrap_untrusted_data(&format!("ephemeral_context::{index}"), text);
+        }
+    }
+    Some(message)
+}
+
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {
     davinci_session::build_context_entries(&session.entries, session.leaf_id.as_deref())
         .into_iter()
@@ -4878,7 +5074,30 @@ impl From<AssistantMessage> for CompleteOutput {
 /// The `customType` of the user message that tells the model a background
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
-const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+pub(crate) const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+
+/// `extra` field on a user-role prompt the harness wrote (see
+/// [`Agent::prompt_internal`]); its value is [`InternalPromptOrigin::as_str`].
+/// A dedicated field, not `customType`, so provider conversion is unchanged.
+pub(crate) const INTERNAL_PROMPT_FIELD: &str = "davinciInternalPrompt";
+
+/// What an internal prompt is, which decides how the Context VM files it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalPromptOrigin {
+    /// Text from another agent or a background source: evidence, not a goal.
+    ToolEvidence,
+    /// The harness's own words, such as validator diagnostics.
+    AgentInference,
+}
+
+impl InternalPromptOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolEvidence => "tool_evidence",
+            Self::AgentInference => "agent_inference",
+        }
+    }
+}
 
 /// User authority comes from the selected WAL branch, not the compacted
 /// provider projection. Summaries, tool output and abandoned branches cannot

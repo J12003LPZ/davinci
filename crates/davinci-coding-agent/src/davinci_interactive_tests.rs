@@ -3748,13 +3748,13 @@ fn context_inspect_opens_the_manifest_sheet() {
 }
 
 #[test]
-fn team_wake_text_drains_teammate_reports_into_one_prompt() {
+fn team_wake_drains_teammate_reports_as_tool_evidence() {
     use davinci_agent::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
     let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
     let lead = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
     lead.ensure_lead_registered("p", "m", std::path::Path::new("."));
     agent.set_runtime(lead.clone());
-    assert!(team_wake_text(&agent).is_none());
+    assert!(!prompt_team_wake(&mut agent));
     lead.mailbox
         .send(davinci_agent::runtime::AgentMessage::new(
             lead.run_id,
@@ -3763,10 +3763,54 @@ fn team_wake_text_drains_teammate_reports_into_one_prompt() {
             "status: completed\n\nfound the bug",
         ))
         .unwrap();
-    let text = team_wake_text(&agent).unwrap();
+    assert!(prompt_team_wake(&mut agent));
+    let message = agent.messages.last().unwrap();
+    let text = davinci_ai::content_text(&message.content);
     assert!(text.contains("found the bug"));
     assert!(text.contains("<agent-message"));
-    assert!(team_wake_text(&agent).is_none());
+    assert_eq!(
+        message.extra.get("davinciInternalPrompt"),
+        Some(&json!("tool_evidence"))
+    );
+    assert!(!prompt_team_wake(&mut agent));
+}
+
+#[test]
+fn team_wake_keeps_host_steering_a_user_message() {
+    use davinci_agent::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let lead = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    lead.ensure_lead_registered("p", "m", std::path::Path::new("."));
+    agent.set_runtime(lead.clone());
+    let generation = lead.registry.get_generation(&lead.agent_id);
+    lead.mailbox
+        .send_steer(
+            lead.agent_id,
+            generation,
+            "switch to the other plan".into(),
+            false,
+        )
+        .unwrap();
+    lead.mailbox
+        .send(davinci_agent::runtime::AgentMessage::new(
+            lead.run_id,
+            lead.agent_id,
+            lead.agent_id,
+            "status: completed\n\nfound the bug",
+        ))
+        .unwrap();
+    assert!(prompt_team_wake(&mut agent));
+    let internal = |text: &str| {
+        let message = agent
+            .messages
+            .iter()
+            .find(|m| davinci_ai::content_text(&m.content).contains(text))
+            .unwrap_or_else(|| panic!("no message with {text}: {:?}", agent.messages));
+        assert_eq!(message.role, "user");
+        message.extra.get("davinciInternalPrompt").cloned()
+    };
+    assert_eq!(internal("switch to the other plan"), None);
+    assert_eq!(internal("found the bug"), Some(json!("tool_evidence")));
 }
 
 #[test]
@@ -4028,6 +4072,35 @@ fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
         m.workflows.as_ref().unwrap().level,
         davinci_tui::davinci::model::WorkflowLevel::Agents
     );
+}
+
+#[test]
+fn interactive_session_commands_replace_the_plugin_session_start_context() {
+    use crate::slash::SlashAction;
+    use crate::tests::SessionStartPlugin;
+    let Some(_plugin) = SessionStartPlugin::install() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new("session start fixture");
+    agent.cwd = dir.path().into();
+    let first =
+        davinci_session::JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None)
+            .unwrap();
+    davinci_coding_agent::plugins::load_session(&mut agent, first).unwrap();
+    let mut m = model();
+    let mut seen = vec![SessionStartPlugin::session_id(&agent)];
+    for action in [SlashAction::NewSession, SlashAction::Clone] {
+        perform(&crate::Args::default(), &mut agent, &mut m, action).unwrap();
+        let id = SessionStartPlugin::session_id(&agent);
+        assert!(!seen.contains(&id), "{id} is a new session");
+        assert_eq!(
+            SessionStartPlugin::context_session_ids(&agent),
+            [id.clone()],
+            "stale plugin context survived the switch"
+        );
+        seen.push(id);
+    }
 }
 
 #[test]

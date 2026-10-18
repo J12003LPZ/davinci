@@ -18,6 +18,7 @@ pub use diagnostics::ContextVmFailure;
 pub use events::{
     events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind, EventImage,
 };
+pub(crate) use events::{internal_user_message, InternalUserMessage};
 pub(crate) use fold::fold_request;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
 pub use metrics::ContextVmMetrics;
@@ -87,6 +88,8 @@ pub struct ContextVmRuntime {
     /// Text of sources the state still cites that a rewritten sessionless
     /// transcript no longer holds; see [`Self::rebase`].
     retained_sources: Arc<RwLock<HashMap<String, String>>>,
+    /// Image bytes of sessionless sources, within a byte bound.
+    source_images: Arc<RwLock<sources::SourceImages>>,
     session_source: Arc<RwLock<Option<sources::SessionSource>>>,
     source_index: Arc<std::sync::Mutex<sources::SourceIndex>>,
     metrics: Arc<RwLock<ContextVmMetrics>>,
@@ -112,6 +115,7 @@ impl ContextVmRuntime {
             events: Arc::new(RwLock::new(Vec::new())),
             source_contents: Arc::new(RwLock::new(HashMap::new())),
             retained_sources: Arc::default(),
+            source_images: Arc::default(),
             session_source: Arc::new(RwLock::new(None)),
             source_index: Arc::default(),
             metrics,
@@ -227,12 +231,13 @@ impl ContextVmRuntime {
     }
 
     fn rebuild_inner(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
-        self.record_events(events);
-        // A state rebuilt from `events` cites only `events`.
+        // A state rebuilt from `events` cites only `events`. Cleared first
+        // so no retained source keeps its images through the rebuild.
         self.retained_sources
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
+        self.record_events(events);
         let parent = CheckpointState::default();
         let delta = ContextStateReducer::deterministic_delta(&parent, events);
         let checkpoint = self.save_page(&ContextObject::Checkpoint(delta.checkpoint_patch))?;
@@ -554,6 +559,13 @@ impl ContextVmRuntime {
                 cited.extend(episode.source_refs);
             }
         }
+        let retained_images =
+            self.source_images
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .subset(cited.iter().filter(|source_ref| {
+                    !events.iter().any(|event| &&event.source_ref == source_ref)
+                }));
         let retained = {
             let contents = self
                 .source_contents
@@ -582,6 +594,10 @@ impl ContextVmRuntime {
         state.through_seq = through;
         let checkpoint = self.save_page(&ContextObject::Checkpoint(state))?;
         self.record_events(events);
+        self.source_images
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .absorb(retained_images);
         *self
             .retained_sources
             .write()
@@ -800,9 +816,33 @@ impl ContextVmRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
         contents.clear();
+        let held = |event: &ContextEvent| !disk_backed || !event.source_ref.starts_with("session:");
+        // Images are held incrementally: a source seen before keeps its
+        // bytes (no deep clone per call). Only a rewrite that removed a held
+        // source rebuilds the set, so the byte bound is applied in order.
+        let mut images = self
+            .source_images
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        // Sources a rebase kept for the state to cite are live too: their
+        // retained images must survive the appends that follow it.
+        let retained = self
+            .retained_sources
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let live = events
+            .iter()
+            .filter(|event| held(event))
+            .map(|event| event.source_ref.as_str())
+            .chain(retained.keys().map(String::as_str))
+            .collect::<std::collections::HashSet<_>>();
+        if images.holds_source_outside(&live) {
+            *images = sources::SourceImages::default();
+        }
         for event in events {
-            if !disk_backed || !event.source_ref.starts_with("session:") {
+            if held(event) {
                 contents.insert(event.source_ref.clone(), event.visible_text.clone());
+                images.insert(&event.source_ref, &event.images);
             }
         }
         diverged
@@ -1044,6 +1084,30 @@ mod persistence_tests {
             previous = Some(image.messages);
         }
         changes
+    }
+
+    #[test]
+    fn source_images_are_kept_across_calls_not_rebuilt() {
+        let vm = vm();
+        let mut shot = ChatMessage::text("user", "look at this");
+        shot.content.push(davinci_ai::MessageContent::Image {
+            data: "AAAA".repeat(64),
+            mime_type: "image/png".into(),
+        });
+        let mut messages = vec![shot];
+        let events = events_from_messages(&messages);
+        let source = events[0].source_ref.clone();
+        vm.record_events(&events);
+        let held = |vm: &ContextVmRuntime| vm.source_images.read().unwrap().data_ptr(&source);
+        let first = held(&vm).expect("the image is held");
+
+        messages.push(ChatMessage::text("user", "and then"));
+        vm.record_events(&events_from_messages(&messages));
+        assert_eq!(held(&vm), Some(first), "the held bytes were copied again");
+
+        // A rewrite that drops the source drops its images with it.
+        vm.record_events(&events_from_messages(&[ChatMessage::text("user", "fresh")]));
+        assert_eq!(held(&vm), None);
     }
 
     #[test]

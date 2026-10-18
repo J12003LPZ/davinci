@@ -62,7 +62,8 @@ pub use checkpoints::{
     MAX_BLOB_BYTES, MAX_TASK_BLOBS_BYTES,
 };
 pub use context::{
-    wrap_untrusted_data, ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource,
+    wrap_untrusted_data, ContextAuthority, ContextBroker, ContextItem, ContextPacket,
+    ContextRequest, ContextSource,
 };
 pub use context_manifest::{
     overlay_application, ContextManifestEntry, PreparedContextManifest, ProvenanceKind,
@@ -195,6 +196,16 @@ impl RuntimeHandle {
     /// plain text exactly as before this change. Agents cannot forge that
     /// path: `agent_message` always sends from the caller's registered id.
     pub fn take_labeled_messages(&self, limit: usize) -> Vec<String> {
+        self.take_labeled_deliveries(limit)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    /// [`take_labeled_messages`](Self::take_labeled_messages) with, for each
+    /// text, whether another registered agent sent it (`true`) rather than
+    /// the host steering on the user's behalf (`false`).
+    pub fn take_labeled_deliveries(&self, limit: usize) -> Vec<(String, bool)> {
         let mut labeled = Vec::new();
         for msg in self.mailbox.drain(self.agent_id, limit) {
             let generation = self.registry.get_generation(&self.agent_id);
@@ -205,11 +216,11 @@ impl RuntimeHandle {
                 continue;
             }
             match self.registry.get(&msg.from) {
-                Some(sender) => labeled.push(team::format_agent_message(
-                    &msg,
-                    Some((sender.name.as_str(), sender.kind)),
+                Some(sender) => labeled.push((
+                    team::format_agent_message(&msg, Some((sender.name.as_str(), sender.kind))),
+                    true,
                 )),
-                None => labeled.push(msg.content.clone()),
+                None => labeled.push((msg.content.clone(), false)),
             }
         }
         labeled

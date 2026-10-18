@@ -550,10 +550,10 @@ impl Agent {
                 .estimated_tokens
                 .saturating_add(entry.estimated_tokens);
             let marker_index = overlay.marker_source_ref.as_ref().and_then(|source| {
-                image
-                    .entries
-                    .iter()
-                    .position(|entry| &entry.source_ref == source && entry.category == "hot_user")
+                image.entries.iter().position(|entry| {
+                    &entry.source_ref == source
+                        && matches!(entry.category.as_str(), "hot_user" | "hot_harness_reminder")
+                })
             });
             if let Some(marker_index) = marker_index {
                 image.estimated_tokens = image

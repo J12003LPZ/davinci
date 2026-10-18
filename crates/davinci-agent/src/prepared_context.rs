@@ -75,6 +75,26 @@ impl Agent {
         out.feed(&self.provider_tool_schema_identity());
         out.feed(&self.visible_tool_names());
         out.feed(&self.plan_provider_context());
+        if let Some(overlay) = &self.context_overlay {
+            // Sorted so the hash is independent of set iteration order.
+            fn sorted(ids: &std::collections::HashSet<String>) -> Vec<&String> {
+                let mut ids = ids.iter().collect::<Vec<_>>();
+                ids.sort();
+                ids
+            }
+            out.feed(&(
+                overlay.revision,
+                sorted(&overlay.pinned_ids),
+                sorted(&overlay.excluded_ids),
+                sorted(&overlay.tombstones),
+                overlay
+                    .memory_corrections
+                    .iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            ));
+        } else {
+            out.feed(&"no-overlay");
+        }
         if let Some(runtime) = &self.runtime {
             out.feed(&(
                 runtime.run_id,

@@ -24,6 +24,29 @@ fn prepared_context_is_reused_and_every_input_change_invalidates_it() {
     agent.set_permission_mode(davinci_agent::PermissionMode::ReadOnly);
     let permission_changed = agent.prepared_context_image().unwrap();
     assert!(!std::sync::Arc::ptr_eq(&overlay, &permission_changed));
+    let mut overlay_v1 = davinci_agent::runtime::ContextOverlay::new(1);
+    overlay_v1.exclude("item", false, true).unwrap();
+    agent.set_context_overlay(Some(overlay_v1.clone()));
+    let with_overlay = agent.prepared_context_image().unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&permission_changed, &with_overlay));
+    // Installing an equal overlay changes nothing.
+    agent.set_context_overlay(Some(overlay_v1.clone()));
+    assert!(std::sync::Arc::ptr_eq(
+        &with_overlay,
+        &agent.prepared_context_image().unwrap()
+    ));
+    // A new revision, and new content at the same revision, both recompile.
+    overlay_v1.add_correction("item", "fixed");
+    agent.set_context_overlay(Some(overlay_v1.clone()));
+    let revised = agent.prepared_context_image().unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&with_overlay, &revised));
+    let mut same_revision = overlay_v1.clone();
+    same_revision.pinned_ids.insert("other".into());
+    agent.set_context_overlay(Some(same_revision));
+    assert!(!std::sync::Arc::ptr_eq(
+        &revised,
+        &agent.prepared_context_image().unwrap()
+    ));
     assert_eq!(
         agent
             .runtime
@@ -32,8 +55,102 @@ fn prepared_context_is_reused_and_every_input_change_invalidates_it() {
             .context_vm
             .metrics()
             .images_compiled,
-        4
+        7
     );
+}
+
+struct FixedItems(Vec<davinci_agent::ContextItem>);
+impl davinci_agent::ContextSource for FixedItems {
+    fn collect(&self, _request: &davinci_agent::ContextRequest) -> Vec<davinci_agent::ContextItem> {
+        self.0.clone()
+    }
+}
+
+fn broker_item(id: &str, text: &str, bytes: usize, priority: i32) -> davinci_agent::ContextItem {
+    davinci_agent::ContextItem {
+        source: format!("memory-{id}"),
+        content: format!("{text}{}", "x".repeat(bytes)),
+        estimated_tokens: bytes as u64,
+        priority,
+        stable_for_cache: false,
+        authority: Default::default(),
+        provenance: serde_json::json!({ "id": id }),
+    }
+}
+
+fn agent_with_items(items: Vec<davinci_agent::ContextItem>) -> Agent {
+    let mut agent = Agent::new("system");
+    let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    runtime
+        .context_broker
+        .register_context_source(std::sync::Arc::new(FixedItems(items)));
+    agent.set_runtime(runtime);
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.context_window = 200_000;
+    agent.messages.push(ChatMessage::text("user", "hello"));
+    agent
+}
+
+fn image_text(agent: &Agent) -> String {
+    let image = agent.prepared_context_image().unwrap();
+    serde_json::to_string(&image.messages).unwrap()
+}
+
+#[test]
+fn overlay_exclusion_removes_broker_item_from_next_compiled_image() {
+    let mut agent = agent_with_items(vec![
+        broker_item("keep", "KEEP-MARKER", 10, 10),
+        broker_item("drop", "DROP-MARKER", 10, 10),
+    ]);
+    let before = image_text(&agent);
+    assert!(before.contains("KEEP-MARKER") && before.contains("DROP-MARKER"));
+    let mut overlay = davinci_agent::runtime::ContextOverlay::new(1);
+    overlay.exclude("drop", false, true).unwrap();
+    agent.set_context_overlay(Some(overlay));
+    let after = image_text(&agent);
+    assert!(after.contains("KEEP-MARKER"));
+    assert!(!after.contains("DROP-MARKER"));
+    agent.set_context_overlay(None);
+    assert!(image_text(&agent).contains("DROP-MARKER"));
+}
+
+#[test]
+fn overlay_pin_survives_budget_pressure_and_correction_replaces_text() {
+    let budget = agent_with_items(vec![]).provider_context_budget();
+    let bytes = (budget.working_set_budget() as usize) * 55 / 100;
+    let mut agent = agent_with_items(vec![
+        broker_item("loud", "LOUD-MARKER", bytes, 100),
+        broker_item("quiet", "QUIET-MARKER", bytes, 1),
+    ]);
+    let plain = image_text(&agent);
+    assert!(plain.contains("LOUD-MARKER") && !plain.contains("QUIET-MARKER"));
+    let mut overlay = davinci_agent::runtime::ContextOverlay::new(1);
+    overlay.pin("quiet", false, true).unwrap();
+    agent.set_context_overlay(Some(overlay.clone()));
+    let pinned = image_text(&agent);
+    assert!(pinned.contains("QUIET-MARKER") && !pinned.contains("LOUD-MARKER"));
+
+    overlay.add_correction("quiet", "CORRECTED-TEXT");
+    agent.set_context_overlay(Some(overlay));
+    let corrected = image_text(&agent);
+    assert!(corrected.contains("CORRECTED-TEXT"));
+    assert!(corrected.contains("user correction of memory-quiet"));
+    assert!(!corrected.contains("QUIET-MARKER"));
+}
+
+#[test]
+fn installed_overlay_revision_drives_the_manifest() {
+    let mut agent = agent_with_items(vec![broker_item("a", "A", 10, 1)]);
+    let mut overlay = davinci_agent::runtime::ContextOverlay::new(7);
+    overlay.exclude("a", false, true).unwrap();
+    let revision = overlay.revision;
+    agent.set_context_overlay(Some(overlay));
+    let manifest = agent.prepare_context_manifest("r", RunId::new(), 1, 1);
+    assert_eq!(manifest.overlay_revision, revision);
+    assert!(manifest
+        .entries
+        .iter()
+        .all(|entry| !entry.source_ref.contains("memory-a")));
 }
 
 #[test]
