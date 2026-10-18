@@ -4877,7 +4877,7 @@ impl From<AssistantMessage> for CompleteOutput {
 /// The `customType` of the user message that tells the model a background
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
-const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+pub(crate) const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
 
 /// User authority comes from the selected WAL branch, not the compacted
 /// provider projection. Summaries, tool output and abandoned branches cannot

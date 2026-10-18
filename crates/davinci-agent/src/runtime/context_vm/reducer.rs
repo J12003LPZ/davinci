@@ -1043,6 +1043,31 @@ mod ledger_tests {
     }
 
     #[test]
+    fn internal_user_role_messages_never_become_goals() {
+        let mut job = ChatMessage::text("user", "Background job 3 finished: cargo test passed.");
+        job.extra.insert(
+            "customType".into(),
+            serde_json::Value::String(crate::JOB_NOTICE_TYPE.into()),
+        );
+        let mut reminder = ChatMessage::text("user", "Run the tests before finishing.");
+        reminder.extra.insert(
+            "davinciCapabilityReminder".into(),
+            serde_json::Value::String("verification_required".into()),
+        );
+        let messages = [
+            ChatMessage::text("user", "Refactor the parser."),
+            job,
+            reminder,
+        ];
+        let events = events_from_messages(&messages);
+        let state = ContextStateReducer::deterministic_delta(&CheckpointState::default(), &events)
+            .checkpoint_patch;
+        let goals: Vec<&str> = state.goals.iter().map(|g| g.value.as_str()).collect();
+        assert_eq!(goals.len(), 1, "{goals:?}");
+        assert!(goals[0].contains("Refactor the parser."));
+    }
+
+    #[test]
     fn a_long_test_log_keeps_its_verdict() {
         let log = format!(
             "running 40 tests\n{}test result: FAILED. 39 passed; 1 failed",

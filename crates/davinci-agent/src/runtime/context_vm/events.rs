@@ -111,7 +111,10 @@ pub(super) fn event_from_message(
     let summary = visible_text.starts_with(crate::COMPACTION_SUMMARY_PREFIX)
         || visible_text.starts_with(crate::BRANCH_SUMMARY_PREFIX);
     let (kind, provenance_kind) = match message.role.as_str() {
-        "user" if !summary => (ContextEventKind::User, ProvenanceKind::UserDecision),
+        "user" if !summary => match internal_user_role_provenance(message) {
+            Some(provenance_kind) => (ContextEventKind::Custom, provenance_kind),
+            None => (ContextEventKind::User, ProvenanceKind::UserDecision),
+        },
         "assistant" => (ContextEventKind::Assistant, ProvenanceKind::AgentInference),
         "toolResult" | "tool_result" => {
             (ContextEventKind::ToolResult, ProvenanceKind::ToolEvidence)
@@ -128,6 +131,35 @@ pub(super) fn event_from_message(
         artifact_refs: artifact_refs_from_message(message, &source_ref),
         images,
     })
+}
+
+/// `extra` field on the reminder the harness queues when a capability gate
+/// blocks completion (`queue_capability_reminder` in turn.rs).
+pub(crate) const CAPABILITY_REMINDER_FIELD: &str = "davinciCapabilityReminder";
+
+/// Provenance of a user-role message the harness wrote, or `None` for words a
+/// person typed. Job notices, capability and completion reminders and any
+/// other `customType` message ride in the user role so the model reads them,
+/// but they are never user requirements: they must not become goals, be
+/// mandatory in the image, or get the user excerpt budget. A message marked
+/// with `REAL_USER_ORIGIN_FIELD` is a person's whatever else it carries;
+/// unmarked plain messages stay user messages (`prompt_with` creates them).
+fn internal_user_role_provenance(message: &ChatMessage) -> Option<ProvenanceKind> {
+    if message.extra_bool(crate::REAL_USER_ORIGIN_FIELD) {
+        return None;
+    }
+    if message.extra.contains_key(CAPABILITY_REMINDER_FIELD)
+        || message
+            .extra
+            .contains_key(crate::completion::COMPLETION_REMINDER_FIELD)
+    {
+        return Some(ProvenanceKind::AgentInference);
+    }
+    match message.extra.get("customType").and_then(Value::as_str) {
+        Some(crate::JOB_NOTICE_TYPE) => Some(ProvenanceKind::ToolEvidence),
+        Some(_) => Some(ProvenanceKind::AgentInference),
+        None => None,
+    }
 }
 
 fn user_images(message: &ChatMessage) -> Vec<EventImage> {
@@ -207,4 +239,74 @@ fn visible_text(message: &ChatMessage) -> String {
         }
     }
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user_with(extra: Value) -> ChatMessage {
+        let mut message = ChatMessage::text("user", "Background job 3 finished.");
+        message.extra = extra.as_object().cloned().unwrap_or_default();
+        message
+    }
+
+    fn classify(message: &ChatMessage) -> (ContextEventKind, ProvenanceKind) {
+        let event = event_from_message(message, "session:x".into(), 1).unwrap();
+        (event.kind, event.provenance_kind)
+    }
+
+    #[test]
+    fn plain_user_message_is_a_user_decision() {
+        assert_eq!(
+            classify(&ChatMessage::text("user", "fix the bug")),
+            (ContextEventKind::User, ProvenanceKind::UserDecision)
+        );
+    }
+
+    #[test]
+    fn job_notice_is_tool_evidence_not_a_user_message() {
+        let message = user_with(json!({"customType": crate::JOB_NOTICE_TYPE, "jobId": 3}));
+        assert_eq!(
+            classify(&message),
+            (ContextEventKind::Custom, ProvenanceKind::ToolEvidence)
+        );
+    }
+
+    #[test]
+    fn harness_reminders_are_agent_inference() {
+        for field in [
+            CAPABILITY_REMINDER_FIELD,
+            crate::completion::COMPLETION_REMINDER_FIELD,
+        ] {
+            let message = user_with(json!({ field: "verification_required" }));
+            assert_eq!(
+                classify(&message),
+                (ContextEventKind::Custom, ProvenanceKind::AgentInference),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_custom_type_on_a_user_role_message_is_not_user() {
+        let message = user_with(json!({"customType": "extension-note"}));
+        assert_eq!(
+            classify(&message),
+            (ContextEventKind::Custom, ProvenanceKind::AgentInference)
+        );
+    }
+
+    #[test]
+    fn real_user_origin_marker_overrides_internal_markers() {
+        let message = user_with(json!({
+            crate::REAL_USER_ORIGIN_FIELD: true,
+            "customType": "extension-note",
+        }));
+        assert_eq!(
+            classify(&message),
+            (ContextEventKind::User, ProvenanceKind::UserDecision)
+        );
+    }
 }
