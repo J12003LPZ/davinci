@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- OpenAI has two logins, not three: `openai` (API key) and `openai-codex` (OAuth). `/login openai-codex` now signs in with the Codex CLI OAuth client and requests go to the ChatGPT Codex backend, the route Codex CLI uses. `/login openai-codex-backend` and the Sign in with ChatGPT login flow are removed from the provider list. A Sign in with ChatGPT login stored by an earlier build keeps working on the documented route until `/login openai-codex` replaces it. Model catalog refresh and the plan-account email check still read a Sign in with ChatGPT token, so they are skipped for a Codex CLI login and the built-in catalog is used. Not live-tested from DaVinci. See `docs/cache/chatgpt-backend-route.md`.
+
 ## 1.1.7
 
 Changes since `v1.1.6`.

@@ -6946,10 +6946,8 @@ fn refresh_thinking_sheet(agent: &Agent, model: &mut Model) {
     model.facts.thinking_output_share = share;
 }
 
-/// One `/login` row per offered provider. The ChatGPT backend login has no
-/// credential of its own: it is stored under `openai-codex` with a route
-/// marker, so its row reads that credential and is ready only when the stored
-/// login is the backend one.
+/// One `/login` row per offered provider, read from the same auth resolution
+/// `/model` uses.
 fn login_provider_rows(
     names: &[String],
     auth: &std::collections::BTreeMap<String, davinci_ai::AuthCheck>,
@@ -6957,12 +6955,7 @@ fn login_provider_rows(
     names
         .iter()
         .map(|name| {
-            let check = if name == davinci_ai::codex_backend::LOGIN_PROVIDER {
-                auth.get("openai-codex")
-                    .filter(|check| check.source == davinci_ai::codex_backend::AUTH_SOURCE)
-            } else {
-                auth.get(name)
-            };
+            let check = auth.get(name);
             match check {
                 Some(check) => ProviderRow {
                     name: name.clone(),

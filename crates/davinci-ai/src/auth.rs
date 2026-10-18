@@ -288,7 +288,8 @@ impl AuthStorage {
             let registration =
                 crate::openai_siwc::registration_from_credential(&cred).ok_or_else(|| {
                     AuthStorageError::Invalid(
-                        "stored ChatGPT registration metadata is missing".into(),
+                        "stored ChatGPT registration metadata is missing; run /login openai-codex"
+                            .into(),
                     )
                 })?;
             let tokens =

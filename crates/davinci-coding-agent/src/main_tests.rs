@@ -1184,12 +1184,16 @@ fn codex_fixture_login_persists_exact_provider_without_aliasing() {
         &std::collections::HashMap::new(),
         false,
     )
-    .expect("verified ChatGPT-plan fixture credential should resolve");
-    assert_eq!(resolved.source, "OAuth");
+    .expect("Codex CLI fixture credential should resolve");
+    assert_eq!(resolved.source, davinci_ai::codex_backend::AUTH_SOURCE);
+    assert!(credential
+        .env
+        .get(davinci_ai::codex_backend::ROUTE_ENV_KEY)
+        .is_some_and(|value| value == davinci_ai::codex_backend::ROUTE_ENV_VALUE));
     assert!(resolved
         .headers
         .get("Authorization")
-        .is_some_and(|value| value.starts_with("Bearer openai-plan-")));
+        .is_some_and(|value| value.starts_with("Bearer e30.")));
     let payload = base64::Engine::encode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
         br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test-account"}}"#,
@@ -3039,6 +3043,20 @@ fn list_models_table_matches_ts_columns() {
     assert!(row.contains("200K"));
     assert!(row.contains("16.4K") || row.contains("16384") || row.contains("16K"));
     assert!(row.contains("yes"));
+}
+
+#[test]
+fn a_pasted_login_must_carry_the_state_it_started_with() {
+    assert!(check_pasted_state(Some("abc"), Some("abc")).is_ok());
+    assert!(check_pasted_state(Some("abc"), Some("xyz"))
+        .unwrap_err()
+        .contains("state mismatch"));
+    assert!(check_pasted_state(Some("abc"), None)
+        .unwrap_err()
+        .contains("no state"));
+    // A login that started without a state has nothing to compare.
+    assert!(check_pasted_state(None, None).is_ok());
+    assert!(check_pasted_state(None, Some("anything")).is_ok());
 }
 
 #[test]

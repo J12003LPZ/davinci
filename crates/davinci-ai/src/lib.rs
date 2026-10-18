@@ -162,8 +162,7 @@ pub use oauth_providers::{
     fresh_authorize_request, fresh_authorize_request_checked, generate_pkce, oauth_providers,
     parse_authorization_callback, parse_authorization_input, refresh_oauth_token,
     save_pending_login, take_pending_login, token_exchange_request, token_refresh_request,
-    AuthorizationCallbackInput, AuthorizeRequest, OauthTokens, OpenAiSiwcAuthorizeContext, Pkce,
-    TokenExchangeRequest,
+    AuthorizationCallbackInput, AuthorizeRequest, OauthTokens, Pkce, TokenExchangeRequest,
 };
 pub use openai_cache_diagnostics::{
     configured_comparison_response_id, diagnostics_every_n_from_env, latest_applied_policy,

@@ -41,19 +41,6 @@ pub struct AuthorizeRequest {
     pub instructions: String,
     pub pkce: Option<Pkce>,
     pub state: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openai_siwc: Option<OpenAiSiwcAuthorizeContext>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct OpenAiSiwcAuthorizeContext {
-    pub client_id: String,
-    pub redirect_uri: String,
-    pub nonce: String,
-    pub resource: String,
-    pub ext_agent_host_id: String,
-    pub expected_subject: Option<String>,
-    pub dynamic_registration: bool,
 }
 
 pub fn generate_pkce(verifier_bytes: &[u8]) -> Pkce {
@@ -65,8 +52,7 @@ pub fn generate_pkce(verifier_bytes: &[u8]) -> Pkce {
     }
 }
 
-/// Generate fresh OAuth transaction material. OpenAI's OSS ChatGPT-plan flow
-/// additionally binds a stable host id, OIDC nonce and issued dynamic-client id.
+/// Generate fresh OAuth transaction material (PKCE verifier and state).
 pub fn fresh_authorize_request_checked(provider: &str) -> Result<Option<AuthorizeRequest>, String> {
     let first = uuid::Uuid::new_v4();
     let second = uuid::Uuid::new_v4();
@@ -76,75 +62,6 @@ pub fn fresh_authorize_request_checked(provider: &str) -> Result<Option<Authoriz
     let pkce = generate_pkce(&verifier_bytes);
     let state = uuid::Uuid::new_v4().simple().to_string();
 
-    if provider == "openai-codex" {
-        let auth_path = crate::try_default_auth_path().map_err(|err| err.to_string())?;
-        let agent_dir = auth_path
-            .parent()
-            .ok_or("OpenAI sign-in could not resolve the DaVinci agent directory")?;
-        let ext_agent_host_id = crate::openai_siwc::load_or_create_host_id(agent_dir)?;
-        let stored = crate::AuthStorage::create()
-            .ok()
-            .and_then(|storage| storage.get(provider).cloned())
-            .and_then(|credential| crate::openai_siwc::registration_from_credential(&credential));
-        let provisional = crate::openai_siwc::load_issued_client_id(agent_dir);
-        let (client_id, expected_subject, dynamic_registration, id_token_hint, login_hint) =
-            match stored {
-                Some(registration) => (
-                    registration.client_id,
-                    Some(registration.identity.subject),
-                    false,
-                    Some(registration.id_token),
-                    registration.identity.email,
-                ),
-                None => match provisional {
-                    Some(client_id) => (client_id, None, false, None, None),
-                    None => (
-                        crate::openai_siwc::OPENAI_SIWC_DYNAMIC_CLIENT_ID.to_string(),
-                        None,
-                        true,
-                        None,
-                        None,
-                    ),
-                },
-            };
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let url = crate::openai_siwc::build_authorization_url(
-            &client_id,
-            &ext_agent_host_id,
-            crate::openai_siwc::OPENAI_SIWC_REDIRECT,
-            &state,
-            &nonce,
-            &pkce,
-            dynamic_registration,
-        )?;
-        let mut url = url::Url::parse(&url).map_err(|err| err.to_string())?;
-        if !dynamic_registration {
-            let mut query = url.query_pairs_mut();
-            if let Some(id_token_hint) = id_token_hint.as_deref() {
-                query.append_pair("id_token_hint", id_token_hint);
-            }
-            if let Some(login_hint) = login_hint.as_deref() {
-                query.append_pair("login_hint", login_hint);
-            }
-        }
-        return Ok(Some(AuthorizeRequest {
-            provider: provider.into(),
-            url: url.to_string(),
-            token_url: crate::openai_siwc::OPENAI_SIWC_TOKEN_URL.into(),
-            instructions: "Continue with ChatGPT in your browser. For first-time registration, paste the complete redirect URL if the loopback callback cannot be reached.".into(),
-            pkce: Some(pkce),
-            state: Some(state),
-            openai_siwc: Some(OpenAiSiwcAuthorizeContext {
-                client_id,
-                redirect_uri: crate::openai_siwc::OPENAI_SIWC_REDIRECT.into(),
-                nonce,
-                resource: crate::openai_siwc::OPENAI_SIWC_RESOURCE.into(),
-                ext_agent_host_id,
-                expected_subject,
-                dynamic_registration,
-            }),
-        }));
-    }
     Ok(authorize_request(provider, &pkce, &state))
 }
 
@@ -271,7 +188,6 @@ pub fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>
 
 pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<AuthorizeRequest> {
     match provider {
-        "openai-codex" => None,
         crate::codex_backend::LOGIN_PROVIDER => {
             let mut url = url::Url::parse(CODEX_BACKEND_AUTHORIZE_URL).ok()?;
             url.query_pairs_mut()
@@ -289,10 +205,9 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
                 provider: provider.into(),
                 url: url.to_string(),
                 token_url: CODEX_BACKEND_TOKEN_URL.into(),
-                instructions: "Complete login in your browser, or paste the authorization code / redirect URL here. This signs in with the Codex CLI client to use the ChatGPT Codex backend.".into(),
+                instructions: "Complete login in your browser, or paste the complete redirect URL here. This signs in with the Codex CLI client to use the ChatGPT Codex backend.".into(),
                 pkce: Some(pkce.clone()),
                 state: Some(state.to_string()),
-                openai_siwc: None,
             })
         }
         "openrouter" => {
@@ -308,7 +223,6 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
                 instructions: "Complete OpenRouter login in your browser.".into(),
                 pkce: Some(pkce.clone()),
                 state: None,
-                openai_siwc: None,
             })
         }
         "xai" => Some(AuthorizeRequest {
@@ -318,7 +232,6 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
             instructions: format!("xAI device code. client_id={XAI_CLIENT_ID} scope={XAI_SCOPE}"),
             pkce: None,
             state: None,
-            openai_siwc: None,
         }),
         "kimi-coding" => Some(AuthorizeRequest {
             provider: provider.into(),
@@ -327,7 +240,6 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
             instructions: format!("Kimi device code. client_id={KIMI_CLIENT_ID}"),
             pkce: None,
             state: None,
-            openai_siwc: None,
         }),
         "github-copilot" => Some(AuthorizeRequest {
             provider: provider.into(),
@@ -336,7 +248,6 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
             instructions: format!("GitHub device code. client_id={GITHUB_CLIENT_ID}"),
             pkce: None,
             state: None,
-            openai_siwc: None,
         }),
         "radius" => {
             let mut url = url::Url::parse("https://radius.example/oauth/authorize").ok()?;
@@ -354,7 +265,6 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
                 instructions: "Complete Radius gateway login.".into(),
                 pkce: Some(pkce.clone()),
                 state: Some(state.to_string()),
-                openai_siwc: None,
             })
         }
         _ => None,
@@ -378,7 +288,6 @@ pub fn token_exchange_request(
 ) -> Option<TokenExchangeRequest> {
     let verifier = pkce.map(|p| p.verifier.as_str()).unwrap_or("");
     match provider {
-        "openai-codex" => None,
         crate::codex_backend::LOGIN_PROVIDER => {
             let body = url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("grant_type", "authorization_code")
@@ -468,7 +377,6 @@ pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExcha
         redirect_uri: String::new(),
     };
     match provider {
-        "openai-codex" => None,
         crate::codex_backend::LOGIN_PROVIDER => Some(form(
             CODEX_BACKEND_TOKEN_URL.into(),
             CODEX_BACKEND_CLIENT_ID,
@@ -484,14 +392,26 @@ pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExcha
     }
 }
 
+/// Fixture access token. The Codex CLI login only stores a token carrying a ChatGPT account id, so its
+/// fixture is JWT-shaped; every other provider's fixture stays an opaque string.
+fn fixture_access_token(provider: &str, seed: &str) -> String {
+    let opaque = format!("{seed}-access");
+    if provider != crate::codex_backend::LOGIN_PROVIDER {
+        return opaque;
+    }
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::json!({
+            crate::codex::JWT_CLAIM_PATH: { "chatgpt_account_id": "fixture-account" }
+        })
+        .to_string(),
+    );
+    format!("e30.{payload}.{opaque}")
+}
+
 /// Trade a refresh token for a fresh access token. Fixture refresh (a
 /// `pi-fixture-` token or `PI_OAUTH_FIXTURE`) never hits the network.
 pub fn refresh_oauth_token(provider: &str, refresh: &str) -> Result<OauthTokens, String> {
-    if provider == "openai-codex" {
-        return Err(
-            "openai-codex refresh requires the issued Sign in with ChatGPT client id".into(),
-        );
-    }
     if provider == "anthropic" {
         return Err(crate::auth::ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into());
     }
@@ -499,7 +419,7 @@ pub fn refresh_oauth_token(provider: &str, refresh: &str) -> Result<OauthTokens,
         && (refresh.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok())
     {
         return Ok(OauthTokens {
-            access: format!("{refresh}-access"),
+            access: fixture_access_token(provider, refresh),
             refresh: Some(refresh.to_string()),
             expires: Some(crate::models_store::now_ms().saturating_add(3_600_000)),
         });
@@ -529,9 +449,6 @@ pub fn exchange_authorization_code(
     pkce: Option<&Pkce>,
     state: Option<&str>,
 ) -> Result<OauthTokens, String> {
-    if provider == "openai-codex" {
-        return Err("openai-codex uses the verified Sign in with ChatGPT exchange path".into());
-    }
     if provider == "anthropic" {
         return Err(crate::auth::ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into());
     }
@@ -539,7 +456,7 @@ pub fn exchange_authorization_code(
         && (code.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok())
     {
         return Ok(OauthTokens {
-            access: format!("{provider}-{code}-access"),
+            access: fixture_access_token(provider, &format!("{provider}-{code}")),
             refresh: pkce.map(|p| format!("pi-fixture-{}", p.verifier)),
             expires: Some(crate::models_store::now_ms().saturating_add(3_600_000)),
         });
@@ -633,7 +550,6 @@ fn describe_token_body(body: &str) -> String {
 
 pub fn oauth_providers() -> &'static [&'static str] {
     &[
-        "openai-codex",
         crate::codex_backend::LOGIN_PROVIDER,
         "openrouter",
         "xai",
@@ -683,19 +599,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_codex_exchange_and_refresh_are_disabled() {
+    fn openai_codex_login_uses_the_codex_cli_client_only() {
         let pkce = generate_pkce(&[1u8; 32]);
-        assert!(authorize_request("openai-codex", &pkce, "state").is_none());
-        assert!(token_exchange_request("openai-codex", "code", Some(&pkce), None).is_none());
-        assert!(token_refresh_request("openai-codex", "refresh").is_none());
-        assert!(
-            exchange_authorization_code("openai-codex", "code", Some(&pkce), Some("state"),)
-                .unwrap_err()
-                .contains("Sign in with ChatGPT")
+        let request = authorize_request("openai-codex", &pkce, "state").unwrap();
+        assert!(request
+            .url
+            .contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+        // A bare code carries no state, which a pasted login must have.
+        assert!(request.instructions.contains("redirect URL"));
+        assert!(!request.instructions.contains("authorization code"));
+        assert!(token_exchange_request("openai-codex", "code", Some(&pkce), None).is_some());
+        assert!(token_refresh_request("openai-codex", "refresh").is_some());
+        // The separate backend login name is gone: one OAuth login, one API-key provider.
+        assert!(authorize_request("openai-codex-backend", &pkce, "state").is_none());
+        assert!(!oauth_providers().contains(&"openai-codex-backend"));
+        assert_eq!(
+            oauth_providers()
+                .iter()
+                .filter(|name| **name == "openai-codex")
+                .count(),
+            1
         );
-        assert!(refresh_oauth_token("openai-codex", "refresh")
-            .unwrap_err()
-            .contains("issued Sign in with ChatGPT client id"));
     }
 
     #[test]
