@@ -27,8 +27,48 @@ fn sandbox_failure(result: &Value) -> CodeModeError {
     match result.pointer("/error/kind").and_then(Value::as_str) {
         Some("timeout") => CodeModeError::new("TIMEOUT", "script deadline expired"),
         Some("aborted") => CodeModeError::new("CANCELLED", "script was cancelled"),
-        _ => CodeModeError::new("SANDBOX_FAILED", "script failed in the sandbox"),
+        _ => CodeModeError::new(
+            "SANDBOX_FAILED",
+            &match script_error_detail(result) {
+                Some(detail) => format!("script failed in the sandbox: {detail}"),
+                None => "script failed in the sandbox".into(),
+            },
+        ),
     }
+}
+
+/// Longest script error detail passed to the model, in characters.
+const SCRIPT_ERROR_DETAIL_CHARS: usize = 300;
+
+/// The script's own `Name: message`, first line only and bounded, so the model
+/// can repair a script that threw. The stack and any non-script error are left
+/// out. The detail is text the sandbox produced from the model's own code; the
+/// script's returned output already reaches the model unfiltered.
+fn script_error_detail(result: &Value) -> Option<String> {
+    let error = result.get("error")?;
+    if error.get("kind").and_then(Value::as_str) != Some("script") {
+        return None;
+    }
+    let message = error.get("message").and_then(Value::as_str)?;
+    let name = error.get("name").and_then(Value::as_str).filter(|name| {
+        name.len() <= 40 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    let line = message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(SCRIPT_ERROR_DETAIL_CHARS)
+        .collect::<String>();
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(match name {
+        Some(name) => format!("{name}: {line}"),
+        None => line.to_owned(),
+    })
 }
 
 /// Milliseconds of the run's wall budget still unspent, or `None` once the
@@ -1198,6 +1238,47 @@ mod tests {
             "SANDBOX_FAILED"
         );
         assert_eq!(code(json!({"ok": false})), "SANDBOX_FAILED");
+    }
+
+    #[test]
+    fn a_script_error_reaches_the_model_bounded_and_without_its_stack() {
+        let message = |result: Value| sandbox_failure(&result).message;
+        let prefix = "script failed in the sandbox";
+        assert_eq!(
+            message(
+                json!({"ok": false, "error": {"kind": "script", "name": "ReferenceError",
+                "message": "missingName is not defined",
+                "stack": "ReferenceError: missingName is not defined\n    at <anonymous> (codemode.js:1:36)"}})
+            ),
+            format!("{prefix}: ReferenceError: missingName is not defined")
+        );
+        // Only the first line, no control characters, capped in length.
+        let multi = format!("first\u{1b}[31m line\nsecond line\n{}", "x".repeat(900));
+        assert_eq!(
+            message(json!({"ok": false, "error": {"kind": "script", "message": multi}})),
+            format!("{prefix}: first[31m line")
+        );
+        let capped =
+            message(json!({"ok": false, "error": {"kind": "script", "message": "y".repeat(900)}}));
+        assert_eq!(
+            capped.chars().count(),
+            prefix.len() + 2 + SCRIPT_ERROR_DETAIL_CHARS
+        );
+        // An unsafe name is dropped; a non-script error never leaks detail.
+        assert_eq!(
+            message(
+                json!({"ok": false, "error": {"kind": "script", "name": "Bad Name\n", "message": "m"}})
+            ),
+            format!("{prefix}: m")
+        );
+        assert_eq!(
+            message(json!({"ok": false, "error": {"kind": "host", "message": "internal path"}})),
+            prefix
+        );
+        assert_eq!(
+            message(json!({"ok": false, "error": {"kind": "script", "message": "  "}})),
+            prefix
+        );
     }
 
     struct CountingBroker(Arc<AtomicUsize>);

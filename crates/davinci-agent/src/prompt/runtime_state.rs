@@ -20,7 +20,18 @@ pub struct RuntimePromptState {
     /// default prompt bytes stay the same.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<String>,
+    /// The read-only `codemode` tool is exposed this turn. False renders
+    /// nothing, so a session without Codemode keeps its prompt bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codemode_available: bool,
 }
+
+/// Why and when to reach for `codemode`. Without this the model never chooses
+/// it: across ~600 unsteered benchmark sessions it made zero calls.
+pub(crate) const CODEMODE_GUIDANCE: &str = "Codemode is available: one `codemode` call runs a short JavaScript program over your read-only tools (`tools.<name>({...})`; `codemode.search` and `codemode.describe` list them) and returns only what the script returns. \
+Use it instead of separate read, grep, find or ls calls whenever you need two or more lookups, or need to filter, join or count their output: survey the directories, read or grep the files you need, and return one compact summary. \
+Use the normal tools for a single lookup, for any edit or shell command, and when you need a file's full text in context. \
+Check each child result's `complete` flag: a truncated read is not the whole file, so read the rest before relying on it.";
 
 pub fn runtime_state_text(state: &RuntimePromptState) -> String {
     let mode_desc = match state.permission_mode {
@@ -85,6 +96,10 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
         ));
     }
 
+    if state.codemode_available {
+        lines.push(CODEMODE_GUIDANCE.to_string());
+    }
+
     format!("<runtime_state>\n{}\n</runtime_state>", lines.join("\n"))
 }
 
@@ -103,6 +118,43 @@ mod tests {
     use crate::prompt::manifest::estimate_tokens_from_str;
 
     #[test]
+    fn codemode_guidance_renders_only_when_available() {
+        let mut state = RuntimePromptState {
+            permission_mode: PermissionMode::Auto,
+            plan_revision: None,
+            plan_approved: false,
+            active_contract: false,
+            visual_verification_available: false,
+            visual_verification_relevant: false,
+            environment: None,
+            additional_directories: Vec::new(),
+            codemode_available: false,
+        };
+        let off = runtime_state_text(&state);
+        assert!(!off.contains("codemode"), "{off}");
+        assert!(serde_json::to_value(&state)
+            .unwrap()
+            .get("codemode_available")
+            .is_none());
+        state.codemode_available = true;
+        let on = runtime_state_text(&state);
+        for needle in [
+            "`codemode`",
+            "two or more lookups",
+            "single lookup",
+            "edit or shell command",
+            "`complete` flag",
+        ] {
+            assert!(on.contains(needle), "missing {needle:?} in {on}");
+        }
+        assert!(on.starts_with("<runtime_state>"));
+        assert!(
+            estimate_tokens_from_str(&on) < 250,
+            "guidance must stay small"
+        );
+    }
+
+    #[test]
     fn read_only_suffix_describes_behavior_without_claiming_authority() {
         let text = runtime_state_text(&RuntimePromptState {
             permission_mode: PermissionMode::ReadOnly,
@@ -113,6 +165,7 @@ mod tests {
             visual_verification_relevant: true,
             environment: None,
             additional_directories: Vec::new(),
+            codemode_available: false,
         });
 
         assert!(text.contains("Plan Mode"));
@@ -141,6 +194,7 @@ mod tests {
                 visual_verification_relevant: true,
                 environment: None,
                 additional_directories: Vec::new(),
+                codemode_available: false,
             };
             let text1 = runtime_state_text(&state);
             let text2 = runtime_state_text(&state);
@@ -168,6 +222,7 @@ mod tests {
             visual_verification_relevant: false,
             environment: None,
             additional_directories: Vec::new(),
+            codemode_available: false,
         };
         let default_text = runtime_state_text(&state);
         assert!(!default_text.contains("Additional writable"));
@@ -204,6 +259,7 @@ mod tests {
             visual_verification_relevant: true,
             environment: None,
             additional_directories: Vec::new(),
+            codemode_available: false,
         };
         let text = runtime_state_text(&state);
         assert!(estimate_tokens_from_str(&text) <= 500);
