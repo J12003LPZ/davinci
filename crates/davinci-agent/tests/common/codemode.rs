@@ -1385,6 +1385,106 @@ fn staged_codemode_is_announced_before_the_runtime_registers_it() {
     assert!(!agent.runtime_prompt_state().codemode_available);
 }
 
+struct EmptyAfterReadHost(&'static str);
+impl crate::codemode::CodeModeHost for EmptyAfterReadHost {
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        _: &crate::codemode::CodeModeRunContext,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        broker
+            .call(CodeModeCall {
+                request_id: 1,
+                tool: "read".into(),
+                args: json!({"path":"input.txt"}),
+            })
+            .unwrap();
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: self.0.into(),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "forged".into(),
+            error: None,
+        }
+    }
+}
+
+fn run_with_output(output: &'static str) -> (serde_json::Value, crate::stats::RunStats) {
+    let (mut agent, workspace, _) = configured_agent();
+    agent
+        .enable_read_only_codemode(Arc::new(EmptyAfterReadHost(output)))
+        .unwrap();
+    let message = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "empty-check".into(),
+                "codemode".into(),
+                json!({"code":"return 1"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    let text = match &message.content[0] {
+        davinci_ai::MessageContent::Text { text } => text.clone(),
+        other => panic!("unexpected content {other:?}"),
+    };
+    (serde_json::from_str(&text).unwrap(), agent.run_stats())
+}
+
+#[test]
+fn a_request_refused_before_any_script_runs_is_still_counted() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent
+        .enable_read_only_codemode(Arc::new(EmptyAfterReadHost("[]")))
+        .unwrap();
+    // `code` must be a string: the request is refused at validation.
+    let message = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![("bad".into(), "codemode".into(), json!({"code": 7}))],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(message.is_error, Some(true));
+    let stats = agent.run_stats();
+    assert_eq!((stats.codemode_runs, stats.codemode_unfinished), (1, 1));
+}
+
+#[test]
+fn an_empty_value_after_tool_calls_is_flagged_and_counted() {
+    for empty in ["[]", "{}", "null", "", "  "] {
+        let (outcome, stats) = run_with_output(empty);
+        let notes = outcome["hostNotes"].as_array().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("field name")),
+            "{empty:?}: {notes:?}"
+        );
+        assert_eq!(outcome["status"], "completed");
+        assert_eq!(
+            (
+                stats.codemode_runs,
+                stats.codemode_empty_results,
+                stats.codemode_unfinished
+            ),
+            (1, 1, 0),
+            "{empty:?}"
+        );
+    }
+    // A real answer is not flagged.
+    let (outcome, stats) = run_with_output("[\"a\"]");
+    assert!(outcome["hostNotes"].as_array().unwrap().is_empty());
+    assert_eq!((stats.codemode_runs, stats.codemode_empty_results), (1, 0));
+}
+
 #[test]
 fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     use crate::codemode::*;
