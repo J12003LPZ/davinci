@@ -941,12 +941,18 @@ pub fn convert_to_llm_for_summary(messages: &[ChatMessage]) -> Vec<ChatMessage> 
     messages
         .iter()
         .flat_map(|source| {
-            let label = (source.role == "custom").then(|| {
-                match source.extra_str("customType").filter(|t| !t.is_empty()) {
-                    Some(kind) => format!("Harness context ({kind})"),
-                    None => "Harness context".to_string(),
-                }
-            });
+            let label = match source.role.as_str() {
+                "custom" => Some(
+                    match source.extra_str("customType").filter(|t| !t.is_empty()) {
+                        Some(kind) => format!("Harness context ({kind})"),
+                        None => "Harness context".to_string(),
+                    },
+                ),
+                // The user ran it, but it is a command, not a request.
+                "bashExecution" => Some("User shell command".to_string()),
+                "branchSummary" | "compactionSummary" => Some("Previous summary".to_string()),
+                _ => None,
+            };
             convert_to_llm(std::slice::from_ref(source))
                 .into_iter()
                 .map(move |mut converted| {
@@ -966,6 +972,11 @@ pub fn convert_to_llm_for_summary(messages: &[ChatMessage]) -> Vec<ChatMessage> 
 fn user_role_label(message: &ChatMessage) -> String {
     if let Some(label) = message.extra_str(SUMMARY_LABEL_KEY) {
         return label.to_string();
+    }
+    // A summary already rendered as a user message (resumed history).
+    let text = content_text(&message.content);
+    if text.starts_with(COMPACTION_SUMMARY_PREFIX) || text.starts_with(BRANCH_SUMMARY_PREFIX) {
+        return "Previous summary".into();
     }
     match crate::runtime::context_vm::internal_user_message(message) {
         Some(crate::runtime::context_vm::InternalUserMessage::JobNotice) => {
@@ -1322,8 +1333,18 @@ mod tests {
             crate::INTERNAL_PROMPT_FIELD.into(),
             "agent_inference".into(),
         );
+        let mut shell = ChatMessage::text("bashExecution", "");
+        shell.extra.insert("command".into(), "ls".into());
+        shell.extra.insert("output".into(), "a.rs".into());
+        let compaction = compaction_context_message("earlier work");
+        let branch = ChatMessage::text("branchSummary", "other branch");
+        let compaction_role = ChatMessage::text("compactionSummary", "older work");
         let messages = [
             ChatMessage::text("user", "Please fix the parser."),
+            shell,
+            compaction,
+            branch,
+            compaction_role,
             mailbox,
             repair,
             job,
@@ -1351,6 +1372,9 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("[Harness prompt]: schema errors"), "{out}");
+        assert!(out.contains("[User shell command]: Ran `ls`"), "{out}");
+        assert!(out.contains("[Previous summary]: "), "{out}");
+        assert_eq!(out.matches("[Previous summary]:").count(), 3, "{out}");
         assert_eq!(out.matches("[User]:").count(), 1, "{out}");
         // The summarizer-only label never reaches the provider conversion.
         assert!(convert_to_llm(&messages)
