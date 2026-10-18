@@ -918,6 +918,14 @@ mod tests {
         let answer = ChatMessage::text("assistant", "Ready to finish");
         agent.messages.push(answer.clone());
         agent.persist_full_message(&answer);
+        for i in 0..2 {
+            let work = ChatMessage::text(
+                "assistant",
+                format!("Earlier work {i}: {}", "detail ".repeat(200)),
+            );
+            agent.messages.push(work.clone());
+            agent.persist_full_message(&work);
+        }
         agent.queue_completion_reminder(
             "Check the final result before finishing".into(),
             "completion.hook_block",
@@ -934,7 +942,8 @@ mod tests {
             })
         }));
         assert!(agent.compact(None).compacted);
-        assert!(agent.compact(None).compacted);
+        // Compacting the compacted history again would not shrink it.
+        assert!(!agent.compact(None).compacted);
         agent.ephemeral_context.push(ChatMessage::text(
             "custom",
             "Preserve the final-check evidence.",
@@ -991,7 +1000,10 @@ mod tests {
         }));
         for _ in 0..2 {
             for i in 0..4 {
-                let message = ChatMessage::text("assistant", format!("Intermediate work {i}"));
+                let message = ChatMessage::text(
+                    "assistant",
+                    format!("Intermediate work {i}: {}", "detail ".repeat(200)),
+                );
                 agent.messages.push(message.clone());
                 agent.persist_full_message(&message);
             }

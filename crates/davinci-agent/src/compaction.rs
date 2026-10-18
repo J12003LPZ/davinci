@@ -314,7 +314,11 @@ pub fn compact_messages_with_options(
     let mut cut_index = cut.first_kept_index;
     if cut_index == 0 {
         // Manual compact still summarizes a prefix when everything fits in keepRecentTokens.
+        // The kept tail must start at a valid boundary, never an orphaned tool result.
         cut_index = messages.len().saturating_sub(1);
+        while cut_index > 0 && !is_cut_point_message(&messages[cut_index]) {
+            cut_index -= 1;
+        }
     }
     if cut_index == 0 {
         return empty_result(messages);
@@ -380,6 +384,22 @@ pub fn compact_messages_with_options(
     let mut compacted = vec![compaction_context_message(&summary)];
     compacted.extend(messages[cut_index..].iter().cloned());
     let tokens_after = estimate_context_tokens(&compacted);
+    // Admission gate: a checkpoint that does not shrink the context only adds
+    // cost and, on auto-compaction, repeats on the next turn.
+    if tokens_after >= tokens_before {
+        return CompactionResult {
+            summary: format!(
+                "Nothing worth compacting: the summary would not shrink the context ({tokens_before} -> {tokens_after} tokens)"
+            ),
+            messages: messages.to_vec(),
+            compacted: false,
+            details,
+            first_kept_entry_id: String::new(),
+            tokens_before,
+            tokens_after: tokens_before,
+            usage,
+        };
+    }
     CompactionResult {
         summary,
         messages: compacted,
@@ -662,7 +682,23 @@ fn complete_summarization(
     if response.has_tool_call {
         return Err(format!("{label} attempted to call a tool"));
     }
+    // A blank or token-sized reply is a provider hiccup, not a checkpoint:
+    // accepting it would swap the whole history for nothing.
+    if !is_meaningful_summary(&response.text) {
+        return Err(format!(
+            "{label} failed: the model returned an empty summary"
+        ));
+    }
     Ok((response.text, response.usage))
+}
+
+/// Enough words to be a checkpoint: at least eight alphanumeric characters.
+fn is_meaningful_summary(text: &str) -> bool {
+    text.chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .take(8)
+        .count()
+        >= 8
 }
 
 pub fn get_summarization_failure(response: &SummarizeResponse, label: &str) -> Option<String> {
@@ -1263,6 +1299,94 @@ mod tests {
         assert!(update.contains(UPDATE_SUMMARIZATION_PROMPT));
     }
 
+    fn fixed_summarizer(text: &'static str) -> Summarizer {
+        Summarizer::new(move |_| {
+            Ok(SummarizeResponse {
+                text: text.into(),
+                usage: Usage::default(),
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        })
+    }
+
+    fn bulky_conversation() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::text("user", "original request ".repeat(100)),
+            ChatMessage::text("assistant", "work done ".repeat(100)),
+            ChatMessage::text("user", "recent"),
+        ]
+    }
+
+    #[test]
+    fn a_blank_or_token_summary_never_replaces_history() {
+        let messages = bulky_conversation();
+        for text in [
+            "", "   
+	 ", "ok", "## Goal",
+        ] {
+            let summarizer = fixed_summarizer(text);
+            let result =
+                compact_messages_with_options(&messages, None, 1, 100, None, Some(&summarizer));
+            assert!(!result.compacted, "{text:?} must be rejected");
+            assert!(
+                result.summary.contains("empty summary"),
+                "{}",
+                result.summary
+            );
+            assert_eq!(result.messages.len(), messages.len());
+            assert_eq!(result.tokens_after, result.tokens_before);
+        }
+        let good = fixed_summarizer(
+            "## Goal
+ship the csv import",
+        );
+        assert!(
+            compact_messages_with_options(&messages, None, 1, 100, None, Some(&good)).compacted
+        );
+    }
+
+    #[test]
+    fn a_summary_larger_than_what_it_replaces_is_not_committed() {
+        let messages = vec![
+            ChatMessage::text("user", "hi"),
+            ChatMessage::text("assistant", "hello"),
+            ChatMessage::text("user", "ok"),
+        ];
+        let long = fixed_summarizer(
+            "## Goal
+the user said hi and the assistant said hello and then the user said ok",
+        );
+        let result = compact_messages_with_options(&messages, None, 1, 100, None, Some(&long));
+        assert!(!result.compacted);
+        assert!(result.summary.contains("Nothing worth compacting"));
+        assert_eq!(result.messages.len(), messages.len());
+    }
+
+    #[test]
+    fn a_trailing_tool_result_never_starts_the_kept_tail() {
+        let messages = vec![
+            ChatMessage::text("user", "original request ".repeat(100)),
+            ChatMessage::text("assistant", "reading the file ".repeat(100)),
+            ChatMessage::tool_result("c1", "read", "contents", false),
+        ];
+        let summarizer = fixed_summarizer(
+            "## Goal
+ship the csv import",
+        );
+        // A huge keep budget makes the selected cut index zero.
+        let result =
+            compact_messages_with_options(&messages, None, 1_000_000, 100, None, Some(&summarizer));
+        assert!(
+            result
+                .messages
+                .get(1)
+                .is_none_or(|m| m.role != "toolResult"),
+            "an orphaned tool result must not lead the kept messages"
+        );
+    }
+
     #[test]
     fn llm_compaction_uses_complete_simple_fixture_and_split_turn() {
         let summarizer = Summarizer::new(|request| {
@@ -1287,8 +1411,8 @@ mod tests {
             })
         });
         let messages = vec![
-            ChatMessage::text("user", "aaaaaaaaaa bbbbbbbbbb"),
-            ChatMessage::text("assistant", "cccccccccc"),
+            ChatMessage::text("user", "aaaaaaaaaa bbbbbbbbbb ".repeat(80)),
+            ChatMessage::text("assistant", "cccccccccc ".repeat(80)),
             ChatMessage::text("user", "recent"),
         ];
         let result =
