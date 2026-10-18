@@ -498,7 +498,9 @@ fn a_symlink_leaving_the_checkout_is_not_followed() {
     let linked = std::os::windows::fs::symlink_dir(outside.path(), &link_dir).is_ok()
         && std::os::windows::fs::symlink_file(outside.path().join("AGENTS.md"), &link_file).is_ok();
     if !linked {
-        return; // symlinks need privilege on some hosts
+        // Symlinks need privilege on some hosts (Windows without developer mode).
+        eprintln!("SKIPPED: symlink creation failed, the escape case did not run");
+        return;
     }
     let mut agent = agent_in(repo.path(), true);
     let read = |path: &str| ("read", serde_json::json!({"path": path}));

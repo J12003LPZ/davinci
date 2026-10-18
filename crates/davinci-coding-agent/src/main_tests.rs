@@ -4129,6 +4129,7 @@ impl SessionStartPlugin {
             .status()
             .is_err()
         {
+            eprintln!("SKIPPED: SessionStart plugin test needs `bash` on PATH, none found");
             return None;
         }
         let dir = tempfile::tempdir().unwrap();
