@@ -320,6 +320,7 @@ fn event_entry(event: &ContextEvent) -> ContextImageEntry {
         ContextEventKind::Assistant => "hot_assistant",
         ContextEventKind::ToolResult => "hot_tool_result",
         ContextEventKind::Custom => "hot_custom",
+        ContextEventKind::HarnessReminder => "hot_harness_reminder",
     };
     ContextImageEntry {
         id: event.source_ref.clone(),
@@ -327,7 +328,10 @@ fn event_entry(event: &ContextEvent) -> ContextImageEntry {
         provenance_kind: event.provenance_kind,
         source_ref: event.source_ref.clone(),
         content_hash: event.content_hash.clone(),
-        content: wrap_untrusted_data(&event.source_ref, &event.visible_text),
+        content: match event.kind {
+            ContextEventKind::HarnessReminder => event.visible_text.clone(),
+            _ => wrap_untrusted_data(&event.source_ref, &event.visible_text),
+        },
         estimated_tokens: hot_entry_tokens(event),
         mandatory: matches!(event.kind, ContextEventKind::User),
         stable_for_cache: false,
@@ -340,6 +344,8 @@ fn event_message(event: &ContextEvent) -> ChatMessage {
         ContextEventKind::Assistant => "assistant",
         ContextEventKind::ToolResult => "custom",
         ContextEventKind::Custom => "custom",
+        // Stays in the user turn so user/assistant turns keep alternating.
+        ContextEventKind::HarnessReminder => "user",
     };
     if matches!(
         event.kind,

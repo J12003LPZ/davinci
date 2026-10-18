@@ -6,9 +6,9 @@ use davinci_protocol::Usage;
 use davinci_session::{branch_entries, SessionEntry};
 
 use crate::compaction::{
-    compute_file_lists, convert_to_llm, env_summarizer, estimate_tokens, extract_file_ops,
-    format_file_operations, get_summarization_failure, serialize_conversation, CompactionDetails,
-    FileOperations, SummarizeRequest, Summarizer, SUMMARIZATION_SYSTEM_PROMPT,
+    compute_file_lists, convert_to_llm_for_summary, env_summarizer, estimate_tokens,
+    extract_file_ops, format_file_operations, get_summarization_failure, serialize_conversation,
+    CompactionDetails, FileOperations, SummarizeRequest, Summarizer, SUMMARIZATION_SYSTEM_PROMPT,
 };
 
 pub const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
@@ -182,7 +182,7 @@ pub fn build_branch_summary_prompt(
     } else {
         BRANCH_SUMMARY_PROMPT.to_string()
     };
-    let conversation = serialize_conversation(&convert_to_llm(messages));
+    let conversation = serialize_conversation(&convert_to_llm_for_summary(messages));
     format!("<conversation>\n{conversation}\n</conversation>\n\n{instructions}")
 }
 
@@ -206,7 +206,9 @@ pub fn generate_branch_summary(
     let Some(summarizer) = summarizer.or(env.as_ref()) else {
         let details = compute_file_lists(&prepared.file_ops);
         let mut summary = BRANCH_SUMMARY_PREAMBLE.to_string();
-        summary.push_str(&serialize_conversation(&convert_to_llm(&prepared.messages)));
+        summary.push_str(&serialize_conversation(&convert_to_llm_for_summary(
+            &prepared.messages,
+        )));
         summary.push_str(&format_file_operations(
             &details.read_files,
             &details.modified_files,

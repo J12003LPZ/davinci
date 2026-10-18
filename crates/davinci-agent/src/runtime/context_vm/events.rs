@@ -13,6 +13,10 @@ pub enum ContextEventKind {
     Assistant,
     ToolResult,
     Custom,
+    /// A capability or completion reminder the harness queued in the user
+    /// role. The model must read it as an instruction in the user turn, but it
+    /// is not a user requirement: no goal, not mandatory, no user budget.
+    HarnessReminder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +41,37 @@ pub struct EventImage {
     pub data: String,
 }
 
+impl EventImage {
+    /// Digest of the image data; the same one `content_hash` folds in.
+    pub fn digest(&self) -> String {
+        digest(self.data.as_bytes())
+    }
+
+    /// The durable pointer to this image that outlives its bytes in the hot
+    /// window: media type, a digest prefix and the way back to the source.
+    pub fn reference(&self, source_ref: &str) -> String {
+        let digest = self.digest();
+        format!(
+            "[image {} sha256:{}... - recover with retrieve_context {source_ref}]",
+            self.mime_type,
+            &digest[..digest.len().min(IMAGE_DIGEST_CHARS)]
+        )
+    }
+}
+
+/// Hex characters of an image digest shown in a reference.
+const IMAGE_DIGEST_CHARS: usize = 16;
+
 impl ContextEvent {
+    /// One reference line per image the event carries (see
+    /// [`EventImage::reference`]); empty for a text-only event.
+    pub fn image_references(&self) -> Vec<String> {
+        self.images
+            .iter()
+            .map(|image| image.reference(&self.source_ref))
+            .collect()
+    }
+
     /// The provider content of a user event: its text, then its images.
     pub fn user_content(&self) -> Vec<MessageContent> {
         let text = (!self.visible_text.is_empty()).then(|| MessageContent::Text {
@@ -111,7 +145,14 @@ pub(super) fn event_from_message(
     let summary = visible_text.starts_with(crate::COMPACTION_SUMMARY_PREFIX)
         || visible_text.starts_with(crate::BRANCH_SUMMARY_PREFIX);
     let (kind, provenance_kind) = match message.role.as_str() {
-        "user" if !summary => (ContextEventKind::User, ProvenanceKind::UserDecision),
+        "user" if !summary => match internal_user_message(message) {
+            Some(InternalUserMessage::Reminder) => (
+                ContextEventKind::HarnessReminder,
+                ProvenanceKind::AgentInference,
+            ),
+            Some(internal) => (ContextEventKind::Custom, internal.provenance_kind()),
+            None => (ContextEventKind::User, ProvenanceKind::UserDecision),
+        },
         "assistant" => (ContextEventKind::Assistant, ProvenanceKind::AgentInference),
         "toolResult" | "tool_result" => {
             (ContextEventKind::ToolResult, ProvenanceKind::ToolEvidence)
@@ -128,6 +169,55 @@ pub(super) fn event_from_message(
         artifact_refs: artifact_refs_from_message(message, &source_ref),
         images,
     })
+}
+
+/// `extra` field on the reminder the harness queues when a capability gate
+/// blocks completion (`queue_capability_reminder` in turn.rs).
+pub(crate) const CAPABILITY_REMINDER_FIELD: &str = "davinciCapabilityReminder";
+
+/// A user-role message the harness wrote rather than a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InternalUserMessage {
+    /// A finished background job (`customType: backgroundJob`).
+    JobNotice,
+    /// A capability or completion reminder.
+    Reminder,
+    /// Any other `customType`.
+    Custom(String),
+}
+
+impl InternalUserMessage {
+    pub(crate) fn provenance_kind(&self) -> ProvenanceKind {
+        match self {
+            Self::JobNotice => ProvenanceKind::ToolEvidence,
+            Self::Reminder | Self::Custom(_) => ProvenanceKind::AgentInference,
+        }
+    }
+}
+
+/// Whether a user-role message came from the harness. Job notices, capability
+/// and completion reminders and any other `customType` message ride in the
+/// user role so the model reads them, but they are never user requirements:
+/// they must not become goals, be mandatory in the image, or get the user
+/// excerpt budget. A message marked with `REAL_USER_ORIGIN_FIELD` is a
+/// person's whatever else it carries; unmarked plain messages stay user
+/// messages (`prompt_with` creates them).
+pub(crate) fn internal_user_message(message: &ChatMessage) -> Option<InternalUserMessage> {
+    if message.role != "user" || message.extra_bool(crate::REAL_USER_ORIGIN_FIELD) {
+        return None;
+    }
+    if message.extra.contains_key(CAPABILITY_REMINDER_FIELD)
+        || message
+            .extra
+            .contains_key(crate::completion::COMPLETION_REMINDER_FIELD)
+    {
+        return Some(InternalUserMessage::Reminder);
+    }
+    match message.extra.get("customType").and_then(Value::as_str) {
+        Some(crate::JOB_NOTICE_TYPE) => Some(InternalUserMessage::JobNotice),
+        Some(other) => Some(InternalUserMessage::Custom(other.to_string())),
+        None => None,
+    }
 }
 
 fn user_images(message: &ChatMessage) -> Vec<EventImage> {
@@ -207,4 +297,92 @@ fn visible_text(message: &ChatMessage) -> String {
         }
     }
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user_with(extra: Value) -> ChatMessage {
+        let mut message = ChatMessage::text("user", "Background job 3 finished.");
+        message.extra = extra.as_object().cloned().unwrap_or_default();
+        message
+    }
+
+    fn classify(message: &ChatMessage) -> (ContextEventKind, ProvenanceKind) {
+        let event = event_from_message(message, "session:x".into(), 1).unwrap();
+        (event.kind, event.provenance_kind)
+    }
+
+    #[test]
+    fn image_reference_names_mime_digest_and_source() {
+        let image = EventImage {
+            mime_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let line = image.reference("session:e1");
+        assert!(line.starts_with("[image image/png sha256:"), "{line}");
+        assert!(line.contains(&image.digest()[..16]), "{line}");
+        assert!(
+            line.ends_with("recover with retrieve_context session:e1]"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn plain_user_message_is_a_user_decision() {
+        assert_eq!(
+            classify(&ChatMessage::text("user", "fix the bug")),
+            (ContextEventKind::User, ProvenanceKind::UserDecision)
+        );
+    }
+
+    #[test]
+    fn job_notice_is_tool_evidence_not_a_user_message() {
+        let message = user_with(json!({"customType": crate::JOB_NOTICE_TYPE, "jobId": 3}));
+        assert_eq!(
+            classify(&message),
+            (ContextEventKind::Custom, ProvenanceKind::ToolEvidence)
+        );
+    }
+
+    #[test]
+    fn harness_reminders_are_agent_inference() {
+        for field in [
+            CAPABILITY_REMINDER_FIELD,
+            crate::completion::COMPLETION_REMINDER_FIELD,
+        ] {
+            let message = user_with(json!({ field: "verification_required" }));
+            assert_eq!(
+                classify(&message),
+                (
+                    ContextEventKind::HarnessReminder,
+                    ProvenanceKind::AgentInference
+                ),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_custom_type_on_a_user_role_message_is_not_user() {
+        let message = user_with(json!({"customType": "extension-note"}));
+        assert_eq!(
+            classify(&message),
+            (ContextEventKind::Custom, ProvenanceKind::AgentInference)
+        );
+    }
+
+    #[test]
+    fn real_user_origin_marker_overrides_internal_markers() {
+        let message = user_with(json!({
+            crate::REAL_USER_ORIGIN_FIELD: true,
+            "customType": "extension-note",
+        }));
+        assert_eq!(
+            classify(&message),
+            (ContextEventKind::User, ProvenanceKind::UserDecision)
+        );
+    }
 }
