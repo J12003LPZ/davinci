@@ -91,6 +91,17 @@ fn path_url(token: &str, cwd: &Path, exists: &mut impl FnMut(&Path) -> bool) -> 
     if !rooted || token.starts_with("//") || (token.contains('\\') && !drive) {
         return None;
     }
+    // On Windows `/config` is a slash command, even where `C:\config` exists:
+    // one name after the root is never read as a path. `/etc/hosts` still is.
+    // Elsewhere the root is a real directory, so `/tmp` links when it exists.
+    if cfg!(windows)
+        && !drive
+        && token
+            .strip_prefix('/')
+            .is_some_and(|rest| !rest.contains('/'))
+    {
+        return None;
+    }
     let mut path = token;
     // `src/lib.rs:12:3` names the file.
     for _ in 0..2 {
@@ -316,6 +327,35 @@ mod tests {
         assert!(links("http://").is_empty());
         let anything = find("/ for commands", Path::new("/work/app"), &mut |_| true);
         assert!(anything.is_empty(), "a bare root is a hint, not a link");
+    }
+
+    #[test]
+    fn a_slash_command_is_never_a_link_even_when_the_root_folder_exists() {
+        // On Windows `/config` resolves to `C:\config`, which may exist.
+        // Elsewhere the root is real: a name there links only if it exists,
+        // so `/tmp` links and a slash command with no such folder does not.
+        let every_path_exists = &mut |_: &Path| true;
+        let cwd = Path::new("/work/app");
+        for row in ["/config", "  /init  /model  /effort", "run /tree:12 now"] {
+            assert_eq!(
+                find(row, cwd, every_path_exists).is_empty(),
+                cfg!(windows),
+                "{row}"
+            );
+            assert!(find(row, cwd, &mut |_| false).is_empty(), "{row}");
+        }
+        assert_eq!(find("/etc/hosts", cwd, every_path_exists).len(), 1);
+        assert_eq!(find("./config", cwd, every_path_exists).len(), 1);
+    }
+
+    #[test]
+    fn a_top_level_unix_directory_links_where_the_root_is_real() {
+        let found = find("see /tmp now", Path::new("/work/app"), &mut |p| {
+            p == Path::new("/tmp")
+        });
+        assert_eq!(found.len(), usize::from(cfg!(not(windows))));
+        // A missing one never links, on any platform.
+        assert!(find("see /nope", Path::new("/work/app"), &mut |_| false).is_empty());
     }
 
     #[test]

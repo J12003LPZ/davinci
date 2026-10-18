@@ -4193,6 +4193,7 @@ pub fn perform(
             }
         }
         SlashAction::Reload => {
+            davinci_coding_agent::plugins::reload_active();
             let keybindings_started = Instant::now();
             model.keybindings = davinci_tui::Keybindings::load(&agent_dir);
             let keybindings_ms = keybindings_started.elapsed().as_millis();
@@ -4811,13 +4812,18 @@ pub fn run(
     // What the composer completes: the same slash corpus, extension providers
     // and `/login` list the legacy chrome offers, through the same engine.
     crate::startup_mark("shell: models listed");
-    model.slash_commands = crate::interactive_slash_commands(agent, parsed);
+    // The shell's host was loaded from the same settings and directory these
+    // lists are read from; each fresh load would cost a whole native host.
+    {
+        let host = host.lock().map_err(|err| err.to_string())?;
+        model.slash_commands = crate::interactive_slash_commands_from(agent, &host);
+        model.extra_autocomplete = crate::interactive_extra_autocomplete_from(&host);
+        model.login_providers = crate::interactive_login_providers_from(&host);
+    }
     // The palette lists what the composer completes, so it is built from the
     // same command list rather than from the built-ins alone.
     model.corpus = corpus(agent, &model.slash_commands, &model.sessions);
     model.corpus_total = model.corpus.len();
-    model.extra_autocomplete = crate::interactive_extra_autocomplete(parsed);
-    model.login_providers = crate::interactive_login_providers(parsed);
     crate::startup_mark("shell: commands and completions");
     model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
     sync_thinking_state(agent, &mut model);
