@@ -26,8 +26,9 @@ use davinci_ai::{ChatMessage, MessageContent};
 use serde_json::Value;
 
 use crate::context::{
-    self, file_stamp, governing_instruction_files, is_plugin_context, reload_changed_context_files,
-    render_nested_instructions, NESTED_INSTRUCTIONS_CUSTOM_TYPE,
+    self, discover_created_context_files, file_stamp, governing_instruction_files,
+    is_plugin_context, reload_changed_context_files, render_nested_instructions,
+    NESTED_INSTRUCTIONS_CUSTOM_TYPE,
 };
 use crate::prompt::manifest::hash_text;
 use crate::Agent;
@@ -46,6 +47,11 @@ impl Agent {
             .iter()
             .filter_map(|file| Some((file.path.clone(), file_stamp(&file.path)?)))
             .collect();
+        self.instruction_chain = if enabled {
+            context::instruction_chain(&self.cwd)
+        } else {
+            Vec::new()
+        };
         self.invalidate_context_image();
     }
 
@@ -57,6 +63,12 @@ impl Agent {
         }
         let edited =
             reload_changed_context_files(&mut self.context_files, &mut self.context_file_stamps);
+        let created = discover_created_context_files(
+            &mut self.context_files,
+            &mut self.context_file_stamps,
+            &self.instruction_chain,
+        );
+        let edited = edited || created;
         let delivered = self.deliver_nested_instructions();
         if edited || delivered {
             self.invalidate_context_image();

@@ -523,6 +523,9 @@ pub struct Agent {
     /// `--no-context-files`, and for files a caller assigned by hand).
     pub instruction_files_enabled: bool,
     pub(crate) context_file_stamps: std::collections::HashMap<PathBuf, context::FileStamp>,
+    /// Where an `AGENTS.md` could sit from the repository root to `cwd`, set
+    /// at load, so one created mid-session is noticed.
+    pub(crate) instruction_chain: Vec<PathBuf>,
     pub session: Option<JsonlSession>,
     pub(crate) prompt_rewind: runtime::rewind::PromptRewindState,
     pub cwd: PathBuf,
@@ -739,6 +742,7 @@ impl Agent {
             context_files: Vec::new(),
             instruction_files_enabled: false,
             context_file_stamps: std::collections::HashMap::new(),
+            instruction_chain: Vec::new(),
             session: None,
             prompt_rewind: runtime::rewind::PromptRewindState::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

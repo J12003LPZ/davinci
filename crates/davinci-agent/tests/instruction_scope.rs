@@ -386,6 +386,103 @@ fn excluded_directory_names_match_case_insensitively() {
 }
 
 #[test]
+fn more_dependency_trees_never_deliver_instructions() {
+    let repo = repository();
+    let dirs = [".venv/lib", "venv/lib", "Pods/lib", "bower_components/lib"];
+    for dir in dirs {
+        fs::create_dir_all(repo.path().join(dir)).unwrap();
+        fs::write(repo.path().join(dir).join("AGENTS.md"), "vendored rules").unwrap();
+        fs::write(repo.path().join(dir).join("index.js"), "").unwrap();
+    }
+    let mut agent = agent_in(repo.path(), true);
+    let calls = dirs
+        .iter()
+        .map(|dir| {
+            (
+                "read",
+                serde_json::json!({"path": format!("{dir}/index.js")}),
+            )
+        })
+        .collect();
+    let requests = run(&mut agent, calls, |_| {});
+    for request in &requests {
+        assert!(
+            !request
+                .messages
+                .join(
+                    "
+"
+                )
+                .contains("vendored rules"),
+            "{:#?}",
+            request.messages
+        );
+    }
+}
+
+#[test]
+fn a_nested_repository_is_not_governed_by_or_delivered_from() {
+    let repo = repository();
+    let inner = repo.path().join("sub/inner");
+    fs::create_dir_all(inner.join("src")).unwrap();
+    // A submodule's `.git` is a file; a nested clone's is a directory.
+    fs::write(inner.join(".git"), "gitdir: ../../.git/modules/inner").unwrap();
+    fs::write(inner.join("AGENTS.md"), "inner repo rules").unwrap();
+    fs::write(inner.join("src/AGENTS.md"), "inner src rules").unwrap();
+    fs::write(inner.join("src/lib.rs"), "").unwrap();
+    let mut agent = agent_in(repo.path(), true);
+    let requests = run(
+        &mut agent,
+        vec![("read", serde_json::json!({"path": "sub/inner/src/lib.rs"}))],
+        |_| {},
+    );
+    for request in &requests {
+        assert!(
+            !request
+                .messages
+                .join(
+                    "
+"
+                )
+                .contains("inner"),
+            "{:#?}",
+            request.messages
+        );
+    }
+}
+
+#[test]
+fn an_instruction_file_created_mid_session_reaches_the_next_request() {
+    let repo = repository();
+    fs::remove_file(repo.path().join("AGENTS.md")).unwrap();
+    fs::remove_file(repo.path().join("sub/AGENTS.md")).unwrap();
+    let cwd = repo.path().join("sub");
+    let mut agent = agent_in(&cwd, true);
+    assert!(agent.context_files.iter().all(|f| !f.body.contains("late")));
+    let root_file = repo.path().join("AGENTS.md");
+    let sub_file = cwd.join("AGENTS.md");
+    let requests = run(
+        &mut agent,
+        vec![("read", serde_json::json!({"path": "x.rs"}))],
+        |turn| {
+            if turn == 0 {
+                // Created in the reverse of chain order on purpose.
+                fs::write(&sub_file, "late sub rules").unwrap();
+                fs::write(&root_file, "late root rules").unwrap();
+            }
+        },
+    );
+    assert!(!requests[0].system.contains("late"));
+    let system = &requests[1].system;
+    let (root, sub) = (
+        system.find("late root rules"),
+        system.find("late sub rules"),
+    );
+    assert!(root.is_some() && sub.is_some(), "{system}");
+    assert!(root < sub, "outermost file reads first: {system}");
+}
+
+#[test]
 fn a_symlink_leaving_the_checkout_is_not_followed() {
     let repo = repository();
     let outside = tempfile::tempdir().unwrap();

@@ -256,6 +256,24 @@ pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
     if !enabled {
         return Vec::new();
     }
+    instruction_chain(cwd)
+        .into_iter()
+        .filter_map(|path| {
+            let body = fs::read_to_string(&path).ok()?;
+            Some(ContextFile {
+                path,
+                name: INSTRUCTION_FILE.to_string(),
+                body,
+            })
+        })
+        .collect()
+}
+
+/// Every path an `AGENTS.md` could sit at from the repository root down to
+/// `cwd`, outermost first, whether or not the file exists. The entry for
+/// `cwd` itself keeps the path the caller gave, so it is labelled relative to
+/// `cwd`.
+pub(crate) fn instruction_chain(cwd: &Path) -> Vec<PathBuf> {
     let (Some(root), Ok(canonical)) = (repository_root(cwd), fs::canonicalize(cwd)) else {
         return Vec::new();
     };
@@ -266,20 +284,12 @@ pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
     directories.reverse();
     directories
         .into_iter()
-        .filter_map(|directory| {
-            // `cwd`'s own file keeps the path the caller gave, so it is
-            // labelled relative to `cwd` exactly as before.
-            let path = if directory == canonical {
+        .map(|directory| {
+            if directory == canonical {
                 cwd.join(INSTRUCTION_FILE)
             } else {
                 directory.join(INSTRUCTION_FILE)
-            };
-            let body = fs::read_to_string(&path).ok()?;
-            Some(ContextFile {
-                path,
-                name: INSTRUCTION_FILE.to_string(),
-                body,
-            })
+            }
         })
         .collect()
 }
@@ -395,11 +405,54 @@ pub(crate) fn reload_changed_context_files(
     changed
 }
 
+/// Pick up an `AGENTS.md` created, mid-session, at a place on the root-to-cwd
+/// `chain` that had none at load. One `stat` per missing chain entry. New
+/// files are inserted in chain order, ahead of `plugin:` pseudo-files.
+/// Returns whether any file was added.
+pub(crate) fn discover_created_context_files(
+    files: &mut Vec<ContextFile>,
+    stamps: &mut HashMap<PathBuf, FileStamp>,
+    chain: &[PathBuf],
+) -> bool {
+    let mut added = false;
+    for (rank, path) in chain.iter().enumerate() {
+        if files.iter().any(|file| &file.path == path) || !path.is_file() {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(stamp) = file_stamp(path) {
+            stamps.insert(path.clone(), stamp);
+        }
+        let position = files
+            .iter()
+            .position(|file| {
+                is_plugin_context(file)
+                    || chain
+                        .iter()
+                        .position(|candidate| candidate == &file.path)
+                        .is_some_and(|other| other > rank)
+            })
+            .unwrap_or(files.len());
+        files.insert(
+            position,
+            ContextFile {
+                path: path.clone(),
+                name: INSTRUCTION_FILE.to_string(),
+                body,
+            },
+        );
+        added = true;
+    }
+    added
+}
+
 /// Custom-message type of the appended nested-instruction delivery.
 pub const NESTED_INSTRUCTIONS_CUSTOM_TYPE: &str = "davinci.nested_instructions";
 
 /// Directories whose `AGENTS.md` is never delivered as nested instructions.
-const EXCLUDED_INSTRUCTION_DIRS: [&str; 7] = [
+const EXCLUDED_INSTRUCTION_DIRS: [&str; 11] = [
     "node_modules",
     "vendor",
     "target",
@@ -407,6 +460,10 @@ const EXCLUDED_INSTRUCTION_DIRS: [&str; 7] = [
     "dist",
     "build",
     "third_party",
+    ".venv",
+    "venv",
+    "Pods",
+    "bower_components",
 ];
 
 /// Every `AGENTS.md` that governs `target`: the repository root's down to the
@@ -458,13 +515,17 @@ pub(crate) fn governing_instruction_files(cwd: &Path, target: &Path) -> Vec<Cont
         // chain stops at the first such directory (a fixed list, not
         // `.gitignore`, so no git process runs per tool call).
         .take_while(|dir| {
-            dir.strip_prefix(&root).is_ok_and(|relative| {
-                !relative.components().any(|part| {
-                    EXCLUDED_INSTRUCTION_DIRS
-                        .iter()
-                        .any(|name| part.as_os_str().eq_ignore_ascii_case(name))
+            // A nested repository or submodule (a `.git` entry below the
+            // root) has its own instructions, not this checkout's.
+            let nested_repository = *dir != root && dir.join(".git").exists();
+            !nested_repository
+                && dir.strip_prefix(&root).is_ok_and(|relative| {
+                    !relative.components().any(|part| {
+                        EXCLUDED_INSTRUCTION_DIRS
+                            .iter()
+                            .any(|name| part.as_os_str().eq_ignore_ascii_case(name))
+                    })
                 })
-            })
         })
         .filter_map(|dir| {
             let path = dir.join(INSTRUCTION_FILE);
