@@ -332,10 +332,17 @@ mod tests {
     #[test]
     fn a_slash_command_is_never_a_link_even_when_the_root_folder_exists() {
         // On Windows `/config` resolves to `C:\config`, which may exist.
+        // Elsewhere the root is real: a name there links only if it exists,
+        // so `/tmp` links and a slash command with no such folder does not.
         let every_path_exists = &mut |_: &Path| true;
         let cwd = Path::new("/work/app");
         for row in ["/config", "  /init  /model  /effort", "run /tree:12 now"] {
-            assert!(find(row, cwd, every_path_exists).is_empty(), "{row}");
+            assert_eq!(
+                find(row, cwd, every_path_exists).is_empty(),
+                cfg!(windows),
+                "{row}"
+            );
+            assert!(find(row, cwd, &mut |_| false).is_empty(), "{row}");
         }
         assert_eq!(find("/etc/hosts", cwd, every_path_exists).len(), 1);
         assert_eq!(find("./config", cwd, every_path_exists).len(), 1);
