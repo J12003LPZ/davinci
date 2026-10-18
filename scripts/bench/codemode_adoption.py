@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -34,6 +35,8 @@ PROMPTS = {
     "p5-docs-summary": "Read the headings of docs/codemode.md and the first 5 lines of CHANGELOG.md, then summarize both in two sentences.",
     "p6-worker-slots": "Find where WorkerSlotCapacity is defined and list every file that calls acquire_exclusive.",
 }
+NOTHING = re.compile(r"\b(no|none|not found|zero|0|nothing|does not|doesn't|not defined|no such)\b", re.I)
+NEGATION = re.compile(r"\b(no|not|none|missing|absent|doesn't|does not|n't|without|nonexistent)\b|n't", re.I)
 ROOT_FILES = ["Cargo.toml", "rust-toolchain.toml", "deny.toml", "rustfmt.toml"]
 MIN_ADOPTION = 0.5  # share of Codemode-on runs that call codemode at least once
 MIN_CORRECT = 0.8  # share of Codemode-on answers that pass their check
@@ -74,20 +77,17 @@ def truth(repo):
     counts, docs = {}, {}
     for name in files:
         docs[name] = _first_doc(_text(repo, f"{CODEMODE_DIR}/{name}"))
-        seen = {len(_text(repo, f"{CODEMODE_DIR}/{name}").splitlines())}
-        # Accept any version of the file from recent history: a long run can span commits.
-        for rev in _git(repo, "log", "-n", "8", "--format=%H", "--", f"{CODEMODE_DIR}/{name}").split():
-            old = _git(repo, "show", f"{rev}:{CODEMODE_DIR}/{name}")
-            if old:
-                seen.add(len(old.splitlines()))
-        counts[name] = seen
-    constructors, callers = [], set()
+        # The tree the run was made against, never an older revision of a file.
+        counts[name] = {len(_text(repo, f"{CODEMODE_DIR}/{name}").splitlines())}
+    constructors, callers, definition = [], set(), set()
     for rel, path in _rust_files(repo):
         for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if "CodeModeChildOutcome {" in line and "pub struct" not in line:
                 constructors.append((Path(rel).name, number))
-            if "acquire_exclusive" in line and Path(rel).name != "capacity.rs":
+            if re.search(r"\bacquire_exclusive\s*\(", line) and not re.search(r"\bfn\s+acquire_exclusive\b", line):
                 callers.add(Path(rel).name)
+            if re.search(r"\b(struct|enum|type)\s+WorkerSlotCapacity\b", line):
+                definition.add(Path(rel).name)
     version = re.search(r'^version\s*=\s*"([^"]+)"', _text(repo, "Cargo.toml"), re.M)
     src = {}
     for crate in sorted(p for p in Path(repo, "crates").iterdir() if (p / "src").is_dir()):
@@ -100,7 +100,7 @@ def truth(repo):
     }
     headings = [h.strip() for h in re.findall(r"^#{1,6}\s+(.+)$", _text(repo, "docs/codemode.md"), re.M)]
     changelog = [l.strip() for l in _text(repo, "CHANGELOG.md").splitlines()[:5] if l.strip()]
-    return {"files": files, "counts": counts, "docs": docs, "headings": headings, "changelog": changelog, "constructors": constructors, "callers": sorted(callers),
+    return {"files": files, "counts": counts, "docs": docs, "headings": headings, "changelog": changelog, "constructors": constructors, "callers": sorted(callers), "definition": sorted(definition),
             "version": version.group(1) if version else None, "src": src, "first3": first3}
 
 
@@ -147,29 +147,42 @@ def grade(prompt, answer, t):
             if name in t["first3"]:
                 for fact in [name] + t["first3"][name]:
                     expect(fact in answer, f"{name}: {fact!r}")
+            else:
+                # A file that does not exist may be named only to say so.
+                claimed = [l for l in lines if name in l and not NEGATION.search(l)]
+                expect(not claimed, f"{name} does not exist but the answer lists it")
     elif prompt == "p4-crate-versions":
         for crate, (files, _entries) in t["src"].items():
             row = next((l for l in lines if re.search(re.escape(crate) + r"(?![-\w])", l)), None)
             expect(row is not None, f"{crate} absent")
             row = row or ""
             expect(bool(t["version"]) and t["version"] in row, f"{crate} version")
-            # Version digits must never satisfy the file count.
+            # Version digits never count; the number must be the one tied to "files".
             bare = row.replace(crate, "").replace(t["version"] or "\0", "")
-            expect(_has_number(bare, files), f"{crate} src count")
+            tied = re.findall(r"(\d+)\s*(?:\w+\s+)?files?\b|\bfiles?\b\s*[:=]?\s*(\d+)", bare, re.I)
+            stated = {int(n) for pair in tied for n in pair if n}
+            if not stated:
+                stated = _numbers(bare)  # a table cell: the only bare number is the count
+            expect(stated == {files}, f"{crate} src count")
     elif prompt == "p5-docs-summary":
         text = _squash(answer)
-        expect(any(_squash(h) in text for h in t["headings"]), "no heading of docs/codemode.md")
-        tokens = [w for l in t["changelog"] for w in re.findall(r"\d+\.\d+\.\d+|unreleased", l, re.I)]
-        expect(any(w.lower() in text for w in tokens), "no changelog entry from its first lines")
+        need = min(2, len(t["headings"]))
+        seen = sum(_squash(h) in text for h in t["headings"])
+        expect(seen >= need, f"only {seen} of the docs/codemode.md headings mentioned (need {need})")
+        tokens = sorted({w.lower() for l in t["changelog"] for w in re.findall(r"\d+\.\d+\.\d+|unreleased", l, re.I)})
+        for token in tokens:
+            expect(token in text, f"changelog entry {token!r} missing")
         expect(len(re.findall(r"[.!?](\s|$)", answer)) >= 2, "not two sentences")
     elif prompt == "p6-worker-slots":
-        expect("capacity.rs" in answer, "definition file")
+        for name in t["definition"]:
+            expect(name in answer, f"definition file {name}")
+        if not t["definition"]:
+            expect(bool(NOTHING.search(answer)), "did not report that WorkerSlotCapacity is not defined")
         if t["callers"]:
             for c in t["callers"]:
                 expect(c in answer, f"caller {c}")
         else:
-            expect(bool(re.search(r"\b(no|none|not found|zero|0|nothing|does not|doesn't)\b", answer, re.I)),
-                   "did not report that nothing calls it")
+            expect(bool(NOTHING.search(answer)), "did not report that nothing calls it")
     return miss, max(total, 1)
 
 
@@ -212,13 +225,30 @@ def run(args):
         sys.exit("--out must be a new directory")
     out.mkdir(parents=True)
     rows = []
+    (out / "commit.txt").write_text(_git(args.repo, "rev-parse", "HEAD").strip() + "\n", encoding="utf-8")
+    # Agent dirs hold auth.json, so they live outside --out (which gets archived
+    # and shared) in a private temp dir that is removed when the runs end.
+    scratch = Path(tempfile.mkdtemp(prefix="codemode-adoption-"))
+    try:
+        _run_all(args, out, scratch, rows)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    with open(out / "runs.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _run_all(args, out, scratch, rows):
+    for arm in args.arms:
+        (out / f"settings-{arm}.json").write_text(json.dumps(settings(arm, args.node, args.host)), encoding="utf-8")
     for rep in range(args.reps):
         for name, prompt in PROMPTS.items():
             for arm in args.arms:
-                agent = out / f"agent-{arm}"
+                agent = scratch / f"agent-{arm}"
                 agent.mkdir(exist_ok=True)
                 (agent / "settings.json").write_text(json.dumps(settings(arm, args.node, args.host)), encoding="utf-8")
-                # Copied fresh each run so a refreshed token carries forward; never printed.
+                # Copied fresh each run; never printed, never left under --out.
                 shutil.copy(Path(args.credential_source) / "auth.json", agent / "auth.json")
                 run_dir = out / "runs" / f"{arm}-{name}-r{rep}"
                 run_dir.mkdir(parents=True)
@@ -234,20 +264,32 @@ def run(args):
                     code = "timeout"
                 rows.append({"arm": arm, "prompt": name, "rep": rep, "exit": code, "wall_s": round(time.time() - started, 1)})
                 print(json.dumps(rows[-1]), flush=True)
-    with open(out / "runs.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 def report(args):
     out, t = Path(args.out), truth(args.repo)
+    exits = {}
+    if (out / "runs.csv").exists():
+        with open(out / "runs.csv", newline="", encoding="utf-8") as f:
+            exits = {(r["arm"], r["prompt"], r["rep"]): r["exit"] for r in csv.DictReader(f)}
+    else:
+        print("warning: no runs.csv, process exit codes were not checked")
+    recorded = out / "commit.txt"
+    head = _git(args.repo, "rev-parse", "HEAD").strip()
+    if recorded.exists() and recorded.read_text(encoding="utf-8").strip() != head:
+        print(f"warning: runs were made at {recorded.read_text(encoding='utf-8').strip()[:10]}, grading against {head[:10]}")
     arms = collections.defaultdict(
-        lambda: {"runs": 0, "correct": 0, "facts": 0, "facts_ok": 0, "adopted": 0, "tools": 0, "failures": []})
+        lambda: {"crashed": 0, "runs": 0, "correct": 0, "facts": 0, "facts_ok": 0, "adopted": 0, "tools": 0, "failures": []})
     for run_dir in sorted((out / "runs").iterdir()):
         arm, prompt = run_dir.name.split("-", 1)[0], re.sub(r"-r\d+$", "", run_dir.name.split("-", 1)[1])
         answer, tools = read_run(run_dir / "out.jsonl")
         miss, total = grade(prompt, answer, t)
+        rep_no = re.search(r"-r(\d+)$", run_dir.name)
+        status = exits.get((arm, prompt, rep_no.group(1) if rep_no else ""), "0" if not exits else "missing")
+        if status != "0":
+            # A run that did not exit cleanly is a failure whatever its output says.
+            miss = [f"process exit {status}"] + miss
+            arms[arm]["crashed"] += 1
         a = arms[arm]
         a["runs"] += 1
         a["correct"] += not miss
@@ -258,7 +300,7 @@ def report(args):
         if miss:
             a["failures"].append(f"{run_dir.name}: {'; '.join(miss)[:160]}")
     for arm, a in sorted(arms.items()):
-        print(f"{arm:4} runs={a['runs']} strict_correct={a['correct']}/{a['runs']} "
+        print(f"{arm:4} runs={a['runs']} crashed={a['crashed']} strict_correct={a['correct']}/{a['runs']} "
               f"facts={a['facts_ok']}/{a['facts']} using_codemode={a['adopted']}/{a['runs']} tool_calls={a['tools']}")
         for failure in a["failures"]:
             print("   ", failure)
@@ -277,6 +319,12 @@ def report(args):
     return ok
 
 
+def default_node():
+    """The Node runtime Codemode installs: node.exe on Windows, bin/node elsewhere."""
+    base = Path.home() / ".davinci/agent/codemode/node"
+    return base / "node.exe" if os.name == "nt" else base / "bin" / "node"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -289,7 +337,7 @@ def main(argv=None):
     live.add_argument("--arms", nargs="+", choices=["on", "off"], default=["on", "off"])
     live.add_argument("--model", default="gpt-6-luna")
     live.add_argument("--timeout", type=int, default=300)
-    live.add_argument("--node", default=Path.home() / ".davinci/agent/codemode/node/node.exe")
+    live.add_argument("--node", default=default_node())
     live.add_argument("--host", default=Path.home() / ".davinci/agent/codemode/host")
     rep = sub.add_parser("report", help="offline grading of a finished run directory")
     rep.add_argument("--out", required=True)

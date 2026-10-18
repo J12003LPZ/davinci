@@ -2,6 +2,9 @@
 import contextlib
 import importlib.util
 import io
+import os
+import re
+import subprocess
 import json
 import tempfile
 import unittest
@@ -28,7 +31,8 @@ def perfect(prompt):
     if prompt == "p4-crate-versions":
         return "\n".join(f"- {c}: {t['version']}, {files} files" for c, (files, _) in t["src"].items())
     if prompt == "p5-docs-summary":
-        return "The doc covers " + t["headings"][0] + " and more. The changelog starts with " + t["changelog"][-1] + "."
+        tokens = sorted({w for l in t["changelog"] for w in re.findall(r"\d+\.\d+\.\d+|Unreleased", l)})
+        return f"The doc covers {t['headings'][0]} and {t['headings'][1]}. The changelog lists {' and '.join(tokens)}."
     callers = ", ".join(t["callers"]) or "nothing calls it"
     return f"WorkerSlotCapacity is defined in capacity.rs. acquire_exclusive callers: {callers}."
 
@@ -81,6 +85,102 @@ class GraderTests(unittest.TestCase):
         bad = f"- {crate}: {TRUTH['version']}, {wrong} files, {major}"
         answer = perfect("p4-crate-versions").replace(good, bad)
         self.assertIn(f"{crate} src count", adoption.check("p4-crate-versions", answer, TRUTH))
+
+    def test_a_listed_file_that_does_not_exist_is_penalized(self):
+        absent = adoption.ROOT_FILES[-1]
+        truth = dict(TRUTH, first3={k: v for k, v in TRUTH["first3"].items() if k != absent})
+        base = "\n".join(f"{n}\n" + "\n".join(lines) for n, lines in truth["first3"].items())
+        self.assertEqual(adoption.check("p3-root-config", base, truth), [])
+        invented = base + f"\n{absent}\nedition = 2021"
+        self.assertTrue(adoption.check("p3-root-config", invented, truth))
+        honest = base + f"\n{absent} does not exist"
+        self.assertEqual(adoption.check("p3-root-config", honest, truth), [])
+
+    def test_the_file_count_must_be_the_number_tied_to_files(self):
+        crate, (files, _) = next(iter(TRUTH["src"].items()))
+        good = next(l for l in perfect("p4-crate-versions").splitlines() if l.startswith(f"- {crate}:"))
+        swapped = f"- {crate}: {TRUTH['version']}, 999 files, {files} modules"
+        answer = perfect("p4-crate-versions").replace(good, swapped)
+        self.assertIn(f"{crate} src count", adoption.check("p4-crate-versions", answer, TRUTH))
+
+    def test_a_thin_docs_summary_fails(self):
+        t = TRUTH
+        one_heading = f"The doc covers {t['headings'][0]}. The changelog lists Unreleased."
+        self.assertTrue(adoption.check("p5-docs-summary", one_heading, t))
+
+    def test_callers_include_every_call_expression_and_skip_the_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp, "crates", "x", "src")
+            crate.mkdir(parents=True)
+            Path(crate, "capacity.rs").write_text(
+                "pub struct WorkerSlotCapacity;\nimpl WorkerSlotCapacity {\n"
+                "    pub fn acquire_exclusive(&self) {}\n}\n"
+                "#[test]\nfn t() { WorkerSlotCapacity.acquire_exclusive(); }\n", encoding="utf-8")
+            Path(crate, "user.rs").write_text("fn f(c: C) { c.acquire_exclusive(); }\n", encoding="utf-8")
+            for name in ("Cargo.toml", "CHANGELOG.md"):
+                Path(tmp, name).write_text('version = "1.0.0"\n', encoding="utf-8")
+            Path(tmp, "docs").mkdir()
+            Path(tmp, "docs", "codemode.md").write_text("# T\n", encoding="utf-8")
+            Path(tmp, "crates", "davinci-agent", "src", "codemode").mkdir(parents=True)
+            t = adoption.truth(tmp)
+        self.assertEqual(t["callers"], ["capacity.rs", "user.rs"])
+        self.assertEqual(t["definition"], ["capacity.rs"])
+
+    def test_a_crashed_run_fails_even_with_a_correct_answer(self):
+        with tempfile.TemporaryDirectory() as out:
+            prompts = list(adoption.PROMPTS)
+            for prompt in prompts:
+                for arm in ("on", "off"):
+                    run = Path(out, "runs", f"{arm}-{prompt}-r0")
+                    run.mkdir(parents=True)
+                    events = [{"type": "tool_execution_start", "toolName": "codemode"},
+                              {"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": perfect(prompt)}]}]}]
+                    Path(run, "out.jsonl").write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+            rows = "arm,prompt,rep,exit,wall_s\n" + "".join(
+                f"{arm},{p},0,{'timeout' if (arm, p) == ('on', prompts[0]) else 0},1\n" for p in prompts for arm in ("on", "off"))
+            Path(out, "runs.csv").write_text(rows, encoding="utf-8")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                adoption.report(Namespace(out=out, repo=REPO))
+        self.assertIn("process exit timeout", buffer.getvalue())
+        self.assertIn("crashed=1", buffer.getvalue())
+
+    def test_credentials_never_land_in_the_results_directory(self):
+        seen = []
+
+        real_run = subprocess.run
+
+        def fake_run(cmd, cwd=None, env=None, stdout=None, stderr=None, timeout=None, **kw):
+            if cmd[0] == "git":
+                return real_run(cmd, cwd=cwd, env=env, **kw)
+            agent = Path(env["DAVINCI_CODING_AGENT_DIR"])
+            seen.append((agent, (agent / "auth.json").exists()))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, "src")
+            source.mkdir()
+            Path(source, "auth.json").write_text("{}", encoding="utf-8")
+            out = Path(tmp, "results")
+            args = Namespace(out=str(out), binary="davinci", repo=str(REPO), credential_source=str(source),
+                             reps=1, arms=["on"], model="m", timeout=5, node="n", host="h")
+            real = adoption.subprocess.run
+            adoption.subprocess.run = fake_run
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    adoption.run(args)
+            finally:
+                adoption.subprocess.run = real
+            self.assertTrue(seen and all(has_auth for _, has_auth in seen))
+            for agent, _ in seen:
+                self.assertFalse(str(agent).startswith(str(out)), "agent dir is outside --out")
+                self.assertFalse(agent.exists(), "temp credentials are removed afterwards")
+            self.assertEqual([p for p in out.rglob("auth.json")], [])
+            self.assertTrue((out / "commit.txt").exists())
+
+    def test_the_default_node_matches_the_platform(self):
+        node = adoption.default_node()
+        self.assertEqual(node.name, "node.exe" if os.name == "nt" else "node")
 
     def test_read_run_extracts_the_answer_and_counts_tool_starts(self):
         with tempfile.TemporaryDirectory() as tmp:

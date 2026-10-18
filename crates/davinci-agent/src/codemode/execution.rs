@@ -267,24 +267,34 @@ impl Agent {
             {
                 outcome.status = CodeModeStatus::Partial;
             }
-            use std::sync::atomic::Ordering::Relaxed;
-            self.counters.codemode_runs.fetch_add(1, Relaxed);
-            if !matches!(outcome.status, CodeModeStatus::Completed) {
-                self.counters.codemode_unfinished.fetch_add(1, Relaxed);
-            }
             if empty {
-                self.counters.codemode_empty_results.fetch_add(1, Relaxed);
+                self.counters
+                    .codemode_empty_results
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok((outcome, authority))
         };
+        // Every terminal outcome counts once, including requests refused
+        // before a script ran, so attempts and failures are never undercounted.
+        let finish = |completed: bool| {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.counters.codemode_runs.fetch_add(1, Relaxed);
+            if !completed {
+                self.counters.codemode_unfinished.fetch_add(1, Relaxed);
+            }
+        };
         match run() {
-            Ok((outcome, authority)) => ToolResult {
-                content: serde_json::to_string(&outcome)
-                    .unwrap_or_else(|_| "Codemode outcome serialization failed".into()),
-                is_error: !matches!(outcome.status, CodeModeStatus::Completed),
-                details: Some(json!({"codemode":outcome,"_codemode_authority":authority})),
-            },
+            Ok((outcome, authority)) => {
+                finish(matches!(outcome.status, CodeModeStatus::Completed));
+                ToolResult {
+                    content: serde_json::to_string(&outcome)
+                        .unwrap_or_else(|_| "Codemode outcome serialization failed".into()),
+                    is_error: !matches!(outcome.status, CodeModeStatus::Completed),
+                    details: Some(json!({"codemode":outcome,"_codemode_authority":authority})),
+                }
+            }
             Err(mut error) => {
+                finish(false);
                 error.operation_ref = parent.map(|parent| parent.to_string());
                 let outcome = CodeModeOutcome {
                     status: match error.code.as_str() {

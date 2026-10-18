@@ -1322,6 +1322,25 @@ fn run_with_output(output: &'static str) -> (serde_json::Value, crate::stats::Ru
 }
 
 #[test]
+fn a_request_refused_before_any_script_runs_is_still_counted() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent
+        .enable_read_only_codemode(Arc::new(EmptyAfterReadHost("[]")))
+        .unwrap();
+    // `code` must be a string: the request is refused at validation.
+    let message = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![("bad".into(), "codemode".into(), json!({"code": 7}))],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(message.is_error, Some(true));
+    let stats = agent.run_stats();
+    assert_eq!((stats.codemode_runs, stats.codemode_unfinished), (1, 1));
+}
+
+#[test]
 fn an_empty_value_after_tool_calls_is_flagged_and_counted() {
     for empty in ["[]", "{}", "null", "", "  "] {
         let (outcome, stats) = run_with_output(empty);
