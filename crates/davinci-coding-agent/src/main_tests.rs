@@ -198,6 +198,7 @@ fn plugin_completion_dispatch_and_post_tool_feedback_reach_host() {
             record,
             plugin,
             data_dir: dir.path().join("data"),
+            agent_dir,
         }],
         errors: Vec::new(),
     };

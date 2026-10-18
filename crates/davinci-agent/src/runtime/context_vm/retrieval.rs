@@ -115,7 +115,7 @@ fn attach_images(
 ) -> (Vec<EventImage>, Option<String>) {
     if images.is_empty() {
         let note = not_retained.then(|| {
-            "This source carried image(s) that are not recoverable: no session file is bound and              the in-memory image bound was exceeded. Only the text is available."
+            "This source carried image(s) that are not recoverable: no session file is bound and the in-memory image bound was exceeded. Only the text is available."
                 .to_string()
         });
         return (Vec::new(), note);
@@ -388,6 +388,10 @@ mod tests {
         assert_eq!(third.content, "third");
         let note = third.image_note.unwrap();
         assert!(note.contains("not recoverable"), "{note}");
+        assert!(
+            !note.contains("  "),
+            "the note reads as one sentence: {note}"
+        );
     }
 
     #[test]

@@ -229,6 +229,14 @@ fn ephemeral_image_context_reaches_provider_request_in_legacy_and_active_mode() 
             assert!(entry.estimated_tokens >= davinci_agent::provider_budget::IMAGE_TOKEN_CEILING);
             assert!(!entry.mandatory);
             assert!(image.estimated_tokens >= entry.estimated_tokens);
+            // Entries describe messages by index (a completion reminder
+            // replaces `messages[i]` where it finds `entries[i]`).
+            assert_eq!(image.entries.len(), image.messages.len());
+            for (entry, message) in image.entries.iter().zip(&image.messages) {
+                if entry.category == "ephemeral_native" {
+                    assert_eq!(entry.content, serde_json::to_string(message).unwrap());
+                }
+            }
         }
     }
     let image_parts = |content: &[davinci_ai::MessageContent]| {

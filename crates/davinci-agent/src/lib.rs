@@ -2358,14 +2358,18 @@ impl Agent {
             .iter()
             .rposition(|message| message.role == "user")
             .unwrap_or(image.messages.len());
+        // Entries and messages stay index-aligned: a completion reminder
+        // replaces `messages[i]` where it finds the marker at `entries[i]`.
+        debug_assert_eq!(image.entries.len(), image.messages.len());
         let mut spliced = Vec::new();
+        let mut spliced_entries = Vec::new();
         for (index, message) in &native_ephemeral {
             let converted =
                 convert_to_llm_for_provider(std::slice::from_ref(message), self.block_images);
             for message in converted {
                 let content = serde_json::to_string(&message).map_err(|e| e.to_string())?;
                 let tokens = provider_budget::message_token_ceiling(&message);
-                image.entries.push(runtime::ContextImageEntry {
+                spliced_entries.push(runtime::ContextImageEntry {
                     id: format!("ephemeral-native:{index}"),
                     source_ref: format!("ephemeral_context::{index}"),
                     category: "ephemeral_native".into(),
@@ -2382,6 +2386,7 @@ impl Agent {
             }
         }
         image.messages.splice(insertion..insertion, spliced);
+        image.entries.splice(insertion..insertion, spliced_entries);
         // The most recent, complete tool exchange remains protocol data. Older
         // exchanges are evidence only. Reserve this suffix before compilation.
         for (index, message) in live.iter().enumerate() {
