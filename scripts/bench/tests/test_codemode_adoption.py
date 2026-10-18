@@ -20,7 +20,7 @@ TRUTH = adoption.truth(REPO)
 def perfect(prompt):
     t = TRUTH
     if prompt == "p1-codemode-dir":
-        return "\n".join(f"| `{n}` | {min(t['counts'][n])} | `/// doc` |" for n in t["files"])
+        return "\n".join(f"| `{n}` | {min(t['counts'][n])} | {t['docs'][n]} |" for n in t["files"])
     if prompt == "p2-constructors":
         return "\n".join(f"- {base} line {number}" for base, number in t["constructors"])
     if prompt == "p3-root-config":
@@ -28,7 +28,7 @@ def perfect(prompt):
     if prompt == "p4-crate-versions":
         return "\n".join(f"- {c}: {t['version']}, {files} files" for c, (files, _) in t["src"].items())
     if prompt == "p5-docs-summary":
-        return "The Codemode doc explains setup. The changelog lists release 1.1.7 changes."
+        return "The doc covers " + t["headings"][0] + " and more. The changelog starts with " + t["changelog"][-1] + "."
     callers = ", ".join(t["callers"]) or "nothing calls it"
     return f"WorkerSlotCapacity is defined in capacity.rs. acquire_exclusive callers: {callers}."
 
@@ -58,6 +58,29 @@ class GraderTests(unittest.TestCase):
         self.assertTrue(adoption.check("p6-worker-slots", "It is somewhere.", TRUTH))
         for prompt in adoption.PROMPTS:
             self.assertEqual(adoption.check(prompt, "   ", TRUTH), ["no final answer"])
+
+    def test_strict_grading_rejects_partly_right_answers(self):
+        t = TRUTH
+        name = t["files"][0]
+        no_doc = perfect("p1-codemode-dir").replace(t["docs"][name], "", 1)
+        self.assertIn(f"{name} doc comment", adoption.check("p1-codemode-dir", no_doc, t))
+        # The file name and its line number must share a row to be a location.
+        base, number = t["constructors"][0]
+        rows = [f"{b} line {n}" for b, n in t["constructors"] if (b, n) != (base, number)]
+        split = "\n".join(rows + [f"{base} is mentioned here", f"and {number} is somewhere else"])
+        if sum(1 for b, _ in t["constructors"] if b == base) == 1:
+            self.assertIn(f"{base}:{number}", adoption.check("p2-constructors", split, t))
+        vague = "The Codemode doc is a guide. The changelog lists some release notes."
+        self.assertTrue(adoption.check("p5-docs-summary", vague, t))
+
+    def test_a_version_component_never_counts_as_a_file_count(self):
+        crate, (files, _) = next(iter(TRUTH["src"].items()))
+        wrong = next(n for n in range(900, 999) if n != files)
+        major = TRUTH["version"].split(".")[0]
+        good = next(l for l in perfect("p4-crate-versions").splitlines() if l.startswith(f"- {crate}:"))
+        bad = f"- {crate}: {TRUTH['version']}, {wrong} files, {major}"
+        answer = perfect("p4-crate-versions").replace(good, bad)
+        self.assertIn(f"{crate} src count", adoption.check("p4-crate-versions", answer, TRUTH))
 
     def test_read_run_extracts_the_answer_and_counts_tool_starts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -95,6 +118,27 @@ class GraderTests(unittest.TestCase):
         self.assertTrue(verdict(perfect, 1))
         self.assertFalse(verdict(perfect, 0), "no adoption must fail")
         self.assertFalse(verdict(lambda p: "wrong", 1), "wrong answers must fail")
+
+    def test_codemode_must_not_answer_worse_than_the_baseline(self):
+        def write(out, arm, prompt, answer):
+            run = Path(out, "runs", f"{arm}-{prompt}-r0")
+            run.mkdir(parents=True)
+            events = [{"type": "tool_execution_start", "toolName": "codemode"},
+                      {"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": answer}]}]}]
+            Path(run, "out.jsonl").write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+
+        prompts = list(adoption.PROMPTS)
+        with tempfile.TemporaryDirectory() as out:
+            for prompt in prompts:
+                write(out, "on", prompt, "wrong" if prompt == prompts[0] else perfect(prompt))
+                write(out, "off", prompt, perfect(prompt))
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                verdict = adoption.report(Namespace(out=out, repo=REPO))
+        # 5/6 strict is above the 80% floor but below the 100% baseline.
+        self.assertFalse(verdict)
+        self.assertIn("baseline strict correct 100%", buffer.getvalue())
+        self.assertIn("facts=", buffer.getvalue())
 
 
 if __name__ == "__main__":

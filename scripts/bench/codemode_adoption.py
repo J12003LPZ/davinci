@@ -8,8 +8,9 @@ repository, so a pass means "correct", not "plausible".
         --credential-source ~/.pi/agent --out /absolute/new/dir --reps 2
     python scripts/bench/codemode_adoption.py report --out /absolute/new/dir --repo .
 
-`report` exits 1 when the Codemode-on arm falls below the adoption or
-correctness threshold. Live runs use the model account behind
+`report` exits 1 when the Codemode-on arm falls below the adoption or strict
+correctness threshold, or answers fewer questions correctly than the
+Codemode-off arm. Partial credit (facts matched) is printed, never gated on. Live runs use the model account behind
 `--credential-source`; `report` and the unit tests are offline.
 """
 import argparse
@@ -52,12 +53,27 @@ def _rust_files(repo):
         yield path.relative_to(repo).as_posix(), path
 
 
+def _first_doc(source):
+    """Text of the first `///` or `//!` line in a Rust file, markers removed."""
+    for line in source.splitlines():
+        match = re.match(r"\s*//[/!]\s?(.*)$", line)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return ""
+
+
+def _squash(text):
+    """Comparable form: no backticks or asterisks, single spaces, lower case."""
+    return re.sub(r"\s+", " ", re.sub(r"[`*]", "", text)).strip().lower()
+
+
 def truth(repo):
     """Facts the answers are graded against, read from the working tree."""
     repo = Path(repo)
     files = sorted(p.name for p in Path(repo, CODEMODE_DIR).glob("*.rs"))
-    counts = {}
+    counts, docs = {}, {}
     for name in files:
+        docs[name] = _first_doc(_text(repo, f"{CODEMODE_DIR}/{name}"))
         seen = {len(_text(repo, f"{CODEMODE_DIR}/{name}").splitlines())}
         # Accept any version of the file from recent history: a long run can span commits.
         for rev in _git(repo, "log", "-n", "8", "--format=%H", "--", f"{CODEMODE_DIR}/{name}").split():
@@ -82,7 +98,9 @@ def truth(repo):
         for name in ROOT_FILES
         if Path(repo, name).exists()
     }
-    return {"files": files, "counts": counts, "constructors": constructors, "callers": sorted(callers),
+    headings = [h.strip() for h in re.findall(r"^#{1,6}\s+(.+)$", _text(repo, "docs/codemode.md"), re.M)]
+    changelog = [l.strip() for l in _text(repo, "CHANGELOG.md").splitlines()[:5] if l.strip()]
+    return {"files": files, "counts": counts, "docs": docs, "headings": headings, "changelog": changelog, "constructors": constructors, "callers": sorted(callers),
             "version": version.group(1) if version else None, "src": src, "first3": first3}
 
 
@@ -90,51 +108,74 @@ def _numbers(row):
     return {int(n) for n in re.findall(r"(?<![\w.])\d+(?![\w.])", row)}
 
 
-def check(prompt, answer, t):
-    """Reasons the answer is wrong; an empty list means it passed."""
+def _has_number(row, number):
+    return bool(re.search(rf"(?<![\w.]){number}(?![\w.])", row))
+
+
+def grade(prompt, answer, t):
+    """(reasons the answer is wrong, number of facts checked) for one answer.
+
+    Every fact is checked on the row that has to carry it, so a name here and
+    a number elsewhere never add up to a pass.
+    """
     if not answer.strip():
-        return ["no final answer"]
-    miss = []
+        return ["no final answer"], 1
+    miss, total = [], 0
+
+    def expect(ok, reason):
+        nonlocal total
+        total += 1
+        if not ok:
+            miss.append(reason)
+
+    lines = answer.splitlines()
     if prompt == "p1-codemode-dir":
         for name in t["files"]:
-            row = next((l for l in answer.splitlines() if name in l), None)
-            if row is None:
-                miss.append(f"{name} absent")
-            elif not _numbers(row.replace(name, "")) & t["counts"][name]:
-                miss.append(f"{name} line count")
+            row = next((l for l in lines if name in l), None)
+            expect(row is not None, f"{name} absent")
+            row = row or ""
+            expect(bool(_numbers(row.replace(name, "")) & t["counts"][name]), f"{name} line count")
+            doc = _squash(t["docs"][name])
+            expect(not doc or doc in _squash(row), f"{name} doc comment")
     elif prompt == "p2-constructors":
+        # One expected location per construction site: its file and its line
+        # number on the same row of the answer.
         for base, number in t["constructors"]:
-            if base not in answer or not re.search(rf"(?<![\w.]){number}(?![\w.])", answer):
-                miss.append(f"{base}:{number}")
+            expect(any(base in l and _has_number(l, number) for l in lines), f"{base}:{number}")
     elif prompt == "p3-root-config":
         for name in ROOT_FILES:
             if name in t["first3"]:
-                miss += [f"{name}: {l!r}" for l in [name] + t["first3"][name] if l not in answer]
+                for fact in [name] + t["first3"][name]:
+                    expect(fact in answer, f"{name}: {fact!r}")
     elif prompt == "p4-crate-versions":
-        for crate, (files, entries) in t["src"].items():
-            row = next((l for l in answer.splitlines() if re.search(re.escape(crate) + r"(?![-\w])", l)), None)
-            if row is None:
-                miss.append(f"{crate} absent")
-                continue
-            if t["version"] and t["version"] not in row:
-                miss.append(f"{crate} version")
-            if not _numbers(row.replace(crate, "")) & {files, entries}:
-                miss.append(f"{crate} src count")
+        for crate, (files, _entries) in t["src"].items():
+            row = next((l for l in lines if re.search(re.escape(crate) + r"(?![-\w])", l)), None)
+            expect(row is not None, f"{crate} absent")
+            row = row or ""
+            expect(bool(t["version"]) and t["version"] in row, f"{crate} version")
+            # Version digits must never satisfy the file count.
+            bare = row.replace(crate, "").replace(t["version"] or "\0", "")
+            expect(_has_number(bare, files), f"{crate} src count")
     elif prompt == "p5-docs-summary":
-        if "codemode" not in answer.lower():
-            miss.append("no codemode doc content")
-        if not re.search(r"changelog|release|unreleased|\d+\.\d+\.\d+", answer, re.I):
-            miss.append("no changelog content")
-        if len(re.findall(r"[.!?](\s|$)", answer)) < 2:
-            miss.append("not two sentences")
+        text = _squash(answer)
+        expect(any(_squash(h) in text for h in t["headings"]), "no heading of docs/codemode.md")
+        tokens = [w for l in t["changelog"] for w in re.findall(r"\d+\.\d+\.\d+|unreleased", l, re.I)]
+        expect(any(w.lower() in text for w in tokens), "no changelog entry from its first lines")
+        expect(len(re.findall(r"[.!?](\s|$)", answer)) >= 2, "not two sentences")
     elif prompt == "p6-worker-slots":
-        if "capacity.rs" not in answer:
-            miss.append("definition file")
+        expect("capacity.rs" in answer, "definition file")
         if t["callers"]:
-            miss += [f"caller {c}" for c in t["callers"] if c not in answer]
-        elif not re.search(r"\b(no|none|not found|zero|0|nothing|does not|doesn't)\b", answer, re.I):
-            miss.append("did not report that nothing calls it")
-    return miss
+            for c in t["callers"]:
+                expect(c in answer, f"caller {c}")
+        else:
+            expect(bool(re.search(r"\b(no|none|not found|zero|0|nothing|does not|doesn't)\b", answer, re.I)),
+                   "did not report that nothing calls it")
+    return miss, max(total, 1)
+
+
+def check(prompt, answer, t):
+    """Reasons the answer is wrong; an empty list means it passed."""
+    return grade(prompt, answer, t)[0]
 
 
 def read_run(jsonl):
@@ -201,28 +242,39 @@ def run(args):
 
 def report(args):
     out, t = Path(args.out), truth(args.repo)
-    arms = collections.defaultdict(lambda: {"runs": 0, "correct": 0, "adopted": 0, "tools": 0, "failures": []})
+    arms = collections.defaultdict(
+        lambda: {"runs": 0, "correct": 0, "facts": 0, "facts_ok": 0, "adopted": 0, "tools": 0, "failures": []})
     for run_dir in sorted((out / "runs").iterdir()):
         arm, prompt = run_dir.name.split("-", 1)[0], re.sub(r"-r\d+$", "", run_dir.name.split("-", 1)[1])
         answer, tools = read_run(run_dir / "out.jsonl")
-        miss = check(prompt, answer, t)
+        miss, total = grade(prompt, answer, t)
         a = arms[arm]
         a["runs"] += 1
         a["correct"] += not miss
+        a["facts"] += total
+        a["facts_ok"] += total - len(miss)
         a["adopted"] += tools.get("codemode", 0) > 0
         a["tools"] += sum(tools.values())
         if miss:
             a["failures"].append(f"{run_dir.name}: {'; '.join(miss)[:160]}")
     for arm, a in sorted(arms.items()):
-        print(f"{arm:4} runs={a['runs']} correct={a['correct']}/{a['runs']} using_codemode={a['adopted']}/{a['runs']} tool_calls={a['tools']}")
+        print(f"{arm:4} runs={a['runs']} strict_correct={a['correct']}/{a['runs']} "
+              f"facts={a['facts_ok']}/{a['facts']} using_codemode={a['adopted']}/{a['runs']} tool_calls={a['tools']}")
         for failure in a["failures"]:
             print("   ", failure)
-    on = arms.get("on")
+    on, off = arms.get("on"), arms.get("off")
     if not on or not on["runs"]:
         sys.exit("no Codemode-on runs to judge")
     adoption, correct = on["adopted"] / on["runs"], on["correct"] / on["runs"]
-    print(f"adoption {adoption:.0%} (min {MIN_ADOPTION:.0%}), correct {correct:.0%} (min {MIN_CORRECT:.0%})")
-    return adoption >= MIN_ADOPTION and correct >= MIN_CORRECT
+    print(f"adoption {adoption:.0%} (min {MIN_ADOPTION:.0%}), strict correct {correct:.0%} (min {MIN_CORRECT:.0%})")
+    ok = adoption >= MIN_ADOPTION and correct >= MIN_CORRECT
+    if off and off["runs"]:
+        # Codemode must not make answers worse than the same questions without it.
+        baseline = off["correct"] / off["runs"]
+        facts_on, facts_off = on["facts_ok"] / on["facts"], off["facts_ok"] / off["facts"]
+        print(f"baseline strict correct {baseline:.0%}, facts on {facts_on:.0%} vs off {facts_off:.0%}")
+        ok = ok and correct >= baseline
+    return ok
 
 
 def main(argv=None):
