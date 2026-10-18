@@ -582,22 +582,6 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     let stdin_tty = io::stdin().is_terminal() || force_interactive;
     let stdout_tty = io::stdout().is_terminal() || force_interactive;
     let print_mode = parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty;
-    // Before the session directory, migrations or the agent: nothing the
-    // project controls (hooks, MCP servers, extensions, skills) loads until
-    // trust is settled.
-    let gate_mode = if print_mode || parsed.mode == Some(Mode::Rpc) {
-        trust::HostMode::Headless
-    } else {
-        trust::HostMode::Interactive
-    };
-    if let trust_gate::GateOutcome::Exit(code) = trust_gate::enforce_startup_trust(
-        &default_agent_dir(),
-        &cwd,
-        parsed.project_trust_override,
-        gate_mode,
-    ) {
-        return Ok(code);
-    }
     let last_message_path = match parsed.output_last_message.as_deref() {
         None => None,
         Some(_) if parsed.mode == Some(Mode::Rpc) => {
@@ -641,6 +625,22 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         }
     };
 
+    // Before the session directory, migrations or the agent: nothing the
+    // project controls (hooks, MCP servers, extensions, skills) loads until
+    // trust is settled.
+    let gate_mode = if print_mode || parsed.mode == Some(Mode::Rpc) {
+        trust::HostMode::Headless
+    } else {
+        trust::HostMode::Interactive
+    };
+    if let trust_gate::GateOutcome::Exit(code) = trust_gate::enforce_startup_trust(
+        &default_agent_dir(),
+        &cwd,
+        parsed.project_trust_override,
+        gate_mode,
+    ) {
+        return Ok(code);
+    }
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
     // `DAVINCI_MCP_BLOCKING=1` waits for the servers before the first frame.
