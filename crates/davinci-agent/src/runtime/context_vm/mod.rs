@@ -231,12 +231,13 @@ impl ContextVmRuntime {
     }
 
     fn rebuild_inner(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
-        self.record_events(events);
-        // A state rebuilt from `events` cites only `events`.
+        // A state rebuilt from `events` cites only `events`. Cleared first
+        // so no retained source keeps its images through the rebuild.
         self.retained_sources
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
+        self.record_events(events);
         let parent = CheckpointState::default();
         let delta = ContextStateReducer::deterministic_delta(&parent, events);
         let checkpoint = self.save_page(&ContextObject::Checkpoint(delta.checkpoint_patch))?;
@@ -823,10 +824,17 @@ impl ContextVmRuntime {
             .source_images
             .write()
             .unwrap_or_else(|error| error.into_inner());
+        // Sources a rebase kept for the state to cite are live too: their
+        // retained images must survive the appends that follow it.
+        let retained = self
+            .retained_sources
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         let live = events
             .iter()
             .filter(|event| held(event))
             .map(|event| event.source_ref.as_str())
+            .chain(retained.keys().map(String::as_str))
             .collect::<std::collections::HashSet<_>>();
         if images.holds_source_outside(&live) {
             *images = sources::SourceImages::default();

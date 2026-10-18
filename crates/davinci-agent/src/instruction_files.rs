@@ -90,10 +90,10 @@ impl Agent {
         let mut seen = HashSet::new();
         let mut fresh = Vec::new();
         for target in &targets {
-            for file in governing_instruction_files(&self.cwd, Path::new(target)) {
+            // A delivered file is still read: an edit shows only in its hash.
+            for file in governing_instruction_files(&self.cwd, Path::new(target), &loaded) {
                 let key = file.path.to_string_lossy().into_owned();
                 if file.body.trim().is_empty()
-                    || loaded.contains(&file.path)
                     || !seen.insert(key.clone())
                     || delivered.get(&key) == Some(&hash_text(&file.body))
                 {

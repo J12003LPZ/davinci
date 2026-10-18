@@ -468,8 +468,13 @@ const EXCLUDED_INSTRUCTION_DIRS: [&str; 11] = [
 
 /// Every `AGENTS.md` that governs `target`: the repository root's down to the
 /// nearest existing directory of the target, outermost first. Empty when the
-/// target is outside the checkout of `cwd`. Paths are canonical.
-pub(crate) fn governing_instruction_files(cwd: &Path, target: &Path) -> Vec<ContextFile> {
+/// target is outside the checkout of `cwd`. Paths are canonical. Files in
+/// `loaded` are left out before their bodies are read.
+pub(crate) fn governing_instruction_files(
+    cwd: &Path,
+    target: &Path,
+    loaded: &HashSet<PathBuf>,
+) -> Vec<ContextFile> {
     let Some(root) = repository_root(cwd) else {
         return Vec::new();
     };
@@ -529,6 +534,9 @@ pub(crate) fn governing_instruction_files(cwd: &Path, target: &Path) -> Vec<Cont
         })
         .filter_map(|dir| {
             let path = dir.join(INSTRUCTION_FILE);
+            if loaded.contains(&path) {
+                return None;
+            }
             // A symlinked AGENTS.md that leaves the checkout is not ours to read.
             if !fs::canonicalize(&path).ok()?.starts_with(&root) {
                 return None;
@@ -710,7 +718,7 @@ mod tests {
         fs::write(repo.join("a/b/AGENTS.md"), "ab").unwrap();
         fs::write(repo.join("sibling/AGENTS.md"), "sibling").unwrap();
         let bodies = |cwd: &Path, target: &str| -> Vec<String> {
-            governing_instruction_files(cwd, Path::new(target))
+            governing_instruction_files(cwd, Path::new(target), &HashSet::new())
                 .into_iter()
                 .map(|file| file.body)
                 .collect()
@@ -723,6 +731,11 @@ mod tests {
             bodies(&repo.join("a"), "../sibling/f.rs"),
             ["root", "sibling"]
         );
+        // A loaded file is not read again.
+        let loaded = HashSet::from([fs::canonicalize(repo.join("AGENTS.md")).unwrap()]);
+        let unloaded = governing_instruction_files(&repo, Path::new("a/b/f.rs"), &loaded);
+        assert_eq!(unloaded.len(), 1);
+        assert_eq!(unloaded[0].body, "ab");
         assert!(bodies(&repo, "../AGENTS.md").is_empty());
         assert!(bodies(outer.path(), "AGENTS.md").is_empty());
     }
@@ -738,7 +751,11 @@ mod tests {
         let files = ["app/inner", "lib"]
             .iter()
             .flat_map(|dir| {
-                governing_instruction_files(&repo.path().join("app"), &repo.path().join(dir))
+                governing_instruction_files(
+                    &repo.path().join("app"),
+                    &repo.path().join(dir),
+                    &HashSet::new(),
+                )
             })
             .collect::<Vec<_>>();
         let text = render_nested_instructions(&files, &repo.path().join("app"));

@@ -2411,17 +2411,42 @@ impl Agent {
 
     fn live_tool_exchange(&self) -> Vec<ChatMessage> {
         self.live_tool_exchange_start()
-            .map(|start| convert_to_llm_for_provider(&self.messages[start..], self.block_images))
+            .map(|start| {
+                let end = self.live_tool_exchange_end();
+                convert_to_llm_for_provider(&self.messages[start..end], self.block_images)
+            })
             .unwrap_or_default()
+    }
+
+    /// End of the history the live tool exchange can span. Nested
+    /// instructions are appended right after the tool results, on the request
+    /// that delivers them. They stay in the compiled history (a user-side
+    /// message, so the cached system prefix is untouched) and do not unpair
+    /// the exchange, which would fall back to evidence text. The host's other
+    /// boundary injections are not skipped here.
+    fn live_tool_exchange_end(&self) -> usize {
+        self.messages
+            .iter()
+            .rposition(|m| {
+                m.role != "custom"
+                    || m.extra_str("customType") != Some(context::NESTED_INSTRUCTIONS_CUSTOM_TYPE)
+            })
+            .map_or(0, |last| last + 1)
     }
 
     /// Index of the assistant message that opens a complete, well-formed
     /// trailing tool exchange, if the transcript ends with one.
     fn live_tool_exchange_start(&self) -> Option<usize> {
-        if self.messages.last().is_none_or(|m| m.role != "toolResult") {
+        let end = self.live_tool_exchange_end();
+        if self.messages[..end]
+            .last()
+            .is_none_or(|m| m.role != "toolResult")
+        {
             return None;
         }
-        let start = self.messages.iter().rposition(|m| m.role == "assistant")?;
+        let start = self.messages[..end]
+            .iter()
+            .rposition(|m| m.role == "assistant")?;
         let mut calls = std::collections::HashSet::new();
         for content in &self.messages[start].content {
             if let MessageContent::ToolCall { id, .. } = content {
@@ -2430,7 +2455,7 @@ impl Agent {
                 }
             }
         }
-        let results = &self.messages[start + 1..];
+        let results = &self.messages[start + 1..end];
         let ids = results
             .iter()
             .filter_map(|m| m.tool_call_id.as_deref())
@@ -2489,7 +2514,12 @@ impl Agent {
     pub(crate) fn context_vm_events_for_vm(&self) -> Vec<runtime::context_vm::ContextEvent> {
         let mut events = self.context_vm_events_for_runtime();
         if let Some(start) = self.live_tool_exchange_start() {
-            drop_live_exchange_events(&mut events, &self.messages[start..]);
+            let end = self.live_tool_exchange_end();
+            drop_live_exchange_events(
+                &mut events,
+                &self.messages[start..end],
+                &self.messages[end..],
+            );
         }
         events
     }
@@ -4913,18 +4943,20 @@ pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
 fn drop_live_exchange_events(
     events: &mut Vec<runtime::context_vm::ContextEvent>,
     exchange: &[ChatMessage],
+    trailing: &[ChatMessage],
 ) {
     let live = runtime::context_vm::events_from_messages(exchange);
-    let Some(tail) = events.len().checked_sub(live.len()) else {
+    let trailing = runtime::context_vm::events_from_messages(trailing).len();
+    let Some(tail) = events.len().checked_sub(live.len() + trailing) else {
         return;
     };
     if !live.is_empty()
-        && events[tail..]
+        && events[tail..tail + live.len()]
             .iter()
             .map(|event| &event.content_hash)
             .eq(live.iter().map(|event| &event.content_hash))
     {
-        events.truncate(tail);
+        events.drain(tail..tail + live.len());
     }
 }
 

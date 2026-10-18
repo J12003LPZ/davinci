@@ -310,6 +310,19 @@ impl ContextBroker {
                     item.priority = item.priority.saturating_add(1_000_000);
                 }
                 if let Some(correction) = ov.memory_corrections.get(&item_id) {
+                    // The id falls back to a content hash, which the rewrite
+                    // below changes. Pin it so later overlays and the manifest
+                    // still name this item by the id the user acted on.
+                    match &mut item.provenance {
+                        Value::Object(map) => {
+                            map.entry("id")
+                                .or_insert_with(|| Value::String(item_id.clone()));
+                        }
+                        other => {
+                            let original = std::mem::take(other);
+                            *other = serde_json::json!({ "id": item_id, "original": original });
+                        }
+                    }
                     item.content = format!("[user correction of {}]\n{correction}", item.source);
                     item.estimated_tokens = (item.content.len() as u64).div_ceil(4);
                     corrected.insert(item_hash(&item));
@@ -663,6 +676,38 @@ mod tests {
         // Without the overlay the original text is unchanged.
         let (plain, _) = broker.build_context_with_overlay(&sample_request(1000), None);
         assert!(plain.render_context().contains("Paris"));
+    }
+
+    #[test]
+    fn a_corrected_idless_item_keeps_its_pre_correction_id() {
+        let item = ContextItem {
+            source: "vector_memory".into(),
+            content: "user likes rust".into(),
+            estimated_tokens: 5,
+            priority: 5,
+            stable_for_cache: true,
+            authority: Default::default(),
+            provenance: Value::Null,
+        };
+        let original_id = item.stable_id();
+        let broker = ContextBroker::new();
+        broker.register_context_source(Arc::new(MockSource { items: vec![item] }));
+        let mut overlay = ContextOverlay::new(1);
+        overlay.add_correction(&original_id, "user likes go");
+
+        let (packet, _) = broker.build_context_with_overlay(&sample_request(1000), Some(&overlay));
+        assert_eq!(packet.items.len(), 1);
+        assert!(packet.items[0].content.contains("user likes go"));
+        assert_eq!(packet.items[0].stable_id(), original_id);
+
+        // The id the manifest reports is the id an overlay can act on.
+        overlay.pin(&original_id, false, true).unwrap();
+        let (pinned, _) = broker.build_context_with_overlay(&sample_request(1000), Some(&overlay));
+        assert!(
+            pinned.items[0].priority > 1_000_000,
+            "{:?}",
+            pinned.items[0]
+        );
     }
 
     #[test]

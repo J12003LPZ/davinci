@@ -5167,7 +5167,7 @@ pub fn run(
             >= Duration::from_millis(750)
         {
             team_mail_since = None;
-            if let Some(text) = team_wake_text(agent) {
+            if prompt_team_wake(agent) {
                 let mut shell = Shell {
                     parsed,
                     agent,
@@ -5187,9 +5187,6 @@ pub fn run(
                 shell.model.transcript.push(Entry::Gap);
                 shell.model.transcript.push(Entry::agent("davinci"));
                 shell.model.running = true;
-                shell
-                    .agent
-                    .prompt_internal(&text, davinci_agent::InternalPromptOrigin::ToolEvidence);
                 match run_turns(&mut shell) {
                     Next::Go => {}
                     Next::Leave => break Ok(0),
@@ -11239,14 +11236,25 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
     }
 }
 
-/// Teammate and background reports waiting for an idle lead, as one prompt.
-pub fn team_wake_text(agent: &Agent) -> Option<String> {
-    let runtime = agent.tool_context.runtime.as_ref()?;
+/// Teammate and background reports waiting for an idle lead, as prompts on
+/// its transcript. Same rule as the turn loop: an agent's report is evidence,
+/// host steering is the user's own words. False when nothing was waiting.
+pub fn prompt_team_wake(agent: &mut Agent) -> bool {
+    let Some(runtime) = agent.tool_context.runtime.clone() else {
+        return false;
+    };
     if runtime.mailbox.pending_count(&runtime.agent_id) == 0 {
-        return None;
+        return false;
     }
-    let messages = runtime.take_labeled_messages(20);
-    (!messages.is_empty()).then(|| messages.join("\n\n"))
+    let deliveries = runtime.take_labeled_deliveries(20);
+    for (text, from_agent) in &deliveries {
+        if *from_agent {
+            agent.prompt_internal(text, davinci_agent::InternalPromptOrigin::ToolEvidence);
+        } else {
+            agent.prompt_with(text, &[]);
+        }
+    }
+    !deliveries.is_empty()
 }
 
 fn team_autowake_enabled() -> bool {

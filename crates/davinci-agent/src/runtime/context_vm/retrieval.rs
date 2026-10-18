@@ -404,6 +404,11 @@ mod tests {
         vm.rebase(&compacted).unwrap();
         let result = retrieve(&vm, &by_source(&cited)).unwrap();
         assert_eq!(result.images.len(), 1, "{result:?}");
+        // A later append sees the retained source outside the events; it
+        // must not read that as a rewrite and wipe the retained images.
+        vm.record_events(&compacted);
+        let result = retrieve(&vm, &by_source(&cited)).unwrap();
+        assert_eq!(result.images.len(), 1, "{result:?}");
     }
 
     #[test]

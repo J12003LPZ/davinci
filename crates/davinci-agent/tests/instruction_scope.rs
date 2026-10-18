@@ -133,6 +133,56 @@ fn a_read_delivers_the_nested_file_scoped_to_its_directory() {
 }
 
 #[test]
+fn active_context_vm_keeps_the_native_tool_pair_on_the_delivering_request() {
+    use davinci_agent::runtime::context_vm::ContextVmMode;
+    use davinci_agent::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    use davinci_ai::{ChatMessage, MessageContent};
+
+    let repo = repository();
+    let mut agent = agent_in(repo.path(), true);
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.prompt("go");
+    let mut requests: Vec<(String, Vec<ChatMessage>)> = Vec::new();
+    let mut turn = 0;
+    agent
+        .run_loop(|current| {
+            requests.push((
+                current.provider_system_prompt(),
+                current.messages_for_provider(),
+            ));
+            let call = (turn == 0).then(|| ("read", serde_json::json!({"path": "sub/x.rs"})));
+            turn += 1;
+            Ok(reply(turn, call))
+        })
+        .unwrap();
+    assert_eq!(requests.len(), 2);
+
+    let (system, messages) = &requests[1];
+    let paired = messages.windows(2).any(|pair| {
+        pair[0]
+            .content
+            .iter()
+            .any(|block| matches!(block, MessageContent::ToolCall { id, .. } if id == "call-1"))
+            && pair[1].role == "toolResult"
+            && pair[1].tool_call_id.as_deref() == Some("call-1")
+    });
+    let texts: Vec<String> = messages.iter().map(|m| content_text(&m.content)).collect();
+    assert!(paired, "native call/result pair lost: {texts:#?}");
+    let delivered = texts
+        .iter()
+        .filter(|text| text.contains("<nested_instructions>"))
+        .count();
+    assert_eq!(delivered, 1, "{texts:#?}");
+    assert!(texts.iter().any(|text| text.contains("sub rules")));
+    assert!(!system.contains("sub rules"), "the cached prefix changed");
+}
+
+#[test]
 fn delivery_leaves_the_cached_prefix_untouched() {
     let repo = repository();
     let mut agent = agent_in(repo.path(), true);
