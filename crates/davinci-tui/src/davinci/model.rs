@@ -2728,6 +2728,9 @@ pub struct Model {
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
     pub caret_moved_at: u64,
+    /// Whether the caret has moved at all: `caret_moved_at` starts at tick
+    /// zero, so zero alone cannot tell "never" from "a key at the first tick".
+    pub caret_moved: bool,
     /// The stored `caretBlink` setting. On unless turned off, as in Claude Code; a steady caret
     /// saves the redraw each phase costs.
     pub caret_blink: bool,
@@ -3401,6 +3404,7 @@ impl Model {
             overlay_offset: None,
             section_notice: None,
             caret_moved_at: 0,
+            caret_moved: false,
             caret_blink: false,
             auto_scroll: true,
             terminal_focused: true,
@@ -4015,6 +4019,7 @@ impl Model {
     /// solid from here. `tick` wraps, so the phase arithmetic wraps with it.
     pub fn mark_caret_moved(&mut self) {
         self.caret_moved_at = self.tick;
+        self.caret_moved = true;
     }
 
     pub fn context_fraction(&self) -> f64 {

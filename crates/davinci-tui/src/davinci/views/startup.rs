@@ -38,6 +38,10 @@ pub const PET_ROWS: usize = 5;
 /// One column of margin before the sprite, two between it and the text.
 const PET_INDENT: &str = " ";
 const PET_GAP: &str = "  ";
+/// Columns the identity text needs beside the art before it is stacked below.
+const MIN_TEXT_COLUMNS: u16 = 14;
+/// Indent of the stacked identity rows.
+const STACKED_INDENT: u16 = 2;
 /// The column the masthead text starts in beside the painter.
 pub const PET_TEXT_COLUMN: u16 = (1 + PET_W + 2) as u16;
 
@@ -164,8 +168,8 @@ const TYPING_HOLD_TICKS: u64 = 4;
 /// the shared tick's redraw writes nothing for it.
 pub fn pet_frame(model: &Model) -> usize {
     let playing = model.tick < STARTUP_TICKS || model.working.is_some();
-    let typing = model.caret_moved_at > 0
-        && model.tick.wrapping_sub(model.caret_moved_at) < TYPING_HOLD_TICKS;
+    let typing =
+        model.caret_moved && model.tick.wrapping_sub(model.caret_moved_at) < TYPING_HOLD_TICKS;
     if !playing || typing || !model.animate || !model.terminal_focused {
         return 0;
     }
@@ -347,6 +351,15 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
         ),
     };
     let pet = column == PET_TEXT_COLUMN;
+    // The identity needs room beside the art; a narrower terminal stacks it
+    // under the art, and under no art at all when even that does not fit.
+    let side_by_side = model.width >= column + MIN_TEXT_COLUMNS;
+    let text_room = if side_by_side {
+        model.width.saturating_sub(column + 1)
+    } else {
+        model.width.saturating_sub(STACKED_INDENT + 1)
+    };
+    let art_width = if pet { 1 + PET_W as u16 } else { 11 };
     let mut text = [
         vec![
             name,
@@ -354,24 +367,32 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
         ],
         serving,
         // The whole path, as the shell has it: the folder the session works in.
-        vec![span(
-            clip_ellipsis(&info.cwd, model.width.saturating_sub(column + 1)),
-            cc.inactive,
-        )],
+        vec![span(clip_ellipsis(&info.cwd, text_room), cc.inactive)],
     ];
-    let mut rows: Vec<Vec<Span<'static>>> = art
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut row)| {
-            if let Some(words) = i.checked_sub(first).and_then(|i| text.get_mut(i)) {
-                if pet {
-                    row.push(Span::raw(PET_GAP));
+    let mut rows: Vec<Vec<Span<'static>>> = if side_by_side {
+        art.into_iter()
+            .enumerate()
+            .map(|(i, mut row)| {
+                if let Some(words) = i.checked_sub(first).and_then(|i| text.get_mut(i)) {
+                    if pet {
+                        row.push(Span::raw(PET_GAP));
+                    }
+                    row.append(words);
                 }
-                row.append(words);
-            }
-            row
-        })
-        .collect();
+                row
+            })
+            .collect()
+    } else {
+        let mut rows = Vec::new();
+        if model.width > art_width {
+            rows.extend(art);
+        }
+        rows.extend(text.into_iter().map(|mut words| {
+            words.insert(0, Span::raw(" ".repeat(STACKED_INDENT as usize)));
+            words
+        }));
+        rows
+    };
     rows.push(vec![]);
     rows.push(vec![
         span("  Switch models anytime with ", th.text),
@@ -589,6 +610,7 @@ mod tests {
         assert_eq!(pet_frame(&m), 2);
 
         m.caret_moved_at = 41;
+        m.caret_moved = true;
         assert_eq!(pet_frame(&m), 0, "typing holds it");
         m.tick = 41 + TYPING_HOLD_TICKS;
         assert_ne!(pet_frame(&m), 0, "a second after the last key it plays");
@@ -631,7 +653,7 @@ mod tests {
 
         // Typing during a working turn: still no cell moves for the painter.
         m.working = Some(Working::default());
-        m.caret_moved_at = m.tick;
+        m.mark_caret_moved();
         let before = painted(&m);
         m.tick += 1;
         assert!(changed(&before, &painted(&m)).is_empty());
@@ -683,6 +705,47 @@ mod tests {
 
         let none = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 100, 52, true);
         assert!(text(&banner(&none, &none.startup)[0]).starts_with(MARK[0]));
+    }
+
+    #[test]
+    fn the_model_stays_visible_however_narrow_the_terminal() {
+        for width in [8, 10, 16, 21, 24, 30, 36, 37, 40, 100] {
+            let m = model(width);
+            let rows = banner(&m, &m.startup);
+            let shown = rows.iter().map(text).collect::<Vec<_>>().join("\n");
+            let want: String = m
+                .model_name
+                .chars()
+                .take(usize::from(width).saturating_sub(3).max(1))
+                .collect();
+            assert!(
+                shown.contains(&want),
+                "width {width}: {want:?} missing in\n{shown}"
+            );
+            assert!(
+                rows.iter().all(
+                    |row| unicode_width::UnicodeWidthStr::width(text(row).as_str())
+                        <= usize::from(width)
+                ),
+                "width {width}: a row overflows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_at_the_first_tick_holds_the_painter_still() {
+        let mut m = model(100);
+        m.working = Some(Working::default());
+        m.tick = 0;
+        m.animate = true;
+        m.terminal_focused = true;
+        m.tick = 2;
+        let moving = pet_frame(&m);
+        assert_ne!(moving, 0);
+        m.tick = 0;
+        m.mark_caret_moved();
+        m.tick = 2;
+        assert_eq!(pet_frame(&m), 0, "typing at tick zero holds it");
     }
 
     #[test]
