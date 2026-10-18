@@ -84,6 +84,41 @@ current assistant/tool suffix preserves provider tool-call/result messages,
 with nonempty, unique, matching IDs. Malformed or partial exchanges become
 evidence instead. OpenAI Responses wire tests cover both paths.
 
+## Broker context authority
+
+Broker items (`ContextItem`) carry a typed `authority`. Only host code that
+builds the item sets `ContextAuthority::Mandatory`; `is_mandatory()` ignores
+the source name and every field of the free-form `provenance` JSON, so a
+source named `x-mandatory-notes` or one that writes `"mandatory": true` is
+still optional and is dropped under budget like any other. A
+`provenance_kind` of `mandatory_policy` in that JSON is likewise shown as
+`repository_fact` unless the item is mandatory. Items deserialized without
+the field are optional. No production source assigns mandatory authority
+today.
+
+`wrap_untrusted_data` writes `<context_data source="...">`. The source is
+attribute-escaped (`&`, `"`, `<`, `>`) and any `<context_data` or
+`</context_data` in the content, in any case, has its `<` written as `&lt;`,
+so user text, tool output and broker content cannot close or open a wrapper.
+Other content is unchanged.
+
+`ContextOverlay` is applied by `build_context_with_overlay`: tombstoned and
+excluded items are dropped, pinned items gain priority, and an item whose id
+has a memory correction shows the corrected text as
+`[user correction of <source>]` plus the text, with tokens re-estimated and
+the ledger reason `user_corrected`. Ids are `provenance.id` or the item hash.
+The agent holds the overlay (`set_context_overlay`, `context_overlay`); the
+active image is compiled with it, and its revision and contents are part of
+the prepared-image revision and the manifest's overlay revision. The coding
+agent has no persisted overlay source yet, so nothing sets it in production.
+
+In active mode an ephemeral message with non-text parts (images) is not
+flattened into a text broker item. It is placed in the provider input before
+the latest user message, as legacy does, its parts intact, charged at the
+image ceiling and honouring `block_images`. Text-only ephemeral messages stay
+broker items marked `tool_evidence`, the only kind that does not grant user
+or policy authority to extension output.
+
 ## Semantic state and materialization
 
 A fold uses the existing configured `Summarizer`, the structured

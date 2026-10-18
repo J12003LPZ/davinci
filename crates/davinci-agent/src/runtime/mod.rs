@@ -62,7 +62,8 @@ pub use checkpoints::{
     MAX_BLOB_BYTES, MAX_TASK_BLOBS_BYTES,
 };
 pub use context::{
-    wrap_untrusted_data, ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource,
+    wrap_untrusted_data, ContextAuthority, ContextBroker, ContextItem, ContextPacket,
+    ContextRequest, ContextSource,
 };
 pub use context_manifest::{
     overlay_application, ContextManifestEntry, PreparedContextManifest, ProvenanceKind,

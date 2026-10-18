@@ -1,5 +1,6 @@
 use davinci_agent::runtime::cache::CacheRuntime;
-use davinci_agent::runtime::context::{ContextItem, ContextPacket};
+use davinci_agent::runtime::context::{ContextAuthority, ContextItem, ContextPacket};
+use davinci_agent::runtime::context_manifest::ProvenanceKind;
 use davinci_agent::runtime::context_vm::{
     events_from_messages, CheckpointState, ContextCompileRequest, ContextCompiler, ContextObject,
     ContextObjectStore, ContextRoot, ContextVmMode, StateDelta, StateValue,
@@ -203,6 +204,7 @@ fn newest_event_takes_priority_over_optional_broker_context() {
             estimated_tokens: 20,
             priority: 0,
             stable_for_cache: false,
+            authority: Default::default(),
             provenance: serde_json::Value::Null,
         }],
         estimated_tokens: 20,
@@ -220,30 +222,40 @@ fn newest_event_takes_priority_over_optional_broker_context() {
     assert!(image.estimated_tokens <= 240);
 }
 
+fn oversized_item(
+    source: &str,
+    authority: ContextAuthority,
+    provenance: serde_json::Value,
+) -> ContextPacket {
+    ContextPacket {
+        items: vec![ContextItem {
+            source: source.into(),
+            content: "x".repeat(4096),
+            estimated_tokens: 1,
+            priority: 0,
+            stable_for_cache: false,
+            authority,
+            provenance,
+        }],
+        estimated_tokens: 1,
+        cache_key: "test".into(),
+    }
+}
+
 #[test]
 fn oversized_mandatory_broker_context_cannot_be_silently_dropped() {
     let compiler = ContextCompiler::new(ContextObjectStore::new(CacheRuntime::default()));
     let root = ContextRoot::default();
     let events = events_from_messages(&[ChatMessage::text("user", "next")]);
+    // Host-assigned authority is mandatory whatever the source name or JSON says.
     for (source, provenance) in [
-        ("mandatory:test", serde_json::Value::Null),
+        ("plain", serde_json::Value::Null),
         (
             "policy",
             serde_json::json!({"provenance_kind":"mandatory_policy"}),
         ),
     ] {
-        let packet = ContextPacket {
-            items: vec![ContextItem {
-                source: source.into(),
-                content: "x".repeat(4096),
-                estimated_tokens: 1,
-                priority: 0,
-                stable_for_cache: false,
-                provenance,
-            }],
-            estimated_tokens: 1,
-            cache_key: "test".into(),
-        };
+        let packet = oversized_item(source, ContextAuthority::Mandatory, provenance);
         let error = compiler
             .compile(ContextCompileRequest {
                 root: &root,
@@ -253,6 +265,44 @@ fn oversized_mandatory_broker_context_cannot_be_silently_dropped() {
             })
             .unwrap_err();
         assert!(error.contains("compilation token budget"));
+    }
+}
+
+#[test]
+fn source_cannot_claim_mandatory_authority_by_name_or_provenance() {
+    let compiler = ContextCompiler::new(ContextObjectStore::new(CacheRuntime::default()));
+    let root = ContextRoot::default();
+    let events = events_from_messages(&[ChatMessage::text("user", "next")]);
+    for (source, provenance) in [
+        ("x-mandatory-notes", serde_json::Value::Null),
+        ("mandatory:test", serde_json::Value::Null),
+        ("policy", serde_json::json!({"mandatory":true})),
+        (
+            "policy",
+            serde_json::json!({"provenance_kind":"mandatory_policy"}),
+        ),
+    ] {
+        let packet = oversized_item(source, ContextAuthority::Optional, provenance.clone());
+        assert!(!packet.items[0].is_mandatory(), "{source} {provenance}");
+        let image = compiler
+            .compile(ContextCompileRequest {
+                root: &root,
+                hot_events: &events,
+                broker_packet: &packet,
+                max_tokens: 512,
+            })
+            .expect("optional oversized item is dropped, not a request failure");
+        assert!(
+            image
+                .entries
+                .iter()
+                .all(|entry| !entry.mandatory || entry.category != "broker_context"),
+            "forged item must not be admitted as mandatory"
+        );
+        assert!(image
+            .entries
+            .iter()
+            .all(|entry| entry.provenance_kind != ProvenanceKind::MandatoryPolicy));
     }
 }
 
@@ -268,7 +318,8 @@ fn broker_preselection_cannot_hide_mandatory_overflow_from_dispatch() {
                 estimated_tokens: request.max_tokens.saturating_add(1),
                 priority: 0,
                 stable_for_cache: true,
-                provenance: serde_json::json!({"mandatory":true}),
+                authority: ContextAuthority::Mandatory,
+                provenance: serde_json::Value::Null,
             }]
         }
     }
