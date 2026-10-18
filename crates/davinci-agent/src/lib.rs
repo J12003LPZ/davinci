@@ -153,8 +153,8 @@ pub use runtime::{
     AgentId, AgentKind, AgentLaunchDisposition, AgentOperationAdapter, AgentOperationError,
     AgentOperationHandle, AgentRecord, AgentState, CacheIdentity, CacheMissReason,
     CancellationToken, CapabilitySource, ChildExecutionContext, ChildExecutionKind,
-    ConcurrencyPolicy, ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource,
-    ContextVmMode, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
+    ConcurrencyPolicy, ContextAuthority, ContextBroker, ContextItem, ContextPacket, ContextRequest,
+    ContextSource, ContextVmMode, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
     ExecutorCapabilities, OperationAttempt, OperationSpec, OperationState, OutputPolicy,
     PhaseStatus, PreparedAction, RegistryError, ReplayPolicy, RunId, RuntimeBus, RuntimeCapability,
     RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle,
@@ -2198,6 +2198,7 @@ impl Agent {
                 content,
                 priority: 200,
                 stable_for_cache: false,
+                authority: Default::default(),
                 provenance: serde_json::json!({"provenance_kind":"tool_evidence"}),
             });
         }
@@ -2208,6 +2209,7 @@ impl Agent {
                 content: plan,
                 priority: 500,
                 stable_for_cache: true,
+                authority: Default::default(),
                 provenance: serde_json::json!({"provenance_kind":"user_decision"}),
             });
         }

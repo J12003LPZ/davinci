@@ -19,6 +19,7 @@ fn retrieve_context_supports_exact_sources_bounded_lines_and_page_fault_metrics(
             estimated_tokens: 8,
             priority: 100,
             stable_for_cache: true,
+            authority: Default::default(),
             provenance: serde_json::json!({"provenance_kind":"repository_fact"}),
         }],
         estimated_tokens: 8,

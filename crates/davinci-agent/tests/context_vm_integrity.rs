@@ -623,6 +623,7 @@ fn wor72_recent_turns_are_admitted_before_optional_broker_context() {
             estimated_tokens: 5_500,
             priority: 100,
             stable_for_cache: true,
+            authority: Default::default(),
             provenance: serde_json::json!({"provenance_kind": "repository_fact"}),
         }],
         estimated_tokens: 5_500,
@@ -870,6 +871,7 @@ fn wor72_the_living_plan_outranks_recent_turns() {
         estimated_tokens: 400,
         priority,
         stable_for_cache: true,
+        authority: Default::default(),
         provenance: serde_json::json!({"provenance_kind": "user_decision"}),
     };
     let broker = ContextPacket {

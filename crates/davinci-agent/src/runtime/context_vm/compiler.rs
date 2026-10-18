@@ -538,7 +538,10 @@ fn broker_provenance(item: &ContextItem) -> ProvenanceKind {
             "user_decision" => Some(ProvenanceKind::UserDecision),
             "repository_fact" => Some(ProvenanceKind::RepositoryFact),
             "tool_evidence" => Some(ProvenanceKind::ToolEvidence),
-            "mandatory_policy" => Some(ProvenanceKind::MandatoryPolicy),
+            // A label a source can write; only host-assigned authority earns it.
+            "mandatory_policy" => item
+                .is_mandatory()
+                .then_some(ProvenanceKind::MandatoryPolicy),
             "agent_inference" => Some(ProvenanceKind::AgentInference),
             _ => None,
         })

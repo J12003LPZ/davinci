@@ -18,6 +18,7 @@ impl ContextSource for RegisteredBrokerSource {
             estimated_tokens: 5,
             priority: 900,
             stable_for_cache: true,
+            authority: Default::default(),
             provenance: serde_json::json!({
                 "provenance_kind": "tool_evidence",
                 "id": "registered-broker-evidence"

@@ -106,6 +106,7 @@ fn volatile_hot_tail_does_not_change_stable_cache_affinity() {
             estimated_tokens: 4,
             priority: 100,
             stable_for_cache: true,
+            authority: Default::default(),
             provenance: serde_json::json!({"provenance_kind":"repository_fact"}),
         }],
         estimated_tokens: 4,

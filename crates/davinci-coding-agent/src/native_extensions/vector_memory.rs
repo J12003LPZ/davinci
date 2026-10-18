@@ -1123,6 +1123,7 @@ impl ContextSource for MemoryContextSource {
                 estimated_tokens: hit.estimated_tokens as u64,
                 priority: (hit.score * 1000.0) as i32,
                 stable_for_cache: true,
+                authority: Default::default(),
                 provenance: json!({
                     "id": hit.id,
                     "score": hit.score,

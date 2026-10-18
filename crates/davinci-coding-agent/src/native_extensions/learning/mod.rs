@@ -1367,6 +1367,7 @@ impl ContextSource for SkillContextSource {
                 estimated_tokens: candidate.estimated_tokens as u64,
                 priority: (candidate.score * 1000.0) as i32,
                 stable_for_cache: true,
+                authority: Default::default(),
                 provenance: json!({
                     "name": candidate.name,
                     "version": candidate.version,
