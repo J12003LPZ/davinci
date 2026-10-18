@@ -10,9 +10,9 @@ use std::path::Path;
 
 use davinci_coding_agent::settings::load_settings;
 use davinci_coding_agent::trust::{
-    canonicalize_trust_path, preflight_project_trust, record_gate_choice,
-    trust_requiring_project_resource_names, HostMode, TrustGateChoice, TrustGateDecision,
-    TrustPolicy,
+    canonicalize_trust_path, preflight_project_trust, record_gate_choice, trust_diagnostic,
+    trust_requiring_project_resource_names, HostMode, TrustDiagnostic, TrustGateChoice,
+    TrustGateDecision, TrustPolicy,
 };
 
 pub const LABEL_EXIT: &str = "No \u{2014} Exit DaVinci";
@@ -167,6 +167,40 @@ fn ask(path: &str, resources: &[String]) -> TrustGateChoice {
     ask_from_lines(&mut stdin.lock(), &mut io::stdout(), path, resources)
 }
 
+fn decide(
+    agent_dir: &Path,
+    cwd: &Path,
+    trust_override: Option<bool>,
+    mode: HostMode,
+) -> TrustGateDecision {
+    let settings = load_settings(agent_dir);
+    let policy = TrustPolicy {
+        override_trust: trust_override,
+        default_project_trust: settings.default_project_trust.as_deref(),
+        trusted_projects: &settings.trusted_projects,
+    };
+    preflight_project_trust(agent_dir, cwd, &policy, mode)
+}
+
+/// What a headless caller (print, json, RPC) owes the client: whether project
+/// resources load, and the `UNTRUSTED_PROJECT` diagnostic when they do not.
+/// An explicit `--no-approve` is the caller's own request, so it gets no
+/// diagnostic.
+pub fn headless_trust_report(
+    agent_dir: &Path,
+    cwd: &Path,
+    trust_override: Option<bool>,
+) -> (bool, Option<TrustDiagnostic>) {
+    let decision = decide(agent_dir, cwd, trust_override, HostMode::Headless);
+    let trusted = decision == TrustGateDecision::Preapproved;
+    let diagnostic = if trust_override.is_some() {
+        None
+    } else {
+        trust_diagnostic(&decision, cwd)
+    };
+    (trusted, diagnostic)
+}
+
 /// Decide before anything project-controlled loads. `trust_override` is the
 /// `--approve` / `--no-approve` flag; everything else comes from the trust
 /// store and the global settings, never from the project.
@@ -176,23 +210,28 @@ pub fn enforce_startup_trust(
     trust_override: Option<bool>,
     mode: HostMode,
 ) -> GateOutcome {
-    let settings = load_settings(agent_dir);
-    let policy = TrustPolicy {
-        override_trust: trust_override,
-        default_project_trust: settings.default_project_trust.as_deref(),
-        trusted_projects: &settings.trusted_projects,
-    };
-    let decision = preflight_project_trust(agent_dir, cwd, &policy, mode);
+    let decision = decide(agent_dir, cwd, trust_override, mode);
     crate::startup_mark("trust gate");
+    if mode == HostMode::Headless {
+        // Nobody can be asked. Project resources stay unloaded (the store and
+        // settings are re-read by every loader) and the client is told why.
+        if trust_override.is_none() {
+            if let Some(diagnostic) = trust_diagnostic(&decision, cwd) {
+                eprintln!("Warning: {}", diagnostic.message);
+            }
+        }
+        return GateOutcome::Continue;
+    }
     match decision {
         TrustGateDecision::Preapproved | TrustGateDecision::Declined => GateOutcome::Continue,
         TrustGateDecision::StoreUnreadable(message) => {
             eprintln!(
-                "Error: {message}\nProject resources stay unloaded until the trust store is readable."
+                "Error: {message}
+Project resources stay unloaded until the trust store is readable."
             );
             GateOutcome::Continue
         }
-        // Task 4 reports this to headless callers.
+        // Only a headless host gets `Unavailable`; an interactive one is asked.
         TrustGateDecision::Unavailable => GateOutcome::Continue,
         TrustGateDecision::Prompt => {
             let path = canonicalize_trust_path(cwd);
@@ -201,7 +240,8 @@ pub fn enforce_startup_trust(
             crate::startup_mark("trust gate answered");
             if let Err(err) = record_gate_choice(agent_dir, cwd, choice) {
                 eprintln!(
-                    "Error: could not save the answer: {err}\nNothing from {path} was loaded."
+                    "Error: could not save the answer: {err}
+Nothing from {path} was loaded."
                 );
                 return GateOutcome::Exit(1);
             }
@@ -209,7 +249,8 @@ pub fn enforce_startup_trust(
                 TrustGateChoice::Trust => GateOutcome::Continue,
                 TrustGateChoice::Exit => {
                     println!(
-                        "\nNothing from {path} was loaded. Opening DaVinci there again starts it without the project's hooks, MCP servers, extensions and skills; /trust changes that."
+                        "
+Nothing from {path} was loaded. Opening DaVinci there again starts it without the project's hooks, MCP servers, extensions and skills; /trust changes that."
                     );
                     GateOutcome::Exit(0)
                 }

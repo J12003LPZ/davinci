@@ -254,22 +254,57 @@ pub fn record_gate_choice(
     ProjectTrustStore::open(agent_dir).set(cwd, Some(choice == TrustGateChoice::Trust))
 }
 
-/// One-line, copy-safe diagnostic for a headless launch that left project
-/// resources unloaded. The code comes first so callers can match on it.
-pub fn untrusted_project_message(cwd: &Path) -> String {
-    format!(
-        "{UNTRUSTED_PROJECT}: {} has project hooks, MCP servers, extensions, skills or packages that were not loaded because the folder is not trusted. Trust it once from an interactive session, pass --approve, or set defaultProjectTrust to \"always\" in the global settings.",
-        canonicalize_trust_path(cwd)
-    )
+/// A structured report that project resources were left unloaded because the
+/// folder is not trusted. Headless entrypoints (print/json mode, RPC, the SDK)
+/// return this instead of dropping the resources silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustDiagnostic {
+    /// Always [`UNTRUSTED_PROJECT`].
+    pub code: &'static str,
+    /// Canonical project path.
+    pub path: String,
+    /// One line, starting with the code.
+    pub message: String,
 }
 
-/// The same diagnostic as a JSON object for machine consumers.
-pub fn untrusted_project_json(cwd: &Path) -> Value {
-    serde_json::json!({
-        "code": UNTRUSTED_PROJECT,
-        "path": canonicalize_trust_path(cwd),
-        "message": untrusted_project_message(cwd),
+impl TrustDiagnostic {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "code": self.code,
+            "path": self.path,
+            "message": self.message,
+        })
+    }
+}
+
+/// The diagnostic a headless caller owes for `decision`, or `None` when the
+/// project loads normally.
+pub fn trust_diagnostic(decision: &TrustGateDecision, cwd: &Path) -> Option<TrustDiagnostic> {
+    let path = canonicalize_trust_path(cwd);
+    let why = match decision {
+        TrustGateDecision::Preapproved => return None,
+        TrustGateDecision::Declined => "it is saved as Do not trust".to_string(),
+        TrustGateDecision::Unavailable | TrustGateDecision::Prompt => {
+            "no trust decision is saved and there is nobody to ask".to_string()
+        }
+        TrustGateDecision::StoreUnreadable(error) => {
+            format!("the trust store cannot be read ({error})")
+        }
+    };
+    Some(TrustDiagnostic {
+        code: UNTRUSTED_PROJECT,
+        message: format!(
+            "{UNTRUSTED_PROJECT}: {path} has project hooks, MCP servers, extensions, skills or packages that were not loaded: {why}. Trust it once from an interactive session, pass --approve, or set defaultProjectTrust to \"always\" in the global settings."
+        ),
+        path,
     })
+}
+
+/// [`trust_diagnostic`] for a folder that is simply not trusted.
+pub fn untrusted_project_message(cwd: &Path) -> String {
+    trust_diagnostic(&TrustGateDecision::Unavailable, cwd)
+        .map(|diagnostic| diagnostic.message)
+        .unwrap_or_default()
 }
 
 pub fn canonicalize_trust_path(path: &Path) -> String {
@@ -849,8 +884,22 @@ mod tests {
         let dir = tempdir().unwrap();
         let project = project_with_hooks(dir.path());
         assert!(untrusted_project_message(&project).starts_with("UNTRUSTED_PROJECT: "));
-        let json = untrusted_project_json(&project);
-        assert_eq!(json["code"], "UNTRUSTED_PROJECT");
-        assert_eq!(json["path"], canonicalize_trust_path(&project));
+        let diagnostic = trust_diagnostic(&TrustGateDecision::Declined, &project).unwrap();
+        assert_eq!(diagnostic.to_json()["code"], "UNTRUSTED_PROJECT");
+        assert_eq!(
+            diagnostic.to_json()["path"],
+            canonicalize_trust_path(&project)
+        );
+        assert!(diagnostic.message.contains("Do not trust"));
+        let unreadable = trust_diagnostic(
+            &TrustGateDecision::StoreUnreadable("bad trust.json".into()),
+            &project,
+        )
+        .unwrap();
+        assert!(unreadable.message.contains("bad trust.json"));
+        assert_eq!(
+            trust_diagnostic(&TrustGateDecision::Preapproved, &project),
+            None
+        );
     }
 }

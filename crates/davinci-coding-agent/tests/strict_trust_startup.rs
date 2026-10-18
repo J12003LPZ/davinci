@@ -35,27 +35,41 @@ fn fixture() -> Fixture {
     let config = base.join("config");
     fs::create_dir_all(project.join(".pi")).unwrap();
     fs::create_dir_all(&config).unwrap();
-    let mcp_marker = base.join("mcp-ran");
-    let hook_marker = base.join("hook-ran");
-    let (program, flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
+    let mcp_marker = project.join("mcp-ran.marker");
+    let hook_marker = project.join("hook-ran.marker");
+    // argv that writes `ran` to the marker. On Windows the redirect is its own
+    // argument so no quoting is needed (the temp path has no spaces).
+    let write_marker = |marker: &Path| -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                ["/C", "echo", "ran", ">", &marker.display().to_string()]
+                    .map(String::from)
+                    .to_vec(),
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".into(), format!("echo ran > '{}'", marker.display())],
+            )
+        }
     };
-    let write_marker = |marker: &Path| format!("echo ran> \"{}\"", marker.display());
+    let (mcp_program, mcp_args) = write_marker(&mcp_marker);
     fs::write(
         project.join(".pi").join("mcp.json"),
         serde_json::json!({"mcpServers": {"planted": {
-            "command": program,
-            "args": [flag, write_marker(&mcp_marker)],
+            "command": mcp_program,
+            "args": mcp_args,
         }}})
         .to_string(),
     )
     .unwrap();
+    let (hook_program, hook_args) = write_marker(&hook_marker);
+    let mut hook_argv = vec![hook_program];
+    hook_argv.extend(hook_args);
     fs::write(
         project.join(".pi").join("hooks.json"),
-        serde_json::json!({"sessionStart": [[program, flag, write_marker(&hook_marker)]]})
-            .to_string(),
+        serde_json::json!({"sessionStart": [hook_argv]}).to_string(),
     )
     .unwrap();
     Fixture {
@@ -499,5 +513,153 @@ mod store {
                 corrupt
             );
         }
+    }
+}
+
+// ---- Task 4: headless entrypoints fail closed with UNTRUSTED_PROJECT ----
+
+mod headless {
+    use super::*;
+
+    fn print_command(fx: &Fixture) -> Command {
+        let mut command = fx.command();
+        command
+            .env_remove("PI_FORCE_INTERACTIVE")
+            .env_remove("PI_SHUTDOWN_SIGNAL")
+            .args(["--print", "hello"]);
+        command
+    }
+
+    #[test]
+    fn headless_untrusted_project_fails_closed() {
+        let fx = fixture();
+        let run = run_with_input(&mut print_command(&fx), "");
+        assert_eq!(run.code, Some(0), "{}", run.describe());
+        assert!(
+            run.stderr.contains("UNTRUSTED_PROJECT"),
+            "the denial must be reported, not silent\n{}",
+            run.describe()
+        );
+        assert!(!run.stdout.contains(PROMPT_YES), "no prompt without a UI");
+        assert!(!fx.mcp_marker.exists(), "untrusted project MCP server ran");
+        assert!(!fx.hook_marker.exists(), "untrusted project hook ran");
+        assert_eq!(
+            fx.stored_decision(),
+            None,
+            "headless never stores a decision"
+        );
+    }
+
+    #[test]
+    fn headless_stored_grant_loads_the_project_without_a_diagnostic() {
+        let fx = fixture();
+        davinci_coding_agent::trust::ProjectTrustStore::open(&fx.config)
+            .set(&fx.project, Some(true))
+            .unwrap();
+        let run = run_with_input(&mut print_command(&fx), "");
+        assert!(
+            !run.stderr.contains("UNTRUSTED_PROJECT"),
+            "{}",
+            run.describe()
+        );
+        let started = Instant::now();
+        while !fx.mcp_marker.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "a granted project must load its MCP server and hook\n{}",
+                run.describe()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn headless_global_default_always_is_the_trusted_host_override() {
+        let fx = fixture();
+        fs::write(
+            fx.config.join("settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        let run = run_with_input(&mut print_command(&fx), "");
+        assert!(
+            !run.stderr.contains("UNTRUSTED_PROJECT"),
+            "{}",
+            run.describe()
+        );
+        assert!(fx.mcp_marker.exists(), "{}", run.describe());
+    }
+
+    #[test]
+    fn headless_project_settings_cannot_grant_themselves_trust() {
+        let fx = fixture();
+        fs::write(
+            fx.project.join(".pi").join("settings.json"),
+            r#"{"defaultProjectTrust":"always","trustedProjects":["*"]}"#,
+        )
+        .unwrap();
+        let run = run_with_input(&mut print_command(&fx), "");
+        assert!(
+            run.stderr.contains("UNTRUSTED_PROJECT"),
+            "{}",
+            run.describe()
+        );
+        assert!(!fx.mcp_marker.exists());
+        assert!(!fx.hook_marker.exists());
+    }
+
+    #[test]
+    fn headless_stored_denial_is_reported_and_beats_default_always() {
+        let fx = fixture();
+        fs::write(
+            fx.config.join("settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        davinci_coding_agent::trust::ProjectTrustStore::open(&fx.config)
+            .set(&fx.project, Some(false))
+            .unwrap();
+        let run = run_with_input(&mut print_command(&fx), "");
+        assert!(
+            run.stderr.contains("UNTRUSTED_PROJECT"),
+            "{}",
+            run.describe()
+        );
+        assert!(run.stderr.contains("Do not trust"), "{}", run.describe());
+        assert!(!fx.mcp_marker.exists());
+    }
+
+    #[test]
+    fn headless_rpc_reports_untrusted_project_and_state() {
+        let fx = fixture();
+        let mut command = fx.command();
+        command
+            .env_remove("PI_FORCE_INTERACTIVE")
+            .env_remove("PI_SHUTDOWN_SIGNAL")
+            .args(["--mode", "rpc"]);
+        let run = run_with_input(&mut command, "{\"id\":\"1\",\"type\":\"get_state\"}\n");
+        let lines: Vec<serde_json::Value> = run
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let notice = lines
+            .iter()
+            .find(|line| line["code"] == "UNTRUSTED_PROJECT")
+            .unwrap_or_else(|| panic!("no UNTRUSTED_PROJECT event\n{}", run.describe()));
+        assert_eq!(notice["type"], "extension_ui_request");
+        assert_eq!(notice["method"], "notify");
+        assert_eq!(notice["notifyType"], "warning");
+        let state = lines
+            .iter()
+            .find(|line| line["type"] == "response" && line["command"] == "get_state")
+            .unwrap_or_else(|| panic!("no get_state response\n{}", run.describe()));
+        assert_eq!(state["data"]["projectTrusted"], false, "{state}");
+        assert_eq!(
+            state["data"]["projectTrustCode"], "UNTRUSTED_PROJECT",
+            "{state}"
+        );
+        assert!(!fx.mcp_marker.exists());
+        assert!(!fx.hook_marker.exists());
     }
 }

@@ -4616,6 +4616,34 @@ fn run_rpc_with_host(
         cwd,
         available_models(parsed),
     );
+    let (project_trusted, trust_diagnostic) = trust_gate::headless_trust_report(
+        &default_agent_dir(),
+        &runtime.cwd,
+        parsed.project_trust_override,
+    );
+    runtime.project_trusted = project_trusted;
+    if let Some(diagnostic) = &trust_diagnostic {
+        // A known event type with extra fields, so existing clients keep
+        // working and new ones can match on `code`.
+        let mut notice = rpc::extension_ui_request(
+            &uuid::Uuid::new_v4().to_string(),
+            "notify",
+            serde_json::json!({
+                "message": diagnostic.message,
+                "notifyType": "warning",
+                "code": diagnostic.code,
+                "path": diagnostic.path,
+            }),
+        );
+        if let Some(object) = notice.as_object_mut() {
+            object.insert("diagnostic".into(), diagnostic.to_json());
+        }
+        output::write_raw_stdout_line(
+            &serde_json::to_string(&notice).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    runtime.project_trust_diagnostic = trust_diagnostic;
     host.lock()
         .unwrap_or_else(|err| err.into_inner())
         .emit(ExtensionEvent::SessionStart);

@@ -164,6 +164,10 @@ pub struct RpcRuntime {
     pub pending_events: Vec<RpcSessionEvent>,
     pub prompt_needs_turn: bool,
     pub control_operations: std::collections::HashMap<String, Value>,
+    /// Whether this launch loaded the project's own resources.
+    pub project_trusted: bool,
+    /// Set when project resources were left unloaded for want of trust.
+    pub project_trust_diagnostic: Option<davinci_coding_agent::trust::TrustDiagnostic>,
 }
 
 impl RpcRuntime {
@@ -193,6 +197,8 @@ impl RpcRuntime {
             pending_events: Vec::new(),
             prompt_needs_turn: false,
             control_operations: std::collections::HashMap::new(),
+            project_trusted: true,
+            project_trust_diagnostic: None,
         }
     }
 
@@ -398,6 +404,8 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 "autoCompactionEnabled": runtime.agent.auto_compaction,
                 "messageCount": runtime.agent.messages.len(),
                 "pendingMessageCount": runtime.agent.queues.steer.len() + runtime.agent.queues.follow_up.len(),
+                "projectTrusted": runtime.project_trusted,
+                "projectTrustCode": runtime.project_trust_diagnostic.as_ref().map(|diagnostic| diagnostic.code),
             })),
         ),
         "set_thinking_level" => {
