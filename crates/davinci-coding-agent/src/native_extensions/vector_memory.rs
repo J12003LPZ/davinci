@@ -454,24 +454,61 @@ pub use resolve_repo_id as repo_id;
 /// The repository identity memory and learning stores are keyed by: the
 /// origin remote, else the work-tree root, else the directory itself.
 ///
-/// Asked once per directory per process. Each answer costs two `git`
-/// spawns (~70ms each on Windows), and every native host asks it twice
-/// while startup builds several hosts. A store key that stayed put for the
-/// whole session is also the safer one: a remote changed mid-session takes
-/// effect at the next start rather than splitting the session's records.
+/// Each answer costs two `git` spawns (~70ms each on Windows), and every
+/// native host asks it twice while startup builds several hosts, so answers
+/// are cached per directory. The cache entry carries a stamp of the git
+/// config that decides the answer (one `stat`, no spawn): a remote added or
+/// changed, or a directory that becomes a repository, changes the stamp, so
+/// a new session in the same process sees the new identity instead of a
+/// stale one. Within one stamp the key stays put, so hosts built during one
+/// startup agree.
 pub fn resolve_repo_id(cwd: &Path) -> String {
-    static KNOWN: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, String>>> =
-        std::sync::OnceLock::new();
+    static KNOWN: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, (Option<GitConfigStamp>, String)>>,
+    > = std::sync::OnceLock::new();
     let known = KNOWN.get_or_init(Default::default);
-    if let Some(id) = known.lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
-        return id.clone();
+    let stamp = git_config_stamp(cwd);
+    if let Some((seen, id)) = known.lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
+        if *seen == stamp {
+            return id.clone();
+        }
     }
     let id = repo_id_from_git(cwd);
     known
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(cwd.to_path_buf(), id.clone());
+        .insert(cwd.to_path_buf(), (stamp, id.clone()));
     id
+}
+
+type GitConfigStamp = (PathBuf, std::time::SystemTime, u64);
+
+/// Path, modification time and length of the config file git reads for
+/// `cwd`'s repository, or `None` outside one. Follows a linked worktree's
+/// `.git` file to the shared config.
+fn git_config_stamp(cwd: &Path) -> Option<GitConfigStamp> {
+    let dot_git = cwd
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|p| p.exists())?;
+    let git_dir = if dot_git.is_file() {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+        let target = if target.is_absolute() {
+            target
+        } else {
+            dot_git.parent()?.join(target)
+        };
+        match std::fs::read_to_string(target.join("commondir")) {
+            Ok(common) => target.join(common.trim()),
+            Err(_) => target,
+        }
+    } else {
+        dot_git
+    };
+    let config = git_dir.join("config");
+    let meta = std::fs::metadata(&config).ok()?;
+    Some((config, meta.modified().ok()?, meta.len()))
 }
 
 fn repo_id_from_git(cwd: &Path) -> String {
@@ -2698,11 +2735,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_directory_keeps_its_repo_id_for_the_whole_session() {
+    fn a_directory_keeps_its_repo_id_until_its_git_config_changes() {
         let directory = tempfile::tempdir().unwrap();
-        let first = resolve_repo_id(directory.path());
-        // Becoming a repository with a remote would change the identity; the
-        // running session keeps the key its stores were opened with.
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
@@ -2712,18 +2746,28 @@ pub(crate) mod tests {
                 .unwrap_or(false)
         };
         assert!(git(&["init", "-q"]), "git is needed for this test");
+        let first = resolve_repo_id(directory.path());
+        assert_eq!(
+            resolve_repo_id(directory.path()),
+            first,
+            "stable while unchanged"
+        );
+        // A new session in the same process after the remote appears must
+        // see the new identity, not the one cached before.
         assert!(git(&[
             "remote",
             "add",
             "origin",
             "https://example.com/other.git"
         ]));
-        assert_ne!(
-            repo_id_from_git(directory.path()),
-            first,
-            "git now names it differently"
+        let second = resolve_repo_id(directory.path());
+        assert_ne!(second, first, "the remote changed the identity");
+        assert_eq!(second, repo_id_from_git(directory.path()));
+        assert_eq!(
+            resolve_repo_id(directory.path()),
+            second,
+            "and is stable again"
         );
-        assert_eq!(resolve_repo_id(directory.path()), first);
     }
 
     #[test]

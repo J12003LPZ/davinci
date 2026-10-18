@@ -91,9 +91,11 @@ fn path_url(token: &str, cwd: &Path, exists: &mut impl FnMut(&Path) -> bool) -> 
     if !rooted || token.starts_with("//") || (token.contains('\\') && !drive) {
         return None;
     }
-    // `/config` is a slash command, even where `C:\config` exists: one name
-    // after the root is never read as a path. `/etc/hosts` still is.
-    if !drive
+    // On Windows `/config` is a slash command, even where `C:\config` exists:
+    // one name after the root is never read as a path. `/etc/hosts` still is.
+    // Elsewhere the root is a real directory, so `/tmp` links when it exists.
+    if cfg!(windows)
+        && !drive
         && token
             .strip_prefix('/')
             .is_some_and(|rest| !rest.contains('/'))
@@ -337,6 +339,16 @@ mod tests {
         }
         assert_eq!(find("/etc/hosts", cwd, every_path_exists).len(), 1);
         assert_eq!(find("./config", cwd, every_path_exists).len(), 1);
+    }
+
+    #[test]
+    fn a_top_level_unix_directory_links_where_the_root_is_real() {
+        let found = find("see /tmp now", Path::new("/work/app"), &mut |p| {
+            p == Path::new("/tmp")
+        });
+        assert_eq!(found.len(), usize::from(cfg!(not(windows))));
+        // A missing one never links, on any platform.
+        assert!(find("see /nope", Path::new("/work/app"), &mut |_| false).is_empty());
     }
 
     #[test]
