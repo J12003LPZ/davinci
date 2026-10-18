@@ -1,6 +1,9 @@
 // Deterministic offline LSP fixture. Protocol stdout contains frames only.
 const fs = require('fs');
 const mode = process.argv[2] || 'normal';
+// A slow start, as on a loaded CI runner: block before reading anything.
+const bootDelay = Number(process.env.DAVINCI_LSP_FIXTURE_BOOT_DELAY_MS || 0);
+if (bootDelay > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, bootDelay);
 const eventsPath = process.argv[3] || process.env.DAVINCI_LSP_EVENT_LOG || '';
 let input = Buffer.alloc(0);
 let initialized = false;
