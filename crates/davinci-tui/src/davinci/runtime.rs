@@ -1449,11 +1449,12 @@ impl PathProbe {
             Some((asked, found)) => (*found, asked.elapsed() >= PATH_TTL),
             None => (false, true),
         };
-        if stale && state.asking.insert(path.to_path_buf()) {
-            if ask.try_send(path.to_path_buf()).is_err() {
-                // Queue full or workers gone: draw unlinked, ask next frame.
-                state.asking.remove(path);
-            }
+        if stale
+            && state.asking.insert(path.to_path_buf())
+            && ask.try_send(path.to_path_buf()).is_err()
+        {
+            // Queue full or workers gone: draw unlinked, ask next frame.
+            state.asking.remove(path);
         }
         answer
     }

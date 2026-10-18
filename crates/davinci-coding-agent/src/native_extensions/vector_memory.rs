@@ -465,9 +465,7 @@ pub use resolve_repo_id as repo_id;
 /// mid-session is picked up by the next lookup: the identity follows the
 /// repository rather than being frozen with the first session that asked.
 pub fn resolve_repo_id(cwd: &Path) -> String {
-    static KNOWN: std::sync::OnceLock<
-        Mutex<std::collections::HashMap<PathBuf, (Option<GitConfigStamp>, String)>>,
-    > = std::sync::OnceLock::new();
+    static KNOWN: std::sync::OnceLock<Mutex<RepoIdCache>> = std::sync::OnceLock::new();
     let known = KNOWN.get_or_init(Default::default);
     let stamp = git_config_stamp(cwd);
     if let Some((seen, id)) = known.lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
@@ -487,6 +485,9 @@ pub fn resolve_repo_id(cwd: &Path) -> String {
 /// is missing, so creating it changes the stamp too), plus the contents of
 /// `HEAD`: an `includeIf "onbranch:..."` makes the effective config depend on
 /// the checked-out branch, which no config file records.
+/// Each directory's repo id and the config stamp it was computed under.
+type RepoIdCache = std::collections::HashMap<PathBuf, (Option<GitConfigStamp>, String)>;
+
 type GitConfigStamp = (Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>, String);
 
 /// The config file git reads for `cwd`'s repository and every file it
