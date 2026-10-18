@@ -488,8 +488,8 @@ fn a_chat_entry_keeps_the_message_extras() {
 #[test]
 fn queues_and_compaction_match_ts_modes() {
     let mut agent = Agent::new(default_system_prompt());
-    agent.prompt("aaaaaaaaaa bbbbbbbbbb");
-    agent.record_assistant("cccccccccc");
+    agent.prompt(&"aaaaaaaaaa bbbbbbbbbb ".repeat(80));
+    agent.record_assistant(&"cccccccccc ".repeat(80));
     agent.queues.enqueue_steer("steer me");
     agent.queues.enqueue_follow_up("follow");
     assert_eq!(agent.queues.steer.len(), 1);
@@ -526,8 +526,8 @@ fn compaction_emits_pre_and_post_compact_on_runtime() {
     let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), bus);
     let mut agent = Agent::new("base prompt").with_runtime(runtime);
 
-    agent.prompt("message 1 for conversation history");
-    agent.record_assistant("assistant response 1");
+    agent.prompt(&"message 1 for conversation history ".repeat(60));
+    agent.record_assistant(&"assistant response 1 ".repeat(60));
     agent.prompt("message 2 for conversation history");
     agent.record_assistant("assistant response 2");
 
@@ -4777,11 +4777,21 @@ fn hybrid_compaction_whose_ledger_cannot_follow_keeps_live_history() {
 fn wor32_abandoned_branch_summary_does_not_seed_the_active_branch() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = legacy_compaction_agent(dir.path());
-    // Echo the prompt so each summary shows exactly which previous summary
-    // the compaction was seeded with.
+    // Echo the focus line and the previous summary so each summary shows
+    // exactly which previous summary the compaction was seeded with, while
+    // staying far smaller than the history it replaces.
     agent.summarizer = Some(crate::compaction::Summarizer::new(|request| {
+        let echoed = request
+            .prompt
+            .lines()
+            .filter(|line| line.contains("MARKER") || line.contains("previous-summary"))
+            .collect::<Vec<_>>()
+            .join("
+");
         Ok(crate::compaction::SummarizeResponse {
-            text: request.prompt.clone(),
+            text: format!("## Goal
+checkpoint
+{echoed}"),
             usage: Default::default(),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,
@@ -4921,4 +4931,46 @@ fn wor39_native_resume_falls_back_to_a_compatible_ancestor_record() {
         agent.native_responses_resume_record_for(&request[..1]),
         None
     );
+}
+
+#[test]
+fn a_full_context_with_failed_auto_compaction_blocks_the_request() {
+    let mut agent = Agent::new("fixture");
+    agent.context_window = 2_000;
+    agent.compaction.enabled = true;
+    agent.compaction.reserve_tokens = 100;
+    agent.compaction.keep_recent_tokens = 1;
+    agent.summarizer = Some(Summarizer::new(|_| Err("provider timed out".into())));
+    for i in 0..6 {
+        agent.prompt(&format!("request {i}: {}", "background ".repeat(400)));
+        agent.record_assistant(&format!("reply {i}: {}", "detail ".repeat(400)));
+    }
+    let before = agent.messages.len();
+    let mut dispatched = false;
+    let error = agent
+        .run_loop(|_| {
+            dispatched = true;
+            Err::<crate::CompleteOutput, String>("must not be reached".into())
+        })
+        .unwrap_err();
+    assert!(!dispatched, "no provider request may follow the failure");
+    assert!(error.contains("automatic compaction failed"), "{error}");
+    assert!(error.contains("provider timed out"), "{error}");
+    assert_eq!(agent.messages.len(), before, "history is untouched");
+}
+
+#[test]
+fn failed_auto_compaction_with_headroom_still_sends_the_request() {
+    let mut agent = Agent::new("fixture");
+    agent.context_window = 200_000;
+    agent.compaction.enabled = true;
+    agent.compaction.reserve_tokens = 199_000;
+    agent.summarizer = Some(Summarizer::new(|_| Err("provider timed out".into())));
+    agent.prompt(&"background ".repeat(2_000));
+    let mut dispatched = false;
+    let _ = agent.run_loop(|_| {
+        dispatched = true;
+        Err::<crate::CompleteOutput, String>("stop here".into())
+    });
+    assert!(dispatched, "headroom left: the turn proceeds");
 }

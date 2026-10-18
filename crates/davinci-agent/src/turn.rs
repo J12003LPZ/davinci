@@ -593,10 +593,19 @@ impl Agent {
             } else if self.auto_compaction {
                 let mut settings = self.compaction;
                 settings.enabled = true;
-                if crate::should_compact(tokens, self.context_window, &settings)
-                    && self.compact(None).compacted
-                {
-                    self.stats.compactions += 1;
+                if crate::should_compact(tokens, self.context_window, &settings) {
+                    let outcome = self.compact(None);
+                    if outcome.compacted {
+                        self.stats.compactions += 1;
+                    } else if self.context_window > 0 && tokens >= self.context_window {
+                        // Compaction failed and the request cannot fit: stop
+                        // with a recoverable error instead of sending a
+                        // request the provider will reject, turn after turn.
+                        return Err(format!(
+                            "Request blocked: the context is full and automatic compaction failed ({}). Run /compact or start a new session.",
+                            outcome.summary
+                        ));
+                    }
                 }
             }
 
