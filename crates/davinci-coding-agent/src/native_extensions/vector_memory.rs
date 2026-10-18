@@ -484,8 +484,10 @@ pub fn resolve_repo_id(cwd: &Path) -> String {
 }
 
 /// Each watched file with its modification time and length (`None` when it
-/// is missing, so creating it changes the stamp too).
-type GitConfigStamp = Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>;
+/// is missing, so creating it changes the stamp too), plus the contents of
+/// `HEAD`: an `includeIf "onbranch:..."` makes the effective config depend on
+/// the checked-out branch, which no config file records.
+type GitConfigStamp = (Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>, String);
 
 /// The config file git reads for `cwd`'s repository and every file it
 /// includes, or `None` outside a repository. Follows a linked worktree's
@@ -495,7 +497,8 @@ fn git_config_stamp(cwd: &Path) -> Option<GitConfigStamp> {
         .ancestors()
         .map(|dir| dir.join(".git"))
         .find(|p| p.exists())?;
-    let git_dir = if dot_git.is_file() {
+    // `HEAD` lives in the work tree's own git dir, the config in the shared one.
+    let (git_dir, head_dir) = if dot_git.is_file() {
         let text = std::fs::read_to_string(&dot_git).ok()?;
         let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
         let target = if target.is_absolute() {
@@ -504,27 +507,27 @@ fn git_config_stamp(cwd: &Path) -> Option<GitConfigStamp> {
             dot_git.parent()?.join(target)
         };
         match std::fs::read_to_string(target.join("commondir")) {
-            Ok(common) => target.join(common.trim()),
-            Err(_) => target,
+            Ok(common) => (target.join(common.trim()), target),
+            Err(_) => (target.clone(), target),
         }
     } else {
-        dot_git
+        (dot_git.clone(), dot_git)
     };
+    let head = std::fs::read_to_string(head_dir.join("HEAD")).unwrap_or_default();
     let config = git_dir.join("config");
     std::fs::metadata(&config).ok()?;
     let mut files = Vec::new();
     collect_config_files(&config, &mut files, 0);
-    Some(
-        files
-            .into_iter()
-            .map(|path| {
-                let meta = std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
-                (path, meta)
-            })
-            .collect(),
-    )
+    let files = files
+        .into_iter()
+        .map(|path| {
+            let meta = std::fs::metadata(&path)
+                .ok()
+                .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+            (path, meta)
+        })
+        .collect();
+    Some((files, head.trim().to_string()))
 }
 
 /// `config` and, transitively, the targets of its `[include]` and
@@ -2860,6 +2863,46 @@ pub(crate) mod tests {
         let second = resolve_repo_id(directory.path());
         assert_ne!(second, first, "the included file changed the remote");
         assert_eq!(second, repo_id_from_git(directory.path()));
+    }
+
+    #[test]
+    fn switching_branch_changes_the_repo_id_when_the_config_depends_on_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory.path())
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        assert!(
+            git(&["init", "-q", "-b", "feature"]),
+            "git is needed for this test"
+        );
+        assert!(git(&["config", "user.email", "t@example.com"]));
+        assert!(git(&["config", "user.name", "t"]));
+        let extra = directory.path().join(".git").join("feature.cfg");
+        std::fs::write(
+            &extra,
+            "[remote \"origin\"]\n\turl = https://example.com/feature.git\n",
+        )
+        .unwrap();
+        assert!(git(&[
+            "config",
+            "includeIf.onbranch:feature.path",
+            "feature.cfg"
+        ]));
+        assert!(git(&["commit", "-q", "--allow-empty", "-m", "x"]));
+        let on_feature = resolve_repo_id(directory.path());
+        assert_eq!(on_feature, repo_id_from_git(directory.path()));
+        assert!(git(&["switch", "-q", "-c", "main"]));
+        let on_main = resolve_repo_id(directory.path());
+        assert_ne!(
+            on_main, on_feature,
+            "no config file changed, the branch did"
+        );
+        assert_eq!(on_main, repo_id_from_git(directory.path()));
     }
 
     #[test]

@@ -1382,15 +1382,14 @@ struct PathProbe {
 #[derive(Default)]
 struct ProbeState {
     known: std::collections::HashMap<std::path::PathBuf, (Instant, bool)>,
-    /// Paths with a question out, and since when.
-    asking: std::collections::HashMap<std::path::PathBuf, Instant>,
+    /// Paths with a question queued or running. A path leaves this set only
+    /// when its check finishes (or could not be queued), never on a timeout:
+    /// a hung check must not be joined by a second one for the same path.
+    asking: std::collections::HashSet<std::path::PathBuf>,
 }
 
 /// How long an answer stands before it is asked again.
 const PATH_TTL: Duration = Duration::from_secs(2);
-/// A question unanswered this long is presumed stuck on a dead drive: it
-/// stops blocking a new one for the same path.
-const PATH_STUCK: Duration = Duration::from_secs(10);
 /// Workers sharing the queue: a few stuck stats cannot starve every other path.
 const PROBE_WORKERS: usize = 4;
 /// Questions waiting for a worker.
@@ -1450,12 +1449,7 @@ impl PathProbe {
             Some((asked, found)) => (*found, asked.elapsed() >= PATH_TTL),
             None => (false, true),
         };
-        let outstanding = state
-            .asking
-            .get(path)
-            .is_some_and(|since| since.elapsed() < PATH_STUCK);
-        if stale && !outstanding {
-            state.asking.insert(path.to_path_buf(), Instant::now());
+        if stale && state.asking.insert(path.to_path_buf()) {
             if ask.try_send(path.to_path_buf()).is_err() {
                 // Queue full or workers gone: draw unlinked, ask next frame.
                 state.asking.remove(path);
@@ -1796,6 +1790,33 @@ mod tests {
         assert!(
             eventually(|| others.iter().all(|other| probe.exists(other))),
             "other paths are still answered while one check hangs"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn a_path_that_stays_on_screen_never_occupies_a_second_worker() {
+        let stuck = std::path::Path::new("Z:/dead/drive.rs");
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = std::sync::Mutex::new(hold);
+        let asks = Arc::new(AtomicUsize::new(0));
+        let counted = asks.clone();
+        let probe = super::PathProbe::with(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = hold.lock().unwrap().recv();
+            false
+        });
+        // Every frame for a long while: the path is on screen the whole time.
+        for _ in 0..500 {
+            assert!(!probe.exists(stuck));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(eventually(|| asks.load(Ordering::SeqCst) == 1));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            1,
+            "one check per path, however long it hangs"
         );
         drop(release);
     }
