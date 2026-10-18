@@ -404,10 +404,7 @@ mod tests {
 
     #[test]
     fn retrieved_images_are_bounded_per_call() {
-        let image = |n: usize| EventImage {
-            mime_type: "image/png".into(),
-            data: format!("img{n}"),
-        };
+        let image = |n: usize| EventImage::new("image/png", format!("img{n}"));
         let many: Vec<EventImage> = (0..MAX_RETRIEVED_IMAGES + 2).map(image).collect();
         let (kept, note) = attach_images("transient:0:x", many, false, true);
         assert_eq!(kept.len(), MAX_RETRIEVED_IMAGES);
@@ -448,11 +445,7 @@ mod tests {
 
     #[test]
     fn tool_details_carry_images_in_the_shape_the_turn_loop_reads() {
-        let details = image_details(&[EventImage {
-            mime_type: "image/png".into(),
-            data: "QUJD".into(),
-        }])
-        .unwrap();
+        let details = image_details(&[EventImage::new("image/png", "QUJD")]).unwrap();
         let parsed = crate::parse_rpc_images(details["images"].as_array().unwrap());
         assert_eq!(
             parsed,

@@ -109,6 +109,25 @@ impl SourceImages {
         out
     }
 
+    /// Whether any held entry belongs to a source outside `live`: the
+    /// transcript was rewritten, so the held set must be rebuilt.
+    pub(crate) fn holds_source_outside(&self, live: &HashSet<&str>) -> bool {
+        self.kept
+            .keys()
+            .chain(self.dropped.iter())
+            .any(|source_ref| !live.contains(source_ref.as_str()))
+    }
+
+    /// Where the held bytes of `source_ref` live, so a test can tell reuse
+    /// from a copy.
+    #[cfg(test)]
+    pub(crate) fn data_ptr(&self, source_ref: &str) -> Option<*const u8> {
+        self.kept
+            .get(source_ref)
+            .and_then(|images| images.first())
+            .map(|image| image.data.as_ptr())
+    }
+
     pub(crate) fn absorb(&mut self, other: Self) {
         for (source_ref, images) in other.kept {
             self.insert(&source_ref, &images);

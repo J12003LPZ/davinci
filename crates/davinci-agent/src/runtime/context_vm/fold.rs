@@ -250,10 +250,10 @@ mod request_tests {
     fn fold_record_keeps_a_durable_image_reference() {
         let mut shot = event(1, ContextEventKind::User, "");
         shot.source_ref = "session:shot".into();
-        shot.images = vec![crate::runtime::context_vm::EventImage {
-            mime_type: "image/png".into(),
-            data: "AAAA".into(),
-        }];
+        shot.images = vec![crate::runtime::context_vm::EventImage::new(
+            "image/png",
+            "AAAA",
+        )];
         let prompt = prompt(&[shot], 32_000);
         assert!(prompt.contains("sha256:"), "{prompt}");
         assert!(prompt.contains("retrieve_context session:shot"), "{prompt}");

@@ -1091,10 +1091,10 @@ mod ledger_tests {
         let mut event = events_from_messages(&[ChatMessage::text("user", "x")]).remove(0);
         event.visible_text.clear();
         event.source_ref = "session:shot".into();
-        event.images = vec![crate::runtime::context_vm::EventImage {
-            mime_type: "image/png".into(),
-            data: "AAAA".into(),
-        }];
+        event.images = vec![crate::runtime::context_vm::EventImage::new(
+            "image/png",
+            "AAAA",
+        )];
         let state = ContextStateReducer::deterministic_delta(&CheckpointState::default(), &[event])
             .checkpoint_patch;
         assert_eq!(state.goals.len(), 1);

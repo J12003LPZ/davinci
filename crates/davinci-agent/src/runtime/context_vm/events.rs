@@ -39,12 +39,37 @@ pub struct ContextEvent {
 pub struct EventImage {
     pub mime_type: String,
     pub data: String,
+    /// Digest of `data`, computed on first use: hashing full base64 on every
+    /// reference or content hash is what this avoids.
+    #[serde(skip)]
+    digest: DigestCache,
 }
 
+/// Lazily computed digest. Never part of an image's identity.
+#[derive(Debug, Clone, Default)]
+struct DigestCache(std::sync::OnceLock<String>);
+
+impl PartialEq for DigestCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DigestCache {}
+
 impl EventImage {
+    pub fn new(mime_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: data.into(),
+            digest: DigestCache::default(),
+        }
+    }
+
     /// Digest of the image data; the same one `content_hash` folds in.
-    pub fn digest(&self) -> String {
-        digest(self.data.as_bytes())
+    /// Computed once per image, then reused.
+    pub fn digest(&self) -> &str {
+        self.digest.0.get_or_init(|| digest(self.data.as_bytes()))
     }
 
     /// The durable pointer to this image that outlives its bytes in the hot
@@ -243,10 +268,9 @@ fn user_images(message: &ChatMessage) -> Vec<EventImage> {
         .content
         .iter()
         .filter_map(|block| match block {
-            MessageContent::Image { data, mime_type } => Some(EventImage {
-                mime_type: mime_type.clone(),
-                data: data.clone(),
-            }),
+            MessageContent::Image { data, mime_type } => {
+                Some(EventImage::new(mime_type.clone(), data.clone()))
+            }
             _ => None,
         })
         .collect()
@@ -259,11 +283,7 @@ fn content_hash(visible_text: &str, images: &[EventImage]) -> String {
     }
     let mut identity = visible_text.to_string();
     for image in images {
-        identity.push_str(&format!(
-            "\n[image {} {}]",
-            image.mime_type,
-            digest(image.data.as_bytes())
-        ));
+        identity.push_str(&format!("\n[image {} {}]", image.mime_type, image.digest()));
     }
     digest(identity.as_bytes())
 }
@@ -331,11 +351,26 @@ mod tests {
     }
 
     #[test]
+    fn the_image_digest_is_computed_once_and_not_part_of_equality() {
+        let image = EventImage::new("image/png", "AAAA");
+        let fresh = image.clone();
+        let first = image.digest();
+        let second = image.digest();
+        assert!(std::ptr::eq(first, second), "digest was recomputed");
+        assert_eq!(first, digest(b"AAAA"));
+        // Cached on one side only, still the same image.
+        assert_eq!(image, fresh);
+        // The cache never reaches serialized form.
+        let json = serde_json::to_value(&image).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 2, "{json}");
+        let back: EventImage = serde_json::from_value(json).unwrap();
+        assert_eq!(back, image);
+        assert_eq!(back.digest(), first);
+    }
+
+    #[test]
     fn image_reference_names_mime_digest_and_source() {
-        let image = EventImage {
-            mime_type: "image/png".into(),
-            data: "AAAA".into(),
-        };
+        let image = EventImage::new("image/png", "AAAA");
         let line = image.reference("session:e1");
         assert!(line.starts_with("[image image/png sha256:"), "{line}");
         assert!(line.contains(&image.digest()[..16]), "{line}");

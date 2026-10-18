@@ -815,17 +815,28 @@ impl ContextVmRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
         contents.clear();
-        let mut images = sources::SourceImages::default();
+        let held = |event: &ContextEvent| !disk_backed || !event.source_ref.starts_with("session:");
+        // Images are held incrementally: a source seen before keeps its
+        // bytes (no deep clone per call). Only a rewrite that removed a held
+        // source rebuilds the set, so the byte bound is applied in order.
+        let mut images = self
+            .source_images
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let live = events
+            .iter()
+            .filter(|event| held(event))
+            .map(|event| event.source_ref.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if images.holds_source_outside(&live) {
+            *images = sources::SourceImages::default();
+        }
         for event in events {
-            if !disk_backed || !event.source_ref.starts_with("session:") {
+            if held(event) {
                 contents.insert(event.source_ref.clone(), event.visible_text.clone());
                 images.insert(&event.source_ref, &event.images);
             }
         }
-        *self
-            .source_images
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = images;
         diverged
     }
 
@@ -1065,6 +1076,30 @@ mod persistence_tests {
             previous = Some(image.messages);
         }
         changes
+    }
+
+    #[test]
+    fn source_images_are_kept_across_calls_not_rebuilt() {
+        let vm = vm();
+        let mut shot = ChatMessage::text("user", "look at this");
+        shot.content.push(davinci_ai::MessageContent::Image {
+            data: "AAAA".repeat(64),
+            mime_type: "image/png".into(),
+        });
+        let mut messages = vec![shot];
+        let events = events_from_messages(&messages);
+        let source = events[0].source_ref.clone();
+        vm.record_events(&events);
+        let held = |vm: &ContextVmRuntime| vm.source_images.read().unwrap().data_ptr(&source);
+        let first = held(&vm).expect("the image is held");
+
+        messages.push(ChatMessage::text("user", "and then"));
+        vm.record_events(&events_from_messages(&messages));
+        assert_eq!(held(&vm), Some(first), "the held bytes were copied again");
+
+        // A rewrite that drops the source drops its images with it.
+        vm.record_events(&events_from_messages(&[ChatMessage::text("user", "fresh")]));
+        assert_eq!(held(&vm), None);
     }
 
     #[test]
