@@ -183,6 +183,45 @@ fn active_context_vm_keeps_the_native_tool_pair_on_the_delivering_request() {
 }
 
 #[test]
+fn a_delivery_does_not_cost_the_active_ledger_an_extra_rebuild() {
+    use davinci_agent::runtime::context_vm::ContextVmMode;
+    use davinci_agent::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+
+    // Two reads then a final answer; `enabled` decides whether the first read
+    // delivers sub/AGENTS.md (the second finds it delivered already).
+    let rebuilds = |enabled: bool| {
+        let repo = repository();
+        let mut agent = agent_in(repo.path(), enabled);
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(ContextVmMode::Active);
+        let sessions = tempfile::tempdir().unwrap();
+        agent.session =
+            Some(davinci_session::JsonlSession::create(sessions.path(), "ledger", None).unwrap());
+        run(
+            &mut agent,
+            vec![
+                ("read", serde_json::json!({"path": "sub/x.rs"})),
+                ("read", serde_json::json!({"path": "sub/x.rs"})),
+            ],
+            |_| {},
+        );
+        agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .context_vm
+            .metrics()
+            .rebuild_attempts
+    };
+    let (with, without) = (rebuilds(true), rebuilds(false));
+    assert_eq!(with, without);
+}
+
+#[test]
 fn delivery_leaves_the_cached_prefix_untouched() {
     let repo = repository();
     let mut agent = agent_in(repo.path(), true);

@@ -3760,9 +3760,7 @@ fn team_wake_drains_teammate_reports_as_tool_evidence() {
             lead.run_id,
             lead.agent_id,
             lead.agent_id,
-            "status: completed
-
-found the bug",
+            "status: completed\n\nfound the bug",
         ))
         .unwrap();
     assert!(prompt_team_wake(&mut agent));
@@ -3798,9 +3796,7 @@ fn team_wake_keeps_host_steering_a_user_message() {
             lead.run_id,
             lead.agent_id,
             lead.agent_id,
-            "status: completed
-
-found the bug",
+            "status: completed\n\nfound the bug",
         ))
         .unwrap();
     assert!(prompt_team_wake(&mut agent));

@@ -2411,19 +2411,18 @@ impl Agent {
 
     fn live_tool_exchange(&self) -> Vec<ChatMessage> {
         self.live_tool_exchange_start()
-            .map(|start| {
-                let end = self.live_tool_exchange_end();
-                convert_to_llm_for_provider(&self.messages[start..end], self.block_images)
-            })
+            .map(|start| convert_to_llm_for_provider(&self.messages[start..], self.block_images))
             .unwrap_or_default()
     }
 
-    /// End of the history the live tool exchange can span. Nested
-    /// instructions are appended right after the tool results, on the request
-    /// that delivers them. They stay in the compiled history (a user-side
-    /// message, so the cached system prefix is untouched) and do not unpair
-    /// the exchange, which would fall back to evidence text. The host's other
-    /// boundary injections are not skipped here.
+    /// End of the tool exchange proper. Nested instructions are appended
+    /// right after the tool results, on the request that delivers them. They
+    /// ride in the live suffix after the pair (a user-side message, so the
+    /// cached system prefix is untouched) and do not unpair the exchange,
+    /// which would fall back to evidence text. Being in the suffix they stay
+    /// out of the ledger's events with the pair, so the next request, where
+    /// the pair is history, only appends. The host's other boundary
+    /// injections are not skipped here.
     fn live_tool_exchange_end(&self) -> usize {
         self.messages
             .iter()
@@ -2514,12 +2513,7 @@ impl Agent {
     pub(crate) fn context_vm_events_for_vm(&self) -> Vec<runtime::context_vm::ContextEvent> {
         let mut events = self.context_vm_events_for_runtime();
         if let Some(start) = self.live_tool_exchange_start() {
-            let end = self.live_tool_exchange_end();
-            drop_live_exchange_events(
-                &mut events,
-                &self.messages[start..end],
-                &self.messages[end..],
-            );
+            drop_live_exchange_events(&mut events, &self.messages[start..]);
         }
         events
     }
@@ -4943,20 +4937,18 @@ pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
 fn drop_live_exchange_events(
     events: &mut Vec<runtime::context_vm::ContextEvent>,
     exchange: &[ChatMessage],
-    trailing: &[ChatMessage],
 ) {
     let live = runtime::context_vm::events_from_messages(exchange);
-    let trailing = runtime::context_vm::events_from_messages(trailing).len();
-    let Some(tail) = events.len().checked_sub(live.len() + trailing) else {
+    let Some(tail) = events.len().checked_sub(live.len()) else {
         return;
     };
     if !live.is_empty()
-        && events[tail..tail + live.len()]
+        && events[tail..]
             .iter()
             .map(|event| &event.content_hash)
             .eq(live.iter().map(|event| &event.content_hash))
     {
-        events.drain(tail..tail + live.len());
+        events.truncate(tail);
     }
 }
 

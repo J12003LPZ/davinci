@@ -314,9 +314,10 @@ impl ContextBroker {
                     // below changes. Pin it so later overlays and the manifest
                     // still name this item by the id the user acted on.
                     match &mut item.provenance {
+                        Value::Object(map) if map.get("id").is_some_and(Value::is_string) => {}
                         Value::Object(map) => {
-                            map.entry("id")
-                                .or_insert_with(|| Value::String(item_id.clone()));
+                            // A non-string id is ignored by stable_id() too.
+                            map.insert("id".into(), Value::String(item_id.clone()));
                         }
                         other => {
                             let original = std::mem::take(other);
@@ -680,34 +681,45 @@ mod tests {
 
     #[test]
     fn a_corrected_idless_item_keeps_its_pre_correction_id() {
-        let item = ContextItem {
-            source: "vector_memory".into(),
-            content: "user likes rust".into(),
-            estimated_tokens: 5,
-            priority: 5,
-            stable_for_cache: true,
-            authority: Default::default(),
-            provenance: Value::Null,
-        };
-        let original_id = item.stable_id();
-        let broker = ContextBroker::new();
-        broker.register_context_source(Arc::new(MockSource { items: vec![item] }));
-        let mut overlay = ContextOverlay::new(1);
-        overlay.add_correction(&original_id, "user likes go");
+        // No usable string id: stable_id() falls back to the content hash.
+        let provenances = [
+            Value::Null,
+            serde_json::json!({ "kind": "memory" }),
+            serde_json::json!({ "id": 5 }),
+            serde_json::json!({ "id": null }),
+        ];
+        for provenance in provenances {
+            let item = ContextItem {
+                source: "vector_memory".into(),
+                content: "user likes rust".into(),
+                estimated_tokens: 5,
+                priority: 5,
+                stable_for_cache: true,
+                authority: Default::default(),
+                provenance: provenance.clone(),
+            };
+            let original_id = item.stable_id();
+            let broker = ContextBroker::new();
+            broker.register_context_source(Arc::new(MockSource { items: vec![item] }));
+            let mut overlay = ContextOverlay::new(1);
+            overlay.add_correction(&original_id, "user likes go");
 
-        let (packet, _) = broker.build_context_with_overlay(&sample_request(1000), Some(&overlay));
-        assert_eq!(packet.items.len(), 1);
-        assert!(packet.items[0].content.contains("user likes go"));
-        assert_eq!(packet.items[0].stable_id(), original_id);
+            let (packet, _) =
+                broker.build_context_with_overlay(&sample_request(1000), Some(&overlay));
+            assert_eq!(packet.items.len(), 1, "{provenance}");
+            assert!(packet.items[0].content.contains("user likes go"));
+            assert_eq!(packet.items[0].stable_id(), original_id, "{provenance}");
 
-        // The id the manifest reports is the id an overlay can act on.
-        overlay.pin(&original_id, false, true).unwrap();
-        let (pinned, _) = broker.build_context_with_overlay(&sample_request(1000), Some(&overlay));
-        assert!(
-            pinned.items[0].priority > 1_000_000,
-            "{:?}",
-            pinned.items[0]
-        );
+            // The id the manifest reports is the id an overlay can act on.
+            overlay.pin(&original_id, false, true).unwrap();
+            let (pinned, _) =
+                broker.build_context_with_overlay(&sample_request(1000), Some(&overlay));
+            assert!(
+                pinned.items[0].priority > 1_000_000,
+                "{:?}",
+                pinned.items[0]
+            );
+        }
     }
 
     #[test]
