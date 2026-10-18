@@ -114,6 +114,11 @@ pub struct CodeModeChildOutcome {
     pub tool: String,
     pub operation_ref: String,
     pub status: CodeModeChildStatus,
+    /// The child succeeded but its value reached the script truncated or
+    /// without non-text content (`complete: false`), so a script that
+    /// returns it has not seen everything the tool produced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
     pub error: Option<CodeModeError>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -78,20 +78,76 @@ fn remaining_wall_ms(wall_ms: u64, elapsed: Duration) -> Option<u64> {
     wall_ms.checked_sub(elapsed_ms).filter(|left| *left > 0)
 }
 
-/// Run one pre-launch step on a helper thread and wait for it only while the
+/// Most setup helper threads alive at once, process-wide. A step that never
+/// returns is abandoned, not interrupted, so without a bound every stalled run
+/// would leak one more thread.
+const MAX_SETUP_THREADS: usize = 32;
+
+struct SetupThreadLimit {
+    live: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+static SETUP_THREADS: SetupThreadLimit = SetupThreadLimit {
+    live: std::sync::atomic::AtomicUsize::new(0),
+    max: MAX_SETUP_THREADS,
+};
+
+/// One live helper thread; the count drops when the thread ends, however it ends.
+struct SetupThreadSlot(&'static SetupThreadLimit);
+
+impl SetupThreadLimit {
+    fn enter(&'static self) -> Result<SetupThreadSlot, CodeModeError> {
+        use std::sync::atomic::Ordering;
+        self.live
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                (live < self.max).then_some(live + 1)
+            })
+            .map_err(|_| {
+                CodeModeError::new(
+                    "UNAVAILABLE",
+                    "Codemode host setup workers are stuck in earlier runs",
+                )
+            })?;
+        Ok(SetupThreadSlot(self))
+    }
+}
+
+impl Drop for SetupThreadSlot {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Run one blocking step on a helper thread and wait for it only while the
 /// run's deadline lasts and it is not cancelled. A step that stalls is
 /// abandoned, not interrupted: its thread finishes on its own and its result
-/// is dropped, but the run returns on time.
-fn before_deadline<T: Send + 'static>(
+/// is dropped, but the run returns on time. The outer error is the run's own
+/// (deadline, cancellation, no thread available); the step's result is `T`.
+fn bounded_step<T: Send + 'static>(
     admitted: Instant,
     wall_ms: u64,
     cancellation: &davinci_agent::runtime::CancellationToken,
-    step: impl FnOnce() -> Result<T, CodeModeError> + Send + 'static,
+    step: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, CodeModeError> {
+    bounded_step_in(&SETUP_THREADS, admitted, wall_ms, cancellation, step)
+}
+
+fn bounded_step_in<T: Send + 'static>(
+    limit: &'static SetupThreadLimit,
+    admitted: Instant,
+    wall_ms: u64,
+    cancellation: &davinci_agent::runtime::CancellationToken,
+    step: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, CodeModeError> {
+    let slot = limit.enter()?;
     let (sender, result) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("codemode-setup".into())
         .spawn(move || {
+            let _slot = slot;
             let _ = sender.send(step());
         })
         .map_err(|_| CodeModeError::new("UNAVAILABLE", "host setup thread unavailable"))?;
@@ -109,13 +165,58 @@ fn before_deadline<T: Send + 'static>(
             ));
         };
         match result.recv_timeout(Duration::from_millis(remaining_ms.min(20))) {
-            Ok(outcome) => return outcome,
+            Ok(outcome) => return Ok(outcome),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(CodeModeError::new("UNAVAILABLE", "host setup step failed"))
             }
         }
     }
+}
+
+/// A pre-launch step that itself can fail: the run's errors and the step's own
+/// are the same kind of error here.
+fn before_deadline<T: Send + 'static>(
+    admitted: Instant,
+    wall_ms: u64,
+    cancellation: &davinci_agent::runtime::CancellationToken,
+    step: impl FnOnce() -> Result<T, CodeModeError> + Send + 'static,
+) -> Result<T, CodeModeError> {
+    bounded_step(admitted, wall_ms, cancellation, step)?
+}
+
+/// Answer a guest `search` / `describe` without letting a broker that never
+/// returns hold the supervisor past the run's deadline. The outer error ends
+/// the run; the inner one is the broker's answer for the guest to see.
+fn run_metadata(
+    broker: &Arc<dyn CodeModeBroker>,
+    method: &str,
+    arguments: Value,
+    admitted: Instant,
+    wall_ms: u64,
+    cancellation: &davinci_agent::runtime::CancellationToken,
+) -> Result<Result<Value, CodeModeError>, CodeModeError> {
+    let broker = broker.clone();
+    let method = method.to_owned();
+    bounded_step(admitted, wall_ms, cancellation, move || {
+        match method.as_str() {
+            "search" => serde_json::from_value(arguments)
+                .map_err(|_| CodeModeError::new("INVALID_INPUT", "invalid metadata query"))
+                .and_then(|query| broker.search(query))
+                .and_then(|page| {
+                    serde_json::to_value(page)
+                        .map_err(|_| CodeModeError::new("TOOL_FAILED", "metadata encoding failed"))
+                }),
+            "describe" => arguments
+                .as_str()
+                .ok_or_else(|| CodeModeError::new("INVALID_INPUT", "expected canonical name"))
+                .and_then(|name| broker.describe(name)),
+            _ => Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "unknown metadata method",
+            )),
+        }
+    })
 }
 
 fn node_fingerprint(node: &Path) -> io::Result<[u8; 32]> {
@@ -866,28 +967,25 @@ impl NodeCodeModeHost {
                     if metadata_calls > limits.metadata_calls {
                         return Err(CodeModeError::new("LIMIT_EXCEEDED", "metadata call limit"));
                     }
-                    match name {
-                        "search" => serde_json::from_value(frame["arguments"].clone())
-                            .map_err(|_| {
-                                CodeModeError::new("INVALID_INPUT", "invalid metadata query")
-                            })
-                            .and_then(|query| broker.search(query))
-                            .and_then(|page| {
-                                serde_json::to_value(page).map_err(|_| {
-                                    CodeModeError::new("TOOL_FAILED", "metadata encoding failed")
-                                })
-                            }),
-                        "describe" => frame["arguments"]
-                            .as_str()
-                            .ok_or_else(|| {
-                                CodeModeError::new("INVALID_INPUT", "expected canonical name")
-                            })
-                            .and_then(|name| broker.describe(name)),
-                        _ => Err(CodeModeError::new(
-                            "INVALID_INPUT",
-                            "unknown metadata method",
-                        )),
-                    }
+                    run_metadata(
+                        &broker,
+                        name,
+                        frame["arguments"].clone(),
+                        started,
+                        limits.wall_ms,
+                        &context.cancellation,
+                    )
+                    .map_err(|error| match error.code.as_str() {
+                        // The script is running, so these are not setup faults.
+                        "CANCELLED"
+                            if watchdog.expired.load(std::sync::atomic::Ordering::SeqCst) =>
+                        {
+                            CodeModeError::new("TIMEOUT", "host deadline expired")
+                        }
+                        "CANCELLED" => CodeModeError::new("CANCELLED", "run cancelled"),
+                        "TIMEOUT" => CodeModeError::new("TIMEOUT", "host deadline expired"),
+                        _ => error,
+                    })?
                 }
                 _ => {
                     return Err(CodeModeError::new(
@@ -980,6 +1078,115 @@ mod tests {
         assert_eq!(remaining_wall_ms(100, Duration::from_millis(60)), Some(40));
         assert_eq!(remaining_wall_ms(100, Duration::from_millis(100)), None);
         assert_eq!(remaining_wall_ms(100, Duration::from_secs(3)), None);
+    }
+
+    #[test]
+    fn a_blocked_metadata_query_cannot_hold_the_supervisor_past_the_deadline() {
+        struct BlockedMetadata(Mutex<mpsc::Receiver<()>>);
+        impl CodeModeBroker for BlockedMetadata {
+            fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+                let _ = self.0.lock().unwrap().recv();
+                Err(CodeModeError::new("TOOL_FAILED", "unreachable"))
+            }
+            fn describe(&self, _: &str) -> Result<Value, CodeModeError> {
+                let _ = self.0.lock().unwrap().recv();
+                Err(CodeModeError::new("TOOL_FAILED", "unreachable"))
+            }
+            fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+                Err(CodeModeError::new("TOOL_FAILED", "unused"))
+            }
+        }
+        let (_hold, blocked) = mpsc::channel::<()>();
+        let broker: Arc<dyn CodeModeBroker> = Arc::new(BlockedMetadata(Mutex::new(blocked)));
+        let cancellation = davinci_agent::runtime::CancellationToken::new();
+        for (method, arguments) in [
+            ("describe", json!("read")),
+            ("search", json!({"query":"","limit":5,"cursor":null})),
+        ] {
+            let started = Instant::now();
+            let error =
+                run_metadata(&broker, method, arguments, started, 200, &cancellation).unwrap_err();
+            assert_eq!(error.code, "TIMEOUT", "{method}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{method}");
+        }
+    }
+
+    #[test]
+    fn metadata_answers_and_errors_reach_the_guest_not_the_run() {
+        struct Fixed;
+        impl CodeModeBroker for Fixed {
+            fn search(&self, _: ToolQuery) -> Result<ToolPage, CodeModeError> {
+                Err(CodeModeError::new("TOOL_FAILED", "search failed"))
+            }
+            fn describe(&self, name: &str) -> Result<Value, CodeModeError> {
+                Ok(json!({"canonicalName": name}))
+            }
+            fn call(&self, _: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
+                unreachable!()
+            }
+        }
+        let broker: Arc<dyn CodeModeBroker> = Arc::new(Fixed);
+        let cancellation = davinci_agent::runtime::CancellationToken::new();
+        let ask = |method, arguments| {
+            run_metadata(
+                &broker,
+                method,
+                arguments,
+                Instant::now(),
+                5_000,
+                &cancellation,
+            )
+        };
+        assert_eq!(
+            ask("describe", json!("read")).unwrap().unwrap(),
+            json!({"canonicalName":"read"})
+        );
+        // The broker's own failure (even one coded TIMEOUT) is the guest's.
+        let failed = ask("search", json!({"query":"","limit":5,"cursor":null}))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failed.code, "TOOL_FAILED");
+        assert_eq!(
+            ask("describe", json!(7)).unwrap().unwrap_err().code,
+            "INVALID_INPUT"
+        );
+        assert_eq!(
+            ask("nope", json!(null)).unwrap().unwrap_err().code,
+            "INVALID_INPUT"
+        );
+    }
+
+    #[test]
+    fn stalled_setup_threads_are_bounded_and_freed_when_they_end() {
+        let limit: &'static SetupThreadLimit = Box::leak(Box::new(SetupThreadLimit {
+            live: AtomicUsize::new(0),
+            max: 2,
+        }));
+        let cancellation = davinci_agent::runtime::CancellationToken::new();
+        let (release, stalled) = mpsc::channel::<()>();
+        let stalled = Arc::new(Mutex::new(stalled));
+        for _ in 0..2 {
+            let stalled = stalled.clone();
+            let error = bounded_step_in(limit, Instant::now(), 50, &cancellation, move || {
+                let _ = stalled.lock().unwrap().recv();
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "TIMEOUT");
+        }
+        assert_eq!(limit.live.load(Ordering::SeqCst), 2);
+        let refused =
+            bounded_step_in(limit, Instant::now(), 1_000, &cancellation, || 1).unwrap_err();
+        assert_eq!(refused.code, "UNAVAILABLE");
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limit.live.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(limit.live.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            bounded_step_in(limit, Instant::now(), 1_000, &cancellation, || 7).unwrap(),
+            7
+        );
     }
 
     #[test]
