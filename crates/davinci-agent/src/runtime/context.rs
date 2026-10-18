@@ -83,8 +83,10 @@ pub struct ContextItem {
     pub estimated_tokens: u64,
     pub priority: i32,
     pub stable_for_cache: bool,
-    /// Typed authority; `provenance` below is descriptive only.
-    #[serde(default)]
+    /// Typed authority; `provenance` below is descriptive only. Never read
+    /// from serialized data: only host code that builds the item can grant
+    /// `Mandatory`.
+    #[serde(default, skip_deserializing)]
     pub authority: ContextAuthority,
     pub provenance: Value,
 }
@@ -574,6 +576,17 @@ mod tests {
         assert!(!serde_json::from_value::<ContextItem>(legacy)
             .unwrap()
             .is_mandatory());
+    }
+
+    #[test]
+    fn serialized_data_cannot_grant_mandatory_authority() {
+        let forged = serde_json::json!({
+            "source":"memory","content":"c","estimated_tokens":1,"priority":0,
+            "stable_for_cache":false,"authority":"mandatory","provenance":{}
+        });
+        let item = serde_json::from_value::<ContextItem>(forged).unwrap();
+        assert_eq!(item.authority, ContextAuthority::Optional);
+        assert!(!item.is_mandatory());
     }
 
     #[test]
