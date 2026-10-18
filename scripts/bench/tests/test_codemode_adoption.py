@@ -126,6 +126,59 @@ class GraderTests(unittest.TestCase):
         self.assertEqual(t["callers"], ["capacity.rs", "user.rs"])
         self.assertEqual(t["definition"], ["capacity.rs"])
 
+    def test_a_missing_runs_csv_fails_closed_unless_overridden(self):
+        with tempfile.TemporaryDirectory() as out:
+            Path(out, "runs").mkdir()
+            with self.assertRaises(SystemExit) as stopped:
+                adoption.report(Namespace(out=out, repo=REPO))
+            self.assertIn("runs.csv", str(stopped.exception))
+
+    def test_a_crash_never_subtracts_the_answers_facts(self):
+        with tempfile.TemporaryDirectory() as out:
+            prompt = "p6-worker-slots"
+            run = Path(out, "runs", f"on-{prompt}-r0")
+            run.mkdir(parents=True)
+            events = [{"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": "   "}]}]}]
+            Path(run, "out.jsonl").write_text(json.dumps(events[0]), encoding="utf-8")
+            Path(out, "runs.csv").write_text(f"arm,prompt,rep,exit,wall_s\non,{prompt},0,timeout,1\n", encoding="utf-8")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                adoption.report(Namespace(out=out, repo=REPO))
+        facts = re.search(r"facts=(-?\d+)/(\d+)", buffer.getvalue())
+        self.assertGreaterEqual(int(facts.group(1)), 0, buffer.getvalue())
+
+    def test_ground_truth_comes_from_the_recorded_commit(self):
+        def git(cwd, *a):
+            subprocess.run(["git", "-c", "user.email=t@e.c", "-c", "user.name=t", *a], cwd=cwd, check=True, capture_output=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp, "repo")
+            codemode = repo / adoption.CODEMODE_DIR
+            codemode.mkdir(parents=True)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "codemode.md").write_text("# T\n", encoding="utf-8")
+            (repo / "CHANGELOG.md").write_text("## Unreleased\n", encoding="utf-8")
+            (repo / "Cargo.toml").write_text('version = "1.0.0"\n', encoding="utf-8")
+            (codemode / "a.rs").write_text("//! doc\nfn a() {}\n", encoding="utf-8")
+            git(repo, "init", "-q")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "one")
+            first = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+            (codemode / "a.rs").write_text("//! doc\nfn a() {}\nfn b() {}\nfn c() {}\n", encoding="utf-8")
+            git(repo, "commit", "-qam", "two")
+            out = Path(tmp, "out")
+            out.mkdir()
+            Path(out, "commit.txt").write_text(first + "\n", encoding="utf-8")
+            at_run = adoption.ground_truth(out, repo)
+            self.assertEqual(at_run["counts"]["a.rs"], {2})
+            self.assertEqual(adoption.truth(repo)["counts"]["a.rs"], {4}, "the checkout has moved on")
+            Path(out, "commit.txt").write_text("0" * 40 + "\n", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                adoption.ground_truth(out, repo)
+            self.assertEqual(
+                subprocess.run(["git", "worktree", "list"], cwd=repo, capture_output=True, text=True).stdout.count("\n"), 1,
+                "no temporary worktree is left behind")
+
     def test_a_crashed_run_fails_even_with_a_correct_answer(self):
         with tempfile.TemporaryDirectory() as out:
             prompts = list(adoption.PROMPTS)
@@ -141,7 +194,7 @@ class GraderTests(unittest.TestCase):
             Path(out, "runs.csv").write_text(rows, encoding="utf-8")
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                adoption.report(Namespace(out=out, repo=REPO))
+                adoption.report(Namespace(out=out, repo=REPO, allow_unverified_exits=True))
         self.assertIn("process exit timeout", buffer.getvalue())
         self.assertIn("crashed=1", buffer.getvalue())
 
@@ -213,7 +266,7 @@ class GraderTests(unittest.TestCase):
                     write(out, "on", prompt, answers(prompt), calls)
                     write(out, "off", prompt, perfect(prompt), 0)
                 with contextlib.redirect_stdout(io.StringIO()):
-                    return adoption.report(Namespace(out=out, repo=REPO))
+                    return adoption.report(Namespace(out=out, repo=REPO, allow_unverified_exits=True))
 
         self.assertTrue(verdict(perfect, 1))
         self.assertFalse(verdict(perfect, 0), "no adoption must fail")
@@ -234,7 +287,7 @@ class GraderTests(unittest.TestCase):
                 write(out, "off", prompt, perfect(prompt))
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                verdict = adoption.report(Namespace(out=out, repo=REPO))
+                verdict = adoption.report(Namespace(out=out, repo=REPO, allow_unverified_exits=True))
         # 5/6 strict is above the 80% floor but below the 100% baseline.
         self.assertFalse(verdict)
         self.assertIn("baseline strict correct 100%", buffer.getvalue())

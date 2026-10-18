@@ -15,6 +15,7 @@ Codemode-off arm. Partial credit (facts matched) is printed, never gated on. Liv
 """
 import argparse
 import collections
+import contextlib
 import csv
 import json
 import os
@@ -266,18 +267,44 @@ def _run_all(args, out, scratch, rows):
                 print(json.dumps(rows[-1]), flush=True)
 
 
+@contextlib.contextmanager
+def tree_at(repo, sha):
+    """A clean checkout of `sha`, so the facts are those of the tree the runs saw."""
+    scratch = Path(tempfile.mkdtemp(prefix="codemode-truth-"))
+    tree = scratch / "tree"
+    added = subprocess.run(["git", "worktree", "add", "--detach", str(tree), sha], cwd=repo,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if added.returncode != 0:
+        shutil.rmtree(scratch, ignore_errors=True)
+        sys.exit(f"cannot check out recorded commit {sha[:10]} to grade against: {added.stderr.strip()[:200]}")
+    try:
+        yield tree
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(tree)], cwd=repo, capture_output=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def ground_truth(out, repo):
+    """Facts from the commit the runs were made at (HEAD when none is recorded)."""
+    recorded = out / "commit.txt"
+    sha = recorded.read_text(encoding="utf-8").strip() if recorded.exists() else ""
+    if sha and sha != _git(repo, "rev-parse", "HEAD").strip():
+        with tree_at(repo, sha) as tree:
+            return truth(tree)
+    return truth(repo)
+
+
 def report(args):
-    out, t = Path(args.out), truth(args.repo)
+    out = Path(args.out)
+    t = ground_truth(out, args.repo)
     exits = {}
     if (out / "runs.csv").exists():
         with open(out / "runs.csv", newline="", encoding="utf-8") as f:
             exits = {(r["arm"], r["prompt"], r["rep"]): r["exit"] for r in csv.DictReader(f)}
+    elif getattr(args, "allow_unverified_exits", False):
+        print("warning: no runs.csv; process exit codes are UNVERIFIED (--allow-unverified-exits)")
     else:
-        print("warning: no runs.csv, process exit codes were not checked")
-    recorded = out / "commit.txt"
-    head = _git(args.repo, "rev-parse", "HEAD").strip()
-    if recorded.exists() and recorded.read_text(encoding="utf-8").strip() != head:
-        print(f"warning: runs were made at {recorded.read_text(encoding='utf-8').strip()[:10]}, grading against {head[:10]}")
+        sys.exit("no runs.csv: process exit codes cannot be verified. Pass --allow-unverified-exits to grade anyway.")
     arms = collections.defaultdict(
         lambda: {"crashed": 0, "runs": 0, "correct": 0, "facts": 0, "facts_ok": 0, "adopted": 0, "tools": 0, "failures": []})
     for run_dir in sorted((out / "runs").iterdir()):
@@ -286,19 +313,20 @@ def report(args):
         miss, total = grade(prompt, answer, t)
         rep_no = re.search(r"-r(\d+)$", run_dir.name)
         status = exits.get((arm, prompt, rep_no.group(1) if rep_no else ""), "0" if not exits else "missing")
-        if status != "0":
-            # A run that did not exit cleanly is a failure whatever its output says.
-            miss = [f"process exit {status}"] + miss
-            arms[arm]["crashed"] += 1
         a = arms[arm]
+        # A run that did not exit cleanly fails strictly whatever its output says,
+        # but never costs the answer's own facts: those stay a measure of the answer.
+        crashed = status != "0"
+        a["crashed"] += crashed
         a["runs"] += 1
-        a["correct"] += not miss
+        a["correct"] += not miss and not crashed
         a["facts"] += total
         a["facts_ok"] += total - len(miss)
         a["adopted"] += tools.get("codemode", 0) > 0
         a["tools"] += sum(tools.values())
-        if miss:
-            a["failures"].append(f"{run_dir.name}: {'; '.join(miss)[:160]}")
+        if miss or crashed:
+            reasons = ([f"process exit {status}"] if crashed else []) + miss
+            a["failures"].append(f"{run_dir.name}: {'; '.join(reasons)[:160]}")
     for arm, a in sorted(arms.items()):
         print(f"{arm:4} runs={a['runs']} crashed={a['crashed']} strict_correct={a['correct']}/{a['runs']} "
               f"facts={a['facts_ok']}/{a['facts']} using_codemode={a['adopted']}/{a['runs']} tool_calls={a['tools']}")
@@ -342,6 +370,8 @@ def main(argv=None):
     rep = sub.add_parser("report", help="offline grading of a finished run directory")
     rep.add_argument("--out", required=True)
     rep.add_argument("--repo", required=True)
+    rep.add_argument("--allow-unverified-exits", action="store_true",
+                     help="grade a legacy run directory that has no runs.csv")
     args = parser.parse_args(argv)
     if args.command == "run":
         run(args)
