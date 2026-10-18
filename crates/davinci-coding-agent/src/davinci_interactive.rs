@@ -2979,7 +2979,7 @@ impl Question {
                 title: "Trust".into(),
                 name: "TRUST".into(),
                 key: "/trust".into(),
-                note: format!("{path} · takes effect on the next start"),
+                note: format!("{path} · /reload applies skills and prompts; restart for the rest"),
                 items: options
                     .iter()
                     .map(|option| {
@@ -10063,9 +10063,11 @@ fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<St
             };
             let store = crate::trust::ProjectTrustStore::open(&crate::default_agent_dir());
             store.set_many(&option.updates)?;
-            Ok(format!(
-                "saved: {}. it takes effect the next time pi starts.",
-                option.label
+            Ok(crate::trust::describe_saved_choice(
+                &crate::default_agent_dir(),
+                &shell.agent.cwd,
+                &option.label,
+                option.trusted,
             ))
         }
         Question::FirstRun => {

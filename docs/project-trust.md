@@ -63,6 +63,15 @@ code. `davinci install -l` refuses an untrusted project. A graph run in an
 untrusted project gets no `verifyCommands` and no commands inferred from
 `Cargo.toml` or `package.json`.
 
+## Changing a decision in a running session
+
+`/trust` writes the same store. `/reload` re-reads it: project skills, prompts,
+agent profiles and context files load or drop at once, per working directory,
+so nothing from a previous project root or a revoked grant stays. MCP servers,
+hooks, extensions and permission rules are built once at startup; restart
+DaVinci for those. There is no command that moves a running session to another
+project root.
+
 ## What trust does not grant
 
 - **Tool approvals.** A trusted project's settings file may tighten the

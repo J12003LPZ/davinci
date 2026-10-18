@@ -384,6 +384,32 @@ pub fn get_project_trust_options(
     options
 }
 
+/// What a saved trust decision changes in a running session, and what needs a
+/// restart. `/reload` re-reads the store and re-discovers skills, prompts,
+/// agent profiles and context files; MCP servers, hooks, extensions and
+/// permission rules are built once at startup.
+pub fn trust_effect_note(trusted: bool) -> &'static str {
+    if trusted {
+        "/reload loads its skills and prompts now. Restart DaVinci to connect its MCP servers and load its hooks, extensions and permission rules."
+    } else {
+        "/reload drops its skills and prompts now. Restart DaVinci to disconnect its MCP servers and drop its hooks, extensions and permission rules."
+    }
+}
+
+/// The line shown after a `/trust` choice is saved. It reads the store back,
+/// so a choice that did not change this folder's own decision says so (a
+/// broader grant above a saved "Do not trust" leaves the folder denied).
+pub fn describe_saved_choice(agent_dir: &Path, cwd: &Path, label: &str, trusted: bool) -> String {
+    match ProjectTrustStore::open(agent_dir).try_get(cwd) {
+        Err(error) => format!("saved: {label}, but the trust store cannot be read back: {error}"),
+        Ok(Some(false)) if trusted => format!(
+            "saved: {label}. {} keeps its own saved Do not trust; choose Trust on that folder to override it.",
+            canonicalize_trust_path(cwd)
+        ),
+        Ok(_) => format!("saved: {label}. {}", trust_effect_note(trusted)),
+    }
+}
+
 /// Names of the project resources that make `cwd` ask for trust, for the
 /// startup question. Same list as [`has_trust_requiring_project_resources`].
 pub fn trust_requiring_project_resource_names(cwd: &Path) -> Vec<String> {
@@ -901,5 +927,30 @@ mod tests {
             trust_diagnostic(&TrustGateDecision::Preapproved, &project),
             None
         );
+    }
+
+    #[test]
+    fn saved_choice_text_is_truthful_about_reload_and_denials() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let parent = dir.path().join("work");
+        let child = parent.join("repo");
+        fs::create_dir_all(&child).unwrap();
+        let store = ProjectTrustStore::open(&agent);
+        store.set(&child, Some(true)).unwrap();
+        let text = describe_saved_choice(&agent, &child, "Trust", true);
+        assert!(text.contains("/reload"), "{text}");
+        assert!(text.contains("Restart DaVinci"), "{text}");
+        assert!(!text.contains("next start"), "{text}");
+        // A parent grant over a saved denial does not change the folder.
+        store.set(&child, Some(false)).unwrap();
+        store.set(&parent, Some(true)).unwrap();
+        let text = describe_saved_choice(&agent, &child, "Trust parent folder", true);
+        assert!(text.contains("keeps its own saved Do not trust"), "{text}");
+        let text = describe_saved_choice(&agent, &child, "Do not trust", false);
+        assert!(text.contains("drops its skills"), "{text}");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json"), "{ nope").unwrap();
+        assert!(describe_saved_choice(&agent, &child, "Trust", true).contains("cannot be read"));
     }
 }

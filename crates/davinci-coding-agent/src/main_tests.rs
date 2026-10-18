@@ -3607,6 +3607,85 @@ fn extension_reload_does_not_load_untrusted_project_skills() {
 }
 
 #[test]
+fn project_switch_and_reload_recheck_trust() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _davinci_agent_dir =
+        EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let project = |name: &str| {
+        let root = dir.path().join(name);
+        let skill = root
+            .join(".pi")
+            .join("skills")
+            .join(format!("{name}-skill"));
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---
+name: {name}-skill
+description: x
+---
+# x
+"
+            ),
+        )
+        .unwrap();
+        root
+    };
+    let (a, b) = (project("alpha"), project("beta"));
+    let store = ProjectTrustStore::open(&agent_dir);
+    let parsed = Args::default();
+    let skills = |agent: &Agent| -> Vec<String> {
+        let mut names: Vec<String> = agent
+            .skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+        names.retain(|name| name.ends_with("-skill"));
+        names.sort();
+        names
+    };
+    let mut agent = Agent::new("x");
+
+    // No decision: neither project's skills load.
+    agent.cwd = a.clone();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+
+    // A grant is read live on reload, with no restart.
+    store.set(&a, Some(true)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert_eq!(skills(&agent), ["alpha-skill"]);
+
+    // Switching to another root applies that root's decision and keeps nothing
+    // of the previous one.
+    agent.cwd = b.clone();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+    store.set(&b, Some(true)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert_eq!(skills(&agent), ["beta-skill"]);
+
+    // A revoked grant drops the skills on the next reload.
+    store.set(&b, Some(false)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+
+    // An explicit child denial beats a trusted parent on reload.
+    store.set(dir.path(), Some(true)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+    agent.cwd = a.clone();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert_eq!(skills(&agent), ["alpha-skill"]);
+}
+
+#[test]
 fn suspend_dry_run_sets_status() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()

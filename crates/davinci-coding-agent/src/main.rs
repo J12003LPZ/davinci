@@ -10719,8 +10719,9 @@ fn apply_trust_decision(
         .collect();
     store.set_many(&mapped)?;
     session.chrome.status = format!(
-        "Saved trust decision: {}. Restart pi for this to take effect.",
-        if trusted { "trusted" } else { "untrusted" }
+        "Saved trust decision: {}. {}",
+        if trusted { "trusted" } else { "untrusted" },
+        trust::trust_effect_note(trusted)
     );
     println!("{}", session.chrome.status);
     Ok(())
@@ -10735,7 +10736,7 @@ fn apply_project_trust_warning(session: &mut InteractiveSession, parsed: &Args, 
     }
     session.chrome.transcript.push(
         "warning",
-        "This project is not trusted. Project .pi resources and packages are ignored. Use /trust to save a trust decision, then restart pi.",
+        "This project is not trusted. Project .pi resources and packages are ignored. Use /trust to save a trust decision, then /reload or restart pi.",
     );
 }
 

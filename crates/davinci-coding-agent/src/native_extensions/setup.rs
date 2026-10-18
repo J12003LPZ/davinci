@@ -760,7 +760,7 @@ pub fn trust_project(agent_dir: &Path, cwd: &Path) -> Step {
             StepState::Done,
             format!("trusted {}", crate::trust::display_path(cwd)),
         )
-        .with_action("restart davinci to load the project's resources"),
+        .with_action("/reload loads its skills and prompts; restart davinci for MCP servers, hooks and extensions"),
         Err(error) => Step::new(
             "trust",
             "project trust",
