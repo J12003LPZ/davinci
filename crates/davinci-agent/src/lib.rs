@@ -2046,7 +2046,7 @@ impl Agent {
         } else {
             self.begin_completion_prompt(text);
         }
-        let message = self.prompt_with_origin(text, images, true, correction);
+        let message = self.prompt_with_origin(text, images, true, correction, None);
         if let (Some(runtime), Some(budget)) = (&self.runtime, &self.root_budget) {
             let admitted = budget.snapshot().is_ok_and(|snapshot| {
                 !snapshot.halted
@@ -2070,7 +2070,14 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
-        self.prompt_with_origin(text, images, false, false)
+        self.prompt_with_origin(text, images, false, false, None)
+    }
+
+    /// A user-role prompt the harness wrote (agent mailbox text, validator
+    /// repair prompts). It is marked at creation, so the Context VM never
+    /// treats it as a user goal or mandatory entry.
+    pub fn prompt_internal(&mut self, text: &str, origin: InternalPromptOrigin) -> ChatMessage {
+        self.prompt_with_origin(text, &[], false, false, Some(origin))
     }
 
     fn prompt_with_origin(
@@ -2079,6 +2086,7 @@ impl Agent {
         images: &[davinci_ai::MessageContent],
         real_user_origin: bool,
         correction: bool,
+        internal: Option<InternalPromptOrigin>,
     ) -> ChatMessage {
         self.flush_pending_bash_messages();
         // A job that finished while the user was typing is in context
@@ -2107,6 +2115,12 @@ impl Agent {
             content,
             ..ChatMessage::default()
         };
+        if let Some(origin) = internal {
+            message.extra.insert(
+                INTERNAL_PROMPT_FIELD.into(),
+                Value::String(origin.as_str().into()),
+            );
+        }
         if real_user_origin {
             message.extra.insert(
                 "davinciRequirementCorrection".into(),
@@ -4975,6 +4989,29 @@ impl From<AssistantMessage> for CompleteOutput {
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
 pub(crate) const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+
+/// `extra` field on a user-role prompt the harness wrote (see
+/// [`Agent::prompt_internal`]); its value is [`InternalPromptOrigin::as_str`].
+/// A dedicated field, not `customType`, so provider conversion is unchanged.
+pub(crate) const INTERNAL_PROMPT_FIELD: &str = "davinciInternalPrompt";
+
+/// What an internal prompt is, which decides how the Context VM files it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalPromptOrigin {
+    /// Text from another agent or a background source: evidence, not a goal.
+    ToolEvidence,
+    /// The harness's own words, such as validator diagnostics.
+    AgentInference,
+}
+
+impl InternalPromptOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolEvidence => "tool_evidence",
+            Self::AgentInference => "agent_inference",
+        }
+    }
+}
 
 /// User authority comes from the selected WAL branch, not the compacted
 /// provider projection. Summaries, tool output and abandoned branches cannot

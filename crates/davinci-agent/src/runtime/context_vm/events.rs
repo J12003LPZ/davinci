@@ -184,6 +184,9 @@ pub(crate) enum InternalUserMessage {
     Reminder,
     /// Any other `customType`.
     Custom(String),
+    /// A prompt the harness created and marked at creation
+    /// (`INTERNAL_PROMPT_FIELD`): mailbox text, validator repair prompts.
+    Marked(ProvenanceKind),
 }
 
 impl InternalUserMessage {
@@ -191,6 +194,7 @@ impl InternalUserMessage {
         match self {
             Self::JobNotice => ProvenanceKind::ToolEvidence,
             Self::Reminder | Self::Custom(_) => ProvenanceKind::AgentInference,
+            Self::Marked(kind) => *kind,
         }
     }
 }
@@ -212,6 +216,17 @@ pub(crate) fn internal_user_message(message: &ChatMessage) -> Option<InternalUse
             .contains_key(crate::completion::COMPLETION_REMINDER_FIELD)
     {
         return Some(InternalUserMessage::Reminder);
+    }
+    match message
+        .extra
+        .get(crate::INTERNAL_PROMPT_FIELD)
+        .and_then(Value::as_str)
+    {
+        Some("tool_evidence") => {
+            return Some(InternalUserMessage::Marked(ProvenanceKind::ToolEvidence))
+        }
+        Some(_) => return Some(InternalUserMessage::Marked(ProvenanceKind::AgentInference)),
+        None => {}
     }
     match message.extra.get("customType").and_then(Value::as_str) {
         Some(crate::JOB_NOTICE_TYPE) => Some(InternalUserMessage::JobNotice),

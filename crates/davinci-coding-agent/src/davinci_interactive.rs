@@ -5187,7 +5187,9 @@ pub fn run(
                 shell.model.transcript.push(Entry::Gap);
                 shell.model.transcript.push(Entry::agent("davinci"));
                 shell.model.running = true;
-                shell.agent.prompt_with(&text, &[]);
+                shell
+                    .agent
+                    .prompt_internal(&text, davinci_agent::InternalPromptOrigin::ToolEvidence);
                 match run_turns(&mut shell) {
                     Next::Go => {}
                     Next::Leave => break Ok(0),

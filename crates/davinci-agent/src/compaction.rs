@@ -977,6 +977,12 @@ fn user_role_label(message: &ChatMessage) -> String {
         Some(crate::runtime::context_vm::InternalUserMessage::Custom(kind)) => {
             format!("Harness context ({kind})")
         }
+        Some(crate::runtime::context_vm::InternalUserMessage::Marked(kind)) => match kind {
+            crate::runtime::context_manifest::ProvenanceKind::ToolEvidence => {
+                "Agent or mailbox message".into()
+            }
+            _ => "Harness prompt".into(),
+        },
         None => "User".into(),
     }
 }
@@ -1307,8 +1313,19 @@ mod tests {
             .insert(crate::COMPLETION_REMINDER_FIELD.into(), true.into());
         let mut custom = ChatMessage::text("custom", "extension said hi");
         custom.extra.insert("customType".into(), "ext-note".into());
+        let mut mailbox = ChatMessage::text("user", "teammate says: done");
+        mailbox
+            .extra
+            .insert(crate::INTERNAL_PROMPT_FIELD.into(), "tool_evidence".into());
+        let mut repair = ChatMessage::text("user", "schema errors");
+        repair.extra.insert(
+            crate::INTERNAL_PROMPT_FIELD.into(),
+            "agent_inference".into(),
+        );
         let messages = [
             ChatMessage::text("user", "Please fix the parser."),
+            mailbox,
+            repair,
             job,
             reminder,
             completion,
@@ -1329,6 +1346,11 @@ mod tests {
             out.contains("[Harness context (ext-note)]: extension said hi"),
             "{out}"
         );
+        assert!(
+            out.contains("[Agent or mailbox message]: teammate says: done"),
+            "{out}"
+        );
+        assert!(out.contains("[Harness prompt]: schema errors"), "{out}");
         assert_eq!(out.matches("[User]:").count(), 1, "{out}");
         // The summarizer-only label never reaches the provider conversion.
         assert!(convert_to_llm(&messages)

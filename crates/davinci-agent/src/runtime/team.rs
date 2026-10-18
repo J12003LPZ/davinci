@@ -607,9 +607,20 @@ mod tests {
             .send_steer(lead.agent_id, generation, "focus on auth".into(), false)
             .unwrap();
         assert_eq!(
-            lead.take_labeled_messages(10),
-            vec!["focus on auth".to_string()]
+            lead.take_labeled_deliveries(10),
+            vec![("focus on auth".to_string(), false)]
         );
+        lead.mailbox
+            .send(AgentMessage::new(
+                lead.run_id,
+                worker,
+                lead.agent_id,
+                "again",
+            ))
+            .unwrap();
+        let deliveries = lead.take_labeled_deliveries(10);
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].1, "a registered sender is an agent");
     }
     fn team_pair() -> (crate::runtime::RuntimeHandle, crate::runtime::RuntimeHandle) {
         use crate::runtime::{RuntimeBus, RuntimeHandle};

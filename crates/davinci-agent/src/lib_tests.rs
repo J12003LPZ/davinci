@@ -707,6 +707,41 @@ fn real_user_routing_history_survives_resume_without_mailbox_contamination() {
 }
 
 #[test]
+fn internal_prompts_are_never_goals_or_mandatory() {
+    use crate::runtime::context_manifest::ProvenanceKind;
+    use crate::runtime::context_vm::ContextEventKind;
+    let mut agent = Agent::new("base");
+    agent.prompt_user_with("Fix the parser.", &[]);
+    agent.prompt_internal("teammate says: done", InternalPromptOrigin::ToolEvidence);
+    agent.prompt_internal("schema errors: /a", InternalPromptOrigin::AgentInference);
+    agent.prompt_with("host steering", &[]);
+    let events = agent.context_vm_events_for_test();
+    let find = |needle: &str| {
+        events
+            .iter()
+            .find(|event| event.visible_text.contains(needle))
+            .unwrap_or_else(|| panic!("{needle}: {events:#?}"))
+    };
+    assert_eq!(find("Fix the parser").kind, ContextEventKind::User);
+    let mailbox = find("teammate says");
+    assert_eq!(mailbox.kind, ContextEventKind::Custom);
+    assert_eq!(mailbox.provenance_kind, ProvenanceKind::ToolEvidence);
+    let repair = find("schema errors");
+    assert_eq!(repair.kind, ContextEventKind::Custom);
+    assert_eq!(repair.provenance_kind, ProvenanceKind::AgentInference);
+    // Unmarked host steering keeps its meaning: a person's words.
+    assert_eq!(find("host steering").kind, ContextEventKind::User);
+    // The marker is an extra field: the provider still sees plain user text.
+    let provider = agent.messages_for_provider();
+    assert!(
+        provider
+            .iter()
+            .any(|m| m.role == "user"
+                && davinci_ai::content_text(&m.content) == "teammate says: done")
+    );
+}
+
+#[test]
 fn prompt_session_explicit_legacy_pin_preserved_on_resume() {
     let dir = tempfile::tempdir().unwrap();
     let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();

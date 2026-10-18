@@ -4334,7 +4334,10 @@ fn enforce_output_schema(
     };
     let json_mode = parsed.mode == Some(Mode::Json);
     // Validator diagnostics are harness output, not a new user instruction.
-    agent.prompt_with(&repair_prompt(&errors), &[]);
+    agent.prompt_internal(
+        &repair_prompt(&errors),
+        davinci_agent::InternalPromptOrigin::AgentInference,
+    );
     agent.stats.output_schema_repair_turns += 1;
     let ((reply, events), required) =
         with_print_approval_policy(agent, configuration_path, denials, |agent| {
