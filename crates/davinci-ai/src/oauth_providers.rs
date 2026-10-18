@@ -205,7 +205,7 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
                 provider: provider.into(),
                 url: url.to_string(),
                 token_url: CODEX_BACKEND_TOKEN_URL.into(),
-                instructions: "Complete login in your browser, or paste the authorization code / redirect URL here. This signs in with the Codex CLI client to use the ChatGPT Codex backend.".into(),
+                instructions: "Complete login in your browser, or paste the complete redirect URL here. This signs in with the Codex CLI client to use the ChatGPT Codex backend.".into(),
                 pkce: Some(pkce.clone()),
                 state: Some(state.to_string()),
             })
@@ -605,6 +605,9 @@ mod tests {
         assert!(request
             .url
             .contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+        // A bare code carries no state, which a pasted login must have.
+        assert!(request.instructions.contains("redirect URL"));
+        assert!(!request.instructions.contains("authorization code"));
         assert!(token_exchange_request("openai-codex", "code", Some(&pkce), None).is_some());
         assert!(token_refresh_request("openai-codex", "refresh").is_some());
         // The separate backend login name is gone: one OAuth login, one API-key provider.

@@ -12867,7 +12867,13 @@ fn start_login(
         davinci_ai::save_pending_login(&default_agent_dir(), provider, &request)?;
         if let Some(dialog) = &mut session.chrome.login_dialog {
             dialog.show_auth(&request.url, Some(request.instructions.as_str()));
-            dialog.show_manual_input("Paste the redirect URL or authorization code");
+            // The state in a redirect URL is what ties a paste to this login, so
+            // openai-codex takes the complete URL only; a bare code would carry none.
+            dialog.show_manual_input(if provider == "openai-codex" {
+                "Paste the complete redirect URL"
+            } else {
+                "Paste the redirect URL or authorization code"
+            });
         }
         println!("{}", request.url);
         println!("{}", request.instructions);
