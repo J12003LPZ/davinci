@@ -4212,10 +4212,8 @@ pub fn perform(
             model.corpus_total = model.corpus.len();
 
             // The `6b` workshop sheet: what loaded, what failed, what it costs.
-            let context_tokens: usize = agent
-                .context_files
+            let context_tokens: u64 = davinci_agent::context_file_charges(&agent.context_files)
                 .iter()
-                .map(|file| file.body.len() / 4)
                 .sum();
             let reload = vec![
                 (

@@ -82,7 +82,8 @@ impl Agent {
         let memory_files: Vec<ContextUsageItem> = self
             .context_files
             .iter()
-            .map(|file| ContextUsageItem {
+            .zip(crate::context::context_file_charges(&self.context_files))
+            .map(|(file, tokens)| ContextUsageItem {
                 name: file
                     .path
                     .strip_prefix(&self.cwd)
@@ -90,7 +91,7 @@ impl Agent {
                     .filter(|path| !path.as_os_str().is_empty())
                     .map(|path| path.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
-                tokens: tokens_of(file.body.len()),
+                tokens,
             })
             .collect();
         let memory_total: u64 = memory_files.iter().map(|item| item.tokens).sum();
@@ -190,6 +191,32 @@ mod tests {
             usage.free(),
             200_000 - usage.used() - usage.autocompact_buffer
         );
+    }
+
+    /// Two instruction files with one body go to the provider once. `/context`
+    /// charged both, so the memory total beat the system prompt, the whole
+    /// breakdown was dropped, and the system prompt read as the full figure.
+    #[test]
+    fn duplicate_instruction_bodies_are_charged_once() {
+        let body = "Run make test before committing.".repeat(20);
+        let mut agent = Agent::new("You are a coding agent.");
+        agent.context_window = 200_000;
+        agent.cwd = std::env::temp_dir();
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            agent.context_files.push(crate::ContextFile {
+                path: agent.cwd.join(name),
+                name: name.into(),
+                body: body.clone(),
+            });
+        }
+        let usage = agent.context_usage();
+        assert_eq!(usage.memory_files.len(), 2, "both files stay listed");
+        assert_eq!(usage.memory_files[0].tokens, tokens_of(body.len()));
+        assert_eq!(usage.memory_files[1].tokens, 0, "the duplicate is free");
+        assert_eq!(usage.memory_tokens(), tokens_of(body.len()));
+        assert_eq!(usage.used(), agent.estimated_context_tokens());
+        // What is left for the prompt itself is its framing, far below one body.
+        assert!(usage.system_prompt > 0 && usage.system_prompt < tokens_of(body.len()));
     }
 
     #[test]

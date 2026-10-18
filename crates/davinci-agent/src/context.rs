@@ -107,6 +107,23 @@ pub(crate) fn append_repository_context(prompt: &mut String, files: &[ContextFil
     prompt.push_str("</project_context>");
 }
 
+/// Tokens each file adds to the request, in file order. The prompt sends one
+/// copy of identical bodies (see `append_repository_context`), so a repeat
+/// costs nothing; `/context` and the `/reload` sheet must not charge it.
+pub fn context_file_charges(files: &[ContextFile]) -> Vec<u64> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    files
+        .iter()
+        .map(|file| {
+            if seen.insert(file.body.as_str()) {
+                (file.body.len() as u64).div_ceil(4)
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RootContextAccount {
     entries: Vec<RootContextEntry>,
@@ -328,6 +345,21 @@ pub fn load_context_files_for_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_instruction_bodies_are_charged_once() {
+        let file = |name: &str, body: &str| ContextFile {
+            path: PathBuf::from(name),
+            name: name.into(),
+            body: body.into(),
+        };
+        let files = [
+            file("AGENTS.md", "twelve chars"),
+            file("CLAUDE.md", "twelve chars"),
+            file("src/AGENTS.md", "other"),
+        ];
+        assert_eq!(context_file_charges(&files), [3, 0, 2]);
+    }
 
     #[test]
     fn duplicate_root_context_content_is_included_once() {
