@@ -102,7 +102,13 @@ pub fn redact_credentials(text: &str) -> String {
     let text = userinfo.replace_all(&text, "${1}[REDACTED]@");
     let text = keyed.replace_all(&text, |caps: &regex::Captures| {
         let whole = caps.get(0).expect("whole match");
-        if is_source_reference(&text[..whole.start()], &text[whole.end()..], &caps[5]) {
+        if is_source_reference(
+            &text[..whole.start()],
+            &text[whole.end()..],
+            &caps[2],
+            &caps[4],
+            &caps[5],
+        ) {
             caps[0].to_string()
         } else if is_credential_value(&caps[2], &caps[5]) {
             format!(
@@ -125,21 +131,55 @@ pub fn redact_credentials(text: &str) -> String {
     bare.replace_all(&text, "[REDACTED]").into_owned()
 }
 
-/// A value that is code referring to something else, not a credential:
-/// (a) the match sits in a source assignment (a `let`/`const`/`var`/`static`
-/// binding on the same line, or a field whose value is followed by `;` or
-/// `,`), and (b) the value is a path or member expression (`self.password`,
-/// `config::SECRET`) or contains the credential word itself (`other_secret`,
-/// `old_password`). Env, shell and config forms never qualify. In doubt, the
-/// value is redacted.
-fn is_source_reference(before: &str, after: &str, value: &str) -> bool {
-    let line = before.rsplit('\n').next().unwrap_or("");
-    let binding = line
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|word| matches!(word, "let" | "const" | "var" | "static"));
-    let terminated = after.trim_start().starts_with([';', ',']);
-    let in_source = (binding || terminated) && !line.trim_start().starts_with("export ");
-    if !in_source {
+/// A value that is code referring to something else, not a credential. Only
+/// when all of these hold:
+/// - the key is not ALL_CAPS (that is an environment variable);
+/// - the value has no digit and is a path or member expression (`self.password`,
+///   `config::SECRET`) or names the credential word itself (`other_secret`);
+/// - the line is not a `key=value;key=value` connection string;
+/// - the match is a source assignment: a statement that BEGINS with
+///   `let/const/var/static` (optionally `pub`), or a whole line of the form
+///   `ident: value[,;]`.
+/// Env, shell, YAML and flag forms never qualify. In doubt, redact.
+fn is_source_reference(before: &str, after: &str, key: &str, sep: &str, value: &str) -> bool {
+    if key.chars().any(|c| c.is_ascii_uppercase()) && !key.chars().any(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    if value.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let before_line = before.rsplit('\n').next().unwrap_or("");
+    let after_line = after.split('\n').next().unwrap_or("");
+    let line = format!("{before_line}{key}{sep}{value}{after_line}");
+    let pairs = line
+        .split(';')
+        .filter(|part| {
+            let part = part.trim();
+            part.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '-'))
+            })
+        })
+        .count();
+    if pairs >= 2 {
+        return false;
+    }
+    let head = before_line.trim_start();
+    let head = head
+        .strip_prefix("pub ")
+        .or_else(|| head.strip_prefix("pub(crate) "))
+        .unwrap_or(head);
+    let binding = ["let", "const", "var", "static"].iter().any(|keyword| {
+        head.strip_prefix(keyword)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace()))
+    });
+    let tail = after_line.trim();
+    let field = before_line.trim().is_empty()
+        && sep.contains(':')
+        && (tail.is_empty() || tail == "," || tail == ";");
+    if !(binding || field) {
         return false;
     }
     let is_expression = value
@@ -728,7 +768,8 @@ end"
             "const SECRET: &str = crate::keys::SECRET;",
             "let secret = settings::SECRET_VALUE;",
             "static PASSWORD_FILE: &str = config.password_file;",
-            "Config { password: self.password, token: old_token, }",
+            "    password: config.password,",
+            "    token: old_token,",
             "var apiKey = old_api_key;",
         ] {
             assert_eq!(redact_credentials(input), input);
