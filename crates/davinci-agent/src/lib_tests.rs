@@ -3016,6 +3016,70 @@ fn resumed_session_keeps_unverified_mutation() {
 }
 
 #[test]
+fn sessions_saved_with_the_old_visible_set_still_restore_discovered_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let probe = verifying_agent(dir.path());
+    let initial = probe
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .visible_names()
+        .clone();
+    let deferred = probe
+        .tools
+        .iter()
+        .find(|name| !initial.contains(*name))
+        .cloned()
+        .expect("a tool that starts deferred");
+    drop(probe);
+    // The earlier format stored the whole visible set: host-initial tools
+    // plus anything discovered, and whatever else had been visible.
+    let mut visible: Vec<String> = initial.iter().cloned().collect();
+    visible.push(deferred.clone());
+    visible.push("tool_that_no_longer_exists".into());
+    let mut session = JsonlSession::create(sessions.path(), "old-exposure", None).unwrap();
+    let mut extra = serde_json::Map::new();
+    extra.insert("data".into(), serde_json::json!({ "visible": visible }));
+    session
+        .append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some("tool_exposure".into()),
+            extra,
+        })
+        .unwrap();
+    let path = session.path.clone();
+    drop(session);
+
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    let exposure = resumed.tool_context.tool_exposure.lock().unwrap();
+    assert!(
+        exposure.is_visible(&deferred),
+        "the discovered tool returns"
+    );
+    assert!(
+        !exposure.is_visible("tool_that_no_longer_exists"),
+        "authorization is re-checked, never trusted from the file"
+    );
+    assert!(exposure.discovered_names().contains(&deferred));
+    assert!(
+        !initial
+            .iter()
+            .any(|name| exposure.discovered_names().contains(name)),
+        "host-initial tools are not counted as discovered"
+    );
+}
+
+#[test]
 fn unreadable_mutation_state_fails_closed_on_resume() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = tempfile::tempdir().unwrap();

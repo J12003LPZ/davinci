@@ -1323,7 +1323,7 @@ impl Agent {
     /// active and authorized in this process. A saved name can narrow nothing
     /// and widen nothing: it is a hint, never authority.
     fn restore_tool_exposure(&mut self) {
-        let saved: Vec<String> = self
+        let (saved, legacy_visible): (Vec<String>, bool) = self
             .session
             .as_ref()
             .and_then(|session| {
@@ -1334,20 +1334,25 @@ impl Agent {
                         entry.entry_type == "custom"
                             && entry.custom_type.as_deref() == Some(TOOL_EXPOSURE_ENTRY_TYPE)
                     })
-                    .and_then(|entry| {
-                        entry
-                            .extra
-                            .get("data")?
-                            .get("discovered")?
-                            .as_array()
-                            .cloned()
+                    .map(|entry| {
+                        // Sessions saved before the discovered-only format
+                        // stored the whole visible set under `visible`.
+                        let data = entry.extra.get("data");
+                        let names = |key: &str| -> Option<Vec<String>> {
+                            Some(
+                                data?
+                                    .get(key)?
+                                    .as_array()?
+                                    .iter()
+                                    .filter_map(|name| name.as_str().map(str::to_string))
+                                    .collect(),
+                            )
+                        };
+                        match names("discovered") {
+                            Some(discovered) => (discovered, false),
+                            None => (names("visible").unwrap_or_default(), true),
+                        }
                     })
-            })
-            .map(|names| {
-                names
-                    .iter()
-                    .filter_map(|name| name.as_str().map(str::to_string))
-                    .collect()
             })
             .unwrap_or_default();
         self.sync_tool_authorization();
@@ -1366,6 +1371,10 @@ impl Agent {
         // apply what the branch saved.
         exposure.reset_discovered();
         for name in saved {
+            // In the legacy format, names visible by default are not discoveries.
+            if legacy_visible && exposure.is_visible(&name) {
+                continue;
+            }
             if self.tools.contains(&name) && authorized.contains(&name) {
                 exposure.activate_authorized(&name, true);
             }
