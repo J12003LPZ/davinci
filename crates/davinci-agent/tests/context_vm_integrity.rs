@@ -1144,3 +1144,100 @@ mod byte_recovery {
         assert_eq!((end.content.as_str(), end.next_byte_offset), ("", None));
     }
 }
+
+fn goal_values(state: &davinci_agent::runtime::context_vm::CheckpointState) -> Vec<&str> {
+    state.goals.iter().map(|goal| goal.value.as_str()).collect()
+}
+
+#[test]
+fn later_user_correction_supersedes_earlier_goal() {
+    let events = vec![
+        event(
+            "user:1",
+            1,
+            ContextEventKind::User,
+            "Use Redis for the cache.",
+        ),
+        event(
+            "user:2",
+            2,
+            ContextEventKind::User,
+            "Correction: use SQLite for the cache.",
+        ),
+    ];
+    let parent = ContextStateReducer::deterministic_delta(&Default::default(), &events[..1])
+        .checkpoint_patch;
+    assert!(goal_values(&parent)
+        .iter()
+        .any(|goal| goal.contains("Redis")));
+    let proposal = CheckpointProposal {
+        transitions: vec![StateTransition {
+            slot: StateSlot::Goal,
+            kind: TransitionKind::Supersede,
+            previous: "Use Redis for the cache.".into(),
+            evidence: user_value("latest user correction", "user:2"),
+            replacement: Some(user_value(
+                "Correction: use SQLite for the cache.",
+                "user:2",
+            )),
+        }],
+        ..CheckpointProposal::default()
+    };
+    let state = ContextStateReducer::validate_proposal(&parent, &events, proposal);
+    let goals = goal_values(&state);
+    assert!(
+        !goals.iter().any(|goal| goal.contains("Redis")),
+        "{goals:?}"
+    );
+    assert!(
+        goals.iter().any(|goal| goal.contains("SQLite")),
+        "{goals:?}"
+    );
+    assert_eq!(state.retired.len(), 1);
+    assert!(state.retired[0].previous.value.contains("Redis"));
+}
+
+#[test]
+fn assistant_speculation_cannot_supersede_a_user_goal() {
+    let events = vec![
+        event(
+            "user:1",
+            1,
+            ContextEventKind::User,
+            "Use Redis for the cache.",
+        ),
+        event(
+            "assistant:2",
+            2,
+            ContextEventKind::Assistant,
+            "Switching the cache to SQLite is probably better.",
+        ),
+    ];
+    let parent = ContextStateReducer::deterministic_delta(&Default::default(), &events[..1])
+        .checkpoint_patch;
+    let assistant_value = |value: &str| ProposedStateValue {
+        value: value.into(),
+        source_refs: vec!["assistant:2".into()],
+        provenance_kind: ProvenanceKind::AgentInference,
+    };
+    let proposal = CheckpointProposal {
+        transitions: vec![StateTransition {
+            slot: StateSlot::Goal,
+            kind: TransitionKind::Supersede,
+            previous: "Use Redis for the cache.".into(),
+            evidence: assistant_value("Switching the cache to SQLite"),
+            replacement: Some(assistant_value(
+                "Switching the cache to SQLite is probably better.",
+            )),
+        }],
+        ..CheckpointProposal::default()
+    };
+    let state = ContextStateReducer::validate_proposal(&parent, &events, proposal);
+    let goals = goal_values(&state);
+    assert!(goals.iter().any(|goal| goal.contains("Redis")), "{goals:?}");
+    assert!(
+        !goals.iter().any(|goal| goal.contains("SQLite")),
+        "{goals:?}"
+    );
+    assert!(state.retired.is_empty());
+}
