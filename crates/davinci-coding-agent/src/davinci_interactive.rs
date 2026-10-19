@@ -9901,6 +9901,24 @@ fn ask_design_setup(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
         shell.note(&format!("/design: {}", setup::HOME_WORKSPACE));
         return Some(Next::Go);
     }
+    // Installed and switched on, yet unusable: name the cause and the one fix,
+    // instead of letting the run fail on a bare runtime error.
+    if setup::needs_runtime(&command) && setup::setup_needed(&command).is_none() {
+        use davinci_coding_agent::design::health::{assess, HealthProbe, HealthState};
+        let health = assess(&HealthProbe::from_environment(&shell.agent.cwd, false));
+        if matches!(health.state, HealthState::Missing | HealthState::Invalid) {
+            let why = health
+                .diagnostics
+                .first()
+                .map_or_else(|| "not ready".to_string(), |first| first.message.clone());
+            let fix = health
+                .fix_action
+                .map(|fix| format!(": {}", fix.describe()))
+                .unwrap_or_default();
+            shell.note(&format!("/design: {why}{fix}"));
+            return Some(Next::Go);
+        }
+    }
     let needed = setup::setup_needed(&command)?;
     // A generation the route would refuse anyway (offline, an API key, a
     // non-subscription model) fails now, not after a few-minute install.

@@ -17,6 +17,7 @@ pub mod generation;
 pub mod handoff;
 pub mod handoff_draft;
 pub mod handoff_verification;
+pub mod health;
 pub mod host;
 pub mod intent;
 pub mod interaction;
