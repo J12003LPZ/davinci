@@ -3161,6 +3161,7 @@ pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
         };
     let mut computed = crate::calculate_usage(model, input, output, cache_read, cache_write);
     computed.cache_write_unreported = crate::stream_decoder::cache_write_unreported(usage);
+    crate::stream_decoder::mark_unreported_counts(usage, &mut computed);
     if let Some(total) = get("total_tokens").or_else(|| get("totalTokens")) {
         computed.total_tokens = total;
     }

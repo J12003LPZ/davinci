@@ -721,6 +721,9 @@ fn combine_usage(first: &Usage, second: &Usage) -> Usage {
         cache_read: first.cache_read + second.cache_read,
         cache_write: first.cache_write + second.cache_write,
         cache_write_unreported: first.cache_write_unreported || second.cache_write_unreported,
+        input_unreported: first.input_unreported || second.input_unreported,
+        output_unreported: first.output_unreported || second.output_unreported,
+        cache_read_unreported: first.cache_read_unreported || second.cache_read_unreported,
         reasoning: match (first.reasoning, second.reasoning) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),

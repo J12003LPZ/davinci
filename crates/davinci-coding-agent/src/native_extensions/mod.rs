@@ -981,6 +981,8 @@ impl NativeExtensionHost {
                         "cacheWriteStatus":write_status,
                         "cacheWriteReportedRequests":stats.provider.cache_write_reported_requests,
                         "cacheWriteUnreportedRequests":writes_unreported,
+                        "cacheReadUnreportedRequests":stats.provider.cache_read_unreported_requests,
+                        "inputUnreportedRequests":stats.provider.input_unreported_requests,
                         "rawInputTokens":raw_input,
                         "cacheReadRatio":if raw_input > 0 {
                             Value::from(stats.provider.cache_read_tokens as f64 / raw_input as f64)

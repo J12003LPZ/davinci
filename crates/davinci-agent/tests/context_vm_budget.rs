@@ -28,6 +28,35 @@ fn provider_budget_includes_every_reservation_before_selection() {
 }
 
 #[test]
+fn small_window_preserves_output_reserve() {
+    // The positive side of the budget: a small window that does fit keeps its
+    // output reserve whole, and the working set is what is left after every
+    // reservation, never more.
+    let mut agent = Agent::new("system");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.context_window = 8_192;
+    agent.set_provider_context_overhead_tokens(Some(512));
+    agent.set_provider_output_limit(Some(1_024));
+    agent.messages.push(ChatMessage::text("user", "hello"));
+    let budget = agent.provider_context_budget();
+    assert_eq!(budget.output_reserve, 1_024, "{budget:?}");
+    assert_eq!(budget.working_set_budget(), 8_192 - budget.reserved());
+    assert!(
+        budget.working_set_budget() > 0 && budget.working_set_budget() < 8_192 - 1024,
+        "{budget:?}"
+    );
+    assert!(agent.context_vm_image().is_ok());
+    // A window that cannot hold the reserve is refused, not shrunk into it.
+    agent.context_window = budget.reserved();
+    assert!(agent.context_vm_image().is_err());
+}
+
+#[test]
 fn first_paging_reserves_the_new_retrieval_schema_before_admission() {
     use davinci_agent::runtime::context_vm::{ContextVmConfig, ContextVmRuntime};
 
