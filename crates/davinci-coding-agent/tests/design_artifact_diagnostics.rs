@@ -42,21 +42,32 @@ fn an_apostrophe_inside_prose_is_not_a_quote() {
 }
 
 #[test]
-fn a_brief_may_start_with_a_subcommand_word() {
+fn a_brief_may_start_with_a_subcommand_word_through_new_or_double_dash() {
     for (line, brief) in [
         (
-            "/design open a cafe landing page",
+            "/design new \"open a cafe landing page\"",
             "open a cafe landing page",
         ),
-        ("/design list of tasks app", "list of tasks app"),
-        ("/design revise the hero section", "revise the hero section"),
+        ("/design -- list of tasks app", "list of tasks app"),
         (
-            "/design status board for my team",
+            "/design new revise the hero section",
+            "revise the hero section",
+        ),
+        (
+            "/design new status board for my team",
             "status board for my team",
         ),
-        ("/design export settings page", "export settings page"),
+        ("/design -- export settings page", "export settings page"),
     ] {
         assert_eq!(create(line).brief, brief, "{line}");
+    }
+    // Without `new`, a reserved word is a verb, and a bad argument is an error.
+    for line in [
+        "/design open a cafe landing page",
+        "/design list of tasks app",
+        "/design status board for my team",
+    ] {
+        assert!(parse_design_command(line).is_err(), "{line}");
     }
     // A subcommand with its real arguments is still a subcommand.
     let id = "2f6f2c2e-52c0-4d3a-8a4e-5b2f3c9a1d10";
@@ -312,11 +323,12 @@ fn resume_is_a_command_and_finds_the_run_by_its_checkpoint() {
         other => panic!("resume expected, got {other:?}"),
     }
     assert!(parse_design_command(&format!("/design resume {}", request.artifact_id)).is_err());
-    // A brief that merely starts with the word is still a brief.
+    // A brief that starts with the word needs `new`; bare it is a usage error.
     assert_eq!(
-        create("/design resume page for a nurse").brief,
+        create("/design new resume page for a nurse").brief,
         "resume page for a nurse"
     );
+    assert!(parse_design_command("/design resume page for a nurse").is_err());
 
     let mut m = model(vec![concepts(), source("design_create"), review()]);
     m.calls = 3;
@@ -369,9 +381,10 @@ fn select_is_a_command_and_none_clears_it() {
     assert!(parse_design_command(&format!("/design select {artifact}")).is_err());
     assert!(parse_design_command(&format!("/design select {artifact} not-a-variant")).is_err());
     assert_eq!(
-        create("/design select a color palette for a florist").brief,
+        create("/design new select a color palette for a florist").brief,
         "select a color palette for a florist"
     );
+    assert!(parse_design_command("/design select a color palette for a florist").is_err());
 }
 
 #[test]

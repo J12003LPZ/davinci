@@ -134,9 +134,10 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
     {
         tokens.remove(0);
     }
-    let Some(command) = tokens.first().map(String::as_str) else {
+    let Some(command) = tokens.first().cloned() else {
         return Ok(DesignCommand::List {});
     };
+    let command = command.as_str();
     if command == "--" {
         return create(&tokens[1..], BTreeMap::new());
     }
@@ -147,13 +148,21 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
     if !reserved.contains(&command) {
         return create(&tokens, BTreeMap::new());
     }
-    // A brief may start with a word that is also a subcommand ("open a cafe
-    // landing page", "list of tasks app"). The word is a verb only when what
-    // follows fits it: `new` always (the legacy form), `list` bare, `sync`
-    // with a path, the rest with an artifact id. Bare `open`, `status`, ...
-    // stay usage errors; anything else is the brief.
+    // A reserved word is always a verb. When what follows does not fit it
+    // (no argument, an empty one, a mistyped id) that is a usage error, never
+    // a brief: a typo must not start a paid generation. A brief that begins
+    // with one of these words goes after `new` or `--`.
+    // Ids may be typed in capitals; a brief's own words are never changed.
+    let id_tokens = if matches!(command, "resume" | "select") {
+        2
+    } else {
+        1
+    };
+    for token in tokens.iter_mut().skip(1).take(id_tokens) {
+        *token = normalize_id(token);
+    }
     let rest = &tokens[1..];
-    let is_verb = match command {
+    let fits = match command {
         "new" => true,
         "list" => rest.is_empty(),
         "sync" => rest.len() == 1 && !rest[0].starts_with("--"),
@@ -161,13 +170,8 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
             .first()
             .is_some_and(|first| first.parse::<ArtifactId>().is_ok()),
     };
-    if !is_verb {
-        if rest.is_empty() && command != "list" {
-            return Err(DesignError::InvalidInput(
-                "invalid command arguments".into(),
-            ));
-        }
-        return create(&tokens, BTreeMap::new());
+    if !fits {
+        return Err(DesignError::InvalidInput(usage(command)));
     }
     let mut positional = Vec::new();
     let mut flags = BTreeMap::new();
@@ -310,6 +314,38 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         }
     })
 }
+/// A UUID typed in capitals is the same id; everything else is left alone.
+fn normalize_id(token: &str) -> String {
+    let uuid_shaped =
+        token.len() == 36 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-');
+    if uuid_shaped {
+        token.to_ascii_lowercase()
+    } else {
+        token.to_string()
+    }
+}
+
+fn usage(command: &str) -> String {
+    let line = match command {
+        "list" => "/design list",
+        "sync" => "/design sync <relative-path>",
+        "open" => "/design open <artifact-id>",
+        "status" => "/design status <artifact-id>",
+        "verify" => "/design verify <artifact-id>",
+        "revise" => "/design revise <artifact-id> <what to change>",
+        "resume" => "/design resume <artifact-id> <checkpoint-id>",
+        "select" => "/design select <artifact-id> <concept-id|none>",
+        "fork" => "/design fork <artifact-id> --revision <n>",
+        "restore" => "/design restore <artifact-id> --revision <n>",
+        "apply" => "/design apply <artifact-id> --revision <n>",
+        "export" => "/design export <artifact-id> --revision <n> --destination <new-absolute-directory> [--format source|png|html] [--artboard <id>] [--viewport WxH]",
+        _ => "/design new \"<brief>\"",
+    };
+    format!(
+        "usage: {line} (the id is the UUID from /design list; to start a brief that begins with \"{command}\", write /design new \"{command} ...\")"
+    )
+}
+
 fn create(words: &[String], flags: BTreeMap<&str, &str>) -> DesignResult<DesignCommand> {
     if words.iter().any(|s| s.starts_with("--")) {
         return Err(DesignError::InvalidInput(
