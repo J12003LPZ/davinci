@@ -4387,24 +4387,40 @@ fn failed_command_retains_exit_status_and_relevant_output() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = verifying_agent(dir.path());
     agent.prompt("run the failing command");
+    let mut script = scripted_tool_calls(vec![(
+        shell_tool(),
+        serde_json::json!({"command":"python -c \"import sys; print('widget 7 is missing'); sys.exit(3)\""}),
+    )]);
+    // What the provider is actually sent on each request.
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = requests.clone();
     agent
-        .run_loop(scripted_tool_calls(vec![(
-            shell_tool(),
-            serde_json::json!({"command":"python -c \"import sys; print('widget 7 is missing'); sys.exit(3)\""}),
-        )]))
+        .run_loop(move |current| {
+            let wire = current
+                .messages_for_provider()
+                .iter()
+                .filter(|message| message.role == "toolResult")
+                .map(|message| content_text(&message.content))
+                .collect::<Vec<_>>()
+                .join(
+                    "
+---
+",
+                );
+            seen.lock().unwrap().push(wire);
+            script(current)
+        })
         .unwrap();
+    let requests = requests.lock().unwrap();
+    let last = requests.last().expect("a request followed the tool result");
+    // The output that matters and the exit status both reach the model.
+    assert!(last.contains("widget 7 is missing"), "{last}");
     let result = agent
         .messages
         .iter()
         .find(|message| message.role == "toolResult")
-        .expect("the command's result reaches the next model turn");
-    let text = content_text(&result.content);
-    assert!(text.contains("widget 7 is missing"), "{text}");
-    // The failure is carried structurally (flag and exit status in details).
-    // The provider wires send only the text (`davinci-ai` never reads
-    // `is_error`), so the exit status does not reach the model; changing the
-    // tool text is a product decision recorded in the audit register.
-    assert_eq!(result.is_error, Some(true), "{text}");
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
     let exit_code = result
         .extra
         .get("details")
@@ -4412,6 +4428,11 @@ fn failed_command_retains_exit_status_and_relevant_output() {
         .and_then(serde_json::Value::as_i64)
         .expect("the exit status stays in the tool result details");
     assert_ne!(exit_code, 0);
+    assert!(
+        last.trim_end()
+            .ends_with(&format!("Command exited with code {exit_code}")),
+        "{last}"
+    );
 }
 
 #[test]

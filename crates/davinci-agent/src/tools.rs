@@ -2467,11 +2467,25 @@ fn shell_tool(
         }
         content.push_str(&String::from_utf8_lossy(&output.stderr));
     }
+    append_exit_status(&mut content, &output.status);
     Ok(ToolResult {
         content,
         is_error: !output.status.success() || pipe_truncated,
         details: Some(serde_json::json!({"exitCode": output.status.code()})),
     })
+}
+
+/// A failed command's exit status is part of what the model needs to see: the
+/// provider wires send only the result text. A successful command's text is
+/// left exactly as the command wrote it.
+fn append_exit_status(content: &mut String, status: &std::process::ExitStatus) {
+    let Some(code) = status.code().filter(|code| *code != 0) else {
+        return;
+    };
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&format!("Command exited with code {code}"));
 }
 
 const MAX_SHELL_STREAM_BYTES: usize = 16 * 1024 * 1024;
@@ -2785,6 +2799,7 @@ fn powershell_tool(
                 }
                 content.push_str(&String::from_utf8_lossy(&output.stderr));
             }
+            append_exit_status(&mut content, &output.status);
             return Ok(ToolResult {
                 content,
                 is_error: !output.status.success(),
@@ -2869,6 +2884,7 @@ fn powershell_tool(
             }
             content.push_str(&String::from_utf8_lossy(&output.stderr));
         }
+        append_exit_status(&mut content, &output.status);
         return Ok(ToolResult {
             content,
             is_error: !output.status.success() || pipe_truncated,
