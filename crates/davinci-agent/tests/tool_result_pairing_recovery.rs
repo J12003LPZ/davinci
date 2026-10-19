@@ -321,3 +321,43 @@ fn compacted_history_retains_matching_ids() {
     resumed.prompt("continue");
     resumed.run_loop(|_| Ok(done())).unwrap();
 }
+
+/// R3: `compact` and `fold_context` are synchronous `&mut self`, and every host
+/// calls them on the agent's own thread (the TUI parks its input loop while a
+/// scoped worker compacts), so a stale summary cannot land over a newer turn.
+/// What remains observable is that a failed or empty summarizer changes nothing.
+#[test]
+fn failed_or_empty_fold_leaves_active_state_unchanged() {
+    for response in [
+        Err("summarizer unavailable".to_string()),
+        Ok(SummarizeResponse {
+            text: String::new(),
+            usage: Default::default(),
+            stop_reason: Some(StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        }),
+    ] {
+        let fixture = Fixture::new(&[]);
+        let mut agent = fixture.agent();
+        agent.compaction.keep_recent_tokens = 1;
+        let canned = response.clone();
+        agent.summarizer = Some(Summarizer::new(move |_| canned.clone()));
+        for round in 0..4 {
+            for message in [
+                ChatMessage::text("user", format!("task {round} {}", "x ".repeat(300))),
+                call_message(&format!("call_{round}"), "read"),
+                result_message(&format!("call_{round}"), "read", &"y ".repeat(300)),
+            ] {
+                agent.messages.push(message.clone());
+                append(agent.session.as_mut().unwrap(), &message);
+            }
+        }
+        let before = serde_json::to_value(&agent.messages).unwrap();
+        let entries_before = agent.session.as_ref().unwrap().entries.len();
+        let result = agent.compact(None);
+        assert!(!result.compacted, "{result:?}");
+        assert_eq!(serde_json::to_value(&agent.messages).unwrap(), before);
+        assert_eq!(agent.session.as_ref().unwrap().entries.len(), entries_before);
+    }
+}

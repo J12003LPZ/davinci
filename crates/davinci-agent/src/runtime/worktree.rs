@@ -39,6 +39,11 @@ pub struct WorktreeLease {
     pub created_at_ms: i64,
     #[serde(default)]
     pub repo_root: Option<PathBuf>,
+    /// Distinguishes two leases of the same run and agent, which share a
+    /// deterministic path. Assigned by the manager; a release must present the
+    /// lease the manager recorded, not a stale copy of an earlier one.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
@@ -51,6 +56,8 @@ pub enum WorktreeError {
     PathAlreadyExists(PathBuf),
     #[error("lease not found: {0}")]
     LeaseNotFound(PathBuf),
+    #[error("lease is stale: a newer lease owns {0}")]
+    StaleLease(PathBuf),
     #[error("worktree has uncommitted or unmerged changes: {path}")]
     DirtyWorktreePreserved { path: PathBuf },
     #[error("git command failed: {0}")]
@@ -140,6 +147,7 @@ pub struct WorktreeManager {
     leases: Arc<RwLock<HashMap<PathBuf, WorktreeLease>>>,
     bus: Option<RuntimeBus>,
     seq: Arc<AtomicU64>,
+    generations: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for WorktreeManager {
@@ -159,6 +167,7 @@ impl WorktreeManager {
             leases: Arc::new(RwLock::new(HashMap::new())),
             bus: None,
             seq: Arc::new(AtomicU64::new(0)),
+            generations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -253,6 +262,7 @@ impl WorktreeManager {
             base_head,
             created_at_ms: now_ms(),
             repo_root: Some(self.repo_root.clone()),
+            generation: self.generations.fetch_add(1, Ordering::SeqCst) + 1,
         };
 
         // 5. Record active lease
@@ -325,6 +335,15 @@ impl WorktreeManager {
     /// Release an existing worktree lease.
     /// If dirty and `force` is false, preserves the worktree directory and returns `DirtyWorktreePreserved`.
     pub fn release_lease(&self, lease: &WorktreeLease, force: bool) -> Result<(), WorktreeError> {
+        // The manager's record is the authority, not the caller's struct: a
+        // newer lease on the same path must survive a stale holder's release,
+        // even a forced one.
+        if self
+            .get_lease(&lease.path)
+            .is_some_and(|recorded| recorded != *lease)
+        {
+            return Err(WorktreeError::StaleLease(lease.path.clone()));
+        }
         // Unreadable state preserves the worktree unless the caller forces.
         let dirty = match self.check_dirty(lease) {
             Ok(dirty) => dirty,
