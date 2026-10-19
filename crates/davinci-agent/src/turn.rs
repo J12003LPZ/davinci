@@ -389,7 +389,7 @@ impl Agent {
                 || message
                     .tool_call_id
                     .as_ref()
-                    .map_or(true, |id| seen.insert(id.clone()))
+                    .is_none_or(|id| seen.insert(id.clone()))
         });
     }
 
