@@ -12,6 +12,7 @@ pub mod git_intelligence;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
+pub mod memory_backends;
 pub mod memory_page;
 pub mod package_intelligence;
 pub mod repo_intelligence;

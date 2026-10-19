@@ -109,9 +109,12 @@ fn setup_profile_defaults_precedence_and_roundtrip() {
     // on, Qdrant off, nothing switched off.
     let effective = load_effective_setup(agent.path(), &no_env);
     assert_eq!(effective.profile_state, ProfileState::Missing);
-    assert_eq!(effective.profile.memory.backend, "local");
+    assert_eq!(
+        effective.profile.memory.backend,
+        davinci_coding_agent::native_extensions::memory_backends::MemoryProjectionBackend::Local
+    );
     assert!(effective.profile.memory.autostart && effective.profile.memory.safe_repair);
-    assert!(!effective.profile.memory.qdrant);
+    assert_eq!(effective.profile.memory.qdrant_setup, Default::default());
     assert!(effective.memory.enabled && effective.governor.enabled);
     assert_eq!(effective.memory.config.embedding_model, "embeddinggemma");
     assert_eq!(effective.memory.config.embedding_dimensions, 768);

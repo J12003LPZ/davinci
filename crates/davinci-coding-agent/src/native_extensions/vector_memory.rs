@@ -4,6 +4,7 @@
 //! lexical fallback and network failures are deliberately fail-open so memory
 //! cannot make an otherwise healthy agent turn fail.
 
+use super::memory_backends::{MemoryProjectionBackend, ProjectionConfig, Secret};
 use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
 use davinci_agent::runtime::events::AgentKind;
 use davinci_agent::{ToolError, ToolResult};
@@ -87,6 +88,9 @@ pub struct VectorMemoryConfig {
     pub extraction_timeout_seconds: u64,
     #[serde(default = "default_true")]
     pub promotion: bool,
+    /// The optional remote projection. `Local` unless chosen.
+    #[serde(default)]
+    pub projection: ProjectionConfig,
 }
 
 fn default_true() -> bool {
@@ -155,11 +159,19 @@ impl Default for VectorMemoryConfig {
             embed_timeout_seconds: default_embed_timeout(),
             extraction_timeout_seconds: default_extraction_timeout(),
             promotion: true,
+            projection: ProjectionConfig::default(),
         }
     }
 }
 
 impl VectorMemoryConfig {
+    /// True when the environment pins the backend, whichever way.
+    pub fn env_sets_backend(get: &dyn Fn(&str) -> Option<String>) -> bool {
+        env_string(get, "PI_MEMORY_BACKEND")
+            .and_then(|word| MemoryProjectionBackend::parse(&word))
+            .is_some()
+    }
+
     pub fn from_env() -> Self {
         let mut config = Self::default();
         config.apply_env_with(&process_env);
@@ -226,6 +238,9 @@ impl VectorMemoryConfig {
         ("PI_MEMORY_MAX_INJECTED_TOKENS", "maxInjectedTokens"),
         ("PI_MEMORY_MINIMUM_SCORE", "minimumScore"),
         ("PI_MEMORY_PROMOTION", "promotion"),
+        ("PI_MEMORY_BACKEND", "projection.backend"),
+        ("PI_MEMORY_QDRANT_API_KEY", "projection.apiKey"),
+        ("PI_MEMORY_QDRANT_ALLOW_REMOTE", "projection.allowRemote"),
     ];
 
     fn apply_env_with(&mut self, get: &dyn Fn(&str) -> Option<String>) {
@@ -274,6 +289,17 @@ impl VectorMemoryConfig {
         }
         if let Some(value) = env_bool(get, "PI_MEMORY_PROMOTION") {
             config.promotion = value;
+        }
+        if let Some(value) = env_string(get, "PI_MEMORY_BACKEND")
+            .and_then(|word| MemoryProjectionBackend::parse(&word))
+        {
+            config.projection.backend = value;
+        }
+        if let Some(value) = env_string(get, "PI_MEMORY_QDRANT_API_KEY").and_then(Secret::new) {
+            config.projection.api_key = Some(value);
+        }
+        if let Some(value) = env_bool(get, "PI_MEMORY_QDRANT_ALLOW_REMOTE") {
+            config.projection.allow_remote = value;
         }
     }
 }
@@ -2526,11 +2552,12 @@ impl VectorMemory {
         Ok(self.status())
     }
 
-    /// The selected Phase 3 projection is deliberately local. Remote write
-    /// amplification stays disabled until a filtered remote retrieval path
-    /// demonstrates the documented quality/latency break-even.
+    /// The single switch for every remote call. `Local` (the default) means
+    /// no Qdrant request is made anywhere; the bounded local index answers.
+    /// Why it stays the default until a measured break-even:
+    /// `docs/superpowers/plans/2026-09-15-memory-projection-decision.md`.
     pub fn remote_projection_enabled(&self) -> bool {
-        false
+        self.config.projection.backend == MemoryProjectionBackend::Qdrant
     }
 
     fn current_embedding_identity(&self) -> EmbeddingIdentity {
@@ -2779,6 +2806,7 @@ impl VectorMemory {
             "denseAvailable": self.dense_available(),
             "projectionProfile": MEMORY_PROJECTION_PROFILE,
             "remoteProjectionEnabled": self.remote_projection_enabled(),
+            "projectionBackend": self.config.projection.backend.name(),
             "projectionLag": self.local_projection_lag(),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
@@ -2818,7 +2846,7 @@ impl VectorMemory {
     /// Best-effort Qdrant upsert. Local persistence remains authoritative when
     /// the service is unavailable.
     pub fn upsert_remote(&self, records: &[MemoryRecord]) -> Result<(), ToolError> {
-        if records.is_empty() {
+        if !self.remote_projection_enabled() || records.is_empty() {
             return Ok(());
         }
         let points = records
