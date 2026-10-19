@@ -27,7 +27,6 @@ fn shared_command_grammar() {
         "/design new x --bad y",
         "/design new x --variants 4",
         "/design new x --variants 1 --variants 2",
-        "/design list extra",
         "/design new 'unterminated",
     ] {
         assert!(parse_design_command(invalid).is_err(), "{invalid}");

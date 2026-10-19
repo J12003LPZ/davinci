@@ -56,6 +56,9 @@ pub enum ExportFormat {
     Png,
     Html,
 }
+/// Split a command line into words. A quote opens a quoted section only at
+/// the start of a word and closes it only at the end of one, so an apostrophe
+/// inside prose ("Julien's team", 5" screen) is an ordinary character.
 fn words(input: &str) -> DesignResult<Vec<String>> {
     let mut result = Vec::new();
     let mut word = String::new();
@@ -73,8 +76,10 @@ fn words(input: &str) -> DesignResult<Vec<String>> {
             continue;
         }
         match (quote, ch) {
-            (Some(q), c) if q == c => quote = None,
-            (None, '\'' | '"') => {
+            (Some(q), c) if q == c && chars.peek().is_none_or(|next| next.is_whitespace()) => {
+                quote = None
+            }
+            (None, '\'' | '"') if !present => {
                 quote = Some(ch);
                 present = true;
             }
@@ -130,6 +135,28 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         "sync",
     ];
     if !reserved.contains(&command) {
+        return create(&tokens, BTreeMap::new());
+    }
+    // A brief may start with a word that is also a subcommand ("open a cafe
+    // landing page", "list of tasks app"). The word is a verb only when what
+    // follows fits it: `new` always (the legacy form), `list` bare, `sync`
+    // with a path, the rest with an artifact id. Bare `open`, `status`, ...
+    // stay usage errors; anything else is the brief.
+    let rest = &tokens[1..];
+    let is_verb = match command {
+        "new" => true,
+        "list" => rest.is_empty(),
+        "sync" => rest.len() == 1 && !rest[0].starts_with("--"),
+        _ => rest
+            .first()
+            .is_some_and(|first| first.parse::<ArtifactId>().is_ok()),
+    };
+    if !is_verb {
+        if rest.is_empty() && command != "list" {
+            return Err(DesignError::InvalidInput(
+                "invalid command arguments".into(),
+            ));
+        }
         return create(&tokens, BTreeMap::new());
     }
     let mut positional = Vec::new();
@@ -265,33 +292,40 @@ fn create(words: &[String], flags: BTreeMap<&str, &str>) -> DesignResult<DesignC
     }
     let brief = words.join(" ");
     validate_text(&brief, 64 * 1024, "brief")?;
-    let kind = match flags.get("--kind").copied().unwrap_or("landing") {
-        "landing" => DesignKind::Landing,
-        "product" => DesignKind::Product,
-        "document" => DesignKind::Document,
-        _ => {
-            return Err(DesignError::InvalidInput(
+    let explicit_kind = flags
+        .get("--kind")
+        .map(|kind| match *kind {
+            "landing" => Ok(DesignKind::Landing),
+            "product" => Ok(DesignKind::Product),
+            "document" => Ok(DesignKind::Document),
+            _ => Err(DesignError::InvalidInput(
                 "kind must be landing, product, or document".into(),
-            ))
-        }
+            )),
+        })
+        .transpose()?;
+    let variants: u32 = match flags.get("--variants") {
+        Some(value) => value
+            .parse()
+            .map_err(|_| DesignError::InvalidInput("invalid variant count".into()))?,
+        None => super::intent::DEFAULT_VARIANTS,
     };
-    let variants: u32 = flags
-        .get("--variants")
-        .copied()
-        .unwrap_or("2")
-        .parse()
-        .map_err(|_| DesignError::InvalidInput("invalid variant count".into()))?;
     if !(1..=3).contains(&variants) {
         return Err(DesignError::InvalidInput("variants must be 1..3".into()));
     }
-    let title = brief.chars().take(80).collect();
+    let resolved = super::intent::DesignIntent {
+        brief,
+        explicit_kind,
+        variants,
+    }
+    .resolve();
+    let title = resolved.brief.chars().take(80).collect();
     Ok(DesignCommand::Create {
         input: CreateDesign {
             title,
-            brief,
-            kind,
+            brief: resolved.brief,
+            kind: resolved.kind,
             operation_id: OperationId::new(),
-            variants,
+            variants: resolved.variants,
         },
     })
 }

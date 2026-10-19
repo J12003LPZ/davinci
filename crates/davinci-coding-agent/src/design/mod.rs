@@ -18,6 +18,7 @@ pub mod handoff;
 pub mod handoff_draft;
 pub mod handoff_verification;
 pub mod host;
+pub mod intent;
 pub mod interaction;
 mod inventory;
 pub mod model;
