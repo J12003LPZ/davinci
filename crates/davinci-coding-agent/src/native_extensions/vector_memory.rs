@@ -1356,6 +1356,118 @@ pub struct VectorMemory {
 /// not UTF-8 or no access). The file is left exactly as it is.
 pub const LOCAL_STORE_UNREADABLE: &str = "LOCAL_STORE_UNREADABLE";
 
+/// A repair batch between planning and applying. It owns copies, so the
+/// network call that fills it in needs no lock on the memory.
+#[derive(Debug)]
+pub struct RepairPlan {
+    receipt: RepairReceipt,
+    config: VectorMemoryConfig,
+    pending: Vec<(String, String)>,
+    finished: bool,
+}
+
+impl RepairPlan {
+    /// Ask the embedding service. A first test vector separates a wrong vector
+    /// size (`EMBEDDING_MISMATCH`) and an unreachable service from a real
+    /// batch, so a blocked repair changes nothing.
+    pub fn embed(&self) -> Result<Vec<Vec<f32>>, (&'static str, String)> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        let blocked = |error: ToolError| {
+            let message = error.to_string();
+            let code = if message.contains("EMBEDDING_MISMATCH") {
+                "EMBEDDING_MISMATCH"
+            } else {
+                "PROVIDER_OFFLINE"
+            };
+            (code, message)
+        };
+        embed_with_config(&self.config, &["repair preflight".to_string()], DOC_PREFIX)
+            .map_err(blocked)?;
+        let texts: Vec<String> = self.pending.iter().map(|(_, text)| text.clone()).collect();
+        let vectors = embed_with_config(&self.config, &texts, DOC_PREFIX).map_err(|error| {
+            // A failure after the preflight is reported, not blocked.
+            ("EMBED_FAILED", error.to_string())
+        })?;
+        if vectors.len() != texts.len() {
+            return Err((
+                "EMBED_FAILED",
+                "embedding rebuild response count does not match request".into(),
+            ));
+        }
+        Ok(vectors)
+    }
+}
+
+fn embed_with_config(
+    config: &VectorMemoryConfig,
+    texts: &[String],
+    prefix: &str,
+) -> Result<Vec<Vec<f32>>, ToolError> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let base_url = config.ollama_url.trim_end_matches('/');
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(config.embed_timeout_seconds))
+        .build();
+
+    // Ollama's current endpoint accepts a batch under `input` and returns
+    // `embeddings`.  Try it first, while retaining the older endpoint for
+    // installations that have not yet adopted `/api/embed`.
+    let modern_payload = embedding_request_payload(&config.embedding_model, texts, prefix);
+    let modern_error = match agent
+        .post(&format!("{base_url}/api/embed"))
+        .send_json(modern_payload)
+    {
+        Ok(response) => match response.into_json::<Value>() {
+            Ok(value) => {
+                match parse_embedding_responses(&value, config.embedding_dimensions, texts.len()) {
+                    Ok(embeddings) => return Ok(embeddings),
+                    // The server answered with vectors of another size:
+                    // the older endpoint would say the same, once per text.
+                    Err(error) if error.to_string().contains("EMBEDDING_MISMATCH") => {
+                        return Err(error)
+                    }
+                    Err(error) => error,
+                }
+            }
+            Err(error) => ToolError::Failed(error.to_string()),
+        },
+        // Only a server that does not know `/api/embed` gets the older
+        // per-text endpoint. A host that is down or slow would fail that
+        // one too, once per text, each with the full timeout.
+        Err(ureq::Error::Status(404, _)) => {
+            ToolError::Failed("/api/embed is not served (404)".into())
+        }
+        Err(error) => return Err(ToolError::Failed(error.to_string())),
+    };
+
+    let mut embeddings = Vec::with_capacity(texts.len());
+    for text in texts {
+        let prefixed = format!("{prefix}{text}");
+        let legacy_response = agent
+            .post(&format!("{base_url}/api/embeddings"))
+            .send_json(json!({
+                "model": config.embedding_model,
+                "prompt": prefixed
+            }))
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let legacy_value: Value = legacy_response
+            .into_json()
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let embedding = parse_embedding_response(&legacy_value, config.embedding_dimensions)
+            .map_err(|error| {
+                ToolError::Failed(format!(
+                    "modern embedding request failed ({modern_error}); legacy response invalid ({error})"
+                ))
+            })?;
+        embeddings.push(embedding);
+    }
+    Ok(embeddings)
+}
+
 /// What one [`VectorMemory::repair_projection`] batch did. `records_before`
 /// always equals `records_after`: repair never removes a record.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1517,13 +1629,69 @@ impl VectorMemory {
         ToolError::Failed(message)
     }
 
-    fn persist_local(&self) -> Result<(), ToolError> {
+    /// Write the records. Under a file lock it first folds in what another
+    /// session wrote since this one loaded, so two sessions on one repo never
+    /// drop each other's records.
+    fn persist_local(&mut self) -> Result<(), ToolError> {
+        self.persist_local_with(true)
+    }
+
+    /// Records another session added (or embedded) since the last load. A
+    /// record counts as new when neither its id nor its content key is known
+    /// here. Lines this repo does not own are kept too. Never removes anything.
+    fn merge_from_disk(&mut self, path: &Path) -> Result<(), ToolError> {
+        let content = match fs::read(path).map(String::from_utf8) {
+            Ok(Ok(content)) => content,
+            Ok(Err(_)) => {
+                return Err(self.mark_store_unreadable(path, "the file is not valid UTF-8"))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(self.mark_store_unreadable(path, &error.to_string())),
+        };
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            match serde_json::from_str::<MemoryRecord>(line) {
+                Ok(record) if record.repo_id == self.repo_id || record.repo_id == "*" => {
+                    if let Some(ours) = self.records.iter_mut().find(|item| item.id == record.id) {
+                        if ours.embedding.is_none() && record.embedding.is_some() {
+                            ours.embedding = record.embedding;
+                            ours.embedding_identity = record.embedding_identity;
+                        }
+                        continue;
+                    }
+                    let key = known_key_scoped(
+                        record.kind,
+                        &record.content_hash,
+                        record.agent_profile_name.as_deref(),
+                    );
+                    if self.known.insert(key) {
+                        self.records.push(record);
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    if !self.foreign_lines.iter().any(|ours| ours == line) {
+                        self.foreign_lines.push(line.to_string());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_local_with(&mut self, merge: bool) -> Result<(), ToolError> {
         if let Some(message) = &self.store_error {
             return Err(ToolError::Failed(message.clone()));
         }
         let path = self.local_path();
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))
             .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let _lock = davinci_sys::lock::ExclusiveFileLock::acquire(
+            &davinci_sys::lock::lock_path_for(&path),
+            Duration::from_secs(5),
+        )
+        .map_err(|err| ToolError::Failed(format!("memory store is busy: {err}")))?;
+        if merge {
+            self.merge_from_disk(&path)?;
+        }
 
         let mut records = self.records.iter().collect::<Vec<_>>();
         records.sort_by_key(|record| record.created_at);
@@ -2352,7 +2520,8 @@ impl VectorMemory {
         cleared.known.clear();
         cleared.last_indexed = 0;
         cleared.last_indexed_at = None;
-        cleared.persist_local()?;
+        // Clearing is deliberate: it must not fold other records back in.
+        cleared.persist_local_with(false)?;
         *self = cleared;
         Ok(self.status())
     }
@@ -2455,11 +2624,26 @@ impl VectorMemory {
     /// service stops the repair with nothing changed, instead of dropping the
     /// old vectors and then failing to replace them.
     pub fn repair_projection(&mut self, max_batch: usize) -> RepairReceipt {
+        let plan = self.repair_plan(max_batch);
+        let outcome = plan.embed();
+        self.repair_apply(plan, outcome)
+    }
+
+    /// Step one of a repair, done under the memory lock: reload, fix shared
+    /// ids and pick the batch. No network call happens here.
+    pub fn repair_plan(&mut self, max_batch: usize) -> RepairPlan {
         let mut receipt = RepairReceipt::default();
+        let mut plan = RepairPlan {
+            receipt: RepairReceipt::default(),
+            config: self.config.clone(),
+            pending: Vec::new(),
+            finished: true,
+        };
         if let Err(error) = self.load_local() {
             receipt.blocked = Some(LOCAL_STORE_UNREADABLE);
             receipt.error = Some(error.to_string());
-            return receipt;
+            plan.receipt = receipt;
+            return plan;
         }
         receipt.records_before = self.records.len();
         let repaired_ids = self.repair_duplicate_ids();
@@ -2467,7 +2651,8 @@ impl VectorMemory {
             if let Err(error) = self.persist_local() {
                 receipt.error = Some(error.to_string());
                 receipt.records_after = self.records.len();
-                return receipt;
+                plan.receipt = receipt;
+                return plan;
             }
         }
         receipt.repaired_ids = repaired_ids;
@@ -2475,25 +2660,92 @@ impl VectorMemory {
         receipt.remaining = receipt.stale_before;
         receipt.records_after = self.records.len();
         if receipt.stale_before == 0 || !self.config.enabled {
+            plan.receipt = receipt;
+            return plan;
+        }
+        let current = self.current_embedding_identity();
+        plan.pending = self
+            .records
+            .iter()
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+                    && (record.embedding.is_none()
+                        || !embedding_identity_compatible(
+                            record.embedding_identity.as_ref(),
+                            &current,
+                        ))
+            })
+            .take(max_batch.max(1))
+            .map(|record| (record.id.clone(), record.text.clone()))
+            .collect();
+        plan.finished = false;
+        plan.receipt = receipt;
+        plan
+    }
+
+    /// Step three, under the lock again: store each vector only where the
+    /// record is still the one that was embedded and still lacks a current
+    /// vector. A record another session changed or already embedded is left.
+    pub fn repair_apply(
+        &mut self,
+        plan: RepairPlan,
+        outcome: Result<Vec<Vec<f32>>, (&'static str, String)>,
+    ) -> RepairReceipt {
+        let mut receipt = plan.receipt;
+        if plan.finished {
             return receipt;
         }
-        if let Err(error) = self.embed_documents(&["repair preflight".to_string()]) {
-            let message = error.to_string();
-            receipt.blocked = Some(if message.contains("EMBEDDING_MISMATCH") {
-                "EMBEDDING_MISMATCH"
-            } else {
-                "PROVIDER_OFFLINE"
-            });
-            receipt.error = Some(message);
-            return receipt;
+        let vectors = match outcome {
+            Ok(vectors) => vectors,
+            Err((code, message)) => {
+                if code != "EMBED_FAILED" {
+                    receipt.blocked = Some(code);
+                }
+                receipt.error = Some(message);
+                return receipt;
+            }
+        };
+        let identity = EmbeddingIdentity::from_config(&plan.config);
+        let mut updated = 0usize;
+        for ((id, text), embedding) in plan.pending.into_iter().zip(vectors) {
+            if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
+                let stale = record.embedding.is_none()
+                    || !embedding_identity_compatible(
+                        record.embedding_identity.as_ref(),
+                        &identity,
+                    );
+                if record.text == text && stale {
+                    record.embedding = Some(embedding);
+                    record.embedding_identity = Some(identity.clone());
+                    updated += 1;
+                }
+            }
         }
-        match self.rebuild_local_embeddings(max_batch) {
-            Ok(count) => receipt.reembedded = count,
-            Err(error) => receipt.error = Some(error.to_string()),
+        if updated > 0 {
+            if let Err(error) = self.persist_local() {
+                receipt.error = Some(error.to_string());
+            }
         }
+        receipt.reembedded = updated;
         receipt.remaining = self.local_projection_lag();
         receipt.records_after = self.records.len();
         receipt
+    }
+
+    /// One repair batch for callers that share the memory behind a mutex: the
+    /// lock is held to plan and to apply, never while the embedding server
+    /// answers.
+    pub fn repair_shared(memory: &Mutex<VectorMemory>, max_batch: usize) -> RepairReceipt {
+        let plan = memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .repair_plan(max_batch);
+        let outcome = plan.embed();
+        memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .repair_apply(plan, outcome)
     }
 
     pub fn status(&self) -> Value {
@@ -2560,71 +2812,7 @@ impl VectorMemory {
         texts: &[String],
         prefix: &str,
     ) -> Result<Vec<Vec<f32>>, ToolError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let base_url = self.config.ollama_url.trim_end_matches('/');
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(self.config.embed_timeout_seconds))
-            .build();
-
-        // Ollama's current endpoint accepts a batch under `input` and returns
-        // `embeddings`.  Try it first, while retaining the older endpoint for
-        // installations that have not yet adopted `/api/embed`.
-        let modern_payload = embedding_request_payload(&self.config.embedding_model, texts, prefix);
-        let modern_error = match agent
-            .post(&format!("{base_url}/api/embed"))
-            .send_json(modern_payload)
-        {
-            Ok(response) => match response.into_json::<Value>() {
-                Ok(value) => {
-                    match parse_embedding_responses(
-                        &value,
-                        self.config.embedding_dimensions,
-                        texts.len(),
-                    ) {
-                        Ok(embeddings) => return Ok(embeddings),
-                        // The server answered with vectors of another size:
-                        // the older endpoint would say the same, once per text.
-                        Err(error) if error.to_string().contains("EMBEDDING_MISMATCH") => {
-                            return Err(error)
-                        }
-                        Err(error) => error,
-                    }
-                }
-                Err(error) => ToolError::Failed(error.to_string()),
-            },
-            // Only a server that does not know `/api/embed` gets the older
-            // per-text endpoint. A host that is down or slow would fail that
-            // one too, once per text, each with the full timeout.
-            Err(ureq::Error::Status(404, _)) => {
-                ToolError::Failed("/api/embed is not served (404)".into())
-            }
-            Err(error) => return Err(ToolError::Failed(error.to_string())),
-        };
-
-        let mut embeddings = Vec::with_capacity(texts.len());
-        for text in texts {
-            let prefixed = format!("{prefix}{text}");
-            let legacy_response = agent
-                .post(&format!("{base_url}/api/embeddings"))
-                .send_json(json!({
-                    "model": self.config.embedding_model,
-                    "prompt": prefixed
-                }))
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
-            let legacy_value: Value = legacy_response
-                .into_json()
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
-            let embedding = parse_embedding_response(&legacy_value, self.config.embedding_dimensions)
-                .map_err(|error| {
-                    ToolError::Failed(format!(
-                        "modern embedding request failed ({modern_error}); legacy response invalid ({error})"
-                    ))
-                })?;
-            embeddings.push(embedding);
-        }
-        Ok(embeddings)
+        embed_with_config(&self.config, texts, prefix)
     }
 
     /// Best-effort Qdrant upsert. Local persistence remains authoritative when

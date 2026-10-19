@@ -288,8 +288,36 @@ pub fn switch_step(
     }
 }
 
+/// A profile that cannot be read leaves both features off and asks the user to
+/// fix it; it never falls back to the defaults.
+fn profile_health(
+    effective: &super::setup_profile::EffectiveSetupConfig,
+    component: &'static str,
+) -> Option<ComponentHealth> {
+    use super::setup_profile::{ProfileState, PROFILE_CORRUPT, PROFILE_NEWER};
+    let detail = effective.profile_problem()?;
+    let code = match effective.profile_state {
+        ProfileState::Newer(_) => PROFILE_NEWER,
+        _ => PROFILE_CORRUPT,
+    };
+    Some(
+        ComponentHealth::new(component, HealthState::ActionRequired, detail)
+            .with_code(code)
+            .with_remediation(
+                "Fix or move setup-profile.json (it is not replaced). The feature stays off until then.",
+            ),
+    )
+}
+
 /// The governor's health in the same shape as the memory component's.
-pub fn governor_health(health: &GovernorHealth, effective_enabled: bool) -> ComponentHealth {
+pub fn governor_health(
+    health: &GovernorHealth,
+    effective_enabled: bool,
+    effective: &super::setup_profile::EffectiveSetupConfig,
+) -> ComponentHealth {
+    if let Some(problem) = profile_health(effective, "governor") {
+        return problem;
+    }
     if !effective_enabled || health.state == GovernorState::Disabled {
         return ComponentHealth::new("governor", HealthState::Disabled, "token governor is off");
     }
@@ -329,6 +357,9 @@ pub fn memory_health(
             status["projectionLag"].as_u64().unwrap_or(0) as usize,
         )
     };
+    if let Some(problem) = profile_health(effective, "memory") {
+        return problem;
+    }
     let config_error = match &effective.memory.file {
         ConfigFileState::Corrupt(error) => Some(error.clone()),
         _ => None,
@@ -557,11 +588,11 @@ fn pull_model(url: &str, model: &str) -> Result<(), String> {
 pub fn embed_backlog(memory: &Arc<Mutex<VectorMemory>>) -> usize {
     let mut total = 0;
     for _ in 0..REINDEX_BATCHES {
-        let receipt = {
-            let mut memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-            memory.clear_dense_offline();
-            memory.repair_projection(REINDEX_BATCH_SIZE)
-        };
+        memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_dense_offline();
+        let receipt = VectorMemory::repair_shared(memory, REINDEX_BATCH_SIZE);
         total += receipt.reembedded;
         if receipt.reembedded == 0 || receipt.blocked.is_some() || receipt.error.is_some() {
             break;
@@ -636,6 +667,13 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool, ctx: &SetupCo
             memory.config.embedding_dimensions,
         )
     };
+    // The files on disk decide too: a profile edited since this session began
+    // must not be ignored by the live copy of the settings.
+    let effective = load_effective_setup(ctx.agent_dir, &process_env);
+    if let Some(problem) = profile_health(&effective, "memory") {
+        return step_from_health(ID, TITLE, &problem);
+    }
+    let enabled = enabled && effective.memory.enabled;
     if !enabled {
         return Step::new(ID, TITLE, StepState::Skipped, {
             let effective = load_effective_setup(ctx.agent_dir, &process_env);

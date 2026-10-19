@@ -65,6 +65,10 @@ impl SetupAction {
 /// `ollama` they approved (path and version), so a different binary later is
 /// refused. Returns a line to show.
 pub fn approve_action(action: SetupAction, ctx: &SetupContext) -> Result<String, String> {
+    // A feature that is off gets no standing "yes" recorded for it.
+    if let Some(off) = memory_off_reason(ctx.agent_dir) {
+        return Err(off);
+    }
     let Some(consent) = action.consent() else {
         return Err(format!(
             "{} needs nothing to approve: install Ollama from https://ollama.com/download yourself",
@@ -83,6 +87,17 @@ pub fn approve_action(action: SetupAction, ctx: &SetupContext) -> Result<String,
     Ok(format!("approved {}", action.name()))
 }
 
+/// Why memory is off, in the user's terms; `None` when it is on.
+fn memory_off_reason(agent_dir: &std::path::Path) -> Option<String> {
+    let effective = load_effective_setup(agent_dir, &process_env);
+    (!effective.memory.enabled).then(|| {
+        format!(
+            "memory is off: {}; /setup enable memory turns it on",
+            effective.off_reason(super::setup_profile::Feature::Memory)
+        )
+    })
+}
+
 /// Do one approved action. Without the matching yes on file it returns an
 /// `Action` step saying how to give it, and changes nothing.
 pub fn execute_approved_action(
@@ -92,6 +107,16 @@ pub fn execute_approved_action(
 ) -> Step {
     const ID: &str = "memory";
     const TITLE: &str = "vector memory";
+    let live_off = !memory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .config
+        .enabled;
+    if let Some(off) = memory_off_reason(ctx.agent_dir)
+        .or_else(|| live_off.then(|| "memory is off; /setup enable memory turns it on".to_string()))
+    {
+        return Step::new(ID, TITLE, StepState::Skipped, off);
+    }
     if let Some(consent) = action.consent() {
         if let Err(reason) = ServiceAuthorization::check(ctx.agent_dir, consent) {
             return Step::new(ID, TITLE, StepState::Action, reason)
@@ -150,11 +175,11 @@ pub fn repair_step(memory: &Arc<Mutex<VectorMemory>>) -> Step {
     let mut total = 0;
     let mut last = None;
     for _ in 0..REINDEX_BATCHES {
-        let receipt = {
-            let mut memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-            memory.clear_dense_offline();
-            memory.repair_projection(REINDEX_BATCH_SIZE)
-        };
+        memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_dense_offline();
+        let receipt = VectorMemory::repair_shared(memory, REINDEX_BATCH_SIZE);
         total += receipt.reembedded;
         let stop = receipt.reembedded == 0 || receipt.blocked.is_some() || receipt.error.is_some();
         last = Some(receipt);

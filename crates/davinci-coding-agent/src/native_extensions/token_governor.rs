@@ -1349,7 +1349,12 @@ impl TokenGovernor {
         // Fail open: if the original cannot be stored, the model keeps the
         // whole output rather than a digest it could never expand.
         let reference = match self.store.save(&result.content) {
-            Ok(reference) => reference,
+            Ok(reference) => {
+                // The store works again: Degraded is about now, not history.
+                // The failure count stays as a record of what happened.
+                self.last_store_error = None;
+                reference
+            }
             Err(error) => {
                 self.record_store_failure(&error);
                 return result;
@@ -1991,6 +1996,26 @@ mod tests {
         assert_eq!(health["storeFailures"], 1);
         assert!(health["lastError"].as_str().is_some_and(|e| !e.is_empty()));
         assert_eq!(health["writable"], false);
+    }
+
+    #[test]
+    fn degraded_clears_after_the_next_successful_save() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        let store = OutputStore::new(blocker.join("outputs"));
+        let mut governor = TokenGovernor::with_store("recovers", tiny_thresholds(), store);
+        let big = "line\n".repeat(50);
+        let _ = governor.after_tool("bash", &json!({"n": 1}), ok(&big));
+        assert_eq!(governor.status()["health"]["state"], "Degraded");
+        // The obstacle goes away; the next save works.
+        fs::remove_file(&blocker).unwrap();
+        let shown = governor.after_tool("bash", &json!({"n": 2}), ok(&big));
+        assert!(shown.content.len() < big.len());
+        let health = governor.status()["health"].clone();
+        assert_eq!(health["state"], "Enabled", "{health}");
+        assert_eq!(health["storeFailures"], 1, "the history stays");
+        assert!(health["lastError"].is_null());
     }
 
     #[test]

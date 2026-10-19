@@ -3,11 +3,30 @@
 //! Offline: loopback fakes only, no real `ollama`, no download. The real
 //! Windows / real-Ollama matrix is not covered here (see docs/setup.md).
 
-use davinci_coding_agent::native_extensions::NativeExtensionHost;
+use davinci_coding_agent::native_extensions::service_supervisor::{
+    ManagedServiceSupervisor, OllamaLauncher, OwnedProcess,
+};
+use davinci_coding_agent::native_extensions::{
+    MemoryKind, NativeExtensionHost, VectorMemory, VectorMemoryConfig,
+};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+
+/// No `ollama` on this pretend machine, and nothing may be started.
+struct NoOllama;
+impl OllamaLauncher for NoOllama {
+    fn find(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn version(&self, _: &Path) -> Option<String> {
+        None
+    }
+    fn spawn(&self, _: &Path, _: &Path) -> Result<Box<dyn OwnedProcess>, String> {
+        Err("no process may be started in this test".into())
+    }
+}
 
 /// Answers `/api/tags` with `models` and every embed call with 8 numbers.
 fn fake(models: &'static str) -> String {
@@ -69,7 +88,10 @@ fn write_config(agent: &Path, url: &str) {
 }
 
 fn launch(agent: &Path, project: &Path) -> serde_json::Value {
-    let mut host = NativeExtensionHost::new_with_agent_dir("matrix", project, Some(agent));
+    let mut host = NativeExtensionHost::new_with_agent_dir("matrix", project, Some(agent))
+        .with_supervisor(std::sync::Arc::new(ManagedServiceSupervisor::new(
+            Box::new(NoOllama),
+        )));
     host.command("setup", "check --json").unwrap().unwrap()
 }
 
@@ -81,14 +103,31 @@ fn repeated_restart_reconciles_without_manual_commands() {
     let no_model = fake("{\"models\":[]}");
     let down = "http://127.0.0.1:9".to_string();
 
-    // One record written before any relaunch; it must survive all of them.
-    let records = project.path().join(".davinci").join("vector-memory");
-    fs::create_dir_all(&records).unwrap();
-    let records = records.join("records.jsonl");
+    // One real record written before any relaunch; its bytes must survive all of them.
+    let mut seed = VectorMemory::with_config(
+        project.path().to_path_buf(),
+        VectorMemoryConfig {
+            ollama_url: down.clone(),
+            ..VectorMemoryConfig::default()
+        },
+    );
+    seed.mark_dense_offline();
+    seed.index_learning_memory(
+        "the build uses cargo with the pinned toolchain",
+        MemoryKind::Fact,
+        0.8,
+        0.9,
+        "session",
+        1,
+        None,
+    )
+    .unwrap();
+    let records = seed.local_path();
+    let seeded = fs::read(&records).unwrap();
+    assert!(!seeded.is_empty(), "the seed record was not written");
     write_config(agent.path(), &down);
     let first = launch(agent.path(), project.path());
-    assert_eq!(first["health"][0]["code"], "PROVIDER_OFFLINE", "{first}");
-    fs::write(&records, b"").unwrap();
+    assert_eq!(first["health"][0]["code"], "INSTALL_REQUIRED", "{first}");
 
     let healthy_cfg = |a: &Path| write_config(a, &healthy);
     type Scenario<'a> = (&'a str, Box<dyn Fn(&Path) + 'a>, &'a str);
@@ -96,9 +135,11 @@ fn repeated_restart_reconciles_without_manual_commands() {
         (
             "ollama missing",
             Box::new(|a| write_config(a, &down)),
-            "PROVIDER_OFFLINE",
+            "INSTALL_REQUIRED",
         ),
-        ("healthy", Box::new(healthy_cfg), ""),
+        // Healthy server, but the seeded record has no vector yet: `check` says so
+        // and does not repair by itself.
+        ("healthy", Box::new(healthy_cfg), "PROJECTION_STALE"),
         (
             "model missing",
             Box::new(|a| write_config(a, &no_model)),
@@ -136,6 +177,6 @@ fn repeated_restart_reconciles_without_manual_commands() {
             !agent.path().join("ollama-start.lock").exists(),
             "round {round} {name}"
         );
-        assert_eq!(fs::read(&records).unwrap(), b"", "round {round} {name}");
+        assert_eq!(fs::read(&records).unwrap(), seeded, "round {round} {name}");
     }
 }

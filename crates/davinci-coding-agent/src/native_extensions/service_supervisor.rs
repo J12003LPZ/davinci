@@ -42,6 +42,8 @@ pub const SERVICE_START_FAILED: &str = "SERVICE_START_FAILED";
 /// How long a start waits for the server to answer.
 pub const START_DEADLINE: Duration = Duration::from_secs(8);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long `ollama --version` may take before it is killed.
+const VERSION_DEADLINE: Duration = Duration::from_secs(5);
 /// A start lock older than this belongs to a process that died.
 const LOCK_STALE: Duration = Duration::from_secs(60);
 const LOCK_FILE: &str = "ollama-start.lock";
@@ -91,15 +93,7 @@ impl OllamaLauncher for SystemLauncher {
     }
 
     fn version(&self, program: &Path) -> Option<String> {
-        let output = std::process::Command::new(program)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let line = text.lines().find(|line| !line.trim().is_empty())?;
-        Some(line.trim().to_string())
+        run_with_deadline(program, &["--version"], VERSION_DEADLINE)
     }
 
     fn spawn(&self, program: &Path, agent_dir: &Path) -> Result<Box<dyn OwnedProcess>, String> {
@@ -148,6 +142,42 @@ impl OllamaLauncher for SystemLauncher {
             .map(|child| Box::new(ChildProcess(child)) as Box<dyn OwnedProcess>)
             .map_err(|error| error.to_string())
     }
+}
+
+/// The first non-empty line `program args` prints, or `None` when it fails or
+/// does not finish in time (the child is killed then).
+fn run_with_deadline(program: &Path, args: &[&str], deadline: Duration) -> Option<String> {
+    use std::io::Read;
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
+    });
+    // A hung executable (a stalled GPU driver, say) must not hang setup.
+    let Ok(bytes) = receiver.recv_timeout(deadline) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let _ = child.wait();
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text.lines().find(|line| !line.trim().is_empty())?;
+    Some(line.trim().to_string())
 }
 
 /// The supervisor for this process. Process-wide so a `/reload` that rebuilds
@@ -281,6 +311,12 @@ pub struct ManagedServiceSupervisor {
     deadline: Duration,
 }
 
+impl std::fmt::Debug for ManagedServiceSupervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManagedServiceSupervisor")
+    }
+}
+
 impl ManagedServiceSupervisor {
     pub fn new(launcher: Box<dyn OllamaLauncher>) -> Self {
         Self {
@@ -391,6 +427,13 @@ impl ManagedServiceSupervisor {
                 format!("answers at {}", target.url),
             );
         }
+        // A server this supervisor already started and that is still alive is
+        // waited for, never replaced: a second spawn would orphan the first.
+        if self.owned_pid().is_some() {
+            let health = self.wait_ready(&target, C, "started earlier and still starting");
+            drop(lock);
+            return health;
+        }
         let child = match self.launcher.spawn(&program, agent_dir) {
             Ok(child) => child,
             Err(error) => {
@@ -489,4 +532,25 @@ fn probe_tags_only(target: &ProbeTarget) -> bool {
         .get(&format!("{}/api/tags", target.url))
         .call()
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hung_version_probe_is_killed_at_its_deadline() {
+        #[cfg(windows)]
+        let (program, args): (&str, &[&str]) = ("ping", &["-n", "60", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let (program, args): (&str, &[&str]) = ("sleep", &["60"]);
+        let started = Instant::now();
+        let found = run_with_deadline(Path::new(program), args, Duration::from_millis(400));
+        assert_eq!(found, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 }

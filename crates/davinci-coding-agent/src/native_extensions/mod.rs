@@ -368,9 +368,21 @@ pub struct NativeExtensionHost {
     pub visual_verification_available: bool,
     pub cwd: std::path::PathBuf,
     agent_dir: std::path::PathBuf,
+    /// Who starts Ollama for `/setup`. `None` is this process's real
+    /// supervisor; tests inject one with a fake launcher.
+    supervisor: Option<Arc<service_supervisor::ManagedServiceSupervisor>>,
 }
 
 impl NativeExtensionHost {
+    /// Use `supervisor` for `/setup` instead of the real machine.
+    pub fn with_supervisor(
+        mut self,
+        supervisor: Arc<service_supervisor::ManagedServiceSupervisor>,
+    ) -> Self {
+        self.supervisor = Some(supervisor);
+        self
+    }
+
     pub fn new_with_agent_dir(
         session_key: impl Into<String>,
         cwd: &Path,
@@ -552,6 +564,7 @@ impl NativeExtensionHost {
             visual_snapshot,
             cwd: cwd.to_path_buf(),
             agent_dir: repo_agent_dir,
+            supervisor: None,
         }
     }
 
@@ -956,8 +969,10 @@ impl NativeExtensionHost {
                 Ok(Some(memory.clear().map_err(|err| err.to_string())?))
             }
             "memory-page" => {
-                let memory = self.memory.lock().map_err(|err| err.to_string())?;
-                Ok(Some(memory_page::command(&memory, args)?))
+                // The page probes the embedding server (seconds). Work on a copy
+                // so a turn that needs memory never waits behind the probe.
+                let snapshot = self.memory.lock().map_err(|err| err.to_string())?.clone();
+                Ok(Some(memory_page::command(&snapshot, args)?))
             }
             "cache-status" => {
                 let stats = self.cache.stats();
@@ -1035,7 +1050,13 @@ impl NativeExtensionHost {
                 } else {
                     self.cwd.clone()
                 };
-                let ctx = setup::SetupContext::system(&self.agent_dir);
+                let ctx = match &self.supervisor {
+                    Some(supervisor) => setup::SetupContext {
+                        agent_dir: &self.agent_dir,
+                        supervisor,
+                    },
+                    None => setup::SetupContext::system(&self.agent_dir),
+                };
                 let steps = if mode == setup::Mode::Trust {
                     vec![setup::trust_project(&self.agent_dir, &cwd)]
                 } else if let setup::Mode::Approve(action) = mode {
@@ -1098,6 +1119,7 @@ impl NativeExtensionHost {
                         health.push(setup::governor_health(
                             &governor.health(),
                             effective.governor.enabled,
+                            &effective,
                         ));
                     }
                     health

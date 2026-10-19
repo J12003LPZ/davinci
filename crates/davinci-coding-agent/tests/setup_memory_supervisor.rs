@@ -488,6 +488,8 @@ struct FakeLauncher {
     url: String,
     spawns: Arc<AtomicUsize>,
     killed: Arc<AtomicBool>,
+    /// False: the child is alive but never brings the server up.
+    serves: bool,
 }
 
 impl FakeLauncher {
@@ -498,6 +500,7 @@ impl FakeLauncher {
             url: url.into(),
             spawns: Arc::new(AtomicUsize::new(0)),
             killed: Arc::new(AtomicBool::new(false)),
+            serves: true,
         }
     }
 }
@@ -511,7 +514,9 @@ impl OllamaLauncher for FakeLauncher {
     }
     fn spawn(&self, _: &Path, _: &Path) -> Result<Box<dyn OwnedProcess>, String> {
         self.spawns.fetch_add(1, Ordering::SeqCst);
-        serve_fake_ollama_at(&self.url, &["embeddinggemma:latest"], 768);
+        if self.serves {
+            serve_fake_ollama_at(&self.url, &["embeddinggemma:latest"], 768);
+        }
         Ok(Box::new(FakeProcess {
             killed: Arc::clone(&self.killed),
         }))
@@ -793,6 +798,13 @@ impl Ctx {
             supervisor: &self.supervisor,
         }
     }
+}
+
+/// A host whose `/setup` can never look at the real PATH or start a process.
+fn offline_host(key: &str, project: &Path, agent: &Path) -> NativeExtensionHost {
+    NativeExtensionHost::new_with_agent_dir(key, project, Some(agent)).with_supervisor(Arc::new(
+        ManagedServiceSupervisor::new(Box::new(NoOllamaHere)),
+    ))
 }
 
 struct NoOllamaHere;
@@ -1085,6 +1097,8 @@ fn recovery_is_not_wanted_until_the_user_set_it_up_and_never_when_disabled() {
 struct EmbedServer {
     url: String,
     dimensions: Arc<AtomicUsize>,
+    /// Milliseconds each embed call waits before it answers.
+    delay_ms: Arc<AtomicUsize>,
 }
 
 fn embed_server(dimensions: usize) -> EmbedServer {
@@ -1092,10 +1106,13 @@ fn embed_server(dimensions: usize) -> EmbedServer {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let dims = Arc::new(AtomicUsize::new(dimensions));
     let shared = Arc::clone(&dims);
+    let delay_ms = Arc::new(AtomicUsize::new(0));
+    let delay = Arc::clone(&delay_ms);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let dims = Arc::clone(&shared);
+            let delay = Arc::clone(&delay);
             std::thread::spawn(move || {
                 let mut buffer = vec![0u8; 65536];
                 let mut read = 0;
@@ -1130,6 +1147,9 @@ fn embed_server(dimensions: usize) -> EmbedServer {
                 let reply = if text.starts_with("GET /api/tags") {
                     "{\"models\":[{\"name\":\"embeddinggemma:latest\"}]}".to_string()
                 } else {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        delay.load(Ordering::SeqCst) as u64,
+                    ));
                     let size = dims.load(Ordering::SeqCst);
                     let vector: Vec<_> = (0..size).map(|i| format!("{}.25", i % 5)).collect();
                     let vectors = vec![format!("[{}]", vector.join(",")); inputs];
@@ -1146,6 +1166,7 @@ fn embed_server(dimensions: usize) -> EmbedServer {
     EmbedServer {
         url,
         dimensions: dims,
+        delay_ms,
     }
 }
 
@@ -1289,7 +1310,7 @@ fn setup_host(agent: &Path, project: &Path, url: &str) -> NativeExtensionHost {
         ),
     )
     .unwrap();
-    NativeExtensionHost::new_with_agent_dir("setup-surface", project, Some(agent))
+    offline_host("setup-surface", project, agent)
 }
 
 #[test]
@@ -1431,8 +1452,7 @@ fn disabled_memory_does_not_spawn_or_reenable() {
     // Ten restarts, with every kind of /setup: nothing is probed or started.
     let before = server.requests.load(Ordering::SeqCst);
     for _ in 0..10 {
-        let mut again =
-            NativeExtensionHost::new_with_agent_dir("opt-out", project.path(), Some(agent.path()));
+        let mut again = offline_host("opt-out", project.path(), agent.path());
         for args in ["check", "check --json", ""] {
             let report = again.command("setup", args).unwrap().unwrap();
             assert_eq!(report["health"][0]["state"], "disabled", "{args}: {report}");
@@ -1466,20 +1486,192 @@ fn disabled_memory_does_not_spawn_or_reenable() {
 }
 
 #[test]
-fn opt_out_with_a_corrupt_profile_is_explicit_and_changes_nothing() {
+fn unreadable_profile_keeps_both_features_off_and_untouched() {
+    use davinci_coding_agent::native_extensions::setup_profile::{
+        EnabledSource, PROFILE_CORRUPT, PROFILE_NEWER,
+    };
+    let cases: [(&[u8], &str); 3] = [
+        (b"{ not json", PROFILE_CORRUPT),
+        // Not valid UTF-8: never decoded lossily and rewritten.
+        (b"{\"ollama\":{\"path\":\"\xe9\"}}", PROFILE_CORRUPT),
+        (b"{\"schema\": 99}", PROFILE_NEWER),
+    ];
+    for (bytes, code) in cases {
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let server = fake_ollama(&["embeddinggemma"], 8);
+        let mut host = setup_host(agent.path(), project.path(), &server.url);
+        let profile = agent.path().join("setup-profile.json");
+        fs::write(&profile, bytes).unwrap();
+
+        // Config files say "on" (the defaults), yet both features are off.
+        let effective = load_effective_setup(agent.path(), &no_env);
+        assert!(!effective.memory.enabled && !effective.governor.enabled);
+        assert_eq!(
+            effective.memory.enabled_source,
+            EnabledSource::ProfileUnreadable
+        );
+        assert_eq!(
+            effective.governor.enabled_source,
+            EnabledSource::ProfileUnreadable
+        );
+
+        let report = host.command("setup", "check --json").unwrap().unwrap();
+        for index in 0..2 {
+            let health = &report["health"][index];
+            assert_eq!(health["state"], "action-required", "{report}");
+            assert_eq!(health["code"], code, "{report}");
+        }
+        assert_eq!(
+            server.requests.load(Ordering::SeqCst),
+            0,
+            "an unreadable profile was probed"
+        );
+
+        // The switch refuses to overwrite it, and says so.
+        let report = host.command("setup", "disable governor").unwrap().unwrap();
+        assert_eq!(report["steps"][0]["state"], "action", "{report}");
+        assert!(report["steps"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains(code));
+        assert_eq!(fs::read(&profile).unwrap(), bytes);
+    }
+    // Words that name no feature are refused.
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let server = fake_ollama(&["embeddinggemma"], 8);
+    let mut host = setup_host(agent.path(), project.path(), "http://127.0.0.1:9");
+    assert!(host.command("setup", "disable everything").is_err());
+}
+
+#[test]
+fn two_sessions_on_one_repo_never_drop_each_others_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut seed = memory_in(dir.path());
+    learn(
+        &mut seed,
+        "record one written before either session started",
+    )
+    .unwrap();
+    // Both sessions load the file while it holds one record.
+    let mut a = memory_in(dir.path());
+    let mut b = memory_in(dir.path());
+    learn(&mut b, "record two written by the second session").unwrap();
+    learn(&mut a, "record three written by the first session").unwrap();
+
+    let text = fs::read_to_string(a.local_path()).unwrap();
+    assert_eq!(text.lines().count(), 3, "a record was lost:\n{text}");
+    for needle in ["record one", "record two", "record three"] {
+        assert!(text.contains(needle), "{needle} is gone:\n{text}");
+    }
+    assert_eq!(
+        a.record_count(),
+        3,
+        "the writer did not fold in the other session"
+    );
+}
+
+#[test]
+fn repair_does_not_hold_the_memory_lock_while_the_server_answers() {
+    let project = tempfile::tempdir().unwrap();
+    let server = embed_server(8);
+    let mut down = memory_in(project.path());
+    for n in 0..3 {
+        learn(&mut down, &format!("fact {n} waiting for its vector")).unwrap();
+    }
+    let memory = Arc::new(Mutex::new(memory_with_server(
+        project.path(),
+        &server.url,
+        "embeddinggemma",
+    )));
+    server.delay_ms.store(900, Ordering::SeqCst);
+    let worker = {
+        let memory = Arc::clone(&memory);
+        std::thread::spawn(move || VectorMemory::repair_shared(&memory, 8))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    drop(memory.lock().unwrap());
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(400),
+        "the lock was held across the embed call for {:?}",
+        started.elapsed()
+    );
+    let receipt = worker.join().unwrap();
+    assert_eq!(
+        (receipt.reembedded, receipt.remaining),
+        (3, 0),
+        "{receipt:?}"
+    );
+}
+
+#[test]
+fn a_record_changed_while_embedding_is_not_overwritten() {
+    let project = tempfile::tempdir().unwrap();
+    let server = embed_server(8);
+    let mut down = memory_in(project.path());
+    learn(&mut down, "a fact that will be embedded").unwrap();
+    let mut memory = memory_with_server(project.path(), &server.url, "embeddinggemma");
+    let plan = memory.repair_plan(8);
+    let outcome = plan.embed();
+    // Another session removes the record file's content before the apply.
+    memory.clear().unwrap();
+    let receipt = memory.repair_apply(plan, outcome);
+    assert_eq!(receipt.reembedded, 0, "{receipt:?}");
+    assert_eq!(memory.record_count(), 0);
+}
+
+#[test]
+fn a_second_start_waits_for_the_first_child_instead_of_orphaning_it() {
+    let machine = Machine::new();
+    machine.consent();
+    machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+    let mut launcher = FakeLauncher::new(&machine.url, "/usr/bin/ollama", "ollama version 0.5.0");
+    launcher.serves = false; // alive, but never answers within the deadline
+    let spawns = Arc::clone(&launcher.spawns);
+    let supervisor = ManagedServiceSupervisor::new(Box::new(launcher))
+        .with_deadline(std::time::Duration::from_millis(300));
+    let effective = machine.effective();
+    for _ in 0..3 {
+        let health = supervisor.reconcile(machine.agent.path(), &effective);
+        assert_eq!(health.state, HealthState::Failed);
+    }
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "a second server was started"
+    );
+    assert!(
+        supervisor.shutdown_owned(),
+        "the one child is still ours to stop"
+    );
+}
+
+#[test]
+fn download_model_respects_a_switched_off_memory() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let server = pull_server(false, 8, true);
     let mut host = setup_host(agent.path(), project.path(), &server.url);
-    let profile = agent.path().join("setup-profile.json");
-    fs::write(&profile, b"{ not json").unwrap();
-    let report = host.command("setup", "disable governor").unwrap().unwrap();
+    host.command("setup", "disable memory").unwrap();
+    let report = host
+        .command("setup", "approve download-model")
+        .unwrap()
+        .unwrap();
     assert_eq!(report["steps"][0]["state"], "action", "{report}");
     assert!(report["steps"][0]["detail"]
         .as_str()
         .unwrap()
-        .contains("PROFILE_CORRUPT"));
-    assert_eq!(fs::read(&profile).unwrap(), b"{ not json");
-    // Words that name no feature are refused.
-    assert!(host.command("setup", "disable everything").is_err());
+        .contains("memory is off"));
+    assert!(
+        !agent.path().join("service-consent.json").exists(),
+        "a yes was recorded"
+    );
+    assert_eq!(server.pulls.load(Ordering::SeqCst), 0);
+    // The same for the other approvals and for repair.
+    for args in ["approve start-ollama", "repair"] {
+        let report = host.command("setup", args).unwrap().unwrap();
+        assert_ne!(report["steps"][0]["state"], "done", "{args}: {report}");
+    }
+    assert!(!agent.path().join("service-consent.json").exists());
 }

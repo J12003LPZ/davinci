@@ -163,8 +163,15 @@ impl SetupProfile {
             }
             Err(error) => return (Self::default(), ProfileState::Corrupt(error.to_string())),
         };
-        let text = String::from_utf8_lossy(&bytes);
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        // Invalid UTF-8 is corrupt, never repaired: a lossy decode would make
+        // the next save rewrite the user's bytes.
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return (
+                Self::default(),
+                ProfileState::Corrupt("not valid UTF-8".into()),
+            );
+        };
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         match serde_json::from_str::<Self>(text) {
             Ok(profile) if profile.schema > PROFILE_SCHEMA => {
                 let newer = profile.schema;
@@ -269,6 +276,9 @@ pub enum EnabledSource {
     Environment(String),
     /// The config file is unreadable, so the feature stays off.
     FailClosed,
+    /// The setup profile is unreadable or newer, so both features stay off:
+    /// the user's choice in it cannot be known.
+    ProfileUnreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -307,9 +317,25 @@ impl EffectiveSetupConfig {
         match source {
             EnabledSource::Environment(var) => format!("{var} turns it off"),
             EnabledSource::FailClosed => format!("{name} cannot be read"),
+            EnabledSource::ProfileUnreadable => {
+                "setup-profile.json cannot be read or is from a newer DaVinci".into()
+            }
             EnabledSource::ConfigFile => format!("{name} has enabled set to false"),
             EnabledSource::Profile => "the setup profile turns it off".into(),
             EnabledSource::Default => "it is off by default".into(),
+        }
+    }
+
+    /// Why setup cannot be trusted to read the user's choices, if so.
+    pub fn profile_problem(&self) -> Option<String> {
+        match &self.profile_state {
+            ProfileState::Corrupt(error) => {
+                Some(format!("setup-profile.json cannot be read: {error}"))
+            }
+            ProfileState::Newer(version) => Some(format!(
+                "setup-profile.json is schema {version}, newer than this DaVinci understands"
+            )),
+            _ => None,
         }
     }
 
@@ -383,14 +409,22 @@ pub fn load_effective_setup(
             ),
         });
     }
-    let (enabled, source) = resolve_enabled(
-        &memory_file,
-        memory_config.enabled,
-        profile.memory.enabled,
-        env_enabled.map(|value| ("PI_MEMORY_ENABLED".to_string(), value)),
-        &mut issues,
-        "memory",
+    let profile_bad = matches!(
+        profile_state,
+        ProfileState::Corrupt(_) | ProfileState::Newer(_)
     );
+    let (enabled, source) = if profile_bad {
+        (false, EnabledSource::ProfileUnreadable)
+    } else {
+        resolve_enabled(
+            &memory_file,
+            memory_config.enabled,
+            profile.memory.enabled,
+            env_enabled.map(|value| ("PI_MEMORY_ENABLED".to_string(), value)),
+            &mut issues,
+            "memory",
+        )
+    };
     memory_config.enabled = enabled;
     let memory = FeatureConfig {
         config: memory_config,
@@ -428,14 +462,18 @@ pub fn load_effective_setup(
             ),
         });
     }
-    let (enabled, source) = resolve_enabled(
-        &governor_file,
-        governor_config.enabled,
-        profile.governor.enabled,
-        env_enabled,
-        &mut issues,
-        "governor",
-    );
+    let (enabled, source) = if profile_bad {
+        (false, EnabledSource::ProfileUnreadable)
+    } else {
+        resolve_enabled(
+            &governor_file,
+            governor_config.enabled,
+            profile.governor.enabled,
+            env_enabled,
+            &mut issues,
+            "governor",
+        )
+    };
     governor_config.enabled = enabled;
     let governor = FeatureConfig {
         config: governor_config,
