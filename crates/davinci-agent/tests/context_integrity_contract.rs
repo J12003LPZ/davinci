@@ -54,21 +54,43 @@ fn context_trace_reports_selected_origin_and_omissions() {
         .expect("the system prompt is a manifest entry");
     assert!(system.mandatory && system.selected);
     assert_eq!(system.source_ref, "agent::system_prompt");
+    assert_eq!(
+        system.provenance_kind,
+        davinci_agent::runtime::ProvenanceKind::MandatoryPolicy
+    );
     for entry in &manifest.entries {
+        assert!(!entry.content_hash.is_empty(), "{} has no hash", entry.id);
         if entry.mandatory {
             assert!(entry.selected, "{} is mandatory yet omitted", entry.id);
         }
-        if !entry.selected {
-            assert!(
-                entry
-                    .selection_reason
-                    .as_deref()
-                    .is_some_and(|reason| !reason.is_empty()),
-                "{} was omitted without a reason",
-                entry.id
-            );
-        }
-        assert!(!entry.content_hash.is_empty(), "{} has no hash", entry.id);
+    }
+
+    // An omission is reported with its reason. A derived-state failure is the
+    // one way a dispatch leaves something out; seed one and read it back.
+    agent
+        .runtime
+        .as_ref()
+        .expect("the turn built a runtime")
+        .context_vm
+        .record_failure("compile", "injected derived-cache failure");
+    let after = agent.context_manifest_now("req-omit");
+    let omitted: Vec<_> = after
+        .entries
+        .iter()
+        .filter(|entry| !entry.selected)
+        .collect();
+    assert!(!omitted.is_empty(), "the failure left no omitted entry");
+    for entry in omitted {
+        assert!(!entry.mandatory, "{} is mandatory yet omitted", entry.id);
+        assert!(
+            entry
+                .selection_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("injected derived-cache failure")),
+            "{} was omitted without its reason: {:?}",
+            entry.id,
+            entry.selection_reason
+        );
     }
     // Hashes and sizes, never the text: a secret in the history is not copied
     // into the trace.

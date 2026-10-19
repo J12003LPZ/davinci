@@ -11178,7 +11178,7 @@ fn apply_session_calls(
                 }
             }
             Some("appendEntry") => {
-                if let Some(store) = agent.session.as_mut() {
+                let written = agent.session.as_mut().map(|store| {
                     let custom_type = call
                         .get("customType")
                         .and_then(|value| value.as_str())
@@ -11186,7 +11186,7 @@ fn apply_session_calls(
                     let data = call.get("data").cloned().unwrap_or(serde_json::Value::Null);
                     let mut extra = serde_json::Map::new();
                     extra.insert("data".into(), data);
-                    let _ = store.append_entry(SessionEntry {
+                    store.append_entry(SessionEntry {
                         id: String::new(),
                         entry_type: "custom".into(),
                         parent_id: None,
@@ -11195,26 +11195,40 @@ fn apply_session_calls(
                         message: None,
                         custom_type: Some(custom_type.to_string()),
                         extra,
-                    });
+                    })
+                });
+                if let Some(Err(error)) = written {
+                    agent.record_persistence_failure(format!("plugin appendEntry: {error}"));
+                    ui.status(&format!("PERSISTENCE_FAILURE: plugin appendEntry: {error}"));
                 }
             }
             Some("setLabel") => {
-                if let Some(store) = agent.session.as_mut() {
+                let written = agent.session.as_mut().map(|store| {
                     let id = call
                         .get("entryId")
                         .and_then(|value| value.as_str())
                         .unwrap_or("");
                     let label = call.get("label").and_then(|value| value.as_str());
-                    let _ = store.append_entry(SessionEntry::label_change(id, label));
+                    store.append_entry(SessionEntry::label_change(id, label))
+                });
+                if let Some(Err(error)) = written {
+                    agent.record_persistence_failure(format!("plugin setLabel: {error}"));
+                    ui.status(&format!("PERSISTENCE_FAILURE: plugin setLabel: {error}"));
                 }
             }
             Some("setSessionName") => {
-                if let Some(store) = agent.session.as_mut() {
+                let written = agent.session.as_mut().map(|store| {
                     let name = call
                         .get("name")
                         .and_then(|value| value.as_str())
                         .unwrap_or("");
-                    let _ = store.set_name(name);
+                    store.set_name(name)
+                });
+                if let Some(Err(error)) = written {
+                    agent.record_persistence_failure(format!("plugin setSessionName: {error}"));
+                    ui.status(&format!(
+                        "PERSISTENCE_FAILURE: plugin setSessionName: {error}"
+                    ));
                 }
             }
             Some("exec") => {

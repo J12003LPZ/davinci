@@ -79,7 +79,7 @@ pub use compaction::{
 };
 pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
-    context_file_charges, load_context_files, load_context_files_for_targets, repository_root, ContextBudgetReport,
+    context_file_charges, load_context_files, repository_root, ContextBudgetReport,
     ContextContribution, ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
     INSTRUCTION_FILE,
 };
@@ -672,8 +672,10 @@ pub struct Agent {
     /// Last prepared context manifest before provider dispatch.
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// The first session write that failed outside the session's own sticky
-    /// error, with the session file it belongs to. Cleared by opening another
-    /// session.
+    /// error, with the session file it belongs to. Cleared when a session is
+    /// opened (`load_from_session`), including the same path again: a failed
+    /// append leaves the old handle failing for good, so a later write can
+    /// only succeed on a reopened one.
     /// `ensure_session_persistence` reports it as PERSISTENCE_FAILURE.
     persistence_failure: Option<(std::path::PathBuf, String)>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
@@ -3209,6 +3211,15 @@ impl Agent {
 
     /// Execution cannot continue after a session write has an uncertain outcome.
     /// Recovery must reopen the durable session before issuing another request.
+    /// Record a failed session write made outside the agent (a plugin's
+    /// `appendEntry`), so the next turn stops with PERSISTENCE_FAILURE.
+    pub fn record_persistence_failure(&mut self, error: impl std::fmt::Display) {
+        if let Some(session) = &self.session {
+            self.persistence_failure
+                .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+        }
+    }
+
     pub fn ensure_session_persistence(&self) -> Result<(), String> {
         if let Some(error) = self
             .session
@@ -4599,6 +4610,9 @@ impl Agent {
         }
         self.pending_prompt_messages.clear();
         self.session = Some(session);
+        // A reopened session is a new file handle with no sticky error, even
+        // at the same path; the earlier failure belonged to the old handle.
+        self.persistence_failure = None;
         if let Some(budget) = session_budget {
             self.root_budget = Some(budget);
         }
