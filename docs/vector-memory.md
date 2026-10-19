@@ -68,7 +68,7 @@ something before it works, fixes what it can, and lists the rest:
 
 | Area | `/setup` does | You do |
 | --- | --- | --- |
-| Vector memory | Starts an installed local Ollama (`ollama serve`), pulls `embeddingModel` in the background, and embeds records that have no vector. | Install Ollama when it is missing. Fix `embeddingDimensions` when the model disagrees. |
+| Vector memory | Reports Ollama, model and record health. After your approval (`/setup approve start-ollama`, `/setup approve download-model`) it starts the installed local Ollama and downloads `embeddingModel`, then embeds records that have no vector (`/setup repair`). | Install Ollama when it is missing. Approve the start and the download. Fix `embeddingDimensions` when the model disagrees. |
 | .gitignore | Adds `/.davinci/vector-memory/` and `/.davinci/graph/` to the project's `.gitignore` inside a Git work tree. | Nothing. |
 | Project trust | Reports when project settings, hooks, skills or MCP servers are ignored because the project is not trusted. | Review them, then run `/setup trust`. Restart to load them. |
 | Plugin hooks | Lists enabled plugins whose hooks wait for approval. | `/plugins approve <name>`. |
@@ -84,7 +84,7 @@ extensions and MCP servers.
 
 | Command | What it does |
 | --- | --- |
-| `/setup [check\|trust]` | Sets up vector memory and the other features above. |
+| `/setup [check [--json]\|repair\|approve <action>\|enable\|disable <feature>\|trust]` | Sets up vector memory and the other features above. See `docs/setup.md`. |
 | `/memory-page [--no-open] [query]` | Writes `.davinci/vector-memory/memory-page.html` beside the records and opens it. |
 | `/memory-status` | Opens the memory sheet with record counts and configuration. |
 | `/memory-search <query>` | Runs the broad search (every kind, including stale claims) without the injection gate. |
