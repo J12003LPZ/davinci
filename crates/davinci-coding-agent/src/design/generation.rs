@@ -135,17 +135,21 @@ pub fn expected_schema(phase: RunPhase, variants: u32) -> String {
 /// token-like strings replaced, and a hard length bound. Never the whole reply.
 pub fn sanitize_snippet(text: &str, limit: usize) -> String {
     let mut out = String::new();
+    // The word after a scheme name is the credential itself.
+    let mut after_scheme = false;
     for word in text.split_whitespace() {
         let secret = word.len() >= 24
             && word.bytes().all(|b| {
                 b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'+' | b'/' | b'=')
             })
             && word.bytes().any(|b| b.is_ascii_digit());
-        let word = if secret || word.starts_with("sk-") || word.starts_with("Bearer") {
+        let scheme = word.eq_ignore_ascii_case("bearer") || word.eq_ignore_ascii_case("basic");
+        let word = if secret || after_scheme || scheme || word.starts_with("sk-") {
             "[redacted]"
         } else {
             word
         };
+        after_scheme = scheme;
         if !out.is_empty() {
             out.push(' ');
         }

@@ -373,3 +373,16 @@ fn select_is_a_command_and_none_clears_it() {
         "select a color palette for a florist"
     );
 }
+
+#[test]
+fn a_snippet_never_carries_the_credential_after_a_scheme() {
+    let snippet = sanitize_snippet(
+        "Authorization: Bearer abc.def.ghi and Basic dXNlcjpwYXNz",
+        200,
+    );
+    assert!(!snippet.contains("abc.def.ghi") && !snippet.contains("dXNlcjpwYXNz"));
+    assert_eq!(
+        snippet,
+        "Authorization: [redacted] [redacted] and [redacted] [redacted]"
+    );
+}
