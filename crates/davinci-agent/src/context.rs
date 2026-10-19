@@ -361,6 +361,20 @@ pub(crate) fn file_stamp(path: &Path) -> Option<FileStamp> {
     Some((meta.modified().ok(), meta.len()))
 }
 
+/// Writes closer than this to now may share a timestamp with an earlier one
+/// (FAT keeps two seconds; others tick coarsely), so a matching stamp does not
+/// prove the content is the same.
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn is_racy(modified: Option<std::time::SystemTime>) -> bool {
+    match modified {
+        None => true,
+        Some(at) => std::time::SystemTime::now()
+            .duration_since(at)
+            .map_or(true, |age| age < RACY_WINDOW),
+    }
+}
+
 /// `plugin:<name>` entries are SessionStart hook output, not files.
 pub(crate) fn is_plugin_context(file: &ContextFile) -> bool {
     file.path.to_string_lossy().starts_with("plugin:")
@@ -390,7 +404,10 @@ pub(crate) fn reload_changed_context_files(
             Err(_) => return true,
         };
         let stamp = (meta.modified().ok(), meta.len());
-        if stamps.get(&file.path) == Some(&stamp) {
+        // Same size and mtime is only proof of "unchanged" once the mtime is
+        // old enough that another write could not share it (coarse clocks,
+        // two writes in one tick). A recent file is read and compared.
+        if stamps.get(&file.path) == Some(&stamp) && !is_racy(stamp.0) {
             return true;
         }
         if let Ok(body) = fs::read_to_string(&file.path) {
@@ -692,6 +709,20 @@ mod tests {
         assert!(reload_changed_context_files(&mut files, &mut stamps));
         let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
         assert_eq!(names, ["plugin:demo"], "plugin entries are never statted");
+    }
+
+    #[test]
+    fn a_same_size_edit_inside_one_timestamp_tick_is_still_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        fs::write(&path, "use tabs").unwrap();
+        let (mut files, mut stamps) = loaded(&path);
+        // Same length, written at once: the stamp may well be identical.
+        fs::write(&path, "use gaps").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        stamps.insert(path.clone(), (Some(modified), 8));
+        assert!(reload_changed_context_files(&mut files, &mut stamps));
+        assert_eq!(files[0].body, "use gaps");
     }
 
     #[test]
