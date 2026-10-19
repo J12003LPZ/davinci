@@ -267,6 +267,67 @@ fn missing_result_after_recovery_has_explicit_nonexecution_or_unknown() {
 }
 
 #[test]
+fn a_journal_record_does_not_excuse_a_result_with_no_call_in_history() {
+    // The assistant message is the record of the call. A journal entry for the
+    // same id says the call ran, not that the conversation still contains it:
+    // sending the result alone would be an unpaired history.
+    let fixture = Fixture::new(&[
+        ChatMessage::text("user", "start"),
+        result_message("lost_call", "bash", "output of a call the history lost"),
+    ]);
+    fixture.latch_started_effect("lost_call", "bash");
+    let mut agent = fixture.agent();
+    agent.prompt("continue");
+    let mut requests = 0;
+    let error = agent
+        .run_loop(|_| {
+            requests += 1;
+            Ok(done())
+        })
+        .expect_err("an unpaired history must not reach the provider");
+    assert!(error.contains("lost_call"), "{error}");
+    assert_eq!(requests, 0);
+}
+
+#[test]
+fn reconciled_results_keep_call_order() {
+    // One assistant message with three calls, none answered.
+    let calls = ChatMessage {
+        role: "assistant".into(),
+        content: ["c1", "c2", "c3"]
+            .map(|id| MessageContent::ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: json!({}),
+            })
+            .into(),
+        ..ChatMessage::default()
+    };
+    let fixture = Fixture::new(&[ChatMessage::text("user", "start"), calls]);
+    let ids = |messages: &[ChatMessage]| -> Vec<String> {
+        messages
+            .iter()
+            .filter(|m| m.role == "toolResult")
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect()
+    };
+    let mut agent = fixture.agent();
+    agent.prompt("continue");
+    let mut seen = Vec::new();
+    agent
+        .run_loop(|agent| {
+            seen = agent.messages.clone();
+            Ok(done())
+        })
+        .unwrap();
+    assert_eq!(ids(&seen), ["c1", "c2", "c3"], "in memory");
+    drop(agent);
+    // The session holds the same order, not the reverse.
+    let reloaded = fixture.agent();
+    assert_eq!(ids(&reloaded.messages), ["c1", "c2", "c3"], "persisted");
+}
+
+#[test]
 fn duplicate_result_does_not_double_publish() {
     let fixture = Fixture::new(&[
         ChatMessage::text("user", "start"),

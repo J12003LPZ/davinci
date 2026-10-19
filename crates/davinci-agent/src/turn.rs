@@ -246,6 +246,9 @@ impl Agent {
         // assistant message lives only in the journal.
         self.validate_loaded_tool_history()?;
         self.recover_pending_operation_publications()?;
+        // Replayed results join the history here; a result whose call is not
+        // in it must not reach the provider either.
+        self.reject_orphan_tool_results()?;
         self.reconcile_unresolved_tool_calls()?;
         self.require_prompt_checkpoint_persistence()?;
         let run_started = std::time::Instant::now();
@@ -355,7 +358,11 @@ impl Agent {
         // newest exchange sits at the session leaf and can be appended
         // durably; older ones are repaired in memory, identically per load.
         let tail_start = self.messages.iter().rposition(|m| m.role == "assistant");
-        while let Some((index, message)) = repaired.pop() {
+        // One assistant message can carry several calls: its group goes in
+        // together, in call order, after any results it already has.
+        while let Some(&(index, _)) = repaired.last() {
+            let split = repaired.partition_point(|(other, _)| *other < index);
+            let group = repaired.split_off(split);
             let mut at = index + 1;
             while self
                 .messages
@@ -364,10 +371,14 @@ impl Agent {
             {
                 at += 1;
             }
-            if Some(index) == tail_start && at == self.messages.len() {
-                self.persist_full_message(&message);
+            let durable = Some(index) == tail_start && at == self.messages.len();
+            for (_, message) in group {
+                if durable {
+                    self.persist_full_message(&message);
+                }
+                self.messages.insert(at, message);
+                at += 1;
             }
-            self.messages.insert(at, message);
         }
         self.ensure_session_persistence()
     }
@@ -422,19 +433,10 @@ impl Agent {
         if orphans.is_empty() {
             return Ok(());
         }
-        // The operation journal is a second record of issued calls: a result
-        // it can account for is not an orphan.
-        if let (Some(journal), Some(session)) = (self.operation_journal(), self.session.as_ref()) {
-            let snapshot = journal
-                .snapshot()
-                .map_err(|error| format!("operation journal could not be read: {error}"))?;
-            orphans.retain(|id| {
-                !snapshot.operations.iter().any(|spec| {
-                    spec.context().session_id == session.header.id
-                        && spec.context().wire_tool_call_id.as_deref() == Some(*id)
-                })
-            });
-        }
+        // The assistant message is the record of the call. The operation
+        // journal says a call ran, not that the conversation still holds it,
+        // so it excuses nothing here. Results the outbox replay adds later are
+        // checked again by the caller once they are in the history.
         match orphans.first() {
             None => Ok(()),
             Some(id) => Err(format!(

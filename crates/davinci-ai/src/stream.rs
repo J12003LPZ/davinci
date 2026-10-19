@@ -3178,6 +3178,10 @@ fn usage_from_google_metadata(model: &Model, metadata: &Value) -> Usage {
     let mut computed = crate::calculate_usage(model, input, output, cached, 0);
     // Google reports cached reads, but no cache-creation token count.
     computed.cache_write_unreported = true;
+    // A missing count is unknown, not a measured zero.
+    computed.input_unreported = get("promptTokenCount").is_none();
+    computed.output_unreported = get("candidatesTokenCount").is_none();
+    computed.cache_read_unreported = get("cachedContentTokenCount").is_none();
     if let Some(total) = get("totalTokenCount") {
         computed.total_tokens = total;
     }
@@ -6162,6 +6166,35 @@ mod tests {
         let usage = parsed.usage.expect("usage");
         assert_eq!(usage.cache_read, 60);
         assert_eq!(usage.input, 40);
+    }
+
+    #[test]
+    fn google_missing_usage_is_unknown_not_zero() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "google-generative-ai")
+            .expect("google model");
+        let usage = |metadata: &str| {
+            parse_provider_response(
+                &model,
+                &format!(
+                    r#"{{"candidates":[{{"content":{{"parts":[{{"text":"hi"}}]}}}}],"usageMetadata":{metadata}}}"#
+                ),
+            )
+            .usage
+            .expect("usage")
+        };
+        let full = usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":5,"cachedContentTokenCount":0,"totalTokenCount":105}"#,
+        );
+        assert!(!full.input_unreported && !full.output_unreported && !full.cache_read_unreported);
+        let no_cache = usage(r#"{"promptTokenCount":100,"candidatesTokenCount":5}"#);
+        assert!(no_cache.cache_read_unreported);
+        assert!(!no_cache.input_unreported && !no_cache.output_unreported);
+        assert!(usage(r#"{"promptTokenCount":100,"cachedContentTokenCount":0}"#).output_unreported);
+        assert!(
+            usage(r#"{"candidatesTokenCount":5,"cachedContentTokenCount":0}"#).input_unreported
+        );
     }
 
     #[test]

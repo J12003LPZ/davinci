@@ -71,6 +71,52 @@ fn missing_usage_is_unknown_not_zero() {
     assert!(!completions_cached.cache_read_unreported);
 }
 
+fn anthropic_usage(start: &str, delta: &str) -> davinci_protocol::Usage {
+    let corpus = format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[],\"usage\":{start}}}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{delta}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    );
+    fixture_complete(&model_for_api("anthropic-messages"), &[], &corpus)
+        .usage
+        .expect("usage")
+}
+
+#[test]
+fn anthropic_missing_usage_is_unknown_not_zero() {
+    // Everything present: nothing is unreported, and a measured zero stays one.
+    let full = anthropic_usage(
+        r#"{"input_tokens":25,"cache_read_input_tokens":0,"output_tokens":1}"#,
+        r#"{"output_tokens":4}"#,
+    );
+    assert!(!full.input_unreported && !full.output_unreported && !full.cache_read_unreported);
+    assert_eq!(full.cache_read, 0);
+    // No cached-read count anywhere in the stream: unknown.
+    let no_cache = anthropic_usage(
+        r#"{"input_tokens":25,"output_tokens":1}"#,
+        r#"{"output_tokens":4}"#,
+    );
+    assert!(no_cache.cache_read_unreported);
+    assert!(!no_cache.input_unreported && !no_cache.output_unreported);
+    // No input count anywhere.
+    let no_input = anthropic_usage(
+        r#"{"cache_read_input_tokens":0,"output_tokens":1}"#,
+        r#"{"output_tokens":4}"#,
+    );
+    assert!(no_input.input_unreported);
+    // A later delta that reports the missing field makes it known.
+    let late = anthropic_usage(
+        r#"{"input_tokens":25,"output_tokens":1}"#,
+        r#"{"output_tokens":4,"cache_read_input_tokens":7}"#,
+    );
+    assert!(!late.cache_read_unreported);
+    assert_eq!(late.cache_read, 7);
+    // No output count anywhere.
+    let no_output = anthropic_usage(
+        r#"{"input_tokens":25,"cache_read_input_tokens":0}"#,
+        r#"{}"#,
+    );
+    assert!(no_output.output_unreported);
+}
+
 #[test]
 fn unreported_counts_stay_off_the_wire_when_reported() {
     let known = responses_usage(

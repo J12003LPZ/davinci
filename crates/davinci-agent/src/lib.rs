@@ -1292,16 +1292,18 @@ impl Agent {
             .tool_exposure
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .visible_names()
+            .discovered_names()
             .clone();
-        if self.persisted_tool_exposure.as_ref() == Some(&visible) {
+        if self.persisted_tool_exposure.as_ref() == Some(&visible)
+            || (self.persisted_tool_exposure.is_none() && visible.is_empty())
+        {
             return;
         }
         let Some(session) = &mut self.session else {
             return;
         };
         let mut extra = serde_json::Map::new();
-        extra.insert("data".into(), serde_json::json!({ "visible": visible }));
+        extra.insert("data".into(), serde_json::json!({ "discovered": visible }));
         let appended = session.append_entry(davinci_session::SessionEntry {
             id: String::new(),
             entry_type: "custom".into(),
@@ -1332,7 +1334,14 @@ impl Agent {
                         entry.entry_type == "custom"
                             && entry.custom_type.as_deref() == Some(TOOL_EXPOSURE_ENTRY_TYPE)
                     })
-                    .and_then(|entry| entry.extra.get("data")?.get("visible")?.as_array().cloned())
+                    .and_then(|entry| {
+                        entry
+                            .extra
+                            .get("data")?
+                            .get("discovered")?
+                            .as_array()
+                            .cloned()
+                    })
             })
             .map(|names| {
                 names
@@ -1353,18 +1362,29 @@ impl Agent {
             .tool_exposure
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Rebuild from the branch: drop what this process had discovered, then
+        // apply what the branch saved.
+        exposure.reset_discovered();
         for name in saved {
             if self.tools.contains(&name) && authorized.contains(&name) {
                 exposure.activate_authorized(&name, true);
             }
         }
-        self.persisted_tool_exposure = Some(exposure.visible_names().clone());
+        self.persisted_tool_exposure = Some(exposure.discovered_names().clone());
+    }
+
+    /// Derive every piece of branch-owned state from the session's current
+    /// branch. A session load and a transcript rewind both call this, so the
+    /// two cannot disagree about what the branch holds.
+    pub(crate) fn restore_branch_state(&mut self) {
+        self.restore_mutation_verification();
+        self.restore_tool_exposure();
     }
 
     /// Restore the state persisted on the session's current branch. Without
     /// one, the state is empty: it belongs to the session, not to the agent.
     fn restore_mutation_verification(&mut self) {
-        let restored = self.session.as_ref().and_then(|session| {
+        let saved = self.session.as_ref().and_then(|session| {
             davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
                 .into_iter()
                 .rev()
@@ -1372,16 +1392,40 @@ impl Agent {
                     entry.entry_type == "custom"
                         && entry.custom_type.as_deref() == Some(MUTATION_VERIFICATION_ENTRY_TYPE)
                 })
-                .and_then(|entry| entry.extra.get("data"))
-                .and_then(|data| {
-                    serde_json::from_value::<MutationVerificationState>(data.clone()).ok()
-                })
+                .map(|entry| entry.extra.get("data").cloned())
         });
+        let (state, persisted) = match saved {
+            None => (MutationVerificationState::default(), None),
+            Some(data) => match data
+                .and_then(|data| serde_json::from_value::<MutationVerificationState>(data).ok())
+            {
+                Some(state) => (state.clone(), Some(state)),
+                // An entry exists but cannot be read: an edit may be pending.
+                // Never fall back to "nothing happened"; treat the work as
+                // edited and unverified until a check passes.
+                None => {
+                    eprintln!(
+                        "warning: the saved mutation-verification state could not be read; treating the session as having unverified edits"
+                    );
+                    (
+                        MutationVerificationState {
+                            mutation_generation: 1,
+                            unknown_mutation_paths: true,
+                            last_classification_reason: Some(
+                                "saved mutation-verification state could not be read".into(),
+                            ),
+                            ..MutationVerificationState::default()
+                        },
+                        None,
+                    )
+                }
+            },
+        };
         *self
             .mutation_verification
             .lock()
-            .unwrap_or_else(|err| err.into_inner()) = restored.clone().unwrap_or_default();
-        self.persisted_mutation_verification = restored;
+            .unwrap_or_else(|err| err.into_inner()) = state;
+        self.persisted_mutation_verification = persisted;
     }
 
     /// Classify whether the current run has evidence for its latest mutation.
@@ -4640,9 +4684,8 @@ impl Agent {
             self.root_budget = Some(budget);
         }
         self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
-        self.restore_mutation_verification();
         self.set_runtime(candidate);
-        self.restore_tool_exposure();
+        self.restore_branch_state();
         self.install_prompt_checkpoints(rewind);
         self.restore_living_plan();
         let _ = self.restore_prompt_session();

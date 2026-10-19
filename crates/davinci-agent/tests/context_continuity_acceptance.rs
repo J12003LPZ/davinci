@@ -151,7 +151,14 @@ fn unknown_effect_reaches_the_active_context_vm_fold_unchanged() {
         .unwrap()
         .context_vm
         .load_state_from_root()
-        .unwrap_or_default();
+        .expect("the checkpoint the fold wrote can be read back");
+    // The property below is about a checkpoint that exists. An empty one (a
+    // fold that wrote nothing, or a load that fell back to the default) would
+    // satisfy it for the wrong reason.
+    assert!(
+        state.through_seq > 0,
+        "the fold must have produced a checkpoint covering the evicted events: {state:?}"
+    );
     assert!(
         !format!("{:?}", state.completed).contains("deploy"),
         "an unknown outcome is not completed work: {:?}",

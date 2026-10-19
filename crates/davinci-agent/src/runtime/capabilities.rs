@@ -419,6 +419,11 @@ impl RuntimeCapability {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExposureState {
     visible: BTreeSet<String>,
+    /// Names made visible after construction (by discovery or an explicit
+    /// selection). Only these are saved with a session and rebuilt from one;
+    /// the initial set is the host's.
+    #[serde(default)]
+    discovered: BTreeSet<String>,
 }
 
 impl ToolExposureState {
@@ -429,6 +434,7 @@ impl ToolExposureState {
     {
         Self {
             visible: initial.into_iter().map(Into::into).collect(),
+            discovered: BTreeSet::new(),
         }
     }
 
@@ -438,15 +444,33 @@ impl ToolExposureState {
 
     pub fn activate_authorized(&mut self, name: &str, authorized: bool) -> bool {
         if authorized {
-            self.visible.insert(name.to_string())
+            let inserted = self.visible.insert(name.to_string());
+            if inserted {
+                self.discovered.insert(name.to_string());
+            }
+            inserted
         } else {
             self.visible.remove(name);
+            self.discovered.remove(name);
             false
         }
     }
 
     pub fn retain_authorized(&mut self, authorized: &BTreeSet<String>) {
         self.visible.retain(|name| authorized.contains(name));
+        self.discovered.retain(|name| authorized.contains(name));
+    }
+
+    /// Names made visible after construction, in order.
+    pub fn discovered_names(&self) -> &BTreeSet<String> {
+        &self.discovered
+    }
+
+    /// Hide everything that was discovered, leaving the host's initial set.
+    pub fn reset_discovered(&mut self) {
+        for name in std::mem::take(&mut self.discovered) {
+            self.visible.remove(&name);
+        }
     }
 
     pub fn visible_names(&self) -> &BTreeSet<String> {

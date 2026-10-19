@@ -3016,6 +3016,43 @@ fn resumed_session_keeps_unverified_mutation() {
 }
 
 #[test]
+fn unreadable_mutation_state_fails_closed_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut session = JsonlSession::create(sessions.path(), "corrupt", None).unwrap();
+    let mut extra = serde_json::Map::new();
+    // Valid JSON of the wrong shape: schema drift or a hand edit.
+    extra.insert(
+        "data".into(),
+        serde_json::json!({"mutation_generation": "three"}),
+    );
+    session
+        .append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some("mutation_verification".into()),
+            extra,
+        })
+        .unwrap();
+    let path = session.path.clone();
+    drop(session);
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    // Not "nothing happened": an edit may be pending and nothing verified it.
+    assert_eq!(
+        resumed.completion_evidence(),
+        CompletionEvidence::Unverified
+    );
+    assert!(resumed.mutation_verification_state().unknown_mutation_paths);
+}
+
+#[test]
 fn last_mutation_generation_survives() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = tempfile::tempdir().unwrap();
