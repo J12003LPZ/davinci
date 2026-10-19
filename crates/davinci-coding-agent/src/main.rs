@@ -2595,7 +2595,7 @@ fn build_worker_agent(
         // (and `WorkerAccess` does not offer those tools). In the shared
         // workspace, writers take turns through the team's shared-write
         // lease.
-        _ => worker_child_mode(req.parent_permission_mode),
+        _ => worker_child_mode(req.parent_permission_mode, req.worktree_path.is_some()),
     };
     let mut policy = davinci_agent::PermissionPolicy::new(child_mode);
     if let Some(wt) = &req.worktree_path {
@@ -2687,8 +2687,17 @@ fn build_worker_agent(
 /// profile mode is held to the same ceiling by `validate_profile_containment`.
 fn worker_child_mode(
     parent: Option<davinci_agent::PermissionMode>,
+    worktree: bool,
 ) -> davinci_agent::PermissionMode {
-    parent.unwrap_or(davinci_agent::PermissionMode::ReadOnly)
+    match parent {
+        // Manual asks before every edit and a worker has no approver. In its
+        // own lease its edits are confined by the worktree boundary and reach
+        // the user's checkout only when the lead merges them, so it edits.
+        Some(davinci_agent::PermissionMode::Ask) if worktree => {
+            davinci_agent::PermissionMode::Edits
+        }
+        other => other.unwrap_or(davinci_agent::PermissionMode::ReadOnly),
+    }
 }
 
 fn run_worker_turn(parsed: &Args, child: &mut Agent, prompt: &str) -> Result<String, String> {

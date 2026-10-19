@@ -312,12 +312,18 @@ impl WorkerAccess {
     /// A worker runs in its parent's permission mode and has no approver, so
     /// anything the mode would ask about is refused. It is therefore offered
     /// only what the mode allows without a question: Plan Mode (or a host that
-    /// did not say) and Manual read; Accept Edits also edits files; Auto and
+    /// did not say) and Manual read (Manual may also edit inside a worktree
+    /// lease); Accept Edits also edits files; Auto and
     /// Always Approve also run shell commands, but only in a worktree lease,
     /// which is its own checkout.
     pub fn for_worker(parent_mode: Option<PermissionMode>, worktree: bool) -> Self {
         match parent_mode {
             Some(PermissionMode::Edits) => Self::FileEdits,
+            // Manual asks before every edit and a worker cannot answer. Inside
+            // its own lease the edits are confined to the lease, and they reach
+            // the user's checkout only when the lead merges them (an action the
+            // lead's Manual mode asks about), so the lease may be edited.
+            Some(PermissionMode::Ask) if worktree => Self::FileEdits,
             Some(PermissionMode::Auto | PermissionMode::AlwaysApprove) if worktree => Self::Full,
             Some(PermissionMode::Auto | PermissionMode::AlwaysApprove) => Self::FileEdits,
             Some(PermissionMode::ReadOnly | PermissionMode::Ask) | None => Self::ReadOnly,
@@ -769,15 +775,6 @@ pub fn run_tool(
     }
     let is_parent_readonly = parent.permission_mode == Some(PermissionMode::ReadOnly);
     for spec in &specs {
-        // Manual mode asks before every edit and a worker cannot answer, so a
-        // lease would be created for a worker that can only read.
-        if parent.permission_mode == Some(PermissionMode::Ask)
-            && spec.isolation.as_deref() == Some("worktree")
-        {
-            return Err(ToolError::Failed(
-                "Parent permission mode 'ask' cannot grant worktree isolation: workers have no approver, so they could not edit in the lease".into(),
-            ));
-        }
         if is_parent_readonly {
             if spec.isolation.as_deref() == Some("worktree") {
                 return Err(ToolError::Failed(
@@ -2354,22 +2351,50 @@ mod tests {
     }
 
     #[test]
-    fn worktree_isolation_is_refused_when_the_parent_mode_asks_before_edits() {
-        // A worker has no approver, so under Manual it could not edit in the
-        // lease it would be given: refuse before creating one.
-        let runner = SubagentRunner::new(|_| panic!("no worker may start"));
+    fn manual_mode_worktree_worker_edits_only_inside_its_lease() {
+        // Manual is the default mode. A worker with its own worktree may edit
+        // there (no shell): its edits are confined to the lease by the
+        // worktree boundary and reach the user's checkout only when the lead
+        // merges them, which the lead's own Manual mode asks about.
+        let repo = init_subagent_temp_git_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), worktrees.path());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(Vec<String>, bool)>::new()));
+        let record = seen.clone();
+        let runner = SubagentRunner::new(move |req| {
+            record
+                .lock()
+                .unwrap()
+                .push((req.tools.clone(), req.worktree_path.is_some()));
+            Ok("edited".into())
+        });
         let parent = SubagentParent {
+            worktree_manager: Some(manager),
             permission_mode: Some(PermissionMode::Ask),
-            ..SubagentParent::default()
+            ..Default::default()
         };
-        let err = run_tool(
+        let tools: Vec<String> = ["read", "write", "bash"].map(String::from).into();
+        run_tool(
             &json!({"prompt": "edit in worktree", "isolation": "worktree"}),
-            &["read".into(), "write".into()],
+            &tools,
             Some(&runner),
             &parent,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot grant worktree isolation"));
+        .expect("a lease worker is allowed under Manual");
+        // A worker in the shared workspace stays read-only under Manual.
+        run_tool(
+            &json!({"prompt": "look around"}),
+            &tools,
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0],
+            (vec!["read".to_string(), "write".to_string()], true)
+        );
+        assert_eq!(seen[1], (vec!["read".to_string()], false));
     }
 
     #[test]
@@ -2953,9 +2978,10 @@ mod tests {
             WorkerAccess::for_worker(Some(PermissionMode::Ask), false),
             WorkerAccess::ReadOnly
         );
+        // ... except in a worktree lease, where edits stay inside the lease.
         assert_eq!(
             WorkerAccess::for_worker(Some(PermissionMode::Ask), true),
-            WorkerAccess::ReadOnly
+            WorkerAccess::FileEdits
         );
         assert_eq!(
             WorkerAccess::for_worker(Some(PermissionMode::Edits), true),
@@ -2986,15 +3012,17 @@ mod tests {
             )
         };
         for worktree in [false, true] {
-            // Plan Mode and Manual (Ask) can only read: edits and shell ask.
+            // Plan Mode reads only; Manual reads only outside a lease.
             assert_eq!(scoped(PermissionMode::ReadOnly, worktree), vec!["read"]);
-            assert_eq!(scoped(PermissionMode::Ask, worktree), vec!["read"]);
             // Accept Edits runs file edits; the shell still asks.
             assert_eq!(
                 scoped(PermissionMode::Edits, worktree),
                 vec!["read", "write"]
             );
         }
+        // Manual: edits only inside a lease, never a shell.
+        assert_eq!(scoped(PermissionMode::Ask, false), vec!["read"]);
+        assert_eq!(scoped(PermissionMode::Ask, true), vec!["read", "write"]);
         // Only a lease is its own checkout, so only it earns a shell, and only
         // when the mode runs shell commands without a question.
         assert_eq!(scoped(PermissionMode::Auto, false), vec!["read", "write"]);
