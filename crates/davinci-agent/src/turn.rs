@@ -242,6 +242,9 @@ impl Agent {
         T: Into<crate::CompleteOutput>,
     {
         self.ensure_session_persistence()?;
+        // Before the outbox replay: that replay may add results for calls whose
+        // assistant message lives only in the journal.
+        self.validate_loaded_tool_history()?;
         self.recover_pending_operation_publications()?;
         self.reconcile_unresolved_tool_calls()?;
         self.require_prompt_checkpoint_persistence()?;
@@ -365,6 +368,77 @@ impl Agent {
             self.messages.insert(at, message);
         }
         self.ensure_session_persistence()
+    }
+
+    fn validate_loaded_tool_history(&mut self) -> Result<(), String> {
+        if self.is_streaming {
+            return Ok(());
+        }
+        self.drop_duplicate_tool_results();
+        self.reject_orphan_tool_results()
+    }
+
+    /// A second result for one call id would reach the provider as a second
+    /// output. The first one answered the call; later ones are dropped.
+    fn drop_duplicate_tool_results(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.messages.retain(|message| {
+            message.role != "toolResult"
+                || message
+                    .tool_call_id
+                    .as_ref()
+                    .map_or(true, |id| seen.insert(id.clone()))
+        });
+    }
+
+    /// A result whose call id was never issued by an earlier assistant message
+    /// cannot be repaired by guessing; the history is refused before any
+    /// provider request is built from it.
+    fn reject_orphan_tool_results(&self) -> Result<(), String> {
+        // Only a persisted conversation is checked: its history came from disk
+        // and may be damaged. Hosts that build `messages` in memory own them.
+        if self.session.is_none() {
+            return Ok(());
+        }
+        let mut called = std::collections::HashSet::new();
+        let mut orphans: Vec<&str> = Vec::new();
+        for message in &self.messages {
+            if message.role == "assistant" {
+                for content in &message.content {
+                    if let davinci_ai::MessageContent::ToolCall { id, .. } = content {
+                        called.insert(id.as_str());
+                    }
+                }
+            } else if message.role == "toolResult" {
+                if let Some(id) = message.tool_call_id.as_deref() {
+                    if !called.contains(id) {
+                        orphans.push(id);
+                    }
+                }
+            }
+        }
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        // The operation journal is a second record of issued calls: a result
+        // it can account for is not an orphan.
+        if let (Some(journal), Some(session)) = (self.operation_journal(), self.session.as_ref()) {
+            let snapshot = journal
+                .snapshot()
+                .map_err(|error| format!("operation journal could not be read: {error}"))?;
+            orphans.retain(|id| {
+                !snapshot.operations.iter().any(|spec| {
+                    spec.context().session_id == session.header.id
+                        && spec.context().wire_tool_call_id.as_deref() == Some(*id)
+                })
+            });
+        }
+        match orphans.first() {
+            None => Ok(()),
+            Some(id) => Err(format!(
+                "Tool result {id} has no matching tool call earlier in the conversation; refusing to send an unpaired history."
+            )),
+        }
     }
 
     /// `(assistant index, call id, tool name)` for calls with no toolResult.
