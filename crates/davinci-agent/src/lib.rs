@@ -4270,7 +4270,9 @@ impl Agent {
             });
             let provider = self.provider.clone();
             let model_id = self.model_id.clone();
+            let window = self.context_window;
             let bound = self.summarizer.clone().map(|inner| {
+                let budget = inner.input_budget().unwrap_or(window / 100 * 95);
                 Summarizer::new(move |request| {
                     let mut request = request.clone();
                     if request.provider.is_empty() {
@@ -4281,6 +4283,7 @@ impl Agent {
                     }
                     inner.summarize(&request)
                 })
+                .with_input_budget(budget)
             });
             let observations = self.provider_observation_scope("compaction");
             let result = compact_messages_with_options(
