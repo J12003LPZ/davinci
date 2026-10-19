@@ -11,13 +11,20 @@
 //! servers, so it is never automatic: `/setup trust` records that decision.
 
 use super::memory_page;
+use super::service_supervisor::find_in_paths;
+#[cfg(test)]
+use super::service_supervisor::is_local_url;
+use super::service_supervisor::{system_supervisor, ManagedServiceSupervisor};
+use super::setup_health::{ComponentHealth, HealthState};
+use super::setup_profile::load_effective_setup;
+use super::vector_memory::process_env;
 use super::vector_memory::VectorMemory;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Local state Davinci writes under the workspace that should never be
 /// committed: learned durable memory records and graph run journals.
@@ -25,8 +32,6 @@ pub const IGNORED_STATE: &[&str] = &[".davinci/vector-memory/", ".davinci/graph/
 /// Records embedded per batch after a pull; the memory lock is released
 /// between batches so a turn is never held behind the whole backlog.
 const REINDEX_BATCHES: usize = 40;
-/// How long `/setup` waits for a freshly started `ollama serve` to answer.
-const SERVE_WAIT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -324,61 +329,6 @@ pub fn embed_backlog(memory: &Arc<Mutex<VectorMemory>>) -> usize {
     total
 }
 
-fn find_on_path(program: &str) -> Option<PathBuf> {
-    find_in_paths(program, &std::env::var_os("PATH")?)
-}
-
-/// First `program` in `path_var`. Only absolute directories count: a relative
-/// entry (`.`, or an empty one) resolves against the process working
-/// directory, which is the project, so a project could plant the executable
-/// that `/setup` then starts.
-fn find_in_paths(program: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path_var)
-        .filter(|directory| directory.is_absolute())
-        .find_map(|directory| {
-            let plain = directory.join(program);
-            let mut candidates = vec![plain.clone()];
-            if cfg!(windows) {
-                for extension in ["exe", "cmd", "bat"] {
-                    candidates.push(plain.with_extension(extension));
-                }
-            }
-            candidates.into_iter().find(|candidate| candidate.is_file())
-        })
-}
-
-/// Only a local Ollama is ever started; a remote URL is the user's server.
-fn is_local_url(url: &str) -> bool {
-    let Ok(url) = url::Url::parse(url) else {
-        return false;
-    };
-    matches!(url.scheme(), "http" | "https")
-        && matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "0.0.0.0")
-        )
-}
-
-fn spawn_ollama_serve(program: &Path) -> Result<(), String> {
-    let mut command = std::process::Command::new(program);
-    command
-        .arg("serve")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
-    }
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 /// Probe the embedding service from a config snapshot: the memory lock is
 /// released before the network is touched, so a slow or hung server never
 /// holds up a turn that needs memory.
@@ -391,18 +341,45 @@ fn probe_unlocked(memory: &Arc<Mutex<VectorMemory>>) -> memory_page::Probe {
     memory_page::probe_config(&config)
 }
 
-fn wait_for_server(memory: &Arc<Mutex<VectorMemory>>) -> memory_page::Probe {
-    let started = Instant::now();
-    loop {
-        let probe = probe_unlocked(memory);
-        if probe.reachable || started.elapsed() >= SERVE_WAIT {
-            return probe;
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    find_in_paths(program, &std::env::var_os("PATH")?)
+}
+
+/// What a setup step may use: the host's agent directory (where consent and
+/// the profile live) and the service supervisor.
+pub struct SetupContext<'a> {
+    pub agent_dir: &'a Path,
+    pub supervisor: &'a ManagedServiceSupervisor,
+}
+
+impl<'a> SetupContext<'a> {
+    /// The real machine: this process's supervisor.
+    pub fn system(agent_dir: &'a Path) -> Self {
+        Self {
+            agent_dir,
+            supervisor: system_supervisor(),
         }
-        std::thread::sleep(Duration::from_millis(400));
     }
 }
 
-pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
+fn step_from_health(id: &'static str, title: &'static str, health: &ComponentHealth) -> Step {
+    let state = match health.state {
+        HealthState::Ready => StepState::Ready,
+        HealthState::Disabled => StepState::Skipped,
+        HealthState::Checking | HealthState::Starting => StepState::Running,
+        _ => StepState::Action,
+    };
+    let mut step = Step::new(id, title, state, health.detail.clone());
+    if let Some(code) = health.code {
+        step = step.with_code(code);
+    }
+    if let Some(remediation) = &health.remediation {
+        step = step.with_action(remediation.clone());
+    }
+    step
+}
+
+pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool, ctx: &SetupContext) -> Step {
     const ID: &str = "memory";
     const TITLE: &str = "vector memory";
     let (enabled, url, model, dimensions) = {
@@ -440,10 +417,11 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
     let mut probe = probe_unlocked(memory);
     let mut started_server = false;
     if !probe.reachable {
-        let installed = find_on_path("ollama");
-        match installed {
-            None => {
-                return Step::new(
+        if !apply {
+            // Read-only: say what is wrong without starting anything.
+            let installed = ctx.supervisor.launcher().find();
+            return match installed {
+                None => Step::new(
                     ID,
                     TITLE,
                     StepState::Action,
@@ -452,41 +430,35 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
                 .with_code(super::setup_health::INSTALL_REQUIRED)
                 .with_action(format!(
                     "install Ollama from https://ollama.com/download, then run /setup (it pulls {model})"
-                ));
-            }
-            Some(program) if apply && is_local_url(&url) => {
-                if let Err(error) = spawn_ollama_serve(&program) {
-                    return Step::new(
-                        ID,
-                        TITLE,
-                        StepState::Action,
-                        format!("could not start {}: {error}", program.display()),
-                    )
-                    .with_action("start Ollama (`ollama serve`), then run /setup");
-                }
-                probe = wait_for_server(memory);
-                if !probe.reachable {
-                    return Step::new(
-                        ID,
-                        TITLE,
-                        StepState::Action,
-                        format!("started `ollama serve` but {url} did not answer yet"),
-                    )
-                    .with_action("run /setup again in a few seconds");
-                }
-                started_server = true;
-            }
-            Some(_) => {
-                return Step::new(
+                )),
+                Some(_) => Step::new(
                     ID,
                     TITLE,
                     StepState::Action,
                     format!("Ollama is installed but {url} does not answer"),
                 )
                 .with_code(super::setup_health::PROVIDER_OFFLINE)
-                .with_action("start Ollama (`ollama serve`), then run /setup");
-            }
+                .with_action("run /setup to start it (it asks once), or `ollama serve`"),
+            };
         }
+        // The supervisor starts it only with the user's consent and only the
+        // Ollama the user approved; see `service_supervisor`.
+        let effective = load_effective_setup(ctx.agent_dir, &process_env);
+        let health = ctx.supervisor.reconcile(ctx.agent_dir, &effective);
+        if health.state != HealthState::Ready {
+            return step_from_health(ID, TITLE, &health);
+        }
+        probe = probe_unlocked(memory);
+        if !probe.reachable {
+            return Step::new(
+                ID,
+                TITLE,
+                StepState::Action,
+                format!("started `ollama serve` but {url} did not answer yet"),
+            )
+            .with_action("run /setup again in a few seconds");
+        }
+        started_server = true;
     }
     let server = if started_server {
         "started Ollama"
@@ -948,6 +920,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+    use std::time::Instant;
 
     #[test]
     fn arguments_select_the_mode() {
@@ -1167,6 +1140,44 @@ mod tests {
         assert_eq!(answer["steps"][1]["action"], "fix it");
     }
 
+    /// A machine with no `ollama` at all, and a throwaway agent directory.
+    struct NoOllama;
+    impl super::super::service_supervisor::OllamaLauncher for NoOllama {
+        fn find(&self) -> Option<PathBuf> {
+            None
+        }
+        fn version(&self, _: &Path) -> Option<String> {
+            None
+        }
+        fn spawn(
+            &self,
+            _: &Path,
+            _: &Path,
+        ) -> Result<Box<dyn super::super::service_supervisor::OwnedProcess>, String> {
+            Err("no process may be started in this test".into())
+        }
+    }
+
+    struct TestCtx {
+        agent: tempfile::TempDir,
+        supervisor: ManagedServiceSupervisor,
+    }
+
+    impl TestCtx {
+        fn new() -> Self {
+            Self {
+                agent: tempfile::tempdir().unwrap(),
+                supervisor: ManagedServiceSupervisor::new(Box::new(NoOllama)),
+            }
+        }
+        fn ctx(&self) -> SetupContext<'_> {
+            SetupContext {
+                agent_dir: self.agent.path(),
+                supervisor: &self.supervisor,
+            }
+        }
+    }
+
     fn memory_with(dir: &Path, url: String) -> Arc<Mutex<VectorMemory>> {
         let config = VectorMemoryConfig {
             ollama_url: url,
@@ -1182,13 +1193,14 @@ mod tests {
 
     #[test]
     fn a_model_with_another_vector_size_names_the_dimension_fix() {
+        let tc = TestCtx::new();
         let dir = tempfile::tempdir().unwrap();
         // The server answers with 12 dimensions; memory expects 8.
         let memory = memory_with(
             dir.path(),
             super::super::vector_memory::tests::fake_ollama(12),
         );
-        let step = memory_step(&memory, false);
+        let step = memory_step(&memory, false, &tc.ctx());
         assert_eq!(step.state, StepState::Action, "{}", step.detail);
         assert_eq!(step.code, Some("EMBEDDING_MISMATCH"));
         assert!(step.detail.contains("12 dimensions"), "{}", step.detail);
@@ -1204,6 +1216,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_record_file_is_an_action_not_a_green_step() {
+        let tc = TestCtx::new();
         let dir = tempfile::tempdir().unwrap();
         let memory = memory_with(
             dir.path(),
@@ -1220,7 +1233,7 @@ mod tests {
                 config,
             )))
         };
-        let step = memory_step(&rebuilt, true);
+        let step = memory_step(&rebuilt, true, &tc.ctx());
         assert_eq!(step.state, StepState::Action);
         assert_eq!(step.code, Some("LOCAL_STORE_UNREADABLE"));
         assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfe");
@@ -1228,6 +1241,7 @@ mod tests {
 
     #[test]
     fn a_ready_server_embeds_records_that_have_no_vector() {
+        let tc = TestCtx::new();
         let dir = tempfile::tempdir().unwrap();
         let dead = {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1249,12 +1263,15 @@ mod tests {
             dir.path(),
             super::super::vector_memory::tests::fake_ollama(8),
         );
-        let checked = memory_step(&memory, false);
+        let checked = memory_step(&memory, false, &tc.ctx());
         assert_eq!(checked.state, StepState::Action, "{}", checked.detail);
-        let applied = memory_step(&memory, true);
+        let applied = memory_step(&memory, true, &tc.ctx());
         assert_eq!(applied.state, StepState::Done, "{}", applied.detail);
         assert!(applied.detail.contains("embedded 1"), "{}", applied.detail);
-        assert_eq!(memory_step(&memory, false).state, StepState::Ready);
+        assert_eq!(
+            memory_step(&memory, false, &tc.ctx()).state,
+            StepState::Ready
+        );
     }
 
     /// Ollama without the embedding model: `/api/tags` lists nothing and
@@ -1322,6 +1339,7 @@ Connection: close
 
     #[test]
     fn folder_trust_does_not_grant_service_start() {
+        let tc = TestCtx::new();
         let agent = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".davinci")).unwrap();
@@ -1350,7 +1368,7 @@ Connection: close
         // With the folder trusted, a check still only observes: it probes the
         // server (model list, one test embedding) and neither pulls a model
         // nor starts a server.
-        let checked = memory_step(&memory, false);
+        let checked = memory_step(&memory, false, &tc.ctx());
         assert_eq!(checked.state, StepState::Action, "{}", checked.detail);
         let seen = requests.lock().unwrap().clone();
         assert!(
@@ -1379,16 +1397,17 @@ Connection: close
 
     #[test]
     fn a_missing_model_is_pulled_in_the_background() {
+        let tc = TestCtx::new();
         let dir = tempfile::tempdir().unwrap();
         let memory = memory_with(dir.path(), ollama_without_model());
-        let checked = memory_step(&memory, false);
+        let checked = memory_step(&memory, false, &tc.ctx());
         assert_eq!(checked.state, StepState::Action);
         assert!(checked
             .action
             .unwrap()
             .contains("ollama pull embeddinggemma"));
 
-        let applied = memory_step(&memory, true);
+        let applied = memory_step(&memory, true, &tc.ctx());
         assert_eq!(applied.state, StepState::Running, "{}", applied.detail);
         let started = Instant::now();
         while !pull_progress().is_some_and(|p| p.finished) {

@@ -17,6 +17,7 @@ pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
 pub mod service_authority;
+pub mod service_supervisor;
 pub mod setup;
 pub mod setup_health;
 pub mod setup_profile;
@@ -1040,7 +1041,11 @@ impl NativeExtensionHost {
                         .as_bool()
                         .unwrap_or(false);
                     vec![
-                        setup::memory_step(&self.memory, apply),
+                        setup::memory_step(
+                            &self.memory,
+                            apply,
+                            &setup::SetupContext::system(&self.agent_dir),
+                        ),
                         setup::gitignore_step(&cwd, apply),
                         setup::trust_step(&self.agent_dir, &cwd),
                         setup::plugins_step(&self.agent_dir),

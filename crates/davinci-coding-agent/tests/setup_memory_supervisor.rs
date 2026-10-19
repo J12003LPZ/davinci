@@ -397,3 +397,289 @@ fn an_unreadable_store_is_action_required_even_when_ollama_is_fine() {
         HealthState::Ready
     );
 }
+
+// ---- Task 4: approved service supervisor ----------------------------------
+
+use davinci_coding_agent::native_extensions::service_authority::{
+    ServiceAction, ServiceConsentStore,
+};
+use davinci_coding_agent::native_extensions::service_supervisor::{
+    ManagedServiceSupervisor, OllamaLauncher, OwnedProcess, CONSENT_REQUIRED,
+    OLLAMA_IDENTITY_CHANGED,
+};
+use davinci_coding_agent::native_extensions::setup_profile::OllamaIdentity;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+
+/// Reserve a loopback port nothing listens on.
+fn free_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("http://{}", listener.local_addr().unwrap())
+}
+
+/// Serve a fake Ollama on exactly `url`.
+fn serve_fake_ollama_at(url: &str, models: &'static [&'static str], dimensions: usize) {
+    let address = url.trim_start_matches("http://").to_string();
+    let listener = loop {
+        match TcpListener::bind(&address) {
+            Ok(listener) => break listener,
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 8192];
+                let mut read = 0;
+                while let Ok(n) = stream.read(&mut buffer[read..]) {
+                    if n == 0 {
+                        break;
+                    }
+                    read += n;
+                    if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") && read > 40 {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let body = if request.starts_with("GET /api/tags") {
+                    let list: Vec<_> = models
+                        .iter()
+                        .map(|name| format!("{{\"name\":\"{name}\"}}"))
+                        .collect();
+                    format!("{{\"models\":[{}]}}", list.join(","))
+                } else if request.starts_with("POST /api/embed") {
+                    let vector: Vec<_> = (0..dimensions).map(|i| format!("{}.5", i % 7)).collect();
+                    format!("{{\"embeddings\":[[{}]]}}", vector.join(","))
+                } else {
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+}
+
+struct FakeProcess {
+    killed: Arc<AtomicBool>,
+}
+
+impl OwnedProcess for FakeProcess {
+    fn id(&self) -> u32 {
+        4242
+    }
+    fn has_exited(&mut self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
+    fn kill(&mut self) {
+        self.killed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A launcher that never starts a real process: "starting" brings up a fake
+/// server on the configured address.
+struct FakeLauncher {
+    path: Option<PathBuf>,
+    version: String,
+    url: String,
+    spawns: Arc<AtomicUsize>,
+    killed: Arc<AtomicBool>,
+}
+
+impl FakeLauncher {
+    fn new(url: &str, path: &str, version: &str) -> Self {
+        Self {
+            path: Some(PathBuf::from(path)),
+            version: version.into(),
+            url: url.into(),
+            spawns: Arc::new(AtomicUsize::new(0)),
+            killed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl OllamaLauncher for FakeLauncher {
+    fn find(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
+    fn version(&self, _: &Path) -> Option<String> {
+        Some(self.version.clone())
+    }
+    fn spawn(&self, _: &Path, _: &Path) -> Result<Box<dyn OwnedProcess>, String> {
+        self.spawns.fetch_add(1, Ordering::SeqCst);
+        serve_fake_ollama_at(&self.url, &["embeddinggemma:latest"], 768);
+        Ok(Box::new(FakeProcess {
+            killed: Arc::clone(&self.killed),
+        }))
+    }
+}
+
+struct Machine {
+    agent: tempfile::TempDir,
+    url: String,
+}
+
+impl Machine {
+    fn new() -> Self {
+        let machine = Self {
+            agent: tempfile::tempdir().unwrap(),
+            url: free_url(),
+        };
+        fs::write(
+            machine.agent.path().join("vector-memory.json"),
+            format!("{{\"ollamaUrl\":\"{}\"}}", machine.url),
+        )
+        .unwrap();
+        machine
+    }
+    fn consent(&self) {
+        ServiceConsentStore::open(self.agent.path())
+            .set(ServiceAction::StartLocalOllama, true)
+            .unwrap();
+    }
+    fn approve(&self, path: &str, version: &str) {
+        let mut profile = SetupProfile::default();
+        profile.ollama = Some(OllamaIdentity {
+            path: path.into(),
+            version: version.into(),
+        });
+        profile.save(self.agent.path()).unwrap();
+    }
+    fn effective(
+        &self,
+    ) -> davinci_coding_agent::native_extensions::setup_profile::EffectiveSetupConfig {
+        load_effective_setup(self.agent.path(), &no_env)
+    }
+}
+
+#[test]
+fn supervisor_starts_only_approved_ollama_once() {
+    // Without consent: ActionRequired, nothing started.
+    let machine = Machine::new();
+    machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+    let launcher = FakeLauncher::new(&machine.url, "/usr/bin/ollama", "ollama version 0.5.0");
+    let spawns = Arc::clone(&launcher.spawns);
+    let supervisor = ManagedServiceSupervisor::new(Box::new(launcher));
+    let health = supervisor.reconcile(machine.agent.path(), &machine.effective());
+    assert_eq!(
+        (health.state, health.code),
+        (HealthState::ActionRequired, Some(CONSENT_REQUIRED))
+    );
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
+
+    // Consent but no approved executable recorded: still nothing started.
+    let machine = Machine::new();
+    machine.consent();
+    let launcher = FakeLauncher::new(&machine.url, "/usr/bin/ollama", "ollama version 0.5.0");
+    let spawns = Arc::clone(&launcher.spawns);
+    let supervisor = ManagedServiceSupervisor::new(Box::new(launcher));
+    let health = supervisor.reconcile(machine.agent.path(), &machine.effective());
+    assert_eq!(health.code, Some(CONSENT_REQUIRED));
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
+
+    // A different binary than the approved one (a planted copy, or an update
+    // nobody approved) is refused.
+    for (found_path, found_version) in [
+        ("/work/project/ollama", "ollama version 0.5.0"),
+        ("/usr/bin/ollama", "ollama version 9.9.9"),
+    ] {
+        let machine = Machine::new();
+        machine.consent();
+        machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+        let launcher = FakeLauncher::new(&machine.url, found_path, found_version);
+        let spawns = Arc::clone(&launcher.spawns);
+        let supervisor = ManagedServiceSupervisor::new(Box::new(launcher));
+        let health = supervisor.reconcile(machine.agent.path(), &machine.effective());
+        assert_eq!(
+            (health.state, health.code),
+            (HealthState::ActionRequired, Some(OLLAMA_IDENTITY_CHANGED)),
+            "{found_path} {found_version}"
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+    }
+
+    // Approved and consented: two simultaneous launches start it once.
+    let machine = Machine::new();
+    machine.consent();
+    machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+    let launcher = FakeLauncher::new(&machine.url, "/usr/bin/ollama", "ollama version 0.5.0");
+    let spawns = Arc::clone(&launcher.spawns);
+    let killed = Arc::clone(&launcher.killed);
+    let supervisor = Arc::new(ManagedServiceSupervisor::new(Box::new(launcher)));
+    let effective = machine.effective();
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let supervisor = Arc::clone(&supervisor);
+            let effective = effective.clone();
+            let dir = machine.agent.path().to_path_buf();
+            std::thread::spawn(move || supervisor.reconcile(&dir, &effective))
+        })
+        .collect();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap().state, HealthState::Ready);
+    }
+    assert_eq!(spawns.load(Ordering::SeqCst), 1, "started more than once");
+
+    // A third reconcile finds it healthy and starts nothing.
+    let health = supervisor.reconcile(machine.agent.path(), &effective);
+    assert_eq!(health.state, HealthState::Ready);
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+
+    // It stops only what it started.
+    assert_eq!(supervisor.owned_pid(), Some(4242));
+    assert!(supervisor.shutdown_owned());
+    assert!(killed.load(Ordering::SeqCst));
+    assert!(!supervisor.shutdown_owned());
+}
+
+#[test]
+fn a_healthy_ollama_is_reused_and_never_stopped() {
+    let machine = Machine::new();
+    machine.consent();
+    machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+    serve_fake_ollama_at(&machine.url, &["embeddinggemma:latest"], 768);
+    let launcher = FakeLauncher::new(&machine.url, "/usr/bin/ollama", "ollama version 0.5.0");
+    let spawns = Arc::clone(&launcher.spawns);
+    let killed = Arc::clone(&launcher.killed);
+    let supervisor = ManagedServiceSupervisor::new(Box::new(launcher));
+    let health = supervisor.reconcile(machine.agent.path(), &machine.effective());
+    assert_eq!(health.state, HealthState::Ready);
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(supervisor.owned_pid(), None);
+    assert!(!supervisor.shutdown_owned());
+    assert!(
+        !killed.load(Ordering::SeqCst),
+        "a server DaVinci did not start was killed"
+    );
+}
+
+#[test]
+fn a_disabled_memory_is_never_probed_or_started() {
+    let machine = Machine::new();
+    machine.consent();
+    machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+    let mut profile = SetupProfile::load(machine.agent.path()).0;
+    profile.memory.enabled = Some(false);
+    profile.save(machine.agent.path()).unwrap();
+    let server = fake_ollama(&["embeddinggemma"], 768);
+    fs::write(
+        machine.agent.path().join("vector-memory.json"),
+        format!("{{\"ollamaUrl\":\"{}\"}}", server.url),
+    )
+    .unwrap();
+    let launcher = FakeLauncher::new(&machine.url, "/usr/bin/ollama", "ollama version 0.5.0");
+    let spawns = Arc::clone(&launcher.spawns);
+    let supervisor = ManagedServiceSupervisor::new(Box::new(launcher));
+    let health = supervisor.reconcile(machine.agent.path(), &machine.effective());
+    assert_eq!(health.state, HealthState::Disabled);
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        server.requests.load(Ordering::SeqCst),
+        0,
+        "a disabled feature was probed"
+    );
+}
