@@ -14,7 +14,7 @@ plumbing, not model quality.
 | Mode | Compactions or folds | Requirement hits | Result |
 | --- | --- | --- | --- |
 | Off | 0 | 883 / 883 | clean (baseline, never compacted at 64k) |
-| Hybrid | 1 | 843 / 883 | known loss: turn 5 and turn 12 requirements gone after the first compaction |
+| Hybrid | 1 compaction, 6 summarizer requests | 883 / 883 | clean, including cold resume and branch |
 | Active | 22 | 883 / 883 | clean, including cold resume and branch |
 
 Findings:
@@ -25,14 +25,20 @@ Findings:
   deterministic rebuild. Fixed: the restored runtime uses the agent's cache
   (`crates/davinci-agent/src/lib.rs`, regression:
   `tests/context_page_cold_load.rs` and the lifecycle eval).
-- Hybrid loses early requirements. A fold sends all unfolded events in one
-  request that must fit the window; the oldest events are omitted from it
-  (`omitted_events`) and never reach the ledger, and the deterministic fallback
-  keeps only a bounded number of goals. Not fixed: it needs oldest-first chunked
-  folds in `fold_context`. The eval records the exact loss as a known failure and
-  fails if any other regression appears or if the loss disappears. Hybrid's cold
-  resume and branch checks do not run while it has a regression, so they are
-  unmeasured.
+- Hybrid lost early requirements (843 / 883 before the fix). A fold sent all
+  unfolded events in one request that had to fit the window; the oldest events
+  were omitted from it (`omitted_events`) and never reached the ledger, and the
+  deterministic fallback keeps only a bounded number of goals. Fixed:
+  `fold_context` now folds oldest first in chunks (`fold_chunk` in
+  `runtime/context_vm/fold.rs`), each sized to the summarizer window, and
+  commits and checkpoints each chunk before asking for the next. A fold is
+  capped at 12 requests (`MAX_FOLD_CHUNKS`); past the cap it fails closed with
+  `CONTEXT_ADMISSION_FAILED`, keeps the chunks already committed, and leaves the
+  history unchanged. When the instructions and state alone fill a very small
+  window, no request is made and the deterministic state carries the rest (the
+  behavior `tests/context_vm_hybrid.rs` documents). Cost: a long unfolded history now takes several summarizer
+  requests instead of one lossy one (6 in this scenario). Regression:
+  `tests/context_fold_chunks.rs` and the Hybrid row above.
 - Not covered here: the live-model quality campaign (needs authorization), the
   10k-entry resume benchmark, and an indexed checkpoint.
 

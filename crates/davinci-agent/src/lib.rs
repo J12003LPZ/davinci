@@ -79,9 +79,9 @@ pub use compaction::{
 };
 pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
-    context_file_charges, load_context_files, load_context_files_for_targets, repository_root,
-    ContextBudgetReport, ContextContribution, ContextFile, ContextPriority, RootContextAccount,
-    SelectedRootContext, INSTRUCTION_FILE,
+    context_file_charges, load_context_files, load_context_files_for_targets, repository_root, ContextBudgetReport,
+    ContextContribution, ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
+    INSTRUCTION_FILE,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
@@ -673,7 +673,8 @@ pub struct Agent {
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// The first session write that failed outside the session's own sticky
     /// error, with the session file it belongs to. Cleared by opening another
-    /// session. `ensure_session_persistence` reports it as PERSISTENCE_FAILURE.
+    /// session.
+    /// `ensure_session_persistence` reports it as PERSISTENCE_FAILURE.
     persistence_failure: Option<(std::path::PathBuf, String)>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
@@ -691,6 +692,9 @@ pub struct Agent {
     /// Separate from mutable public session/runtime fields to reject stale reuse.
     runtime_session: Option<(PathBuf, String, RunId)>,
 }
+
+/// Summarizer requests one fold may make. Past it the fold fails closed.
+const MAX_FOLD_CHUNKS: usize = 12;
 
 impl Agent {
     pub fn new(system_prompt: impl Into<String>) -> Self {
@@ -4047,96 +4051,141 @@ impl Agent {
         // An earlier fold already turned older events into the parent state,
         // so the summarizer gets only the newer ones. Validation below still
         // sees every event, so a value may cite an older source.
-        let unfolded = events
+        let mut unfolded = events
             .iter()
             .filter(|event| event.seq > folded_through)
             .cloned()
             .collect::<Vec<_>>();
-        let observations = self.provider_observation_scope("compaction");
-        let proposal = self.summarizer.as_ref().and_then(|summarizer| {
-            let request = runtime::context_vm::fold_request(
-                &parent,
-                &unfolded,
-                custom_instructions,
-                self.context_window,
-                &self.provider,
-                &self.model_id,
-            )?;
-            // A failed proposal falls back to the deterministic checkpoint.
-            let proposal = summarizer.summarize(&request).and_then(|response| {
-                match compaction::get_summarization_failure(&response, "context fold") {
-                    Some(failure) => Err(failure),
-                    None => runtime::context_vm::parse_checkpoint_proposal(&response.text),
+        let mut parent = parent;
+        let mut chunks = 0usize;
+        // Oldest first, in chunks that each fit the summarizer's window, so
+        // every unfolded event reaches the ledger. Each chunk is committed and
+        // checkpointed before the next is asked for: a failure part-way keeps
+        // the chunks already folded, and the history is never rewritten.
+        let (root, before_tokens, after_tokens) = loop {
+            chunks += 1;
+            let mut chunk_len = unfolded.len();
+            let mut request = None;
+            if self.summarizer.is_some() && !unfolded.is_empty() {
+                if chunks > MAX_FOLD_CHUNKS {
+                    return Err(format!(
+                        "{}: the unfolded history needs more than {MAX_FOLD_CHUNKS} summarizer requests; the folds so far are kept and the history is unchanged",
+                        compaction::CONTEXT_ADMISSION_FAILED
+                    ));
                 }
-            });
-            proposal
-                .map_err(|error| {
-                    runtime.context_vm.record_failure(
-                        "fold_proposal",
-                        format!("{error}; used the deterministic checkpoint"),
-                    )
-                })
-                .ok()
-        });
-        let observed = observations.finish(if proposal.is_some() {
-            "completed"
-        } else {
-            "failed"
-        });
-        for observation in observed {
-            self.stats.note_provider_observation(&observation);
-            self.emit_live(AgentEvent::ProviderObservation {
-                observation: Box::new(observation),
-            });
-        }
-        // The checkpoint entry below is the durable record of this fold. If it
-        // cannot be written, the in-memory VM must not stay a fold ahead of
-        // the session it reloads from (WOR-61).
-        let undo = runtime.context_vm.fold_undo_point();
-        let root = match runtime
-            .context_vm
-            .fold_with_proposal(reason, &events, proposal)
-        {
-            Ok(root) => root,
-            Err(error) => {
-                runtime.context_vm.undo_fold(undo);
-                return Err(error);
+                // When the instructions and the state alone fill the window (a
+                // very small one), no request can be made: nothing is sent and
+                // the deterministic state carries the rest, as it always has.
+                if let Some(chunk) = runtime::context_vm::fold_chunk(
+                    &parent,
+                    &unfolded,
+                    custom_instructions,
+                    self.context_window,
+                    &self.provider,
+                    &self.model_id,
+                ) {
+                    chunk_len = chunk.covered;
+                    request = Some(chunk.request);
+                }
             }
-        };
-        // Only the active mode sends a compiled image whose prefix is worth
-        // recording; compiling one for any other mode is wasted work.
-        let prefix_digest = if self.context_vm_mode() == ContextVmMode::Active {
-            self.prepared_context_image()
-                .map(|image| image.prefix_digest.clone())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let (before_tokens, after_tokens) = runtime.context_vm.last_fold_tokens().unwrap_or((0, 0));
-        if let Some(session) = &mut self.session {
-            let seq = session
-                .entries
-                .iter()
-                .map(|entry| entry.seq)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            let entry = runtime::context_vm::context_checkpoint_entry(
-                &root,
-                events.iter().map(|event| event.seq).max().unwrap_or(0),
-                &prefix_digest,
-                session.leaf_id.clone(),
-                seq,
-            );
-            if let Err(error) = session.append_entry(entry) {
-                runtime.context_vm.undo_fold(undo);
-                let error = format!("context checkpoint persistence failed: {error}");
-                runtime
-                    .context_vm
-                    .record_failure("fold", format!("{error}; the fold was rolled back"));
-                return Err(error);
+            let last = chunk_len >= unfolded.len();
+            let through = if last {
+                u64::MAX
+            } else {
+                unfolded[chunk_len - 1].seq
+            };
+            let observations = self.provider_observation_scope("compaction");
+            let proposal = request.as_ref().and_then(|request| {
+                let summarizer = self.summarizer.as_ref()?;
+                // A failed proposal falls back to the deterministic checkpoint.
+                let proposal = summarizer.summarize(request).and_then(|response| {
+                    match compaction::get_summarization_failure(&response, "context fold") {
+                        Some(failure) => Err(failure),
+                        None => runtime::context_vm::parse_checkpoint_proposal(&response.text),
+                    }
+                });
+                proposal
+                    .map_err(|error| {
+                        runtime.context_vm.record_failure(
+                            "fold_proposal",
+                            format!("{error}; used the deterministic checkpoint"),
+                        )
+                    })
+                    .ok()
+            });
+            let observed = observations.finish(if proposal.is_some() {
+                "completed"
+            } else {
+                "failed"
+            });
+            for observation in observed {
+                self.stats.note_provider_observation(&observation);
+                self.emit_live(AgentEvent::ProviderObservation {
+                    observation: Box::new(observation),
+                });
             }
-        }
+            // The checkpoint entry below is the durable record of this fold. If it
+            // cannot be written, the in-memory VM must not stay a fold ahead of
+            // the session it reloads from (WOR-61).
+            let undo = runtime.context_vm.fold_undo_point();
+            let root = match runtime
+                .context_vm
+                .fold_with_proposal_through(reason, &events, through, proposal)
+            {
+                Ok(root) => root,
+                Err(error) => {
+                    runtime.context_vm.undo_fold(undo);
+                    return Err(error);
+                }
+            };
+            // Only the active mode sends a compiled image whose prefix is worth
+            // recording; compiling one for any other mode is wasted work.
+            let prefix_digest = if self.context_vm_mode() == ContextVmMode::Active {
+                self.prepared_context_image()
+                    .map(|image| image.prefix_digest.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let (before_tokens, after_tokens) =
+                runtime.context_vm.last_fold_tokens().unwrap_or((0, 0));
+            if let Some(session) = &mut self.session {
+                let seq = session
+                    .entries
+                    .iter()
+                    .map(|entry| entry.seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let entry = runtime::context_vm::context_checkpoint_entry(
+                    &root,
+                    if last {
+                        events.iter().map(|event| event.seq).max().unwrap_or(0)
+                    } else {
+                        through
+                    },
+                    &prefix_digest,
+                    session.leaf_id.clone(),
+                    seq,
+                );
+                if let Err(error) = session.append_entry(entry) {
+                    runtime.context_vm.undo_fold(undo);
+                    let error = format!("context checkpoint persistence failed: {error}");
+                    runtime
+                        .context_vm
+                        .record_failure("fold", format!("{error}; the fold was rolled back"));
+                    return Err(error);
+                }
+            }
+            if last {
+                break (root, before_tokens, after_tokens);
+            }
+            unfolded.drain(..chunk_len);
+            parent = runtime
+                .context_vm
+                .load_state_from_root()
+                .unwrap_or_default();
+        };
         if reason != runtime::context_vm::FoldReason::Manual {
             runtime.context_vm.push_notice(format!(
                 "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \

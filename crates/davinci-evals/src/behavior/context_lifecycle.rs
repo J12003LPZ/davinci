@@ -118,8 +118,8 @@ pub fn audit_statuses() -> Vec<AuditStatus> {
         },
         AuditStatus {
             finding: "hybrid fold omits the oldest events from its prompt",
-            status: "open",
-            evidence: "known failure in context_lifecycle_no_authority_regression: needs chunked folds in fold_context",
+            status: "fixed",
+            evidence: "tests/context_fold_chunks.rs and context_lifecycle_no_authority_regression (Hybrid)",
         },
         AuditStatus {
             finding: "overlay (pin/exclude/correct) has no production source",
@@ -434,18 +434,6 @@ pub fn run_context_lifecycle_evals() -> Vec<ContextLifecycleScorecard> {
 mod tests {
     use super::*;
 
-    /// Hybrid folds every pending event in one summarizer request, and that
-    /// request holds only what fits the model window; the oldest events are
-    /// omitted from it and never reach the ledger. A requirement buried in an
-    /// early long message is then gone after the first compaction. Fixing it
-    /// needs chunked folds (oldest first), a change to `fold_context`, not a
-    /// fixture edit. Until then this exact loss is a known failure: any other
-    /// regression, or the loss disappearing, fails the test.
-    fn is_known_hybrid_loss(regression: &str) -> bool {
-        regression.starts_with("requirement stated at turn 5 missing")
-            || regression.starts_with("requirement stated at turn 12 missing")
-    }
-
     #[test]
     fn context_lifecycle_no_authority_regression() {
         let cards = run_context_lifecycle_evals();
@@ -458,34 +446,6 @@ mod tests {
         }
         for card in &cards {
             assert_eq!(card.turns, LIFECYCLE_TURNS);
-            if card.mode == "Off" {
-                // The baseline: no compaction is needed for it to be clean.
-                assert!(
-                    card.authority_regressions.is_empty(),
-                    "Off: {:?}",
-                    card.authority_regressions
-                );
-                assert!(card.passes(), "{card:?}");
-                continue;
-            }
-            assert!(
-                card.compactions_or_folds >= 1,
-                "{}: the session never compacted, so the gate proved nothing",
-                card.mode
-            );
-            if card.mode == "Hybrid" {
-                assert!(
-                    !card.authority_regressions.is_empty(),
-                    "Hybrid no longer loses the early requirements: remove the known-failure allowance"
-                );
-                let unexpected: Vec<_> = card
-                    .authority_regressions
-                    .iter()
-                    .filter(|r| !is_known_hybrid_loss(r))
-                    .collect();
-                assert!(unexpected.is_empty(), "Hybrid: {unexpected:?}");
-                continue;
-            }
             assert!(
                 card.authority_regressions.is_empty(),
                 "{}: {:?}",
@@ -493,6 +453,16 @@ mod tests {
                 card.authority_regressions
             );
             assert!(card.passes(), "{card:?}");
+            // Off is the baseline and never reaches its compaction threshold
+            // at this window; the other two must compact for the gate to mean
+            // anything.
+            if card.mode != "Off" {
+                assert!(
+                    card.compactions_or_folds >= 1,
+                    "{}: the session never compacted, so the gate proved nothing",
+                    card.mode
+                );
+            }
         }
     }
 

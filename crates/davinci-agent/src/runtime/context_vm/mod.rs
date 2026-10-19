@@ -19,7 +19,7 @@ pub use events::{
     events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind, EventImage,
 };
 pub(crate) use events::{internal_user_message, InternalUserMessage};
-pub(crate) use fold::fold_request;
+pub(crate) use fold::fold_chunk;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
 pub use metrics::ContextVmMetrics;
 pub use reducer::{
@@ -440,7 +440,32 @@ impl ContextVmRuntime {
         events: &[ContextEvent],
         proposal: Option<CheckpointProposal>,
     ) -> Result<ContextRoot, String> {
-        let diverged = self.record_events(events);
+        self.fold_with_proposal_through(reason, events, u64::MAX, proposal)
+    }
+
+    /// Fold the events up to `through_seq`; later ones stay for the next fold.
+    /// `events` is still the whole history, so the recorded conversation does
+    /// not look rewritten between chunks.
+    pub fn fold_with_proposal_through(
+        &self,
+        reason: FoldReason,
+        events: &[ContextEvent],
+        through_seq: u64,
+        proposal: Option<CheckpointProposal>,
+    ) -> Result<ContextRoot, String> {
+        let all = events;
+        let covered: std::borrow::Cow<[ContextEvent]> = if through_seq == u64::MAX {
+            std::borrow::Cow::Borrowed(all)
+        } else {
+            std::borrow::Cow::Owned(
+                all.iter()
+                    .filter(|event| event.seq <= through_seq)
+                    .cloned()
+                    .collect(),
+            )
+        };
+        let events: &[ContextEvent] = &covered;
+        let diverged = self.record_events(all);
         if diverged || self.root().checkpoint.is_none() {
             self.rebuild_from_events(events)?;
         }
@@ -451,6 +476,10 @@ impl ContextVmRuntime {
                 self.load_state_from_root()?
             }
         };
+        if events.len() != all.len() {
+            // A rebuild records the prefix it was given; put the whole back.
+            self.record_events(all);
+        }
         let new_events = events
             .iter()
             .filter(|event| event.seq > before.through_seq)
@@ -505,8 +534,8 @@ impl ContextVmRuntime {
             checkpoint: Some(checkpoint),
             deltas: Vec::new(),
             episodes,
-            hot_event_refs: self.hot_refs(events),
-            evidence_refs: evidence_refs(events),
+            hot_event_refs: self.hot_refs(all),
+            evidence_refs: evidence_refs(all),
             updates_since_fold: 0,
             folded_through_seq: events.iter().map(|event| event.seq).max().unwrap_or(0),
         };
