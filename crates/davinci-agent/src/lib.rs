@@ -148,6 +148,7 @@ pub use prompt::{
 
 pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
 const MUTATION_VERIFICATION_ENTRY_TYPE: &str = "mutation_verification";
+const TOOL_EXPOSURE_ENTRY_TYPE: &str = "tool_exposure";
 pub use runtime::{
     conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
     find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
@@ -631,6 +632,7 @@ pub struct Agent {
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
     /// Last state written to the session, so unchanged state is not rewritten.
     persisted_mutation_verification: Option<MutationVerificationState>,
+    persisted_tool_exposure: Option<std::collections::BTreeSet<String>>,
     completion_state: Arc<Mutex<completion::CompletionState>>,
     /// Bounded request suffix; never session/WAL history or compaction input.
     completion_context: Vec<completion::CompletionContextMessage>,
@@ -812,6 +814,7 @@ impl Agent {
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
             persisted_mutation_verification: None,
+            persisted_tool_exposure: None,
             completion_state: Arc::new(Mutex::new(completion::CompletionState::default())),
             completion_context: Vec::new(),
             pending_transaction_verification: Arc::new(Mutex::new(
@@ -1278,6 +1281,84 @@ impl Agent {
         if appended.is_ok() {
             self.persisted_mutation_verification = Some(state);
         }
+    }
+
+    /// Write the set of tool schemas the model has been shown to the session
+    /// when it changed, so a resumed session does not have to rediscover them.
+    /// The set is a hint: restoring re-checks it against current authority.
+    pub fn persist_tool_exposure(&mut self) {
+        let visible = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .visible_names()
+            .clone();
+        if self.persisted_tool_exposure.as_ref() == Some(&visible) {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("data".into(), serde_json::json!({ "visible": visible }));
+        let appended = session.append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some(TOOL_EXPOSURE_ENTRY_TYPE.into()),
+            extra,
+        });
+        if appended.is_ok() {
+            self.persisted_tool_exposure = Some(visible);
+        }
+    }
+
+    /// Re-expose the tools the session had discovered, but only those that are
+    /// active and authorized in this process. A saved name can narrow nothing
+    /// and widen nothing: it is a hint, never authority.
+    fn restore_tool_exposure(&mut self) {
+        let saved: Vec<String> = self
+            .session
+            .as_ref()
+            .and_then(|session| {
+                davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+                    .into_iter()
+                    .rev()
+                    .find(|entry| {
+                        entry.entry_type == "custom"
+                            && entry.custom_type.as_deref() == Some(TOOL_EXPOSURE_ENTRY_TYPE)
+                    })
+                    .and_then(|entry| entry.extra.get("data")?.get("visible")?.as_array().cloned())
+            })
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.sync_tool_authorization();
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut exposure = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for name in saved {
+            if self.tools.contains(&name) && authorized.contains(&name) {
+                exposure.activate_authorized(&name, true);
+            }
+        }
+        self.persisted_tool_exposure = Some(exposure.visible_names().clone());
     }
 
     /// Restore the state persisted on the session's current branch. Without
@@ -4561,6 +4642,7 @@ impl Agent {
         self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
         self.restore_mutation_verification();
         self.set_runtime(candidate);
+        self.restore_tool_exposure();
         self.install_prompt_checkpoints(rewind);
         self.restore_living_plan();
         let _ = self.restore_prompt_session();

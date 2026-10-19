@@ -331,3 +331,79 @@ fn mcp_server_family_uses_exact_handshake_namespace_without_relaxing_trust() {
         .unwrap();
     assert_eq!(other.family.as_deref(), Some("mcp:browserless"));
 }
+
+fn two_tool_body() -> String {
+    json!({
+        "initialize": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fixture", "version": "0"}
+        },
+        "tools/list": {"tools": [
+            {"name": "lookup", "description": "lookup fixture", "inputSchema": {"type": "object"}},
+            {"name": "dangerous_write", "description": "mutation fixture", "inputSchema": {"type": "object"}}
+        ]},
+        "resources/list": {"resources": []}
+    })
+    .to_string()
+}
+
+fn visible(agent: &Agent, name: &str) -> bool {
+    agent
+        .provider_tool_specs()
+        .iter()
+        .any(|tool| tool.name == name)
+}
+
+/// A tool the model discovered stays visible when the same session resumes in a
+/// new process, and only while it is still authorized there.
+#[test]
+fn activation_survives_safe_resume() {
+    let (dir, config) = http_fixture(&two_tool_body());
+    let sessions = tempfile::tempdir().unwrap();
+    let lookup = "mcp__memory__lookup";
+    let dangerous = "mcp__memory__dangerous_write";
+
+    let mut agent = agent_with_runtime();
+    agent.attach_mcp(McpRegistry::connect(&config, dir.path()));
+    agent
+        .load_from_session(
+            davinci_session::JsonlSession::create(sessions.path(), "tools", None).unwrap(),
+        )
+        .unwrap();
+    for query in ["lookup", "dangerous_write"] {
+        execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &json!({"query": query}),
+            &agent.tool_context,
+        )
+        .unwrap();
+    }
+    assert!(visible(&agent, lookup) && visible(&agent, dangerous));
+    agent.persist_tool_exposure();
+    let path = agent.session.as_ref().unwrap().path.clone();
+    drop(agent);
+
+    // Same session, new process: the activation is restored.
+    let mut resumed = agent_with_runtime();
+    resumed.attach_mcp(McpRegistry::connect(&config, dir.path()));
+    assert!(!visible(&resumed, lookup), "a fresh agent starts deferred");
+    resumed
+        .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+        .unwrap();
+    assert!(visible(&resumed, lookup));
+    assert!(visible(&resumed, dangerous));
+    drop(resumed);
+
+    // Same session, but the tool is no longer part of the authorized surface:
+    // restoring can never widen authority.
+    let mut narrowed = agent_with_runtime();
+    narrowed.attach_mcp(McpRegistry::connect(&config, dir.path()));
+    narrowed.tools.retain(|name| name != dangerous);
+    narrowed
+        .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+        .unwrap();
+    assert!(visible(&narrowed, lookup));
+    assert!(!visible(&narrowed, dangerous));
+}

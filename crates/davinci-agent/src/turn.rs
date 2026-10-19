@@ -253,6 +253,7 @@ impl Agent {
         self.completion_context.clear();
         self.invalidate_context_image();
         self.persist_mutation_verification();
+        self.persist_tool_exposure();
         let rewind_persistence = self.settle_prompt_checkpoint();
         let persistence = self.ensure_session_persistence();
         crate::RunStats::add_elapsed(&mut self.stats.wall_ms, run_started.elapsed());
@@ -5189,12 +5190,14 @@ Issue the call again if it is still needed.";
             }
             if self.session.is_some() && self.persist_operation_chat_result(message)? {
                 self.persist_mutation_verification();
+                self.persist_tool_exposure();
                 return self.ensure_session_persistence();
             }
         }
         self.persist_full_message(message);
         if message.role == "toolResult" {
             self.persist_mutation_verification();
+            self.persist_tool_exposure();
         }
         self.ensure_session_persistence()
     }
