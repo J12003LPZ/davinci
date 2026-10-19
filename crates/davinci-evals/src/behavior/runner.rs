@@ -243,9 +243,23 @@ pub struct BehaviorSuiteSummary {
     pub task_identity: Option<String>,
 }
 
-/// SHA-256 over the scenarios sorted by id: any change to a request, fixture
-/// or requirement changes the identity.
+/// SHA-256 over the scenarios sorted by id and the content of every fixture
+/// repository they name: any change to a request, a requirement or a file of
+/// the repository under test changes the identity.
 pub fn task_identity(scenarios: &[&BehaviorScenario]) -> String {
+    task_identity_in(&default_fixture_root(), scenarios)
+}
+
+fn default_fixture_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("repos")
+}
+
+pub(crate) fn task_identity_in(
+    fixture_root: &std::path::Path,
+    scenarios: &[&BehaviorScenario],
+) -> String {
     use sha2::{Digest, Sha256};
     let mut encoded: Vec<(String, String)> = scenarios
         .iter()
@@ -264,11 +278,53 @@ pub fn task_identity(scenarios: &[&BehaviorScenario]) -> String {
         hasher.update(body.as_bytes());
         hasher.update([0]);
     }
+    let fixtures: std::collections::BTreeSet<&str> = scenarios
+        .iter()
+        .map(|scenario| scenario.repo_fixture.as_str())
+        .collect();
+    for name in fixtures {
+        hasher.update(b"fixture\0");
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hash_tree(&mut hasher, &fixture_root.join(name), "");
+    }
     hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Every file under `dir` in path order: relative path, then bytes. A missing
+/// directory hashes as itself being missing, so it cannot match a present one.
+fn hash_tree(hasher: &mut sha2::Sha256, dir: &std::path::Path, prefix: &str) {
+    use sha2::Digest;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        hasher.update(b"missing\0");
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = format!("{prefix}{name}");
+        let path = entry.path();
+        if path.is_dir() {
+            hasher.update(b"dir\0");
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            hash_tree(hasher, &path, &format!("{relative}/"));
+        } else {
+            hasher.update(b"file\0");
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            // Line endings differ between checkouts of the same revision.
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            let normalized: Vec<u8> = bytes.into_iter().filter(|byte| *byte != b'\r').collect();
+            hasher.update((normalized.len() as u64).to_le_bytes());
+            hasher.update(&normalized);
+        }
+    }
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -385,6 +441,44 @@ mod tests {
         BehaviorCategory, BehaviorLimits, BehaviorRequirement, BehaviorScenario,
     };
     use crate::behavior::trace::{BehaviorEvent, BehaviorTrace};
+
+    #[test]
+    fn task_identity_covers_the_fixture_repository_content() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("repo/src")).unwrap();
+        std::fs::write(root.path().join("repo/src/auth.rs"), "fn login() {}\n").unwrap();
+        let scenario = BehaviorScenario {
+            id: "s".into(),
+            category: BehaviorCategory::Exploration,
+            request: "r".into(),
+            repo_fixture: "repo".into(),
+            requirements: Vec::new(),
+            limits: BehaviorLimits::default(),
+            setup_commands: Vec::new(),
+            verification_commands: Vec::new(),
+        };
+        let identity = || task_identity_in(root.path(), &[&scenario]);
+        let before = identity();
+        assert_eq!(before, identity(), "deterministic");
+        // CRLF checkouts of the same revision are the same repository.
+        std::fs::write(root.path().join("repo/src/auth.rs"), "fn login() {}\r\n").unwrap();
+        assert_eq!(before, identity());
+        // Editing a file of the repository under test changes the identity.
+        std::fs::write(
+            root.path().join("repo/src/auth.rs"),
+            "fn login() { todo!() }\n",
+        )
+        .unwrap();
+        assert_ne!(before, identity());
+        // So does adding one.
+        let edited = identity();
+        std::fs::write(root.path().join("repo/new.rs"), "").unwrap();
+        assert_ne!(edited, identity());
+        // And a fixture that is missing never equals one that is present.
+        let mut elsewhere = scenario.clone();
+        elsewhere.repo_fixture = "absent".into();
+        assert_ne!(identity(), task_identity_in(root.path(), &[&elsewhere]));
+    }
 
     #[test]
     fn aggregate_suite_scores_computes_correct_metrics() {

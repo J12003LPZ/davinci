@@ -83,16 +83,61 @@ pub struct FileDiff {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "BehaviorStatsWire", into = "BehaviorStatsWire")]
 pub struct BehaviorStats {
     pub model_turns: u64,
     pub tool_calls: u64,
     /// `None` means the run never reported the count; `Some(0)` is a measured zero.
-    #[serde(default)]
     pub input_tokens: Option<u64>,
-    #[serde(default)]
     pub output_tokens: Option<u64>,
     pub wall_ms: u64,
     pub permission_prompts: u64,
+}
+
+/// On-disk shape. `usage_markers` is written by every current trace. A trace
+/// without it predates optional usage, when `0` was the placeholder for "never
+/// reported", so a zero there is read back as unknown.
+#[derive(Serialize, Deserialize)]
+struct BehaviorStatsWire {
+    model_turns: u64,
+    tool_calls: u64,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    wall_ms: u64,
+    permission_prompts: u64,
+    #[serde(default)]
+    usage_markers: bool,
+}
+
+impl From<BehaviorStats> for BehaviorStatsWire {
+    fn from(stats: BehaviorStats) -> Self {
+        Self {
+            model_turns: stats.model_turns,
+            tool_calls: stats.tool_calls,
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
+            wall_ms: stats.wall_ms,
+            permission_prompts: stats.permission_prompts,
+            usage_markers: true,
+        }
+    }
+}
+
+impl From<BehaviorStatsWire> for BehaviorStats {
+    fn from(wire: BehaviorStatsWire) -> Self {
+        let legacy_zero_is_unknown =
+            |count: Option<u64>| count.filter(|count| wire.usage_markers || *count != 0);
+        Self {
+            model_turns: wire.model_turns,
+            tool_calls: wire.tool_calls,
+            input_tokens: legacy_zero_is_unknown(wire.input_tokens),
+            output_tokens: legacy_zero_is_unknown(wire.output_tokens),
+            wall_ms: wire.wall_ms,
+            permission_prompts: wire.permission_prompts,
+        }
+    }
 }
 
 pub fn classify_shell_command(command: &str) -> &'static str {
@@ -174,11 +219,20 @@ pub fn detect_verification_claims(text: &str) -> Vec<String> {
 }
 
 impl BehaviorTrace {
-    /// Edits recorded so far; the generation a new check belongs to.
+    /// Edits recorded so far; the generation a new check belongs to. A shell
+    /// call that is neither a check nor a read-only search (`sed -i`, `git
+    /// checkout`, a generator) may have changed files without an `Edit` event,
+    /// so it counts too: a later passing check is needed after it.
     pub fn mutation_count(&self) -> u64 {
         self.events
             .iter()
-            .filter(|event| matches!(event, BehaviorEvent::Edit { .. }))
+            .filter(|event| match event {
+                BehaviorEvent::Edit { .. } => true,
+                BehaviorEvent::Shell { command_class, .. } => {
+                    !matches!(command_class.as_str(), "test" | "build" | "lint" | "search")
+                }
+                _ => false,
+            })
             .count() as u64
     }
 

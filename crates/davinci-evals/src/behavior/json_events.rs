@@ -15,6 +15,7 @@ pub fn trace_from_json_lines(scenario_id: &str, lines: &[String]) -> Result<Beha
     let mut supplemental_events = Vec::new();
     let mut manifest = None;
     let mut stats = BehaviorStats::default();
+    let mut gaps = UsageGaps::default();
 
     for (index, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
@@ -22,7 +23,7 @@ pub fn trace_from_json_lines(scenario_id: &str, lines: &[String]) -> Result<Beha
         }
         let value: Value = serde_json::from_str(line)
             .map_err(|error| format!("invalid JSON event on line {}: {error}", index + 1))?;
-        collect_stats(&mut stats, &value);
+        collect_stats(&mut stats, &mut gaps, &value);
 
         if let Some(found) = find_prompt_manifest(&value) {
             supplemental_events.push(BehaviorEvent::PromptProfile {
@@ -112,6 +113,13 @@ pub fn trace_from_json_lines(scenario_id: &str, lines: &[String]) -> Result<Beha
         }
     }
 
+    // A total that leaves out a turn is an undercount presented as measured.
+    if gaps.input {
+        stats.input_tokens = None;
+    }
+    if gaps.output {
+        stats.output_tokens = None;
+    }
     let mut trace =
         BehaviorTrace::from_agent_events(scenario_id, manifest, &agent_events, Some(stats));
     trace.events.extend(supplemental_events);
@@ -272,8 +280,29 @@ fn find_prompt_manifest(value: &Value) -> Option<PromptManifest> {
     }
 }
 
-fn collect_stats(stats: &mut BehaviorStats, value: &Value) {
+/// Whether any usage-bearing event left a count out. Once one did, the run
+/// total for that field is unknown.
+#[derive(Default)]
+struct UsageGaps {
+    input: bool,
+    output: bool,
+}
+
+fn collect_stats(stats: &mut BehaviorStats, gaps: &mut UsageGaps, value: &Value) {
     let usage = value.get("usage").unwrap_or(value);
+    // An event is usage-bearing when it has a usage object or carries a count.
+    let bears_usage = value.get("usage").is_some_and(Value::is_object)
+        || integer_field(
+            value,
+            &[
+                "inputTokens",
+                "input_tokens",
+                "outputTokens",
+                "output_tokens",
+            ],
+        )
+        .is_some()
+        || bool_field(value, &["inputUnreported", "outputUnreported"]).is_some();
     // A count the event does not carry (or marks unreported) stays unknown. It
     // is never added as zero, so a run that reported nothing cannot look like
     // a run that spent nothing.
@@ -283,11 +312,17 @@ fn collect_stats(stats: &mut BehaviorStats, value: &Value) {
         }
         integer_field(usage, keys).map(|count| count.max(0) as u64)
     };
-    if let Some(count) = reported(&["inputTokens", "input_tokens"], &["inputUnreported"]) {
-        stats.input_tokens = Some(stats.input_tokens.unwrap_or(0).saturating_add(count));
+    match reported(&["inputTokens", "input_tokens"], &["inputUnreported"]) {
+        Some(count) => {
+            stats.input_tokens = Some(stats.input_tokens.unwrap_or(0).saturating_add(count));
+        }
+        None => gaps.input |= bears_usage,
     }
-    if let Some(count) = reported(&["outputTokens", "output_tokens"], &["outputUnreported"]) {
-        stats.output_tokens = Some(stats.output_tokens.unwrap_or(0).saturating_add(count));
+    match reported(&["outputTokens", "output_tokens"], &["outputUnreported"]) {
+        Some(count) => {
+            stats.output_tokens = Some(stats.output_tokens.unwrap_or(0).saturating_add(count));
+        }
+        None => gaps.output |= bears_usage,
     }
     if let Some(wall_ms) = integer_field(value, &["wallMs", "wall_ms"]) {
         stats.wall_ms = stats.wall_ms.max(wall_ms as u64);
@@ -449,7 +484,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mixed.stats.input_tokens, Some(150));
-        assert_eq!(mixed.stats.output_tokens, Some(7));
+        // One turn never reported its output: the run total is unknown, not 7.
+        assert_eq!(mixed.stats.output_tokens, None);
+        // A usage object that simply lacks the key is the same gap.
+        let missing_key = trace_from_json_lines(
+            "u",
+            &[
+                line(json!({"type": "turn_end", "usage": {"inputTokens": 1, "outputTokens": 2}})),
+                line(json!({"type": "turn_end", "usage": {"inputTokens": 1}})),
+                line(json!({"type": "tool_call", "id": "g", "name": "grep", "args": {}})),
+            ],
+        )
+        .unwrap();
+        assert_eq!(missing_key.stats.input_tokens, Some(2));
+        assert_eq!(missing_key.stats.output_tokens, None);
         let only_unreported = trace_from_json_lines(
             "u",
             &[line(
@@ -468,7 +516,8 @@ mod tests {
         });
         let stats: BehaviorStats = serde_json::from_value(old).unwrap();
         assert_eq!(stats.input_tokens, Some(900));
-        assert_eq!(stats.output_tokens, Some(0));
+        // Before the marker existed, 0 meant "never reported".
+        assert_eq!(stats.output_tokens, None);
         let omitted: BehaviorStats = serde_json::from_value(json!({
             "model_turns": 1, "tool_calls": 0, "wall_ms": 0, "permission_prompts": 0
         }))
@@ -479,6 +528,16 @@ mod tests {
         let back: BehaviorStats =
             serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
         assert_eq!(back, omitted);
+        // A measured zero written today stays a measured zero when read back.
+        let measured = BehaviorStats {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..BehaviorStats::default()
+        };
+        let back: BehaviorStats =
+            serde_json::from_value(serde_json::to_value(&measured).unwrap()).unwrap();
+        assert_eq!(back.input_tokens, Some(0));
+        assert_eq!(back.output_tokens, Some(0));
     }
 
     #[test]

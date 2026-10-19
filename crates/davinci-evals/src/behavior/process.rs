@@ -31,24 +31,127 @@ pub struct DavinciProcessConfig {
 
 /// Replace credential-shaped values with a marker. Used for every string the
 /// harness exports: diagnostics, trace events, verification commands, diffs.
+///
+/// Two kinds of match:
+/// - a credential-named key (`api_key`, `AWS_SECRET_ACCESS_KEY`, `password`,
+///   `auth_token`, `Authorization`, ...) followed by `:` or `=` and a value
+///   that looks like a credential, and
+/// - credential-shaped values wherever they appear (`sk-...`, `ghp_...`,
+///   `xox[bp]-...`, `AKIA...`, `Bearer ...`).
+///
+/// Source code must survive: `let token = read_token();`, `token: usize`,
+/// `max_token: 5` and `"input_token": 900` pass through unchanged. A quoted
+/// string is always a value. An unquoted value after a strong key (secret,
+/// password, `*_key` names that hold keys, authorization) is a value unless it
+/// is a number, a type or keyword, or an expression. After a bare `token` key
+/// it must also carry a digit and some length, or be long.
 pub fn redact_credentials(text: &str) -> String {
     use std::sync::OnceLock;
     static KEYED: OnceLock<regex::Regex> = OnceLock::new();
+    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
     static BARE: OnceLock<regex::Regex> = OnceLock::new();
     let keyed = KEYED.get_or_init(|| {
         regex::Regex::new(
-            r#"(?i)(["']?)([A-Za-z0-9_-]*(?:authorization|api[_-]?key|token|secret|password))(["']?)\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:(?:bearer|basic)\s+)?[^\s,"}'&]+)"#,
+            r#"(?i)(["']?)([A-Za-z0-9_-]*?(?:authorization|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|signing[_-]?key|secret|passw(?:or)?d|passphrase|token))(["']?)(\s*[:=]\s*)("[^"]*"|'[^']*'|(?:(?:bearer|basic)\s+)?[^\s,"}'&;]+)"#,
         )
         .expect("static credential pattern")
     });
+    let bearer = BEARER.get_or_init(|| {
+        regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}").expect("static bearer pattern")
+    });
     let bare = BARE.get_or_init(|| {
         regex::Regex::new(
-            r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b",
+            r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35})\b",
         )
         .expect("static token pattern")
     });
-    let text = keyed.replace_all(text, "$1$2$3=[REDACTED]");
+    let text = keyed.replace_all(text, |caps: &regex::Captures| {
+        if is_credential_value(&caps[2], &caps[5]) {
+            format!("{}{}{}=[REDACTED]", &caps[1], &caps[2], &caps[3])
+        } else {
+            caps[0].to_string()
+        }
+    });
+    let text = bearer.replace_all(&text, "Bearer [REDACTED]");
     bare.replace_all(&text, "[REDACTED]").into_owned()
+}
+
+fn is_credential_value(key: &str, value: &str) -> bool {
+    let quoted = value.len() >= 3
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')));
+    if quoted {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("bearer ") || lower.starts_with("basic ") {
+        return true;
+    }
+    if value.chars().any(|c| "()<>{}[]".contains(c)) {
+        return false;
+    }
+    if value.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    const NOT_VALUES: &[&str] = &[
+        "string",
+        "str",
+        "usize",
+        "isize",
+        "bool",
+        "char",
+        "self",
+        "none",
+        "null",
+        "nil",
+        "true",
+        "false",
+        "undefined",
+        "option",
+        "vec",
+        "box",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "f32",
+        "f64",
+    ];
+    if NOT_VALUES.contains(&lower.as_str()) {
+        return false;
+    }
+    let name: String = key
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    const STRONG: &[&str] = &[
+        "authorization",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "secretkey",
+        "signingkey",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+    ];
+    if STRONG.iter().any(|word| name.ends_with(word)) {
+        return true;
+    }
+    // A bare `token` key: code names tokens all the time, so the value must
+    // look like one.
+    let has_digit = value.chars().any(|c| c.is_ascii_digit());
+    (has_digit && value.len() >= 8)
+        || (value.len() >= 24 && !value.contains('.'))
+        || (value.len() >= 16 && value.contains(['/', '+', '=']))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -371,6 +474,67 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             let out = redact_credentials(input);
             assert!(!out.contains(secret), "{input} -> {out}");
             assert!(out.contains("[REDACTED]"), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_covers_credential_names_and_value_shapes() {
+        // (input, the secret that must be gone)
+        for (input, secret) in [
+            (
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG",
+                "wJalrXUtnFEMI/K7MDENG",
+            ),
+            ("access_key=AKIAabc", "AKIAabc"),
+            ("DB_PRIVATE_KEY=abcdef123", "abcdef123"),
+            ("aws id AKIAIOSFODNN7EXAMPLE here", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "slack xoxb-1234567890-abcdefghij",
+                "xoxb-1234567890-abcdefghij",
+            ),
+            (
+                "slack xoxp-1234567890-abcdefghij",
+                "xoxp-1234567890-abcdefghij",
+            ),
+            (
+                "pat ghp_0123456789abcdefghij0123",
+                "ghp_0123456789abcdefghij0123",
+            ),
+            ("key sk-fake-0123456789abcdef", "sk-fake-0123456789abcdef"),
+            (
+                "curl -H 'Authorization: Bearer abcdefgh12345'",
+                "abcdefgh12345",
+            ),
+            ("sent Bearer abcdefgh12345 upstream", "abcdefgh12345"),
+            (r#"api_key = "hunter2-fake""#, "hunter2-fake"),
+            (r#"{"password": "pw-fake-1"}"#, "pw-fake-1"),
+            ("export STRIPE_SECRET=fakevalue-9876", "fakevalue-9876"),
+            (r#"{"token": "plain words allowed"}"#, "plain words allowed"),
+            ("auth_token: abcdef0123456789", "abcdef0123456789"),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_code_and_numbers_alone() {
+        for input in [
+            "let token = read_token();",
+            "token: usize",
+            "max_token: 5",
+            r#"{"input_token": 900}"#,
+            "pub struct Cfg { token: String }",
+            "pub token: usize,",
+            "let secret = load_secret();",
+            "password: String",
+            "primary_key: u32",
+            "cache_key = compute(a)",
+            "token = self.next()",
+            "secret: Option<String>",
+        ] {
+            assert_eq!(redact_credentials(input), input);
         }
     }
 

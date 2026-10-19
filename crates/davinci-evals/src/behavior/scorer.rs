@@ -570,6 +570,39 @@ mod tests {
     }
 
     #[test]
+    fn shell_edit_after_a_passing_check_makes_the_pass_stale() {
+        let mut trace = edited_trace_claiming_success();
+        trace.events.push(BehaviorEvent::Shell {
+            command_class: "test".into(),
+            exit_code: Some(0),
+        });
+        trace.verification = vec![check(true, 1)];
+        assert!(trace.verified_after_last_mutation(None));
+        // `sed -i` edits a file without an Edit event. It is a shell call that
+        // is not a check and not a read-only search: a possible mutation.
+        trace.events.push(BehaviorEvent::Shell {
+            command_class: "other".into(),
+            exit_code: Some(0),
+        });
+        assert!(!trace.verified_after_last_mutation(None));
+        let score = score_trace(&sample_scenario(), &trace);
+        assert!(!score.passed, "{score:?}");
+        // A later passing check re-establishes it.
+        trace.events.push(BehaviorEvent::Shell {
+            command_class: "test".into(),
+            exit_code: Some(0),
+        });
+        trace.verification.push(check(true, 2));
+        assert!(trace.verified_after_last_mutation(None));
+        // Searching and checking are not mutations.
+        trace.events.push(BehaviorEvent::Shell {
+            command_class: "search".into(),
+            exit_code: Some(0),
+        });
+        assert!(trace.verified_after_last_mutation(None));
+    }
+
+    #[test]
     fn scorer_passes_valid_trace_with_verification() {
         let scenario = sample_scenario();
         let mut trace = BehaviorTrace::new("scen-test", None);
