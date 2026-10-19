@@ -564,3 +564,26 @@ fn select_variant_revise_reload_and_review_without_apply() {
     );
     assert_eq!(repository(dir.path()), before);
 }
+
+#[test]
+fn the_browser_asks_the_host_what_a_brief_will_create() {
+    let (dir, mut agent, controller, _) = generated();
+    let mut resolve = |brief: &str| {
+        controller
+            .execute(
+                &mut agent,
+                dir.path(),
+                DesignRequest::Resolve {
+                    brief: brief.into(),
+                },
+            )
+            .unwrap()
+    };
+    let dashboard = resolve("Create a modern dashboard for AI agents");
+    assert_eq!(dashboard["kind"], "product");
+    assert_eq!(dashboard["variants"], 3);
+    assert_eq!(dashboard["source"], "inferred");
+    let vague = resolve("something fresh");
+    assert_eq!(vague["kind"], "landing");
+    assert_eq!(vague["source"], "default");
+}

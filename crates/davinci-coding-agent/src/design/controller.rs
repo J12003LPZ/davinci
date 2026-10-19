@@ -93,6 +93,11 @@ pub enum DesignRequest {
     Accept {
         request: super::acceptance::AcceptRequest,
     },
+    /// What a brief will create (its inferred kind and the default concept
+    /// count), decided by the same classifier as the command line. Pure.
+    Resolve {
+        brief: String,
+    },
     /// Choose a concept (or clear the choice). Changes no source.
     Select {
         request: super::selection::SelectVariant,
@@ -106,6 +111,7 @@ impl DesignRequest {
     fn authority(&self) -> &'static str {
         match self {
             Self::List {}
+            | Self::Resolve { .. }
             | Self::Status { .. }
             | Self::Read { .. }
             | Self::ReadBinding { .. }
@@ -656,6 +662,17 @@ impl DesignController {
                     &runtime,
                     request,
                 )?)?)
+            }
+            DesignRequest::Resolve { brief } => {
+                validate_text(&brief, 64 * 1024, "brief")?;
+                Ok(serde_json::to_value(
+                    super::intent::DesignIntent {
+                        brief,
+                        explicit_kind: None,
+                        variants: super::intent::DEFAULT_VARIANTS,
+                    }
+                    .resolve(),
+                )?)
             }
             DesignRequest::Select { request } => Ok(serde_json::to_value(
                 super::selection::select_variant(&self.store, &ctx, session, request)?,

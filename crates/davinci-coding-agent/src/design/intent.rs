@@ -4,6 +4,7 @@
 //! same words always give the same kind, and an explicit `--kind` always wins.
 
 use super::types::DesignKind;
+use serde::Serialize;
 
 /// Concepts generated when the brief does not say how many.
 pub const DEFAULT_VARIANTS: u32 = 3;
@@ -17,7 +18,8 @@ pub struct DesignIntent {
 }
 
 /// Where a resolved kind came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KindSource {
     /// `--kind` on the legacy `new` form.
     Explicit,
@@ -28,7 +30,7 @@ pub enum KindSource {
 }
 
 /// The intent after inference: what the controller creates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedDesignBrief {
     pub kind: DesignKind,
     pub variants: u32,
