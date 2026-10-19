@@ -41,6 +41,9 @@ struct Inner {
     routes: BTreeMap<String, (String, String)>,
     trusted_read_only_servers: BTreeSet<String>,
     rows: Vec<McpServerRow>,
+    /// Servers stopped on purpose; a background connect that finishes later
+    /// must not bring them back.
+    blocked: BTreeSet<String>,
 }
 
 /// Connected MCP servers, shared with the tool thread and the shell.
@@ -176,6 +179,15 @@ impl McpRegistry {
     fn adopt(&self, parts: Vec<Inner>) {
         let mut inner = self.lock();
         for part in parts {
+            let blocked = |name: &String| inner.blocked.contains(name);
+            if part.clients.keys().any(blocked)
+                || part
+                    .rows
+                    .iter()
+                    .any(|row| inner.blocked.contains(&row.name))
+            {
+                continue;
+            }
             inner.clients.extend(part.clients);
             inner.routes.extend(part.routes);
             inner
@@ -187,6 +199,24 @@ impl McpRegistry {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Stop and forget the named servers: their process ends, their tools
+    /// and rows go, and a connect still running will not re-add them. Used
+    /// when trust in the project that configured them is withdrawn.
+    pub fn disconnect(&self, names: &[String]) -> usize {
+        let mut inner = self.lock();
+        let mut stopped = 0;
+        for name in names {
+            inner.blocked.insert(name.clone());
+            if inner.clients.remove(name).is_some() {
+                stopped += 1;
+            }
+            inner.routes.retain(|_, (server, _)| server != name);
+            inner.trusted_read_only_servers.remove(name);
+            inner.rows.retain(|row| &row.name != name);
+        }
+        stopped
     }
 
     /// Kill every stdio server this process spawned, for an exit that runs
@@ -641,6 +671,27 @@ mod tests {
             None,
         );
         assert!(!empty.connecting() && !empty.take_ready());
+    }
+
+    #[test]
+    fn disconnect_stops_named_servers_and_a_late_connect_cannot_bring_them_back() {
+        let (dir, config) = http_fixture(
+            r#"{
+            "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+            "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+        }"#,
+        );
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert_eq!(registry.tool_names(), ["mcp__memory__ping"]);
+        assert_eq!(registry.disconnect(&["memory".to_string()]), 1);
+        assert!(registry.tool_names().is_empty());
+        assert!(registry.rows().is_empty());
+        assert!(registry.resolve_tool("mcp__memory__ping").is_none());
+        // A connect that was still in flight lands afterwards and is dropped.
+        let late = McpRegistry::connect_parts(&config, dir.path(), None);
+        registry.adopt(late);
+        assert!(registry.tool_names().is_empty());
+        assert_eq!(registry.disconnect(&["unknown".to_string()]), 0);
     }
 
     #[test]

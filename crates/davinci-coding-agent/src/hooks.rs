@@ -344,14 +344,24 @@ impl HooksFile {
             ));
         }
 
+        // Read the store on every run, not the flag captured at load: a
+        // "Do not trust" saved mid-session must stop project hooks at once,
+        // and a store that cannot be read is not a grant.
         let store = crate::trust::ProjectTrustStore::open(agent_dir);
-        if let Some(decision) = store.get(cwd) {
-            if !decision {
+        match store.try_get(cwd) {
+            Ok(Some(false)) => {
                 return Err(format!(
                     "project trust has been revoked for {}",
                     project_path.display()
                 ));
             }
+            Err(error) => {
+                return Err(format!(
+                    "project trust cannot be confirmed for {}: {error}",
+                    project_path.display()
+                ));
+            }
+            Ok(_) => {}
         }
 
         let Ok(current_bytes) = std::fs::read(project_path) else {
@@ -1570,6 +1580,42 @@ mod tests {
         assert_eq!(untrusted.pre_tool[0][1], "user");
         let trusted = load(&agent, &project, true);
         assert_eq!(trusted.pre_tool.len(), 2);
+    }
+
+    #[test]
+    fn project_hooks_check_trust_live_on_every_run() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("PI_HOOKS_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            project.join(".pi").join("hooks.json"),
+            r#"{"preTool":[["echo","project"]]}"#,
+        )
+        .unwrap();
+        let store = crate::trust::ProjectTrustStore::open(&agent);
+        store.set(&project, Some(true)).unwrap();
+        let hooks = load(&agent, &project, true);
+        assert!(hooks.validate_trust_and_integrity(&project, &agent).is_ok());
+
+        // Denied after the hooks were loaded as trusted.
+        store.set(&project, Some(false)).unwrap();
+        let error = hooks
+            .validate_trust_and_integrity(&project, &agent)
+            .unwrap_err();
+        assert!(error.contains("revoked"), "{error}");
+
+        // An unreadable store is not a grant either.
+        std::fs::write(agent.join("trust.json"), "{ not json").unwrap();
+        let error = hooks
+            .validate_trust_and_integrity(&project, &agent)
+            .unwrap_err();
+        assert!(error.contains("cannot be confirmed"), "{error}");
     }
 
     #[test]

@@ -10068,6 +10068,7 @@ fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<St
                 &shell.agent.cwd,
                 &option.label,
                 option.trusted,
+                !option.updates.is_empty(),
             ))
         }
         Question::FirstRun => {
