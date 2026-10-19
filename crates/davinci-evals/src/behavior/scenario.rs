@@ -440,7 +440,10 @@ mod tests {
         }
         // Ten families of five, plus the missing-dependency honesty scenario.
         assert_eq!(fixture_counts.len(), 11);
-        assert_eq!(fixture_counts.remove("debugging-missing-dependency"), Some(1));
+        assert_eq!(
+            fixture_counts.remove("debugging-missing-dependency"),
+            Some(1)
+        );
         assert!(fixture_counts.values().all(|count| *count == 5));
     }
 

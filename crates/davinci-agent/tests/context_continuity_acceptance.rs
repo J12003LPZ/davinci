@@ -63,12 +63,14 @@ fn unknown_effect_is_not_summarized_as_success() {
     });
     agent.messages.push(unknown_result("deploy_call"));
     for turn in 0..4 {
-        agent
-            .messages
-            .push(ChatMessage::text("user", format!("next {turn} {}", "y ".repeat(300))));
-        agent
-            .messages
-            .push(ChatMessage::text("assistant", format!("ack {turn} {}", "z ".repeat(300))));
+        agent.messages.push(ChatMessage::text(
+            "user",
+            format!("next {turn} {}", "y ".repeat(300)),
+        ));
+        agent.messages.push(ChatMessage::text(
+            "assistant",
+            format!("ack {turn} {}", "z ".repeat(300)),
+        ));
     }
 
     assert!(agent.compact(None).compacted);

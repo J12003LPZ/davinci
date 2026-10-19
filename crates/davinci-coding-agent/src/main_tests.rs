@@ -4410,9 +4410,9 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
     assert!(!child.tools.contains(&"write".into()));
     assert!(!child.tools.contains(&"agent".into()));
     assert_eq!(child.max_model_turns, Some(60));
-    // Plan Mode keeps a worktree worker read-only. Every other parent mode,
-    // including the default Manual mode, edits inside the isolated lease: the
-    // child has no approver, so `Ask` there could only deny every write.
+    // A worktree worker runs in its parent's mode, never a more permissive
+    // one: under Plan Mode and Manual (which asks before every edit, and the
+    // worker has no approver) it cannot write inside the lease.
     for (parent, expected) in [
         (
             davinci_agent::PermissionMode::ReadOnly,
@@ -4420,7 +4420,7 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         ),
         (
             davinci_agent::PermissionMode::Ask,
-            davinci_agent::PermissionMode::Edits,
+            davinci_agent::PermissionMode::Ask,
         ),
         (
             davinci_agent::PermissionMode::Edits,
@@ -4445,6 +4445,52 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
             !shared_writer,
             "a worktree worker never holds the shared lock"
         );
+    }
+}
+
+#[test]
+fn delegated_worker_does_not_exceed_parent_permission() {
+    use davinci_agent::PermissionMode as Mode;
+    // How much a mode lets a run do without asking, least to most.
+    let rank = |mode: Mode| match mode {
+        Mode::ReadOnly => 0,
+        Mode::Ask => 1,
+        Mode::Edits => 2,
+        Mode::Auto => 3,
+        Mode::AlwaysApprove => 4,
+    };
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        project_trust_override: Some(true),
+        ..Default::default()
+    };
+    for parent in Mode::ALL {
+        for worktree in [None, Some(dir.path().to_path_buf())] {
+            let req = davinci_agent::SubagentRequest {
+                tools: vec!["read".into(), "write".into(), "bash".into()],
+                parent_tools: Some(vec!["read".into(), "write".into(), "bash".into()]),
+                parent_permission_mode: Some(parent),
+                worktree_path: worktree.clone(),
+                ..Default::default()
+            };
+            let (child, _) = build_worker_agent(
+                &parsed,
+                dir.path(),
+                &davinci_agent::McpRegistry::default(),
+                &req,
+            )
+            .unwrap();
+            assert!(
+                rank(child.permission_mode()) <= rank(parent),
+                "a worker under {parent:?} ran in {:?} (worktree: {})",
+                child.permission_mode(),
+                worktree.is_some()
+            );
+        }
     }
 }
 
@@ -4475,12 +4521,17 @@ fn shared_workers_and_inheriting_profiles_edit_files_outside_plan_mode() {
             ),
             (
                 davinci_agent::PermissionMode::Ask,
+                davinci_agent::PermissionMode::Ask,
+                false,
+            ),
+            (
+                davinci_agent::PermissionMode::Edits,
                 davinci_agent::PermissionMode::Edits,
                 true,
             ),
             (
                 davinci_agent::PermissionMode::Auto,
-                davinci_agent::PermissionMode::Edits,
+                davinci_agent::PermissionMode::Auto,
                 true,
             ),
         ] {

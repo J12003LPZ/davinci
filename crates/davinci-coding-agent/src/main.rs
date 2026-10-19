@@ -2590,11 +2590,11 @@ fn build_worker_agent(
             davinci_agent::PermissionMode::parse(&profile.permission_mode)
                 .unwrap_or(davinci_agent::PermissionMode::ReadOnly)
         }
-        // Every worker reads and edits files. A child has no approver, so
-        // `Ask` could only deny: Plan Mode (or an unknown parent) stays
-        // read-only and every other parent mode accepts edits. A worktree
-        // lease is its own checkout; in the shared workspace, writers take
-        // turns through the team's shared-write lease.
+        // A worker never runs in a mode more permissive than its parent's.
+        // It has no approver, so what the mode would ask about is refused
+        // (and `WorkerAccess` does not offer those tools). In the shared
+        // workspace, writers take turns through the team's shared-write
+        // lease.
         _ => worker_child_mode(req.parent_permission_mode),
     };
     let mut policy = davinci_agent::PermissionPolicy::new(child_mode);
@@ -2673,20 +2673,22 @@ fn build_worker_agent(
         })));
     }
     let shared_writer = req.worktree_path.is_none()
-        && !matches!(child_mode, davinci_agent::PermissionMode::ReadOnly);
+        && matches!(
+            child_mode,
+            davinci_agent::PermissionMode::Edits
+                | davinci_agent::PermissionMode::Auto
+                | davinci_agent::PermissionMode::AlwaysApprove
+        );
     Ok((child, shared_writer))
 }
 
-/// Permission mode for a worker without an explicit profile mode.
+/// Permission mode for a worker without an explicit profile mode: the
+/// parent's own (an unknown parent is treated as Plan Mode). An explicit
+/// profile mode is held to the same ceiling by `validate_profile_containment`.
 fn worker_child_mode(
     parent: Option<davinci_agent::PermissionMode>,
 ) -> davinci_agent::PermissionMode {
-    match parent {
-        Some(davinci_agent::PermissionMode::ReadOnly) | None => {
-            davinci_agent::PermissionMode::ReadOnly
-        }
-        Some(_) => davinci_agent::PermissionMode::Edits,
-    }
+    parent.unwrap_or(davinci_agent::PermissionMode::ReadOnly)
 }
 
 fn run_worker_turn(parsed: &Args, child: &mut Agent, prompt: &str) -> Result<String, String> {

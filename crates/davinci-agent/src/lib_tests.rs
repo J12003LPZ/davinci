@@ -3056,7 +3056,10 @@ fn last_mutation_generation_survives() {
         .load_from_session(JsonlSession::open(&path).unwrap())
         .unwrap();
     assert_eq!(resumed.mutation_verification_state(), before);
-    assert_eq!(resumed.completion_evidence(), CompletionEvidence::Unverified);
+    assert_eq!(
+        resumed.completion_evidence(),
+        CompletionEvidence::Unverified
+    );
 }
 
 #[test]

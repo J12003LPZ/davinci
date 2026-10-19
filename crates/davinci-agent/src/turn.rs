@@ -5689,6 +5689,32 @@ mod tests {
     }
 
     #[test]
+    fn per_call_refinement_cannot_upgrade_a_serial_barrier() {
+        // Only the `agent` tool is refined per call, and only downward. Worktree
+        // isolation in the arguments of any other tool does not buy a lane.
+        let mut agent = Agent::new("lane fixture");
+        let isolated = serde_json::json!({"command": "make", "isolation": "worktree"});
+        for mode in [
+            crate::PermissionMode::Edits,
+            crate::PermissionMode::Auto,
+            crate::PermissionMode::AlwaysApprove,
+        ] {
+            agent.set_permission_mode(mode);
+            for (tool, class) in [
+                ("bash", crate::permission::ToolClass::Shell),
+                ("write", crate::permission::ToolClass::Edit),
+                ("unregistered_tool", crate::permission::ToolClass::Other),
+            ] {
+                assert_eq!(
+                    agent.lane_for_call(tool, class, &isolated),
+                    crate::scheduler::ToolLane::Serial,
+                    "{tool} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn graph_effect_handoff_failure_stops_worker_after_mutation() {
         const CHILD: &str = "DAVINCI_EFFECT_HANDOFF_FIXTURE";
         let Some(root) = std::env::var_os(CHILD) else {
