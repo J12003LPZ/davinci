@@ -1246,3 +1246,152 @@ fn repair_with_the_service_down_changes_nothing() {
     assert_eq!(receipt.blocked, Some("PROVIDER_OFFLINE"), "{receipt:?}");
     assert_eq!(fs::read(memory.local_path()).unwrap(), before);
 }
+
+// ---- Task 8: one /setup surface ---------------------------------------------
+
+use davinci_coding_agent::native_extensions::NativeExtensionHost;
+use std::collections::BTreeMap;
+
+/// Every file under `root` with its bytes, for before/after comparison.
+fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let key = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.insert(key, fs::read(&path).unwrap_or_default());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn setup_host(agent: &Path, project: &Path, url: &str) -> NativeExtensionHost {
+    fs::write(
+        agent.join("vector-memory.json"),
+        format!(
+            "{{\"ollamaUrl\":\"{url}\",\"embeddingDimensions\":8,\"requestTimeoutSeconds\":5}}"
+        ),
+    )
+    .unwrap();
+    NativeExtensionHost::new_with_agent_dir("setup-surface", project, Some(agent))
+}
+
+#[test]
+fn setup_check_is_readonly_setup_offers_actions() {
+    let _turn = PULL_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let server = pull_server(false, 8, true);
+    let mut host = setup_host(agent.path(), project.path(), &server.url);
+
+    // `/setup check` (and its JSON form) change no file and download nothing.
+    let agent_before = snapshot(agent.path());
+    let project_before = snapshot(project.path());
+    for args in ["check", "status", "check --json"] {
+        let report = host.command("setup", args).unwrap().unwrap();
+        assert_eq!(report["mode"], "check", "{args}");
+        let memory = &report["steps"][0];
+        assert_eq!(memory["id"], "memory");
+        assert_eq!(memory["code"], "MODEL_MISSING", "{args}: {report}");
+        assert_eq!(report["health"][0]["code"], "MODEL_MISSING");
+    }
+    let json = host.command("setup", "check --json").unwrap().unwrap();
+    let text = json["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).expect("lines are one JSON document");
+    assert!(parsed["steps"].is_array() && parsed["health"].is_array());
+    assert_eq!(
+        snapshot(agent.path()),
+        agent_before,
+        "/setup check wrote to the agent directory"
+    );
+    assert_eq!(
+        snapshot(project.path()),
+        project_before,
+        "/setup check wrote to the project"
+    );
+    assert_eq!(server.pulls.load(Ordering::SeqCst), 0);
+
+    // `/setup` offers the action and says exactly how to approve it; it does
+    // not download on its own.
+    let applied = host.command("setup", "").unwrap().unwrap();
+    let memory = &applied["steps"][0];
+    assert_eq!(memory["code"], "CONSENT_REQUIRED", "{applied}");
+    assert!(memory["action"]
+        .as_str()
+        .unwrap()
+        .contains("/setup approve download-model"));
+    assert_eq!(server.pulls.load(Ordering::SeqCst), 0);
+
+    // One yes, one action: approving the download runs only the download.
+    let approved = host
+        .command("setup", "approve download-model")
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved["mode"], "approve");
+    assert_eq!(approved["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(approved["steps"][0]["state"], "running", "{approved}");
+    wait_for_pull();
+    assert_eq!(server.pulls.load(Ordering::SeqCst), 1);
+
+    // Unknown words are refused without changing anything.
+    assert!(host.command("setup", "approve everything").is_err());
+    assert!(host.command("setup", "wipe").is_err());
+}
+
+#[test]
+fn setup_trust_still_records_the_phase_one_decision() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join(".davinci")).unwrap();
+    fs::write(project.path().join(".davinci").join("hooks.json"), "{}").unwrap();
+    let server = fake_ollama(&["embeddinggemma"], 8);
+    let mut host = setup_host(agent.path(), project.path(), &server.url);
+    let report = host.command("setup", "trust").unwrap().unwrap();
+    assert_eq!(report["mode"], "trust");
+    let store = fs::read_to_string(agent.path().join("trust.json")).unwrap();
+    assert!(store.contains("true"), "{store}");
+    // Trusting a folder started and approved nothing.
+    assert!(!agent.path().join("service-consent.json").exists());
+    assert_eq!(server.requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn setup_repair_reembeds_and_keeps_every_record() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let server = embed_server(8);
+    let mut host = setup_host(agent.path(), project.path(), &server.url);
+    // Records written while the service was down.
+    let mut down = memory_in(project.path());
+    for n in 0..3 {
+        learn(&mut down, &format!("a fact worth repairing {n}")).unwrap();
+    }
+    let path = down.local_path();
+    let lines_before = fs::read_to_string(&path).unwrap().lines().count();
+    let report = host.command("setup", "repair").unwrap().unwrap();
+    assert_eq!(report["mode"], "repair");
+    assert_eq!(report["steps"][0]["state"], "done", "{report}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap().lines().count(),
+        lines_before
+    );
+}

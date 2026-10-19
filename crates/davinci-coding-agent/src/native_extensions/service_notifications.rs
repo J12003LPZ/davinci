@@ -207,6 +207,7 @@ pub fn recovery_wanted(agent_dir: &Path) -> bool {
 pub fn start_recovery(
     agent_dir: PathBuf,
     supervisor: &'static ManagedServiceSupervisor,
+    memory: Option<Arc<Mutex<super::vector_memory::VectorMemory>>>,
 ) -> Option<Arc<AtomicBool>> {
     if !recovery_wanted(&agent_dir) {
         return None;
@@ -220,7 +221,17 @@ pub fn start_recovery(
             if let Some(notice) = round.notice {
                 push_notice(notice);
             }
-            let Some(wait) = round.retry_in else { break };
+            let Some(wait) = round.retry_in else {
+                // Ollama answers: embed whatever was written while it was
+                // down, if the user left safe repair on. Derived data only.
+                if round.health.state == HealthState::Ready {
+                    let effective = load_effective_setup(&agent_dir, &process_env);
+                    if let (true, Some(memory)) = (effective.profile.memory.safe_repair, &memory) {
+                        let _ = super::setup_actions::repair_step(memory);
+                    }
+                }
+                break;
+            };
             let mut waited = Duration::ZERO;
             while waited < wait && !flag.load(Ordering::SeqCst) {
                 let step = Duration::from_millis(250).min(wait - waited);

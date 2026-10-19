@@ -32,27 +32,46 @@ use std::time::Duration;
 pub const IGNORED_STATE: &[&str] = &[".davinci/vector-memory/", ".davinci/graph/"];
 /// Records embedded per batch after a pull; the memory lock is released
 /// between batches so a turn is never held behind the whole backlog.
-const REINDEX_BATCHES: usize = 40;
+pub(crate) const REINDEX_BATCHES: usize = 40;
 /// Records re-embedded per locked batch.
-const REINDEX_BATCH_SIZE: usize = 256;
+pub(crate) const REINDEX_BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Report every area and apply the local, reversible steps.
     Apply,
-    /// Report only.
+    /// Report only. Changes nothing and starts nothing.
     Check,
+    /// `Check`, answered as JSON.
+    CheckJson,
+    /// Re-embed records whose vector is stale. Never deletes a record.
+    Repair,
     /// Record that this project is trusted.
     Trust,
+    /// Record the user's yes to one action and do just that action.
+    Approve(super::setup_actions::SetupAction),
 }
 
 pub fn parse_args(args: &str) -> Result<Mode, String> {
-    match args.trim() {
+    let args = args.trim();
+    if let Some(rest) = args.strip_prefix("approve") {
+        let word = rest.trim();
+        return super::setup_actions::SetupAction::parse(word)
+            .map(Mode::Approve)
+            .ok_or_else(|| {
+                format!(
+                    "unknown action `{word}` · use /setup approve start-ollama or /setup approve download-model"
+                )
+            });
+    }
+    match args {
         "" | "apply" => Ok(Mode::Apply),
         "check" | "--check" | "status" => Ok(Mode::Check),
+        "check --json" | "status --json" | "--json" => Ok(Mode::CheckJson),
+        "repair" => Ok(Mode::Repair),
         "trust" => Ok(Mode::Trust),
         other => Err(format!(
-            "unknown /setup argument `{other}` · use /setup, /setup check or /setup trust"
+            "unknown /setup argument `{other}` · use /setup, /setup check [--json], /setup repair, /setup approve <action> or /setup trust"
         )),
     }
 }
@@ -138,6 +157,17 @@ impl Step {
 /// The answer every mode returns: `lines` for the transcript, `steps` for
 /// RPC clients and tests.
 pub fn report(mode: Mode, steps: Vec<Step>) -> Value {
+    report_full(mode, steps, Vec::new(), Vec::new())
+}
+
+/// [`report`] with the component health and the configuration issues the
+/// steps were derived from. `/setup check --json` prints this object.
+pub fn report_full(
+    mode: Mode,
+    steps: Vec<Step>,
+    health: Vec<ComponentHealth>,
+    issues: Vec<super::setup_profile::Issue>,
+) -> Value {
     let pending = steps
         .iter()
         .filter(|step| step.state == StepState::Action)
@@ -148,16 +178,82 @@ pub fn report(mode: Mode, steps: Vec<Step>) -> Value {
         (0, true) => "setup continues in the background · run /setup again to follow it".into(),
         (count, _) => format!("{count} step(s) need you"),
     };
+    let lines: Vec<String> = if mode == Mode::CheckJson {
+        let body = json!({
+            "summary": summary,
+            "steps": steps,
+            "health": health,
+            "issues": issues,
+        });
+        serde_json::to_string_pretty(&body)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    } else {
+        steps.iter().map(Step::line).collect()
+    };
     json!({
         "mode": match mode {
             Mode::Apply => "apply",
-            Mode::Check => "check",
+            Mode::Check | Mode::CheckJson => "check",
+            Mode::Repair => "repair",
             Mode::Trust => "trust",
+            Mode::Approve(_) => "approve",
         },
         "summary": summary,
-        "lines": steps.iter().map(Step::line).collect::<Vec<_>>(),
+        "lines": lines,
         "steps": steps,
+        "health": health,
+        "issues": issues,
     })
+}
+
+/// The memory component's health, from live probes and the store, without
+/// holding the memory lock across the network and without changing anything.
+pub fn memory_health(
+    memory: &Arc<Mutex<VectorMemory>>,
+    effective: &super::setup_profile::EffectiveSetupConfig,
+    ctx: &SetupContext,
+) -> ComponentHealth {
+    use super::setup_health::{assess_memory, probe_ollama, MemoryFacts, ProbeTarget};
+    use super::vector_memory::ConfigFileState;
+    let (config, store, records, lag) = {
+        let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
+        let status = memory.status();
+        (
+            memory.config.clone(),
+            memory.store_health(),
+            status["records"].as_u64().unwrap_or(0) as usize,
+            status["projectionLag"].as_u64().unwrap_or(0) as usize,
+        )
+    };
+    let config_error = match &effective.memory.file {
+        ConfigFileState::Corrupt(error) => Some(error.clone()),
+        _ => None,
+    };
+    let enabled = effective.memory.enabled && config.enabled;
+    // A feature that is off, or whose config is unreadable, is not probed.
+    let probe = (enabled && config_error.is_none() && !store.is_unreadable())
+        .then(|| probe_ollama(&ProbeTarget::from_config(&config)));
+    let installed = probe
+        .as_ref()
+        .filter(|probe| !probe.reachable)
+        .map(|_| ctx.supervisor.launcher().find().is_some());
+    let starting = pull_progress().is_some_and(|progress| !progress.finished);
+    let facts = MemoryFacts {
+        enabled,
+        config_error: config_error.as_deref(),
+        store: &store,
+        probe: probe.as_ref(),
+        ollama_installed: installed,
+        starting,
+        model: &config.embedding_model,
+        configured_dimensions: config.embedding_dimensions,
+        records,
+        lag,
+    };
+    assess_memory(&facts)
 }
 
 // ---------------------------------------------------------------------------

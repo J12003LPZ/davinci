@@ -5066,6 +5066,11 @@ pub fn run(
     let service_recovery = crate::native_extensions::service_notifications::start_recovery(
         crate::default_agent_dir(),
         crate::native_extensions::service_supervisor::system_supervisor(),
+        {
+            let locked = host.lock().unwrap_or_else(|e| e.into_inner());
+            let native = locked.native.lock().unwrap_or_else(|e| e.into_inner());
+            Some(native.memory.clone())
+        },
     );
     let result = loop {
         let _ = terminal.reacquire();

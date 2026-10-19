@@ -303,7 +303,7 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "setup",
             "Set up this workspace: vector memory, .gitignore, trust, plugin hooks and language servers.",
-            Some("[check|trust]"),
+            Some("[check [--json]|repair|approve <start-ollama|download-model>|trust]"),
         ),
     ]
     .into_iter().filter(|(name, _, _)| !name.ends_with("-status")).collect()
@@ -1035,19 +1035,39 @@ impl NativeExtensionHost {
                 } else {
                     self.cwd.clone()
                 };
+                let ctx = setup::SetupContext::system(&self.agent_dir);
                 let steps = if mode == setup::Mode::Trust {
                     vec![setup::trust_project(&self.agent_dir, &cwd)]
+                } else if let setup::Mode::Approve(action) = mode {
+                    // One yes, one action: record it, then do just that.
+                    let approved = setup_actions::approve_action(action, &ctx);
+                    let mut step =
+                        setup_actions::execute_approved_action(action, &self.memory, &ctx);
+                    match approved {
+                        Ok(line) => step.detail = format!("{line}; {}", step.detail),
+                        Err(error) => {
+                            step = setup::Step::new(
+                                "memory",
+                                "vector memory",
+                                setup::StepState::Action,
+                                error,
+                            );
+                        }
+                    }
+                    vec![step]
+                } else if mode == setup::Mode::Repair {
+                    vec![setup_actions::execute_approved_action(
+                        setup_actions::SetupAction::RepairProjection,
+                        &self.memory,
+                        &ctx,
+                    )]
                 } else {
                     let apply = mode == setup::Mode::Apply;
                     let lsp_enabled = self.language_intelligence.status()["enabled"]
                         .as_bool()
                         .unwrap_or(false);
                     vec![
-                        setup::memory_step(
-                            &self.memory,
-                            apply,
-                            &setup::SetupContext::system(&self.agent_dir),
-                        ),
+                        setup::memory_step(&self.memory, apply, &ctx),
                         setup::gitignore_step(&cwd, apply),
                         setup::trust_step(&self.agent_dir, &cwd),
                         setup::plugins_step(&self.agent_dir),
@@ -1055,7 +1075,26 @@ impl NativeExtensionHost {
                         setup::instructions_step(&cwd),
                     ]
                 };
-                Ok(Some(setup::report(mode, steps)))
+                let effective = setup_profile::load_effective_setup(
+                    &self.agent_dir,
+                    &vector_memory::process_env,
+                );
+                // Trusting a folder, approving one action or repairing touches no
+                // service for a status read; only the reporting modes probe.
+                let health = if matches!(
+                    mode,
+                    setup::Mode::Apply | setup::Mode::Check | setup::Mode::CheckJson
+                ) {
+                    vec![setup::memory_health(&self.memory, &effective, &ctx)]
+                } else {
+                    Vec::new()
+                };
+                Ok(Some(setup::report_full(
+                    mode,
+                    steps,
+                    health,
+                    effective.issues(),
+                )))
             }
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name == "security-scan" || name.starts_with("sec-") => {

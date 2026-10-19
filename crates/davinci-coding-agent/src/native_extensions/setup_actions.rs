@@ -22,13 +22,17 @@ pub enum SetupAction {
     DownloadModel,
     /// Start the approved local Ollama.
     StartService,
+    /// Re-embed records whose vector is stale. Derived data only; no record
+    /// is ever removed, so it needs no approval beyond asking for it.
+    RepairProjection,
 }
 
 impl SetupAction {
-    pub const ALL: [SetupAction; 3] = [
+    pub const ALL: [SetupAction; 4] = [
         SetupAction::Install,
         SetupAction::DownloadModel,
         SetupAction::StartService,
+        SetupAction::RepairProjection,
     ];
 
     /// The word used after `/setup approve`.
@@ -37,6 +41,7 @@ impl SetupAction {
             Self::Install => "install",
             Self::DownloadModel => "download-model",
             Self::StartService => "start-ollama",
+            Self::RepairProjection => "repair",
         }
     }
 
@@ -49,7 +54,7 @@ impl SetupAction {
     /// The consent this action runs under, if it needs one.
     pub fn consent(self) -> Option<ServiceAction> {
         match self {
-            Self::Install => None,
+            Self::Install | Self::RepairProjection => None,
             Self::DownloadModel => Some(ServiceAction::DownloadEmbeddingModel),
             Self::StartService => Some(ServiceAction::StartLocalOllama),
         }
@@ -108,6 +113,7 @@ pub fn execute_approved_action(
             let health = ctx.supervisor.reconcile(ctx.agent_dir, &effective);
             step_from_health(ID, TITLE, &health)
         }
+        SetupAction::RepairProjection => repair_step(memory),
         SetupAction::DownloadModel => {
             let (url, model) = {
                 let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
@@ -133,4 +139,79 @@ pub fn execute_approved_action(
             }
         }
     }
+}
+
+/// Run repair batches (the memory lock is released between them) until the
+/// records are all embedded, a batch embeds nothing, or something blocks it.
+pub fn repair_step(memory: &Arc<Mutex<VectorMemory>>) -> Step {
+    use super::setup::{REINDEX_BATCHES, REINDEX_BATCH_SIZE};
+    const ID: &str = "memory";
+    const TITLE: &str = "vector memory";
+    let mut total = 0;
+    let mut last = None;
+    for _ in 0..REINDEX_BATCHES {
+        let receipt = {
+            let mut memory = memory.lock().unwrap_or_else(|e| e.into_inner());
+            memory.clear_dense_offline();
+            memory.repair_projection(REINDEX_BATCH_SIZE)
+        };
+        total += receipt.reembedded;
+        let stop = receipt.reembedded == 0 || receipt.blocked.is_some() || receipt.error.is_some();
+        last = Some(receipt);
+        if stop {
+            break;
+        }
+    }
+    let receipt = last.unwrap_or_default();
+    if let Some(code) = receipt.blocked {
+        let action = match code {
+            "EMBEDDING_MISMATCH" => {
+                "set embeddingDimensions to the size the model returns, then run /setup repair"
+            }
+            "LOCAL_STORE_UNREADABLE" => "fix or move the record file, then run /setup repair",
+            _ => "start Ollama (/setup), then run /setup repair",
+        };
+        return Step::new(
+            ID,
+            TITLE,
+            StepState::Action,
+            format!(
+                "repair did not start: {} (no record was changed)",
+                receipt.error.unwrap_or_default()
+            ),
+        )
+        .with_code(match code {
+            "EMBEDDING_MISMATCH" => super::setup_health::EMBEDDING_MISMATCH,
+            "LOCAL_STORE_UNREADABLE" => super::vector_memory::LOCAL_STORE_UNREADABLE,
+            _ => super::setup_health::PROVIDER_OFFLINE,
+        })
+        .with_action(action);
+    }
+    if let Some(error) = receipt.error {
+        return Step::new(
+            ID,
+            TITLE,
+            StepState::Action,
+            format!("repair stopped after {total} record(s): {error}; no record was changed"),
+        )
+        .with_action("run /setup repair again");
+    }
+    if receipt.remaining > 0 {
+        return Step::new(
+            ID,
+            TITLE,
+            StepState::Running,
+            format!("re-embedded {total} record(s); {} left", receipt.remaining),
+        )
+        .with_action("run /setup repair again");
+    }
+    Step::new(
+        ID,
+        TITLE,
+        StepState::Done,
+        format!(
+            "re-embedded {total} record(s); {} record(s) kept",
+            receipt.records_after
+        ),
+    )
 }
