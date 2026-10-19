@@ -5012,7 +5012,7 @@ impl Agent {
                     message[key] = value.clone();
                 }
             }
-            let _ = session.append_entry(davinci_session::SessionEntry {
+            if let Err(error) = session.append_entry(davinci_session::SessionEntry {
                 id: String::new(),
                 entry_type: "message".into(),
                 parent_id: None,
@@ -5021,7 +5021,10 @@ impl Agent {
                 message: Some(message),
                 custom_type: None,
                 extra: serde_json::Map::new(),
-            });
+            }) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
             // Native tapes include exact request inputs. An ephemeral overlay
             // must not enter saved session history through this second route.
             if let Some(record) =
@@ -5030,7 +5033,7 @@ impl Agent {
                 if let Ok(data) = serde_json::to_value(record) {
                     let mut extra = serde_json::Map::new();
                     extra.insert("data".into(), data);
-                    let _ = session.append_entry(davinci_session::SessionEntry {
+                    if let Err(error) = session.append_entry(davinci_session::SessionEntry {
                         id: String::new(),
                         entry_type: "custom".into(),
                         parent_id: None,
@@ -5039,7 +5042,10 @@ impl Agent {
                         message: None,
                         custom_type: Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE.to_string()),
                         extra,
-                    });
+                    }) {
+                        self.persistence_failure
+                            .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+                    }
                 }
             }
         }

@@ -2109,7 +2109,12 @@ impl crate::Agent {
                     custom_type: Some(PROMPT_REWIND_DELTA_ENTRY.into()),
                     extra: serde_json::Map::from_iter([("data".into(), data)]),
                 })
-                .map_err(|error| format!("Prompt rewind persistence failed: {error}"))?;
+                .map_err(|error| {
+                    format!(
+                        "{}: Prompt rewind persistence failed: {error}",
+                        crate::PERSISTENCE_FAILURE
+                    )
+                })?;
         }
         Ok(())
     }

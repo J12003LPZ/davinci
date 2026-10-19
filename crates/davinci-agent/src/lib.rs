@@ -147,6 +147,8 @@ pub use prompt::{
 };
 
 pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
+/// Code on every error that reports a lost session write.
+pub const PERSISTENCE_FAILURE: &str = "PERSISTENCE_FAILURE";
 pub use runtime::{
     conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
     find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
@@ -669,6 +671,10 @@ pub struct Agent {
     provider_system_prompt_suffix: Option<String>,
     /// Last prepared context manifest before provider dispatch.
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
+    /// The first session write that failed outside the session's own sticky
+    /// error, with the session file it belongs to. Cleared by opening another
+    /// session. `ensure_session_persistence` reports it as PERSISTENCE_FAILURE.
+    persistence_failure: Option<(std::path::PathBuf, String)>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
     /// The bus created solely for prompt checkpoints. Host-bound runtimes
@@ -833,6 +839,7 @@ impl Agent {
             prepared_manifest_revisions: (0, 0),
             provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
+            persistence_failure: None,
             runtime: None,
             prompt_checkpoint_bus: None,
             runtime_session: None,
@@ -2098,11 +2105,14 @@ impl Agent {
         for notice in self.job_notice_messages() {
             self.messages.push(notice.clone());
             if let Some(session) = &mut self.session {
-                let _ = session.append_entry(chat_entry(
+                if let Err(error) = session.append_entry(chat_entry(
                     "user",
                     serde_json::to_value(&notice.content).unwrap_or(Value::Null),
                     &notice.extra,
-                ));
+                )) {
+                    self.persistence_failure
+                        .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+                }
             }
             self.pending_prompt_messages.push(notice);
         }
@@ -2146,11 +2156,14 @@ impl Agent {
         }
         self.messages.push(message.clone());
         if let Some(session) = &mut self.session {
-            let _ = session.append_entry(chat_entry(
+            if let Err(error) = session.append_entry(chat_entry(
                 "user",
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
                 &message.extra,
-            ));
+            )) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
         if let Some(checkpoint) = rewind_start {
             self.record_prompt_checkpoint(checkpoint);
@@ -3175,14 +3188,23 @@ impl Agent {
     /// Execution cannot continue after a session write has an uncertain outcome.
     /// Recovery must reopen the durable session before issuing another request.
     pub fn ensure_session_persistence(&self) -> Result<(), String> {
-        match self
+        if let Some(error) = self
             .session
             .as_ref()
             .and_then(JsonlSession::persistence_error)
         {
-            Some(error) => Err(format!("Session recovery required: {error}")),
-            None => Ok(()),
+            return Err(format!(
+                "{PERSISTENCE_FAILURE}: Session recovery required: {error}"
+            ));
         }
+        if let (Some(session), Some((path, error))) = (&self.session, &self.persistence_failure) {
+            if &session.path == path {
+                return Err(format!(
+                    "{PERSISTENCE_FAILURE}: a session write failed and the turn is not saved ({error}). Reopen the session to recover."
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn cache_operation_presentation(&self, call_id: &str, result: ToolResult) {
@@ -3214,7 +3236,10 @@ impl Agent {
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
             );
             entry.message = Some(serde_json::to_value(message).unwrap_or(Value::Null));
-            let _ = session.append_entry(entry);
+            if let Err(error) = session.append_entry(entry) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
     }
 
@@ -3340,7 +3365,7 @@ impl Agent {
         if let Some(session) = &mut self.session {
             let mut extra = serde_json::Map::new();
             extra.insert("data".into(), value);
-            let _ = session.append_entry(SessionEntry {
+            if let Err(error) = session.append_entry(SessionEntry {
                 id: String::new(),
                 entry_type: "custom".into(),
                 parent_id: None,
@@ -3349,7 +3374,10 @@ impl Agent {
                 message: None,
                 custom_type: Some(TODO_ENTRY_TYPE.into()),
                 extra,
-            });
+            }) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
     }
 
@@ -3433,7 +3461,7 @@ impl Agent {
                     extra.insert(key.to_string(), value.clone());
                 }
             }
-            let _ = session.append_entry(SessionEntry {
+            if let Err(error) = session.append_entry(SessionEntry {
                 id: String::new(),
                 entry_type: "custom_message".into(),
                 parent_id: None,
@@ -3445,7 +3473,10 @@ impl Agent {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 extra,
-            });
+            }) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
         self.messages.push(message.clone());
         self.pending_prompt_messages.push(message.clone());
@@ -3460,10 +3491,13 @@ impl Agent {
         let message = ChatMessage::text("assistant", text);
         self.messages.push(message);
         if let Some(session) = &mut self.session {
-            let _ = session.append_entry(SessionEntry::message(
+            if let Err(error) = session.append_entry(SessionEntry::message(
                 "assistant",
                 serde_json::json!([{"type":"text","text": text}]),
-            ));
+            )) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
     }
 
@@ -4533,7 +4567,7 @@ impl Agent {
                 custom_type: Some(PROMPT_SESSION_ENTRY_TYPE.into()),
                 extra,
             })
-            .map_err(|error| format!("Session recovery required: {error}"))
+            .map_err(|error| format!("{PERSISTENCE_FAILURE}: Session recovery required: {error}"))
     }
 
     /// Restore prompt session state and identity from persisted custom session entries.
