@@ -6,6 +6,7 @@ pub mod build_intelligence;
 pub mod change_impact;
 pub mod content_router;
 mod credential_redaction;
+pub mod docker_discovery;
 pub mod ecosystem;
 pub mod engineering_snapshot;
 pub mod git_intelligence;
@@ -24,6 +25,7 @@ pub mod setup;
 pub mod setup_actions;
 pub mod setup_health;
 pub mod setup_profile;
+pub mod setup_qdrant;
 pub mod test_impact;
 pub mod token_governor;
 pub mod vector_memory;
@@ -372,9 +374,18 @@ pub struct NativeExtensionHost {
     /// Who starts Ollama for `/setup`. `None` is this process's real
     /// supervisor; tests inject one with a fake launcher.
     supervisor: Option<Arc<service_supervisor::ManagedServiceSupervisor>>,
+    /// Read-only Docker questions for `/setup qdrant`; tests inject a fake.
+    docker: Option<Arc<dyn docker_discovery::DockerRunner>>,
 }
 
 impl NativeExtensionHost {
+    /// Use `supervisor` for `/setup` instead of the real machine.
+    /// Use `docker` for the read-only Docker questions of `/setup qdrant`.
+    pub fn with_docker(mut self, docker: Arc<dyn docker_discovery::DockerRunner>) -> Self {
+        self.docker = Some(docker);
+        self
+    }
+
     /// Use `supervisor` for `/setup` instead of the real machine.
     pub fn with_supervisor(
         mut self,
@@ -566,6 +577,7 @@ impl NativeExtensionHost {
             cwd: cwd.to_path_buf(),
             agent_dir: repo_agent_dir,
             supervisor: None,
+            docker: None,
         }
     }
 
@@ -1051,13 +1063,17 @@ impl NativeExtensionHost {
                 } else {
                     self.cwd.clone()
                 };
-                let ctx = match &self.supervisor {
+                let mut ctx = match &self.supervisor {
                     Some(supervisor) => setup::SetupContext {
                         agent_dir: &self.agent_dir,
                         supervisor,
+                        docker: &docker_discovery::SystemDockerRunner,
                     },
                     None => setup::SetupContext::system(&self.agent_dir),
                 };
+                if let Some(docker) = &self.docker {
+                    ctx.docker = docker.as_ref();
+                }
                 let steps = if mode == setup::Mode::Trust {
                     vec![setup::trust_project(&self.agent_dir, &cwd)]
                 } else if let setup::Mode::Approve(action) = mode {
@@ -1077,6 +1093,8 @@ impl NativeExtensionHost {
                         }
                     }
                     vec![step]
+                } else if let setup::Mode::Qdrant(command) = &mode {
+                    setup_qdrant::command(command.clone(), &self.memory, &ctx)
                 } else if let setup::Mode::Switch(feature, on) = mode {
                     vec![setup::switch_step(
                         &self.agent_dir,
@@ -1098,6 +1116,7 @@ impl NativeExtensionHost {
                         .unwrap_or(false);
                     vec![
                         setup::memory_step(&self.memory, apply, &ctx),
+                        setup_qdrant::summary_step(&ctx),
                         setup::gitignore_step(&cwd, apply),
                         setup::trust_step(&self.agent_dir, &cwd),
                         setup::plugins_step(&self.agent_dir),

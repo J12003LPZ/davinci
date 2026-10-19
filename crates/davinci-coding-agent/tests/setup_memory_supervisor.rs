@@ -799,6 +799,7 @@ impl Ctx {
         SetupContext {
             agent_dir: self.agent.path(),
             supervisor: &self.supervisor,
+            docker: &davinci_coding_agent::native_extensions::docker_discovery::AbsentDocker,
         }
     }
 }

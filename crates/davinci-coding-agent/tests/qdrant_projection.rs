@@ -66,6 +66,7 @@ fn profile_choice_selects_qdrant_and_environment_can_turn_it_off() {
     profile.memory.qdrant_setup = QdrantChoices {
         url: Some("http://127.0.0.1:7777".into()),
         allow_remote: false,
+        ..QdrantChoices::default()
     };
     profile.save(agent.path()).unwrap();
 

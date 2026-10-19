@@ -66,6 +66,23 @@ pub struct QdrantChoices {
     /// The user agreed that a non-loopback Qdrant may receive vectors.
     #[serde(default)]
     pub allow_remote: bool,
+    /// The one container the user told DaVinci is its own. Only this one may
+    /// ever be started, and only with `allow_start_owned_qdrant_container`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_container: Option<OwnedContainer>,
+    /// The user wants the command DaVinci shows for creating its container to
+    /// include `--restart unless-stopped`. DaVinci never changes a restart
+    /// policy itself; this only changes the text it prints.
+    #[serde(default)]
+    pub keep_running: bool,
+}
+
+/// A container recorded as DaVinci's. Matched by id, never by name alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedContainer {
+    pub id: String,
+    pub name: String,
 }
 
 impl Default for MemoryChoices {

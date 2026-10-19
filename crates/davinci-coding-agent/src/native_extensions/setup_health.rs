@@ -21,6 +21,13 @@ pub const INSTALL_REQUIRED: &str = "INSTALL_REQUIRED";
 pub const MODEL_MISSING: &str = "MODEL_MISSING";
 pub const PROVIDER_OFFLINE: &str = "PROVIDER_OFFLINE";
 pub const EMBEDDING_MISMATCH: &str = "EMBEDDING_MISMATCH";
+/// Docker is installed but its engine does not answer (or answers too slowly).
+pub const DOCKER_UNAVAILABLE: &str = "DOCKER_UNAVAILABLE";
+/// Qdrant is chosen, nothing answers, and no Qdrant container exists.
+pub const QDRANT_MISSING: &str = "QDRANT_MISSING";
+/// A Qdrant container exists that DaVinci did not create and will not touch.
+pub const QDRANT_NOT_OWNED: &str = "QDRANT_NOT_OWNED";
+pub use super::memory_backends::QDRANT_OFFLINE;
 /// Records exist that dense search cannot find yet (repairable).
 pub const PROJECTION_STALE: &str = "PROJECTION_STALE";
 
