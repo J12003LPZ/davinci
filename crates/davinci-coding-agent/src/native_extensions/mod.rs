@@ -16,6 +16,7 @@ pub mod memory_page;
 pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
+pub mod service_authority;
 pub mod setup;
 pub mod test_impact;
 pub mod token_governor;
@@ -399,9 +400,7 @@ impl NativeExtensionHost {
         ) {
             governor_config.store_dir = Some(dir.join("token-governor"));
         }
-        let memory_config = agent_dir
-            .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
-            .unwrap_or_else(VectorMemoryConfig::from_env);
+        let memory_config = host_memory_config(agent_dir);
         let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
         let _ = governor_value.sweep_stale_outputs();
         let governor = Arc::new(Mutex::new(governor_value));
@@ -1186,9 +1185,53 @@ impl NativeExtensionHost {
     }
 }
 
+/// The memory service config. It comes from the host's agent directory (or
+/// the environment), never from the project: a repository must not be able to
+/// point the embedding client at a server or switch on a service start.
+fn host_memory_config(agent_dir: Option<&Path>) -> VectorMemoryConfig {
+    agent_dir
+        .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
+        .unwrap_or_else(VectorMemoryConfig::from_env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_cannot_supply_the_memory_service_config() {
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            agent.path().join("vector-memory.json"),
+            r#"{"ollamaUrl":"http://127.0.0.1:11111"}"#,
+        )
+        .unwrap();
+        for dir in [".davinci", ".pi"] {
+            std::fs::create_dir(project.path().join(dir)).unwrap();
+            std::fs::write(
+                project.path().join(dir).join("vector-memory.json"),
+                r#"{"ollamaUrl":"http://127.0.0.1:22222","autoStart":true}"#,
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            project.path().join("vector-memory.json"),
+            r#"{"ollamaUrl":"http://127.0.0.1:22222"}"#,
+        )
+        .unwrap();
+        // The project directory is the process cwd for this build; only the
+        // agent directory may supply the config.
+        let config = host_memory_config(Some(agent.path()));
+        if std::env::var_os("PI_MEMORY_OLLAMA_URL").is_none() {
+            assert_eq!(config.ollama_url, "http://127.0.0.1:11111");
+        }
+        assert!(
+            !config.ollama_url.contains("22222"),
+            "{}",
+            config.ollama_url
+        );
+    }
 
     #[test]
     fn every_external_native_command_is_listed() {

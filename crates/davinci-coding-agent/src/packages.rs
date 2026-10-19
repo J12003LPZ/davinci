@@ -31,6 +31,17 @@ pub fn handle_package_command(
     args: &[String],
     agent_dir: &Path,
 ) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+    handle_package_command_in(command, args, agent_dir, &cwd)
+}
+
+/// [`handle_package_command`] for an explicit project directory.
+pub fn handle_package_command_in(
+    command: &str,
+    args: &[String],
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Result<String, String> {
     let local = args.iter().any(|a| a == "-l" || a == "--local");
     let source = args.iter().find(|a| !a.starts_with('-')).cloned();
     let settings = load_settings(agent_dir);
@@ -38,25 +49,23 @@ pub fn handle_package_command(
         "install" => {
             let source = source.ok_or("install <source> [-l]")?;
             if local {
-                let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
-                ensure_project_trusted_for_packages(agent_dir, &cwd, &settings)?;
+                ensure_project_trusted_for_packages(agent_dir, cwd, &settings)?;
             }
-            let installed = install_and_persist(&source, local, agent_dir)?;
+            let installed = install_and_persist(&source, local, agent_dir, cwd)?;
             Ok(format!("Installed {installed}{}", scope(local)))
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
-            let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
             let normalized = match parse_package_source(&source) {
-                ParsedSource::Local(path) => normalize_local_source(&path, &cwd)?,
+                ParsedSource::Local(path) => normalize_local_source(&path, cwd)?,
                 _ => source.clone(),
             };
-            let settings_dir = settings_dir_for(local, agent_dir, &cwd);
+            let settings_dir = settings_dir_for(local, agent_dir, cwd);
             update_settings(&settings_dir, |settings| {
                 settings.extensions.retain(|item| item != &normalized);
                 settings.packages.retain(|item| item.source() != normalized);
             })?;
-            remove_installed_package(&source, local, agent_dir, &cwd)?;
+            remove_installed_package(&source, local, agent_dir, cwd)?;
             Ok(format!("Removed {normalized}{}", scope(local)))
         }
         "update" => handle_update(args, agent_dir),
@@ -400,11 +409,15 @@ fn normalize_local_source(path: &str, cwd: &Path) -> Result<String, String> {
     Ok(crate::trust::display_path(&canonical))
 }
 
-fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+fn install_and_persist(
+    source: &str,
+    local: bool,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Result<String, String> {
     let parsed = parse_package_source(source);
     let stored_source = match &parsed {
-        ParsedSource::Local(path) => normalize_local_source(path, &cwd)?,
+        ParsedSource::Local(path) => normalize_local_source(path, cwd)?,
         ParsedSource::Npm { name, spec } => {
             install_remote_package(agent_dir, "npm", name, spec, local)?;
             source.to_string()
@@ -415,7 +428,7 @@ fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<St
             source.to_string()
         }
     };
-    let settings_dir = settings_dir_for(local, agent_dir, &cwd);
+    let settings_dir = settings_dir_for(local, agent_dir, cwd);
     update_settings(&settings_dir, |settings| {
         if !settings.extensions.contains(&stored_source) {
             settings.extensions.push(stored_source.clone());
@@ -1305,17 +1318,36 @@ mod tests {
         let agent = dir.path().join("agent");
         fs::create_dir_all(&agent).unwrap();
         let project = project_with_packages(dir.path());
-        let user = load_settings(&agent);
-        let error = ensure_project_trusted_for_packages(&agent, &project, &user).unwrap_err();
+        let package = dir.path().join("pkg");
+        fs::create_dir_all(&package).unwrap();
+        let args = vec!["-l".to_string(), package.display().to_string()];
+        let before = fs::read_to_string(project.join(".pi").join("settings.json")).unwrap();
+
+        // The real entry point, as `davinci install -l <pkg>` reaches it.
+        let error = handle_package_command_in("install", &args, &agent, &project).unwrap_err();
         assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
+        assert_eq!(
+            fs::read_to_string(project.join(".pi").join("settings.json")).unwrap(),
+            before,
+            "an untrusted project's settings were rewritten"
+        );
+
         crate::trust::ProjectTrustStore::open(&agent)
             .set(&project, Some(true))
             .unwrap();
-        assert!(ensure_project_trusted_for_packages(&agent, &project, &user).is_ok());
-        // A folder with nothing project-controlled has nothing to distrust.
-        let empty = dir.path().join("empty");
-        fs::create_dir_all(&empty).unwrap();
-        assert!(ensure_project_trusted_for_packages(&agent, &empty, &user).is_ok());
+        let installed = handle_package_command_in("install", &args, &agent, &project).unwrap();
+        assert!(installed.starts_with("Installed "), "{installed}");
+        assert!(
+            fs::read_to_string(project.join(".pi").join("settings.json"))
+                .unwrap()
+                .contains("pkg"),
+        );
+        // A user-scoped install never needed the project's trust.
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        let user_scope = vec![package.display().to_string()];
+        assert!(handle_package_command_in("install", &user_scope, &agent, &project).is_ok());
     }
 
     #[test]

@@ -1247,12 +1247,6 @@ Connection: close
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".davinci")).unwrap();
         std::fs::write(project.path().join(".davinci").join("hooks.json"), "{}").unwrap();
-        // A project-written memory config is not a source of service verbs.
-        std::fs::write(
-            project.path().join(".davinci").join("vector-memory.json"),
-            r#"{"ollamaUrl":"http://127.0.0.1:9","autoStart":true}"#,
-        )
-        .unwrap();
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let url = recording_ollama(Arc::clone(&requests));
