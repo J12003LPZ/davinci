@@ -2506,7 +2506,24 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
             return Some(next);
         }
         // The ordinary worker path keeps the UI alive while approval is pending.
-        return Some(submit_prompt(shell, line, &[]));
+        let next = submit_prompt(shell, line, &[]);
+        if !matches!(next, Next::Go) {
+            return Some(next);
+        }
+        // A design that just finished opens its studio: the result is already
+        // in the transcript, and the studio is the same command a person would
+        // type, so it goes through the same checks and the same approval.
+        return Some(match studio_follow_up(shell.agent, line) {
+            Some(open) => {
+                shell.model.transcript.push(Entry::Gap);
+                shell.model.transcript.push(Entry::user(&open));
+                shell.model.transcript.push(Entry::Gap);
+                shell.model.transcript.push(Entry::agent("davinci"));
+                shell.model.running = true;
+                on_line(shell, &open)
+            }
+            None => next,
+        });
     }
     let (name, args) = crate::parse_extension_command(line);
     if name.is_empty() {
@@ -9845,6 +9862,32 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     Next::Go
 }
 
+/// The `/design open <id>` a just-finished generation asks for, if this line
+/// was a generation and its run completed. A blocked run, a read-only command
+/// or an error asks for nothing.
+fn studio_follow_up(agent: &Agent, line: &str) -> Option<String> {
+    use davinci_coding_agent::design::commands::{parse_design_command, DesignCommand};
+    if !matches!(
+        parse_design_command(line).ok()?,
+        DesignCommand::Create { .. } | DesignCommand::Revise { .. } | DesignCommand::Resume { .. }
+    ) {
+        return None;
+    }
+    let last = agent.messages.last()?;
+    if last.extra.get("customType").and_then(|v| v.as_str()) != Some("design_result") {
+        return None;
+    }
+    let text = last.content.iter().find_map(|block| match block {
+        davinci_ai::MessageContent::Text { text } => Some(text.as_str()),
+        _ => None,
+    })?;
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let action = value["next"]["action"].as_str()?;
+    action
+        .starts_with("/design open ")
+        .then(|| action.to_string())
+}
+
 /// `/design` asks before it fails: `Some` when the runtime is missing or the
 /// feature is off, with either the setup question or, where nothing can be
 /// installed from here, what to do instead.
@@ -9863,7 +9906,9 @@ fn ask_design_setup(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
     // non-subscription model) fails now, not after a few-minute install.
     if matches!(
         command,
-        commands::DesignCommand::Create { .. } | commands::DesignCommand::Revise { .. }
+        commands::DesignCommand::Create { .. }
+            | commands::DesignCommand::Revise { .. }
+            | commands::DesignCommand::Resume { .. }
     ) && (shell.parsed.offline
         || shell.parsed.api_key.is_some()
         || davinci_coding_agent::design::model::SubscriptionModel::configured(shell.agent).is_err())

@@ -20,6 +20,11 @@ pub enum DesignCommand {
         brief: String,
         operation_id: OperationId,
     },
+    /// Try the failed phase of a blocked generation again from its checkpoint.
+    Resume {
+        artifact_id: ArtifactId,
+        operation_id: OperationId,
+    },
     Verify {
         artifact_id: ArtifactId,
     },
@@ -131,8 +136,8 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         return create(&tokens[1..], BTreeMap::new());
     }
     let reserved = [
-        "new", "list", "open", "status", "revise", "verify", "fork", "restore", "export", "apply",
-        "sync",
+        "new", "list", "open", "status", "revise", "resume", "verify", "fork", "restore", "export",
+        "apply", "sync",
     ];
     if !reserved.contains(&command) {
         return create(&tokens, BTreeMap::new());
@@ -201,7 +206,8 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
             path: positional[0].clone(),
         });
     }
-    if positional.is_empty() || (command != "revise" && positional.len() != 1) {
+    let expected = if command == "resume" { 2 } else { 1 };
+    if positional.is_empty() || (command != "revise" && positional.len() != expected) {
         return Err(DesignError::InvalidInput(
             "invalid command arguments".into(),
         ));
@@ -217,6 +223,10 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         "open" => DesignCommand::Open { artifact_id },
         "status" => DesignCommand::Status { artifact_id },
         "verify" => DesignCommand::Verify { artifact_id },
+        "resume" => DesignCommand::Resume {
+            artifact_id,
+            operation_id: positional[1].parse()?,
+        },
         "revise" if positional.len() > 1 => DesignCommand::Revise {
             artifact_id,
             brief: positional[1..].join(" "),

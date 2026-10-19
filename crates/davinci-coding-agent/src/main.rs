@@ -2863,7 +2863,7 @@ fn complete_prompt_with_host(
         let cwd = agent.cwd.clone();
         let result = davinci_coding_agent::design::commands::parse_design_command(&design_text)
             .and_then(|command| {
-                if matches!(&command, davinci_coding_agent::design::commands::DesignCommand::Create { .. } | davinci_coding_agent::design::commands::DesignCommand::Revise { .. })
+                if matches!(&command, davinci_coding_agent::design::commands::DesignCommand::Create { .. } | davinci_coding_agent::design::commands::DesignCommand::Revise { .. } | davinci_coding_agent::design::commands::DesignCommand::Resume { .. })
                     && (parsed.offline || parsed.api_key.is_some()) {
                     return Err(davinci_coding_agent::design::error::DesignError::Denied("design generation requires the selected subscription route without offline mode or an API-key override".into()));
                 }

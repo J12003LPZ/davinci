@@ -577,6 +577,31 @@ pub fn resume(
     )
 }
 
+/// Resume a blocked run by its checkpoint (the operation id its failure
+/// receipt names). The stored request is used as it was; nothing is re-typed.
+pub fn resume_operation(
+    store: &DesignStore,
+    agent: &mut Agent,
+    workspace: &Path,
+    operation_id: OperationId,
+    model: &mut dyn DesignModel,
+    renderer: &mut dyn DesignRenderer,
+    cancel: Option<Arc<AtomicBool>>,
+) -> DesignResult<DesignRunState> {
+    let ctx = AuthorizedDesignContext::from_agent(agent, workspace)?;
+    let state = latest_run(store, &ctx, session(agent)?, operation_id)?
+        .ok_or_else(|| DesignError::NotFound("no design run has that checkpoint".into()))?;
+    resume(
+        store,
+        agent,
+        workspace,
+        state.request,
+        model,
+        renderer,
+        cancel,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive(
     store: &DesignStore,
