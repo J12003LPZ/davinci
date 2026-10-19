@@ -41,8 +41,11 @@ struct Inner {
     routes: BTreeMap<String, (String, String)>,
     trusted_read_only_servers: BTreeSet<String>,
     rows: Vec<McpServerRow>,
-    /// Servers stopped on purpose; a background connect that finishes later
-    /// must not bring them back.
+    /// Servers the project's own `mcp.json` configured, noted when the
+    /// connect starts (so ones still connecting are covered too).
+    project: BTreeSet<String>,
+    /// Project servers stopped on purpose; a background connect that finishes
+    /// later must not bring them back.
     blocked: BTreeSet<String>,
 }
 
@@ -92,6 +95,7 @@ impl McpRegistry {
         )>,
     ) -> Self {
         let registry = Self::default();
+        registry.note_project_servers(config);
         registry.adopt(Self::connect_parts(config, cwd, executor));
         registry
     }
@@ -112,6 +116,7 @@ impl McpRegistry {
         if config.mcp_servers.is_empty() {
             return registry;
         }
+        registry.note_project_servers(config);
         registry.progress.running.store(true, Ordering::SeqCst);
         let worker = registry.clone();
         let config = config.clone();
@@ -201,13 +206,25 @@ impl McpRegistry {
         self.inner.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    /// Stop and forget the named servers: their process ends, their tools
-    /// and rows go, and a connect still running will not re-add them. Used
-    /// when trust in the project that configured them is withdrawn.
-    pub fn disconnect(&self, names: &[String]) -> usize {
+    fn note_project_servers(&self, config: &davinci_mcp::ConfigFile) {
         let mut inner = self.lock();
+        for (name, server) in &config.mcp_servers {
+            if server.project_origin {
+                inner.project.insert(name.clone());
+            }
+        }
+    }
+
+    /// Stop and forget every server whose origin is the project: their
+    /// process ends, their tools and rows go, and a connect still running will
+    /// not re-add them. A user or plugin server is never touched, whatever its
+    /// name. Used when trust in the project is withdrawn. Returns how many
+    /// connected servers were stopped.
+    pub fn disconnect_project(&self) -> usize {
+        let mut inner = self.lock();
+        let names: Vec<String> = inner.project.iter().cloned().collect();
         let mut stopped = 0;
-        for name in names {
+        for name in &names {
             inner.blocked.insert(name.clone());
             if inner.clients.remove(name).is_some() {
                 stopped += 1;
@@ -673,25 +690,64 @@ mod tests {
         assert!(!empty.connecting() && !empty.take_ready());
     }
 
-    #[test]
-    fn disconnect_stops_named_servers_and_a_late_connect_cannot_bring_them_back() {
-        let (dir, config) = http_fixture(
+    fn fixture_with_two_servers(project: &[&str]) -> (tempfile::TempDir, davinci_mcp::ConfigFile) {
+        let (dir, mut config) = http_fixture(
             r#"{
             "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
             "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
         }"#,
         );
+        let template = config.mcp_servers["memory"].clone();
+        config.mcp_servers.insert("user".into(), template);
+        for (name, server) in config.mcp_servers.iter_mut() {
+            server.project_origin = project.contains(&name.as_str());
+        }
+        (dir, config)
+    }
+
+    #[test]
+    fn disconnect_project_stops_only_project_origin_servers() {
+        let (dir, config) = fixture_with_two_servers(&["memory"]);
         let registry = McpRegistry::connect(&config, dir.path());
-        assert_eq!(registry.tool_names(), ["mcp__memory__ping"]);
-        assert_eq!(registry.disconnect(&["memory".to_string()]), 1);
-        assert!(registry.tool_names().is_empty());
-        assert!(registry.rows().is_empty());
+        assert_eq!(
+            registry.tool_names(),
+            ["mcp__memory__ping", "mcp__user__ping"]
+        );
+        assert_eq!(registry.disconnect_project(), 1);
+        assert_eq!(registry.tool_names(), ["mcp__user__ping"]);
+        assert_eq!(registry.rows().len(), 1);
         assert!(registry.resolve_tool("mcp__memory__ping").is_none());
-        // A connect that was still in flight lands afterwards and is dropped.
+        // A connect still in flight lands afterwards: the project server is
+        // dropped, the user one is not.
         let late = McpRegistry::connect_parts(&config, dir.path(), None);
         registry.adopt(late);
-        assert!(registry.tool_names().is_empty());
-        assert_eq!(registry.disconnect(&["unknown".to_string()]), 0);
+        assert_eq!(registry.tool_names(), ["mcp__user__ping"]);
+    }
+
+    #[test]
+    fn a_user_server_sharing_a_name_with_an_unloaded_project_entry_is_never_stopped() {
+        // Nothing is project-origin: the project's mcp.json was not loaded
+        // (untrusted at startup), so every connected server is the user's.
+        let (dir, config) = fixture_with_two_servers(&[]);
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert_eq!(registry.disconnect_project(), 0);
+        assert_eq!(
+            registry.tool_names(),
+            ["mcp__memory__ping", "mcp__user__ping"]
+        );
+    }
+
+    #[test]
+    fn disconnect_project_covers_servers_still_connecting() {
+        let (dir, config) = fixture_with_two_servers(&["memory"]);
+        let registry = McpRegistry::connect_in_background(&config, dir.path(), None);
+        registry.disconnect_project();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !registry.take_ready() {
+            assert!(std::time::Instant::now() < deadline, "never reported ready");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(registry.tool_names(), ["mcp__user__ping"]);
     }
 
     #[test]
