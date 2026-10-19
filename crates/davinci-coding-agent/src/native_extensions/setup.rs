@@ -51,6 +51,8 @@ pub enum Mode {
     Trust,
     /// Record the user's yes to one action and do just that action.
     Approve(super::setup_actions::SetupAction),
+    /// Switch a feature on or off for good (`/setup enable|disable <feature>`).
+    Switch(super::setup_profile::Feature, bool),
 }
 
 pub fn parse_args(args: &str) -> Result<Mode, String> {
@@ -64,6 +66,14 @@ pub fn parse_args(args: &str) -> Result<Mode, String> {
                     "unknown action `{word}` · use /setup approve start-ollama or /setup approve download-model"
                 )
             });
+    }
+    for (verb, on) in [("enable", true), ("disable", false)] {
+        if let Some(rest) = args.strip_prefix(verb) {
+            let word = rest.trim();
+            return super::setup_profile::Feature::parse(word)
+                .map(|feature| Mode::Switch(feature, on))
+                .ok_or_else(|| format!("unknown feature `{word}` · use /setup {verb} memory or /setup {verb} governor"));
+        }
     }
     match args {
         "" | "apply" => Ok(Mode::Apply),
@@ -201,6 +211,8 @@ pub fn report_full(
             Mode::Repair => "repair",
             Mode::Trust => "trust",
             Mode::Approve(_) => "approve",
+            Mode::Switch(_, true) => "enable",
+            Mode::Switch(_, false) => "disable",
         },
         "summary": summary,
         "lines": lines,
@@ -208,6 +220,72 @@ pub fn report_full(
         "health": health,
         "issues": issues,
     })
+}
+
+/// `/setup enable|disable <feature>`: persist the choice, then apply it to the
+/// running session. Records and stored outputs are never touched.
+pub fn switch_step(
+    agent_dir: &Path,
+    feature: super::setup_profile::Feature,
+    enabled: bool,
+    memory: &Arc<Mutex<VectorMemory>>,
+    governor: &Arc<Mutex<super::token_governor::TokenGovernor>>,
+) -> Step {
+    let (id, title) = match feature {
+        super::setup_profile::Feature::Memory => ("memory", "vector memory"),
+        super::setup_profile::Feature::Governor => ("governor", "token governor"),
+    };
+    // On disk first. If this fails nothing changes and the user is told.
+    if let Err(error) = super::setup_profile::set_feature_enabled(agent_dir, feature, enabled) {
+        return Step::new(id, title, StepState::Action, error)
+            .with_action("fix the setup profile, then run the command again");
+    }
+    let effective = load_effective_setup(agent_dir, &process_env);
+    let now_on = match feature {
+        super::setup_profile::Feature::Memory => effective.memory.enabled,
+        super::setup_profile::Feature::Governor => effective.governor.enabled,
+    };
+    match feature {
+        super::setup_profile::Feature::Memory => {
+            memory
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .config
+                .enabled = now_on;
+        }
+        super::setup_profile::Feature::Governor => {
+            governor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .config
+                .enabled = now_on;
+        }
+    }
+    if enabled && !now_on {
+        // The user said on, but another layer still says off. Say which.
+        return Step::new(
+            id,
+            title,
+            StepState::Action,
+            format!("{id} stays off: {}", effective.off_reason(feature)),
+        )
+        .with_action(format!("fix that, then run /setup enable {id} again"));
+    }
+    if enabled {
+        Step::new(
+            id,
+            title,
+            StepState::Done,
+            format!("{id} is on; run /setup check to see whether it is ready"),
+        )
+    } else {
+        Step::new(
+            id,
+            title,
+            StepState::Done,
+            format!("{id} is off for good: nothing will be probed, started or downloaded; stored data is kept; /setup enable {id} turns it back on"),
+        )
+    }
 }
 
 /// The governor's health in the same shape as the memory component's.
@@ -559,12 +637,13 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool, ctx: &SetupCo
         )
     };
     if !enabled {
-        return Step::new(
-            ID,
-            TITLE,
-            StepState::Skipped,
-            "disabled by vector-memory.json or PI_MEMORY_ENABLED=0".into(),
-        );
+        return Step::new(ID, TITLE, StepState::Skipped, {
+            let effective = load_effective_setup(ctx.agent_dir, &process_env);
+            format!(
+                "off: {}; /setup enable memory turns it on",
+                effective.off_reason(super::setup_profile::Feature::Memory)
+            )
+        });
     }
     if let Some(progress) = pull_for(&url, &model).filter(|p| !p.finished) {
         return Step::new(ID, TITLE, StepState::Running, pull_line(&progress));

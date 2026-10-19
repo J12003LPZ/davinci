@@ -303,7 +303,7 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "setup",
             "Set up this workspace: vector memory, .gitignore, trust, plugin hooks and language servers.",
-            Some("[check [--json]|repair|approve <start-ollama|download-model>|trust]"),
+            Some("[check [--json]|repair|approve <start-ollama|download-model>|enable|disable <memory|governor>|trust]"),
         ),
     ]
     .into_iter().filter(|(name, _, _)| !name.ends_with("-status")).collect()
@@ -1055,6 +1055,14 @@ impl NativeExtensionHost {
                         }
                     }
                     vec![step]
+                } else if let setup::Mode::Switch(feature, on) = mode {
+                    vec![setup::switch_step(
+                        &self.agent_dir,
+                        feature,
+                        on,
+                        &self.memory,
+                        &self.governor,
+                    )]
                 } else if mode == setup::Mode::Repair {
                     vec![setup_actions::execute_approved_action(
                         setup_actions::SetupAction::RepairProjection,

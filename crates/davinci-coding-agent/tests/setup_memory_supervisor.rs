@@ -1395,3 +1395,87 @@ fn setup_repair_reembeds_and_keeps_every_record() {
         lines_before
     );
 }
+
+// ---- Task 10: persistent opt-outs -------------------------------------------
+
+#[test]
+fn disabled_memory_does_not_spawn_or_reenable() {
+    use davinci_coding_agent::native_extensions::setup_profile::{
+        load_effective_setup, ENV_CONFLICT,
+    };
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let server = fake_ollama(&["embeddinggemma"], 8);
+    let mut host = setup_host(agent.path(), project.path(), &server.url);
+
+    // Records exist in the current store and in a legacy `.pi` one.
+    let mut seed = memory_in(project.path());
+    learn(&mut seed, "a fact that must survive an opt-out").unwrap();
+    let records = seed.local_path();
+    let legacy = project.path().join(".pi").join("vector-memory");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("records.jsonl"), b"{\"legacy\":true}\n").unwrap();
+    let records_before = fs::read(&records).unwrap();
+    let legacy_before = fs::read(legacy.join("records.jsonl")).unwrap();
+
+    let report = host.command("setup", "disable memory").unwrap().unwrap();
+    assert_eq!(report["mode"], "disable");
+    assert_eq!(report["steps"][0]["state"], "done", "{report}");
+    let profile = fs::read_to_string(agent.path().join("setup-profile.json")).unwrap();
+    assert!(profile.contains("\"enabled\": false"), "{profile}");
+
+    // Ten restarts, with every kind of /setup: nothing is probed or started.
+    let before = server.requests.load(Ordering::SeqCst);
+    for _ in 0..10 {
+        let mut again =
+            NativeExtensionHost::new_with_agent_dir("opt-out", project.path(), Some(agent.path()));
+        for args in ["check", "check --json", ""] {
+            let report = again.command("setup", args).unwrap().unwrap();
+            assert_eq!(report["health"][0]["state"], "disabled", "{args}: {report}");
+        }
+    }
+    assert_eq!(
+        server.requests.load(Ordering::SeqCst),
+        before,
+        "a disabled feature was probed"
+    );
+    assert!(!agent.path().join("ollama-start.lock").exists());
+    assert_eq!(fs::read(&records).unwrap(), records_before);
+    assert_eq!(
+        fs::read(legacy.join("records.jsonl")).unwrap(),
+        legacy_before
+    );
+
+    // An environment variable cannot turn it back on; the conflict is named.
+    let env = |name: &str| (name == "PI_MEMORY_ENABLED").then(|| "1".to_string());
+    let effective = load_effective_setup(agent.path(), &env);
+    assert!(!effective.memory.enabled);
+    assert!(effective
+        .issues()
+        .iter()
+        .any(|issue| issue.code == ENV_CONFLICT));
+
+    // Only the explicit command re-enables it.
+    let report = host.command("setup", "enable memory").unwrap().unwrap();
+    assert_eq!(report["steps"][0]["state"], "done", "{report}");
+    assert!(load_effective_setup(agent.path(), &|_| None).memory.enabled);
+}
+
+#[test]
+fn opt_out_with_a_corrupt_profile_is_explicit_and_changes_nothing() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let server = fake_ollama(&["embeddinggemma"], 8);
+    let mut host = setup_host(agent.path(), project.path(), &server.url);
+    let profile = agent.path().join("setup-profile.json");
+    fs::write(&profile, b"{ not json").unwrap();
+    let report = host.command("setup", "disable governor").unwrap().unwrap();
+    assert_eq!(report["steps"][0]["state"], "action", "{report}");
+    assert!(report["steps"][0]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("PROFILE_CORRUPT"));
+    assert_eq!(fs::read(&profile).unwrap(), b"{ not json");
+    // Words that name no feature are refused.
+    assert!(host.command("setup", "disable everything").is_err());
+}

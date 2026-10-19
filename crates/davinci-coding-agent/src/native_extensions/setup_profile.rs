@@ -206,6 +206,48 @@ impl SetupProfile {
     }
 }
 
+/// A feature the user can switch on or off for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {
+    Memory,
+    Governor,
+}
+
+impl Feature {
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "memory" => Some(Self::Memory),
+            "governor" => Some(Self::Governor),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Governor => "governor",
+        }
+    }
+}
+
+/// Record the user's on/off choice in the setup profile. The previous profile
+/// is kept as `.bak`. A corrupt or newer profile is never replaced (the error
+/// names it), so a failed switch changes nothing. Call this before touching
+/// any running component: the intent is on disk first, so a crash in between
+/// still leaves the feature off.
+pub fn set_feature_enabled(
+    agent_dir: &Path,
+    feature: Feature,
+    enabled: bool,
+) -> Result<(), String> {
+    let (mut profile, _) = SetupProfile::load(agent_dir);
+    match feature {
+        Feature::Memory => profile.memory.enabled = Some(enabled),
+        Feature::Governor => profile.governor.enabled = Some(enabled),
+    }
+    profile.save(agent_dir)
+}
+
 /// Something the user has to look at, with a stable code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Issue {
@@ -256,6 +298,21 @@ pub struct EffectiveSetupConfig {
 }
 
 impl EffectiveSetupConfig {
+    /// Why `feature` is off, in words the user can act on.
+    pub fn off_reason(&self, feature: Feature) -> String {
+        let (source, name) = match feature {
+            Feature::Memory => (&self.memory.enabled_source, "vector-memory.json"),
+            Feature::Governor => (&self.governor.enabled_source, "token-governor.json"),
+        };
+        match source {
+            EnabledSource::Environment(var) => format!("{var} turns it off"),
+            EnabledSource::FailClosed => format!("{name} cannot be read"),
+            EnabledSource::ConfigFile => format!("{name} has enabled set to false"),
+            EnabledSource::Profile => "the setup profile turns it off".into(),
+            EnabledSource::Default => "it is off by default".into(),
+        }
+    }
+
     pub fn issues(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
         match &self.profile_state {
