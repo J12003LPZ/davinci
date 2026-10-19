@@ -2467,10 +2467,11 @@ fn shell_tool(
         }
         content.push_str(&String::from_utf8_lossy(&output.stderr));
     }
-    append_exit_status(&mut content, &output.status);
+    let is_error = !output.status.success() || pipe_truncated;
+    append_exit_status(&mut content, &output.status, is_error);
     Ok(ToolResult {
         content,
-        is_error: !output.status.success() || pipe_truncated,
+        is_error,
         details: Some(serde_json::json!({"exitCode": output.status.code()})),
     })
 }
@@ -2478,14 +2479,26 @@ fn shell_tool(
 /// A failed command's exit status is part of what the model needs to see: the
 /// provider wires send only the result text. A successful command's text is
 /// left exactly as the command wrote it.
-fn append_exit_status(content: &mut String, status: &std::process::ExitStatus) {
-    let Some(code) = status.code().filter(|code| *code != 0) else {
+fn append_exit_status(content: &mut String, status: &std::process::ExitStatus, is_error: bool) {
+    let Some(line) = exit_status_line(status.code(), is_error) else {
         return;
     };
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&format!("Command exited with code {code}"));
+    content.push_str(&line);
+}
+
+/// The trailer for a result, or None when the text must stay untouched. A
+/// command with no exit code (killed by a signal) that is reported as an error
+/// would otherwise look like a command that merely printed nothing.
+fn exit_status_line(code: Option<i32>, is_error: bool) -> Option<String> {
+    match code {
+        Some(0) => None,
+        Some(code) => Some(format!("Command exited with code {code}")),
+        None if is_error => Some("Command terminated without an exit code".to_string()),
+        None => None,
+    }
 }
 
 const MAX_SHELL_STREAM_BYTES: usize = 16 * 1024 * 1024;
@@ -2799,10 +2812,11 @@ fn powershell_tool(
                 }
                 content.push_str(&String::from_utf8_lossy(&output.stderr));
             }
-            append_exit_status(&mut content, &output.status);
+            let is_error = !output.status.success();
+            append_exit_status(&mut content, &output.status, is_error);
             return Ok(ToolResult {
                 content,
-                is_error: !output.status.success(),
+                is_error,
                 details: Some(serde_json::json!({"exitCode": output.status.code()})),
             });
         }
@@ -2884,10 +2898,11 @@ fn powershell_tool(
             }
             content.push_str(&String::from_utf8_lossy(&output.stderr));
         }
-        append_exit_status(&mut content, &output.status);
+        let is_error = !output.status.success() || pipe_truncated;
+        append_exit_status(&mut content, &output.status, is_error);
         return Ok(ToolResult {
             content,
-            is_error: !output.status.success() || pipe_truncated,
+            is_error,
             details: Some(serde_json::json!({"exitCode": output.status.code()})),
         });
     }
@@ -4511,6 +4526,21 @@ fn code_rename_preview_tool(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exit_status_line_names_every_failed_exit_and_leaves_success_alone() {
+        assert_eq!(super::exit_status_line(Some(0), false), None);
+        assert_eq!(super::exit_status_line(Some(0), true), None);
+        assert_eq!(
+            super::exit_status_line(Some(3), true).as_deref(),
+            Some("Command exited with code 3")
+        );
+        assert_eq!(
+            super::exit_status_line(None, true).as_deref(),
+            Some("Command terminated without an exit code")
+        );
+        assert_eq!(super::exit_status_line(None, false), None);
+    }
+
     /// PowerShell 7 must win whenever it is on PATH, including the Microsoft
     /// Store build whose PATH entry is an App Execution Alias. Falling back to
     /// Windows PowerShell 5.1 changes how native arguments are quoted.
