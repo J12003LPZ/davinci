@@ -2863,6 +2863,24 @@ impl Agent {
         prompt
     }
 
+    /// The manifest of what the next request will carry, built now. The turn
+    /// loop calls this before every active-mode dispatch; `/context inspect`
+    /// calls it in any mode, so the sheet shows the real projection and not a
+    /// stale or empty one. Revision counters stay at their current values, so
+    /// calling it never recompiles an unchanged image.
+    pub fn context_manifest_now(
+        &mut self,
+        request_id: &str,
+    ) -> runtime::context_manifest::PreparedContextManifest {
+        let run_id = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.run_id)
+            .unwrap_or_default();
+        let (source_revision, overlay_revision) = self.prepared_manifest_revisions;
+        self.prepare_context_manifest(request_id, run_id, source_revision, overlay_revision)
+    }
+
     /// Captures the complete prepared provider context manifest.
     pub fn prepare_context_manifest(
         &mut self,

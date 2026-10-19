@@ -633,14 +633,35 @@ impl Agent {
                 }
             }
 
-            if self
+            // The manifest of what is about to be sent: the inspector shows
+            // it, and a mandatory item that is not selected stops the request.
+            // Other modes build it on demand (`/context inspect`); they pay
+            // nothing per turn and their requests are not touched.
+            if active_context_vm {
+                let request_id = format!("req-{}", self.stats.model_turns + 1);
+                self.context_manifest_now(&request_id);
+            }
+            if let Some(manifest) = self
                 .last_prepared_manifest
                 .as_ref()
-                .is_some_and(|m| m.is_mandatory_violated())
+                .filter(|m| m.is_mandatory_violated())
             {
-                return Err(
-                    "Request blocked: mandatory context policy is violated or unavailable".into(),
-                );
+                let reasons = manifest
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.mandatory && !entry.selected)
+                    .map(|entry| {
+                        format!(
+                            "{}: {}",
+                            entry.id,
+                            entry.selection_reason.as_deref().unwrap_or("not selected")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "Request blocked: mandatory context policy is violated or unavailable ({reasons})"
+                ));
             }
 
             self.ensure_session_persistence()?;
