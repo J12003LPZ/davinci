@@ -52,7 +52,7 @@ pub struct DavinciProcessConfig {
 /// (`self.password`, `config::SECRET`) is a reference, not a literal. A quoted
 /// string is always a value. Any other unquoted value after a strong key
 /// (secret, password, `*_key` names that hold keys, authorization) is a value
-/// unless it is a number, a type or keyword, or an expression. After a bare
+/// unless it is a number, a type or keyword, or an expression. The identifier exemption applies only in source assignments (see `is_source_reference`). After a bare
 /// `token` key it must also carry a digit and some length, or be long.
 pub fn redact_credentials(text: &str) -> String {
     use std::sync::OnceLock;
@@ -101,7 +101,10 @@ pub fn redact_credentials(text: &str) -> String {
     let text = pem.replace_all(text, "[REDACTED]");
     let text = userinfo.replace_all(&text, "${1}[REDACTED]@");
     let text = keyed.replace_all(&text, |caps: &regex::Captures| {
-        if is_credential_value(&caps[2], &caps[5]) {
+        let whole = caps.get(0).expect("whole match");
+        if is_source_reference(&text[..whole.start()], &text[whole.end()..], &caps[5]) {
+            caps[0].to_string()
+        } else if is_credential_value(&caps[2], &caps[5]) {
             format!(
                 "{}{}{}{}{}",
                 &caps[1],
@@ -122,6 +125,57 @@ pub fn redact_credentials(text: &str) -> String {
     bare.replace_all(&text, "[REDACTED]").into_owned()
 }
 
+/// A value that is code referring to something else, not a credential:
+/// (a) the match sits in a source assignment (a `let`/`const`/`var`/`static`
+/// binding on the same line, or a field whose value is followed by `;` or
+/// `,`), and (b) the value is a path or member expression (`self.password`,
+/// `config::SECRET`) or contains the credential word itself (`other_secret`,
+/// `old_password`). Env, shell and config forms never qualify. In doubt, the
+/// value is redacted.
+fn is_source_reference(before: &str, after: &str, value: &str) -> bool {
+    let line = before.rsplit('\n').next().unwrap_or("");
+    let binding = line
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| matches!(word, "let" | "const" | "var" | "static"));
+    let terminated = after.trim_start().starts_with([';', ',']);
+    let in_source = (binding || terminated) && !line.trim_start().starts_with("export ");
+    if !in_source {
+        return false;
+    }
+    let is_expression = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'));
+    if !is_expression {
+        return false;
+    }
+    let normalized: String = value
+        .chars()
+        .filter(|c| *c != '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let is_path = value.contains('.') || value.contains("::");
+    let names_the_word = [
+        "authorization",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "secretkey",
+        "signingkey",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "token",
+    ]
+    .iter()
+    .any(|word| normalized.contains(word));
+    is_path || names_the_word
+}
+
 fn is_credential_value(key: &str, value: &str) -> bool {
     let quoted = value.len() >= 3
         && ((value.starts_with('"') && value.ends_with('"'))
@@ -132,20 +186,6 @@ fn is_credential_value(key: &str, value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     if lower.starts_with("bearer ") || lower.starts_with("basic ") {
         return true;
-    }
-    // `other_secret`, `self.password`, `config::SECRET`: a name or a path to
-    // one, not a literal. A digit (`hunter_2`) makes it look like a literal.
-    let is_reference = value
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
-        && value.contains(['_', '.', ':'])
-        && !value.chars().any(|c| c.is_ascii_digit());
-    if is_reference {
-        return false;
     }
     if value.chars().any(|c| "()<>{}[]".contains(c)) {
         return false;
@@ -204,6 +244,10 @@ fn is_credential_value(key: &str, value: &str) -> bool {
         "passphrase",
     ];
     if STRONG.iter().any(|word| name.ends_with(word)) {
+        return true;
+    }
+    // An ALL_CAPS key is an environment variable, never a bare code name.
+    if key.chars().any(|c| c.is_ascii_uppercase()) && !key.chars().any(|c| c.is_ascii_lowercase()) {
         return true;
     }
     // A bare `token` key: code names tokens all the time, so the value must
@@ -612,7 +656,7 @@ end"
                 "rk_live_FAKEFAKEFAKE0123",
             ),
             (pem, "MIIEowIBAAKCAQEAfakefakefake"),
-            (&format!("key:\n{pem}\nend"), "abcdefghijklmnop"),
+            (wrapped.as_str(), "abcdefghijklmnop"),
             (
                 "-----BEGIN PRIVATE KEY-----\nMIIfaketruncatedbody",
                 "MIIfaketruncatedbody",
@@ -675,21 +719,40 @@ end"
     }
 
     #[test]
-    fn strong_keys_keep_identifier_and_path_values() {
+    fn strong_keys_keep_source_references_but_never_env_or_config_values() {
+        // Source code: a binding or field whose value is a path or names the
+        // same credential word is a reference, not a literal.
         for input in [
             "let secret = other_secret;",
-            "let password = config.password;",
+            "let password = self.password;",
             "const SECRET: &str = crate::keys::SECRET;",
-            "password = self.password",
-            "secret = settings::SECRET_VALUE",
+            "let secret = settings::SECRET_VALUE;",
+            "static PASSWORD_FILE: &str = config.password_file;",
+            "Config { password: self.password, token: old_token, }",
+            "var apiKey = old_api_key;",
         ] {
             assert_eq!(redact_credentials(input), input);
         }
-        // Literal values still go.
+        // Env, shell and config forms are always redacted, whatever the shape
+        // of the value, and so are source literals.
         for (input, secret) in [
             (r#"let secret = "hunter2-fake";"#, "hunter2-fake"),
             ("secret=hunter2", "hunter2"),
             ("PASSWORD=Tr0ub4dor", "Tr0ub4dor"),
+            ("DB_PASSWORD=correct_horse_battery", "correct_horse_battery"),
+            ("export API_TOKEN=abc_def", "abc_def"),
+            ("password: hunter_two", "hunter_two"),
+            ("password = other_word", "other_word"),
+            ("export SECRET=old_secret", "old_secret"),
+            (
+                "let password = correct_horse_battery;",
+                "correct_horse_battery",
+            ),
+            ("db:\n  password: hunter_two,", "hunter_two"),
+            (
+                "tool --password correct_horse_battery",
+                "correct_horse_battery",
+            ),
         ] {
             let out = redact_credentials(input);
             assert!(!out.contains(secret), "{input} -> {out}");
