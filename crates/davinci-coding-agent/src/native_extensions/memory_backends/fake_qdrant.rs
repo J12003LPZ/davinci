@@ -51,6 +51,9 @@ struct Shared {
     /// Close the connection without answering: the way a stopped service looks.
     down: AtomicBool,
     stop: AtomicBool,
+    /// Misbehaviors for tests that prove a gate can fail.
+    ignore_filters: AtomicBool,
+    ignore_deletes: AtomicBool,
 }
 
 impl std::fmt::Debug for FakeQdrant {
@@ -74,6 +77,8 @@ impl FakeQdrant {
             state: Mutex::new(State::default()),
             down: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            ignore_filters: AtomicBool::new(false),
+            ignore_deletes: AtomicBool::new(false),
         });
         let worker = shared.clone();
         let thread = std::thread::spawn(move || {
@@ -115,6 +120,16 @@ impl FakeQdrant {
     /// While down, a connection is accepted and dropped with no answer.
     pub fn set_down(&self, down: bool) {
         self.shared.down.store(down, Ordering::SeqCst);
+    }
+
+    /// A broken Qdrant that answers queries without applying the filter.
+    pub fn ignore_filters(&self, on: bool) {
+        self.shared.ignore_filters.store(on, Ordering::SeqCst);
+    }
+
+    /// A broken Qdrant that acknowledges deletes and keeps the points.
+    pub fn ignore_deletes(&self, on: bool) {
+        self.shared.ignore_deletes.store(on, Ordering::SeqCst);
     }
 
     pub fn set_not_ready(&self, not_ready: bool) {
@@ -400,7 +415,10 @@ fn handle(mut stream: TcpStream, shared: &Shared) {
             let mut scored: Vec<(f32, &String, &StoredPoint)> = collection
                 .points
                 .iter()
-                .filter(|(id, point)| filter_matches(&body["filter"], id, &point.payload))
+                .filter(|(id, point)| {
+                    shared.ignore_filters.load(Ordering::SeqCst)
+                        || filter_matches(&body["filter"], id, &point.payload)
+                })
                 .map(|(id, point)| (cosine(&query, &point.vector), id, point))
                 .collect();
             scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
@@ -425,9 +443,11 @@ fn handle(mut stream: TcpStream, shared: &Shared) {
                     &json!({"status": {"error": "empty delete"}}),
                 );
             }
-            collection
-                .points
-                .retain(|id, point| !filter_matches(&filter, id, &point.payload));
+            if !shared.ignore_deletes.load(Ordering::SeqCst) {
+                collection
+                    .points
+                    .retain(|id, point| !filter_matches(&filter, id, &point.payload));
+            }
             respond(
                 &mut stream,
                 200,

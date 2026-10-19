@@ -8,6 +8,7 @@ pub mod gate;
 pub mod json_events;
 pub mod mutation;
 pub mod process;
+pub mod qdrant_projection;
 pub mod runner;
 pub mod scenario;
 pub mod scorer;

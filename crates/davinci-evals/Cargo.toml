@@ -21,5 +21,6 @@ uuid.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
+davinci-coding-agent = { path = "../davinci-coding-agent", features = ["test-fixtures"] }
 davinci-tui = { path = "../davinci-tui" }
 tempfile.workspace = true
