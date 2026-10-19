@@ -146,6 +146,7 @@ pub fn redact_credentials(text: &str) -> String {
 ///   names-the-word value), or a whole `ident: value,` / `ident: value;` field
 ///   line whose value starts with `self.` or contains `::` (an empty tail does
 ///   not count: that is YAML).
+///
 /// Env, shell, YAML and flag forms never qualify. In doubt, redact.
 fn is_source_reference(before: &str, after: &str, key: &str, sep: &str, value: &str) -> bool {
     if key.chars().any(|c| c.is_ascii_uppercase()) && !key.chars().any(|c| c.is_ascii_lowercase()) {
