@@ -1356,6 +1356,33 @@ pub struct VectorMemory {
 /// not UTF-8 or no access). The file is left exactly as it is.
 pub const LOCAL_STORE_UNREADABLE: &str = "LOCAL_STORE_UNREADABLE";
 
+/// What one [`VectorMemory::repair_projection`] batch did. `records_before`
+/// always equals `records_after`: repair never removes a record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairReceipt {
+    pub records_before: usize,
+    pub records_after: usize,
+    /// Records without a current vector when the batch began.
+    pub stale_before: usize,
+    pub reembedded: usize,
+    /// Records still without a current vector; run again while above zero.
+    pub remaining: usize,
+    /// Shared ids that were made unique.
+    pub repaired_ids: usize,
+    /// Why nothing was done: `LOCAL_STORE_UNREADABLE`, `EMBEDDING_MISMATCH` or
+    /// `PROVIDER_OFFLINE`.
+    pub blocked: Option<&'static str>,
+    pub error: Option<String>,
+}
+
+impl RepairReceipt {
+    /// Nothing was lost and nothing is left to do.
+    pub fn is_complete(&self) -> bool {
+        self.blocked.is_none() && self.error.is_none() && self.remaining == 0
+    }
+}
+
 /// What the last read of the local record file found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalStoreHealth {
@@ -2415,6 +2442,58 @@ impl VectorMemory {
             self.persist_local()?;
         }
         Ok(updated)
+    }
+
+    /// Re-embed one bounded batch of records whose vector is missing or was
+    /// made by another model or size. The records themselves (text,
+    /// tombstones, supersessions, source hashes) are never changed or removed:
+    /// only the derived vectors are rebuilt. Call it again while
+    /// `remaining > 0`; each call is safe to repeat and to interrupt.
+    ///
+    /// Before touching anything it asks the embedding service for one test
+    /// vector. A wrong vector size (`EMBEDDING_MISMATCH`) or an unreachable
+    /// service stops the repair with nothing changed, instead of dropping the
+    /// old vectors and then failing to replace them.
+    pub fn repair_projection(&mut self, max_batch: usize) -> RepairReceipt {
+        let mut receipt = RepairReceipt::default();
+        if let Err(error) = self.load_local() {
+            receipt.blocked = Some(LOCAL_STORE_UNREADABLE);
+            receipt.error = Some(error.to_string());
+            return receipt;
+        }
+        receipt.records_before = self.records.len();
+        let repaired_ids = self.repair_duplicate_ids();
+        if repaired_ids > 0 {
+            if let Err(error) = self.persist_local() {
+                receipt.error = Some(error.to_string());
+                receipt.records_after = self.records.len();
+                return receipt;
+            }
+        }
+        receipt.repaired_ids = repaired_ids;
+        receipt.stale_before = self.local_projection_lag();
+        receipt.remaining = receipt.stale_before;
+        receipt.records_after = self.records.len();
+        if receipt.stale_before == 0 || !self.config.enabled {
+            return receipt;
+        }
+        if let Err(error) = self.embed_documents(&["repair preflight".to_string()]) {
+            let message = error.to_string();
+            receipt.blocked = Some(if message.contains("EMBEDDING_MISMATCH") {
+                "EMBEDDING_MISMATCH"
+            } else {
+                "PROVIDER_OFFLINE"
+            });
+            receipt.error = Some(message);
+            return receipt;
+        }
+        match self.rebuild_local_embeddings(max_batch) {
+            Ok(count) => receipt.reembedded = count,
+            Err(error) => receipt.error = Some(error.to_string()),
+        }
+        receipt.remaining = self.local_projection_lag();
+        receipt.records_after = self.records.len();
+        receipt
     }
 
     pub fn status(&self) -> Value {

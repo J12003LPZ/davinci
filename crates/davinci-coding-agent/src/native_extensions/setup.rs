@@ -33,6 +33,8 @@ pub const IGNORED_STATE: &[&str] = &[".davinci/vector-memory/", ".davinci/graph/
 /// Records embedded per batch after a pull; the memory lock is released
 /// between batches so a turn is never held behind the whole backlog.
 const REINDEX_BATCHES: usize = 40;
+/// Records re-embedded per locked batch.
+const REINDEX_BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -358,12 +360,13 @@ fn pull_model(url: &str, model: &str) -> Result<(), String> {
 pub fn embed_backlog(memory: &Arc<Mutex<VectorMemory>>) -> usize {
     let mut total = 0;
     for _ in 0..REINDEX_BATCHES {
-        let mut memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-        memory.clear_dense_offline();
-        let Ok(answer) = memory.reindex() else { break };
-        let embedded = answer["reembedded"].as_u64().unwrap_or(0) as usize;
-        total += embedded;
-        if embedded == 0 || !answer["embeddingError"].is_null() {
+        let receipt = {
+            let mut memory = memory.lock().unwrap_or_else(|e| e.into_inner());
+            memory.clear_dense_offline();
+            memory.repair_projection(REINDEX_BATCH_SIZE)
+        };
+        total += receipt.reembedded;
+        if receipt.reembedded == 0 || receipt.blocked.is_some() || receipt.error.is_some() {
             break;
         }
     }

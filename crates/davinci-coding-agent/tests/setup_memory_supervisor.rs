@@ -1074,3 +1074,175 @@ fn recovery_is_not_wanted_until_the_user_set_it_up_and_never_when_disabled() {
     profile.save(machine.agent.path()).unwrap();
     assert!(!recovery_wanted(machine.agent.path()));
 }
+
+// ---- Task 7: safe projection repair -----------------------------------------
+
+/// An embedding endpoint whose vector size can be changed while it runs.
+struct EmbedServer {
+    url: String,
+    dimensions: Arc<AtomicUsize>,
+}
+
+fn embed_server(dimensions: usize) -> EmbedServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let dims = Arc::new(AtomicUsize::new(dimensions));
+    let shared = Arc::clone(&dims);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let dims = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 65536];
+                let mut read = 0;
+                let mut expected = None;
+                while let Ok(n) = stream.read(&mut buffer[read..]) {
+                    if n == 0 {
+                        break;
+                    }
+                    read += n;
+                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        expected = Some(split + 4 + length);
+                    }
+                    if expected.is_some_and(|total| read >= total) {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let inputs = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|value| value["input"].as_array().map(Vec::len))
+                    .unwrap_or(1);
+                let reply = if text.starts_with("GET /api/tags") {
+                    "{\"models\":[{\"name\":\"embeddinggemma:latest\"}]}".to_string()
+                } else {
+                    let size = dims.load(Ordering::SeqCst);
+                    let vector: Vec<_> = (0..size).map(|i| format!("{}.25", i % 5)).collect();
+                    let vectors = vec![format!("[{}]", vector.join(",")); inputs];
+                    format!("{{\"embeddings\":[{}]}}", vectors.join(","))
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    EmbedServer {
+        url,
+        dimensions: dims,
+    }
+}
+
+fn memory_with_server(cwd: &Path, url: &str, model: &str) -> VectorMemory {
+    VectorMemory::with_config(
+        cwd.to_path_buf(),
+        VectorMemoryConfig {
+            ollama_url: url.into(),
+            embedding_model: model.into(),
+            embedding_dimensions: 8,
+            ..VectorMemoryConfig::default()
+        },
+    )
+}
+
+fn record_ids(memory: &VectorMemory) -> Vec<String> {
+    fs::read_to_string(memory.local_path())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| value["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn repair_rebuilds_only_stale_vectors_without_deleting_records() {
+    let project = tempfile::tempdir().unwrap();
+    let server = embed_server(8);
+
+    // Five records written while the service was down: no vectors yet.
+    let mut down = memory_in(project.path());
+    for n in 0..5 {
+        learn(&mut down, &format!("fact number {n} about repair")).unwrap();
+    }
+    let mut memory = memory_with_server(project.path(), &server.url, "embeddinggemma");
+    let ids = record_ids(&memory);
+    assert_eq!(ids.len(), 5);
+    // One record is retracted: it must stay in the file and stay unembedded.
+    memory.tombstones.insert(ids[0].clone());
+
+    // The model answers with the wrong size: nothing is dropped or changed.
+    server.dimensions.store(12, Ordering::SeqCst);
+    let before = fs::read(memory.local_path()).unwrap();
+    let blocked = memory.repair_projection(2);
+    assert_eq!(blocked.blocked, Some("EMBEDDING_MISMATCH"), "{blocked:?}");
+    assert_eq!(blocked.reembedded, 0);
+    assert_eq!(blocked.records_before, blocked.records_after);
+    assert_eq!(
+        fs::read(memory.local_path()).unwrap(),
+        before,
+        "a blocked repair wrote the store"
+    );
+
+    // Fixed: bounded batches of two, each safe to repeat.
+    server.dimensions.store(8, Ordering::SeqCst);
+    let first = memory.repair_projection(2);
+    assert_eq!(
+        (first.reembedded, first.error.clone()),
+        (2, None),
+        "{first:?}"
+    );
+    assert_eq!(first.stale_before, 4, "the retracted record is not counted");
+    assert_eq!(first.remaining, 2);
+    let second = memory.repair_projection(2);
+    assert_eq!(second.reembedded, 2);
+    assert!(second.is_complete(), "{second:?}");
+    let again = memory.repair_projection(2);
+    assert_eq!((again.reembedded, again.remaining), (0, 0));
+
+    // Every record is still in the file, the retracted one included.
+    assert_eq!(record_ids(&memory), ids);
+    assert_eq!(second.records_before, 5);
+    assert_eq!(second.records_after, 5);
+}
+
+#[test]
+fn vectors_from_another_model_are_re_embedded_and_no_record_is_lost() {
+    let project = tempfile::tempdir().unwrap();
+    let server = embed_server(8);
+    let mut first = memory_with_server(project.path(), &server.url, "model-a");
+    learn(&mut first, "alpha fact kept across models").unwrap();
+    learn(&mut first, "beta fact kept across models").unwrap();
+    assert_eq!(first.repair_projection(8).remaining, 0);
+    let ids = record_ids(&first);
+
+    // A different embedding model: the old vectors no longer fit.
+    let mut second = memory_with_server(project.path(), &server.url, "model-b");
+    let receipt = second.repair_projection(8);
+    assert_eq!(receipt.stale_before, 2, "{receipt:?}");
+    assert_eq!(receipt.reembedded, 2);
+    assert!(receipt.is_complete());
+    assert_eq!(record_ids(&second), ids);
+}
+
+#[test]
+fn repair_with_the_service_down_changes_nothing() {
+    let project = tempfile::tempdir().unwrap();
+    let mut memory = memory_in(project.path());
+    learn(&mut memory, "a record waiting for its vector").unwrap();
+    let before = fs::read(memory.local_path()).unwrap();
+    let receipt = memory.repair_projection(8);
+    assert_eq!(receipt.blocked, Some("PROVIDER_OFFLINE"), "{receipt:?}");
+    assert_eq!(fs::read(memory.local_path()).unwrap(), before);
+}
