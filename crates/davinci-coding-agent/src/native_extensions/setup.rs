@@ -11,6 +11,7 @@
 //! servers, so it is never automatic: `/setup trust` records that decision.
 
 use super::memory_page;
+use super::service_authority::{ServiceAction, ServiceAuthorization};
 use super::service_supervisor::find_in_paths;
 #[cfg(test)]
 use super::service_supervisor::is_local_url;
@@ -97,7 +98,12 @@ pub struct Step {
 }
 
 impl Step {
-    fn new(id: &'static str, title: &'static str, state: StepState, detail: String) -> Self {
+    pub(crate) fn new(
+        id: &'static str,
+        title: &'static str,
+        state: StepState,
+        detail: String,
+    ) -> Self {
         Self {
             id,
             title,
@@ -108,12 +114,12 @@ impl Step {
         }
     }
 
-    fn with_code(mut self, code: &'static str) -> Self {
+    pub(crate) fn with_code(mut self, code: &'static str) -> Self {
         self.code = Some(code);
         self
     }
 
-    fn with_action(mut self, action: impl Into<String>) -> Self {
+    pub(crate) fn with_action(mut self, action: impl Into<String>) -> Self {
         self.action = Some(action.into());
         self
     }
@@ -177,6 +183,35 @@ fn pulls() -> &'static Mutex<Option<PullProgress>> {
     PULLS.get_or_init(|| Mutex::new(None))
 }
 
+/// Set by [`cancel_pull`]; the running pull checks it between progress lines.
+static PULL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the running model download to stop. The partial download stays in
+/// Ollama's own store; nothing of ours is deleted. Returns false when no
+/// download is running.
+pub fn cancel_pull() -> bool {
+    let running = pull_progress().is_some_and(|progress| !progress.finished);
+    if running {
+        PULL_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    running
+}
+
+/// Forget a failed pull so the next explicit `/setup` may try again. A failed
+/// or interrupted download is reported to the user first; it is never started
+/// again silently.
+fn take_failed_pull(url: &str, model: &str) -> Option<PullProgress> {
+    let mut guard = pulls().lock().unwrap_or_else(|e| e.into_inner());
+    let matches = guard
+        .as_ref()
+        .is_some_and(|p| p.url == url && p.model == model && p.finished && p.error.is_some());
+    if matches {
+        guard.take()
+    } else {
+        None
+    }
+}
+
 pub fn pull_progress() -> Option<PullProgress> {
     pulls().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -225,6 +260,7 @@ fn reserve_pull(slot: &mut Option<PullProgress>, url: &str, model: &str) -> bool
     if slot.as_ref().is_some_and(|existing| !existing.finished) {
         return false;
     }
+    PULL_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     *slot = Some(PullProgress {
         model: model.to_string(),
         url: url.to_string(),
@@ -286,6 +322,9 @@ fn pull_model(url: &str, model: &str) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
+        if PULL_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("cancelled; the partial download stays in Ollama's store".into());
+        }
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -309,7 +348,9 @@ fn pull_model(url: &str, model: &str) -> Result<(), String> {
     if succeeded {
         Ok(())
     } else {
-        Err("the pull ended without reporting success".into())
+        // The stream ended without a verdict: the outcome is unknown. The
+        // next check asks Ollama what it has instead of assuming either way.
+        Err("the download ended without a result; Ollama may still hold a partial copy".into())
     }
 }
 
@@ -362,7 +403,11 @@ impl<'a> SetupContext<'a> {
     }
 }
 
-fn step_from_health(id: &'static str, title: &'static str, health: &ComponentHealth) -> Step {
+pub(crate) fn step_from_health(
+    id: &'static str,
+    title: &'static str,
+    health: &ComponentHealth,
+) -> Step {
     let state = match health.state {
         HealthState::Ready => StepState::Ready,
         HealthState::Disabled => StepState::Skipped,
@@ -468,18 +513,22 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool, ctx: &SetupCo
 
     if probe.model_installed == Some(false) {
         if let Some(progress) = pull_for(&url, &model).filter(|p| p.error.is_some()) {
-            if !apply {
-                return Step::new(
-                    ID,
-                    TITLE,
-                    StepState::Action,
-                    format!(
-                        "pulling {model} failed: {}",
-                        progress.error.unwrap_or_default()
-                    ),
-                )
-                .with_action(format!("run /setup to retry, or `ollama pull {model}`"));
+            // A failed or interrupted download is reported, once, and never
+            // restarted by itself: the next explicit /setup may try again.
+            if apply {
+                take_failed_pull(&url, &model);
             }
+            return Step::new(
+                ID,
+                TITLE,
+                StepState::Action,
+                format!(
+                    "downloading {model} did not finish: {}",
+                    progress.error.unwrap_or_default()
+                ),
+            )
+            .with_code(super::setup_health::MODEL_MISSING)
+            .with_action(format!("run /setup to try again, or `ollama pull {model}`"));
         }
         if !apply {
             return Step::new(
@@ -489,7 +538,26 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool, ctx: &SetupCo
                 format!("{server}; embedding model {model} is not installed"),
             )
             .with_code(super::setup_health::MODEL_MISSING)
-            .with_action(format!("run /setup to pull it, or `ollama pull {model}`"));
+            .with_action(format!(
+                "run /setup to download it (it asks first), or `ollama pull {model}`"
+            ));
+        }
+        // Downloading is the user's call, made once and recorded.
+        if let Err(reason) =
+            ServiceAuthorization::check(ctx.agent_dir, ServiceAction::DownloadEmbeddingModel)
+        {
+            return Step::new(
+                ID,
+                TITLE,
+                StepState::Action,
+                format!(
+                    "{server}; embedding model {model} is not installed and downloading it needs your approval ({reason})"
+                ),
+            )
+            .with_code(super::service_supervisor::CONSENT_REQUIRED)
+            .with_action(format!(
+                "approve the download of {model} with /setup approve download-model (Ollama reports the size once it starts), then run /setup"
+            ));
         }
         start_pull(Arc::clone(memory), &url, &model);
         let progress = pull_progress().unwrap_or_default();
@@ -1406,6 +1474,14 @@ Connection: close
             .action
             .unwrap()
             .contains("ollama pull embeddinggemma"));
+
+        // Without the user's yes the download does not start.
+        let refused = memory_step(&memory, true, &tc.ctx());
+        assert_eq!(refused.state, StepState::Action, "{}", refused.detail);
+        assert_eq!(refused.code, Some("CONSENT_REQUIRED"));
+        super::super::service_authority::ServiceConsentStore::open(tc.agent.path())
+            .set(ServiceAction::DownloadEmbeddingModel, true)
+            .unwrap();
 
         let applied = memory_step(&memory, true, &tc.ctx());
         assert_eq!(applied.state, StepState::Running, "{}", applied.detail);

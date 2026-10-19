@@ -19,6 +19,7 @@ pub mod security_scan;
 pub mod service_authority;
 pub mod service_supervisor;
 pub mod setup;
+pub mod setup_actions;
 pub mod setup_health;
 pub mod setup_profile;
 pub mod test_impact;

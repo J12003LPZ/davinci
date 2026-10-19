@@ -683,3 +683,236 @@ fn a_disabled_memory_is_never_probed_or_started() {
         "a disabled feature was probed"
     );
 }
+
+// ---- Task 5: consented model download ---------------------------------------
+
+use davinci_coding_agent::native_extensions::service_authority::ServiceAuthorization;
+use davinci_coding_agent::native_extensions::setup::{
+    cancel_pull, memory_step, pull_progress, SetupContext, StepState,
+};
+use davinci_coding_agent::native_extensions::setup_actions::{
+    approve_action, execute_approved_action, SetupAction,
+};
+use std::sync::Mutex;
+
+/// The download slot is process-wide, so tests that download take turns.
+static PULL_TURN: Mutex<()> = Mutex::new(());
+
+/// A stateful fake Ollama: `/api/pull` either installs the model (`succeed`)
+/// or ends its stream without a verdict. Counts pulls.
+struct PullServer {
+    url: String,
+    pulls: Arc<AtomicUsize>,
+}
+
+fn pull_server(installed: bool, dimensions: usize, succeed: bool) -> PullServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let have = Arc::new(AtomicBool::new(installed));
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let (have_t, pulls_t) = (Arc::clone(&have), Arc::clone(&pulls));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (have, pulls) = (Arc::clone(&have_t), Arc::clone(&pulls_t));
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 8192];
+                let mut read = 0;
+                while let Ok(n) = stream.read(&mut buffer[read..]) {
+                    if n == 0 {
+                        break;
+                    }
+                    read += n;
+                    if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") && read > 40 {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let body = if request.starts_with("GET /api/tags") {
+                    if have.load(Ordering::SeqCst) {
+                        "{\"models\":[{\"name\":\"embeddinggemma:latest\"}]}".to_string()
+                    } else {
+                        "{\"models\":[]}".to_string()
+                    }
+                } else if request.starts_with("POST /api/pull") {
+                    pulls.fetch_add(1, Ordering::SeqCst);
+                    if succeed {
+                        have.store(true, Ordering::SeqCst);
+                        "{\"status\":\"pulling manifest\"}\n{\"status\":\"success\"}\n".to_string()
+                    } else {
+                        "{\"status\":\"pulling manifest\"}\n".to_string()
+                    }
+                } else if request.starts_with("POST /api/embed") {
+                    let vector: Vec<_> = (0..dimensions).map(|i| format!("{}.5", i % 7)).collect();
+                    format!("{{\"embeddings\":[[{}]]}}", vector.join(","))
+                } else {
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    PullServer { url, pulls }
+}
+
+fn memory_for(dir: &Path, url: &str) -> Arc<Mutex<VectorMemory>> {
+    let config = VectorMemoryConfig {
+        ollama_url: url.into(),
+        embedding_dimensions: 8,
+        request_timeout_seconds: 5,
+        ..VectorMemoryConfig::default()
+    };
+    Arc::new(Mutex::new(VectorMemory::with_config(
+        dir.to_path_buf(),
+        config,
+    )))
+}
+
+struct Ctx {
+    agent: tempfile::TempDir,
+    supervisor: ManagedServiceSupervisor,
+}
+
+impl Ctx {
+    fn new() -> Self {
+        Self {
+            agent: tempfile::tempdir().unwrap(),
+            // No ollama on this "machine": nothing may be started.
+            supervisor: ManagedServiceSupervisor::new(Box::new(NoOllamaHere)),
+        }
+    }
+    fn get(&self) -> SetupContext<'_> {
+        SetupContext {
+            agent_dir: self.agent.path(),
+            supervisor: &self.supervisor,
+        }
+    }
+}
+
+struct NoOllamaHere;
+impl OllamaLauncher for NoOllamaHere {
+    fn find(&self) -> Option<PathBuf> {
+        None
+    }
+    fn version(&self, _: &Path) -> Option<String> {
+        None
+    }
+    fn spawn(&self, _: &Path, _: &Path) -> Result<Box<dyn OwnedProcess>, String> {
+        Err("no process may be started in this test".into())
+    }
+}
+
+fn wait_for_pull() {
+    let started = std::time::Instant::now();
+    while !pull_progress().is_some_and(|progress| progress.finished) {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the download never finished"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn ollama_model_present_skips_pull_missing_requires_consent() {
+    let _turn = PULL_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+
+    // The model is already there: nothing is downloaded, even on apply.
+    let present = pull_server(true, 8, true);
+    let ctx = Ctx::new();
+    let memory = memory_for(project.path(), &present.url);
+    let step = memory_step(&memory, true, &ctx.get());
+    assert!(
+        matches!(step.state, StepState::Ready | StepState::Done),
+        "{}",
+        step.detail
+    );
+    assert_eq!(present.pulls.load(Ordering::SeqCst), 0);
+
+    // The model is missing and nobody said yes: a check and an apply both
+    // leave it alone and say how to approve.
+    let missing = pull_server(false, 8, true);
+    let ctx = Ctx::new();
+    let memory = memory_for(project.path(), &missing.url);
+    let checked = memory_step(&memory, false, &ctx.get());
+    assert_eq!(checked.code, Some("MODEL_MISSING"));
+    let refused = memory_step(&memory, true, &ctx.get());
+    assert_eq!(refused.state, StepState::Action);
+    assert_eq!(refused.code, Some("CONSENT_REQUIRED"));
+    assert!(refused
+        .action
+        .unwrap()
+        .contains("/setup approve download-model"));
+    assert_eq!(
+        missing.pulls.load(Ordering::SeqCst),
+        0,
+        "downloaded without approval"
+    );
+    assert!(
+        ServiceAuthorization::check(ctx.agent.path(), ServiceAction::DownloadEmbeddingModel)
+            .is_err()
+    );
+    // The action itself refuses too.
+    let refused = execute_approved_action(SetupAction::DownloadModel, &memory, &ctx.get());
+    assert_eq!(refused.code, Some("CONSENT_REQUIRED"));
+    assert_eq!(missing.pulls.load(Ordering::SeqCst), 0);
+
+    // After the user's yes, the download runs once and the model is there.
+    approve_action(SetupAction::DownloadModel, &ctx.get()).unwrap();
+    let started = memory_step(&memory, true, &ctx.get());
+    assert_eq!(started.state, StepState::Running, "{}", started.detail);
+    wait_for_pull();
+    assert_eq!(missing.pulls.load(Ordering::SeqCst), 1);
+    let done = memory_step(&memory, true, &ctx.get());
+    assert!(
+        matches!(done.state, StepState::Ready | StepState::Done),
+        "{}",
+        done.detail
+    );
+    assert_eq!(missing.pulls.load(Ordering::SeqCst), 1, "pulled again");
+}
+
+#[test]
+fn an_interrupted_download_is_reported_not_silently_restarted() {
+    let _turn = PULL_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    // The stream ends without a verdict.
+    let server = pull_server(false, 8, false);
+    let ctx = Ctx::new();
+    approve_action(SetupAction::DownloadModel, &ctx.get()).unwrap();
+    let memory = memory_for(project.path(), &server.url);
+
+    assert_eq!(
+        memory_step(&memory, true, &ctx.get()).state,
+        StepState::Running
+    );
+    wait_for_pull();
+    assert_eq!(server.pulls.load(Ordering::SeqCst), 1);
+
+    // The next apply reports the unknown outcome and does NOT pull again.
+    let report = memory_step(&memory, true, &ctx.get());
+    assert_eq!(report.state, StepState::Action, "{}", report.detail);
+    assert!(
+        report.detail.contains("did not finish"),
+        "{}",
+        report.detail
+    );
+    assert_eq!(server.pulls.load(Ordering::SeqCst), 1, "restarted silently");
+
+    // Only the explicit run after that tries again.
+    assert_eq!(
+        memory_step(&memory, true, &ctx.get()).state,
+        StepState::Running
+    );
+    wait_for_pull();
+    assert_eq!(server.pulls.load(Ordering::SeqCst), 2);
+    assert!(
+        !cancel_pull(),
+        "nothing is running, so there is nothing to cancel"
+    );
+}
