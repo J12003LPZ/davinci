@@ -18,6 +18,7 @@ use super::service_supervisor::is_local_url;
 use super::service_supervisor::{system_supervisor, ManagedServiceSupervisor};
 use super::setup_health::{ComponentHealth, HealthState};
 use super::setup_profile::load_effective_setup;
+use super::token_governor::{GovernorHealth, GovernorState};
 use super::vector_memory::process_env;
 use super::vector_memory::VectorMemory;
 use serde::Serialize;
@@ -207,6 +208,28 @@ pub fn report_full(
         "health": health,
         "issues": issues,
     })
+}
+
+/// The governor's health in the same shape as the memory component's.
+pub fn governor_health(health: &GovernorHealth, effective_enabled: bool) -> ComponentHealth {
+    if !effective_enabled || health.state == GovernorState::Disabled {
+        return ComponentHealth::new("governor", HealthState::Disabled, "token governor is off");
+    }
+    match health.state {
+        GovernorState::Degraded => ComponentHealth::new(
+            "governor",
+            HealthState::Degraded,
+            format!(
+                "cannot keep full tool outputs at {}: {}; {} output(s) stayed uncompressed",
+                health.store.display(),
+                health.last_error.as_deref().unwrap_or("store not writable"),
+                health.store_failures
+            ),
+        )
+        .with_code("GOVERNOR_STORE_UNWRITABLE")
+        .with_remediation("make the store folder writable or set storeDir in token-governor.json"),
+        _ => ComponentHealth::new("governor", HealthState::Ready, "token governor is on"),
+    }
 }
 
 /// The memory component's health, from live probes and the store, without

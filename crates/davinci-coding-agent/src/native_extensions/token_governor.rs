@@ -612,6 +612,41 @@ impl OutputStore {
         })
     }
 
+    fn lsp_marker(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.lsp"))
+    }
+
+    /// Record on disk that `id` holds language evidence that needed a
+    /// permission check, so the rule survives a restart (the in-memory
+    /// manifest does not).
+    pub fn mark_lsp(&self, id: &str) -> Result<(), ToolError> {
+        davinci_sys::fs::atomic_write_private(&self.lsp_marker(id), b"lsp")
+            .map_err(|err| ToolError::Failed(err.to_string()))
+    }
+
+    pub fn is_lsp(&self, id: &str) -> bool {
+        is_valid_output_id(id) && self.lsp_marker(id).exists()
+    }
+
+    /// Whether outputs could be written here, without creating or changing
+    /// anything: the nearest existing ancestor must be a writable directory.
+    pub fn writable(&self) -> Result<(), String> {
+        let mut probe: &Path = &self.root;
+        loop {
+            match fs::metadata(probe) {
+                Ok(meta) if meta.is_dir() && !meta.permissions().readonly() => return Ok(()),
+                Ok(meta) if meta.is_dir() => {
+                    return Err(format!("{} is read-only", probe.display()))
+                }
+                Ok(_) => return Err(format!("{} is not a directory", probe.display())),
+                Err(_) => match probe.parent() {
+                    Some(parent) => probe = parent,
+                    None => return Err(format!("no existing parent of {}", self.root.display())),
+                },
+            }
+        }
+    }
+
     pub fn load(&self, id: &str) -> Result<String, ToolError> {
         if !is_valid_output_id(id) {
             return Err(ToolError::Failed("invalid output id".into()));
@@ -1035,6 +1070,26 @@ pub struct GovernorStats {
     pub content_routing: ContentRoutingStats,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum GovernorState {
+    Enabled,
+    Disabled,
+    Degraded,
+}
+
+/// What `/governor-status` and `/setup` report about the governor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernorHealth {
+    pub state: GovernorState,
+    pub store: PathBuf,
+    pub writable: bool,
+    pub store_failures: u64,
+    pub last_error: Option<String>,
+    pub compressed_outputs: u64,
+    pub retrievals: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenGovernor {
     pub config: TokenGovernorConfig,
@@ -1055,6 +1110,10 @@ pub struct TokenGovernor {
     prunings: usize,
     content_routing: ContentRoutingStats,
     lsp_permissions: Option<Arc<PermissionState>>,
+    /// Originals that could not be stored, and the last reason. The model kept
+    /// the whole output each time, so nothing is lost, but the user is told.
+    store_failures: u64,
+    last_store_error: Option<String>,
 }
 
 impl Default for TokenGovernor {
@@ -1084,6 +1143,8 @@ impl TokenGovernor {
             prunings: 0,
             content_routing: ContentRoutingStats::default(),
             lsp_permissions: None,
+            store_failures: 0,
+            last_store_error: None,
         }
     }
 
@@ -1174,6 +1235,8 @@ impl TokenGovernor {
         let _ = self.store.clear();
         self.stored.clear();
         self.lsp_permissions = None;
+        self.store_failures = 0;
+        self.last_store_error = None;
         self.tool_calls = 0;
         self.compressed_outputs = 0;
         self.deduplicated_reads = 0;
@@ -1285,8 +1348,12 @@ impl TokenGovernor {
         }
         // Fail open: if the original cannot be stored, the model keeps the
         // whole output rather than a digest it could never expand.
-        let Ok(reference) = self.store.save(&result.content) else {
-            return result;
+        let reference = match self.store.save(&result.content) {
+            Ok(reference) => reference,
+            Err(error) => {
+                self.record_store_failure(&error);
+                return result;
+            }
         };
         let generic = compress_with_reference(&result.content, &self.config, Some(&reference));
         let kind =
@@ -1401,7 +1468,13 @@ impl TokenGovernor {
         }
         paths.sort();
         paths.dedup();
-        let reference = self.store.save(content)?;
+        let reference = self
+            .store
+            .save(content)
+            .inspect_err(|e| self.record_store_failure(e))?;
+        self.store
+            .mark_lsp(&reference.id)
+            .inspect_err(|e| self.record_store_failure(e))?;
         self.lsp_permissions = Some(permissions);
         self.remember_stored(
             name,
@@ -1421,6 +1494,13 @@ impl TokenGovernor {
 
     fn authorize_lsp_retrieval(&self, id: &str) -> Result<(), ToolError> {
         let Some(entry) = self.stored.iter().find(|entry| entry.id == id) else {
+            // After a restart the manifest is empty but the file is not. Language
+            // evidence cannot prove its permission any more, so it stays closed.
+            if self.store.is_lsp(id) {
+                return Err(ToolError::Failed(
+                    "stored language evidence is no longer authorized (the session restarted); run the language tool again".into(),
+                ));
+            }
             return Ok(());
         };
         let Some(auth) = &entry.lsp_authorization else {
@@ -1631,6 +1711,33 @@ impl TokenGovernor {
         Ok(content)
     }
 
+    fn record_store_failure(&mut self, error: &ToolError) {
+        self.store_failures += 1;
+        self.last_store_error = Some(error.to_string());
+    }
+
+    /// Enabled, Disabled, or Degraded (turned on but unable to keep originals).
+    /// Checks the store without creating or changing a file.
+    pub fn health(&self) -> GovernorHealth {
+        let writable = self.store.writable();
+        let state = if !self.config.enabled {
+            GovernorState::Disabled
+        } else if writable.is_err() || self.last_store_error.is_some() {
+            GovernorState::Degraded
+        } else {
+            GovernorState::Enabled
+        };
+        GovernorHealth {
+            state,
+            store: self.store.root().to_path_buf(),
+            writable: writable.is_ok(),
+            store_failures: self.store_failures,
+            last_error: self.last_store_error.clone().or_else(|| writable.err()),
+            compressed_outputs: self.compressed_outputs as u64,
+            retrievals: self.retrievals.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn status(&self) -> Value {
         let content_original_bytes = self.content_routing.original_bytes;
         let content_model_view_bytes = self.content_routing.model_view_bytes;
@@ -1646,6 +1753,7 @@ impl TokenGovernor {
         };
         json!({
             "enabled": self.config.enabled,
+            "health": self.health(),
             "sessionKey": self.session_key,
             "toolCalls": self.tool_calls,
             "compressedOutputs": self.compressed_outputs,
@@ -1786,6 +1894,103 @@ mod tests {
         assert!(governor
             .retrieve_artifact(&format!("governor://output/{id}"))
             .is_err());
+    }
+
+    fn governor_in(dir: &Path, key: &str) -> TokenGovernor {
+        TokenGovernor::with_store(
+            key,
+            tiny_thresholds(),
+            OutputStore::new(dir.join("outputs")),
+        )
+    }
+
+    #[test]
+    fn governor_compress_store_retrieve_after_restart() {
+        let dir = tempdir().unwrap();
+        let big: String = (1..=300)
+            .map(|n| format!("line {n} payload {}\n", "x".repeat(20)))
+            .collect();
+        let mut first = governor_in(dir.path(), "restart");
+        let shown = first.after_tool("bash", &json!({"command": "big"}), ok(&big));
+        assert!(shown.content.len() < big.len(), "output was not compressed");
+        let id = first.status()["stored"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            shown.content.contains(&id),
+            "the digest names its reference"
+        );
+        assert_eq!(first.status()["health"]["state"], "Enabled");
+
+        // A new process with the same session key: empty manifest, same files.
+        let mut second = governor_in(dir.path(), "restart");
+        let hidden = second
+            .retrieve(&json!({"id": id, "startLine": 217, "endLine": 217}))
+            .unwrap();
+        assert_eq!(
+            hidden.content,
+            format!("217: line 217 payload {}", "x".repeat(20))
+        );
+        assert_eq!(
+            second
+                .retrieve_artifact(&format!("governor://output/{id}"))
+                .unwrap(),
+            big
+        );
+    }
+
+    #[test]
+    fn lsp_output_stays_closed_after_restart() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("lib.rs");
+        std::fs::write(&source, "pub fn value() {}\n").unwrap();
+        let permissions = Arc::new(PermissionState::new(davinci_agent::PermissionPolicy::new(
+            davinci_agent::PermissionMode::AlwaysApprove,
+        )));
+        permissions.lock().unwrap().project_trusted = true;
+        let mut first = governor_in(dir.path(), "lsp-restart");
+        let id = first
+            .retain_lsp_output(
+                "lsp_references",
+                &json!({"path": "lib.rs"}),
+                r#"{"items":[{"path":"lib.rs"}]}"#,
+                &workspace,
+                Some(&source),
+                permissions,
+            )
+            .unwrap();
+        assert!(first.retrieve(&json!({"id": id})).is_ok());
+        // After a restart nothing proves the permission, so the file is not served.
+        let mut second = governor_in(dir.path(), "lsp-restart");
+        assert!(second.retrieve(&json!({"id": id})).is_err());
+        assert!(second
+            .retrieve_artifact(&format!("governor://output/{id}"))
+            .is_err());
+        // Ordinary output is unaffected.
+        let plain = second.store.save("plain output").unwrap();
+        assert!(second.retrieve(&json!({"id": plain.id})).is_ok());
+    }
+
+    #[test]
+    fn unwritable_store_is_degraded_never_ready() {
+        let dir = tempdir().unwrap();
+        // The store's parent is a file, so no output can ever be written.
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        let store = OutputStore::new(blocker.join("outputs"));
+        let mut governor = TokenGovernor::with_store("degraded", tiny_thresholds(), store);
+        assert_eq!(governor.status()["health"]["state"], "Degraded");
+        let big = "line\n".repeat(50);
+        let shown = governor.after_tool("bash", &json!({}), ok(&big));
+        assert_eq!(shown.content, big, "the model keeps the whole output");
+        let health = governor.status()["health"].clone();
+        assert_eq!(health["state"], "Degraded");
+        assert_eq!(health["storeFailures"], 1);
+        assert!(health["lastError"].as_str().is_some_and(|e| !e.is_empty()));
+        assert_eq!(health["writable"], false);
     }
 
     #[test]

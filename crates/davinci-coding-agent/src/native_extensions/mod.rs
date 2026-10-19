@@ -1085,7 +1085,14 @@ impl NativeExtensionHost {
                     mode,
                     setup::Mode::Apply | setup::Mode::Check | setup::Mode::CheckJson
                 ) {
-                    vec![setup::memory_health(&self.memory, &effective, &ctx)]
+                    let mut health = vec![setup::memory_health(&self.memory, &effective, &ctx)];
+                    if let Ok(governor) = self.governor.lock() {
+                        health.push(setup::governor_health(
+                            &governor.health(),
+                            effective.governor.enabled,
+                        ));
+                    }
+                    health
                 } else {
                     Vec::new()
                 };

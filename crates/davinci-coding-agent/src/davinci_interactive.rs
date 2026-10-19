@@ -7498,6 +7498,15 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
             format!("{embedded} of {records} records carry a vector"),
         ));
     }
+    if value["storeHealth"]["state"] == "unreadable" {
+        health.push((
+            State::Attention,
+            format!(
+                "record file unreadable, writes are blocked and nothing was changed: {}",
+                json_str(&value["storeHealth"], "detail")
+            ),
+        ));
+    }
     if !dense_available {
         health.push((
             State::Attention,
@@ -7598,7 +7607,12 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
         } else {
             format!("{embed_host} · {model_dims}")
         },
-        store: "qdrant".into(),
+        // The local record file is the store; Qdrant is an optional copy.
+        store: if value["remoteProjectionEnabled"].as_bool().unwrap_or(false) {
+            "local file + qdrant".into()
+        } else {
+            "local file".into()
+        },
         collection: json_str(value, "collection"),
         extraction: json_str(value, "extractionModel"),
         config: crate::default_agent_dir()
