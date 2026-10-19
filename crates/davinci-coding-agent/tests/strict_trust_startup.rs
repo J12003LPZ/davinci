@@ -20,6 +20,7 @@ struct Fixture {
     _root: tempfile::TempDir,
     project: PathBuf,
     config: PathBuf,
+    home: PathBuf,
     trace: PathBuf,
     mcp_marker: PathBuf,
     hook_marker: PathBuf,
@@ -77,6 +78,7 @@ fn fixture() -> Fixture {
         _root: root,
         project,
         config,
+        home: base.clone(),
         mcp_marker,
         hook_marker,
     }
@@ -96,14 +98,11 @@ impl Fixture {
             .arg("--offline")
             .arg("--session-dir")
             .arg(self.project.join("..").join("sessions"))
-            // The agent directory is redirected below. HOME stays the real
-            // one so the user's own `~/.agents/skills` is recognised as
-            // user-owned, not as a project resource of a temp dir under it.
-            .envs(
-                ["HOME", "USERPROFILE"]
-                    .into_iter()
-                    .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
-            )
+            // Every place a profile could be read from is the fixture's own
+            // temp root, so nothing here touches the real user profile.
+            .envs(["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"].map(
+                |key| (key, &self.home),
+            ))
             .env("PI_CODING_AGENT_DIR", &self.config)
             .env("DAVINCI_CODING_AGENT_DIR", &self.config)
             .env("PI_OFFLINE", "1")
@@ -260,21 +259,87 @@ fn strict_trust_no_project_hook_before_prompt() {
 
 #[test]
 fn strict_trust_decline_exits_without_loading() {
-    for answer in ["\n", "1\n", "n\n", "no\n", ""] {
+    for answer in [
+        "
+", "1
+", "n
+", "no
+",
+    ] {
         let fx = fixture();
         let run = run_with_input(&mut fx.command(), answer);
-        assert_eq!(run.code, Some(0), "answer {answer:?}\n{}", run.describe());
+        assert_eq!(
+            run.code,
+            Some(0),
+            "answer {answer:?}
+{}",
+            run.describe()
+        );
         assert!(run.stdout.contains(PROMPT_NO), "{}", run.describe());
         assert!(run.stdout.contains(PROMPT_YES), "{}", run.describe());
         assert_eq!(fx.stored_decision(), Some(false), "answer {answer:?}");
         let trace = fx.trace();
         assert!(
             !trace.contains("agent built"),
-            "answer {answer:?} still built the agent:\n{trace}"
+            "answer {answer:?} still built the agent:
+{trace}"
         );
         assert!(!fx.mcp_marker.exists(), "answer {answer:?}: MCP ran");
         assert!(!fx.hook_marker.exists(), "answer {answer:?}: hook ran");
     }
+}
+
+#[test]
+fn strict_trust_cancelling_exits_without_saving_a_denial() {
+    // Closed input and unusable answers are no answer: only an explicit No
+    // is persisted.
+    for input in [
+        "",
+        "what
+what
+what
+",
+    ] {
+        let fx = fixture();
+        let run = run_with_input(&mut fx.command(), input);
+        assert_eq!(run.code, Some(0), "{}", run.describe());
+        assert_eq!(
+            fx.stored_decision(),
+            None,
+            "input {input:?} saved something"
+        );
+        assert!(
+            run.stdout.contains("nothing was saved"),
+            "{}",
+            run.describe()
+        );
+        assert!(!fx.trace().contains("agent built"));
+        assert!(!fx.mcp_marker.exists() && !fx.hook_marker.exists());
+    }
+}
+
+#[test]
+fn strict_trust_global_never_denies_without_asking_and_says_how_to_trust() {
+    let fx = fixture();
+    fs::write(
+        fx.config.join("settings.json"),
+        r#"{"defaultProjectTrust":"never"}"#,
+    )
+    .unwrap();
+    let run = run_with_input(
+        &mut fx.command(),
+        "2
+",
+    );
+    assert!(!run.stdout.contains(PROMPT_YES), "{}", run.describe());
+    assert!(
+        run.stdout.contains("defaultProjectTrust is never"),
+        "{}",
+        run.describe()
+    );
+    assert!(run.stdout.contains("/trust"), "{}", run.describe());
+    assert_eq!(fx.stored_decision(), None);
+    assert!(!fx.mcp_marker.exists() && !fx.hook_marker.exists());
 }
 
 #[test]
@@ -551,6 +616,37 @@ mod headless {
     }
 
     #[test]
+    fn headless_json_mode_emits_a_structured_event_on_stdout() {
+        let fx = fixture();
+        let mut command = fx.command();
+        command
+            .env_remove("PI_FORCE_INTERACTIVE")
+            .env_remove("PI_SHUTDOWN_SIGNAL")
+            .args(["--mode", "json", "--print", "hello"]);
+        let run = run_with_input(&mut command, "");
+        let event: serde_json::Value = run
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value["code"] == "UNTRUSTED_PROJECT")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no UNTRUSTED_PROJECT event on stdout
+{}",
+                    run.describe()
+                )
+            });
+        assert_eq!(event["type"], "project_trust");
+        assert!(event["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("UNTRUSTED_PROJECT: "));
+        assert!(event["remediation"].as_str().unwrap().contains("--approve"));
+        assert!(event["path"].as_str().is_some());
+        assert!(!fx.mcp_marker.exists());
+    }
+
+    #[test]
     fn headless_stored_grant_loads_the_project_without_a_diagnostic() {
         let fx = fixture();
         davinci_coding_agent::trust::ProjectTrustStore::open(&fx.config)
@@ -661,5 +757,85 @@ mod headless {
         );
         assert!(!fx.mcp_marker.exists());
         assert!(!fx.hook_marker.exists());
+    }
+}
+
+// ---- Task 5: folder trust is not service consent -------------------------
+
+mod consent {
+    use davinci_coding_agent::native_extensions::service_authority::{
+        ServiceAction, ServiceAuthorization, ServiceConsentStore, CONSENT_FILE,
+    };
+    use davinci_coding_agent::native_extensions::setup::trust_project;
+    use davinci_coding_agent::trust::{resolve_project_trusted, ProjectTrustStore};
+    use std::fs;
+
+    #[test]
+    fn folder_trust_does_not_grant_service_start() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let project = root.path().join("repo");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(project.join(".pi").join("hooks.json"), "{}").unwrap();
+        // The project ships a consent file of its own, every box ticked.
+        let planted = serde_json::json!({
+            "allow_start_local_ollama": true,
+            "allow_download_embedding_model": true,
+            "allow_start_owned_qdrant_container": true,
+            "allow_install_software": true,
+        });
+        fs::write(project.join(".pi").join(CONSENT_FILE), planted.to_string()).unwrap();
+        fs::write(project.join(CONSENT_FILE), planted.to_string()).unwrap();
+
+        // Every way of trusting the folder: the store, `/setup trust`, and
+        // the global default.
+        ProjectTrustStore::open(&agent)
+            .set(&project, Some(true))
+            .unwrap();
+        trust_project(&agent, &project);
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        assert!(resolve_project_trusted(
+            &agent,
+            &project,
+            Some(true),
+            Some("always"),
+            &[]
+        ));
+
+        for action in ServiceAction::ALL {
+            let denied = ServiceAuthorization::check(&agent, action);
+            assert!(denied.is_err(), "{action:?} was allowed by folder trust");
+        }
+        assert!(
+            !agent.join(CONSENT_FILE).exists(),
+            "trusting a folder wrote a consent file"
+        );
+
+        // Only the user's own, explicit consent opens exactly that action.
+        ServiceConsentStore::open(&agent)
+            .set(ServiceAction::DownloadEmbeddingModel, true)
+            .unwrap();
+        for action in ServiceAction::ALL {
+            let allowed = ServiceAuthorization::check(&agent, action).is_ok();
+            assert_eq!(
+                allowed,
+                action == ServiceAction::DownloadEmbeddingModel,
+                "{action:?}"
+            );
+        }
+        // Revoking the folder's trust does not touch the consent, and a damaged
+        // consent file refuses everything.
+        ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        assert!(ServiceAuthorization::check(&agent, ServiceAction::DownloadEmbeddingModel).is_ok());
+        fs::write(agent.join(CONSENT_FILE), "{ nope").unwrap();
+        for action in ServiceAction::ALL {
+            assert!(ServiceAuthorization::check(&agent, action).is_err());
+        }
     }
 }

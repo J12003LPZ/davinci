@@ -3686,6 +3686,50 @@ description: x
 }
 
 #[test]
+fn revoking_trust_and_reloading_stops_the_projects_mcp_servers() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _a = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _b = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    let fixture = dir.path().join("server.json");
+    std::fs::write(
+        &fixture,
+        r#"{"initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+            "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".pi").join("mcp.json"),
+        serde_json::json!({"mcpServers": {"planted": {"url": format!("fixture:{}", fixture.display())}}})
+            .to_string(),
+    )
+    .unwrap();
+    let store = ProjectTrustStore::open(&agent_dir);
+    store.set(&project, Some(true)).unwrap();
+
+    let mut agent = Agent::new("x");
+    agent.cwd = project.clone();
+    let config = mcp::load(&agent_dir, &project, true, false);
+    agent.attach_mcp(davinci_agent::McpRegistry::connect(&config, &project));
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__planted__ping"]);
+
+    // Still trusted: a reload keeps it.
+    apply_discovered_resources(&Args::default(), &mut agent);
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__planted__ping"]);
+
+    // "Do not trust", then /reload: the server is gone, not merely hidden.
+    store.set(&project, Some(false)).unwrap();
+    apply_discovered_resources(&Args::default(), &mut agent);
+    assert!(agent.tool_context.mcp.tool_names().is_empty());
+    assert!(agent.tool_context.mcp.rows().is_empty());
+}
+
+#[test]
 fn suspend_dry_run_sets_status() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()

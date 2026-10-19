@@ -24,15 +24,25 @@ Trusting only lets DaVinci load it. Tool approvals and the sandbox stay on.
   2. Yes, I trust this folder
 ```
 
-- `No` is the default (Enter, `1`, `n`, Esc, Ctrl+C, closed input). It stores
-  "Do not trust" for the canonical folder path and exits with status 0.
+- `No` is the default answer (Enter, `1`, `n`). Only an explicit No stores
+  "Do not trust" for the canonical folder path; it then exits with status 0.
+- Esc, Ctrl+C, Ctrl+D, closed input and a terminal I/O error exit with status 0
+  and store nothing, so the question comes back next launch.
 - `Yes` stores trust and continues.
+- With `defaultProjectTrust: "never"` in your global settings nothing is asked:
+  the project's resources stay unloaded, one line says how to trust the folder
+  (`/trust`, or `trustedProjects`), and DaVinci opens. A stored grant or
+  `--approve` still wins.
+- "Trust parent folder" is not offered when the parent is a drive or filesystem
+  root or your home directory.
 - A stored decision is never asked again. A stored denial keeps the project's
   resources unloaded on later launches (DaVinci still opens, without them);
   `/trust` and `/setup trust` change the decision.
 - A nearer entry wins over a parent's: a saved "Do not trust" on a folder
   survives "Trust parent folder".
-- Symlinks, junctions and the Windows drive-letter case resolve to one entry.
+- Symlinks, junctions, the Windows drive-letter case, `\\?\` prefixes and
+  separators resolve to one entry. `trustedProjects` entries are compared the
+  same way.
 - An unreadable or malformed `trust.json` fails closed. DaVinci reports the file
   and the error and leaves it alone. `/setup` shows the same error.
 
@@ -50,7 +60,9 @@ resources load only when one of these host-owned inputs allows it:
 Otherwise the project's resources stay unloaded and the caller is told, with the
 stable code `UNTRUSTED_PROJECT`:
 
-- print / json mode: a `Warning: UNTRUSTED_PROJECT: ...` line on stderr;
+- print mode: a `Warning: UNTRUSTED_PROJECT: ...` line on stderr;
+- json mode: the same warning on stderr and a `{"type":"project_trust","code":
+  "UNTRUSTED_PROJECT","message":...,"remediation":...}` event line on stdout;
 - RPC: an `extension_ui_request` `notify` event with `notifyType: "warning"`,
   `code: "UNTRUSTED_PROJECT"`, `path` and `diagnostic`, and `get_state` reports
   `projectTrusted` and `projectTrustCode`;
@@ -67,9 +79,11 @@ untrusted project gets no `verifyCommands` and no commands inferred from
 
 `/trust` writes the same store. `/reload` re-reads it: project skills, prompts,
 agent profiles and context files load or drop at once, per working directory,
-so nothing from a previous project root or a revoked grant stays. MCP servers,
-hooks, extensions and permission rules are built once at startup; restart
-DaVinci for those. There is no command that moves a running session to another
+so nothing from a previous project root or a revoked grant stays. After a
+denial, `/reload` also stops the project's MCP servers, and project hooks read
+the store on every run, so a denied project's hooks do not fire. Extensions and
+permission rules are built once at startup; restart DaVinci for those. Granting
+trust mid-session loads skills and prompts at `/reload`; restart for the rest. There is no command that moves a running session to another
 project root.
 
 ## What trust does not grant
@@ -86,7 +100,13 @@ project root.
   is what starts a local Ollama or pulls a model, memory settings come from the
   global `vector-memory.json` only, and `/setup` looks for `ollama` only in
   absolute `PATH` directories, so a project cannot plant the executable.
-  Consent receipts for automatic service start are a later phase.
+  Service actions have their own host-owned consent, stored in
+  `service-consent.json` in the agent directory (never in a project):
+  `allow_start_local_ollama`, `allow_download_embedding_model`,
+  `allow_start_owned_qdrant_container` and `allow_install_software`, all false by
+  default. A corrupt file fails closed. Folder trust sets none of them
+  (pinned by `tests/strict_trust_startup.rs`). `ServiceAuthorization::check` is
+  the seam: the `/setup` start and pull paths call it in the next phase.
 
 ## Rollback and opt-out
 

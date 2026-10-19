@@ -64,14 +64,15 @@ fn option_line(index: usize, label: &str, selected: bool) -> String {
 }
 
 /// Ask on a pipe or redirected stdin: print the question, read one line per
-/// attempt. End of input and unreadable input mean No, so a closed pipe never
-/// grants trust.
+/// attempt. An empty line is the default, No. End of input, unreadable input
+/// and three unusable answers return `None`: no answer, so nothing is saved
+/// and nothing is granted.
 pub fn ask_from_lines(
     input: &mut impl BufRead,
     output: &mut impl Write,
     path: &str,
     resources: &[String],
-) -> TrustGateChoice {
+) -> Option<TrustGateChoice> {
     for line in prompt_lines(path, resources) {
         let _ = writeln!(output, "{line}");
     }
@@ -82,20 +83,20 @@ pub fn ask_from_lines(
         let _ = output.flush();
         let mut line = String::new();
         match input.read_line(&mut line) {
-            Ok(0) | Err(_) => return TrustGateChoice::Exit,
+            Ok(0) | Err(_) => return None,
             Ok(_) => {}
         }
         if let Some(choice) = parse_answer(&line) {
-            return choice;
+            return Some(choice);
         }
         let _ = writeln!(output, "Answer 1 (No) or 2 (Yes).");
     }
-    TrustGateChoice::Exit
+    None
 }
 
 /// Ask on a terminal: arrow keys move, Enter confirms, `1`/`n` and `2`/`y`
-/// answer at once, Esc and Ctrl+C mean No.
-fn ask_on_terminal(path: &str, resources: &[String]) -> io::Result<TrustGateChoice> {
+/// answer at once. Esc, Ctrl+C and Ctrl+D cancel: no answer, nothing saved.
+fn ask_on_terminal(path: &str, resources: &[String]) -> io::Result<Option<TrustGateChoice>> {
     use crossterm::cursor::MoveUp;
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal::{self, Clear, ClearType};
@@ -139,29 +140,30 @@ fn ask_on_terminal(path: &str, resources: &[String]) -> io::Result<TrustGateChoi
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('c' | 'd') if ctrl => return Ok(TrustGateChoice::Exit),
-            KeyCode::Esc | KeyCode::Char('1' | 'n' | 'N') => return Ok(TrustGateChoice::Exit),
-            KeyCode::Char('2' | 'y' | 'Y') => return Ok(TrustGateChoice::Trust),
+            KeyCode::Char('c' | 'd') if ctrl => return Ok(None),
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char('1' | 'n' | 'N') => return Ok(Some(TrustGateChoice::Exit)),
+            KeyCode::Char('2' | 'y' | 'Y') => return Ok(Some(TrustGateChoice::Trust)),
             KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Char('j' | 'k') => {
                 selected = 1 - selected;
             }
             KeyCode::Enter => {
-                return Ok(if selected == 0 {
+                return Ok(Some(if selected == 0 {
                     TrustGateChoice::Exit
                 } else {
                     TrustGateChoice::Trust
-                })
+                }))
             }
             _ => {}
         }
     }
 }
 
-fn ask(path: &str, resources: &[String]) -> TrustGateChoice {
+fn ask(path: &str, resources: &[String]) -> Option<TrustGateChoice> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        // A terminal that cannot enter raw mode cannot show the question, so
-        // the answer is No rather than a guess.
-        return ask_on_terminal(path, resources).unwrap_or(TrustGateChoice::Exit);
+        // A terminal that cannot show the question gives no answer, which
+        // grants nothing and saves nothing.
+        return ask_on_terminal(path, resources).unwrap_or(None);
     }
     let stdin = io::stdin();
     ask_from_lines(&mut stdin.lock(), &mut io::stdout(), path, resources)
@@ -209,6 +211,7 @@ pub fn enforce_startup_trust(
     cwd: &Path,
     trust_override: Option<bool>,
     mode: HostMode,
+    json_events: bool,
 ) -> GateOutcome {
     let decision = decide(agent_dir, cwd, trust_override, mode);
     crate::startup_mark("trust gate");
@@ -218,12 +221,25 @@ pub fn enforce_startup_trust(
         if trust_override.is_none() {
             if let Some(diagnostic) = trust_diagnostic(&decision, cwd) {
                 eprintln!("Warning: {}", diagnostic.message);
+                if json_events {
+                    // `--mode json` clients read stdout events, not stderr.
+                    let mut event = diagnostic.to_json();
+                    event["type"] = "project_trust".into();
+                    let _ = crate::output::write_raw_stdout_line(&event.to_string());
+                }
             }
         }
         return GateOutcome::Continue;
     }
     match decision {
         TrustGateDecision::Preapproved | TrustGateDecision::Declined => GateOutcome::Continue,
+        TrustGateDecision::Never => {
+            println!(
+                "Project resources in {} stay unloaded: defaultProjectTrust is never. Trust the folder with /trust, or list it under trustedProjects in your settings.",
+                canonicalize_trust_path(cwd)
+            );
+            GateOutcome::Continue
+        }
         TrustGateDecision::StoreUnreadable(message) => {
             eprintln!(
                 "Error: {message}
@@ -236,7 +252,13 @@ Project resources stay unloaded until the trust store is readable."
         TrustGateDecision::Prompt => {
             let path = canonicalize_trust_path(cwd);
             let resources = trust_requiring_project_resource_names(cwd);
-            let choice = ask(&path, &resources);
+            let Some(choice) = ask(&path, &resources) else {
+                crate::startup_mark("trust gate cancelled");
+                println!(
+                    "\nNo answer was given, so nothing was saved and nothing from {path} was loaded."
+                );
+                return GateOutcome::Exit(0);
+            };
             crate::startup_mark("trust gate answered");
             if let Err(err) = record_gate_choice(agent_dir, cwd, choice) {
                 eprintln!(
@@ -264,7 +286,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn ask_with(input: &str) -> (TrustGateChoice, String) {
+    fn ask_with(input: &str) -> (Option<TrustGateChoice>, String) {
         let mut output = Vec::new();
         let choice = ask_from_lines(
             &mut Cursor::new(input.as_bytes().to_vec()),
@@ -294,22 +316,46 @@ mod tests {
 
     #[test]
     fn no_is_the_default_and_closed_input_never_grants_trust() {
-        assert_eq!(ask_with("\n").0, TrustGateChoice::Exit);
-        assert_eq!(ask_with("").0, TrustGateChoice::Exit);
-        assert_eq!(ask_with("1\n").0, TrustGateChoice::Exit);
+        // Enter and "1" are an explicit No.
         assert_eq!(
-            ask_with("garbage\ngarbage\ngarbage\n2\n").0,
-            TrustGateChoice::Exit
+            ask_with(
+                "
+"
+            )
+            .0,
+            Some(TrustGateChoice::Exit)
+        );
+        assert_eq!(
+            ask_with(
+                "1
+"
+            )
+            .0,
+            Some(TrustGateChoice::Exit)
+        );
+        // Closed input and three bad answers are no answer at all: never
+        // Trust, and nothing for the caller to save.
+        assert_eq!(ask_with("").0, None);
+        assert_eq!(
+            ask_with(
+                "garbage
+garbage
+garbage
+2
+"
+            )
+            .0,
+            None
         );
     }
 
     #[test]
     fn yes_needs_an_explicit_answer() {
         for yes in ["2\n", "y\n", "Y\n", "yes\n", " Yes \n"] {
-            assert_eq!(ask_with(yes).0, TrustGateChoice::Trust, "{yes:?}");
+            assert_eq!(ask_with(yes).0, Some(TrustGateChoice::Trust), "{yes:?}");
         }
         // A bad answer re-asks instead of guessing.
-        assert_eq!(ask_with("maybe\n2\n").0, TrustGateChoice::Trust);
+        assert_eq!(ask_with("maybe\n2\n").0, Some(TrustGateChoice::Trust));
     }
 
     #[test]

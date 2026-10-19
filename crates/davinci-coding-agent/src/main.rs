@@ -638,6 +638,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         &cwd,
         parsed.project_trust_override,
         gate_mode,
+        parsed.mode == Some(Mode::Json),
     ) {
         return Ok(code);
     }
@@ -9827,6 +9828,14 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         parsed.project_trust_override,
     );
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    if !trusted {
+        // Trust withdrawn (or never given): the project's MCP servers must not
+        // keep running just because they connected before the decision.
+        let names = mcp::project_server_names(&agent.cwd);
+        if !names.is_empty() && agent.tool_context.mcp.disconnect(&names) > 0 {
+            agent.refresh_mcp();
+        }
+    }
     let plugins = davinci_coding_agent::plugins::active(&default_agent_dir());
     // What `run_nested_subagent` resolves, in the same precedence, so the
     // `agent` tool schema names every profile a call can start.
