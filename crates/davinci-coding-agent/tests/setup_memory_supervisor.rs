@@ -916,3 +916,161 @@ fn an_interrupted_download_is_reported_not_silently_restarted() {
         "nothing is running, so there is nothing to cancel"
     );
 }
+
+// ---- Task 6: restart recovery and deduplicated notices ----------------------
+
+use davinci_coding_agent::native_extensions::service_notifications::{
+    backoff_delay, recovery_round, recovery_wanted, IncidentTracker, NoticeKind, RecoveryState,
+    COOLDOWN,
+};
+
+/// Fails to start `fail_first` times, then works.
+struct FlakyLauncher {
+    inner: FakeLauncher,
+    fail_first: usize,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl OllamaLauncher for FlakyLauncher {
+    fn find(&self) -> Option<PathBuf> {
+        self.inner.find()
+    }
+    fn version(&self, program: &Path) -> Option<String> {
+        self.inner.version(program)
+    }
+    fn spawn(&self, program: &Path, agent_dir: &Path) -> Result<Box<dyn OwnedProcess>, String> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt < self.fail_first {
+            return Err("the process exited immediately".into());
+        }
+        self.inner.spawn(program, agent_dir)
+    }
+}
+
+#[test]
+fn backoff_is_one_two_four_then_the_cooldown() {
+    let seconds: Vec<u64> = (1..=6).map(|n| backoff_delay(n).as_secs()).collect();
+    assert_eq!(seconds, [1, 2, 4, 120, 120, 120]);
+    assert_eq!(backoff_delay(4), COOLDOWN);
+}
+
+#[test]
+fn cold_relaunch_restores_ollama_and_deduplicates_alerts() {
+    let machine = Machine::new();
+    machine.consent();
+    machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+    assert!(recovery_wanted(machine.agent.path()));
+
+    // A record written before the "reboot". Ollama is down, so search can
+    // only use keywords, and it still finds the record.
+    let project = tempfile::tempdir().unwrap();
+    let mut memory = memory_in(project.path());
+    learn(
+        &mut memory,
+        "We decided to use the tokio runtime everywhere.",
+    )
+    .unwrap();
+    let hits = memory.search("tokio runtime", 3);
+    assert!(
+        !hits.is_empty(),
+        "keyword search found nothing while Ollama is down"
+    );
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let launcher = FlakyLauncher {
+        inner: FakeLauncher::new(&machine.url, "/usr/bin/ollama", "ollama version 0.5.0"),
+        fail_first: 3,
+        attempts: Arc::clone(&attempts),
+    };
+    let supervisor = ManagedServiceSupervisor::new(Box::new(launcher));
+    let mut state = RecoveryState::default();
+    let dir = machine.agent.path();
+
+    // Three failed starts: one incident notice, then silence; the waits are
+    // 1s, 2s, 4s.
+    let first = recovery_round(&mut state, &supervisor, dir);
+    assert_eq!(first.health.state, HealthState::Failed);
+    assert_eq!(
+        first.notice.as_ref().map(|n| n.kind.clone()),
+        Some(NoticeKind::Incident)
+    );
+    assert_eq!(first.retry_in.map(|d| d.as_secs()), Some(1));
+    let second = recovery_round(&mut state, &supervisor, dir);
+    assert!(
+        second.notice.is_none(),
+        "the same failure was announced twice"
+    );
+    assert_eq!(second.retry_in.map(|d| d.as_secs()), Some(2));
+    let third = recovery_round(&mut state, &supervisor, dir);
+    assert!(third.notice.is_none());
+    assert_eq!(third.retry_in.map(|d| d.as_secs()), Some(4));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    // The fourth attempt works: Ollama is back, announced exactly once.
+    let fourth = recovery_round(&mut state, &supervisor, dir);
+    assert_eq!(fourth.health.state, HealthState::Ready);
+    assert_eq!(
+        fourth.notice.as_ref().map(|n| n.kind.clone()),
+        Some(NoticeKind::Recovered)
+    );
+    assert_eq!(fourth.retry_in, None);
+    let after = recovery_round(&mut state, &supervisor, dir);
+    assert!(after.notice.is_none(), "recovery announced twice");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        4,
+        "started again although it was healthy"
+    );
+
+    // Once the failures reach the cooldown, the wait stays at 120s.
+    let mut state = RecoveryState::default();
+    state.failures = 3;
+    assert_eq!(backoff_delay(state.failures + 1), COOLDOWN);
+}
+
+#[test]
+fn a_different_failure_is_announced_again_but_a_repeat_is_not() {
+    use davinci_coding_agent::native_extensions::setup_health::ComponentHealth;
+    let mut tracker = IncidentTracker::default();
+    let failed = ComponentHealth::new("ollama", HealthState::Failed, "did not come up")
+        .with_code("SERVICE_START_FAILED");
+    assert!(tracker.observe(&failed).is_some());
+    assert!(tracker.observe(&failed).is_none());
+    let needs_user = ComponentHealth::new("ollama", HealthState::ActionRequired, "no consent")
+        .with_code("CONSENT_REQUIRED");
+    assert!(tracker.observe(&needs_user).is_some());
+    // Checking or starting in between neither announces nor clears.
+    assert!(tracker
+        .observe(&ComponentHealth::new(
+            "ollama",
+            HealthState::Starting,
+            "starting"
+        ))
+        .is_none());
+    assert!(tracker.open_incident().is_some());
+    let ready = ComponentHealth::new("ollama", HealthState::Ready, "answers");
+    assert_eq!(
+        tracker.observe(&ready).map(|n| n.kind),
+        Some(NoticeKind::Recovered)
+    );
+    assert!(tracker.observe(&ready).is_none());
+}
+
+#[test]
+fn recovery_is_not_wanted_until_the_user_set_it_up_and_never_when_disabled() {
+    // Nothing approved: no thread, no probe, no notice.
+    let machine = Machine::new();
+    assert!(!recovery_wanted(machine.agent.path()));
+    machine.consent();
+    assert!(
+        !recovery_wanted(machine.agent.path()),
+        "no approved executable yet"
+    );
+    machine.approve("/usr/bin/ollama", "ollama version 0.5.0");
+    assert!(recovery_wanted(machine.agent.path()));
+    // Switched off: silent again, however much else is in place.
+    let mut profile = SetupProfile::load(machine.agent.path()).0;
+    profile.memory.enabled = Some(false);
+    profile.save(machine.agent.path()).unwrap();
+    assert!(!recovery_wanted(machine.agent.path()));
+}

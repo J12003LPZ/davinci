@@ -17,6 +17,7 @@ pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
 pub mod service_authority;
+pub mod service_notifications;
 pub mod service_supervisor;
 pub mod setup;
 pub mod setup_actions;
