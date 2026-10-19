@@ -56,6 +56,9 @@ pub fn handle_package_command_in(
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
+            if local {
+                ensure_project_trusted_for_packages(agent_dir, cwd, &settings)?;
+            }
             let normalized = match parse_package_source(&source) {
                 ParsedSource::Local(path) => normalize_local_source(&path, cwd)?,
                 _ => source.clone(),
@@ -1268,6 +1271,26 @@ mod tests {
         )
         .unwrap();
         project
+    }
+
+    #[test]
+    fn project_scoped_remove_needs_a_trusted_project() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let project = project_with_packages(dir.path());
+        let settings = project.join(".pi").join("settings.json");
+        let before = fs::read_to_string(&settings).unwrap();
+        let args = vec!["-l".to_string(), "npm:project-owned".to_string()];
+
+        // The real entry point, as `davinci remove -l <pkg>` reaches it.
+        let error = handle_package_command_in("remove", &args, &agent, &project).unwrap_err();
+        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            before,
+            "an untrusted project's settings were rewritten"
+        );
     }
 
     #[test]

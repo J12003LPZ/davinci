@@ -69,18 +69,10 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool, sandbox_active: bool) -
     };
     let mut project = load_layer(&path);
     resolve_origin(&mut project, true, sandbox_active);
+    for server in project.mcp_servers.values_mut() {
+        server.project_origin = true;
+    }
     davinci_mcp::merge(user, project)
-}
-
-/// Names of the servers the project's own `mcp.json` configures, trusted or
-/// not. Used to stop exactly those when trust is withdrawn mid-session.
-pub fn project_server_names(cwd: &Path) -> Vec<String> {
-    let Some(path) = crate::project_config::resolve(cwd, "mcp.json") else {
-        return Vec::new();
-    };
-    davinci_mcp::load_path(&path)
-        .map(|config| config.mcp_servers.keys().cloned().collect())
-        .unwrap_or_default()
 }
 
 /// Raw stdio owns only its direct child. Reconnecting cannot prove that its

@@ -3255,11 +3255,15 @@ fn complete_prompt_with_host(
     )));
 
     let pre_hooks = user_hooks.clone();
+    let pre_cwd = agent.cwd.clone();
+    let pre_agent_dir = default_agent_dir();
     let pre_plugin_hooks = plugin_hooks.clone();
     let pre_plugin_base = plugin_hook_base.clone();
     agent.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, args| {
         if std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
-            if let Some(reason) = hooks::run_pre_tool(&pre_hooks, name, args) {
+            if let Some(reason) =
+                hooks::run_pre_tool_live(&pre_hooks, &pre_cwd, &pre_agent_dir, name, args)
+            {
                 return Some(reason);
             }
         }
@@ -7016,6 +7020,16 @@ fn apply_session_action(
         }
         SessionAction::SelectTrust { trusted, updates } => {
             apply_trust_decision(session, trusted, &updates)?;
+            // A denial takes effect now, through the same path /reload uses.
+            let settings = load_merged_settings_with_override(
+                &default_agent_dir(),
+                &agent.cwd,
+                parsed.project_trust_override,
+            );
+            let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+            if project_mcp_withdrawn(parsed, &agent.cwd, trusted) {
+                stop_project_mcp_servers(agent);
+            }
             Ok(true)
         }
         SessionAction::SelectThinking(level) => apply_thinking_level(agent, session, &level, false),
@@ -9822,6 +9836,31 @@ fn run_plugin_completion_hooks(
     result.block
 }
 
+/// Stop the MCP servers that came from the project's own `mcp.json`, judged
+/// by the origin recorded when they connected (not by re-reading the file, so
+/// a renamed or broken file changes nothing). A user or plugin server with the
+/// same name is left alone. Shared by `/reload` and `/trust`.
+fn stop_project_mcp_servers(agent: &mut Agent) {
+    if agent.tool_context.mcp.disconnect_project() > 0 {
+        agent.refresh_mcp();
+    }
+}
+
+/// Whether project MCP servers must not keep running: the folder is not
+/// trusted, or a "Do not trust" is stored (or the store cannot be read) even
+/// though the folder no longer shows any resource that would need trust, for
+/// example after its `mcp.json` was renamed away while the server ran.
+fn project_mcp_withdrawn(parsed: &Args, cwd: &Path, trusted: bool) -> bool {
+    if parsed.project_trust_override == Some(true) {
+        return false;
+    }
+    !trusted
+        || !matches!(
+            ProjectTrustStore::open(&default_agent_dir()).try_get(cwd),
+            Ok(None) | Ok(Some(true))
+        )
+}
+
 fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
@@ -9829,13 +9868,10 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         parsed.project_trust_override,
     );
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
-    if !trusted {
+    if project_mcp_withdrawn(parsed, &agent.cwd, trusted) {
         // Trust withdrawn (or never given): the project's MCP servers must not
         // keep running just because they connected before the decision.
-        let names = mcp::project_server_names(&agent.cwd);
-        if !names.is_empty() && agent.tool_context.mcp.disconnect(&names) > 0 {
-            agent.refresh_mcp();
-        }
+        stop_project_mcp_servers(agent);
     }
     let plugins = davinci_coding_agent::plugins::active(&default_agent_dir());
     // What `run_nested_subagent` resolves, in the same precedence, so the

@@ -9,6 +9,7 @@
 - A trusted project's `permissions.mode` can tighten the approval mode but no longer loosen it past the mode in your own settings (warning at startup, row in `/permissions`). `/setup` ignores relative `PATH` entries when looking for `ollama`.
 
 ### Fixed
+- Withdrawing project trust stops the project's MCP servers by origin: `/trust` "Do not trust" stops them at once and `/reload` does the same, even if `mcp.json` was renamed or broken. A user or plugin server with the same name is never stopped. `remove -l` needs a trusted project like `install -l`. Project hooks check trust live on the legacy hook path too. "Trust parent folder" is not offered when the home directory is unknown.
 - "Trust parent folder" no longer erases a folder's saved "Do not trust". `/setup` shows an unreadable trust store's error instead of "not trusted".
 
 ### Changed

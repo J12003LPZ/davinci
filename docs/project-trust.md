@@ -34,7 +34,7 @@ Trusting only lets DaVinci load it. Tool approvals and the sandbox stay on.
   (`/trust`, or `trustedProjects`), and DaVinci opens. A stored grant or
   `--approve` still wins.
 - "Trust parent folder" is not offered when the parent is a drive or filesystem
-  root or your home directory.
+  root or your home directory, or when the home directory cannot be determined.
 - A stored decision is never asked again. A stored denial keeps the project's
   resources unloaded on later launches (DaVinci still opens, without them);
   `/trust` and `/setup trust` change the decision.
@@ -71,7 +71,7 @@ stable code `UNTRUSTED_PROJECT`:
 ## Packages and graph verification
 
 `davinci update` skips an untrusted project's packages and says so with the same
-code. `davinci install -l` refuses an untrusted project. A graph run in an
+code. `davinci install -l` and `davinci remove -l` refuse an untrusted project. A graph run in an
 untrusted project gets no `verifyCommands` and no commands inferred from
 `Cargo.toml` or `package.json`.
 
@@ -80,8 +80,13 @@ untrusted project gets no `verifyCommands` and no commands inferred from
 `/trust` writes the same store. `/reload` re-reads it: project skills, prompts,
 agent profiles and context files load or drop at once, per working directory,
 so nothing from a previous project root or a revoked grant stays. After a
-denial, `/reload` also stops the project's MCP servers, and project hooks read
-the store on every run, so a denied project's hooks do not fire. Extensions and
+denial, `/trust` stops the project's MCP servers at once and `/reload` does the
+same. Which servers are the project's is recorded when they connect (their
+origin), not read back from `mcp.json`, so a renamed or broken file still
+stops them, and a user or plugin server with the same name is never touched.
+Project hooks read the store on every run, on the legacy hook path
+(`DAVINCI_RUNTIME_HOOKS_V2=0`) as well, so a denied project's hooks do not
+fire. Extensions and
 permission rules are built once at startup; restart DaVinci for those. Granting
 trust mid-session loads skills and prompts at `/reload`; restart for the rest. There is no command that moves a running session to another
 project root.

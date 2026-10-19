@@ -356,13 +356,14 @@ pub fn get_project_trust_parent_path(cwd: &Path) -> Option<String> {
     // A grant on a drive root, or on the home directory or anything above it,
     // would trust every unrelated project underneath. Offer no such option.
     parent.parent()?;
-    if let Some(home) = davinci_session::home_dir().filter(|home| !home.as_os_str().is_empty()) {
-        let home = comparable_path(&canonicalize_trust_path(&home));
-        let candidate = comparable_path(&parent.to_string_lossy());
-        let sep = if cfg!(windows) { '\\' } else { '/' };
-        if home == candidate || home.starts_with(&format!("{candidate}{sep}")) {
-            return None;
-        }
+    // Without a known home directory the floor cannot be checked: offer
+    // nothing rather than a grant that might cover it.
+    let home = davinci_session::home_dir().filter(|home| !home.as_os_str().is_empty())?;
+    let home = comparable_path(&canonicalize_trust_path(&home));
+    let candidate = comparable_path(&parent.to_string_lossy());
+    let sep = if cfg!(windows) { '\\' } else { '/' };
+    if home == candidate || home.starts_with(&format!("{candidate}{sep}")) {
+        return None;
     }
     Some(parent.to_string_lossy().into_owned())
 }
@@ -431,7 +432,7 @@ pub fn trust_effect_note(trusted: bool) -> &'static str {
     if trusted {
         "/reload loads its skills and prompts now. Restart DaVinci to connect its MCP servers and load its hooks, extensions and permission rules."
     } else {
-        "Its hooks stop now. /reload drops its skills and prompts and stops its MCP servers. Restart DaVinci to drop its extensions and permission rules."
+        "Its hooks and MCP servers stop now. /reload drops its skills and prompts. Restart DaVinci to drop its extensions and permission rules."
     }
 }
 
@@ -1018,7 +1019,7 @@ mod tests {
         let text = describe_saved_choice(&agent, &child, "Trust parent folder", true, true);
         assert!(text.contains("keeps its own saved Do not trust"), "{text}");
         let text = describe_saved_choice(&agent, &child, "Do not trust", false, true);
-        assert!(text.contains("stops its MCP servers"), "{text}");
+        assert!(text.contains("MCP servers stop now"), "{text}");
         fs::create_dir_all(&agent).unwrap();
         fs::write(agent.join("trust.json"), "{ nope").unwrap();
         assert!(

@@ -3722,11 +3722,103 @@ fn revoking_trust_and_reloading_stops_the_projects_mcp_servers() {
     apply_discovered_resources(&Args::default(), &mut agent);
     assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__planted__ping"]);
 
-    // "Do not trust", then /reload: the server is gone, not merely hidden.
+    // "Do not trust", then /reload: the server is gone, not merely hidden,
+    // even though the file that configured it has been renamed away.
+    std::fs::rename(
+        project.join(".pi").join("mcp.json"),
+        project.join(".pi").join("mcp.json.gone"),
+    )
+    .unwrap();
     store.set(&project, Some(false)).unwrap();
     apply_discovered_resources(&Args::default(), &mut agent);
     assert!(agent.tool_context.mcp.tool_names().is_empty());
     assert!(agent.tool_context.mcp.rows().is_empty());
+}
+
+fn project_and_user_mcp_fixture(
+    dir: &std::path::Path,
+    agent_dir: &std::path::Path,
+) -> (std::path::PathBuf, Agent) {
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    std::fs::create_dir_all(agent_dir).unwrap();
+    let fixture = dir.join("server.json");
+    std::fs::write(
+        &fixture,
+        r#"{"initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+            "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}}"#,
+    )
+    .unwrap();
+    let entry = |name: &str| {
+        serde_json::json!({"mcpServers": {name: {"url": format!("fixture:{}", fixture.display())}}})
+            .to_string()
+    };
+    // The user and the project both name a server "shared"; the project also
+    // has its own "planted".
+    std::fs::write(agent_dir.join("mcp.json"), entry("shared")).unwrap();
+    let both = serde_json::json!({"mcpServers": {
+        "shared": {"url": format!("fixture:{}", fixture.display())},
+        "planted": {"url": format!("fixture:{}", fixture.display())}}});
+    std::fs::write(project.join(".pi").join("mcp.json"), both.to_string()).unwrap();
+    let mut agent = Agent::new("x");
+    agent.cwd = project.clone();
+    (project, agent)
+}
+
+#[test]
+fn a_user_mcp_server_named_like_a_project_entry_survives_a_denial() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _a = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _b = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let (project, mut agent) = project_and_user_mcp_fixture(dir.path(), &agent_dir);
+
+    // Untrusted at startup: only the user's "shared" connects.
+    let config = mcp::load(&agent_dir, &project, false, false);
+    agent.attach_mcp(davinci_agent::McpRegistry::connect(&config, &project));
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__shared__ping"]);
+    ProjectTrustStore::open(&agent_dir)
+        .set(&project, Some(false))
+        .unwrap();
+    apply_discovered_resources(&Args::default(), &mut agent);
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__shared__ping"]);
+}
+
+#[test]
+fn trust_deny_stops_project_mcp_servers_at_once() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _a = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _b = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let (project, mut agent) = project_and_user_mcp_fixture(dir.path(), &agent_dir);
+    ProjectTrustStore::open(&agent_dir)
+        .set(&project, Some(true))
+        .unwrap();
+    let config = mcp::load(&agent_dir, &project, true, false);
+    agent.attach_mcp(davinci_agent::McpRegistry::connect(&config, &project));
+    assert_eq!(
+        agent.tool_context.mcp.tool_names(),
+        ["mcp__planted__ping", "mcp__shared__ping"]
+    );
+
+    // The /trust "Do not trust" action, no /reload afterwards.
+    let (parsed, _, mut session) = test_session();
+    let action = SessionAction::SelectTrust {
+        trusted: false,
+        updates: vec![TrustUpdate {
+            path: project.to_string_lossy().into_owned(),
+            decision: Some(false),
+        }],
+    };
+    apply_session_action(&parsed, &mut agent, &mut session, action, None).unwrap();
+    assert!(agent.tool_context.mcp.tool_names().is_empty());
+    assert!(session.chrome.status.contains("MCP servers stop now"));
 }
 
 #[test]

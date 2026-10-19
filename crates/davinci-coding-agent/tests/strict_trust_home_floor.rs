@@ -46,6 +46,32 @@ fn trust_parent_is_not_offered_at_home_a_root_or_above() {
 }
 
 #[test]
+fn trust_parent_is_not_offered_when_the_home_directory_is_unknown() {
+    let _turn = HOME.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let project = fs::canonicalize(root.path())
+        .unwrap()
+        .join("a")
+        .join("repo");
+    fs::create_dir_all(&project).unwrap();
+    let saved = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+    std::env::remove_var("HOME");
+    std::env::remove_var("USERPROFILE");
+    let parent = get_project_trust_parent_path(&project);
+    let offered = get_project_trust_options(&project, false)
+        .iter()
+        .any(|option| option.label.starts_with("Trust parent folder"));
+    for (key, value) in [("HOME", saved.0), ("USERPROFILE", saved.1)] {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert_eq!(parent, None);
+    assert!(!offered);
+}
+
+#[test]
 fn the_project_search_stops_at_the_home_directory() {
     let _turn = HOME.lock().unwrap_or_else(|e| e.into_inner());
     let root = tempfile::tempdir().unwrap();

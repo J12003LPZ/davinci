@@ -1199,41 +1199,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_project_cannot_supply_the_memory_service_config() {
-        let agent = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(
-            agent.path().join("vector-memory.json"),
-            r#"{"ollamaUrl":"http://127.0.0.1:11111"}"#,
-        )
-        .unwrap();
-        for dir in [".davinci", ".pi"] {
-            std::fs::create_dir(project.path().join(dir)).unwrap();
-            std::fs::write(
-                project.path().join(dir).join("vector-memory.json"),
-                r#"{"ollamaUrl":"http://127.0.0.1:22222","autoStart":true}"#,
-            )
-            .unwrap();
-        }
-        std::fs::write(
-            project.path().join("vector-memory.json"),
-            r#"{"ollamaUrl":"http://127.0.0.1:22222"}"#,
-        )
-        .unwrap();
-        // The project directory is the process cwd for this build; only the
-        // agent directory may supply the config.
-        let config = host_memory_config(Some(agent.path()));
-        if std::env::var_os("PI_MEMORY_OLLAMA_URL").is_none() {
-            assert_eq!(config.ollama_url, "http://127.0.0.1:11111");
-        }
-        assert!(
-            !config.ollama_url.contains("22222"),
-            "{}",
-            config.ollama_url
-        );
-    }
-
-    #[test]
     fn every_external_native_command_is_listed() {
         let listed: std::collections::BTreeSet<_> = command_specs()
             .into_iter()

@@ -531,6 +531,24 @@ pub fn run_pre_tool(hooks: &HooksFile, tool: &str, args: &Value) -> Option<Strin
     None
 }
 
+/// [`run_pre_tool`] for the legacy hook path (`DAVINCI_RUNTIME_HOOKS_V2=0`),
+/// with the same live trust and integrity check the v2 path makes on every
+/// run: project hooks do not run once the folder is denied or the store cannot
+/// be read.
+pub fn run_pre_tool_live(
+    hooks: &HooksFile,
+    cwd: &Path,
+    agent_dir: &Path,
+    tool: &str,
+    args: &Value,
+) -> Option<String> {
+    if let Err(error) = hooks.validate_trust_and_integrity(cwd, agent_dir) {
+        eprintln!("[davinci-hooks] preTool: {error}");
+        return None;
+    }
+    run_pre_tool(hooks, tool, args)
+}
+
 pub fn run_post_tool(hooks: &HooksFile, tool: &str, args: &Value, result: &str) {
     for argv in &hooks.post_tool {
         let _ = run_one(argv, "postTool", tool, args, Some(result));
@@ -1616,6 +1634,46 @@ mod tests {
             .validate_trust_and_integrity(&project, &agent)
             .unwrap_err();
         assert!(error.contains("cannot be confirmed"), "{error}");
+    }
+
+    #[test]
+    fn legacy_pre_tool_hooks_check_trust_live() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("PI_HOOKS_CONFIG");
+        std::env::remove_var("PI_HOOKS_DRY_RUN");
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("proj");
+        let capture = dir.path().join("seen.json");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            project.join(".pi").join("hooks.json"),
+            serde_json::json!({ "preTool": [shell_hook(3, &capture)] }).to_string(),
+        )
+        .unwrap();
+        let store = crate::trust::ProjectTrustStore::open(&agent);
+        store.set(&project, Some(true)).unwrap();
+        let hooks = load(&agent, &project, true);
+        let args = serde_json::json!({ "path": "a.md" });
+
+        // Trusted: the project hook runs and blocks.
+        let reason = run_pre_tool_live(&hooks, &project, &agent, "write", &args);
+        assert!(reason.is_some_and(|r| r.contains("blocked write")));
+        assert!(capture.exists());
+
+        // Denied after load: the hook must not run again.
+        std::fs::remove_file(&capture).unwrap();
+        store.set(&project, Some(false)).unwrap();
+        assert!(run_pre_tool_live(&hooks, &project, &agent, "write", &args).is_none());
+        assert!(!capture.exists(), "a denied project's hook ran");
+
+        // An unreadable store is not a grant.
+        std::fs::write(agent.join("trust.json"), "{ not json").unwrap();
+        assert!(run_pre_tool_live(&hooks, &project, &agent, "write", &args).is_none());
+        assert!(!capture.exists());
     }
 
     #[test]
