@@ -37,7 +37,7 @@ pub fn redact_credentials(text: &str) -> String {
     static BARE: OnceLock<regex::Regex> = OnceLock::new();
     let keyed = KEYED.get_or_init(|| {
         regex::Regex::new(
-            r#"(?i)\b(authorization|api[_-]?key|token|secret|password)\b\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\s,"}'&]+"#,
+            r#"(?i)(["']?)([A-Za-z0-9_-]*(?:authorization|api[_-]?key|token|secret|password))(["']?)\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:(?:bearer|basic)\s+)?[^\s,"}'&]+)"#,
         )
         .expect("static credential pattern")
     });
@@ -47,7 +47,7 @@ pub fn redact_credentials(text: &str) -> String {
         )
         .expect("static token pattern")
     });
-    let text = keyed.replace_all(text, "$1=[REDACTED]");
+    let text = keyed.replace_all(text, "$1$2$3=[REDACTED]");
     bare.replace_all(&text, "[REDACTED]").into_owned()
 }
 
@@ -355,6 +355,36 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
         let target = AuthStorage::open(&clean_agent_dir.join("auth.json")).unwrap();
         assert!(target.get("selected").is_some());
         assert!(target.get("unselected").is_none());
+    }
+
+    #[test]
+    fn redaction_covers_prefixed_env_keys_json_keys_and_bearer() {
+        for (input, secret) in [
+            ("OPENAI_API_KEY=fakevalue-0123 run", "fakevalue-0123"),
+            ("export GITHUB_TOKEN=fakevalue-4567", "fakevalue-4567"),
+            (r#"{"token": "abc-fake-1"}"#, "abc-fake-1"),
+            (r#"{"client_secret":"abc fake 2"}"#, "abc fake 2"),
+            (r#"{"password": 'pw fake 3'}"#, "pw fake 3"),
+            ("Authorization: Bearer fakebearer4 ok", "fakebearer4"),
+            (r#"{"Authorization": "Bearer fakebearer5"}"#, "fakebearer5"),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_non_secret_text_unchanged() {
+        for input in [
+            "tokenizer: x",
+            "max_tokens: 5",
+            r#"{"input_tokens": 900, "output_tokens": 3}"#,
+            "secretary: Jo",
+            "the password policy was reviewed",
+        ] {
+            assert_eq!(redact_credentials(input), input);
+        }
     }
 
     #[test]
