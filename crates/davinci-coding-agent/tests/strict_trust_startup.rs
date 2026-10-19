@@ -637,6 +637,18 @@ mod headless {
                 )
             });
         assert_eq!(event["type"], "project_trust");
+        // The session header stays the first stdout line; the event follows.
+        let lines: Vec<serde_json::Value> = run
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(lines[0]["kind"], "header", "{}", run.describe());
+        let at = lines
+            .iter()
+            .position(|value| value["type"] == "project_trust")
+            .unwrap();
+        assert!(at > 0, "event came before the header: {}", run.describe());
         assert!(event["message"]
             .as_str()
             .unwrap()

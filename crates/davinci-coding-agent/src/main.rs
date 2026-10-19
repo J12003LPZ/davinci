@@ -4139,6 +4139,7 @@ fn run_print_turns(
         if let Some(session) = &agent.session {
             print!("{}", encode_header(&session.header));
         }
+        trust_gate::flush_pending_json_event();
         write_prompt_manifest_json_event(agent)?;
     }
     let mut approval_required = None;

@@ -203,6 +203,18 @@ pub fn headless_trust_report(
     (trusted, diagnostic)
 }
 
+/// The `project_trust` stdout event of a `--mode json` launch, held until the
+/// session header has been written.
+static PENDING_JSON_EVENT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Write the held `project_trust` event, if any. Call right after the header.
+pub fn flush_pending_json_event() {
+    let event = PENDING_JSON_EVENT.lock().unwrap().take();
+    if let Some(event) = event {
+        let _ = crate::output::write_raw_stdout_line(&event);
+    }
+}
+
 /// Decide before anything project-controlled loads. `trust_override` is the
 /// `--approve` / `--no-approve` flag; everything else comes from the trust
 /// store and the global settings, never from the project.
@@ -225,7 +237,9 @@ pub fn enforce_startup_trust(
                     // `--mode json` clients read stdout events, not stderr.
                     let mut event = diagnostic.to_json();
                     event["type"] = "project_trust".into();
-                    let _ = crate::output::write_raw_stdout_line(&event.to_string());
+                    // The session header must stay the first stdout line, so
+                    // the event waits for `flush_pending_json_event`.
+                    *PENDING_JSON_EVENT.lock().unwrap() = Some(event.to_string());
                 }
             }
         }
