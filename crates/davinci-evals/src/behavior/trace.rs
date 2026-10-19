@@ -140,58 +140,197 @@ impl From<BehaviorStatsWire> for BehaviorStats {
     }
 }
 
+/// Class of a shell command: `dev_server`, `test`, `build`, `lint`, `git`
+/// (read-only git), `search` (read-only file readers and finders) or `other`.
+/// `other` is also what every command we cannot prove harmless is: the
+/// staleness rule treats it as a possible edit. Classification is by program
+/// and subcommand, never by substring, so `cat tests/data.txt` is not a test.
 pub fn classify_shell_command(command: &str) -> &'static str {
-    let trimmed = command.trim();
-    let lower = trimmed.to_lowercase();
-    let first_word = lower.split_whitespace().next().unwrap_or("");
-
-    if lower.starts_with("npm run dev")
-        || lower.starts_with("npm start")
-        || lower.starts_with("pnpm dev")
-        || lower.starts_with("yarn dev")
-        || lower.starts_with("vite")
-        || lower.starts_with("next dev")
-        || lower.starts_with("cargo run")
-    {
-        "dev_server"
-    } else if lower.contains("test")
-        || lower.starts_with("pytest")
-        || lower.starts_with("cargo test")
-        || lower.starts_with("npm test")
-        || lower.starts_with("vitest")
-        || lower.starts_with("jest")
-        || lower.starts_with("ctest")
-    {
-        "test"
-    } else if lower.starts_with("cargo build")
-        || lower.starts_with("npm run build")
-        || lower.starts_with("make")
-        || lower.starts_with("cargo check")
-        || lower.starts_with("rustc")
-        || lower.starts_with("gcc")
-        || lower.starts_with("clang")
-    {
-        "build"
-    } else if lower.starts_with("cargo clippy")
-        || lower.starts_with("eslint")
-        || lower.starts_with("tsc")
-        || lower.starts_with("flake8")
-        || lower.starts_with("ruff")
-        || lower.starts_with("mypy")
-    {
-        "lint"
-    } else if first_word == "git" {
-        "git"
-    } else if first_word == "grep"
-        || first_word == "rg"
-        || first_word == "find"
-        || first_word == "ls"
-        || first_word == "dir"
-    {
-        "search"
-    } else {
-        "other"
+    let lower = command.trim().to_lowercase();
+    let mut classes: Vec<&'static str> = Vec::new();
+    for segment in split_segments(&lower) {
+        match classify_segment(&segment) {
+            "neutral" => {}
+            class => classes.push(class),
+        }
     }
+    let is_check = |class: &&str| matches!(*class, "test" | "build" | "lint");
+    let is_read_only = |class: &&str| matches!(*class, "git" | "search");
+    if classes.is_empty() {
+        return "other";
+    }
+    if classes.contains(&"dev_server") {
+        return if classes
+            .iter()
+            .all(|c| *c == "dev_server" || is_read_only(c))
+        {
+            "dev_server"
+        } else {
+            "other"
+        };
+    }
+    // Read-only segments (`| tail`, `git diff`) do not change what a check is.
+    let rest: Vec<&'static str> = classes
+        .iter()
+        .copied()
+        .filter(|c| !is_read_only(c))
+        .collect();
+    if rest.is_empty() {
+        return classes[0];
+    }
+    if rest.iter().all(is_check) {
+        for class in ["test", "build", "lint"] {
+            if rest.contains(&class) {
+                return class;
+            }
+        }
+    }
+    "other"
+}
+
+/// Split on `&&`, `||`, `;`, `|` and newlines. A segment that redirects output
+/// to a file is not read-only whatever its program: it is marked with a `>` so
+/// `classify_segment` can refuse it (a `2>&1` merge does not write a file).
+fn split_segments(command: &str) -> Vec<String> {
+    let cleaned = command.replace("2>&1", " ").replace("1>&2", " ");
+    cleaned
+        .split(['\n', ';', '|', '&'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|segment| {
+            // Command substitution can run anything.
+            if segment.contains("$(") || segment.contains('`') {
+                format!("{segment} >")
+            } else {
+                segment
+            }
+        })
+        .collect()
+}
+
+fn classify_segment(segment: &str) -> &'static str {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let Some(first) = tokens.first() else {
+        return "neutral";
+    };
+    let program = first
+        .trim_matches(['"', '\''])
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd");
+    let args = &tokens[1..];
+    // A redirect writes a file, unless the program is a check we only observe.
+    let redirects = segment.contains('>');
+    let arg_is = |index: usize, name: &str| args.get(index).is_some_and(|arg| *arg == name);
+    let class = match program {
+        "cd" | "pushd" | "popd" | "set-location" | "sl" => return "neutral",
+        "vite" => "dev_server",
+        "next" if arg_is(0, "dev") => "dev_server",
+        "npm" | "pnpm" | "yarn" | "bun" => match args {
+            [first, ..] if matches!(*first, "dev" | "start") => "dev_server",
+            [run, name, ..] if *run == "run" && *name == "dev" => "dev_server",
+            [first, ..] if matches!(*first, "test" | "t") => "test",
+            [run, name, ..] if *run == "run" && matches!(*name, "test" | "test:unit") => "test",
+            [run, name, ..] if *run == "run" && *name == "build" => "build",
+            [first, ..] if *first == "build" => "build",
+            _ => "other",
+        },
+        "cargo" => {
+            let sub = args
+                .iter()
+                .find(|arg| !arg.starts_with('+') && !arg.starts_with('-'))
+                .copied();
+            match sub {
+                Some("test") | Some("nextest") => "test",
+                Some("run") => "dev_server",
+                Some("build") | Some("check") => "build",
+                Some("clippy") => "lint",
+                _ => "other",
+            }
+        }
+        "pytest" | "py.test" | "vitest" | "jest" | "ctest" => "test",
+        "node" if args.contains(&"--test") => "test",
+        "deno" if arg_is(0, "test") => "test",
+        // Runners that only launch another program: judge that program.
+        "npx" | "pnpx" | "bunx" | "uvx" => {
+            let launched: Vec<&str> = args
+                .iter()
+                .copied()
+                .skip_while(|arg| arg.starts_with('-'))
+                .collect();
+            return classify_segment(&launched.join(" "));
+        }
+        "uv" | "poetry" if arg_is(0, "run") => {
+            return classify_segment(&args[1..].join(" "));
+        }
+        "python" | "python3" | "py" => {
+            if arg_is(0, "-m") && matches!(args.get(1), Some(&"pytest") | Some(&"unittest")) {
+                "test"
+            } else {
+                "other"
+            }
+        }
+        "go" => match args.first() {
+            Some(&"test") => "test",
+            Some(&"build") => "build",
+            _ => "other",
+        },
+        "dotnet" => match args.first() {
+            Some(&"test") => "test",
+            Some(&"build") => "build",
+            _ => "other",
+        },
+        "make" => match args.first() {
+            Some(&"test") | Some(&"check") => "test",
+            _ => "build",
+        },
+        "rustc" | "gcc" | "clang" => "build",
+        "eslint" | "tsc" | "flake8" | "ruff" | "mypy" => "lint",
+        "git" => {
+            let mut rest = args.iter();
+            let mut sub = None;
+            while let Some(arg) = rest.next() {
+                match *arg {
+                    "-c" | "-C" => {
+                        rest.next();
+                    }
+                    flag if flag.starts_with('-') => {}
+                    name => {
+                        sub = Some(name);
+                        break;
+                    }
+                }
+            }
+            let writes_file = args.iter().any(|arg| arg.starts_with("--output"));
+            if matches!(sub, Some("status" | "diff" | "log" | "show" | "blame")) && !writes_file {
+                "git"
+            } else {
+                "other"
+            }
+        }
+        "cat" | "type" | "head" | "tail" | "wc" | "ls" | "dir" | "get-content" | "gc"
+        | "select-string" | "sls" | "get-childitem" | "gci" | "rg" | "grep" => "search",
+        "find" => {
+            let mutating = [
+                "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
+            ];
+            if args.iter().any(|arg| mutating.contains(arg)) {
+                "other"
+            } else {
+                "search"
+            }
+        }
+        _ => "other",
+    };
+    if redirects && matches!(class, "search" | "git") {
+        return "other";
+    }
+    class
 }
 
 pub fn detect_verification_claims(text: &str) -> Vec<String> {
@@ -228,9 +367,10 @@ impl BehaviorTrace {
             .iter()
             .filter(|event| match event {
                 BehaviorEvent::Edit { .. } => true,
-                BehaviorEvent::Shell { command_class, .. } => {
-                    !matches!(command_class.as_str(), "test" | "build" | "lint" | "search")
-                }
+                BehaviorEvent::Shell { command_class, .. } => !matches!(
+                    command_class.as_str(),
+                    "test" | "build" | "lint" | "search" | "git"
+                ),
                 _ => false,
             })
             .count() as u64
@@ -734,6 +874,157 @@ mod tests {
                 BehaviorEvent::FinalResponse,
             ]
         );
+    }
+
+    #[test]
+    fn classifier_uses_program_and_subcommand_not_substrings() {
+        // Reading a path that happens to contain "test" is not running tests.
+        assert_eq!(classify_shell_command("cat tests/data.txt"), "search");
+        assert_eq!(classify_shell_command("ls tests"), "search");
+        assert_eq!(classify_shell_command("git log -- test_utils.rs"), "git");
+        assert_eq!(classify_shell_command("curl http://x/test"), "other");
+        assert_eq!(classify_shell_command("echo run the tests"), "other");
+        // Real runners, by program and subcommand.
+        for command in [
+            "cargo test",
+            "cargo +nightly test --lib",
+            "cargo nextest run",
+            "pytest -q",
+            "python -m pytest tests",
+            "python3 -m unittest",
+            "npm test",
+            "npm run test",
+            "pnpm test",
+            "yarn test",
+            "go test ./...",
+            "dotnet test",
+            "make test",
+            "vitest run",
+            "jest",
+            "node --test src/login.test.ts",
+            "npx --yes vitest run",
+            "uv run pytest -q",
+            "cd crates/a && cargo test --quiet",
+            "cargo test 2>&1 | tail -20",
+            "C:\\tools\\cargo.exe test",
+        ] {
+            assert_eq!(classify_shell_command(command), "test", "{command}");
+        }
+        assert_eq!(classify_shell_command("go build ./..."), "build");
+        assert_eq!(classify_shell_command("cargo build && cargo test"), "test");
+        // A check chained after something we cannot vouch for is not a check.
+        assert_eq!(
+            classify_shell_command("sed -i s/a/b/ f && cargo test"),
+            "other"
+        );
+        assert_eq!(classify_shell_command("cargo test; rm -rf target"), "other");
+    }
+
+    #[test]
+    fn read_only_shell_calls_are_classified_read_only() {
+        for command in [
+            "git diff",
+            "git status --short",
+            "git --no-pager log -5",
+            "git -C sub show HEAD",
+            "git blame src/a.rs",
+            "cat src/a.rs",
+            "type src\\a.rs",
+            "head -20 a",
+            "tail -f a",
+            "wc -l a",
+            "ls -la",
+            "dir",
+            "Get-Content a.txt",
+            "Select-String -Path a -Pattern x",
+            "Get-ChildItem -Recurse",
+            "rg foo",
+            "grep -rn foo .",
+            "find . -name '*.rs'",
+            "git diff | wc -l",
+        ] {
+            assert!(
+                matches!(classify_shell_command(command), "git" | "search"),
+                "{command} -> {}",
+                classify_shell_command(command)
+            );
+        }
+        // Anything that can write stays a possible edit.
+        for command in [
+            "sed -i s/a/b/ f",
+            "git checkout -- f",
+            "git commit -am x",
+            "git apply p.diff",
+            "git diff --output=out.patch",
+            "find . -name '*.o' -delete",
+            "find . -exec rm {} ;",
+            "cat a > b",
+            "Get-Content a | Set-Content b",
+            "grep foo . > out",
+            "cat $(rm f)",
+            "python gen.py",
+        ] {
+            assert_eq!(classify_shell_command(command), "other", "{command}");
+        }
+    }
+
+    fn shell(command: &str) -> BehaviorEvent {
+        BehaviorEvent::Shell {
+            command_class: classify_shell_command(command).into(),
+            exit_code: Some(0),
+        }
+    }
+
+    fn passing_check(generation: u64) -> VerificationEvent {
+        VerificationEvent {
+            kind: "test".into(),
+            command: "cargo test".into(),
+            passed: true,
+            mutation_generation: Some(generation),
+        }
+    }
+
+    #[test]
+    fn read_only_shell_calls_after_a_passing_check_keep_it_verified() {
+        for reader in [
+            "git diff",
+            "Get-Content src/a.rs",
+            "cat src/a.rs",
+            "rg foo",
+            "git status",
+        ] {
+            let mut trace = BehaviorTrace::new("s", None);
+            trace.events.push(BehaviorEvent::Edit {
+                path: "a.rs".into(),
+            });
+            trace.events.push(shell("cargo test"));
+            trace
+                .verification
+                .push(passing_check(trace.mutation_count()));
+            trace.events.push(shell(reader));
+            assert!(trace.verified_after_last_mutation(None), "{reader}");
+        }
+    }
+
+    #[test]
+    fn a_possible_edit_after_a_passing_check_makes_it_stale() {
+        for writer in [
+            "sed -i s/a/b/ src/a.rs",
+            "git checkout -- src/a.rs",
+            "python gen.py",
+            "cat a > b",
+        ] {
+            let mut trace = BehaviorTrace::new("s", None);
+            trace.events.push(BehaviorEvent::Edit {
+                path: "a.rs".into(),
+            });
+            trace.events.push(shell("cargo test"));
+            trace
+                .verification
+                .push(passing_check(trace.mutation_count()));
+            trace.events.push(shell(writer));
+            assert!(!trace.verified_after_last_mutation(None), "{writer}");
+        }
     }
 
     #[test]

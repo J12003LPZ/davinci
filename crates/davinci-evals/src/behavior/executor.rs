@@ -317,7 +317,13 @@ fn unsolved_reason(disposition: RunDisposition, error: &str) -> String {
 
 fn verification_event(result: &VerificationResult, generation: u64) -> VerificationEvent {
     VerificationEvent {
-        kind: classify_shell_command(&result.command).into(),
+        // A host-run verification command is a check by construction, even
+        // when it is a script the classifier cannot name (`node check.js`).
+        kind: match classify_shell_command(&result.command) {
+            class @ ("test" | "build" | "lint") => class,
+            _ => "test",
+        }
+        .into(),
         command: result.command.clone(),
         passed: result.passed,
         mutation_generation: Some(generation),
