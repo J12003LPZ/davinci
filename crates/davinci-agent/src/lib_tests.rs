@@ -3016,6 +3016,50 @@ fn resumed_session_keeps_unverified_mutation() {
 }
 
 #[test]
+fn last_mutation_generation_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent
+        .load_from_session(JsonlSession::create(sessions.path(), "fold", None).unwrap())
+        .unwrap();
+    agent.cwd = dir.path().to_path_buf();
+    agent.compaction.keep_recent_tokens = 1;
+    agent.summarizer = Some(Summarizer::new(|_| {
+        Ok(SummarizeResponse {
+            text: "Lossy summary that says nothing about edits.".into(),
+            usage: Default::default(),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.prompt(&format!("edit a file and stop {}", "x".repeat(400)));
+    agent
+        .run_loop(scripted_tool_calls(vec![(
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        )]))
+        .unwrap();
+    for turn in 0..4 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("answer {turn} {}", "y".repeat(400)));
+    }
+    assert!(agent.compact(None).compacted, "the fold must happen");
+    let before = agent.mutation_verification_state();
+    assert_eq!(before.mutation_generation, 1);
+    let path = agent.session.as_ref().unwrap().path.clone();
+    drop(agent);
+
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    assert_eq!(resumed.mutation_verification_state(), before);
+    assert_eq!(resumed.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+#[test]
 fn source_edits_during_a_passing_check_cannot_verify_the_new_generation() {
     let dir = tempfile::tempdir().unwrap();
     let agent = verifying_agent(dir.path());
@@ -4333,6 +4377,71 @@ fn harness_rerun_respects_permission_denial() {
     assert!(outcomes[0].2.contains("Permission denied"), "{outcomes:?}");
     assert_eq!(harness_runs(&agent), 1);
     assert_ne!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn failed_command_retains_exit_status_and_relevant_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("run the failing command");
+    agent
+        .run_loop(scripted_tool_calls(vec![(
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"import sys; print('widget 7 is missing'); sys.exit(3)\""}),
+        )]))
+        .unwrap();
+    let result = agent
+        .messages
+        .iter()
+        .find(|message| message.role == "toolResult")
+        .expect("the command's result reaches the next model turn");
+    let text = content_text(&result.content);
+    assert!(text.contains("widget 7 is missing"), "{text}");
+    // The failure is carried structurally (flag and exit status in details).
+    // The provider wires send only the text (`davinci-ai` never reads
+    // `is_error`), so the exit status does not reach the model; changing the
+    // tool text is a product decision recorded in the audit register.
+    assert_eq!(result.is_error, Some(true), "{text}");
+    let exit_code = result
+        .extra
+        .get("details")
+        .and_then(|details| details.get("exitCode"))
+        .and_then(serde_json::Value::as_i64)
+        .expect("the exit status stays in the tool result details");
+    assert_ne!(exit_code, 0);
+}
+
+#[test]
+fn permission_denied_never_auto_retries_privileged_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = asked.clone();
+    agent.approver = Some(ToolApprover(Arc::new(move |_| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ToolApprovalDecision::Deny
+    })));
+    agent.prompt("publish the release");
+    let marker = dir.path().join("published.txt");
+    let command = format!(
+        "python -c \"open(r'{}', 'w').write('x')\"",
+        marker.display()
+    );
+    agent
+        .run_loop(scripted_tool_calls(vec![(
+            shell_tool(),
+            serde_json::json!({ "command": command }),
+        )]))
+        .unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!marker.exists(), "a denied tool must not run, now or later");
+    let denied: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|message| message.role == "toolResult")
+        .collect();
+    assert_eq!(denied.len(), 1);
+    assert!(content_text(&denied[0].content).contains("Permission denied"));
 }
 
 #[test]
