@@ -24,6 +24,10 @@ impl Default for RegressionBudget {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GateResult {
     pub passed: bool,
@@ -33,6 +37,9 @@ pub struct GateResult {
     pub unrelated_edits_ok: bool,
     pub turns_efficiency_ok: bool,
     pub tools_efficiency_ok: bool,
+    /// False when the two summaries did not run the same tasks.
+    #[serde(default = "default_true")]
+    pub comparison_valid: bool,
 }
 
 pub fn evaluate_gate(
@@ -113,7 +120,14 @@ pub fn evaluate_gate(
         ));
     }
 
-    let passed = pass_rate_ok
+    let identity_problems = super::compare::summary_identity_problems(baseline, candidate);
+    let comparison_valid = identity_problems.is_empty();
+    for problem in identity_problems {
+        violations.push(format!("Comparison is not like-for-like: {problem}"));
+    }
+
+    let passed = comparison_valid
+        && pass_rate_ok
         && unverified_claims_ok
         && unrelated_edits_ok
         && turns_efficiency_ok
@@ -127,6 +141,7 @@ pub fn evaluate_gate(
         unrelated_edits_ok,
         turns_efficiency_ok,
         tools_efficiency_ok,
+        comparison_valid,
     }
 }
 
@@ -153,6 +168,7 @@ mod tests {
             unverified_claim_rate: unverified,
             unrelated_edit_rate: unrelated,
             unnecessary_permission_prompt_rate: 0.0,
+            task_identity: None,
         }
     }
 
@@ -211,5 +227,28 @@ mod tests {
         let res2 = evaluate_gate(&base, &cand_bad_edits, &budget);
         assert!(!res2.unrelated_edits_ok);
         assert!(!res2.passed);
+    }
+
+    #[test]
+    fn unmatched_task_revision_invalidates_the_gate() {
+        let budget = RegressionBudget::default();
+        let mut base = summary(0.90, 0.0, 0.0, 5.0, 10.0);
+        let mut cand = summary(0.95, 0.0, 0.0, 5.0, 10.0);
+        base.task_identity = Some("rev-a".into());
+        cand.task_identity = Some("rev-a".into());
+        assert!(evaluate_gate(&base, &cand, &budget).passed);
+
+        // Better numbers on a different task set prove nothing.
+        cand.task_identity = Some("rev-b".into());
+        let res = evaluate_gate(&base, &cand, &budget);
+        assert!(!res.passed);
+        assert!(!res.comparison_valid);
+        assert!(res.violations.iter().any(|v| v.contains("task revision")));
+
+        // Same identity but a different scenario count is also unmatched.
+        cand.task_identity = base.task_identity.clone();
+        cand.total_scenarios = 150;
+        let res = evaluate_gate(&base, &cand, &budget);
+        assert!(!res.passed && !res.comparison_valid);
     }
 }

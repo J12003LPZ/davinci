@@ -37,6 +37,9 @@ pub struct PairedComparison {
     pub deltas: BTreeMap<String, f64>,
     pub regressions: Vec<Regression>,
     pub provider_errors: usize,
+    /// Why this pair is not a like-for-like comparison. Empty when it is.
+    #[serde(default)]
+    pub invalid_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,6 +106,28 @@ pub fn format_repeated_comparison_markdown(comparison: &RepeatedPairedComparison
         }
     }
     output
+}
+
+/// Reasons two suite summaries did not run the same tasks. A summary without an
+/// identity (saved before it existed) cannot be proven unmatched, so only two
+/// known, different identities or different scenario counts are reported.
+pub(crate) fn summary_identity_problems(
+    baseline: &BehaviorSuiteSummary,
+    candidate: &BehaviorSuiteSummary,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if baseline.total_scenarios != candidate.total_scenarios {
+        problems.push(format!(
+            "task set size differs ({} vs {} scenarios)",
+            baseline.total_scenarios, candidate.total_scenarios
+        ));
+    }
+    if let (Some(a), Some(b)) = (&baseline.task_identity, &candidate.task_identity) {
+        if a != b {
+            problems.push("task revision differs (scenario definitions are not identical)".into());
+        }
+    }
+    problems
 }
 
 pub fn compare_eval_runs(
@@ -230,6 +255,19 @@ pub fn compare_eval_runs(
         });
     }
 
+    let mut invalid_reasons = summary_identity_problems(baseline, candidate);
+    if baseline_variant.provider != candidate_variant.provider
+        || baseline_variant.model != candidate_variant.model
+    {
+        invalid_reasons.push(format!(
+            "model differs ({}/{} vs {}/{})",
+            baseline_variant.provider,
+            baseline_variant.model,
+            candidate_variant.provider,
+            candidate_variant.model
+        ));
+    }
+
     PairedComparison {
         baseline_variant,
         candidate_variant,
@@ -238,6 +276,7 @@ pub fn compare_eval_runs(
         deltas,
         regressions,
         provider_errors,
+        invalid_reasons,
     }
 }
 
@@ -328,6 +367,12 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
     };
 
     let mut out = String::new();
+    if !comparison.invalid_reasons.is_empty() {
+        out.push_str(&format!(
+            "INVALID COMPARISON, not like-for-like: {}\n\n",
+            comparison.invalid_reasons.join("; ")
+        ));
+    }
     out.push_str(&format!(
         "| Metric | {} ({}) | {} ({}) | Delta |\n",
         comparison.baseline_variant.name,
@@ -395,6 +440,7 @@ mod tests {
             unverified_claim_rate: unverified,
             unrelated_edit_rate: unrelated,
             unnecessary_permission_prompt_rate: prompts,
+            task_identity: None,
         }
     }
 
@@ -489,5 +535,34 @@ mod tests {
         assert_eq!(comparison.ties, 0);
         assert_eq!(comparison.losses, 0);
         assert_eq!(comparison.repetitions, 1);
+    }
+
+    #[test]
+    fn unmatched_task_revision_invalidates_comparison() {
+        let (v_base, v_cand) = sample_variants();
+        let mut base = dummy_summary(0.80, 0.02, 0.05, 6.0, 12.0, 1.0);
+        let mut cand = dummy_summary(0.95, 0.0, 0.0, 6.0, 12.0, 1.0);
+        base.task_identity = Some("rev-a".into());
+        cand.task_identity = Some("rev-a".into());
+        let matched = compare_eval_runs(v_base.clone(), v_cand.clone(), &base, &cand, 0);
+        assert!(matched.invalid_reasons.is_empty());
+
+        // The candidate ran a different revision of the task set.
+        cand.task_identity = Some("rev-b".into());
+        let unmatched = compare_eval_runs(v_base.clone(), v_cand.clone(), &base, &cand, 0);
+        assert!(unmatched
+            .invalid_reasons
+            .iter()
+            .any(|reason| reason.contains("task")));
+
+        // A different model is not a like-for-like pair either.
+        cand.task_identity = base.task_identity.clone();
+        let mut other_model = v_cand;
+        other_model.model = "another-model".into();
+        let model = compare_eval_runs(v_base, other_model, &base, &cand, 0);
+        assert!(model
+            .invalid_reasons
+            .iter()
+            .any(|reason| reason.contains("model")));
     }
 }

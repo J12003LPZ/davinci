@@ -197,7 +197,7 @@ pub fn execute_scenario(
         trace.stats.wall_ms = process_result.wall_ms;
         let mut observed_verification = baseline_reproducers
             .iter()
-            .map(verification_event)
+            .map(|result| verification_event(result, 0))
             .collect::<Vec<_>>();
         observed_verification.append(&mut trace.verification);
         trace.verification = observed_verification;
@@ -213,8 +213,11 @@ pub fn execute_scenario(
             &workspace,
         )?);
         verification.extend(run_verification_commands(&reproducer_commands, &workspace)?);
+        let final_generation = trace.mutation_count();
         for result in verification.iter().skip(baseline_count) {
-            trace.verification.push(verification_event(result));
+            trace
+                .verification
+                .push(verification_event(result, final_generation));
         }
         if let Some(failed) = verification
             .iter()
@@ -246,8 +249,13 @@ pub fn execute_scenario(
 
     if let Err(error) = result {
         let disposition = classify_failure_signal(&error);
+        let mut score = score_trace(scenario, &trace);
+        // A run that did not complete is retained with its error but is never
+        // solved: a partial trace can satisfy every requirement vacuously.
+        score.record_failure(format!(
+            "infrastructure or harness error, run not solved: {error}"
+        ));
         infrastructure_error = Some(error);
-        let score = score_trace(scenario, &trace);
         return ScenarioRunResult {
             scenario: scenario.clone(),
             trace,
@@ -291,11 +299,12 @@ fn original_reproducer_commands(scenario: &BehaviorScenario) -> Vec<Verification
     commands
 }
 
-fn verification_event(result: &VerificationResult) -> VerificationEvent {
+fn verification_event(result: &VerificationResult, generation: u64) -> VerificationEvent {
     VerificationEvent {
         kind: classify_shell_command(&result.command).into(),
         command: result.command.clone(),
         passed: result.passed,
+        mutation_generation: Some(generation),
     }
 }
 
@@ -590,6 +599,38 @@ mod tests {
         assert_eq!(result.disposition, RunDisposition::InfrastructureFailure);
         assert!(result.verification.is_empty());
         assert_eq!(result.trace.scenario_id, "missing-product");
+    }
+
+    #[test]
+    fn infra_failure_retained_but_not_solved() {
+        let dir = tempfile::tempdir().unwrap();
+        // No requirements: an empty trace satisfies all of them, which is
+        // exactly how a run that never started must not become a pass.
+        let scenario = BehaviorScenario {
+            id: "never-started".into(),
+            category: BehaviorCategory::Exploration,
+            request: "inspect".into(),
+            repo_fixture: "core-repo".into(),
+            requirements: Vec::new(),
+            limits: BehaviorLimits::default(),
+            setup_commands: Vec::new(),
+            verification_commands: Vec::new(),
+        };
+        let result = execute_scenario(
+            &scenario,
+            &config("definitely-missing-davinci-binary"),
+            &ArtifactRoot::new(dir.path()),
+        );
+        // Retained: the error and its disposition are kept for the report.
+        assert!(result.infrastructure_error.is_some());
+        assert_eq!(result.disposition, RunDisposition::InfrastructureFailure);
+        // Not solved: the score card is failed and says why.
+        assert!(!result.score.passed, "{:?}", result.score);
+        assert!(result
+            .score
+            .hard_failures
+            .iter()
+            .any(|failure| failure.contains("infrastructure")));
     }
 
     #[test]

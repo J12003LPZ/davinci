@@ -69,6 +69,11 @@ pub struct VerificationEvent {
     pub kind: String,
     pub command: String,
     pub passed: bool,
+    /// Number of edits the trace had recorded when this check finished. A check
+    /// older than the last edit says nothing about the final state. `None`
+    /// (traces saved before this field) is treated as current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +174,31 @@ pub fn detect_verification_claims(text: &str) -> Vec<String> {
 }
 
 impl BehaviorTrace {
+    /// Edits recorded so far; the generation a new check belongs to.
+    pub fn mutation_count(&self) -> u64 {
+        self.events
+            .iter()
+            .filter(|event| matches!(event, BehaviorEvent::Edit { .. }))
+            .count() as u64
+    }
+
+    /// True only when the latest check of `kind` (every kind, when `None`) that
+    /// is not older than the last edit passed. A pass before the final edit, or
+    /// a pass followed by a failure, is not verification of the final state.
+    pub fn verified_after_last_mutation(&self, kind: Option<&str>) -> bool {
+        let final_generation = self.mutation_count();
+        let mut latest: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
+        for check in &self.verification {
+            let current = check
+                .mutation_generation
+                .is_none_or(|generation| generation >= final_generation);
+            if current && kind.is_none_or(|kind| check.kind == kind) {
+                latest.insert(check.kind.as_str(), check.passed);
+            }
+        }
+        !latest.is_empty() && latest.values().all(|passed| *passed)
+    }
+
     /// Strip credential-shaped values from every free-text field before the
     /// trace leaves the process. Structure, counts and exit codes are kept.
     pub fn redact_credentials(&mut self) {
@@ -354,10 +384,12 @@ impl BehaviorTrace {
                         });
 
                         if class == "test" || class == "build" || class == "lint" {
+                            let generation = trace.mutation_count();
                             trace.verification.push(VerificationEvent {
                                 kind: class.to_string(),
                                 command,
                                 passed: exit_code == Some(0),
+                                mutation_generation: Some(generation),
                             });
                         }
                     }

@@ -159,6 +159,7 @@ fn trace_observer_preserves_unavailable_metrics_and_reports_missing_steps() {
         kind: "test".into(),
         command: "npm test -- login".into(),
         passed: true,
+        mutation_generation: None,
     });
     trace.stats = BehaviorStats {
         tool_calls: 4,
@@ -209,6 +210,23 @@ fn trace_observer_preserves_unavailable_metrics_and_reports_missing_steps() {
 }
 
 #[test]
+fn missing_usage_retained_as_unknown() {
+    let mut trace = BehaviorTrace::new("usage", None);
+    trace.stats = BehaviorStats {
+        input_tokens: None,
+        output_tokens: Some(0),
+        ..BehaviorStats::default()
+    };
+    let observation = observe_behavior_trace(&trace);
+    // Never reported: no value, a reason. Measured zero: a value of zero.
+    let input = &observation.metrics[&EngineeringMetric::InputTokens];
+    assert_eq!(input.value, None);
+    assert!(input.reason.as_deref().unwrap().contains("not emitted"));
+    let output = &observation.metrics[&EngineeringMetric::OutputTokens];
+    assert_eq!(output.value, Some(0.0));
+}
+
+#[test]
 fn trace_observer_accepts_only_explicit_complete_workflow_receipts() {
     let mut trace = BehaviorTrace::new("complete-login", None);
     for step in EngineeringWorkflowStep::ALL {
@@ -226,6 +244,7 @@ fn trace_observer_accepts_only_explicit_complete_workflow_receipts() {
         kind: "test".into(),
         command: "npm test -- login".into(),
         passed: true,
+        mutation_generation: None,
     });
 
     let receipt = scenario_receipt_from_trace(

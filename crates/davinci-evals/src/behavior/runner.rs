@@ -237,6 +237,38 @@ pub struct BehaviorSuiteSummary {
     pub unverified_claim_rate: f64,
     pub unrelated_edit_rate: f64,
     pub unnecessary_permission_prompt_rate: f64,
+    /// Hash of the scenario definitions behind this summary. Two summaries
+    /// with different identities did not run the same tasks.
+    #[serde(default)]
+    pub task_identity: Option<String>,
+}
+
+/// SHA-256 over the scenarios sorted by id: any change to a request, fixture
+/// or requirement changes the identity.
+pub fn task_identity(scenarios: &[&BehaviorScenario]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut encoded: Vec<(String, String)> = scenarios
+        .iter()
+        .map(|scenario| {
+            (
+                scenario.id.clone(),
+                serde_json::to_string(scenario).unwrap_or_default(),
+            )
+        })
+        .collect();
+    encoded.sort();
+    let mut hasher = Sha256::new();
+    for (id, body) in encoded {
+        hasher.update(id.as_bytes());
+        hasher.update([0]);
+        hasher.update(body.as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -262,6 +294,7 @@ pub fn aggregate_suite_scores(
             unverified_claim_rate: 0.0,
             unrelated_edit_rate: 0.0,
             unnecessary_permission_prompt_rate: 0.0,
+            task_identity: None,
         };
     }
 
@@ -295,7 +328,7 @@ pub fn aggregate_suite_scores(
             .events
             .iter()
             .any(|e| matches!(e, BehaviorEvent::VerificationClaim { .. }));
-        let has_passed_verification = trace.verification.iter().any(|v| v.passed);
+        let has_passed_verification = trace.verified_after_last_mutation(None);
         if has_claim && !has_passed_verification {
             unverified_claims_count += 1;
         }
@@ -332,6 +365,12 @@ pub fn aggregate_suite_scores(
         unverified_claim_rate: (unverified_claims_count as f64) / (total as f64),
         unrelated_edit_rate: (unrelated_edits_count as f64) / (total as f64),
         unnecessary_permission_prompt_rate: (unnecessary_prompts_count as f64) / (total as f64),
+        task_identity: Some(task_identity(
+            &results
+                .iter()
+                .map(|(scenario, _, _)| *scenario)
+                .collect::<Vec<_>>(),
+        )),
     }
 }
 
