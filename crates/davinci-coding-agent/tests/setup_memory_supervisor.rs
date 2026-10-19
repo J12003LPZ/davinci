@@ -542,11 +542,13 @@ impl Machine {
             .unwrap();
     }
     fn approve(&self, path: &str, version: &str) {
-        let mut profile = SetupProfile::default();
-        profile.ollama = Some(OllamaIdentity {
-            path: path.into(),
-            version: version.into(),
-        });
+        let profile = SetupProfile {
+            ollama: Some(OllamaIdentity {
+                path: path.into(),
+                version: version.into(),
+            }),
+            ..SetupProfile::default()
+        };
         profile.save(self.agent.path()).unwrap();
     }
     fn effective(
@@ -1023,8 +1025,10 @@ fn cold_relaunch_restores_ollama_and_deduplicates_alerts() {
     );
 
     // Once the failures reach the cooldown, the wait stays at 120s.
-    let mut state = RecoveryState::default();
-    state.failures = 3;
+    let state = RecoveryState {
+        failures: 3,
+        ..RecoveryState::default()
+    };
     assert_eq!(backoff_delay(state.failures + 1), COOLDOWN);
 }
 

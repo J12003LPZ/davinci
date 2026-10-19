@@ -91,7 +91,8 @@ fn repeated_restart_reconciles_without_manual_commands() {
     fs::write(&records, b"").unwrap();
 
     let healthy_cfg = |a: &Path| write_config(a, &healthy);
-    let scenarios: Vec<(&str, Box<dyn Fn(&Path)>, &str)> = vec![
+    type Scenario<'a> = (&'a str, Box<dyn Fn(&Path) + 'a>, &'a str);
+    let scenarios: Vec<Scenario> = vec![
         (
             "ollama missing",
             Box::new(|a| write_config(a, &down)),
