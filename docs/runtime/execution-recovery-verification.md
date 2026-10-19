@@ -166,6 +166,28 @@ persistence after an effect, unknown process ownership, stale worker binding,
 incomplete transactions, missing evidence, corrupt journals, duplicate
 collisions, legacy-root/downgrade conflicts, and storage pressure.
 
+## Killed tool resume evidence
+
+`agent_crash_after_started_effect_reports_unknown_without_replay`
+(`crates/davinci-agent/tests/agent_tool_resume_integration.rs`) runs an Agent
+in a child process whose tool writes `START` and then sleeps; the parent kills
+the child, then resumes the same session and journal with a fresh execution
+owner. Asserted: `START` once, `END` never, the tool is not dispatched again
+(even when the model re-emits the call), the first request after resume carries
+exactly one error tool result for the call id that says the outcome is unknown,
+and the result sits directly after the assistant call in the session.
+
+Resume closes unanswered calls in `Agent::reconcile_unresolved_tool_calls`.
+The class comes from the operation journal effect status (`NotStarted` or
+`KnownNoEffect` reports "Not executed"; anything else, or an unreadable
+journal, reports "Outcome unknown"), then from the legacy tool ledger. The
+attempt row itself stays `EffectPossible`, which keeps blocking redispatch.
+Publish-once after a crash is covered by `operation_publication.rs`
+(`reopening_a_session_replays_pending_result_before_provider_continuation`,
+`append_before_ack_crash_is_deduplicated_and_acknowledged_after_reopen`).
+The effect tool in the test is a native-extension tool, not built-in `bash`;
+both reach the same journal latch before the executor runs.
+
 ## Remaining unsupported guarantees
 
 Physical disk-full and power-loss behavior beyond the exercised transactional

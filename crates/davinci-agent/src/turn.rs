@@ -243,6 +243,7 @@ impl Agent {
     {
         self.ensure_session_persistence()?;
         self.recover_pending_operation_publications()?;
+        self.reconcile_unresolved_tool_calls()?;
         self.require_prompt_checkpoint_persistence()?;
         let run_started = std::time::Instant::now();
         let result = self.run_loop_body(emit_prompt_messages, complete);
@@ -313,6 +314,145 @@ impl Agent {
             runtime.mark_turn_failed();
             runtime.emit_turn_end(false);
         }
+    }
+
+    /// Answer every persisted tool call that has no result after a restart.
+    ///
+    /// A hard stop can land after `persist_assistant` and before the result,
+    /// leaving a call the provider would reject as unpaired. The answer is
+    /// anchored in durable state and never fabricates success or re-runs the
+    /// tool: a call whose effect may have started reports "outcome unknown", a
+    /// call that never started reports "not executed". Pairing is by call id.
+    /// Calls with a durable result waiting in the outbox are left to the
+    /// publication replay, which runs first. Idle agents only: a streaming
+    /// agent has calls that are legitimately in flight.
+    pub(crate) fn reconcile_unresolved_tool_calls(&mut self) -> Result<(), String> {
+        if self.is_streaming || self.unresolved_tool_calls().is_empty() {
+            return Ok(());
+        }
+        self.recover_pending_operation_publications()?;
+        let unresolved = self.unresolved_tool_calls();
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+        let mut repaired: Vec<(usize, ChatMessage)> = Vec::new();
+        for (index, id, name) in unresolved {
+            let mut message = tool_result_message(
+                &id,
+                &name,
+                self.unresolved_call_result(&id),
+                self.auto_resize_images,
+            );
+            self.annotate_tool_result_wire_kind(&mut message);
+            repaired.push((index, message));
+        }
+        // Back to front so earlier insertion points stay valid. Only the
+        // newest exchange sits at the session leaf and can be appended
+        // durably; older ones are repaired in memory, identically per load.
+        let tail_start = self.messages.iter().rposition(|m| m.role == "assistant");
+        while let Some((index, message)) = repaired.pop() {
+            let mut at = index + 1;
+            while self
+                .messages
+                .get(at)
+                .is_some_and(|next| next.role == "toolResult")
+            {
+                at += 1;
+            }
+            if Some(index) == tail_start && at == self.messages.len() {
+                self.persist_full_message(&message);
+            }
+            self.messages.insert(at, message);
+        }
+        self.ensure_session_persistence()
+    }
+
+    /// `(assistant index, call id, tool name)` for calls with no toolResult.
+    fn unresolved_tool_calls(&self) -> Vec<(usize, String, String)> {
+        let answered: std::collections::HashSet<&str> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut unresolved = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if message.role != "assistant" {
+                continue;
+            }
+            for content in &message.content {
+                if let davinci_ai::MessageContent::ToolCall { id, name, .. } = content {
+                    if !answered.contains(id.as_str()) && seen.insert(id.clone()) {
+                        unresolved.push((index, id.clone(), name.clone()));
+                    }
+                }
+            }
+        }
+        unresolved
+    }
+
+    fn unresolved_call_result(&self, call_id: &str) -> crate::ToolResult {
+        use crate::runtime::operations::EffectStatus;
+        const UNKNOWN: &str = "Outcome unknown: the session ended after this call started, \
+so it may or may not have taken effect. It was not re-run. Check the current state \
+(files, processes, external systems) before retrying.";
+        const NOT_EXECUTED: &str = "Not executed: the session ended before this call started. \
+Issue the call again if it is still needed.";
+        let (unknown, source) = if let Some(journal) = self.operation_journal() {
+            let session_id = self.session.as_ref().map(|session| session.header.id.clone());
+            match journal.snapshot() {
+                Err(_) => (true, "operation_journal_unreadable"),
+                Ok(snapshot) => {
+                    let operation = snapshot.operations.iter().find(|spec| {
+                        spec.context().wire_tool_call_id.as_deref() == Some(call_id)
+                            && Some(&spec.context().session_id) == session_id.as_ref()
+                    });
+                    let latest = operation.and_then(|spec| {
+                        snapshot
+                            .attempts
+                            .iter()
+                            .filter(|attempt| attempt.operation_id() == spec.operation_id())
+                            .max_by_key(|attempt| attempt.attempt_number())
+                    });
+                    match latest {
+                        Some(attempt) => (
+                            !matches!(
+                                attempt.effect_status(),
+                                EffectStatus::NotStarted | EffectStatus::KnownNoEffect
+                            ),
+                            "operation_journal",
+                        ),
+                        None => (self.ledger_says_started(call_id), "tool_ledger"),
+                    }
+                }
+            }
+        } else {
+            (self.ledger_says_started(call_id), "tool_ledger")
+        };
+        crate::ToolResult {
+            content: if unknown { UNKNOWN } else { NOT_EXECUTED }.into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "toolRecovery": {
+                    "outcome": if unknown { "unknown" } else { "not_executed" },
+                    "source": source,
+                }
+            })),
+        }
+    }
+
+    fn ledger_says_started(&self, call_id: &str) -> bool {
+        use crate::tool_ledger::{AttemptOutcome, ToolExecutionStatus};
+        self.tool_ledger.lock().map_or(true, |ledger| {
+            ledger.records().get(call_id).is_some_and(|record| {
+                record.outcome != AttemptOutcome::NotStarted
+                    || matches!(
+                        record.status,
+                        ToolExecutionStatus::Executing | ToolExecutionStatus::Blocked
+                    )
+            })
+        })
     }
 
     fn finish_run(&mut self, events: &mut Vec<AgentEvent>, new_messages: Vec<ChatMessage>) {

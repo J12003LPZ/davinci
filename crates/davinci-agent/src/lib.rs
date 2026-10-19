@@ -2093,6 +2093,9 @@ impl Agent {
         internal: Option<InternalPromptOrigin>,
     ) -> ChatMessage {
         self.flush_pending_bash_messages();
+        // A call left unanswered by a restart is closed before this prompt,
+        // so the result stays adjacent to its call in the session.
+        let _ = self.reconcile_unresolved_tool_calls();
         // A job that finished while the user was typing is in context
         // before what they typed, so the model reads the news first.
         for notice in self.job_notice_messages() {
