@@ -37,6 +37,8 @@ pub fn validate_directions(directions: &[ConceptDirection], count: u32) -> Desig
     }
     let mut layouts = std::collections::BTreeSet::new();
     let mut typography = std::collections::BTreeSet::new();
+    let mut strategies = std::collections::BTreeSet::new();
+    let mut titles = std::collections::BTreeSet::new();
     for direction in directions {
         for text in [
             &direction.title,
@@ -55,9 +57,130 @@ pub fn validate_directions(directions: &[ConceptDirection], count: u32) -> Desig
                 "concepts must differ in layout and typography, not only palette".into(),
             ));
         }
+        // Different words for the same idea are not a different concept, but
+        // the same words certainly are not.
+        let normalize = |text: &str| {
+            text.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
+        if !strategies.insert(normalize(&direction.content_strategy))
+            || !titles.insert(normalize(&direction.title))
+        {
+            return Err(DesignError::InvalidInput(
+                "concepts must differ in content strategy and title, not only layout".into(),
+            ));
+        }
     }
     Ok(())
 }
+
+/// Read a model's concept plan. Accepts the documented array, the same array
+/// in a code fence or wrapped as `{"directions": [...]}`, and a bare object
+/// when exactly one concept was asked for. Anything else is rejected with the
+/// shape that was expected.
+pub fn parse_directions(text: &str, count: u32) -> DesignResult<Vec<ConceptDirection>> {
+    let value: serde_json::Value = serde_json::from_str(unfenced(text))
+        .map_err(|error| DesignError::InvalidInput(format!("the plan is not JSON: {error}")))?;
+    let list = match value {
+        serde_json::Value::Array(list) => list,
+        serde_json::Value::Object(mut object) => {
+            if let Some(serde_json::Value::Array(list)) = object
+                .remove("directions")
+                .or_else(|| object.remove("concepts"))
+            {
+                list
+            } else if count == 1 {
+                vec![serde_json::Value::Object(object)]
+            } else {
+                return Err(DesignError::InvalidInput(
+                    "the plan is an object; an array of concept directions was expected".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(DesignError::InvalidInput(
+                "the plan is not an array of concept directions".into(),
+            ))
+        }
+    };
+    list.into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            serde_json::from_value::<ConceptDirection>(item)
+                .map_err(|error| DesignError::InvalidInput(format!("direction {index}: {error}")))
+        })
+        .collect()
+}
+
+/// What a phase's reply must look like, for an error a person can act on.
+pub fn expected_schema(phase: RunPhase, variants: u32) -> String {
+    match phase {
+        RunPhase::Directions => format!(
+            "a JSON array of exactly {variants} objects {{title, layout: editorial|split|modular, typography: serif|sans|mono, content_strategy}}; layouts, typographies, titles and content strategies all different"
+        ),
+        RunPhase::Generate => "one design_create or design_patch tool call: {files: {name: html}, entry_points: [name], variants: [{id, title, artboards: [{id, title, entry_point}]}], bindings: []}; variants is always an array".into(),
+        RunPhase::Render => "source that compiles and renders in the confined browser".into(),
+        RunPhase::Review => "JSON {\"findings\": [\"concrete actionable defect\"]} with at most 32 findings".into(),
+        RunPhase::Complete | RunPhase::Blocked => String::new(),
+    }
+}
+
+/// A model reply cut down for an error message: control characters gone,
+/// token-like strings replaced, and a hard length bound. Never the whole reply.
+pub fn sanitize_snippet(text: &str, limit: usize) -> String {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        let secret = word.len() >= 24
+            && word.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'+' | b'/' | b'=')
+            })
+            && word.bytes().any(|b| b.is_ascii_digit());
+        let word = if secret || word.starts_with("sk-") || word.starts_with("Bearer") {
+            "[redacted]"
+        } else {
+            word
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.extend(word.chars().filter(|c| !c.is_control()));
+        if out.chars().count() >= limit {
+            break;
+        }
+    }
+    let mut out: String = out.chars().take(limit).collect();
+    if out.chars().count() == limit {
+        out.push_str(" [...]");
+    }
+    out
+}
+/// Why a run stopped, kept with the state so the stop is not a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesignFailureReceipt {
+    /// The phase that failed. The run itself is `Blocked`.
+    pub phase: RunPhase,
+    pub code: String,
+    pub message: String,
+    pub artifact: ArtifactId,
+    /// The last committed revision; it stays readable.
+    pub revision: RevisionId,
+    /// Whether `resume` can try the phase again.
+    pub retryable: bool,
+    pub repair_count: u32,
+    pub repairs_remaining: u32,
+    pub model_route: String,
+    pub expected_schema: String,
+    /// A bounded, sanitized piece of the reply that failed.
+    pub snippet: String,
+    /// The run to resume: this operation's checkpoint.
+    pub checkpoint: OperationId,
+    /// The retained model reply, when there is one.
+    pub draft: Option<ArtifactRef>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunPhase {
@@ -94,6 +217,17 @@ impl RunProgress {
         }
         Ok(())
     }
+    /// Spend one repair to ask the same phase again (a plan or a critique that
+    /// did not parse). Shares the two-round allowance with source repairs.
+    pub fn retry_phase(&mut self) -> DesignResult<()> {
+        if self.repairs >= 2 {
+            return Err(DesignError::BudgetExceeded(
+                "two repair rounds exhausted; last revision retained".into(),
+            ));
+        }
+        self.repairs += 1;
+        Ok(())
+    }
     pub fn begin_repair(&mut self) -> DesignResult<()> {
         if self.repairs >= 2 {
             return Err(DesignError::BudgetExceeded(
@@ -123,6 +257,8 @@ pub struct DesignRunState {
     pub last_revision: RevisionId,
     pub findings: Vec<String>,
     pub quality: Option<QualityReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<DesignFailureReceipt>,
 }
 /// Trusted host injection, never constructible by a browser or generated tool call.
 /// Implementations return measured evidence; they cannot publish acceptance.
@@ -342,10 +478,31 @@ fn phase_messages(
     )];
     let manifest = store.manifest(ctx, session(agent)?, state.request.artifact_id)?;
     match state.progress.phase {
-        RunPhase::Directions => messages.push(ChatMessage::text("user", format!("Return only a JSON array of exactly {} concept directions. Each has title, layout (editorial/split/modular), typography (serif/sans/mono), content_strategy. Each direction must have a unique layout AND typography and describe how it meets the brief. Do not generate source yet.", manifest.requested_variants))),
+        RunPhase::Directions => {
+            messages.push(ChatMessage::text("user", format!("Return only a JSON array of exactly {} concept directions. Each has title, layout (editorial/split/modular), typography (serif/sans/mono), content_strategy. Each direction must have a unique layout, typography, title AND content_strategy: a different idea for what leads the page and how dense it is, not the same idea restyled. Describe how each meets the brief. Do not generate source yet.", manifest.requested_variants)));
+            if !state.findings.is_empty() {
+                messages.push(ChatMessage::text(
+                    "user",
+                    format!(
+                        "The previous plan was rejected: {}. Return the corrected JSON array only.",
+                        state.findings.join("; ")
+                    ),
+                ));
+            }
+        }
         RunPhase::Generate | RunPhase::Review => {
-            let files = if state.last_revision.0 == 0 { BTreeMap::new() } else { store.read_sources(ctx, session(agent)?, manifest.id, state.last_revision)? };
-            let assets = if state.last_revision.0 == 0 { vec![] } else { store.read_revision(ctx, session(agent)?, manifest.id, state.last_revision)?.assets };
+            let files = if state.last_revision.0 == 0 {
+                BTreeMap::new()
+            } else {
+                store.read_sources(ctx, session(agent)?, manifest.id, state.last_revision)?
+            };
+            let assets = if state.last_revision.0 == 0 {
+                vec![]
+            } else {
+                store
+                    .read_revision(ctx, session(agent)?, manifest.id, state.last_revision)?
+                    .assets
+            };
             messages.push(ChatMessage::text("user", serde_json::to_string(&json!({"directions":state.directions,"current_source":files,"retained_assets":assets,"findings":state.findings,"quality":state.quality}))?));
             if state.progress.phase == RunPhase::Generate {
                 messages.push(ChatMessage::text("user", "Call the single active source tool exactly once with every variant and complete source. The variants field MUST be an array of variant objects, including when there is only one concept; never send a bare object. Preserve factual content, responsive behavior, accessible names and keyboard interactions. Keep all node bindings backed by JSON source; the host computes source_hash from supplied JSON bytes. Never invent real backend integrations. Repairs must address the supplied findings without changing the selected directions."));
@@ -353,17 +510,36 @@ fn phase_messages(
                 if images {
                     if let Some(report) = &state.quality {
                         use base64::Engine;
-                        for reference in report.evidence.iter().filter(|r| r.media_type == "image/png") {
+                        for reference in report
+                            .evidence
+                            .iter()
+                            .filter(|r| r.media_type == "image/png")
+                        {
                             let bytes = store.read_blob(ctx, reference)?;
-                            if bytes.len() > 4 * 1024 * 1024 { return Err(DesignError::BudgetExceeded("review image size".into())); }
-                            messages.push(ChatMessage { role:"user".into(), content:vec![MessageContent::Image { data:base64::engine::general_purpose::STANDARD.encode(bytes), mime_type:"image/png".into() }], ..Default::default() });
+                            if bytes.len() > 4 * 1024 * 1024 {
+                                return Err(DesignError::BudgetExceeded(
+                                    "review image size".into(),
+                                ));
+                            }
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: vec![MessageContent::Image {
+                                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                    mime_type: "image/png".into(),
+                                }],
+                                ..Default::default()
+                            });
                         }
                     }
                 }
                 messages.push(ChatMessage::text("user", "Critique the actual supplied source and evidence against the brief and every planned concept. Return only JSON {\"findings\":[\"concrete actionable defect\"]}. Empty means no defect found in supplied evidence, not acceptance or verified implementation. Do not infer visual quality without images, interaction without action evidence, or production integration from mocks."));
             }
         }
-        _ => return Err(DesignError::Conflict("no provider dispatch for this phase".into())),
+        _ => {
+            return Err(DesignError::Conflict(
+                "no provider dispatch for this phase".into(),
+            ))
+        }
     }
     Ok(messages)
 }
@@ -378,8 +554,44 @@ pub fn run(
     renderer: &mut dyn DesignRenderer,
     cancel: Option<Arc<AtomicBool>>,
 ) -> DesignResult<DesignRunState> {
+    drive(
+        store, agent, workspace, request, model, renderer, cancel, false,
+    )
+}
+
+/// Try the failed phase of a blocked run once more, from its checkpoint. The
+/// original request, route, effort, ledger, deadline and repair count all
+/// stay: this is one more attempt inside the same allowance, not a new budget.
+/// A run whose provider outcome is unknown is never resumed.
+pub fn resume(
+    store: &DesignStore,
+    agent: &mut Agent,
+    workspace: &Path,
+    request: GenerationRequest,
+    model: &mut dyn DesignModel,
+    renderer: &mut dyn DesignRenderer,
+    cancel: Option<Arc<AtomicBool>>,
+) -> DesignResult<DesignRunState> {
+    drive(
+        store, agent, workspace, request, model, renderer, cancel, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive(
+    store: &DesignStore,
+    agent: &mut Agent,
+    workspace: &Path,
+    request: GenerationRequest,
+    model: &mut dyn DesignModel,
+    renderer: &mut dyn DesignRenderer,
+    cancel: Option<Arc<AtomicBool>>,
+    resuming: bool,
+) -> DesignResult<DesignRunState> {
     if agent.root_budget().is_some() {
-        return run_accounted(store, agent, workspace, request, model, renderer, cancel);
+        return run_accounted(
+            store, agent, workspace, request, model, renderer, cancel, resuming,
+        );
     }
     // No host budget: this operation's own, attached for its length only.
     model.validate(agent)?;
@@ -390,11 +602,14 @@ pub fn run(
     )?;
     agent
         .with_operation_budget(budget, |agent| {
-            run_accounted(store, agent, workspace, request, model, renderer, cancel)
+            run_accounted(
+                store, agent, workspace, request, model, renderer, cancel, resuming,
+            )
         })
         .map_err(DesignError::MissingCapability)?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_accounted(
     store: &DesignStore,
     agent: &mut Agent,
@@ -403,6 +618,7 @@ fn run_accounted(
     model: &mut dyn DesignModel,
     renderer: &mut dyn DesignRenderer,
     cancel: Option<Arc<AtomicBool>>,
+    resuming: bool,
 ) -> DesignResult<DesignRunState> {
     model.validate(agent)?;
     validate_text(&request.brief, 64 * 1024, "revision brief")?;
@@ -420,7 +636,8 @@ fn run_accounted(
     )?;
     let request_hash = digest(&request)?;
     let effort = format!("{:?}", agent.request_thinking_level());
-    let mut state = if let Some(state) =
+    let mut resumed = false;
+    let mut state = if let Some(mut state) =
         latest_run(store, &ctx, session(agent)?, request.operation_id)?
     {
         if state.request_hash != request_hash
@@ -433,7 +650,27 @@ fn run_accounted(
                 "resume requires the exact original request, route, effort and root ledger".into(),
             ));
         }
-        if matches!(state.progress.phase, RunPhase::Complete | RunPhase::Blocked) {
+        let resumable = resuming
+            && state.progress.phase == RunPhase::Blocked
+            && !state.progress.in_flight
+            && state
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.retryable);
+        if resumable {
+            resumed = true;
+            let failure = state.failure.take().expect("checked above");
+            state.progress.phase = failure.phase;
+            // A reply that failed validation is asked for again; a reply that
+            // was fine and failed later (a write) is used as it is.
+            if failure.code == "invalid_input" {
+                state.reply = None;
+            }
+            state.findings.push(format!(
+                "resumed from checkpoint {} at {:?}",
+                failure.checkpoint, failure.phase
+            ));
+        } else if matches!(state.progress.phase, RunPhase::Complete | RunPhase::Blocked) {
             budget
                 .finish_operation(&request.operation_id.to_string())
                 .map_err(DesignError::BudgetExceeded)?;
@@ -501,22 +738,25 @@ fn run_accounted(
             last_revision: manifest.revision,
             findings: vec![],
             quality: None,
+            failure: None,
         };
         checkpoint(store, &ctx, agent, &state)?;
         state
     };
-    budget
-        .begin_operation(
-            &request.operation_id.to_string(),
-            12,
-            state.progress.deadline_ms,
-        )
-        .map_err(DesignError::BudgetExceeded)?;
+    let operation = request.operation_id.to_string();
+    let opened = if resumed {
+        budget.resume_operation(&operation, 12, state.progress.deadline_ms)
+    } else {
+        budget.begin_operation(&operation, 12, state.progress.deadline_ms)
+    };
+    opened.map_err(DesignError::BudgetExceeded)?;
     let result = run_phases(store, &ctx, agent, model, renderer, &mut state);
     if let Err(error) = result {
         // If authority was lost, publication also fails; the previous durable state remains.
+        let receipt = failure_receipt(store, &ctx, agent, &state, &error);
         state.progress.phase = RunPhase::Blocked;
         state.findings.push(error.to_string());
+        state.failure = Some(receipt);
     }
     let publication = checkpoint(store, &ctx, agent, &state);
     budget
@@ -524,6 +764,94 @@ fn run_accounted(
         .map_err(DesignError::BudgetExceeded)?;
     publication?;
     Ok(state)
+}
+
+fn failure_receipt(
+    store: &DesignStore,
+    ctx: &AuthorizedDesignContext,
+    agent: &mut Agent,
+    state: &DesignRunState,
+    error: &DesignError,
+) -> DesignFailureReceipt {
+    let phase = state.progress.phase;
+    let (code, message) = match error {
+        DesignError::Cancelled => ("cancelled".to_string(), "the run was cancelled".to_string()),
+        other => {
+            let value = serde_json::to_value(other).unwrap_or_default();
+            (
+                value["code"].as_str().unwrap_or("error").to_string(),
+                value["message"].as_str().unwrap_or_default().to_string(),
+            )
+        }
+    };
+    let snippet = state
+        .reply
+        .as_ref()
+        .and_then(|reference| store.read_blob(ctx, reference).ok())
+        .and_then(|data| serde_json::from_slice::<ChatMessage>(&data).ok())
+        .map(|reply| {
+            let mut text = davinci_ai::content_text(&reply.content);
+            for content in &reply.content {
+                if let MessageContent::ToolCall { arguments, .. } = content {
+                    text.push(' ');
+                    text.push_str(&arguments.to_string());
+                }
+            }
+            sanitize_snippet(&text, 240)
+        })
+        .unwrap_or_default();
+    let variants = session(agent)
+        .ok()
+        .and_then(|session| store.manifest(ctx, session, state.request.artifact_id).ok())
+        .map(|manifest| manifest.requested_variants)
+        .unwrap_or(state.directions.len() as u32);
+    DesignFailureReceipt {
+        phase,
+        retryable: matches!(
+            error,
+            DesignError::InvalidInput(_)
+                | DesignError::BudgetExceeded(_)
+                | DesignError::IoFailure(_)
+                | DesignError::Cancelled
+        ) && !state.progress.in_flight,
+        code,
+        message: sanitize_snippet(&message, 400),
+        artifact: state.request.artifact_id,
+        revision: state.last_revision,
+        repair_count: state.progress.repairs,
+        repairs_remaining: 2u32.saturating_sub(state.progress.repairs),
+        model_route: format!("{}/{}", state.provider, state.model),
+        expected_schema: expected_schema(phase, variants),
+        snippet,
+        checkpoint: state.request.operation_id,
+        draft: state.reply.clone(),
+    }
+}
+
+/// Spend one repair, or stop with the message that needed it. The caller's
+/// message, not "allowance exhausted", is what a person has to act on.
+fn repair_with(state: &mut DesignRunState, message: &str, in_place: bool) -> DesignResult<()> {
+    let spent = if in_place {
+        state.progress.retry_phase()
+    } else {
+        state.progress.begin_repair()
+    };
+    spent.map_err(|_| {
+        DesignError::InvalidInput(format!(
+            "{message} (two repair rounds exhausted; last revision retained)"
+        ))
+    })
+}
+
+/// Reply text without a surrounding code fence.
+fn unfenced(text: &str) -> &str {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.trim_end().strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim()
 }
 
 fn run_phases(
@@ -561,8 +889,8 @@ fn run_phases(
                     state.progress.phase = RunPhase::Review;
                 }
                 Err(DesignError::InvalidInput(message)) => {
+                    repair_with(state, &message, false)?;
                     state.findings = vec![message];
-                    state.progress.begin_repair()?;
                 }
                 Err(error) => return Err(error),
             }
@@ -602,9 +930,35 @@ fn run_phases(
                         "tool calls are not admitted during concept planning".into(),
                     ));
                 }
-                state.directions = serde_json::from_str(&davinci_ai::content_text(&reply.content))?;
-                validate_directions(&state.directions, head.requested_variants)?;
-                state.progress.phase = RunPhase::Generate;
+                let planned = parse_directions(
+                    &davinci_ai::content_text(&reply.content),
+                    head.requested_variants,
+                )
+                .and_then(|directions| {
+                    validate_directions(&directions, head.requested_variants)?;
+                    Ok(directions)
+                });
+                match planned {
+                    Ok(directions) => {
+                        state.directions = directions;
+                        state.findings.clear();
+                        state.progress.phase = RunPhase::Generate;
+                    }
+                    // A plan that does not parse or differ is the model's to
+                    // fix: ask again, inside the same allowance.
+                    Err(DesignError::InvalidInput(message)) => {
+                        repair_with(
+                            state,
+                            &format!("the concept plan was rejected: {message}"),
+                            true,
+                        )?;
+                        state.findings = vec![format!("the concept plan was rejected: {message}")];
+                        state.reply = None;
+                        checkpoint(store, ctx, agent, state)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             RunPhase::Generate => {
                 let calls: Vec<_> = reply
@@ -651,9 +1005,9 @@ fn run_phases(
                 let source = match source {
                     Ok(source) => source,
                     Err(DesignError::InvalidInput(message)) => {
-                        state.findings =
-                            vec![format!("the source tool call was rejected: {message}")];
-                        state.progress.begin_repair()?;
+                        let message = format!("the source tool call was rejected: {message}");
+                        repair_with(state, &message, false)?;
+                        state.findings = vec![message];
                         state.reply = None;
                         checkpoint(store, ctx, agent, state)?;
                         continue;
@@ -668,8 +1022,9 @@ fn run_phases(
                 ) {
                     Ok(sources) => sources,
                     Err(DesignError::InvalidInput(message)) => {
-                        state.findings = vec![format!("the source files were rejected: {message}")];
-                        state.progress.begin_repair()?;
+                        let message = format!("the source files were rejected: {message}");
+                        repair_with(state, &message, false)?;
+                        state.findings = vec![message];
                         state.reply = None;
                         checkpoint(store, ctx, agent, state)?;
                         continue;
@@ -702,9 +1057,9 @@ fn run_phases(
                     // Bindings and sources the store refuses are the model's
                     // to fix, like a malformed call.
                     Err(DesignError::InvalidInput(message)) => {
-                        state.findings =
-                            vec![format!("the source revision was rejected: {message}")];
-                        state.progress.begin_repair()?;
+                        let message = format!("the source revision was rejected: {message}");
+                        repair_with(state, &message, false)?;
+                        state.findings = vec![message];
                         state.reply = None;
                         checkpoint(store, ctx, agent, state)?;
                         continue;
@@ -723,7 +1078,18 @@ fn run_phases(
                     return Err(DesignError::Denied("review cannot mutate a design".into()));
                 }
                 let critique: Critique =
-                    serde_json::from_str(&davinci_ai::content_text(&reply.content))?;
+                    match serde_json::from_str(unfenced(&davinci_ai::content_text(&reply.content)))
+                    {
+                        Ok(critique) => critique,
+                        Err(error) => {
+                            let message =
+                                format!("the critique was not valid JSON findings: {error}");
+                            repair_with(state, &message, true)?;
+                            state.reply = None;
+                            checkpoint(store, ctx, agent, state)?;
+                            continue;
+                        }
+                    };
                 if critique.findings.len() > 32 {
                     return Err(DesignError::BudgetExceeded("review findings limit".into()));
                 }
