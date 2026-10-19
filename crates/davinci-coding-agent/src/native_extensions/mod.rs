@@ -16,6 +16,7 @@ pub mod learning;
 pub mod memory_backends;
 pub mod memory_page;
 pub mod package_intelligence;
+pub mod qdrant_supervisor;
 pub mod repo_intelligence;
 pub mod security_scan;
 pub mod service_authority;
@@ -376,6 +377,7 @@ pub struct NativeExtensionHost {
     supervisor: Option<Arc<service_supervisor::ManagedServiceSupervisor>>,
     /// Read-only Docker questions for `/setup qdrant`; tests inject a fake.
     docker: Option<Arc<dyn docker_discovery::DockerRunner>>,
+    container_starter: Option<Arc<dyn qdrant_supervisor::ContainerStarter>>,
 }
 
 impl NativeExtensionHost {
@@ -383,6 +385,15 @@ impl NativeExtensionHost {
     /// Use `docker` for the read-only Docker questions of `/setup qdrant`.
     pub fn with_docker(mut self, docker: Arc<dyn docker_discovery::DockerRunner>) -> Self {
         self.docker = Some(docker);
+        self
+    }
+
+    /// Use `starter` to start DaVinci's own Qdrant container; tests inject a fake.
+    pub fn with_container_starter(
+        mut self,
+        starter: Arc<dyn qdrant_supervisor::ContainerStarter>,
+    ) -> Self {
+        self.container_starter = Some(starter);
         self
     }
 
@@ -578,6 +589,7 @@ impl NativeExtensionHost {
             agent_dir: repo_agent_dir,
             supervisor: None,
             docker: None,
+            container_starter: None,
         }
     }
 
@@ -1068,11 +1080,15 @@ impl NativeExtensionHost {
                         agent_dir: &self.agent_dir,
                         supervisor,
                         docker: &docker_discovery::SystemDockerRunner,
+                        containers: &qdrant_supervisor::SystemContainerStarter,
                     },
                     None => setup::SetupContext::system(&self.agent_dir),
                 };
                 if let Some(docker) = &self.docker {
                     ctx.docker = docker.as_ref();
+                }
+                if let Some(starter) = &self.container_starter {
+                    ctx.containers = starter.as_ref();
                 }
                 let steps = if mode == setup::Mode::Trust {
                     vec![setup::trust_project(&self.agent_dir, &cwd)]

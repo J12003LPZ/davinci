@@ -202,6 +202,63 @@ pub fn recovery_wanted(agent_dir: &Path) -> bool {
         && ServiceAuthorization::check(agent_dir, ServiceAction::StartLocalOllama).is_ok()
 }
 
+/// One attempt to bring DaVinci's own Qdrant container back after a relaunch.
+/// `None` health means nothing was wanted: the default setup, a disabled
+/// intent, or no consent. Docker is not asked in those cases.
+pub fn qdrant_recovery_round(
+    agent_dir: &Path,
+    docker: &dyn super::docker_discovery::DockerRunner,
+    starter: &dyn super::qdrant_supervisor::ContainerStarter,
+    tracker: &mut IncidentTracker,
+) -> Option<(ComponentHealth, Option<ServiceNotice>)> {
+    let effective = load_effective_setup(agent_dir, &process_env);
+    if !super::qdrant_supervisor::start_wanted(agent_dir, &effective) {
+        return None;
+    }
+    let health = super::qdrant_supervisor::reconcile_owned_qdrant(
+        agent_dir,
+        &effective,
+        docker,
+        starter,
+        super::qdrant_supervisor::DEADLINE,
+    );
+    let notice = tracker.observe(&health);
+    Some((health, notice))
+}
+
+/// Start the Qdrant recovery for this session: once, in the background, and
+/// only if the user turned the projection on and consented to the start. When
+/// Qdrant is back, the remote copy is caught up.
+pub fn start_qdrant_recovery(
+    agent_dir: PathBuf,
+    memory: Option<Arc<Mutex<super::vector_memory::VectorMemory>>>,
+) {
+    let effective = load_effective_setup(&agent_dir, &process_env);
+    if !super::qdrant_supervisor::start_wanted(&agent_dir, &effective) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut tracker = IncidentTracker::default();
+        let round = qdrant_recovery_round(
+            &agent_dir,
+            &super::docker_discovery::SystemDockerRunner,
+            &super::qdrant_supervisor::SystemContainerStarter,
+            &mut tracker,
+        );
+        let Some((health, notice)) = round else {
+            return;
+        };
+        if let Some(notice) = notice {
+            push_notice(notice);
+        }
+        if health.state == HealthState::Ready {
+            if let (true, Some(memory)) = (effective.profile.memory.safe_repair, &memory) {
+                let _ = super::setup_actions::repair_step(memory);
+            }
+        }
+    });
+}
+
 /// Start the background recovery for this session, if the user set it up.
 /// Returns the stop flag; set it to end the thread.
 pub fn start_recovery(

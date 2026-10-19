@@ -26,14 +26,17 @@ pub enum SetupAction {
     /// Re-embed records whose vector is stale. Derived data only; no record
     /// is ever removed, so it needs no approval beyond asking for it.
     RepairProjection,
+    /// Start the one Qdrant container the user recorded as DaVinci's.
+    StartQdrant,
 }
 
 impl SetupAction {
-    pub const ALL: [SetupAction; 4] = [
+    pub const ALL: [SetupAction; 5] = [
         SetupAction::Install,
         SetupAction::DownloadModel,
         SetupAction::StartService,
         SetupAction::RepairProjection,
+        SetupAction::StartQdrant,
     ];
 
     /// The word used after `/setup approve`.
@@ -43,6 +46,7 @@ impl SetupAction {
             Self::DownloadModel => "download-model",
             Self::StartService => "start-ollama",
             Self::RepairProjection => "repair",
+            Self::StartQdrant => super::docker_discovery::START_QDRANT,
         }
     }
 
@@ -58,6 +62,7 @@ impl SetupAction {
             Self::Install | Self::RepairProjection => None,
             Self::DownloadModel => Some(ServiceAction::DownloadEmbeddingModel),
             Self::StartService => Some(ServiceAction::StartLocalOllama),
+            Self::StartQdrant => Some(ServiceAction::StartOwnedQdrantContainer),
         }
     }
 }
@@ -76,6 +81,21 @@ pub fn approve_action(action: SetupAction, ctx: &SetupContext) -> Result<String,
             action.name()
         ));
     };
+    if action == SetupAction::StartQdrant {
+        let effective = load_effective_setup(ctx.agent_dir, &process_env);
+        if effective.memory.config.projection.backend
+            != super::memory_backends::MemoryProjectionBackend::Qdrant
+        {
+            return Err(
+                "the Qdrant projection is off; /setup qdrant enable turns it on first".into(),
+            );
+        }
+        ServiceConsentStore::open(ctx.agent_dir).set(consent, true)?;
+        return Ok(
+            "approved starting DaVinci's own Qdrant container (only the one recorded with /setup qdrant own, or labelled by DaVinci)"
+                .into(),
+        );
+    }
     if action == SetupAction::StartService {
         let identity = approve_installed_ollama(ctx.agent_dir, ctx.supervisor.launcher())?;
         ServiceConsentStore::open(ctx.agent_dir).set(consent, true)?;
@@ -140,6 +160,17 @@ pub fn execute_approved_action(
             step_from_health(ID, TITLE, &health)
         }
         SetupAction::RepairProjection => repair_step(memory),
+        SetupAction::StartQdrant => {
+            let effective = load_effective_setup(ctx.agent_dir, &process_env);
+            let health = super::qdrant_supervisor::reconcile_owned_qdrant(
+                ctx.agent_dir,
+                &effective,
+                ctx.docker,
+                ctx.containers,
+                super::qdrant_supervisor::DEADLINE,
+            );
+            step_from_health("qdrant", "Qdrant projection", &health)
+        }
         SetupAction::DownloadModel => {
             let (url, model) = {
                 let memory = memory.lock().unwrap_or_else(|e| e.into_inner());

@@ -5072,6 +5072,16 @@ pub fn run(
             Some(native.memory.clone())
         },
     );
+    // The optional Qdrant: only when the user chose it and approved starting
+    // their own container. Otherwise this returns at once and asks Docker nothing.
+    crate::native_extensions::service_notifications::start_qdrant_recovery(
+        crate::default_agent_dir(),
+        {
+            let locked = host.lock().unwrap_or_else(|e| e.into_inner());
+            let native = locked.native.lock().unwrap_or_else(|e| e.into_inner());
+            Some(native.memory.clone())
+        },
+    );
     let result = loop {
         let _ = terminal.reacquire();
         if let Some(outcome) = model

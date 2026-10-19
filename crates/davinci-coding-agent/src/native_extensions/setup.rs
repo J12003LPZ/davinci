@@ -631,6 +631,8 @@ pub struct SetupContext<'a> {
     /// Read-only Docker questions for the optional Qdrant step. Asked only
     /// when Qdrant is the chosen backend or the user ran `/setup qdrant`.
     pub docker: &'a dyn super::docker_discovery::DockerRunner,
+    /// Starts DaVinci's own Qdrant container, after consent and nothing else.
+    pub containers: &'a dyn super::qdrant_supervisor::ContainerStarter,
 }
 
 impl<'a> SetupContext<'a> {
@@ -640,6 +642,7 @@ impl<'a> SetupContext<'a> {
             agent_dir,
             supervisor: system_supervisor(),
             docker: &super::docker_discovery::SystemDockerRunner,
+            containers: &super::qdrant_supervisor::SystemContainerStarter,
         }
     }
 }
@@ -1492,6 +1495,7 @@ mod tests {
                 agent_dir: self.agent.path(),
                 supervisor: &self.supervisor,
                 docker: &super::super::docker_discovery::AbsentDocker,
+                containers: &super::super::docker_discovery::AbsentDocker,
             }
         }
     }

@@ -53,6 +53,12 @@ struct Shared {
     stop: AtomicBool,
 }
 
+impl std::fmt::Debug for FakeQdrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FakeQdrant({})", self.address)
+    }
+}
+
 pub struct FakeQdrant {
     address: SocketAddr,
     shared: Arc<Shared>,
