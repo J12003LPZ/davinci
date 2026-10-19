@@ -32,46 +32,92 @@ pub struct DavinciProcessConfig {
 /// Replace credential-shaped values with a marker. Used for every string the
 /// harness exports: diagnostics, trace events, verification commands, diffs.
 ///
-/// Two kinds of match:
+/// What is matched:
 /// - a credential-named key (`api_key`, `AWS_SECRET_ACCESS_KEY`, `password`,
 ///   `auth_token`, `Authorization`, ...) followed by `:` or `=` and a value
-///   that looks like a credential, and
+///   that looks like a credential. The separator and the value's quotes are
+///   kept, so JSON text stays valid JSON;
+/// - a credential-named long flag followed by a space and its value
+///   (`--password hunter2`, `--api-key abc`); the short `-p` is ambiguous and
+///   is left alone;
+/// - the password of URL userinfo (`postgres://user:hunter2@db`);
 /// - credential-shaped values wherever they appear (`sk-...`, `ghp_...`,
-///   `xox[bp]-...`, `AKIA...`, `Bearer ...`).
+///   `xox[bp]-...`, `AKIA...`, Stripe `sk_live_...`, JWTs, `Bearer ...`);
+/// - PEM private key blocks, up to their END line or, when the text was cut
+///   short, to the end of the text.
 ///
 /// Source code must survive: `let token = read_token();`, `token: usize`,
-/// `max_token: 5` and `"input_token": 900` pass through unchanged. A quoted
-/// string is always a value. An unquoted value after a strong key (secret,
-/// password, `*_key` names that hold keys, authorization) is a value unless it
-/// is a number, a type or keyword, or an expression. After a bare `token` key
-/// it must also carry a digit and some length, or be long.
+/// `max_token: 5` and `"input_token": 900` pass through unchanged, and so does
+/// `let secret = other_secret;`: an unquoted identifier or path expression
+/// (`self.password`, `config::SECRET`) is a reference, not a literal. A quoted
+/// string is always a value. Any other unquoted value after a strong key
+/// (secret, password, `*_key` names that hold keys, authorization) is a value
+/// unless it is a number, a type or keyword, or an expression. After a bare
+/// `token` key it must also carry a digit and some length, or be long.
 pub fn redact_credentials(text: &str) -> String {
     use std::sync::OnceLock;
     static KEYED: OnceLock<regex::Regex> = OnceLock::new();
+    static FLAG: OnceLock<regex::Regex> = OnceLock::new();
+    static USERINFO: OnceLock<regex::Regex> = OnceLock::new();
+    static PEM: OnceLock<regex::Regex> = OnceLock::new();
+    static JWT: OnceLock<regex::Regex> = OnceLock::new();
     static BEARER: OnceLock<regex::Regex> = OnceLock::new();
     static BARE: OnceLock<regex::Regex> = OnceLock::new();
-    let keyed = KEYED.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)(["']?)([A-Za-z0-9_-]*?(?:authorization|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|signing[_-]?key|secret|passw(?:or)?d|passphrase|token))(["']?)(\s*[:=]\s*)("[^"]*"|'[^']*'|(?:(?:bearer|basic)\s+)?[^\s,"}'&;]+)"#,
-        )
-        .expect("static credential pattern")
-    });
-    let bearer = BEARER.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}").expect("static bearer pattern")
-    });
-    let bare = BARE.get_or_init(|| {
-        regex::Regex::new(
-            r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35})\b",
-        )
-        .expect("static token pattern")
-    });
-    let text = keyed.replace_all(text, |caps: &regex::Captures| {
+    let compile = |cell: &'static OnceLock<regex::Regex>, pattern: &str| -> &'static regex::Regex {
+        cell.get_or_init(|| regex::Regex::new(pattern).expect("static credential pattern"))
+    };
+    let pem = compile(
+        &PEM,
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
+    );
+    let userinfo = compile(
+        &USERINFO,
+        r"([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^/\s@]+@",
+    );
+    let keyed = compile(
+        &KEYED,
+        r#"(?i)(["']?)([A-Za-z0-9_-]*?(?:authorization|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|signing[_-]?key|secret|passw(?:or)?d|passphrase|token))(["']?)(\s*[:=]\s*)("[^"]*"|'[^']*'|(?:(?:bearer|basic)\s+)?[^\s,"}'&;]+)"#,
+    );
+    let flag = compile(
+        &FLAG,
+        r#"(?i)(--[A-Za-z0-9_-]*?(?:authorization|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|signing[_-]?key|secret|passw(?:or)?d|passphrase|token))(\s+)("[^"]*"|'[^']*'|[^\s"'-][^\s"']*)"#,
+    );
+    let jwt = compile(
+        &JWT,
+        r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{2,}",
+    );
+    let bearer = compile(&BEARER, r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}");
+    let bare = compile(
+        &BARE,
+        r"\b(?:sk-[A-Za-z0-9_-]{16,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35})\b",
+    );
+    // A redacted value keeps its quotes, so `"k": "v"` stays valid JSON.
+    let marker = |value: &str| -> String {
+        match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => format!("{quote}[REDACTED]{quote}"),
+            _ => "[REDACTED]".to_string(),
+        }
+    };
+    let text = pem.replace_all(text, "[REDACTED]");
+    let text = userinfo.replace_all(&text, "${1}[REDACTED]@");
+    let text = keyed.replace_all(&text, |caps: &regex::Captures| {
         if is_credential_value(&caps[2], &caps[5]) {
-            format!("{}{}{}=[REDACTED]", &caps[1], &caps[2], &caps[3])
+            format!(
+                "{}{}{}{}{}",
+                &caps[1],
+                &caps[2],
+                &caps[3],
+                &caps[4],
+                marker(&caps[5])
+            )
         } else {
             caps[0].to_string()
         }
     });
+    let text = flag.replace_all(&text, |caps: &regex::Captures| {
+        format!("{}{}{}", &caps[1], &caps[2], marker(&caps[3]))
+    });
+    let text = jwt.replace_all(&text, "[REDACTED]");
     let text = bearer.replace_all(&text, "Bearer [REDACTED]");
     bare.replace_all(&text, "[REDACTED]").into_owned()
 }
@@ -86,6 +132,20 @@ fn is_credential_value(key: &str, value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     if lower.starts_with("bearer ") || lower.starts_with("basic ") {
         return true;
+    }
+    // `other_secret`, `self.password`, `config::SECRET`: a name or a path to
+    // one, not a literal. A digit (`hunter_2`) makes it look like a literal.
+    let is_reference = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
+        && value.contains(['_', '.', ':'])
+        && !value.chars().any(|c| c.is_ascii_digit());
+    if is_reference {
+        return false;
     }
     if value.chars().any(|c| "()<>{}[]".contains(c)) {
         return false;
@@ -519,6 +579,124 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
     }
 
     #[test]
+    fn redaction_covers_flags_userinfo_and_provider_shapes() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAfakefakefake\nabcdefghijklmnop\n-----END RSA PRIVATE KEY-----";
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJlZmFrZQ";
+        let wrapped = format!(
+            "key:
+{pem}
+end"
+        );
+        let saw = format!("saw {jwt} in log");
+        for (input, secret) in [
+            ("curl --password hunter2 host", "hunter2"),
+            ("mysql --api-key abc123xyz host", "abc123xyz"),
+            ("tool --token xq9 host", "xq9"),
+            ("tool --client-secret 'two words' go", "two words"),
+            ("tool --api_key abcdef", "abcdef"),
+            ("psql postgres://user:hunter2@db/app", "hunter2"),
+            (
+                "git clone https://bot:ghfake-pw@example.com/r.git",
+                "ghfake-pw",
+            ),
+            (
+                "charge sk_live_FAKEFAKEFAKE0123",
+                "sk_live_FAKEFAKEFAKE0123",
+            ),
+            (
+                "charge sk_test_FAKEFAKEFAKE0123",
+                "sk_test_FAKEFAKEFAKE0123",
+            ),
+            (
+                "restricted rk_live_FAKEFAKEFAKE0123",
+                "rk_live_FAKEFAKEFAKE0123",
+            ),
+            (pem, "MIIEowIBAAKCAQEAfakefakefake"),
+            (&format!("key:\n{pem}\nend"), "abcdefghijklmnop"),
+            (
+                "-----BEGIN PRIVATE KEY-----\nMIIfaketruncatedbody",
+                "MIIfaketruncatedbody",
+            ),
+            (saw.as_str(), jwt),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{input} -> {out}");
+        }
+        // The user name and host of a URL survive, so the log stays readable.
+        assert_eq!(
+            redact_credentials("psql postgres://user:hunter2@db/app"),
+            "psql postgres://user:[REDACTED]@db/app"
+        );
+        // The short `-p` is ambiguous (port, path, password) and is left alone.
+        assert_eq!(
+            redact_credentials("mysql -p 3306 host"),
+            "mysql -p 3306 host"
+        );
+        // A flag whose next word is another flag has no value to redact.
+        assert_eq!(
+            redact_credentials("tool --token --verbose"),
+            "tool --token --verbose"
+        );
+        // Ordinary URLs and flags are untouched.
+        for input in [
+            "https://example.com:8080/path",
+            "git@github.com:org/repo.git",
+            "tool --max-tokens 5 --token-file creds.txt",
+            "cargo test --password-policy strict",
+        ] {
+            assert_eq!(redact_credentials(input), input);
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_the_original_separator_so_json_stays_valid() {
+        let json = r#"{"password": "pw-fake-1", "token":"abc-fake-1", "api_key" : 'k-fake-2'}"#;
+        let out = redact_credentials(json);
+        assert!(
+            !out.contains("pw-fake-1") && !out.contains("abc-fake-1") && !out.contains("k-fake-2")
+        );
+        assert_eq!(
+            out,
+            r#"{"password": "[REDACTED]", "token":"[REDACTED]", "api_key" : '[REDACTED]'}"#
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&redact_credentials(r#"{"password": "pw-fake-1", "n": 1}"#))
+                .unwrap();
+        assert_eq!(parsed["password"], "[REDACTED]");
+        assert_eq!(
+            redact_credentials("export API_KEY = fake-0123"),
+            "export API_KEY = [REDACTED]"
+        );
+        assert_eq!(
+            redact_credentials("auth_token: abcdef0123456789"),
+            "auth_token: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn strong_keys_keep_identifier_and_path_values() {
+        for input in [
+            "let secret = other_secret;",
+            "let password = config.password;",
+            "const SECRET: &str = crate::keys::SECRET;",
+            "password = self.password",
+            "secret = settings::SECRET_VALUE",
+        ] {
+            assert_eq!(redact_credentials(input), input);
+        }
+        // Literal values still go.
+        for (input, secret) in [
+            (r#"let secret = "hunter2-fake";"#, "hunter2-fake"),
+            ("secret=hunter2", "hunter2"),
+            ("PASSWORD=Tr0ub4dor", "Tr0ub4dor"),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+        }
+    }
+
+    #[test]
     fn redaction_leaves_code_and_numbers_alone() {
         for input in [
             "let token = read_token();",
@@ -564,7 +742,7 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             timed_out: false,
         };
         let diagnostic = run.bounded_diagnostic();
-        assert!(diagnostic.contains("Authorization=[REDACTED]"));
+        assert!(diagnostic.contains("Authorization: [REDACTED]"));
         assert!(diagnostic.contains("api_key=[REDACTED]"));
         assert!(!diagnostic.contains("bearer-secret"));
         assert!(!diagnostic.contains("key-secret"));
