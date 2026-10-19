@@ -224,6 +224,7 @@ pub fn execute_scenario(
             return Err(format!("verification failed: {}", failed.command));
         }
 
+        trace.redact_credentials();
         artifacts.write_json(
             Path::new("scenarios").join(&scenario.id).join("trace.json"),
             &trace,

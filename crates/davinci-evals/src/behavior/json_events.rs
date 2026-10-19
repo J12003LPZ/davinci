@@ -115,6 +115,7 @@ pub fn trace_from_json_lines(scenario_id: &str, lines: &[String]) -> Result<Beha
     let mut trace =
         BehaviorTrace::from_agent_events(scenario_id, manifest, &agent_events, Some(stats));
     trace.events.extend(supplemental_events);
+    trace.redact_credentials();
     Ok(trace)
 }
 
@@ -273,12 +274,21 @@ fn find_prompt_manifest(value: &Value) -> Option<PromptManifest> {
 
 fn collect_stats(stats: &mut BehaviorStats, value: &Value) {
     let usage = value.get("usage").unwrap_or(value);
-    stats.input_tokens = stats
-        .input_tokens
-        .saturating_add(integer_field(usage, &["inputTokens", "input_tokens"]).unwrap_or(0) as u64);
-    stats.output_tokens = stats.output_tokens.saturating_add(
-        integer_field(usage, &["outputTokens", "output_tokens"]).unwrap_or(0) as u64,
-    );
+    // A count the event does not carry (or marks unreported) stays unknown. It
+    // is never added as zero, so a run that reported nothing cannot look like
+    // a run that spent nothing.
+    let reported = |keys: &[&str], unreported: &[&str]| {
+        if bool_field(usage, unreported).unwrap_or(false) {
+            return None;
+        }
+        integer_field(usage, keys).map(|count| count.max(0) as u64)
+    };
+    if let Some(count) = reported(&["inputTokens", "input_tokens"], &["inputUnreported"]) {
+        stats.input_tokens = Some(stats.input_tokens.unwrap_or(0).saturating_add(count));
+    }
+    if let Some(count) = reported(&["outputTokens", "output_tokens"], &["outputUnreported"]) {
+        stats.output_tokens = Some(stats.output_tokens.unwrap_or(0).saturating_add(count));
+    }
     if let Some(wall_ms) = integer_field(value, &["wallMs", "wall_ms"]) {
         stats.wall_ms = stats.wall_ms.max(wall_ms as u64);
     }
@@ -410,5 +420,86 @@ mod tests {
             event,
             BehaviorEvent::PlanEvent { kind } if kind == "workflow:transaction_verify"
         )));
+    }
+
+    #[test]
+    fn unknown_usage_is_not_zero() {
+        let line = |value: Value| value.to_string();
+        // No usage anywhere: unknown.
+        let none = trace_from_json_lines("u", &[line(json!({"type": "turn_start"}))]).unwrap();
+        assert_eq!(none.stats.input_tokens, None);
+        assert_eq!(none.stats.output_tokens, None);
+        // A measured zero is a measured zero.
+        let zero = trace_from_json_lines(
+            "u",
+            &[line(
+                json!({"type": "turn_end", "usage": {"inputTokens": 0, "outputTokens": 0}}),
+            )],
+        )
+        .unwrap();
+        assert_eq!(zero.stats.input_tokens, Some(0));
+        assert_eq!(zero.stats.output_tokens, Some(0));
+        // Counts add across events; an unreported field does not add a zero.
+        let mixed = trace_from_json_lines(
+            "u",
+            &[
+                line(json!({"type": "turn_end", "usage": {"inputTokens": 100, "outputTokens": 7}})),
+                line(json!({"type": "turn_end", "usage": {"inputTokens": 50, "outputUnreported": true}})),
+            ],
+        )
+        .unwrap();
+        assert_eq!(mixed.stats.input_tokens, Some(150));
+        assert_eq!(mixed.stats.output_tokens, Some(7));
+        let only_unreported = trace_from_json_lines(
+            "u",
+            &[line(
+                json!({"type": "turn_end", "usage": {"outputUnreported": true}}),
+            )],
+        )
+        .unwrap();
+        assert_eq!(only_unreported.stats.output_tokens, None);
+    }
+
+    #[test]
+    fn traces_saved_before_optional_usage_still_load() {
+        let old = json!({
+            "model_turns": 2, "tool_calls": 3, "input_tokens": 900, "output_tokens": 0,
+            "wall_ms": 10, "permission_prompts": 0
+        });
+        let stats: BehaviorStats = serde_json::from_value(old).unwrap();
+        assert_eq!(stats.input_tokens, Some(900));
+        assert_eq!(stats.output_tokens, Some(0));
+        let omitted: BehaviorStats = serde_json::from_value(json!({
+            "model_turns": 1, "tool_calls": 0, "wall_ms": 0, "permission_prompts": 0
+        }))
+        .unwrap();
+        assert_eq!(omitted.input_tokens, None);
+        assert_eq!(omitted.output_tokens, None);
+        // Unknown round-trips as unknown, not as zero.
+        let back: BehaviorStats =
+            serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
+        assert_eq!(back, omitted);
+    }
+
+    #[test]
+    fn sensitive_values_never_enter_exported_trace() {
+        let lines = [
+            json!({"type": "tool_call", "id": "g1", "name": "grep",
+                "args": {"query": "api_key=sk-fake-0123456789abcdef"}}),
+            json!({"type": "shell_exit", "id": "b1", "tool": "bash", "exitCode": 0,
+                "command": "curl -H 'Authorization: Bearer fake-token-abc123' https://example.test"}),
+            json!({"type": "final_response",
+                "text": "All tests pass. token=ghp_fakeSecret0123456789"}),
+        ]
+        .map(|value| value.to_string());
+        let trace = trace_from_json_lines("secret", &lines).unwrap();
+        let exported = serde_json::to_string(&trace).unwrap();
+        for secret in [
+            "sk-fake-0123456789abcdef",
+            "fake-token-abc123",
+            "ghp_fakeSecret0123456789",
+        ] {
+            assert!(!exported.contains(secret), "{secret} leaked: {exported}");
+        }
     }
 }

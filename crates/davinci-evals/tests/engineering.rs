@@ -162,7 +162,7 @@ fn trace_observer_preserves_unavailable_metrics_and_reports_missing_steps() {
     });
     trace.stats = BehaviorStats {
         tool_calls: 4,
-        output_tokens: 12,
+        output_tokens: Some(12),
         ..BehaviorStats::default()
     };
 

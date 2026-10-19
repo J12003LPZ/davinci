@@ -29,6 +29,28 @@ pub struct DavinciProcessConfig {
     pub allowed_env: BTreeMap<String, String>,
 }
 
+/// Replace credential-shaped values with a marker. Used for every string the
+/// harness exports: diagnostics, trace events, verification commands, diffs.
+pub fn redact_credentials(text: &str) -> String {
+    use std::sync::OnceLock;
+    static KEYED: OnceLock<regex::Regex> = OnceLock::new();
+    static BARE: OnceLock<regex::Regex> = OnceLock::new();
+    let keyed = KEYED.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)\b(authorization|api[_-]?key|token|secret|password)\b\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\s,"}'&]+"#,
+        )
+        .expect("static credential pattern")
+    });
+    let bare = BARE.get_or_init(|| {
+        regex::Regex::new(
+            r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b",
+        )
+        .expect("static token pattern")
+    });
+    let text = keyed.replace_all(text, "$1=[REDACTED]");
+    bare.replace_all(&text, "[REDACTED]").into_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DavinciProcessRun {
     pub exit_code: i32,
@@ -42,9 +64,7 @@ impl DavinciProcessRun {
     pub fn bounded_diagnostic(&self) -> String {
         const LIMIT: usize = 2_048;
         let combined = format!("{}\n{}", self.stdout_lines.join("\n"), self.stderr);
-        let redacted = regex::Regex::new(r#"(?i)(authorization|api[_-]?key)\s*[:=]\s*[^\s,"}]+"#)
-            .expect("static credential pattern")
-            .replace_all(&combined, "$1=[REDACTED]");
+        let redacted = redact_credentials(&combined);
         redacted
             .chars()
             .rev()

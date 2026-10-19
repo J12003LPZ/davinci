@@ -81,8 +81,11 @@ pub struct FileDiff {
 pub struct BehaviorStats {
     pub model_turns: u64,
     pub tool_calls: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    /// `None` means the run never reported the count; `Some(0)` is a measured zero.
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
     pub wall_ms: u64,
     pub permission_prompts: u64,
 }
@@ -166,6 +169,25 @@ pub fn detect_verification_claims(text: &str) -> Vec<String> {
 }
 
 impl BehaviorTrace {
+    /// Strip credential-shaped values from every free-text field before the
+    /// trace leaves the process. Structure, counts and exit codes are kept.
+    pub fn redact_credentials(&mut self) {
+        use super::process::redact_credentials as redact;
+        for event in &mut self.events {
+            match event {
+                BehaviorEvent::Search { query, .. } => *query = redact(query),
+                BehaviorEvent::VerificationClaim { claim } => *claim = redact(claim),
+                _ => {}
+            }
+        }
+        for item in &mut self.verification {
+            item.command = redact(&item.command);
+        }
+        for file in &mut self.file_diffs {
+            file.diff = redact(&file.diff);
+        }
+    }
+
     pub fn new(scenario_id: impl Into<String>, prompt_manifest: Option<PromptManifest>) -> Self {
         Self {
             scenario_id: scenario_id.into(),
