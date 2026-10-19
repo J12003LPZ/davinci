@@ -859,10 +859,11 @@ fn result_transition_and_session_outbox_are_atomic() {
 }
 
 #[test]
-fn replayed_result_without_its_call_in_history_does_not_reach_the_provider() {
-    // The journal knows the call ran and holds its result, but the session lost
-    // the assistant message that issued it. Replaying the result alone would
-    // send an unpaired history.
+fn replayed_result_without_its_call_in_history_is_withheld_from_the_provider() {
+    // The journal holds a result whose assistant message the session does not
+    // have (a host-run command, or a damaged session). Replaying it alone
+    // would send an unpaired history, so it is withheld, and the session keeps
+    // working.
     let fixture = Fixture::new();
     fixture.complete_provider_call(
         "lost-call",
@@ -872,14 +873,20 @@ fn replayed_result_without_its_call_in_history_does_not_reach_the_provider() {
     );
     let mut agent = fixture.agent();
     let mut requests = 0;
-    let error = agent
-        .run_loop(|_| {
+    agent
+        .run_loop(|agent| {
             requests += 1;
+            assert!(
+                !agent
+                    .messages
+                    .iter()
+                    .any(|message| message.tool_call_id.as_deref() == Some("lost-call")),
+                "an unpaired result reached the provider"
+            );
             Ok(done_response())
         })
-        .expect_err("an unpaired history must not reach the provider");
-    assert!(error.contains("lost-call"), "{error}");
-    assert_eq!(requests, 0);
+        .unwrap();
+    assert_eq!(requests, 1);
 }
 
 #[test]

@@ -267,10 +267,13 @@ fn missing_result_after_recovery_has_explicit_nonexecution_or_unknown() {
 }
 
 #[test]
-fn a_journal_record_does_not_excuse_a_result_with_no_call_in_history() {
-    // The assistant message is the record of the call. A journal entry for the
-    // same id says the call ran, not that the conversation still contains it:
-    // sending the result alone would be an unpaired history.
+fn a_journal_known_orphan_is_withheld_not_sent_and_does_not_poison_the_session() {
+    // The journal says the call ran, but the conversation no longer holds the
+    // assistant message that issued it (a host-run command never had one; a
+    // damaged session lost it). The result cannot be sent alone, and refusing
+    // every later prompt would strand the session: it is withheld from the
+    // provider, with a warning. An id the journal does not know still fails
+    // closed (`orphan_result_id_fails_closed`).
     let fixture = Fixture::new(&[
         ChatMessage::text("user", "start"),
         result_message("lost_call", "bash", "output of a call the history lost"),
@@ -278,15 +281,48 @@ fn a_journal_record_does_not_excuse_a_result_with_no_call_in_history() {
     fixture.latch_started_effect("lost_call", "bash");
     let mut agent = fixture.agent();
     agent.prompt("continue");
+    let mut sent = Vec::new();
+    agent
+        .run_loop(|agent| {
+            sent = agent.messages.clone();
+            Ok(done())
+        })
+        .expect("the session still accepts prompts");
+    assert!(
+        tool_results(&sent, "lost_call").is_empty(),
+        "an unpaired result must not reach the provider: {sent:?}"
+    );
+}
+
+#[test]
+fn host_run_checks_do_not_poison_the_session_on_resume() {
+    // A host-run verification command has a journal entry and a result but no
+    // assistant message: the host, not the model, issued it. Resuming such a
+    // session must not fail every prompt.
+    let fixture = Fixture::new(&[ChatMessage::text("user", "start")]);
+    let mut agent = fixture.agent();
+    agent.set_permission_mode(davinci_agent::PermissionMode::AlwaysApprove);
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The receipt plumbing is not wired in this fixture and the call may report
+    // that; the operation itself is still admitted and journaled.
+    let _ = agent.execute_host_verification_command(
+        &fixture.workspace,
+        "echo host-check",
+        20_000,
+        abort,
+    );
+    drop(agent);
+
+    let mut resumed = fixture.agent();
+    resumed.prompt("continue");
     let mut requests = 0;
-    let error = agent
+    resumed
         .run_loop(|_| {
             requests += 1;
             Ok(done())
         })
-        .expect_err("an unpaired history must not reach the provider");
-    assert!(error.contains("lost_call"), "{error}");
-    assert_eq!(requests, 0);
+        .expect("a resumed session with a host-run check still accepts prompts");
+    assert_eq!(requests, 1);
 }
 
 #[test]

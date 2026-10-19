@@ -407,14 +407,14 @@ impl Agent {
     /// A result whose call id was never issued by an earlier assistant message
     /// cannot be repaired by guessing; the history is refused before any
     /// provider request is built from it.
-    fn reject_orphan_tool_results(&self) -> Result<(), String> {
+    fn reject_orphan_tool_results(&mut self) -> Result<(), String> {
         // Only a persisted conversation is checked: its history came from disk
         // and may be damaged. Hosts that build `messages` in memory own them.
         if self.session.is_none() {
             return Ok(());
         }
         let mut called = std::collections::HashSet::new();
-        let mut orphans: Vec<&str> = Vec::new();
+        let mut orphans: Vec<String> = Vec::new();
         for message in &self.messages {
             if message.role == "assistant" {
                 for content in &message.content {
@@ -425,7 +425,7 @@ impl Agent {
             } else if message.role == "toolResult" {
                 if let Some(id) = message.tool_call_id.as_deref() {
                     if !called.contains(id) {
-                        orphans.push(id);
+                        orphans.push(id.to_string());
                     }
                 }
             }
@@ -433,16 +433,44 @@ impl Agent {
         if orphans.is_empty() {
             return Ok(());
         }
-        // The assistant message is the record of the call. The operation
-        // journal says a call ran, not that the conversation still holds it,
-        // so it excuses nothing here. Results the outbox replay adds later are
-        // checked again by the caller once they are in the history.
-        match orphans.first() {
-            None => Ok(()),
-            Some(id) => Err(format!(
-                "Tool result {id} has no matching tool call earlier in the conversation; refusing to send an unpaired history."
-            )),
+        // The assistant message is the record of a model's call. The operation
+        // journal records every call that ran, including ones the host issued
+        // itself (checks, handoffs), which never had an assistant message. A
+        // result the journal accounts for cannot be sent alone, but refusing
+        // every later prompt would strand the session: it is withheld from the
+        // provider, with a warning. An id nothing accounts for fails closed.
+        let mut withheld: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let (Some(journal), Some(session)) = (self.operation_journal(), self.session.as_ref()) {
+            let snapshot = journal
+                .snapshot()
+                .map_err(|error| format!("operation journal could not be read: {error}"))?;
+            for id in &orphans {
+                if snapshot.operations.iter().any(|spec| {
+                    spec.context().session_id == session.header.id
+                        && spec.context().wire_tool_call_id.as_deref() == Some(id.as_str())
+                }) {
+                    withheld.insert(id.clone());
+                }
+            }
         }
+        if let Some(id) = orphans.iter().find(|id| !withheld.contains(*id)) {
+            return Err(format!(
+                "Tool result {id} has no matching tool call earlier in the conversation; refusing to send an unpaired history."
+            ));
+        }
+        eprintln!(
+            "warning: withholding {} tool result(s) with no matching tool call from the provider request: {}",
+            withheld.len(),
+            withheld.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        self.messages.retain(|message| {
+            !(message.role == "toolResult"
+                && message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| withheld.contains(id)))
+        });
+        Ok(())
     }
 
     /// `(assistant index, call id, tool name)` for calls with no toolResult.
