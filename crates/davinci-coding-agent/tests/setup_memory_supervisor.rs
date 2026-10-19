@@ -209,3 +209,191 @@ fn a_utf8_bom_in_a_config_file_is_tolerated() {
     assert_eq!(effective.memory.enabled_source, EnabledSource::ConfigFile);
     assert!(effective.issues().is_empty());
 }
+
+// ---- Task 2: health from probes ------------------------------------------
+
+use davinci_coding_agent::native_extensions::setup_health::{
+    assess_memory, probe_memory_store, probe_ollama, EmbedOutcome, HealthState, MemoryFacts,
+    OllamaProbe, ProbeTarget, EMBEDDING_MISMATCH, INSTALL_REQUIRED, MODEL_MISSING,
+    PROJECTION_STALE, PROVIDER_OFFLINE,
+};
+use davinci_coding_agent::native_extensions::LocalStoreHealth;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A loopback Ollama: `/api/tags` lists `models`, `/api/embed` answers with
+/// vectors of `dimensions`. Counts the requests it serves.
+struct FakeOllama {
+    url: String,
+    requests: Arc<AtomicUsize>,
+}
+
+fn fake_ollama(models: &'static [&'static str], dimensions: usize) -> FakeOllama {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 8192];
+                let mut read = 0;
+                // Read until the headers (and a short body) are in.
+                while let Ok(n) = stream.read(&mut buffer[read..]) {
+                    if n == 0 {
+                        break;
+                    }
+                    read += n;
+                    if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") && read > 40 {
+                        break;
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let body = if request.starts_with("GET /api/tags") {
+                    let list: Vec<_> = models
+                        .iter()
+                        .map(|name| format!("{{\"name\":\"{name}\"}}"))
+                        .collect();
+                    format!("{{\"models\":[{}]}}", list.join(","))
+                } else if request.starts_with("POST /api/embed") {
+                    let vector: Vec<_> = (0..dimensions).map(|i| format!("{}.5", i % 7)).collect();
+                    format!("{{\"embeddings\":[[{}]]}}", vector.join(","))
+                } else {
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    FakeOllama { url, requests }
+}
+
+fn target(url: &str, dimensions: usize) -> ProbeTarget {
+    ProbeTarget {
+        url: url.into(),
+        model: "embeddinggemma".into(),
+        dimensions,
+        timeout: Duration::from_secs(5),
+    }
+}
+
+fn facts<'a>(probe: Option<&'a OllamaProbe>, store: &'a LocalStoreHealth) -> MemoryFacts<'a> {
+    MemoryFacts {
+        enabled: true,
+        config_error: None,
+        store,
+        probe,
+        ollama_installed: None,
+        starting: false,
+        model: "embeddinggemma",
+        configured_dimensions: 768,
+        records: 3,
+        lag: 0,
+    }
+}
+
+#[test]
+fn health_does_not_claim_dense_ready_when_ollama_down() {
+    let store = LocalStoreHealth::Ok;
+
+    // Nothing listens: Degraded with PROVIDER_OFFLINE. The dense cooldown
+    // flag is not an input at all.
+    let down = probe_ollama(&target("http://127.0.0.1:9", 768));
+    assert!(!down.reachable);
+    let health = assess_memory(&facts(Some(&down), &store));
+    assert_eq!(health.state, HealthState::Degraded);
+    assert_eq!(health.code, Some(PROVIDER_OFFLINE));
+
+    // No ollama on the machine either: install is required.
+    let mut f = facts(Some(&down), &store);
+    f.ollama_installed = Some(false);
+    assert_eq!(assess_memory(&f).code, Some(INSTALL_REQUIRED));
+    assert_eq!(assess_memory(&f).state, HealthState::ActionRequired);
+
+    // Server up, model missing: ActionRequired MODEL_MISSING, and the probe
+    // did not embed.
+    let server = fake_ollama(&["other-model:latest"], 768);
+    let missing = probe_ollama(&target(&server.url, 768));
+    assert_eq!(missing.model_installed, Some(false));
+    assert_eq!(missing.embed, EmbedOutcome::NotAttempted);
+    let health = assess_memory(&facts(Some(&missing), &store));
+    assert_eq!(
+        (health.state, health.code),
+        (HealthState::ActionRequired, Some(MODEL_MISSING))
+    );
+    // Listing the models is the only request: a probe never pulls.
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+
+    // Everything works: Ready. A stale record makes it Degraded.
+    let server = fake_ollama(&["embeddinggemma:latest"], 768);
+    let up = probe_ollama(&target(&server.url, 768));
+    assert!(matches!(
+        up.embed,
+        EmbedOutcome::Ok {
+            dimensions: 768,
+            ..
+        }
+    ));
+    assert_eq!(
+        assess_memory(&facts(Some(&up), &store)).state,
+        HealthState::Ready
+    );
+    let mut f = facts(Some(&up), &store);
+    f.lag = 2;
+    let health = assess_memory(&f);
+    assert_eq!(
+        (health.state, health.code),
+        (HealthState::Degraded, Some(PROJECTION_STALE))
+    );
+
+    // Disabled stays Disabled, whatever the probe says; no probe is Checking.
+    let mut f = facts(Some(&up), &store);
+    f.enabled = false;
+    assert_eq!(assess_memory(&f).state, HealthState::Disabled);
+    assert_eq!(
+        assess_memory(&facts(None, &store)).state,
+        HealthState::Checking
+    );
+}
+
+#[test]
+fn a_model_with_the_wrong_vector_size_is_an_embedding_mismatch() {
+    let server = fake_ollama(&["embeddinggemma"], 512);
+    let probe = probe_ollama(&target(&server.url, 768));
+    assert_eq!(probe.embed, EmbedOutcome::Mismatch { actual: 512 });
+    let store = LocalStoreHealth::Ok;
+    let health = assess_memory(&facts(Some(&probe), &store));
+    assert_eq!(
+        (health.state, health.code),
+        (HealthState::ActionRequired, Some(EMBEDDING_MISMATCH))
+    );
+    assert!(health
+        .remediation
+        .unwrap()
+        .contains("\"embeddingDimensions\": 512"));
+}
+
+#[test]
+fn an_unreadable_store_is_action_required_even_when_ollama_is_fine() {
+    let store = LocalStoreHealth::Unreadable("cannot read records.jsonl".into());
+    let health = assess_memory(&facts(None, &store));
+    assert_eq!(health.code, Some("LOCAL_STORE_UNREADABLE"));
+    assert_eq!(
+        probe_memory_store(&store).state,
+        HealthState::ActionRequired
+    );
+    assert_eq!(
+        probe_memory_store(&LocalStoreHealth::Ok).state,
+        HealthState::Ready
+    );
+}

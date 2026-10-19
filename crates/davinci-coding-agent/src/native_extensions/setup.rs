@@ -85,6 +85,10 @@ pub struct Step {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Stable error code (`MODEL_MISSING`, `LOCAL_STORE_UNREADABLE`, ...) when
+    /// the step needs the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
 }
 
 impl Step {
@@ -95,7 +99,13 @@ impl Step {
             state,
             detail,
             action: None,
+            code: None,
         }
+    }
+
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 
     fn with_action(mut self, action: impl Into<String>) -> Self {
@@ -369,13 +379,22 @@ fn spawn_ollama_serve(program: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Probe the embedding service from a config snapshot: the memory lock is
+/// released before the network is touched, so a slow or hung server never
+/// holds up a turn that needs memory.
+fn probe_unlocked(memory: &Arc<Mutex<VectorMemory>>) -> memory_page::Probe {
+    let config = memory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .config
+        .clone();
+    memory_page::probe_config(&config)
+}
+
 fn wait_for_server(memory: &Arc<Mutex<VectorMemory>>) -> memory_page::Probe {
     let started = Instant::now();
     loop {
-        let probe = {
-            let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-            memory_page::probe(&memory)
-        };
+        let probe = probe_unlocked(memory);
         if probe.reachable || started.elapsed() >= SERVE_WAIT {
             return probe;
         }
@@ -406,11 +425,19 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
     if let Some(progress) = pull_for(&url, &model).filter(|p| !p.finished) {
         return Step::new(ID, TITLE, StepState::Running, pull_line(&progress));
     }
+    if let super::vector_memory::LocalStoreHealth::Unreadable(error) = memory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .store_health()
+    {
+        return Step::new(ID, TITLE, StepState::Action, error)
+            .with_code(super::vector_memory::LOCAL_STORE_UNREADABLE)
+            .with_action(
+                "the record file was left untouched; fix its permissions or encoding, or move it aside, then run /memory-reindex",
+            );
+    }
 
-    let mut probe = {
-        let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-        memory_page::probe(&memory)
-    };
+    let mut probe = probe_unlocked(memory);
     let mut started_server = false;
     if !probe.reachable {
         let installed = find_on_path("ollama");
@@ -422,6 +449,7 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
                     StepState::Action,
                     format!("no Ollama at {url}; search uses keywords only"),
                 )
+                .with_code(super::setup_health::INSTALL_REQUIRED)
                 .with_action(format!(
                     "install Ollama from https://ollama.com/download, then run /setup (it pulls {model})"
                 ));
@@ -455,6 +483,7 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
                     StepState::Action,
                     format!("Ollama is installed but {url} does not answer"),
                 )
+                .with_code(super::setup_health::PROVIDER_OFFLINE)
                 .with_action("start Ollama (`ollama serve`), then run /setup");
             }
         }
@@ -487,6 +516,7 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
                 StepState::Action,
                 format!("{server}; embedding model {model} is not installed"),
             )
+            .with_code(super::setup_health::MODEL_MISSING)
             .with_action(format!("run /setup to pull it, or `ollama pull {model}`"));
         }
         start_pull(Arc::clone(memory), &url, &model);
@@ -494,6 +524,23 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
         return Step::new(ID, TITLE, StepState::Running, pull_line(&progress));
     }
 
+    // A model that answers with the wrong vector size is not "a failed
+    // embedding": say what to change.
+    if let Some(actual) = probe
+        .embed_dimensions
+        .filter(|actual| *actual != dimensions)
+    {
+        return Step::new(
+            ID,
+            TITLE,
+            StepState::Action,
+            format!("{model} returns {actual} dimensions; memory expects {dimensions}"),
+        )
+        .with_code(super::setup_health::EMBEDDING_MISMATCH)
+        .with_action(format!(
+            "set \"embeddingDimensions\": {actual} in ~/.davinci/agent/vector-memory.json, then run /setup repair"
+        ));
+    }
     if !probe.embed_ok {
         return Step::new(
             ID,
@@ -505,20 +552,6 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
             ),
         )
         .with_action("check `embeddingModel` in ~/.davinci/agent/vector-memory.json");
-    }
-    if let Some(actual) = probe
-        .embed_dimensions
-        .filter(|actual| *actual != dimensions)
-    {
-        return Step::new(
-            ID,
-            TITLE,
-            StepState::Action,
-            format!("{model} returns {actual} dimensions; memory expects {dimensions}"),
-        )
-        .with_action(format!(
-            "set \"embeddingDimensions\": {actual} in ~/.davinci/agent/vector-memory.json"
-        ));
     }
 
     let (records, lag) = {
@@ -1145,6 +1178,52 @@ mod tests {
             dir.to_path_buf(),
             config,
         )))
+    }
+
+    #[test]
+    fn a_model_with_another_vector_size_names_the_dimension_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        // The server answers with 12 dimensions; memory expects 8.
+        let memory = memory_with(
+            dir.path(),
+            super::super::vector_memory::tests::fake_ollama(12),
+        );
+        let step = memory_step(&memory, false);
+        assert_eq!(step.state, StepState::Action, "{}", step.detail);
+        assert_eq!(step.code, Some("EMBEDDING_MISMATCH"));
+        assert!(step.detail.contains("12 dimensions"), "{}", step.detail);
+        assert!(
+            step.action
+                .as_deref()
+                .unwrap_or("")
+                .contains("\"embeddingDimensions\": 12"),
+            "{:?}",
+            step.action
+        );
+    }
+
+    #[test]
+    fn an_unreadable_record_file_is_an_action_not_a_green_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = memory_with(
+            dir.path(),
+            super::super::vector_memory::tests::fake_ollama(8),
+        );
+        let path = memory.lock().unwrap().local_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"\xff\xfe").unwrap();
+        // Rebuild so the constructor sees the bad file.
+        let rebuilt = {
+            let config = memory.lock().unwrap().config.clone();
+            Arc::new(Mutex::new(VectorMemory::with_config(
+                dir.path().to_path_buf(),
+                config,
+            )))
+        };
+        let step = memory_step(&rebuilt, true);
+        assert_eq!(step.state, StepState::Action);
+        assert_eq!(step.code, Some("LOCAL_STORE_UNREADABLE"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfe");
     }
 
     #[test]

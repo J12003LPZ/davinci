@@ -18,6 +18,7 @@ pub mod repo_intelligence;
 pub mod security_scan;
 pub mod service_authority;
 pub mod setup;
+pub mod setup_health;
 pub mod setup_profile;
 pub mod test_impact;
 pub mod token_governor;

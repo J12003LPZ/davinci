@@ -2505,6 +2505,11 @@ impl VectorMemory {
                         texts.len(),
                     ) {
                         Ok(embeddings) => return Ok(embeddings),
+                        // The server answered with vectors of another size:
+                        // the older endpoint would say the same, once per text.
+                        Err(error) if error.to_string().contains("EMBEDDING_MISMATCH") => {
+                            return Err(error)
+                        }
                         Err(error) => error,
                     }
                 }
@@ -2754,9 +2759,10 @@ fn parse_embedding_vector(
     expected_dimensions: usize,
 ) -> Result<Vec<f32>, ToolError> {
     if vector.len() != expected_dimensions {
-        return Err(ToolError::Failed(
-            "embedding dimensions do not match configuration".into(),
-        ));
+        return Err(ToolError::Failed(format!(
+            "EMBEDDING_MISMATCH: the server returned {} dimensions; memory is configured for {expected_dimensions}",
+            vector.len()
+        )));
     }
     vector
         .iter()
