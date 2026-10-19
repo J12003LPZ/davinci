@@ -286,3 +286,281 @@ fn a_finished_run_says_what_to_do_next() {
         .unwrap()
         .starts_with("/design revise"));
 }
+
+// ---- selection and targeted revision
+
+use davinci_ai::ContentBlock;
+use davinci_coding_agent::design::selection::*;
+
+fn status(
+    controller: &DesignController,
+    agent: &mut davinci_agent::Agent,
+    dir: &std::path::Path,
+    artifact: ArtifactId,
+) -> Value {
+    controller
+        .execute(
+            agent,
+            dir,
+            DesignRequest::Status {
+                artifact_id: artifact,
+            },
+        )
+        .unwrap()
+}
+fn select(
+    controller: &DesignController,
+    agent: &mut davinci_agent::Agent,
+    dir: &std::path::Path,
+    request: SelectVariant,
+) -> DesignResult<Value> {
+    controller.execute(agent, dir, DesignRequest::Select { request })
+}
+fn read_files(
+    controller: &DesignController,
+    agent: &mut davinci_agent::Agent,
+    dir: &std::path::Path,
+    artifact: ArtifactId,
+    revision: &str,
+) -> Value {
+    controller
+        .execute(
+            agent,
+            dir,
+            DesignRequest::Read {
+                artifact_id: artifact,
+                revision: serde_json::from_value(json!(revision)).unwrap(),
+            },
+        )
+        .unwrap()["files"]
+        .clone()
+}
+/// Every file under the workspace that is not the design store itself.
+fn repository(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut found = vec![];
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if ["sessions", "design", "ledger.json"]
+                .iter()
+                .any(|skip| name.starts_with(skip))
+            {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push((name, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+/// A `design_patch` call that returns the current revision with edits applied.
+fn patch(current: &Value, files: &Value, edit: impl Fn(&mut Value, &mut Value)) -> ContentBlock {
+    let mut variants = current["revision"]["variants"].clone();
+    let mut files = files.clone();
+    edit(&mut variants, &mut files);
+    ContentBlock::ToolCall {
+        id: OperationId::new().to_string(),
+        name: "design_patch".into(),
+        arguments: json!({
+            "files": files,
+            "entry_points": current["revision"]["sources"]["entry_points"],
+            "variants": variants,
+            "bindings": [],
+        }),
+    }
+}
+fn page(title: &str, body: &str) -> Value {
+    json!(format!(
+        "<!doctype html><html lang=\"en\"><title>{title}</title><main>{body}</main></html>"
+    ))
+}
+
+#[test]
+fn select_variant_revise_reload_and_review_without_apply() {
+    let (dir, mut agent, controller, artifact) = generated();
+    std::fs::write(dir.path().join("app.txt"), "the repository").unwrap();
+    let before = repository(dir.path());
+
+    let shown = status(&controller, &mut agent, dir.path(), artifact);
+    assert!(shown["selection"].is_null(), "nothing chosen yet");
+    let ids: Vec<String> = shown["revision"]["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|variant| variant["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    let revision = shown["manifest"]["revision"].clone();
+    let choose = |id: &str, operation: OperationId, revision: &Value| SelectVariant {
+        artifact_id: artifact,
+        revision: serde_json::from_value(revision.clone()).unwrap(),
+        variant_id: Some(id.parse().unwrap()),
+        operation_id: operation,
+    };
+
+    // Stale or foreign choices are refused and leave no mark.
+    assert!(matches!(
+        select(
+            &controller,
+            &mut agent,
+            dir.path(),
+            choose(&ids[1], OperationId::new(), &json!("9"))
+        ),
+        Err(DesignError::Conflict(_))
+    ));
+    assert!(matches!(
+        select(
+            &controller,
+            &mut agent,
+            dir.path(),
+            choose(&VariantId::new().to_string(), OperationId::new(), &revision)
+        ),
+        Err(DesignError::NotFound(_))
+    ));
+    assert!(status(&controller, &mut agent, dir.path(), artifact)["selection"].is_null());
+
+    // Choose B. The same operation twice is one choice; another payload under
+    // the same operation id is a conflict.
+    let operation = OperationId::new();
+    let receipt = select(
+        &controller,
+        &mut agent,
+        dir.path(),
+        choose(&ids[1], operation, &revision),
+    )
+    .unwrap();
+    assert_eq!(receipt["variant_id"], ids[1]);
+    assert_eq!(
+        select(
+            &controller,
+            &mut agent,
+            dir.path(),
+            choose(&ids[1], operation, &revision)
+        )
+        .unwrap(),
+        receipt
+    );
+    assert!(matches!(
+        select(
+            &controller,
+            &mut agent,
+            dir.path(),
+            choose(&ids[2], operation, &revision)
+        ),
+        Err(DesignError::Conflict(_))
+    ));
+
+    // A restart keeps the choice: the session is read back from disk.
+    let path = agent.session.as_ref().unwrap().path.clone();
+    agent.session = Some(davinci_session::JsonlSession::open(&path).unwrap());
+    let reloaded = status(&controller, &mut agent, dir.path(), artifact);
+    assert_eq!(reloaded["selection"]["variant_id"], ids[1]);
+
+    // "Make B more minimal": the model rewrites B and tries to touch A first.
+    let files = read_files(&controller, &mut agent, dir.path(), artifact, "1");
+    let minimal = |variants: &mut Value, files: &mut Value| {
+        variants[1]["title"] = json!("Concept 1, more minimal");
+        files["v1.html"] = page("B", "Minimal");
+    };
+    let touches_a = patch(&reloaded, &files, |variants, files| {
+        minimal(variants, files);
+        files["v0.html"] = page("A", "Changed A");
+    });
+    let good = patch(&reloaded, &files, minimal);
+    let store = controller.store.clone();
+    let request = GenerationRequest {
+        artifact_id: artifact,
+        expected_revision: serde_json::from_value(revision.clone()).unwrap(),
+        brief: "make B more minimal".into(),
+        operation_id: OperationId::new(),
+        target_variant: Some(ids[1].parse().unwrap()),
+    };
+    let mut m = model(vec![touches_a, good, review()]);
+    m.calls = 3;
+    let state = run_it(
+        &store,
+        &mut agent,
+        dir.path(),
+        &request,
+        &mut m,
+        &mut renderer(),
+    );
+    assert_eq!(
+        state.progress.phase,
+        RunPhase::Complete,
+        "{:?}",
+        state.failure
+    );
+    assert_eq!(
+        state.progress.repairs, 1,
+        "the edit to A was sent back once"
+    );
+    assert_eq!(m.calls, 6, "no concept plan was asked for");
+
+    let after = status(&controller, &mut agent, dir.path(), artifact);
+    assert_eq!(after["manifest"]["revision"], "2");
+    let new_files = read_files(&controller, &mut agent, dir.path(), artifact, "2");
+    assert_ne!(new_files["v1.html"], files["v1.html"], "B changed");
+    assert_eq!(new_files["v0.html"], files["v0.html"], "A is untouched");
+    assert_eq!(new_files["v2.html"], files["v2.html"], "C is untouched");
+    assert_eq!(
+        after["revision"]["variants"][0],
+        reloaded["revision"]["variants"][0]
+    );
+    assert_eq!(
+        after["revision"]["variants"][2],
+        reloaded["revision"]["variants"][2]
+    );
+    assert_eq!(
+        after["selection"]["variant_id"], ids[1],
+        "the choice outlives the revision"
+    );
+
+    // Choosing and revising changed nothing in the repository.
+    assert_eq!(repository(dir.path()), before);
+
+    // A model that will not leave C alone is stopped at the exact reason, and
+    // the last revision stays the head.
+    let stubborn = || {
+        patch(&after, &new_files, |variants, files| {
+            variants[1]["title"] = json!("B again");
+            files["v2.html"] = page("C", "Changed C");
+        })
+    };
+    let mut request = request;
+    request.expected_revision = serde_json::from_value(json!("2")).unwrap();
+    request.operation_id = OperationId::new();
+    let mut m = model(vec![stubborn(), stubborn(), stubborn()]);
+    m.calls = 10;
+    let state = run_it(
+        &store,
+        &mut agent,
+        dir.path(),
+        &request,
+        &mut m,
+        &mut renderer(),
+    );
+    assert_eq!(state.progress.phase, RunPhase::Blocked);
+    let failure = state.failure.unwrap();
+    assert_eq!(failure.phase, RunPhase::Generate);
+    assert!(
+        failure.message.contains("only the selected concept"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(
+        status(&controller, &mut agent, dir.path(), artifact)["manifest"]["revision"],
+        "2"
+    );
+    assert_eq!(repository(dir.path()), before);
+}

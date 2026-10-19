@@ -39,6 +39,10 @@ pub struct ImplementationProposal {
     pub plan_hash: String,
     pub step_id: String,
     pub brief: String,
+    /// The concept the person chose, when they did. The proposal implements
+    /// the accepted revision; this says which concept of it they meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<super::selection::DesignSelectionReceipt>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,7 +231,14 @@ pub fn prepare_handoff(
             "transaction target scope differs from the reviewed candidate".into(),
         ));
     }
-    let brief = format!("Implement accepted design {} revision {} (source {}, acceptance evidence {}). Preserve routes, factual content, authentication and existing backend behavior. No dependency/configuration changes, installation, commits or deployment. Prototype mocks and preview captures are not production integration evidence. Review RSC/client boundaries and use existing components. Validate the actual target build/tests and primary browser flow. Until those receipts exist, implementation remains unverified.", request.artifact_id, request.revision.0, accepted.source_hash, evidence);
+    let selection =
+        super::selection::current_selection(store, &ctx, session(agent)?, request.artifact_id)?;
+    let chosen = selection
+        .as_ref()
+        .and_then(|selection| selection.variant_id)
+        .map(|variant| format!(" Implement the concept the person selected, variant {variant}; the other concepts are alternatives, not requirements."))
+        .unwrap_or_default();
+    let brief = format!("Implement accepted design {} revision {} (source {}, acceptance evidence {}).{chosen} Preserve routes, factual content, authentication and existing backend behavior. No dependency/configuration changes, installation, commits or deployment. Prototype mocks and preview captures are not production integration evidence. Review RSC/client boundaries and use existing components. Validate the actual target build/tests and primary browser flow. Until those receipts exist, implementation remains unverified.", request.artifact_id, request.revision.0, accepted.source_hash, evidence);
     let step_id = format!("design-{}", request.operation_id);
     let revision = agent
         .tool_context
@@ -274,6 +285,7 @@ pub fn prepare_handoff(
         plan_hash: plan_hash(agent)?,
         step_id,
         brief,
+        selection,
     };
     let bytes = serde_json::to_vec(&proposal)?;
     if bytes.len() > 220 * 1024 {

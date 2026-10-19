@@ -20,6 +20,11 @@ pub enum DesignCommand {
         brief: String,
         operation_id: OperationId,
     },
+    /// Choose one concept (or `none`); later revisions touch only that concept.
+    Select {
+        artifact_id: ArtifactId,
+        variant_id: Option<VariantId>,
+    },
     /// Try the failed phase of a blocked generation again from its checkpoint.
     Resume {
         artifact_id: ArtifactId,
@@ -136,8 +141,8 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         return create(&tokens[1..], BTreeMap::new());
     }
     let reserved = [
-        "new", "list", "open", "status", "revise", "resume", "verify", "fork", "restore", "export",
-        "apply", "sync",
+        "new", "list", "open", "status", "revise", "resume", "select", "verify", "fork", "restore",
+        "export", "apply", "sync",
     ];
     if !reserved.contains(&command) {
         return create(&tokens, BTreeMap::new());
@@ -206,7 +211,11 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
             path: positional[0].clone(),
         });
     }
-    let expected = if command == "resume" { 2 } else { 1 };
+    let expected = if matches!(command, "resume" | "select") {
+        2
+    } else {
+        1
+    };
     if positional.is_empty() || (command != "revise" && positional.len() != expected) {
         return Err(DesignError::InvalidInput(
             "invalid command arguments".into(),
@@ -223,6 +232,13 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         "open" => DesignCommand::Open { artifact_id },
         "status" => DesignCommand::Status { artifact_id },
         "verify" => DesignCommand::Verify { artifact_id },
+        "select" => DesignCommand::Select {
+            artifact_id,
+            variant_id: match positional[1].as_str() {
+                "none" => None,
+                other => Some(other.parse()?),
+            },
+        },
         "resume" => DesignCommand::Resume {
             artifact_id,
             operation_id: positional[1].parse()?,

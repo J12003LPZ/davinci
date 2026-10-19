@@ -344,3 +344,32 @@ fn resume_is_a_command_and_finds_the_run_by_its_checkpoint() {
         Err(DesignError::NotFound(_))
     ));
 }
+
+#[test]
+fn select_is_a_command_and_none_clears_it() {
+    let artifact = ArtifactId::new();
+    let variant = VariantId::new();
+    match parse_design_command(&format!("/design select {artifact} {variant}")).unwrap() {
+        DesignCommand::Select {
+            artifact_id,
+            variant_id,
+        } => {
+            assert_eq!(artifact_id, artifact);
+            assert_eq!(variant_id, Some(variant));
+        }
+        other => panic!("select expected, got {other:?}"),
+    }
+    assert!(matches!(
+        parse_design_command(&format!("/design select {artifact} none")).unwrap(),
+        DesignCommand::Select {
+            variant_id: None,
+            ..
+        }
+    ));
+    assert!(parse_design_command(&format!("/design select {artifact}")).is_err());
+    assert!(parse_design_command(&format!("/design select {artifact} not-a-variant")).is_err());
+    assert_eq!(
+        create("/design select a color palette for a florist").brief,
+        "select a color palette for a florist"
+    );
+}

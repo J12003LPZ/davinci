@@ -20,6 +20,10 @@ pub struct GenerationRequest {
     pub expected_revision: RevisionId,
     pub brief: String,
     pub operation_id: OperationId,
+    /// Revise only this concept of the current revision. Every other concept
+    /// and every file it uses must come back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_variant: Option<VariantId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -259,6 +263,10 @@ pub struct DesignRunState {
     pub quality: Option<QualityReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<DesignFailureReceipt>,
+    /// The revision a targeted run started from; the concepts it must not
+    /// change are read from it, however many repairs the run takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<RevisionId>,
 }
 /// Trusted host injection, never constructible by a browser or generated tool call.
 /// Implementations return measured evidence; they cannot publish acceptance.
@@ -357,6 +365,56 @@ fn parse_generated_source(
         ));
     }
     Ok(source)
+}
+
+/// A targeted revision may change the chosen concept and the files only it
+/// uses. Every other concept must be present as it was, and every other file
+/// byte for byte; anything else is the model's to fix.
+fn only_target_changed(
+    before: &DesignRevision,
+    files: &BTreeMap<String, String>,
+    after: &GeneratedSource,
+    target: VariantId,
+) -> DesignResult<()> {
+    let changed = |what: String| {
+        Err(DesignError::InvalidInput(format!(
+            "only the selected concept may change, but {what}"
+        )))
+    };
+    let mut target_files = std::collections::BTreeSet::new();
+    for variant in &before.variants {
+        if variant.id == target {
+            target_files.extend(variant.artboards.iter().map(|b| b.entry_point.clone()));
+            continue;
+        }
+        match after.variants.iter().find(|v| v.id == variant.id) {
+            Some(same) if same == variant => {}
+            Some(_) => return changed(format!("concept {} was altered", variant.id)),
+            None => return changed(format!("concept {} is missing", variant.id)),
+        }
+    }
+    if !after.variants.iter().any(|variant| variant.id == target) {
+        return changed("the selected concept is missing".into());
+    }
+    // A file the other concepts use is not the target's to rewrite, even when
+    // the target uses it too.
+    let shared: std::collections::BTreeSet<&String> = before
+        .variants
+        .iter()
+        .filter(|variant| variant.id != target)
+        .flat_map(|variant| variant.artboards.iter().map(|b| &b.entry_point))
+        .collect();
+    for (path, text) in files {
+        if target_files.contains(path) && !shared.contains(path) {
+            continue;
+        }
+        match after.files.get(path) {
+            Some(now) if now == text => {}
+            Some(_) => return changed(format!("{path} was edited")),
+            None => return changed(format!("{path} was removed")),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -504,7 +562,11 @@ fn phase_messages(
                     .assets
             };
             messages.push(ChatMessage::text("user", serde_json::to_string(&json!({"directions":state.directions,"current_source":files,"retained_assets":assets,"findings":state.findings,"quality":state.quality}))?));
-            if state.progress.phase == RunPhase::Generate {
+            if let (RunPhase::Generate, Some(target)) =
+                (state.progress.phase, state.request.target_variant)
+            {
+                messages.push(ChatMessage::text("user", format!("Revise ONLY the concept with id {target} according to the requested revision. Call the single active source tool exactly once with every variant. Return every other variant exactly as it is in current_source: the same id, title and artboards. Only the entry point files of the revised concept may change; every other existing file must come back byte-identical. Add new files for anything new. The variants field MUST be an array of variant objects. Keep all node bindings backed by JSON source; the host computes source_hash from supplied JSON bytes. Never invent real backend integrations. Repairs must address the supplied findings.")));
+            } else if state.progress.phase == RunPhase::Generate {
                 messages.push(ChatMessage::text("user", "Call the single active source tool exactly once with every variant and complete source. The variants field MUST be an array of variant objects, including when there is only one concept; never send a bare object. Preserve factual content, responsive behavior, accessible names and keyboard interactions. Keep all node bindings backed by JSON source; the host computes source_hash from supplied JSON bytes. Never invent real backend integrations. Repairs must address the supplied findings without changing the selected directions."));
             } else {
                 if images {
@@ -742,6 +804,28 @@ fn run_accounted(
             facts.as_ref(),
             12_000,
         )?;
+        let baseline = match request.target_variant {
+            Some(target) => {
+                if manifest.revision.0 == 0 {
+                    return Err(DesignError::InvalidInput(
+                        "there is no concept to revise yet".into(),
+                    ));
+                }
+                let current = store.read_revision(
+                    &ctx,
+                    session(agent)?,
+                    request.artifact_id,
+                    manifest.revision,
+                )?;
+                if !current.variants.iter().any(|variant| variant.id == target) {
+                    return Err(DesignError::NotFound(
+                        "the selected concept is not in the current revision".into(),
+                    ));
+                }
+                Some(manifest.revision)
+            }
+            None => None,
+        };
         let state = DesignRunState {
             request: request.clone(),
             request_hash,
@@ -754,7 +838,12 @@ fn run_accounted(
             system_snapshot: snapshot,
             directions: vec![],
             progress: RunProgress {
-                phase: RunPhase::Directions,
+                // A targeted revision keeps the plan it already has.
+                phase: if baseline.is_some() {
+                    RunPhase::Generate
+                } else {
+                    RunPhase::Directions
+                },
                 in_flight: false,
                 repairs: 0,
                 deadline_ms: davinci_session::now_ms().saturating_add(600_000),
@@ -764,6 +853,7 @@ fn run_accounted(
             findings: vec![],
             quality: None,
             failure: None,
+            baseline,
         };
         checkpoint(store, &ctx, agent, &state)?;
         state
@@ -1010,9 +1100,15 @@ fn run_phases(
                         "generation must call the active artifact source tool exactly once".into(),
                     ));
                 }
-                let source = (|| -> DesignResult<GeneratedSource> {
-                    let mut source =
-                        parse_generated_source(calls[0].1.clone(), state.directions.len())?;
+                let expected_variants = match state.baseline {
+                    Some(baseline) => store
+                        .read_revision(ctx, session(agent)?, head.id, baseline)?
+                        .variants
+                        .len(),
+                    None => state.directions.len(),
+                };
+                let mut source = (|| -> DesignResult<GeneratedSource> {
+                    let mut source = parse_generated_source(calls[0].1.clone(), expected_variants)?;
                     // Hashing is deterministic host work, never a model arithmetic obligation.
                     for binding in &mut source.bindings {
                         let file = source.files.get(&binding.source_file).ok_or_else(|| {
@@ -1025,6 +1121,16 @@ fn run_phases(
                     }
                     Ok(source)
                 })();
+                // Only the chosen concept may change in a targeted revision.
+                if let (Ok(generated), Some(target), Some(baseline)) =
+                    (&mut source, state.request.target_variant, state.baseline)
+                {
+                    let before = store.read_revision(ctx, session(agent)?, head.id, baseline)?;
+                    let files = store.read_sources(ctx, session(agent)?, head.id, baseline)?;
+                    if let Err(error) = only_target_changed(&before, &files, generated, target) {
+                        source = Err(error);
+                    }
+                }
                 // A malformed call is the model's to fix, inside the repair
                 // allowance, like a compile or render failure.
                 let source = match source {

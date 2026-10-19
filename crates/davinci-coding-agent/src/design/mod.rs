@@ -26,6 +26,7 @@ pub mod quality;
 pub mod records;
 pub mod render;
 pub mod runtime;
+pub mod selection;
 pub mod setup;
 pub mod skills;
 pub mod store;

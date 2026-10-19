@@ -173,6 +173,7 @@ pub fn setup_with_variants(
         expected_revision: RevisionId(0),
         brief: "Create the design".into(),
         operation_id: OperationId::new(),
+        target_variant: None,
     };
     (dir, agent, store, request)
 }

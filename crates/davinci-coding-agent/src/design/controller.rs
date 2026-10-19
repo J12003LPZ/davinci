@@ -93,6 +93,10 @@ pub enum DesignRequest {
     Accept {
         request: super::acceptance::AcceptRequest,
     },
+    /// Choose a concept (or clear the choice). Changes no source.
+    Select {
+        request: super::selection::SelectVariant,
+    },
     Sync {
         path: String,
         operation_id: OperationId,
@@ -114,7 +118,10 @@ impl DesignRequest {
             }
             Self::VerifyImplementation { .. } => "design_check",
             Self::Apply { .. } => "design_apply",
-            Self::Edit { .. } | Self::Comment { .. } | Self::Restore { .. } => "design_patch",
+            Self::Edit { .. }
+            | Self::Comment { .. }
+            | Self::Restore { .. }
+            | Self::Select { .. } => "design_patch",
             Self::Verify { .. } | Self::Render { .. } | Self::Interact { .. } => "design_render",
             Self::Export { .. } => "design_export",
             Self::Accept { .. } => "design_accept",
@@ -580,9 +587,12 @@ impl DesignController {
                     )
                     .is_ok()
                 });
+                let selection =
+                    super::selection::current_selection(&self.store, &ctx, session, artifact_id)?;
                 Ok(
                     json!({"manifest":manifest,"revision":revision,"quality":quality,"comments":comments,"captures":captures,
-                    "runtime_error":runtime_error,"evidence_hash":evidence_hash,"acceptance_gaps":acceptance_gaps,"accepted":accepted}),
+                    "runtime_error":runtime_error,"evidence_hash":evidence_hash,"acceptance_gaps":acceptance_gaps,"accepted":accepted,
+                    "selection":selection}),
                 )
             }
             DesignRequest::Edit { edit } => Ok(serde_json::to_value(super::edits::apply_edit(
@@ -647,6 +657,9 @@ impl DesignController {
                     request,
                 )?)?)
             }
+            DesignRequest::Select { request } => Ok(serde_json::to_value(
+                super::selection::select_variant(&self.store, &ctx, session, request)?,
+            )?),
             DesignRequest::Sync { path, operation_id } => {
                 self.store
                     .prepare(&ctx, session, "design_sync", &json!({"path":path}))?;
@@ -703,6 +716,23 @@ impl DesignController {
                         expected_revision: manifest.revision,
                         brief,
                         operation_id: OperationId::new(),
+                        target_variant: None,
+                    },
+                }
+            }
+            DesignCommand::Select {
+                artifact_id,
+                variant_id,
+            } => {
+                let value =
+                    self.execute(agent, workspace, DesignRequest::Status { artifact_id })?;
+                let manifest: ArtifactManifest = serde_json::from_value(value["manifest"].clone())?;
+                DesignRequest::Select {
+                    request: super::selection::SelectVariant {
+                        artifact_id,
+                        revision: manifest.revision,
+                        variant_id,
+                        operation_id: OperationId::new(),
                     },
                 }
             }
@@ -714,12 +744,18 @@ impl DesignController {
                 let value =
                     self.execute(agent, workspace, DesignRequest::Status { artifact_id })?;
                 let manifest: ArtifactManifest = serde_json::from_value(value["manifest"].clone())?;
+                // A chosen concept is the only one a revision touches.
+                let target_variant = serde_json::from_value::<
+                    Option<super::selection::DesignSelectionReceipt>,
+                >(value["selection"].clone())?
+                .and_then(|selection| selection.variant_id);
                 DesignRequest::Generate {
                     request: super::generation::GenerationRequest {
                         artifact_id,
                         expected_revision: manifest.revision,
                         brief,
                         operation_id,
+                        target_variant,
                     },
                 }
             }
