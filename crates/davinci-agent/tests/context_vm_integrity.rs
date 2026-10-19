@@ -1017,3 +1017,130 @@ fn wor59_run_loop_tool_rounds_do_not_rebuild_the_vm() {
     // One rebuild creates the first checkpoint; none after that.
     assert_eq!(vm.metrics().rebuilds, 1, "{:?}", vm.metrics());
 }
+
+mod byte_recovery {
+    use davinci_agent::runtime::cache::{CacheConfig, CacheRuntime};
+    use davinci_agent::runtime::context_vm::{
+        events_from_messages, ContextVmConfig, ContextVmRuntime, RetrieveContextRequest,
+    };
+    use davinci_agent::{ContextItem, ContextPacket};
+    use davinci_ai::ChatMessage;
+    use sha2::{Digest, Sha256};
+
+    const REF: &str = "repo:data.json";
+
+    fn digest(text: &str) -> String {
+        Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// A runtime that holds `text` as an exact source.
+    fn runtime_with(text: &str) -> (tempfile::TempDir, ContextVmRuntime) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ContextVmRuntime::new(
+            ContextVmConfig::default(),
+            CacheRuntime::new(CacheConfig::default(), Some(directory.path().to_path_buf())),
+        );
+        let packet = ContextPacket {
+            items: vec![ContextItem {
+                source: REF.into(),
+                content: text.into(),
+                estimated_tokens: 8,
+                priority: 100,
+                stable_for_cache: true,
+                authority: Default::default(),
+                provenance: serde_json::json!({"provenance_kind":"repository_fact"}),
+            }],
+            estimated_tokens: 8,
+            cache_key: "fixture".into(),
+        };
+        runtime
+            .compile(
+                &events_from_messages(&[ChatMessage::text("user", "read the data")]),
+                &packet,
+                1_000_000,
+            )
+            .unwrap();
+        (directory, runtime)
+    }
+
+    fn request(byte_offset: Option<usize>) -> RetrieveContextRequest {
+        RetrieveContextRequest {
+            source_ref: Some(REF.into()),
+            byte_offset,
+            ..RetrieveContextRequest::default()
+        }
+    }
+
+    /// 200 KB on one line (multi-byte text, so cuts must find a boundary),
+    /// then a CRLF line break, which line paging would have turned into LF.
+    fn big_source() -> String {
+        let value = "é1\"x".repeat(50_000);
+        format!("{{\"blob\":\"{value}\"}}\r\nsecond line\r\n")
+    }
+
+    #[test]
+    fn oversized_line_recovers_exact_source_by_byte_offset() {
+        let original = big_source();
+        assert!(original.len() > 200_000);
+        let (_dir, runtime) = runtime_with(&original);
+
+        // The line page cuts the long line and says where its tail starts.
+        let first = runtime.retrieve(&request(None)).unwrap();
+        assert!(first.content.contains("line cut at"));
+        let resume = first.next_byte_offset.expect("the cut line has a tail");
+        let shown = first.content.split(" … [line cut").next().unwrap();
+        assert!(original.starts_with(shown), "the shown part is a prefix");
+        assert_eq!(
+            resume,
+            shown.len(),
+            "the tail starts where the page stopped"
+        );
+
+        // Following byteOffset to the end returns the exact original.
+        let mut rebuilt = shown.to_string();
+        let mut next = Some(resume);
+        let mut pages = 0;
+        while let Some(at) = next {
+            let page = runtime.retrieve(&request(Some(at))).unwrap();
+            assert!(page.content.len() <= 64 * 1024);
+            rebuilt.push_str(&page.content);
+            next = page.next_byte_offset;
+            pages += 1;
+            assert!(pages < 100, "paging does not end");
+        }
+        assert_eq!(rebuilt.len(), original.len());
+        assert_eq!(digest(&rebuilt), digest(&original));
+        assert!(
+            rebuilt.contains("}\r\nsecond line\r\n"),
+            "CRLF was rewritten"
+        );
+    }
+
+    #[test]
+    fn byte_offset_misuse_is_refused_not_guessed() {
+        let original = big_source();
+        let (_dir, runtime) = runtime_with(&original);
+        // Inside the two-byte "é" at the start of the value.
+        let inside = original.find('é').unwrap() + 1;
+        assert!(runtime
+            .retrieve(&request(Some(inside)))
+            .unwrap_err()
+            .contains("UTF-8 boundary"));
+        assert!(runtime
+            .retrieve(&request(Some(original.len() + 1)))
+            .unwrap_err()
+            .contains("past the end"));
+        let mut both = request(Some(0));
+        both.query = Some("second".into());
+        assert!(runtime
+            .retrieve(&both)
+            .unwrap_err()
+            .contains("cannot be combined"));
+        // The end of the source is a valid, empty page.
+        let end = runtime.retrieve(&request(Some(original.len()))).unwrap();
+        assert_eq!((end.content.as_str(), end.next_byte_offset), ("", None));
+    }
+}
