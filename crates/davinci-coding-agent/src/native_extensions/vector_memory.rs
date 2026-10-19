@@ -1287,6 +1287,34 @@ pub struct VectorMemory {
     /// Set when an embedding request failed; dense retrieval and document
     /// embedding are skipped until it passes.
     dense_offline_until: Arc<Mutex<Option<Instant>>>,
+    /// Why the record file could not be read, when it could not. While set,
+    /// nothing is written to that file: the in-memory state is not the file's
+    /// state, and rewriting from it would destroy what is there.
+    store_error: Option<String>,
+}
+
+/// Stable code for an existing record file that cannot be read (for example
+/// not UTF-8 or no access). The file is left exactly as it is.
+pub const LOCAL_STORE_UNREADABLE: &str = "LOCAL_STORE_UNREADABLE";
+
+/// What the last read of the local record file found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalStoreHealth {
+    /// Read fine, or the file does not exist yet (created on first write).
+    Ok,
+    /// The file exists and could not be read; the reason is attached.
+    Unreadable(String),
+}
+
+impl LocalStoreHealth {
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_))
+    }
+
+    /// `Some(LOCAL_STORE_UNREADABLE)` when unreadable.
+    pub fn code(&self) -> Option<&'static str> {
+        self.is_unreadable().then_some(LOCAL_STORE_UNREADABLE)
+    }
 }
 
 fn known_key_scoped(kind: MemoryKind, hash: &str, profile: Option<&str>) -> String {
@@ -1324,9 +1352,19 @@ impl VectorMemory {
             last_indexed: 0,
             last_indexed_at: None,
             dense_offline_until: Arc::new(Mutex::new(None)),
+            store_error: None,
         };
+        // A failed read is kept (`store_error`), not discarded: it blocks
+        // writes to that file and shows up in `status()`.
         let _ = memory.load_local();
         memory
+    }
+
+    pub fn store_health(&self) -> LocalStoreHealth {
+        match &self.store_error {
+            Some(error) => LocalStoreHealth::Unreadable(error.clone()),
+            None => LocalStoreHealth::Ok,
+        }
     }
 
     pub fn local_path(&self) -> PathBuf {
@@ -1350,11 +1388,16 @@ impl VectorMemory {
     }
 
     fn load_local(&mut self) -> Result<(), ToolError> {
-        let content = match fs::read_to_string(self.local_path()) {
-            Ok(content) => content,
+        let path = self.local_path();
+        let content = match fs::read(&path).map(String::from_utf8) {
+            Ok(Ok(content)) => content,
+            Ok(Err(_)) => {
+                return Err(self.mark_store_unreadable(&path, "the file is not valid UTF-8"))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(ToolError::Failed(error.to_string())),
+            Err(error) => return Err(self.mark_store_unreadable(&path, &error.to_string())),
         };
+        self.store_error = None;
         self.records.clear();
         self.foreign_lines.clear();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
@@ -1379,7 +1422,19 @@ impl VectorMemory {
         Ok(())
     }
 
+    fn mark_store_unreadable(&mut self, path: &Path, reason: &str) -> ToolError {
+        let message = format!(
+            "{LOCAL_STORE_UNREADABLE}: cannot read {}: {reason}. The file was left untouched; fix or move it, then run /memory-reindex.",
+            path.display()
+        );
+        self.store_error = Some(message.clone());
+        ToolError::Failed(message)
+    }
+
     fn persist_local(&self) -> Result<(), ToolError> {
+        if let Some(message) = &self.store_error {
+            return Err(ToolError::Failed(message.clone()));
+        }
         let path = self.local_path();
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))
             .map_err(|err| ToolError::Failed(err.to_string()))?;
@@ -2319,6 +2374,10 @@ impl VectorMemory {
             .count();
         json!({
             "enabled": self.config.enabled,
+            "storeHealth": match &self.store_error {
+                Some(error) => json!({"state": "unreadable", "code": LOCAL_STORE_UNREADABLE, "detail": error}),
+                None => json!({"state": "ok"}),
+            },
             "repoId": self.repo_id,
             "collection": self.config.collection,
             "records": self.records.len(),
