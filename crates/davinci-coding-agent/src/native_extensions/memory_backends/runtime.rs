@@ -277,7 +277,7 @@ fn cache_key(config: &VectorMemoryConfig, repo_id: &str) -> String {
         .map(|key| sha256_hex(key.expose().as_bytes()))
         .unwrap_or_default();
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{repo_id}|{key_digest}",
         config.qdrant_url,
         config.projection.collection_prefix,
         config.projection.allow_remote,
@@ -285,6 +285,5 @@ fn cache_key(config: &VectorMemoryConfig, repo_id: &str) -> String {
         config.request_timeout_seconds,
         config.embedding_model,
         config.embedding_dimensions,
-        format!("{repo_id}{key_digest}")
     )
 }

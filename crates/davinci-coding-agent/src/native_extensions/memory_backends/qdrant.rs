@@ -331,8 +331,10 @@ mod tests {
 
     #[test]
     fn a_remote_url_is_refused_without_the_opt_in() {
-        let mut config = VectorMemoryConfig::default();
-        config.qdrant_url = "https://qdrant.example.com".into();
+        let mut config = VectorMemoryConfig {
+            qdrant_url: "https://qdrant.example.com".into(),
+            ..VectorMemoryConfig::default()
+        };
         assert!(matches!(
             QdrantProjection::new(&config, "r"),
             Err(ProjectionError::Refused(_))

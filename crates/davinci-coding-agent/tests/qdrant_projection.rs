@@ -287,7 +287,7 @@ fn api_key_goes_in_a_header_and_nowhere_else() {
     let status = memory.status().to_string();
     assert!(!status.contains("k-123-secret"));
     assert!(!format!("{:?}", memory.config).contains("k-123-secret"));
-    assert!(!format!("{:?}", memory).contains("k-123-secret"));
+    assert!(!format!("{memory:?}").contains("k-123-secret"));
 }
 
 // ---- Task 3: lag, outage fallback and reconcile ----

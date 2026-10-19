@@ -49,7 +49,7 @@ impl Default for QdrantEvaluationConfig {
             queries: 60,
             dimensions: 64,
             k: 10,
-            seed: 0x5eed_0f_c0ffee,
+            seed: 0x5eed_0fc0_ffee,
         }
     }
 }
