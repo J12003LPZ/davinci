@@ -147,143 +147,221 @@ impl Default for TokenGovernorConfig {
 impl TokenGovernorConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        apply_env(&mut config);
+        apply_env(&mut config, &super::vector_memory::process_env);
         config
     }
 
+    /// The config file merged over defaults, then the environment. A file that
+    /// exists but cannot be read or parsed never turns into the defaults: the
+    /// governor stays off until the file is fixed.
     pub fn from_file(path: &Path) -> Self {
-        let mut config = fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-            .unwrap_or_default();
-        apply_env(&mut config);
-        config
+        Self::load_file(path, &super::vector_memory::process_env).0
     }
-}
 
-fn apply_env(config: &mut TokenGovernorConfig) {
-    if let Some(value) = env_bool_any(&[
+    /// Like [`Self::from_file`], with the file's state and an injectable
+    /// environment. A UTF-8 byte order mark is accepted.
+    pub fn load_file(
+        path: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> (Self, super::vector_memory::ConfigFileState) {
+        use super::vector_memory::ConfigFileState;
+        let (mut config, state) = match fs::read(path) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                match serde_json::from_str::<Self>(text) {
+                    Ok(config) => (config, ConfigFileState::Present),
+                    Err(error) => (
+                        Self {
+                            enabled: false,
+                            ..Self::default()
+                        },
+                        ConfigFileState::Corrupt(error.to_string()),
+                    ),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Self::default(), ConfigFileState::Missing)
+            }
+            Err(error) => (
+                Self {
+                    enabled: false,
+                    ..Self::default()
+                },
+                ConfigFileState::Corrupt(error.to_string()),
+            ),
+        };
+        apply_env(&mut config, env);
+        (config, state)
+    }
+
+    /// The variables that switch the governor on or off, for setup to list.
+    pub const ENABLED_ENV: &'static [&'static str] = &[
         "DAVINCI_GOVERNOR_ENABLED",
         "DAVINCI_TOKEN_GOVERNOR_ENABLED",
         "PI_GOVERNOR_ENABLED",
         "PI_TOKEN_GOVERNOR_ENABLED",
-    ]) {
+    ];
+}
+
+type EnvGet<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn apply_env(config: &mut TokenGovernorConfig, get: EnvGet) {
+    if let Some(value) = env_bool_any(
+        get,
+        &[
+            "DAVINCI_GOVERNOR_ENABLED",
+            "DAVINCI_TOKEN_GOVERNOR_ENABLED",
+            "PI_GOVERNOR_ENABLED",
+            "PI_TOKEN_GOVERNOR_ENABLED",
+        ],
+    ) {
         config.enabled = value;
     }
-    if let Some(value) = env_bool_any(&[
-        "DAVINCI_GOVERNOR_CONTENT_AWARE",
-        "DAVINCI_TOKEN_GOVERNOR_CONTENT_AWARE",
-        "PI_GOVERNOR_CONTENT_AWARE",
-        "PI_TOKEN_GOVERNOR_CONTENT_AWARE",
-    ]) {
+    if let Some(value) = env_bool_any(
+        get,
+        &[
+            "DAVINCI_GOVERNOR_CONTENT_AWARE",
+            "DAVINCI_TOKEN_GOVERNOR_CONTENT_AWARE",
+            "PI_GOVERNOR_CONTENT_AWARE",
+            "PI_TOKEN_GOVERNOR_CONTENT_AWARE",
+        ],
+    ) {
         config.content_aware = value;
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
-        "DAVINCI_TOKEN_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
-        "PI_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
-        "PI_TOKEN_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+            "DAVINCI_TOKEN_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+            "PI_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+            "PI_TOKEN_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+        ],
+    ) {
         config.specialized_min_reduction_pct = value.min(100) as u8;
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_GOVERNOR_COMPRESS_THRESHOLD",
-        "DAVINCI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_BYTES",
-        "PI_GOVERNOR_COMPRESS_THRESHOLD",
-        "PI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_BYTES",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_GOVERNOR_COMPRESS_THRESHOLD",
+            "DAVINCI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_BYTES",
+            "PI_GOVERNOR_COMPRESS_THRESHOLD",
+            "PI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_BYTES",
+        ],
+    ) {
         config.compress_threshold_bytes = value.max(1);
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_LINES",
-        "PI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_LINES",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_LINES",
+            "PI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_LINES",
+        ],
+    ) {
         config.compress_threshold_lines = value.max(1);
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_KEEP_HEAD_LINES",
-        "PI_TOKEN_GOVERNOR_KEEP_HEAD_LINES",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_KEEP_HEAD_LINES",
+            "PI_TOKEN_GOVERNOR_KEEP_HEAD_LINES",
+        ],
+    ) {
         config.keep_head_lines = value;
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_KEEP_TAIL_LINES",
-        "PI_TOKEN_GOVERNOR_KEEP_TAIL_LINES",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_KEEP_TAIL_LINES",
+            "PI_TOKEN_GOVERNOR_KEEP_TAIL_LINES",
+        ],
+    ) {
         config.keep_tail_lines = value;
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_MAX_IMPORTANT_LINES",
-        "PI_TOKEN_GOVERNOR_MAX_IMPORTANT_LINES",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_MAX_IMPORTANT_LINES",
+            "PI_TOKEN_GOVERNOR_MAX_IMPORTANT_LINES",
+        ],
+    ) {
         config.max_important_lines = value.max(1);
     }
-    if let Some(value) = env_bool_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_DEDUPE_READS",
-        "PI_TOKEN_GOVERNOR_DEDUPE_READS",
-    ]) {
+    if let Some(value) = env_bool_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_DEDUPE_READS",
+            "PI_TOKEN_GOVERNOR_DEDUPE_READS",
+        ],
+    ) {
         config.dedupe_reads = value;
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_DEDUPE_WINDOW",
-        "PI_TOKEN_GOVERNOR_DEDUPE_WINDOW",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_DEDUPE_WINDOW",
+            "PI_TOKEN_GOVERNOR_DEDUPE_WINDOW",
+        ],
+    ) {
         config.dedupe_window = value;
     }
-    if let Some(value) = env_bool_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_ANTI_LOOP",
-        "PI_TOKEN_GOVERNOR_ANTI_LOOP",
-    ]) {
+    if let Some(value) = env_bool_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_ANTI_LOOP",
+            "PI_TOKEN_GOVERNOR_ANTI_LOOP",
+        ],
+    ) {
         config.anti_loop = value;
     }
-    if let Some(value) = env_usize_any(&[
-        "DAVINCI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES",
-        "PI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES",
-    ]) {
+    if let Some(value) = env_usize_any(
+        get,
+        &[
+            "DAVINCI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES",
+            "PI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES",
+        ],
+    ) {
         config.retrieve_max_bytes = value.max(1_024);
     }
-    if let Some(value) = env_string_any(&[
-        "DAVINCI_GOVERNOR_STORE_DIR",
-        "DAVINCI_TOKEN_GOVERNOR_DIR",
-        "PI_GOVERNOR_STORE_DIR",
-        "PI_TOKEN_GOVERNOR_DIR",
-    ]) {
+    if let Some(value) = env_string_any(
+        get,
+        &[
+            "DAVINCI_GOVERNOR_STORE_DIR",
+            "DAVINCI_TOKEN_GOVERNOR_DIR",
+            "PI_GOVERNOR_STORE_DIR",
+            "PI_TOKEN_GOVERNOR_DIR",
+        ],
+    ) {
         config.store_dir = Some(PathBuf::from(value));
     }
 }
 
-fn env_string_any(names: &[&str]) -> Option<String> {
+fn env_string_any(get: EnvGet, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
+        get(name)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     })
 }
 
-fn env_bool_any(names: &[&str]) -> Option<bool> {
-    names.iter().find_map(|name| env_bool(name))
+fn env_bool_any(get: EnvGet, names: &[&str]) -> Option<bool> {
+    names.iter().find_map(|name| env_bool(get, name))
 }
 
-fn env_usize_any(names: &[&str]) -> Option<usize> {
-    names.iter().find_map(|name| env_usize(name))
+fn env_usize_any(get: EnvGet, names: &[&str]) -> Option<usize> {
+    names.iter().find_map(|name| env_usize(get, name))
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    match std::env::var(name)
-        .ok()?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+fn env_bool(get: EnvGet, name: &str) -> Option<bool> {
+    match get(name)?.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
 }
 
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.trim().parse().ok()
+fn env_usize(get: EnvGet, name: &str) -> Option<usize> {
+    get(name)?.trim().parse().ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

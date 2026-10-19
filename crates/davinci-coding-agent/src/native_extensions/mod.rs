@@ -18,6 +18,7 @@ pub mod repo_intelligence;
 pub mod security_scan;
 pub mod service_authority;
 pub mod setup;
+pub mod setup_profile;
 pub mod test_impact;
 pub mod token_governor;
 pub mod vector_memory;
@@ -384,7 +385,11 @@ impl NativeExtensionHost {
             None => davinci_agent::runtime::cache::CacheRuntime::default(),
         };
         let mut governor_config = agent_dir
-            .map(|dir| TokenGovernorConfig::from_file(&dir.join("token-governor.json")))
+            .map(|dir| {
+                setup_profile::load_effective_setup(dir, &vector_memory::process_env)
+                    .governor
+                    .config
+            })
             .unwrap_or_else(TokenGovernorConfig::from_env);
         // Stored outputs belong to this host's agent dir, not whatever
         // `USERPROFILE` says: a host started for another agent dir (tests,
@@ -1185,12 +1190,18 @@ impl NativeExtensionHost {
     }
 }
 
-/// The memory service config. It comes from the host's agent directory (or
-/// the environment), never from the project: a repository must not be able to
-/// point the embedding client at a server or switch on a service start.
+/// The memory service config. It comes from the host's agent directory (the
+/// setup profile, `vector-memory.json`, then the environment), never from the
+/// project: a repository must not be able to point the embedding client at a
+/// server or switch on a service start. An unreadable config file or an
+/// explicit "off" in the profile leaves memory off.
 fn host_memory_config(agent_dir: Option<&Path>) -> VectorMemoryConfig {
     agent_dir
-        .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
+        .map(|dir| {
+            setup_profile::load_effective_setup(dir, &vector_memory::process_env)
+                .memory
+                .config
+        })
         .unwrap_or_else(VectorMemoryConfig::from_env)
 }
 
