@@ -686,6 +686,13 @@ mod tests {
         artifacts
             .write_text("summary.md", &format!("leaked {secret}"))
             .unwrap();
+        // The public trace writer is an artifact path too.
+        crate::artifacts::persist_behavior_trace_artifacts(
+            &dir.path().join("persisted"),
+            "secrets",
+            &result.trace,
+        )
+        .unwrap();
 
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             for entry in fs::read_dir(dir).unwrap() {
