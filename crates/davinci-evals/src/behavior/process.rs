@@ -110,7 +110,11 @@ pub fn redact_credentials(text: &str) -> String {
             &caps[5],
         ) {
             caps[0].to_string()
-        } else if is_credential_value(&caps[2], &caps[5]) {
+        } else if is_credential_value(
+            &caps[2],
+            &caps[5],
+            is_config_line(&text[..whole.start()], &text[whole.end()..], &caps[4]),
+        ) {
             format!(
                 "{}{}{}{}{}",
                 &caps[1],
@@ -138,8 +142,10 @@ pub fn redact_credentials(text: &str) -> String {
 ///   `config::SECRET`) or names the credential word itself (`other_secret`);
 /// - the line is not a `key=value;key=value` connection string;
 /// - the match is a source assignment: a statement that BEGINS with
-///   `let/const/var/static` (optionally `pub`), or a whole line of the form
-///   `ident: value[,;]`.
+///   `let/const/var/static` (optionally `pub`) and ends with `;` (path or
+///   names-the-word value), or a whole `ident: value,` / `ident: value;` field
+///   line whose value starts with `self.` or contains `::` (an empty tail does
+///   not count: that is YAML).
 /// Env, shell, YAML and flag forms never qualify. In doubt, redact.
 fn is_source_reference(before: &str, after: &str, key: &str, sep: &str, value: &str) -> bool {
     if key.chars().any(|c| c.is_ascii_uppercase()) && !key.chars().any(|c| c.is_ascii_lowercase()) {
@@ -176,9 +182,7 @@ fn is_source_reference(before: &str, after: &str, key: &str, sep: &str, value: &
             .is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace()))
     });
     let tail = after_line.trim();
-    let field = before_line.trim().is_empty()
-        && sep.contains(':')
-        && (tail.is_empty() || tail == "," || tail == ";");
+    let field = before_line.trim().is_empty() && sep.contains(':') && matches!(tail, "," | ";");
     if !(binding || field) {
         return false;
     }
@@ -198,6 +202,16 @@ fn is_source_reference(before: &str, after: &str, key: &str, sep: &str, value: &
         .collect::<String>()
         .to_ascii_lowercase();
     let is_path = value.contains('.') || value.contains("::");
+    if field {
+        // A field line (`    password: self.password,`) is exempt only for a
+        // member of self or a `::` path; never for a value that merely names
+        // the word, which is what a YAML `password: mysecretpassword` looks like.
+        return value.starts_with("self.") || value.contains("::");
+    }
+    // A leading binding must end its statement.
+    if tail != ";" {
+        return false;
+    }
     let names_the_word = [
         "authorization",
         "apikey",
@@ -216,7 +230,15 @@ fn is_source_reference(before: &str, after: &str, key: &str, sep: &str, value: &
     is_path || names_the_word
 }
 
-fn is_credential_value(key: &str, value: &str) -> bool {
+/// A whole line `key: value` with nothing after the value and no `,`/`;`
+/// terminator: YAML or similar config, not a Rust or TS field.
+fn is_config_line(before: &str, after: &str, sep: &str) -> bool {
+    let before_line = before.rsplit('\n').next().unwrap_or("");
+    let after_line = after.split('\n').next().unwrap_or("");
+    before_line.trim().is_empty() && sep.contains(':') && after_line.trim().is_empty()
+}
+
+fn is_credential_value(key: &str, value: &str, config_line: bool) -> bool {
     let quoted = value.len() >= 3
         && ((value.starts_with('"') && value.ends_with('"'))
             || (value.starts_with('\'') && value.ends_with('\'')));
@@ -288,6 +310,10 @@ fn is_credential_value(key: &str, value: &str) -> bool {
     }
     // An ALL_CAPS key is an environment variable, never a bare code name.
     if key.chars().any(|c| c.is_ascii_uppercase()) && !key.chars().any(|c| c.is_ascii_lowercase()) {
+        return true;
+    }
+    // YAML-style `token: value` on its own line is configuration.
+    if config_line {
         return true;
     }
     // A bare `token` key: code names tokens all the time, so the value must
@@ -768,8 +794,7 @@ end"
             "const SECRET: &str = crate::keys::SECRET;",
             "let secret = settings::SECRET_VALUE;",
             "static PASSWORD_FILE: &str = config.password_file;",
-            "    password: config.password,",
-            "    token: old_token,",
+            "    password: self.password,",
             "var apiKey = old_api_key;",
         ] {
             assert_eq!(redact_credentials(input), input);
