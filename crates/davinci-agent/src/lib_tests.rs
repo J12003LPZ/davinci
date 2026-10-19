@@ -2980,6 +2980,42 @@ fn shell_edits_invalidate_an_earlier_check_generation() {
 }
 
 #[test]
+fn resumed_session_keeps_unverified_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent
+        .load_from_session(JsonlSession::create(sessions.path(), "mutation", None).unwrap())
+        .unwrap();
+    agent.cwd = dir.path().to_path_buf();
+    agent.prompt("edit a file and stop");
+    agent
+        .run_loop(scripted_tool_calls(vec![(
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        )]))
+        .unwrap();
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let path = agent.session.as_ref().unwrap().path.clone();
+    drop(agent);
+
+    // A new process: nothing is in memory but the session file.
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    resumed.cwd = dir.path().to_path_buf();
+    let state = resumed.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 1);
+    assert_eq!(state.mutation_paths, vec![PathBuf::from("a.txt")]);
+    assert_eq!(
+        resumed.completion_evidence(),
+        CompletionEvidence::Unverified
+    );
+}
+
+#[test]
 fn source_edits_during_a_passing_check_cannot_verify_the_new_generation() {
     let dir = tempfile::tempdir().unwrap();
     let agent = verifying_agent(dir.path());

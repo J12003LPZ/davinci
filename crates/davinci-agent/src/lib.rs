@@ -147,6 +147,7 @@ pub use prompt::{
 };
 
 pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
+const MUTATION_VERIFICATION_ENTRY_TYPE: &str = "mutation_verification";
 pub use runtime::{
     conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
     find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
@@ -628,6 +629,8 @@ pub struct Agent {
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
+    /// Last state written to the session, so unchanged state is not rewritten.
+    persisted_mutation_verification: Option<MutationVerificationState>,
     completion_state: Arc<Mutex<completion::CompletionState>>,
     /// Bounded request suffix; never session/WAL history or compaction input.
     completion_context: Vec<completion::CompletionContextMessage>,
@@ -808,6 +811,7 @@ impl Agent {
             last_verification_notice: None,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
+            persisted_mutation_verification: None,
             completion_state: Arc::new(Mutex::new(completion::CompletionState::default())),
             completion_context: Vec::new(),
             pending_transaction_verification: Arc::new(Mutex::new(
@@ -1241,6 +1245,62 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    /// Write the mutation and verification state to the session when it changed,
+    /// so a resumed session still knows an edit has not been verified.
+    pub(crate) fn persist_mutation_verification(&mut self) {
+        let state = self.mutation_verification_state();
+        if self.persisted_mutation_verification.as_ref() == Some(&state)
+            || (self.persisted_mutation_verification.is_none()
+                && state == MutationVerificationState::default())
+        {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Ok(data) = serde_json::to_value(&state) else {
+            return;
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("data".into(), data);
+        let appended = session.append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some(MUTATION_VERIFICATION_ENTRY_TYPE.into()),
+            extra,
+        });
+        if appended.is_ok() {
+            self.persisted_mutation_verification = Some(state);
+        }
+    }
+
+    /// Restore the state persisted on the session's current branch. Without
+    /// one, the state is empty: it belongs to the session, not to the agent.
+    fn restore_mutation_verification(&mut self) {
+        let restored = self.session.as_ref().and_then(|session| {
+            davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+                .into_iter()
+                .rev()
+                .find(|entry| {
+                    entry.entry_type == "custom"
+                        && entry.custom_type.as_deref() == Some(MUTATION_VERIFICATION_ENTRY_TYPE)
+                })
+                .and_then(|entry| entry.extra.get("data"))
+                .and_then(|data| {
+                    serde_json::from_value::<MutationVerificationState>(data.clone()).ok()
+                })
+        });
+        *self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = restored.clone().unwrap_or_default();
+        self.persisted_mutation_verification = restored;
     }
 
     /// Classify whether the current run has evidence for its latest mutation.
@@ -4499,6 +4559,7 @@ impl Agent {
             self.root_budget = Some(budget);
         }
         self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
+        self.restore_mutation_verification();
         self.set_runtime(candidate);
         self.install_prompt_checkpoints(rewind);
         self.restore_living_plan();

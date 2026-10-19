@@ -208,7 +208,10 @@ fn orphan_result_id_fails_closed() {
     });
     let error = outcome.expect_err("an unpaired history must not reach the provider");
     assert!(error.contains("ghost_call"), "{error}");
-    assert_eq!(requests, 0, "no provider request is built from an unpaired history");
+    assert_eq!(
+        requests, 0,
+        "no provider request is built from an unpaired history"
+    );
 }
 
 #[test]
@@ -233,18 +236,33 @@ fn missing_result_after_recovery_has_explicit_nonexecution_or_unknown() {
     let not_started = tool_results(&seen, "never_started");
     assert_eq!(not_started.len(), 1);
     assert_eq!(not_started[0].is_error, Some(true));
-    assert!(text(not_started[0]).starts_with("Not executed"), "{}", text(not_started[0]));
+    assert!(
+        text(not_started[0]).starts_with("Not executed"),
+        "{}",
+        text(not_started[0])
+    );
 
     let latched = tool_results(&seen, "effect_latched");
     assert_eq!(latched.len(), 1);
     assert_eq!(latched[0].is_error, Some(true));
-    assert!(text(latched[0]).starts_with("Outcome unknown"), "{}", text(latched[0]));
+    assert!(
+        text(latched[0]).starts_with("Outcome unknown"),
+        "{}",
+        text(latched[0])
+    );
 
     // Each answer sits right after its own call and before the new prompt.
     let roles: Vec<_> = seen.iter().map(|m| m.role.as_str()).collect();
     assert_eq!(
         roles[..6],
-        ["user", "assistant", "toolResult", "assistant", "toolResult", "user"]
+        [
+            "user",
+            "assistant",
+            "toolResult",
+            "assistant",
+            "toolResult",
+            "user"
+        ]
     );
 }
 
@@ -289,9 +307,16 @@ fn compacted_history_retains_matching_ids() {
     }));
     let mut history = Vec::new();
     for round in 0..4 {
-        history.push(ChatMessage::text("user", format!("task {round} {}", "x ".repeat(300))));
+        history.push(ChatMessage::text(
+            "user",
+            format!("task {round} {}", "x ".repeat(300)),
+        ));
         history.push(call_message(&format!("call_{round}"), "read"));
-        history.push(result_message(&format!("call_{round}"), "read", &"y ".repeat(300)));
+        history.push(result_message(
+            &format!("call_{round}"),
+            "read",
+            &"y ".repeat(300),
+        ));
     }
     for message in &history {
         agent.messages.push(message.clone());
@@ -314,10 +339,16 @@ fn compacted_history_retains_matching_ids() {
         if message.role == "toolResult" {
             results += 1;
             let id = message.tool_call_id.clone().unwrap();
-            assert!(called.contains(&id), "result {id} lost its call after compaction");
+            assert!(
+                called.contains(&id),
+                "result {id} lost its call after compaction"
+            );
         }
     }
-    assert!(results > 0, "the kept tail must still contain a tool exchange");
+    assert!(
+        results > 0,
+        "the kept tail must still contain a tool exchange"
+    );
     resumed.prompt("continue");
     resumed.run_loop(|_| Ok(done())).unwrap();
 }
@@ -358,6 +389,9 @@ fn failed_or_empty_fold_leaves_active_state_unchanged() {
         let result = agent.compact(None);
         assert!(!result.compacted, "{result:?}");
         assert_eq!(serde_json::to_value(&agent.messages).unwrap(), before);
-        assert_eq!(agent.session.as_ref().unwrap().entries.len(), entries_before);
+        assert_eq!(
+            agent.session.as_ref().unwrap().entries.len(),
+            entries_before
+        );
     }
 }

@@ -59,8 +59,9 @@ impl World {
 
     fn agent(&self, owner: ExecutionOwner, executor: CustomToolExecutor) -> Agent {
         let identity = self.identity.clone().into_journal_identity();
-        let journal =
-            Arc::new(OperationJournal::open(&self.journal_dir, identity.clone(), self.root).unwrap());
+        let journal = Arc::new(
+            OperationJournal::open(&self.journal_dir, identity.clone(), self.root).unwrap(),
+        );
         let context = OperationContext {
             journal_id: identity.journal_id,
             root_namespace_id: self.root,
@@ -252,7 +253,8 @@ fn agent_crash_after_started_effect_reports_unknown_without_replay() {
                     .messages
                     .iter()
                     .find(|message| {
-                        message.role == "toolResult" && message.tool_call_id.as_deref() == Some(CALL_ID)
+                        message.role == "toolResult"
+                            && message.tool_call_id.as_deref() == Some(CALL_ID)
                     })
                     .expect("the first request after resume must answer the killed call");
                 assert_eq!(result.is_error, Some(true), "unknown is never a success");

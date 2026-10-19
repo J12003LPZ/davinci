@@ -252,6 +252,7 @@ impl Agent {
         let result = self.run_loop_body(emit_prompt_messages, complete);
         self.completion_context.clear();
         self.invalidate_context_image();
+        self.persist_mutation_verification();
         let rewind_persistence = self.settle_prompt_checkpoint();
         let persistence = self.ensure_session_persistence();
         crate::RunStats::add_elapsed(&mut self.stats.wall_ms, run_started.elapsed());
@@ -474,7 +475,10 @@ so it may or may not have taken effect. It was not re-run. Check the current sta
         const NOT_EXECUTED: &str = "Not executed: the session ended before this call started. \
 Issue the call again if it is still needed.";
         let (unknown, source) = if let Some(journal) = self.operation_journal() {
-            let session_id = self.session.as_ref().map(|session| session.header.id.clone());
+            let session_id = self
+                .session
+                .as_ref()
+                .map(|session| session.header.id.clone());
             match journal.snapshot() {
                 Err(_) => (true, "operation_journal_unreadable"),
                 Ok(snapshot) => {
@@ -5184,10 +5188,14 @@ Issue the call again if it is still needed.";
                 );
             }
             if self.session.is_some() && self.persist_operation_chat_result(message)? {
+                self.persist_mutation_verification();
                 return self.ensure_session_persistence();
             }
         }
         self.persist_full_message(message);
+        if message.role == "toolResult" {
+            self.persist_mutation_verification();
+        }
         self.ensure_session_persistence()
     }
 
