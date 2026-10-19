@@ -394,10 +394,7 @@ fn a_snippet_never_carries_the_credential_after_a_scheme() {
         200,
     );
     assert!(!snippet.contains("abc.def.ghi") && !snippet.contains("dXNlcjpwYXNz"));
-    assert_eq!(
-        snippet,
-        "Authorization: [redacted] [redacted] and [redacted] [redacted]"
-    );
+    assert_eq!(snippet, "Authorization: [redacted] and [redacted]");
 }
 
 #[test]
@@ -442,4 +439,42 @@ fn resume_with_another_designs_checkpoint_stops_before_any_provider_call() {
     assert_eq!(before.progress.repairs, after.progress.repairs);
     assert_eq!(before.last_revision, after.last_revision);
     assert_eq!(before.progress.phase, after.progress.phase);
+}
+
+#[test]
+fn snippets_redact_json_headers_jwts_and_prefixed_tokens() {
+    let secrets = [
+        (
+            r#"{"apiKey":"sk-proj-AbCdEf0123456789xyzWVUT"}"#,
+            "sk-proj-AbCdEf0123456789xyzWVUT",
+        ),
+        (r#"{"Password": "hunter2"}"#, "hunter2"),
+        ("Cookie: session=abc123; theme=dark", "abc123"),
+        (
+            "Set-Cookie: sid=AbCdEf0123456789XyZ; Path=/",
+            "AbCdEf0123456789XyZ",
+        ),
+        ("Authorization:Bearer abc.def.ghi", "abc.def.ghi"),
+        (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92",
+            "eyJhbGciOiJIUzI1NiJ9",
+        ),
+        (
+            r#"token "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH""#,
+            "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH",
+        ),
+    ];
+    for (text, secret) in secrets {
+        let clean = sanitize_snippet(&format!("reply: {text} and more"), 400);
+        assert!(!clean.contains(secret), "{text} -> {clean}");
+        assert!(clean.contains("[redacted]"), "{text} -> {clean}");
+        assert!(
+            clean.starts_with("reply:") && clean.contains("and more"),
+            "{clean}"
+        );
+    }
+    assert_eq!(
+        sanitize_snippet("design tokens: colors and spacing", 100),
+        "design tokens: colors and spacing"
+    );
 }

@@ -341,8 +341,13 @@ fn usage(command: &str) -> String {
         "export" => "/design export <artifact-id> --revision <n> --destination <new-absolute-directory> [--format source|png|html] [--artboard <id>] [--viewport WxH]",
         _ => "/design new \"<brief>\"",
     };
+    let id_hint = if matches!(command, "list" | "sync") {
+        ""
+    } else {
+        "the id is the UUID from /design list; "
+    };
     format!(
-        "usage: {line} (the id is the UUID from /design list; to start a brief that begins with \"{command}\", write /design new \"{command} ...\")"
+        "usage: {line} ({id_hint}to start a brief that begins with \"{command}\", write /design new \"{command} ...\")"
     )
 }
 

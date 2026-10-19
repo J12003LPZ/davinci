@@ -186,6 +186,96 @@ fn leaks() -> Vec<(&'static str, String, &'static str)> {
             "token=Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg== done".into(),
             "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg==",
         ),
+        (
+            "a JSON apiKey",
+            r#"{"apiKey":"sk-proj-AbCdEf0123456789xyzWVUT"}"#.into(),
+            r#"sk-proj-AbCdEf0123456789xyzWVUT"#,
+        ),
+        (
+            "a JSON APIKEY in capitals",
+            r#"{"APIKEY":"sk-ABCDEFGH12345678"}"#.into(),
+            r#"sk-ABCDEFGH12345678"#,
+        ),
+        (
+            "a JSON token",
+            r#"{"token":"opaque-session-value"}"#.into(),
+            r#"opaque-session-value"#,
+        ),
+        (
+            "a JSON secret",
+            r#"{"Secret": "s3cr3t-value-here"}"#.into(),
+            r#"s3cr3t-value-here"#,
+        ),
+        (
+            "a JSON password",
+            r#"{"password":"hunter2"}"#.into(),
+            r#"hunter2"#,
+        ),
+        (
+            "a JSON authorization",
+            r#"{"authorization":"Bearer abc.def.ghi"}"#.into(),
+            r#"abc.def.ghi"#,
+        ),
+        (
+            "a JSON cookie",
+            r#"{"cookie":"sid=AbCdEf0123456789"}"#.into(),
+            r#"AbCdEf0123456789"#,
+        ),
+        (
+            "an escaped JSON key",
+            r#"args "{\"apiKey\":\"sk-proj-ZZZZ1234567890\"}""#.into(),
+            r#"sk-proj-ZZZZ1234567890"#,
+        ),
+        (
+            "a Cookie header",
+            r#"Cookie: session=abc123; theme=dark"#.into(),
+            r#"abc123"#,
+        ),
+        (
+            "a Set-Cookie header",
+            r#"Set-Cookie: sid=AbCdEf0123456789XyZ; Path=/"#.into(),
+            r#"AbCdEf0123456789XyZ"#,
+        ),
+        (
+            "a SET-COOKIE header in capitals",
+            r#"SET-COOKIE: sid=zzzzzzzz1; Secure"#.into(),
+            r#"zzzzzzzz1"#,
+        ),
+        (
+            "a scheme glued to its header",
+            r#"Authorization:Bearer abc.def.ghi"#.into(),
+            r#"abc.def.ghi"#,
+        ),
+        (
+            "a basic credential",
+            r#"Authorization: Basic dXNlcjpwYXNzd29yZA=="#.into(),
+            r#"dXNlcjpwYXNzd29yZA=="#,
+        ),
+        (
+            "a bare JWT",
+            r#"jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r end"#.into(),
+            r#"eyJhbGciOiJIUzI1NiJ9"#,
+        ),
+        (
+            "a quoted GitHub token",
+            r#"token "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH""#.into(),
+            r#"ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH"#,
+        ),
+        (
+            "a gho_ token",
+            r#"gho_abcdefghijklmnopqrstuvwxyzABCDEFGH"#.into(),
+            r#"gho_abcdefghijklmnopqrstuvwxyzABCDEFGH"#,
+        ),
+        (
+            "a fine-grained GitHub token",
+            r#"github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz"#.into(),
+            r#"github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz"#,
+        ),
+        (
+            "an AWS key id",
+            r#"key AKIAIOSFODNN7EXAMPLE end"#.into(),
+            r#"AKIAIOSFODNN7EXAMPLE"#,
+        ),
     ]
 }
 
@@ -193,7 +283,19 @@ pub fn run_design_studio_evals() -> DesignStudioReport {
     let mut fidelity = Vec::new();
     let mut accuracy = Vec::new();
     for row in labelled() {
-        let line = format!("/design {}", row.brief);
+        // A brief that opens with a verb word goes after `new`; any other
+        // brief is typed bare, as a person would.
+        let first = row.brief.split_whitespace().next().unwrap_or_default();
+        let verb = [
+            "new", "list", "open", "status", "revise", "resume", "select", "verify", "fork",
+            "restore", "export", "apply", "sync",
+        ]
+        .contains(&first);
+        let line = if verb {
+            format!("/design new {}", row.brief)
+        } else {
+            format!("/design {}", row.brief)
+        };
         match parse_design_command(&line) {
             Ok(DesignCommand::Create { input }) => {
                 fidelity.push(result(
@@ -254,6 +356,19 @@ pub fn run_design_studio_evals() -> DesignStudioReport {
             format!("redaction: {name}"),
             !snippet.contains(secret) && snippet.chars().count() <= 130,
             format!("snippet {snippet:?}"),
+        ));
+    }
+    // Redaction must not eat ordinary prose about design.
+    for prose in [
+        "the hero section needs a bluer call to action",
+        "design tokens: colors and spacing",
+        "cookie banner copy for the footer",
+    ] {
+        let kept = sanitize_snippet(prose, 120);
+        redaction.push(result(
+            format!("redaction keeps prose: {prose}"),
+            kept == prose,
+            format!("snippet {kept:?}"),
         ));
     }
     let long = sanitize_snippet(&"word ".repeat(10_000), 400);

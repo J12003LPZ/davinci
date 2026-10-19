@@ -131,9 +131,58 @@ pub fn expected_schema(phase: RunPhase, variants: u32) -> String {
     }
 }
 
+/// Credentials in the shapes a model reply or a tool call actually carries
+/// them, replaced before the reply is split into words: JSON and assignment
+/// pairs (`"apiKey":"..."`, `token=...`), `Authorization`, `Cookie` and
+/// `Set-Cookie` headers, a scheme glued to its header (`Authorization:Bearer x`),
+/// bare JWTs, and tokens with a well-known prefix. The word pass after this
+/// catches long opaque strings these do not name.
+fn mask_credentials(text: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    const KEYS: &str = r"(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|secret|password|passwd|private[_-]?key|token)";
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        let sources = [
+            // "apiKey": "...", \"token\": \"...\", 'secret': '...'
+            format!(
+                r#"(?i)[a-z0-9_.-]*(?:{KEYS}|authorization|cookie)[a-z0-9_.-]*\\?["']?\s*[:=]\s*(?:\\?"(?:[^"\\]|\\.)*\\?"|'(?:[^'\\]|\\.)*')"#
+            ),
+            // Authorization: [scheme] credential, Cookie: a=b; c=d, Set-Cookie: a=b; Path=/
+            // (the header name stays; group 1 is kept).
+            r#"(?i)(\b(?:proxy-)?authorization\b["']?\s*[:=]\s*)(?:(?:bearer|basic|digest|token)\s*:?\s*)?[^\s"',;}]+"#.to_string(),
+            r#"(?i)(\b(?:set-)?cookie\b["']?\s*[:=]\s*)[^\s;="'}]+=[^\s;"'}]*(?:;\s*[^\s;="'}]+(?:=[^\s;"'}]*)?)*"#.to_string(),
+            // token=abc12345, password: hunter2hunter2
+            format!(r#"(?i)[a-z0-9_.-]*{KEYS}[a-z0-9_.-]*\s*[:=]\s*[^\s"',;}}&]{{8,}}"#),
+            // Bearer abc, Basic abc, with or without the space.
+            r"(?i)\b(?:bearer|basic)\b[\s:]*[A-Za-z0-9._~+/=-]{4,}".to_string(),
+            // A JWT with or without a scheme.
+            r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*".to_string(),
+            // Well-known prefixes, with no digit requirement.
+            r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}".to_string(),
+            r"\bgh[pousr]_[A-Za-z0-9]{16,}".to_string(),
+            r"\bgithub_pat_[A-Za-z0-9_]{16,}".to_string(),
+            r"\bAKIA[0-9A-Z]{16}\b".to_string(),
+            r"\bxox[abprs]-[A-Za-z0-9-]{10,}".to_string(),
+            r"\bAIza[0-9A-Za-z_-]{30,}".to_string(),
+        ];
+        sources
+            .iter()
+            .map(|source| Regex::new(source).expect("fixed credential pattern"))
+            .collect()
+    });
+    let mut out = text.to_string();
+    for pattern in patterns {
+        out = pattern.replace_all(&out, "${1}[redacted]").into_owned();
+    }
+    out
+}
+
 /// A model reply cut down for an error message: control characters gone,
 /// token-like strings replaced, and a hard length bound. Never the whole reply.
 pub fn sanitize_snippet(text: &str, limit: usize) -> String {
+    let masked = mask_credentials(text);
+    let text = masked.as_str();
     let mut out = String::new();
     // The word after a scheme name is the credential itself.
     let mut after_scheme = false;
