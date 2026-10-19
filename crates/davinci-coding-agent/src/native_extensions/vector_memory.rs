@@ -5,7 +5,8 @@
 //! cannot make an otherwise healthy agent turn fail.
 
 use super::memory_backends::{
-    MemoryProjectionBackend, ProjectionConfig, ProjectionPoint, ProjectionRuntime, Secret,
+    MemoryProjectionBackend, ProjectionConfig, ProjectionError, ProjectionPoint,
+    ProjectionRepairReceipt, ProjectionRuntime, Secret, QDRANT_OFFLINE, QDRANT_REFUSED,
 };
 use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
 use davinci_agent::runtime::events::AgentKind;
@@ -2438,17 +2439,27 @@ impl VectorMemory {
             .map(|value| (value as usize).clamp(1, SEARCH_LIMIT_CAP))
             .unwrap_or(self.config.result_limit);
         let hits = without_embeddings(self.search(query, limit));
-        let content = hits
+        let mut content = hits
             .iter()
             .map(|hit| format!("[{:.2}] {}", hit.score, hit.record.text))
             .collect::<Vec<_>>()
             .join("\n");
+        let health = self.projection.health(&self.config);
+        if let Some(code) = health.code {
+            // Visible, not silent: the answer above came from the local index.
+            content.push_str(&format!(
+                "\n[{code}] remote vector search is unavailable; local search was used."
+            ));
+        }
         Ok(ToolResult {
             content,
             is_error: false,
-            details: Some(
-                json!({"vectorMemory": {"query": query, "count": hits.len(), "hits": hits}}),
-            ),
+            details: Some(json!({"vectorMemory": {
+                "query": query,
+                "count": hits.len(),
+                "hits": hits,
+                "projection": {"code": health.code, "detail": health.detail},
+            }})),
         })
     }
 
@@ -2505,7 +2516,11 @@ impl VectorMemory {
         } else {
             (0, None)
         };
+        let remote = self
+            .remote_projection_enabled()
+            .then(|| self.reconcile_remote(self.config.projection.batch_size));
         let mut status = self.status();
+        status["remoteReconcile"] = json!(remote);
         status["repairedIds"] = json!(repaired_ids);
         status["reembedded"] = json!(embedded);
         status["embeddingError"] = json!(embedding_error);
@@ -2559,6 +2574,23 @@ impl VectorMemory {
         cleared.last_indexed_at = None;
         // Clearing is deliberate: it must not fold other records back in.
         cleared.persist_local_with(false)?;
+        // The remote copy of this repo goes with it. Best effort: a down
+        // remote only keeps vectors that no local record can resolve to.
+        if cleared.remote_projection_enabled() {
+            if let Some(client) = cleared
+                .projection
+                .acquire(&cleared.config, &cleared.repo_id)
+            {
+                let outcome = client.clear_namespace(&cleared.repo_id);
+                if outcome.is_ok() {
+                    cleared.projection.forget_synced(
+                        &cleared.projection_state_path(),
+                        &cleared.remote_collection_name(),
+                    );
+                }
+                cleared.projection.record(&cleared.config, outcome);
+            }
+        }
         *self = cleared;
         Ok(self.status())
     }
@@ -2874,6 +2906,8 @@ impl VectorMemory {
                 "detail": self.projection.health(&self.config).detail,
             },
             "projectionLag": self.local_projection_lag(),
+            "remoteProjectionLag": self.remote_projection_lag(),
+            "remoteCollection": self.remote_projection_enabled().then(|| self.remote_collection_name()),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
             "embeddingModel": self.config.embedding_model,
@@ -2917,7 +2951,10 @@ impl VectorMemory {
         }
         let points = records
             .iter()
-            .filter(|record| !self.tombstones.contains(&record.id))
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+            })
             .filter_map(|record| {
                 record.embedding.as_ref().map(|vector| ProjectionPoint {
                     id: record.id.clone(),
@@ -2934,7 +2971,200 @@ impl VectorMemory {
         };
         let outcome = client.upsert(&points);
         self.projection.record(&self.config, outcome.clone());
-        outcome.map_err(|error| ToolError::Failed(error.to_string()))
+        match outcome {
+            Ok(()) => {
+                self.projection.update_synced(
+                    &self.projection_state_path(),
+                    &self.remote_collection_name(),
+                    points.iter().map(|point| point.id.clone()),
+                    [],
+                );
+                // The remote is back: catch up one bounded batch of anything
+                // missed while it was down, and drop what was retired.
+                let _ = self.reconcile_remote(self.config.projection.batch_size);
+                Ok(())
+            }
+            Err(error) => Err(ToolError::Failed(error.to_string())),
+        }
+    }
+
+    /// The namespaced remote collection for this repo and embedding model.
+    pub fn remote_collection_name(&self) -> String {
+        super::memory_backends::qdrant::collection_name(
+            &self.config.projection.collection_prefix,
+            &self.repo_id,
+            &self.current_embedding_identity(),
+        )
+    }
+
+    /// Which record ids the remote is known to hold. Derived, rebuildable:
+    /// losing this file only means the next reconcile re-sends.
+    fn projection_state_path(&self) -> PathBuf {
+        self.local_path().with_file_name("projection-state.json")
+    }
+
+    /// Records the remote does not yet mirror, plus retired records it still
+    /// holds. Zero in local mode (there is no remote to lag behind).
+    pub fn remote_projection_lag(&self) -> usize {
+        if !self.remote_projection_enabled() {
+            return 0;
+        }
+        let (unsynced, stale, _) = self.remote_delta();
+        unsynced.len() + stale.len()
+    }
+
+    /// `(to send, to remove, skipped)` against what the remote is known to hold.
+    fn remote_delta(&self) -> (Vec<&MemoryRecord>, Vec<String>, usize) {
+        let identity = self.current_embedding_identity();
+        let synced = self.projection.synced_ids(
+            &self.projection_state_path(),
+            &self.remote_collection_name(),
+        );
+        let present: HashSet<&str> = self
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        // An unreadable or empty in-memory store says nothing about the
+        // remote: only explicit tombstones and supersessions retire records.
+        let store_trusted = self.store_error.is_none() && !self.records.is_empty();
+        let retired = |id: &str| {
+            self.tombstones.contains(id)
+                || self.supersessions.contains_key(id)
+                || (store_trusted && !present.contains(id))
+        };
+        let mut skipped = 0usize;
+        let mut unsynced = Vec::new();
+        for record in &self.records {
+            if record.repo_id != self.repo_id || retired(&record.id) {
+                continue;
+            }
+            if record.embedding.is_some()
+                && embedding_identity_compatible(record.embedding_identity.as_ref(), &identity)
+            {
+                if !synced.contains(&record.id) {
+                    unsynced.push(record);
+                }
+            } else {
+                skipped += 1;
+            }
+        }
+        let stale = synced
+            .iter()
+            .filter(|id| retired(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        (unsynced, stale, skipped)
+    }
+
+    /// One bounded, idempotent catch-up pass: send up to `max_batch` records
+    /// the remote lacks and remove up to `max_batch` it should no longer hold.
+    /// Local records are never changed. Run again while `lag > 0`. Safe to
+    /// interrupt: the sync file only gains an id after the remote accepted it.
+    pub fn reconcile_remote(&self, max_batch: usize) -> ProjectionRepairReceipt {
+        let mut receipt = ProjectionRepairReceipt::default();
+        if !self.remote_projection_enabled() {
+            return receipt;
+        }
+        let (unsynced, stale, skipped) = self.remote_delta();
+        receipt.skipped = skipped;
+        receipt.lag = unsynced.len() + stale.len();
+        if receipt.lag == 0 {
+            return receipt;
+        }
+        let Some(client) = self.projection.acquire(&self.config, &self.repo_id) else {
+            // Backing off or refused: report it, change nothing.
+            let health = self.projection.health(&self.config);
+            receipt.code = health.code;
+            receipt.error = Some(health.detail).filter(|detail| !detail.is_empty());
+            return receipt;
+        };
+        let batch = max_batch.max(1);
+        let path = self.projection_state_path();
+        let collection = self.remote_collection_name();
+        let fail = |receipt: &mut ProjectionRepairReceipt, error: ProjectionError| {
+            receipt.failures += 1;
+            receipt.code = Some(match error {
+                ProjectionError::Offline(_) => QDRANT_OFFLINE,
+                ProjectionError::Refused(_) => QDRANT_REFUSED,
+            });
+            receipt.error = Some(error.to_string());
+            self.projection.record(&self.config, Err(error));
+        };
+
+        let removing: Vec<String> = stale.into_iter().take(batch).collect();
+        if !removing.is_empty() {
+            match client.delete(&removing, &self.repo_id) {
+                Ok(()) => {
+                    receipt.removed = removing.len();
+                    self.projection
+                        .update_synced(&path, &collection, [], removing.clone());
+                }
+                Err(error) => {
+                    fail(&mut receipt, error);
+                    return receipt;
+                }
+            }
+        }
+        let sending: Vec<ProjectionPoint> = unsynced
+            .iter()
+            .take(batch)
+            .filter_map(|record| {
+                Some(ProjectionPoint {
+                    id: record.id.clone(),
+                    vector: record.embedding.clone()?,
+                    repo_id: record.repo_id.clone(),
+                })
+            })
+            .collect();
+        if !sending.is_empty() {
+            match client.upsert(&sending) {
+                Ok(()) => {
+                    receipt.indexed = sending.len();
+                    self.projection.update_synced(
+                        &path,
+                        &collection,
+                        sending.iter().map(|point| point.id.clone()),
+                        [],
+                    );
+                }
+                Err(error) => {
+                    fail(&mut receipt, error);
+                    return receipt;
+                }
+            }
+        }
+        self.projection.record(&self.config, Ok(()));
+        receipt.lag = receipt
+            .lag
+            .saturating_sub(receipt.indexed + receipt.removed);
+        receipt
+    }
+
+    /// Delete this repo's points from the remote and forget what was synced,
+    /// then send everything again in bounded batches on the next reconcile.
+    /// Only this repo's namespace is touched.
+    pub fn rebuild_remote(&self) -> ProjectionRepairReceipt {
+        let mut receipt = ProjectionRepairReceipt::default();
+        let Some(client) = self.projection.acquire(&self.config, &self.repo_id) else {
+            receipt.code = self.projection.health(&self.config).code;
+            return receipt;
+        };
+        if let Err(error) = client.clear_namespace(&self.repo_id) {
+            receipt.failures = 1;
+            receipt.code = Some(match error {
+                ProjectionError::Offline(_) => QDRANT_OFFLINE,
+                ProjectionError::Refused(_) => QDRANT_REFUSED,
+            });
+            receipt.error = Some(error.to_string());
+            self.projection.record(&self.config, Err(error));
+            return receipt;
+        }
+        self.projection.forget_synced(
+            &self.projection_state_path(),
+            &self.remote_collection_name(),
+        );
+        self.reconcile_remote(self.config.projection.batch_size)
     }
 
     /// Learning re-derived a claim it already stored, so the claim holds for

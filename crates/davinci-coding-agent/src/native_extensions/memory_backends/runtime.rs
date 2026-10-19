@@ -11,7 +11,10 @@
 use super::qdrant::QdrantProjection;
 use super::{MemoryProjectionBackend, ProjectionError, VectorProjection};
 use crate::native_extensions::vector_memory::{sha256_hex, VectorMemoryConfig};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,7 +42,25 @@ pub struct ProjectionHealth {
     pub detail: String,
 }
 
+/// Which record ids the remote collection is known to hold. A missing,
+/// unreadable or foreign-collection file reads as empty: the next reconcile
+/// re-sends everything, which is idempotent.
+#[derive(Default, Serialize, Deserialize)]
+struct SyncFile {
+    #[serde(default)]
+    collection: String,
+    #[serde(default)]
+    synced: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct SyncState {
+    loaded_from: Option<PathBuf>,
+    file: SyncFile,
+}
+
 struct Inner {
+    sync: SyncState,
     injected: Option<Arc<dyn VectorProjection>>,
     cached: Option<(String, Arc<dyn VectorProjection>)>,
     backoff_until: Option<Instant>,
@@ -54,6 +75,7 @@ impl Default for ProjectionRuntime {
     fn default() -> Self {
         Self {
             inner: Mutex::new(Inner {
+                sync: SyncState::default(),
                 injected: None,
                 cached: None,
                 backoff_until: None,
@@ -106,6 +128,72 @@ impl ProjectionRuntime {
             health.state = ProjectionState::Unchecked;
         }
         health
+    }
+
+    /// Ids the remote holds for `collection`, read from `path` the first time.
+    pub fn synced_ids(&self, path: &Path, collection: &str) -> BTreeSet<String> {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        inner.sync.file.synced.clone()
+    }
+
+    /// Record that these ids reached the remote and these left it.
+    pub fn update_synced(
+        &self,
+        path: &Path,
+        collection: &str,
+        added: impl IntoIterator<Item = String>,
+        removed: impl IntoIterator<Item = String>,
+    ) {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        inner.sync.file.synced.extend(added);
+        for id in removed {
+            inner.sync.file.synced.remove(&id);
+        }
+        Self::save_sync(&inner.sync, path);
+    }
+
+    /// The remote lost this namespace (or it was cleared on purpose).
+    pub fn forget_synced(&self, path: &Path, collection: &str) {
+        let mut inner = self.lock();
+        inner.sync.loaded_from = Some(path.to_path_buf());
+        inner.sync.file = SyncFile {
+            collection: collection.to_string(),
+            synced: BTreeSet::new(),
+        };
+        Self::save_sync(&inner.sync, path);
+    }
+
+    fn load_sync(sync: &mut SyncState, path: &Path, collection: &str) {
+        if sync.loaded_from.as_deref() != Some(path) {
+            sync.file = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            sync.loaded_from = Some(path.to_path_buf());
+        }
+        // Another model or repo means another collection: nothing is synced.
+        if sync.file.collection != collection {
+            sync.file = SyncFile {
+                collection: collection.to_string(),
+                synced: BTreeSet::new(),
+            };
+        }
+    }
+
+    /// Best effort: a file that cannot be written only costs a re-send.
+    fn save_sync(sync: &SyncState, path: &Path) {
+        let Ok(bytes) = serde_json::to_vec(&sync.file) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let temporary = path.with_extension("json.tmp");
+        if std::fs::write(&temporary, bytes).is_ok() {
+            let _ = std::fs::rename(&temporary, path);
+        }
     }
 
     /// True while a recent failure keeps the remote out of use.

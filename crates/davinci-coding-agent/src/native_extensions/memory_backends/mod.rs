@@ -165,6 +165,32 @@ impl fmt::Display for ProjectionError {
 
 impl std::error::Error for ProjectionError {}
 
+/// What one reconcile pass did. Local records are never touched by it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionRepairReceipt {
+    /// Records sent to the remote in this pass.
+    pub indexed: usize,
+    /// Retired records (tombstoned, superseded, gone) removed from the remote.
+    pub removed: usize,
+    /// Records still not mirrored (or still to remove) after the pass. Run
+    /// again while above zero.
+    pub lag: usize,
+    /// Live records with no current local vector; they cannot be mirrored
+    /// until the local repair embeds them.
+    pub skipped: usize,
+    pub failures: usize,
+    /// `QDRANT_OFFLINE` or `QDRANT_REFUSED` when the pass could not finish.
+    pub code: Option<&'static str>,
+    pub error: Option<String>,
+}
+
+impl ProjectionRepairReceipt {
+    pub fn is_complete(&self) -> bool {
+        self.failures == 0 && self.lag == 0
+    }
+}
+
 /// A remote vector index. Implemented for Qdrant; a fake in tests.
 pub trait VectorProjection: Send + Sync {
     /// Readiness plus collection validation. Creates the namespaced collection
@@ -181,6 +207,9 @@ pub trait VectorProjection: Send + Sync {
     ) -> Result<Vec<ProjectionHit>, ProjectionError>;
     /// Remove these ids from this namespace.
     fn delete(&self, ids: &[String], repo_id: &str) -> Result<(), ProjectionError>;
+    /// Remove every point of this namespace. Other namespaces in the same
+    /// collection, and other collections, are never touched.
+    fn clear_namespace(&self, repo_id: &str) -> Result<(), ProjectionError>;
 }
 
 #[cfg(test)]

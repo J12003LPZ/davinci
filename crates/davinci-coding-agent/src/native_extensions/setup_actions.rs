@@ -6,6 +6,7 @@
 //! the action and refuses when the yes is not on file. Nothing here runs from
 //! a health check, and a project file can neither record nor widen a yes.
 
+use super::memory_backends::ProjectionRepairReceipt;
 use super::service_authority::{ServiceAction, ServiceAuthorization, ServiceConsentStore};
 use super::service_supervisor::{approve_installed_ollama, CONSENT_REQUIRED};
 use super::setup::{start_pull, step_from_health, SetupContext, Step, StepState};
@@ -188,6 +189,7 @@ pub fn repair_step(memory: &Arc<Mutex<VectorMemory>>) -> Step {
         }
     }
     let receipt = last.unwrap_or_default();
+    let remote = remote_catch_up(memory);
     if let Some(code) = receipt.blocked {
         let action = match code {
             "EMBEDDING_MISMATCH" => {
@@ -235,8 +237,50 @@ pub fn repair_step(memory: &Arc<Mutex<VectorMemory>>) -> Step {
         TITLE,
         StepState::Done,
         format!(
-            "re-embedded {total} record(s); {} record(s) kept",
-            receipt.records_after
+            "re-embedded {total} record(s); {} record(s) kept{}",
+            receipt.records_after,
+            remote_note(remote.as_ref())
         ),
     )
+}
+
+/// Bring the optional remote copy up to date, a bounded batch at a time. The
+/// network is used on a snapshot, never under the memory lock. `None` in
+/// local mode: nothing is contacted.
+fn remote_catch_up(memory: &Arc<Mutex<VectorMemory>>) -> Option<ProjectionRepairReceipt> {
+    use super::setup::REINDEX_BATCHES;
+    let snapshot = memory.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !snapshot.remote_projection_enabled() {
+        return None;
+    }
+    let batch = snapshot.config.projection.batch_size;
+    let mut total = ProjectionRepairReceipt::default();
+    for _ in 0..REINDEX_BATCHES {
+        let pass = snapshot.reconcile_remote(batch);
+        total.indexed += pass.indexed;
+        total.removed += pass.removed;
+        total.lag = pass.lag;
+        total.skipped = pass.skipped;
+        total.failures += pass.failures;
+        total.code = pass.code;
+        total.error = pass.error;
+        if pass.failures > 0 || pass.lag == 0 || pass.indexed + pass.removed == 0 {
+            break;
+        }
+    }
+    Some(total)
+}
+
+fn remote_note(remote: Option<&ProjectionRepairReceipt>) -> String {
+    match remote {
+        None => String::new(),
+        Some(receipt) if receipt.is_complete() => {
+            format!("; Qdrant copy in sync ({} sent)", receipt.indexed)
+        }
+        Some(receipt) => format!(
+            "; {} Qdrant copy not finished: {} record(s) still to mirror, local search is in use (nothing was lost)",
+            receipt.code.unwrap_or("QDRANT_PENDING"),
+            receipt.lag
+        ),
+    }
 }

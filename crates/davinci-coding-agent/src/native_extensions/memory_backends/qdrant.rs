@@ -276,6 +276,20 @@ impl VectorProjection for QdrantProjection {
         }
         Ok(())
     }
+
+    fn clear_namespace(&self, repo_id: &str) -> Result<(), ProjectionError> {
+        self.ensure_ready()?;
+        let path = format!("/collections/{}/points/delete?wait=true", self.collection);
+        self.call(
+            "POST",
+            &path,
+            Some(json!({"filter": {"must": [
+                {"key": "repo_id", "match": {"value": repo_id}},
+            ]}})),
+        )
+        .map_err(|error| self.fail(error, "namespace clear"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

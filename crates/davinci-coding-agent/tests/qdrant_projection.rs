@@ -288,3 +288,188 @@ fn api_key_goes_in_a_header_and_nowhere_else() {
     assert!(!format!("{:?}", memory.config).contains("k-123-secret"));
     assert!(!format!("{:?}", memory).contains("k-123-secret"));
 }
+
+// ---- Task 3: lag, outage fallback and reconcile ----
+
+use davinci_coding_agent::native_extensions::memory_backends::{QDRANT_OFFLINE, QDRANT_REFUSED};
+
+fn instant_retry(mut config: VectorMemoryConfig) -> VectorMemoryConfig {
+    config.projection.offline_backoff_seconds = 0;
+    config
+}
+
+fn remote_points(fake: &FakeQdrant, memory: &VectorMemory) -> usize {
+    fake.collection(&memory.remote_collection_name())
+        .map(|collection| collection.points.len())
+        .unwrap_or(0)
+}
+
+#[test]
+fn qdrant_rebuild_and_outage_keep_local_memory() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    assert_eq!(remote_points(&fake, &memory), 1);
+    assert_eq!(memory.remote_projection_lag(), 0);
+
+    // Outage: indexing still stores the record locally; the lag is counted.
+    fake.set_down(true);
+    memory.index_messages(&[note("beta two")]).unwrap();
+    assert_eq!(memory.records().len(), 2, "no record was lost");
+    assert_eq!(memory.remote_projection_lag(), 1);
+    let local_file = std::fs::read_to_string(memory.local_path()).unwrap();
+    assert!(local_file.contains("beta two"));
+
+    // Search still answers, from the local index, and says why.
+    let result = memory
+        .search_tool(&serde_json::json!({"query": "beta"}))
+        .unwrap();
+    assert!(result.content.contains("beta two"), "{}", result.content);
+    assert!(
+        result.content.contains(QDRANT_OFFLINE),
+        "{}",
+        result.content
+    );
+    assert_eq!(memory.status()["projection"]["code"], QDRANT_OFFLINE);
+    let offline_receipt = memory.reconcile_remote(10);
+    assert_eq!(offline_receipt.code, Some(QDRANT_OFFLINE));
+    assert_eq!((offline_receipt.indexed, offline_receipt.lag), (0, 1));
+    assert_eq!(offline_receipt.failures, 1);
+
+    // Recovery: one bounded pass catches up, a second finds nothing to do.
+    fake.set_down(false);
+    let receipt = memory.reconcile_remote(10);
+    assert_eq!((receipt.indexed, receipt.lag, receipt.failures), (1, 0, 0));
+    assert!(receipt.is_complete());
+    assert_eq!(remote_points(&fake, &memory), 2);
+    let before = fake.request_count();
+    assert_eq!(memory.reconcile_remote(10).indexed, 0);
+    assert_eq!(fake.request_count(), before, "nothing left means no calls");
+    assert!(memory.status()["projection"]["code"].is_null());
+
+    // A tombstone removes the remote point; the local record stays.
+    let alpha = memory.search("alpha", 1)[0].record.id.clone();
+    memory.add_tombstone(alpha.clone());
+    assert_eq!(memory.remote_projection_lag(), 1);
+    let receipt = memory.reconcile_remote(10);
+    assert_eq!((receipt.removed, receipt.lag), (1, 0));
+    assert_eq!(remote_points(&fake, &memory), 1);
+    assert!(memory.records().iter().any(|record| record.id == alpha));
+
+    // The remote loses its data: a rebuild restores it from local records
+    // without touching a collection that belongs to someone else.
+    fake.preload_collection("someone-elses", DIMS, "Cosine");
+    fake.wipe_points();
+    let rebuilt = memory.rebuild_remote();
+    assert_eq!(rebuilt.failures, 0, "{rebuilt:?}");
+    assert_eq!(remote_points(&fake, &memory), 1);
+    assert!(fake.collection("someone-elses").unwrap().points.is_empty());
+    assert!(fake
+        .requests()
+        .iter()
+        .all(|request| !request.path.contains("someone-elses")));
+}
+
+#[test]
+fn reconcile_is_bounded_and_survives_a_restart() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    fake.set_down(true);
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    let notes: Vec<MemoryMessage> = (0..5).map(|i| note(&format!("alpha note {i}"))).collect();
+    memory.index_messages(&notes).unwrap();
+    assert_eq!(memory.remote_projection_lag(), 5);
+
+    fake.set_down(false);
+    let first = memory.reconcile_remote(2);
+    assert_eq!((first.indexed, first.lag), (2, 3));
+    assert!(!first.is_complete());
+    let second = memory.reconcile_remote(2);
+    assert_eq!((second.indexed, second.lag), (2, 1));
+    // Re-sending is harmless: point ids are stable.
+    assert_eq!(remote_points(&fake, &memory), 4);
+    let third = memory.reconcile_remote(2);
+    assert_eq!((third.indexed, third.lag), (1, 0));
+    assert_eq!(remote_points(&fake, &memory), 5);
+
+    // A new process reads the sync file and does not re-send.
+    let again = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    assert_eq!(again.remote_projection_lag(), 0);
+    let before = fake.request_count();
+    assert!(again.reconcile_remote(10).is_complete());
+    assert_eq!(fake.request_count(), before);
+}
+
+#[test]
+fn an_outage_costs_one_attempt_until_the_backoff_ends() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = qdrant_config(&fake, &embedder);
+    config.projection.offline_backoff_seconds = 300;
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    fake.set_down(true);
+    memory.index_messages(&[note("beta two")]).unwrap();
+    let after_failure = fake.request_count();
+    for _ in 0..3 {
+        let hits = memory.search("alpha", 2);
+        assert!(!hits.is_empty(), "local search still answers");
+    }
+    memory.index_messages(&[note("alpha three")]).unwrap();
+    assert_eq!(
+        fake.request_count(),
+        after_failure,
+        "no request is made while backing off"
+    );
+    assert_eq!(memory.status()["projection"]["code"], QDRANT_OFFLINE);
+}
+
+#[test]
+fn a_refused_remote_is_reported_as_refused_not_offline() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    fake.require_api_key("needed");
+    let dir = tempfile::tempdir().unwrap();
+    let mut memory = VectorMemory::with_config(
+        dir.path().to_path_buf(),
+        instant_retry(qdrant_config(&fake, &embedder)),
+    );
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    assert_eq!(memory.records().len(), 1);
+    let receipt = memory.reconcile_remote(10);
+    assert_eq!(receipt.code, Some(QDRANT_REFUSED));
+    assert_eq!(memory.status()["projection"]["state"], "refused");
+}
+
+#[test]
+fn setup_repair_catches_the_remote_up_and_says_so() {
+    use davinci_coding_agent::native_extensions::setup_actions::repair_step;
+    use std::sync::{Arc, Mutex};
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    fake.set_down(true);
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    let shared = Arc::new(Mutex::new(memory));
+
+    let step = repair_step(&shared);
+    assert!(step.detail.contains(QDRANT_OFFLINE), "{}", step.detail);
+    assert!(step.detail.contains("nothing was lost"), "{}", step.detail);
+
+    fake.set_down(false);
+    let step = repair_step(&shared);
+    assert!(
+        step.detail.contains("Qdrant copy in sync"),
+        "{}",
+        step.detail
+    );
+    assert_eq!(shared.lock().unwrap().remote_projection_lag(), 0);
+}
