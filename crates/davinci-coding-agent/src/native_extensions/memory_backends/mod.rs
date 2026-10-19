@@ -10,7 +10,15 @@
 //! this module is reached: no socket is opened and no `docker` is run.
 
 #[cfg(any(test, feature = "test-fixtures"))]
+pub mod fake_ollama;
+#[cfg(any(test, feature = "test-fixtures"))]
 pub mod fake_qdrant;
+pub mod qdrant;
+pub mod runtime;
+
+pub use runtime::{
+    ProjectionHealth, ProjectionRuntime, ProjectionState, QDRANT_OFFLINE, QDRANT_REFUSED,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -94,6 +102,9 @@ pub struct ProjectionConfig {
     /// Records sent per request, and per reconcile pass.
     #[serde(default = "default_batch")]
     pub batch_size: usize,
+    /// After a failure the remote is skipped for this long.
+    #[serde(default = "default_backoff")]
+    pub offline_backoff_seconds: u64,
 }
 
 fn default_prefix() -> String {
@@ -101,6 +112,9 @@ fn default_prefix() -> String {
 }
 fn default_batch() -> usize {
     64
+}
+fn default_backoff() -> u64 {
+    60
 }
 
 impl Default for ProjectionConfig {
@@ -111,6 +125,7 @@ impl Default for ProjectionConfig {
             allow_remote: false,
             collection_prefix: default_prefix(),
             batch_size: default_batch(),
+            offline_backoff_seconds: default_backoff(),
         }
     }
 }

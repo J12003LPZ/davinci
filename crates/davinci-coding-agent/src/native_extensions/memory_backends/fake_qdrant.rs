@@ -177,7 +177,9 @@ impl Drop for FakeQdrant {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<(String, String, Option<String>, Value)> {
+pub(super) fn read_request(
+    stream: &mut TcpStream,
+) -> Option<(String, String, Option<String>, Value)> {
     stream.set_nonblocking(false).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let mut buffer = Vec::new();
@@ -220,7 +222,7 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, Option<String
     Some((method, path, api_key, body))
 }
 
-fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
+pub(super) fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
     let text = body.to_string();
     let reason = match status {
         200 => "OK",

@@ -4,7 +4,9 @@
 //! lexical fallback and network failures are deliberately fail-open so memory
 //! cannot make an otherwise healthy agent turn fail.
 
-use super::memory_backends::{MemoryProjectionBackend, ProjectionConfig, Secret};
+use super::memory_backends::{
+    MemoryProjectionBackend, ProjectionConfig, ProjectionPoint, ProjectionRuntime, Secret,
+};
 use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
 use davinci_agent::runtime::events::AgentKind;
 use davinci_agent::{ToolError, ToolResult};
@@ -1372,6 +1374,9 @@ pub struct VectorMemory {
     /// Set when an embedding request failed; dense retrieval and document
     /// embedding are skipped until it passes.
     dense_offline_until: Arc<Mutex<Option<Instant>>>,
+    /// The optional remote projection's client and outage state. Shared by
+    /// clones, like the dense backoff, so one failure is seen everywhere.
+    pub projection: Arc<ProjectionRuntime>,
     /// Why the record file could not be read, when it could not. While set,
     /// nothing is written to that file: the in-memory state is not the file's
     /// state, and rewriting from it would destroy what is there.
@@ -1576,6 +1581,7 @@ impl VectorMemory {
             last_indexed: 0,
             last_indexed_at: None,
             dense_offline_until: Arc::new(Mutex::new(None)),
+            projection: Arc::new(ProjectionRuntime::default()),
             store_error: None,
         };
         // A failed read is kept (`store_error`), not discarded: it blocks
@@ -2037,38 +2043,43 @@ impl VectorMemory {
         })
         .flatten();
 
-        let mut dense_ranked = query_embedding
-            .as_ref()
-            .map(|query_vector| {
-                let mut ranked = candidates
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, record)| {
-                        if !embedding_identity_compatible(
-                            record.embedding_identity.as_ref(),
-                            &embedding_identity,
-                        ) {
-                            return None;
-                        }
-                        let embedding = record.embedding.as_ref()?;
-                        if embedding.len() != query_vector.len() {
-                            return None;
-                        }
-                        let score = cosine_similarity(query_vector, embedding);
-                        (score > 0.0).then_some((index, score))
-                    })
-                    .collect::<Vec<_>>();
-                ranked.sort_by(|left, right| {
-                    right
-                        .1
-                        .partial_cmp(&left.1)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
-                });
-                ranked.truncate(candidate_limit);
-                ranked
-            })
-            .unwrap_or_default();
+        let remote_ranked = query_embedding.as_ref().and_then(|query_vector| {
+            self.remote_dense_ranked(query_vector, &candidates, candidate_limit)
+        });
+        let mut dense_ranked = remote_ranked.unwrap_or_else(|| {
+            query_embedding
+                .as_ref()
+                .map(|query_vector| {
+                    let mut ranked = candidates
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| {
+                            if !embedding_identity_compatible(
+                                record.embedding_identity.as_ref(),
+                                &embedding_identity,
+                            ) {
+                                return None;
+                            }
+                            let embedding = record.embedding.as_ref()?;
+                            if embedding.len() != query_vector.len() {
+                                return None;
+                            }
+                            let score = cosine_similarity(query_vector, embedding);
+                            (score > 0.0).then_some((index, score))
+                        })
+                        .collect::<Vec<_>>();
+                    ranked.sort_by(|left, right| {
+                        right
+                            .1
+                            .partial_cmp(&left.1)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
+                    });
+                    ranked.truncate(candidate_limit);
+                    ranked
+                })
+                .unwrap_or_default()
+        });
 
         #[derive(Default, Clone, Copy)]
         struct RankState {
@@ -2560,6 +2571,56 @@ impl VectorMemory {
         self.config.projection.backend == MemoryProjectionBackend::Qdrant
     }
 
+    /// Dense ranking from the remote projection, as `(candidate index, score)`.
+    /// `None` means "rank locally": remote off, down, refused, or not able to
+    /// answer for these candidates. The remote returns ids and scores only;
+    /// they are resolved against the local candidates, which already exclude
+    /// tombstoned, superseded and out-of-scope records, so a stale remote point
+    /// cannot surface a memory the local store has retired.
+    fn remote_dense_ranked(
+        &self,
+        query_vector: &[f32],
+        candidates: &[&MemoryRecord],
+        candidate_limit: usize,
+    ) -> Option<Vec<(usize, f32)>> {
+        if query_vector.len() != self.config.embedding_dimensions
+            || candidates
+                .iter()
+                .any(|record| record.repo_id != self.repo_id)
+        {
+            return None;
+        }
+        let client = self.projection.acquire(&self.config, &self.repo_id)?;
+        // Over-fetch: scope and tombstone filtering happens here, after.
+        let fetch = (candidate_limit * 3).min(256);
+        match client.query(query_vector, &self.repo_id, fetch) {
+            Ok(hits) => {
+                self.projection.record(&self.config, Ok(()));
+                let by_id: std::collections::HashMap<&str, usize> = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| (record.id.as_str(), index))
+                    .collect();
+                let mut ranked: Vec<(usize, f32)> = hits
+                    .iter()
+                    .filter_map(|hit| by_id.get(hit.id.as_str()).map(|index| (*index, hit.score)))
+                    .filter(|(_, score)| *score > 0.0)
+                    .collect();
+                ranked.truncate(candidate_limit);
+                // An empty answer for a store that has vectors means the
+                // remote is stale or was wiped: let the local index answer.
+                if ranked.is_empty() && candidates.iter().any(|record| record.embedding.is_some()) {
+                    return None;
+                }
+                Some(ranked)
+            }
+            Err(error) => {
+                self.projection.record(&self.config, Err(error));
+                None
+            }
+        }
+    }
+
     fn current_embedding_identity(&self) -> EmbeddingIdentity {
         EmbeddingIdentity::from_config(&self.config)
     }
@@ -2807,6 +2868,11 @@ impl VectorMemory {
             "projectionProfile": MEMORY_PROJECTION_PROFILE,
             "remoteProjectionEnabled": self.remote_projection_enabled(),
             "projectionBackend": self.config.projection.backend.name(),
+            "projection": {
+                "state": format!("{:?}", self.projection.health(&self.config).state).to_lowercase(),
+                "code": self.projection.health(&self.config).code,
+                "detail": self.projection.health(&self.config).detail,
+            },
             "projectionLag": self.local_projection_lag(),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
@@ -2851,28 +2917,24 @@ impl VectorMemory {
         }
         let points = records
             .iter()
+            .filter(|record| !self.tombstones.contains(&record.id))
             .filter_map(|record| {
-                record
-                    .embedding
-                    .as_ref()
-                    .map(|vector| json!({"id": record.id, "vector": vector, "payload": record}))
+                record.embedding.as_ref().map(|vector| ProjectionPoint {
+                    id: record.id.clone(),
+                    vector: vector.clone(),
+                    repo_id: record.repo_id.clone(),
+                })
             })
             .collect::<Vec<_>>();
         if points.is_empty() {
             return Ok(());
         }
-        let url = format!(
-            "{}/collections/{}/points?wait=true",
-            self.config.qdrant_url.trim_end_matches('/'),
-            self.config.collection
-        );
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(self.config.request_timeout_seconds))
-            .build()
-            .put(&url)
-            .send_json(json!({"points": points}))
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
-        Ok(())
+        let Some(client) = self.projection.acquire(&self.config, &self.repo_id) else {
+            return Ok(());
+        };
+        let outcome = client.upsert(&points);
+        self.projection.record(&self.config, outcome.clone());
+        outcome.map_err(|error| ToolError::Failed(error.to_string()))
     }
 
     /// Learning re-derived a claim it already stored, so the claim holds for
