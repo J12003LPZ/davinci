@@ -780,6 +780,19 @@ impl DesignController {
                 artifact_id,
                 operation_id,
             } => {
+                // The checkpoint must belong to this design before anything
+                // is built, spent or sent.
+                let owner = super::generation::checkpoint_artifact(
+                    &self.store,
+                    agent,
+                    workspace,
+                    operation_id,
+                )?;
+                if owner != artifact_id {
+                    return Err(DesignError::Conflict(
+                        "that checkpoint belongs to a different design".into(),
+                    ));
+                }
                 let mut model = super::model::SubscriptionModel::configured(agent)?;
                 let mut renderer = super::generation::ConfinedRenderer {
                     runtime: super::runtime::TrustedDesignRuntime::configured(workspace)?,
@@ -793,11 +806,6 @@ impl DesignController {
                     &mut renderer,
                     None,
                 )?;
-                if state.request.artifact_id != artifact_id {
-                    return Err(DesignError::Conflict(
-                        "that checkpoint belongs to a different design".into(),
-                    ));
-                }
                 return Ok(with_next_step(serde_json::to_value(state)?, artifact_id));
             }
             DesignCommand::Open { artifact_id } => {

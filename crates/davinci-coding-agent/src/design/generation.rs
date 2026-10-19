@@ -643,6 +643,21 @@ pub fn resume(
     )
 }
 
+/// The design a checkpoint belongs to, read without running anything. `resume`
+/// checks it before the model or the renderer is built, so a checkpoint of
+/// another design never reaches a provider.
+pub fn checkpoint_artifact(
+    store: &DesignStore,
+    agent: &mut Agent,
+    workspace: &Path,
+    operation_id: OperationId,
+) -> DesignResult<ArtifactId> {
+    let ctx = AuthorizedDesignContext::from_agent(agent, workspace)?;
+    latest_run(store, &ctx, session(agent)?, operation_id)?
+        .map(|state| state.request.artifact_id)
+        .ok_or_else(|| DesignError::NotFound("no design run has that checkpoint".into()))
+}
+
 /// Resume a blocked run by its checkpoint (the operation id its failure
 /// receipt names). The stored request is used as it was; nothing is re-typed.
 pub fn resume_operation(

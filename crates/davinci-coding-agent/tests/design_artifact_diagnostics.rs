@@ -399,3 +399,47 @@ fn a_snippet_never_carries_the_credential_after_a_scheme() {
         "Authorization: [redacted] [redacted] and [redacted] [redacted]"
     );
 }
+
+#[test]
+fn resume_with_another_designs_checkpoint_stops_before_any_provider_call() {
+    use davinci_coding_agent::design::admission::AuthorizedDesignContext;
+    use davinci_coding_agent::design::commands::DesignCommand;
+    use davinci_coding_agent::design::controller::DesignController;
+
+    let (dir, mut agent, store, request) = setup();
+    let mut m = model(vec![text("nope"), text("nope"), text("nope")]);
+    let mut r = renderer();
+    let blocked = run_it(&store, &mut agent, dir.path(), &request, &mut m, &mut r);
+    let checkpoint = blocked.failure.expect("receipt").checkpoint;
+    let ctx = AuthorizedDesignContext::from_agent(&mut agent, dir.path()).unwrap();
+    let session = agent.session.as_ref().unwrap();
+    let before = latest_run(&store, &ctx, session, checkpoint)
+        .unwrap()
+        .unwrap();
+
+    let controller = DesignController::new(store, true);
+    let other = ArtifactId::new();
+    let outcome = controller.command(
+        &mut agent,
+        dir.path(),
+        DesignCommand::Resume {
+            artifact_id: other,
+            operation_id: checkpoint,
+        },
+    );
+    // The mismatch is reported before a model or renderer is even built
+    // (building the real subscription model would fail differently), and the
+    // run is exactly as it was: nothing was spent and nothing was committed.
+    match outcome {
+        Err(DesignError::Conflict(message)) => assert!(message.contains("different design")),
+        other => panic!("conflict expected, got {other:?}"),
+    }
+    let ctx = AuthorizedDesignContext::from_agent(&mut agent, dir.path()).unwrap();
+    let session = agent.session.as_ref().unwrap();
+    let after = latest_run(&controller.store, &ctx, session, checkpoint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.progress.repairs, after.progress.repairs);
+    assert_eq!(before.last_revision, after.last_revision);
+    assert_eq!(before.progress.phase, after.progress.phase);
+}
