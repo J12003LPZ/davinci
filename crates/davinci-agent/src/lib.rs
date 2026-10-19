@@ -4463,7 +4463,10 @@ impl Agent {
                     .map_err(|error| format!("Runtime recovery required: {error}"))?
             }
             (None, None) => runtime::session::restore_session_runtime(
-                RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new()),
+                // The agent's cache, not a fresh in-memory one: the context pages a
+                // fold wrote to disk must be readable after a cold resume.
+                RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+                    .with_cache(self.tool_context.cache.clone()),
                 &session,
             )
             .map_err(|error| {

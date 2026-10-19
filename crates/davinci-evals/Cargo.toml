@@ -11,6 +11,8 @@ davinci-sys = { path = "../davinci-sys" }
 clap.workspace = true
 davinci-agent = { path = "../davinci-agent" }
 davinci-ai = { path = "../davinci-ai" }
+davinci-protocol = { path = "../davinci-protocol" }
+davinci-session = { path = "../davinci-session" }
 davinci-coding-agent = { path = "../davinci-coding-agent" }
 serde.workspace = true
 serde_json.workspace = true

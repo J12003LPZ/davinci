@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod compare;
+pub mod context_lifecycle;
 pub mod context_vm;
 pub mod executor;
 pub mod gate;
@@ -20,6 +21,9 @@ pub use compare::{
     compare_eval_runs, compare_repeated_runs, format_comparison_markdown,
     format_repeated_comparison_markdown, EvalVariant, PairedComparison, Regression,
     RepeatedPairedComparison,
+};
+pub use context_lifecycle::{
+    audit_statuses, run_context_lifecycle_evals, AuditStatus, ContextLifecycleScorecard,
 };
 pub use context_vm::{context_vm_fixture_names, run_context_vm_evals, ContextVmEvalResult};
 pub use executor::{
