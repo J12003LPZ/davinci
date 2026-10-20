@@ -13,6 +13,7 @@
 pub mod fake_ollama;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fake_qdrant;
+mod pending_seal;
 pub mod qdrant;
 pub mod runtime;
 

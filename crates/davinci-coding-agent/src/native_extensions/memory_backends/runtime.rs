@@ -8,6 +8,7 @@
 //!
 //! [`VectorMemory`]: crate::native_extensions::vector_memory::VectorMemory
 
+use super::pending_seal;
 use super::qdrant::QdrantProjection;
 use super::{MemoryProjectionBackend, ProjectionError, VectorProjection};
 use crate::native_extensions::vector_memory::{sha256_hex, VectorMemoryConfig};
@@ -78,6 +79,12 @@ pub struct PendingClear {
     /// the ledger plus the local records. Later uploads from this or another
     /// clone of the same repository are not touched when it runs.
     pub ids: Vec<String>,
+    /// HMAC-SHA256 over the three fields above and the path of this file, under
+    /// a per-user key kept outside every repository. The file sits in the
+    /// working tree, so anyone who controls a checkout controls its contents;
+    /// an entry without a valid MAC is dropped, not run.
+    #[serde(default)]
+    pub mac: String,
 }
 
 #[derive(Default)]
@@ -203,6 +210,7 @@ impl ProjectionRuntime {
     ) -> Result<(), String> {
         let mut inner = self.lock();
         Self::load_sync(&mut inner.sync, path, collection);
+        let key = Self::signing_key(&ids)?;
         let before = (
             inner.sync.file.synced.clone(),
             inner.sync.file.pending_clears.clone(),
@@ -210,7 +218,7 @@ impl ProjectionRuntime {
         );
         inner.sync.file.synced.clear();
         inner.sync.file.clear_epoch += 1;
-        Self::merge_owed(&mut inner.sync.file, collection, repo_id, ids);
+        Self::merge_owed(&mut inner.sync.file, collection, repo_id, ids, key, path);
         let saved = Self::save_sync_checked(&inner.sync, path);
         if saved.is_err() {
             inner.sync.file.synced = before.0;
@@ -231,8 +239,9 @@ impl ProjectionRuntime {
     ) -> Result<(), String> {
         let mut inner = self.lock();
         Self::load_sync(&mut inner.sync, path, collection);
+        let key = Self::signing_key(&ids)?;
         let before = inner.sync.file.pending_clears.clone();
-        Self::merge_owed(&mut inner.sync.file, collection, repo_id, ids);
+        Self::merge_owed(&mut inner.sync.file, collection, repo_id, ids, key, path);
         let saved = Self::save_sync_checked(&inner.sync, path);
         if saved.is_err() {
             inner.sync.file.pending_clears = before;
@@ -240,7 +249,28 @@ impl ProjectionRuntime {
         saved
     }
 
-    fn merge_owed(file: &mut SyncFile, collection: &str, repo_id: &str, ids: Vec<String>) {
+    /// The per-user key, made on first use, when there is something to sign.
+    /// No key means no clear can be recorded, so the caller refuses the clear.
+    fn signing_key(ids: &[String]) -> Result<Option<pending_seal::Key>, String> {
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        pending_seal::key_or_create()
+            .map(Some)
+            .map_err(|error| format!("no per-user key to sign the pending clear with: {error}"))
+    }
+
+    fn merge_owed(
+        file: &mut SyncFile,
+        collection: &str,
+        repo_id: &str,
+        ids: Vec<String>,
+        key: Option<pending_seal::Key>,
+        store: &Path,
+    ) {
+        let Some(key) = key else {
+            return;
+        };
         if ids.is_empty() {
             return;
         }
@@ -252,14 +282,18 @@ impl ProjectionRuntime {
             Some(pending) => {
                 let merged: BTreeSet<String> = pending.ids.iter().cloned().chain(ids).collect();
                 pending.ids = merged.into_iter().collect();
+                pending.mac = pending_seal::sign(&key, pending, store);
             }
             None => {
                 let unique: BTreeSet<String> = ids.into_iter().collect();
-                file.pending_clears.push(PendingClear {
+                let mut entry = PendingClear {
                     collection: collection.to_string(),
                     repo_id: repo_id.to_string(),
                     ids: unique.into_iter().collect(),
-                });
+                    mac: String::new(),
+                };
+                entry.mac = pending_seal::sign(&key, &entry, store);
+                file.pending_clears.push(entry);
             }
         }
     }
@@ -339,6 +373,9 @@ impl ProjectionRuntime {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_default();
             sync.loaded_from = Some(path.to_path_buf());
+            if Self::drop_untrusted(&mut sync.file, path, collection) {
+                Self::save_sync(sync, path);
+            }
         }
         // Another model or repo means another collection: nothing is synced.
         // A clear still owed to the old collection is kept, with the name it
@@ -351,6 +388,38 @@ impl ProjectionRuntime {
                 clear_epoch: sync.file.clear_epoch,
             };
         }
+    }
+
+    /// Keep only the owed clears this user recorded. The file is read from the
+    /// working tree, where a repository can ship anything: an entry whose MAC
+    /// is missing or wrong is dropped with one warning and never executed.
+    /// One exception keeps files from before signing working: an entry with no
+    /// MAC and no repo id, for the current collection, which can only act on
+    /// the current repo id in the current collection, i.e. this checkout.
+    /// True when something was dropped.
+    fn drop_untrusted(file: &mut SyncFile, path: &Path, collection: &str) -> bool {
+        if file.pending_clears.is_empty() {
+            return false;
+        }
+        let key = pending_seal::existing_key();
+        let before = file.pending_clears.len();
+        file.pending_clears.retain(|pending| {
+            let legacy = pending.mac.is_empty()
+                && pending.repo_id.is_empty()
+                && pending.collection == collection;
+            legacy
+                || key
+                    .as_ref()
+                    .is_some_and(|key| pending_seal::verify(key, pending, path))
+        });
+        let dropped = before - file.pending_clears.len();
+        if dropped > 0 {
+            eprintln!(
+                "[davinci-memory] ignored {dropped} pending remote clear(s) in {}: not recorded by this user",
+                path.display()
+            );
+        }
+        dropped > 0
     }
 
     /// Best effort: a file that cannot be written only costs a re-send.

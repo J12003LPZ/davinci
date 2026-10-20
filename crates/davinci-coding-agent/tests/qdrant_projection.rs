@@ -119,7 +119,20 @@ fn ollama() -> FakeOllama {
     )
 }
 
+/// Owed clears are signed with a per-user key kept next to the credentials.
+/// Point that directory at a temporary one, once for this test process, so no
+/// test writes into the real one.
+fn isolate_user_dir() {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DAVINCI_CODING_AGENT_DIR", dir.path());
+        dir
+    });
+}
+
 fn qdrant_config(qdrant: &FakeQdrant, ollama: &FakeOllama) -> VectorMemoryConfig {
+    isolate_user_dir();
     let mut config = VectorMemoryConfig {
         qdrant_url: qdrant.url(),
         ollama_url: ollama.url(),
@@ -1161,4 +1174,167 @@ fn points_that_could_not_be_taken_back_after_a_clear_are_owed_not_forgotten() {
         "the owed delete never ran"
     );
     assert_eq!(remote_points(&fake, &memory), 2);
+}
+
+fn state_file(memory: &VectorMemory) -> std::path::PathBuf {
+    memory.local_path().with_file_name("projection-state.json")
+}
+
+fn pending_in_file(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let state: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    state["pending_clears"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Another project's points on the user's Qdrant, which a hostile checkout
+/// tries to have deleted through its own `projection-state.json`.
+fn victim(config: &VectorMemoryConfig) -> (QdrantProjection, String) {
+    let client = QdrantProjection::new(config, "victim-repo").unwrap();
+    client
+        .upsert(&[
+            foreign_point("victim-1", "victim-repo"),
+            foreign_point("victim-2", "victim-repo"),
+        ])
+        .unwrap();
+    let collection = client.collection().to_string();
+    (client, collection)
+}
+
+#[test]
+fn a_pending_clear_planted_in_the_working_tree_is_not_executed() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let (_victim, victim_collection) = victim(&config);
+
+    // No MAC, a wrong MAC, and the old unsigned shape aimed at a collection
+    // that is not this checkout's.
+    let forged = [
+        ("\"repo_id\": \"victim-repo\"", ", \"mac\": \"\""),
+        ("\"repo_id\": \"victim-repo\"", ", \"mac\": \"00ff\""),
+        ("\"repo_id\": \"\"", ""),
+    ];
+    for (repo_field, mac_field) in forged {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+        memory.index_messages(&[note("alpha one")]).unwrap();
+        let state = state_file(&memory);
+        let planted = format!(
+            r#"{{"collection": "{}", "synced": [], "clear_epoch": 0, "pending_clears": [
+                {{"collection": "{victim_collection}", {repo_field},
+                  "ids": ["victim-1", "victim-2"]{mac_field}}}]}}"#,
+            memory.remote_collection_name()
+        );
+        drop(memory);
+        std::fs::write(&state, planted).unwrap();
+
+        let deletes_before = fake.count_matching("POST", "/points/delete");
+        let restarted = Arc::new(Mutex::new(VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            config.clone(),
+        )));
+        assert!(
+            finish_owed_remote_clear(&restarted),
+            "{repo_field} {mac_field}"
+        );
+        let guard = restarted.lock().unwrap();
+        guard.reconcile_remote(10);
+
+        assert_eq!(
+            fake.count_matching("POST", "/points/delete"),
+            deletes_before,
+            "a planted clear reached Qdrant ({repo_field} {mac_field})"
+        );
+        assert_eq!(
+            fake.collection(&victim_collection).unwrap().points.len(),
+            2,
+            "the other project lost points ({repo_field} {mac_field})"
+        );
+        assert!(!guard.remote_clear_pending());
+        assert!(
+            pending_in_file(&state).is_empty(),
+            "the planted entry stayed in the file ({repo_field} {mac_field})"
+        );
+    }
+}
+
+#[test]
+fn a_recorded_clear_is_signed_and_a_tampered_copy_is_dropped() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let (_victim, victim_collection) = victim(&config);
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    fake.set_down(true);
+    memory.clear().unwrap();
+    let state = state_file(&memory);
+    drop(memory);
+    fake.set_down(false);
+
+    let recorded = pending_in_file(&state);
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0]["mac"].as_str().map(str::len),
+        Some(64),
+        "{recorded:?}"
+    );
+
+    // Someone edits the signed entry to add another project's collection.
+    let mut tampered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    tampered["pending_clears"][0]["collection"] = victim_collection.clone().into();
+    tampered["pending_clears"][0]["repo_id"] = "victim-repo".into();
+    std::fs::write(&state, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let deletes_before = fake.count_matching("POST", "/points/delete");
+    let restarted = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    assert!(!restarted.remote_clear_pending());
+    restarted.reconcile_remote(10);
+    assert_eq!(
+        fake.count_matching("POST", "/points/delete"),
+        deletes_before
+    );
+    assert_eq!(fake.collection(&victim_collection).unwrap().points.len(), 2);
+    assert!(pending_in_file(&state).is_empty());
+}
+
+#[test]
+fn an_unsigned_clear_from_before_signing_still_runs_against_this_checkout() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    let held = fake
+        .collection(&memory.remote_collection_name())
+        .unwrap()
+        .points
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(held.len(), 1);
+    let record_id = memory.records()[0].id.clone();
+    let state = state_file(&memory);
+    let planted = format!(
+        r#"{{"collection": "{}", "synced": [], "clear_epoch": 0, "pending_clears": [
+            {{"collection": "{}", "ids": ["{record_id}"]}}]}}"#,
+        memory.remote_collection_name(),
+        memory.remote_collection_name()
+    );
+    drop(memory);
+    std::fs::write(&state, planted).unwrap();
+
+    let restarted = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    assert!(
+        restarted.remote_clear_pending(),
+        "the legacy entry was dropped"
+    );
+    let deletes_before = fake.count_matching("POST", "/points/delete");
+    restarted.reconcile_remote(10);
+    assert!(fake.count_matching("POST", "/points/delete") > deletes_before);
+    assert!(!restarted.remote_clear_pending());
 }
