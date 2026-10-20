@@ -309,15 +309,24 @@ pub enum WorkerAccess {
 }
 
 impl WorkerAccess {
-    /// Every worker reads and edits files unless the lead is in Plan Mode (or
-    /// the host did not say, which is treated the same). A worktree lease is
-    /// its own checkout, so it also gets the parent's shell tools.
+    /// A worker runs in its parent's permission mode and has no approver, so
+    /// anything the mode would ask about is refused. It is therefore offered
+    /// only what the mode allows without a question: Plan Mode (or a host that
+    /// did not say) and Manual read (Manual may also edit inside a worktree
+    /// lease); Accept Edits also edits files; Auto and
+    /// Always Approve also run shell commands, but only in a worktree lease,
+    /// which is its own checkout.
     pub fn for_worker(parent_mode: Option<PermissionMode>, worktree: bool) -> Self {
         match parent_mode {
-            Some(PermissionMode::ReadOnly) => Self::ReadOnly,
-            _ if worktree => Self::Full,
-            Some(_) => Self::FileEdits,
-            None => Self::ReadOnly,
+            Some(PermissionMode::Edits) => Self::FileEdits,
+            // Manual asks before every edit and a worker cannot answer. Inside
+            // its own lease the edits are confined to the lease, and they reach
+            // the user's checkout only when the lead merges them (an action the
+            // lead's Manual mode asks about), so the lease may be edited.
+            Some(PermissionMode::Ask) if worktree => Self::FileEdits,
+            Some(PermissionMode::Auto | PermissionMode::AlwaysApprove) if worktree => Self::Full,
+            Some(PermissionMode::Auto | PermissionMode::AlwaysApprove) => Self::FileEdits,
+            Some(PermissionMode::ReadOnly | PermissionMode::Ask) | None => Self::ReadOnly,
         }
     }
 }
@@ -847,10 +856,8 @@ pub fn run_tool(
             .map(|t| t.as_atomic_bool())
             .or_else(|| parent.abort.clone());
         let is_wt = spec.isolation.as_deref() == Some("worktree");
-        // Every worker reads and edits files unless the lead is in Plan
-        // Mode; only a worktree lease also earns shell tools. The host runs
-        // the worker in the matching permission mode, so nothing offered
-        // here is denied mid-task.
+        // The host runs the worker in the lead's permission mode with no
+        // approver, so it is offered only what that mode runs unasked.
         let access = WorkerAccess::for_worker(parent.permission_mode, is_wt);
         let fallback_registry;
         let capability_registry = if let Some(runtime) = &parent.runtime {
@@ -928,7 +935,11 @@ pub fn run_tool(
                     .unwrap_or_else(|| parent.model_id.clone().unwrap_or_default()),
                 cwd: effective_cwd,
                 state: AgentState::Starting,
-                task_id: None,
+                // The worker serves the lead's accepted task, when it has one.
+                task_id: parent
+                    .active_contract
+                    .as_ref()
+                    .map(|contract| contract.task_id),
                 worktree: wt_path.clone(),
                 started_ms: now,
                 updated_ms: now,
@@ -2303,6 +2314,96 @@ mod tests {
     }
 
     #[test]
+    fn delegation_result_links_to_task_id() {
+        let task_id = crate::runtime::TaskId::new();
+        let runtime = RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let runner = SubagentRunner::new(|_| Ok("investigated".into()));
+        let parent = SubagentParent {
+            runtime: Some(runtime.clone()),
+            permission_mode: Some(PermissionMode::Edits),
+            active_contract: Some(crate::runtime::contracts::TaskContract {
+                id: "contract".into(),
+                revision: 1,
+                task_id,
+                accepted_plan_revision: 1,
+                writable_paths: vec![],
+                protected_paths: vec![],
+                allowed_new_dependencies: false,
+                external_effects: vec![],
+                verification_requirements: vec![],
+                artifact_write_roots: vec![],
+                digest: "digest".into(),
+            }),
+            ..SubagentParent::default()
+        };
+        let result = run_tool(
+            &json!({"prompt": "look into it", "name": "investigator"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        let agent_id: AgentId = result.details.unwrap()["agentId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let record = runtime.registry.get(&agent_id).expect("worker record");
+        assert_eq!(record.task_id, Some(task_id));
+    }
+
+    #[test]
+    fn manual_mode_worktree_worker_edits_only_inside_its_lease() {
+        // Manual is the default mode. A worker with its own worktree may edit
+        // there (no shell): its edits are confined to the lease by the
+        // worktree boundary and reach the user's checkout only when the lead
+        // merges them, which the lead's own Manual mode asks about.
+        let repo = init_subagent_temp_git_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), worktrees.path());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(Vec<String>, bool)>::new()));
+        let record = seen.clone();
+        let runner = SubagentRunner::new(move |req| {
+            record
+                .lock()
+                .unwrap()
+                .push((req.tools.clone(), req.worktree_path.is_some()));
+            Ok("edited".into())
+        });
+        let parent = SubagentParent {
+            worktree_manager: Some(manager),
+            permission_mode: Some(PermissionMode::Ask),
+            ..Default::default()
+        };
+        let tools: Vec<String> = ["read", "write", "bash"].map(String::from).into();
+        run_tool(
+            &json!({"prompt": "edit in worktree", "isolation": "worktree"}),
+            &tools,
+            Some(&runner),
+            &parent,
+        )
+        .expect("a lease worker is allowed under Manual");
+        // A worker in the shared workspace stays read-only under Manual.
+        run_tool(
+            &json!({"prompt": "look around"}),
+            &tools,
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0],
+            (vec!["read".to_string(), "write".to_string()], true)
+        );
+        assert_eq!(seen[1], (vec!["read".to_string()], false));
+    }
+
+    #[test]
     fn mixed_oneshot_and_background_batch_is_refused_before_launch() {
         let runtime = RuntimeHandle::new(
             crate::runtime::RunId::new(),
@@ -2848,12 +2949,11 @@ mod tests {
             rx.recv().unwrap()
         };
         let asked = json!({"prompt": "x", "tools": ["read", "write", "bash"]});
-        // Shared workers edit files but never get a shell.
-        for mode in [
-            PermissionMode::Ask,
-            PermissionMode::Edits,
-            PermissionMode::Auto,
-        ] {
+        // Shared workers never get a shell. They edit files only where the
+        // mode runs edits without asking; a worker has no approver, so under
+        // Manual (Ask) an offered edit tool could only be refused.
+        assert_eq!(scoped_for(asked.clone(), PermissionMode::Ask), vec!["read"]);
+        for mode in [PermissionMode::Edits, PermissionMode::Auto] {
             assert_eq!(scoped_for(asked.clone(), mode), vec!["read", "write"]);
         }
     }
@@ -2868,7 +2968,7 @@ mod tests {
         let shared = scoped_tools_for_access(
             None,
             &parent_tools,
-            WorkerAccess::for_worker(Some(PermissionMode::Ask), false),
+            WorkerAccess::for_worker(Some(PermissionMode::Edits), false),
             &registry,
         );
         assert_eq!(shared, vec!["read", "grep", "find", "ls", "write", "edit"]);
@@ -2879,9 +2979,66 @@ mod tests {
             &registry,
         );
         assert_eq!(plan, vec!["read", "grep", "find", "ls"]);
+        // Manual mode asks before every edit and a worker cannot answer.
+        assert_eq!(
+            WorkerAccess::for_worker(Some(PermissionMode::Ask), false),
+            WorkerAccess::ReadOnly
+        );
+        // ... except in a worktree lease, where edits stay inside the lease.
         assert_eq!(
             WorkerAccess::for_worker(Some(PermissionMode::Ask), true),
+            WorkerAccess::FileEdits
+        );
+        assert_eq!(
+            WorkerAccess::for_worker(Some(PermissionMode::Edits), true),
+            WorkerAccess::FileEdits
+        );
+        assert_eq!(
+            WorkerAccess::for_worker(Some(PermissionMode::Auto), true),
             WorkerAccess::Full
+        );
+    }
+
+    #[test]
+    fn workers_are_only_advertised_tools_their_mode_can_run() {
+        // A worker has no approver, so a tool its mode would ask about can
+        // never run. It must not be offered: the model would plan around it.
+        let parent_tools: Vec<String> = ["read", "write", "bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let registry = RuntimeCapabilityRegistry::with_builtins();
+        let asked: Vec<String> = parent_tools.clone();
+        let scoped = |mode: PermissionMode, worktree: bool| {
+            scoped_tools_for_access(
+                Some(&asked),
+                &parent_tools,
+                WorkerAccess::for_worker(Some(mode), worktree),
+                &registry,
+            )
+        };
+        for worktree in [false, true] {
+            // Plan Mode reads only; Manual reads only outside a lease.
+            assert_eq!(scoped(PermissionMode::ReadOnly, worktree), vec!["read"]);
+            // Accept Edits runs file edits; the shell still asks.
+            assert_eq!(
+                scoped(PermissionMode::Edits, worktree),
+                vec!["read", "write"]
+            );
+        }
+        // Manual: edits only inside a lease, never a shell.
+        assert_eq!(scoped(PermissionMode::Ask, false), vec!["read"]);
+        assert_eq!(scoped(PermissionMode::Ask, true), vec!["read", "write"]);
+        // Only a lease is its own checkout, so only it earns a shell, and only
+        // when the mode runs shell commands without a question.
+        assert_eq!(scoped(PermissionMode::Auto, false), vec!["read", "write"]);
+        assert_eq!(
+            scoped(PermissionMode::Auto, true),
+            vec!["read", "write", "bash"]
+        );
+        assert_eq!(
+            scoped(PermissionMode::AlwaysApprove, true),
+            vec!["read", "write", "bash"]
         );
     }
 

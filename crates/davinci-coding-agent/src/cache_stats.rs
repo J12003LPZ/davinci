@@ -234,11 +234,19 @@ pub fn assistant_usage_from_value(message: &Value, fallback_timestamp: u64) -> A
         usage_reported: usage
             .and_then(|value| value.get("input"))
             .and_then(Value::as_u64)
-            .is_some(),
+            .is_some()
+            && usage
+                .and_then(|value| value.get("inputUnreported"))
+                .and_then(Value::as_bool)
+                != Some(true),
         cache_read_reported: usage
             .and_then(|value| value.get("cacheRead"))
             .and_then(Value::as_u64)
-            .is_some(),
+            .is_some()
+            && usage
+                .and_then(|value| value.get("cacheReadUnreported"))
+                .and_then(Value::as_bool)
+                != Some(true),
         cache_write_reported: usage
             .and_then(|value| value.get("cacheWrite"))
             .and_then(Value::as_u64)
@@ -512,6 +520,9 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             cache_write_unreported: false,
+            input_unreported: false,
+            output_unreported: false,
+            cache_read_unreported: false,
             reasoning: None,
             total_tokens: 3_000,
             cost: davinci_protocol::UsageCost {

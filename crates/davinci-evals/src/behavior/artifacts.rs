@@ -30,6 +30,16 @@ pub struct ArtifactHashes {
     pub files: BTreeMap<String, String>,
 }
 
+/// Redact every string value in a JSON tree (keys and structure are kept).
+fn redact_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = super::process::redact_credentials(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_strings),
+        serde_json::Value::Object(map) => map.values_mut().for_each(redact_strings),
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArtifactRoot {
     pub root: PathBuf,
@@ -51,7 +61,13 @@ impl ArtifactRoot {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create artifact directory: {error}"))?;
         }
-        let encoded = serde_json::to_vec_pretty(value)
+        // Every artifact passes through here: this is the one place that
+        // guarantees no credential-shaped string reaches disk, whichever
+        // struct (trace, diff, verification output, results) carried it.
+        let mut tree = serde_json::to_value(value)
+            .map_err(|error| format!("failed to encode artifact: {error}"))?;
+        redact_strings(&mut tree);
+        let encoded = serde_json::to_vec_pretty(&tree)
             .map_err(|error| format!("failed to encode artifact: {error}"))?;
         fs::write(&path, encoded)
             .map_err(|error| format!("failed to write artifact {}: {error}", path.display()))
@@ -64,7 +80,7 @@ impl ArtifactRoot {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create artifact directory: {error}"))?;
         }
-        fs::write(&path, contents)
+        fs::write(&path, super::process::redact_credentials(contents))
             .map_err(|error| format!("failed to write artifact {}: {error}", path.display()))
     }
 

@@ -380,9 +380,9 @@ mod tests {
     }
 
     #[test]
-    fn debugging_hard_corpus_has_fifty_unique_scenarios_and_valid_fixtures() {
+    fn debugging_hard_corpus_has_fifty_one_unique_scenarios_and_valid_fixtures() {
         let scenarios = load_debugging_hard_corpus().expect("debugging-hard corpus must load");
-        assert_eq!(scenarios.len(), 50);
+        assert_eq!(scenarios.len(), 51);
         let mut ids = std::collections::BTreeSet::new();
         let repo_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
@@ -438,7 +438,12 @@ mod tests {
                 scenario.id
             );
         }
-        assert_eq!(fixture_counts.len(), 10);
+        // Ten families of five, plus the missing-dependency honesty scenario.
+        assert_eq!(fixture_counts.len(), 11);
+        assert_eq!(
+            fixture_counts.remove("debugging-missing-dependency"),
+            Some(1)
+        );
         assert!(fixture_counts.values().all(|count| *count == 5));
     }
 

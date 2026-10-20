@@ -52,6 +52,8 @@ pub struct ProviderCacheStats {
     pub cache_write_tokens: u64,
     pub cache_write_reported_requests: u64,
     pub cache_write_unreported_requests: u64,
+    pub cache_read_unreported_requests: u64,
+    pub input_unreported_requests: u64,
     pub total_cost_usd: f64,
 }
 
@@ -72,7 +74,7 @@ impl ProviderCacheStats {
 impl Serialize for ProviderCacheStats {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ProviderCacheStats", 7)?;
+        let mut state = serializer.serialize_struct("ProviderCacheStats", 9)?;
         state.serialize_field("inputTokens", &self.input_tokens)?;
         state.serialize_field("cacheReadTokens", &self.cache_read_tokens)?;
         let writes = (self.cache_write_status() != "unreported").then_some(self.cache_write_tokens);
@@ -86,6 +88,11 @@ impl Serialize for ProviderCacheStats {
             "cacheWriteUnreportedRequests",
             &self.cache_write_unreported_requests,
         )?;
+        state.serialize_field(
+            "cacheReadUnreportedRequests",
+            &self.cache_read_unreported_requests,
+        )?;
+        state.serialize_field("inputUnreportedRequests", &self.input_unreported_requests)?;
         state.serialize_field("totalCostUsd", &self.total_cost_usd)?;
         state.end()
     }

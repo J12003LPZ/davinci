@@ -29,6 +29,302 @@ pub struct DavinciProcessConfig {
     pub allowed_env: BTreeMap<String, String>,
 }
 
+/// Replace credential-shaped values with a marker. Used for every string the
+/// harness exports: diagnostics, trace events, verification commands, diffs.
+///
+/// What is matched:
+/// - a credential-named key (`api_key`, `AWS_SECRET_ACCESS_KEY`, `password`,
+///   `auth_token`, `Authorization`, ...) followed by `:` or `=` and a value
+///   that looks like a credential. The separator and the value's quotes are
+///   kept, so JSON text stays valid JSON;
+/// - a credential-named long flag followed by a space and its value
+///   (`--password hunter2`, `--api-key abc`); the short `-p` is ambiguous and
+///   is left alone;
+/// - the password of URL userinfo (`postgres://user:hunter2@db`);
+/// - credential-shaped values wherever they appear (`sk-...`, `ghp_...`,
+///   `xox[bp]-...`, `AKIA...`, Stripe `sk_live_...`, JWTs, `Bearer ...`);
+/// - PEM private key blocks, up to their END line or, when the text was cut
+///   short, to the end of the text.
+///
+/// Source code must survive: `let token = read_token();`, `token: usize`,
+/// `max_token: 5` and `"input_token": 900` pass through unchanged, and so does
+/// `let secret = other_secret;`: an unquoted identifier or path expression
+/// (`self.password`, `config::SECRET`) is a reference, not a literal. A quoted
+/// string is always a value. Any other unquoted value after a strong key
+/// (secret, password, `*_key` names that hold keys, authorization) is a value
+/// unless it is a number, a type or keyword, or an expression. The identifier exemption applies only in source assignments (see `is_source_reference`). After a bare
+/// `token` key it must also carry a digit and some length, or be long.
+pub fn redact_credentials(text: &str) -> String {
+    use std::sync::OnceLock;
+    static KEYED: OnceLock<regex::Regex> = OnceLock::new();
+    static FLAG: OnceLock<regex::Regex> = OnceLock::new();
+    static USERINFO: OnceLock<regex::Regex> = OnceLock::new();
+    static PEM: OnceLock<regex::Regex> = OnceLock::new();
+    static JWT: OnceLock<regex::Regex> = OnceLock::new();
+    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
+    static BARE: OnceLock<regex::Regex> = OnceLock::new();
+    let compile = |cell: &'static OnceLock<regex::Regex>, pattern: &str| -> &'static regex::Regex {
+        cell.get_or_init(|| regex::Regex::new(pattern).expect("static credential pattern"))
+    };
+    let pem = compile(
+        &PEM,
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
+    );
+    let userinfo = compile(
+        &USERINFO,
+        r"([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^/\s@]+@",
+    );
+    let keyed = compile(
+        &KEYED,
+        r#"(?i)(["']?)([A-Za-z0-9_-]*?(?:authorization|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|signing[_-]?key|secret|passw(?:or)?d|passphrase|token))(["']?)(\s*[:=]\s*)("[^"]*"|'[^']*'|(?:(?:bearer|basic)\s+)?[^\s,"}'&;]+)"#,
+    );
+    let flag = compile(
+        &FLAG,
+        r#"(?i)(--[A-Za-z0-9_-]*?(?:authorization|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|signing[_-]?key|secret|passw(?:or)?d|passphrase|token))(\s+)("[^"]*"|'[^']*'|[^\s"'-][^\s"']*)"#,
+    );
+    let jwt = compile(
+        &JWT,
+        r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{2,}",
+    );
+    let bearer = compile(&BEARER, r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}");
+    let bare = compile(
+        &BARE,
+        r"\b(?:sk-[A-Za-z0-9_-]{16,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35})\b",
+    );
+    // A redacted value keeps its quotes, so `"k": "v"` stays valid JSON.
+    let marker = |value: &str| -> String {
+        match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => format!("{quote}[REDACTED]{quote}"),
+            _ => "[REDACTED]".to_string(),
+        }
+    };
+    let text = pem.replace_all(text, "[REDACTED]");
+    let text = userinfo.replace_all(&text, "${1}[REDACTED]@");
+    let text = keyed.replace_all(&text, |caps: &regex::Captures| {
+        let whole = caps.get(0).expect("whole match");
+        if is_source_reference(
+            &text[..whole.start()],
+            &text[whole.end()..],
+            &caps[2],
+            &caps[4],
+            &caps[5],
+        ) {
+            caps[0].to_string()
+        } else if is_credential_value(
+            &caps[2],
+            &caps[5],
+            is_config_line(&text[..whole.start()], &text[whole.end()..], &caps[4]),
+        ) {
+            format!(
+                "{}{}{}{}{}",
+                &caps[1],
+                &caps[2],
+                &caps[3],
+                &caps[4],
+                marker(&caps[5])
+            )
+        } else {
+            caps[0].to_string()
+        }
+    });
+    let text = flag.replace_all(&text, |caps: &regex::Captures| {
+        format!("{}{}{}", &caps[1], &caps[2], marker(&caps[3]))
+    });
+    let text = jwt.replace_all(&text, "[REDACTED]");
+    let text = bearer.replace_all(&text, "Bearer [REDACTED]");
+    bare.replace_all(&text, "[REDACTED]").into_owned()
+}
+
+/// A value that is code referring to something else, not a credential. Only
+/// when all of these hold:
+/// - the key is not ALL_CAPS (that is an environment variable);
+/// - the value has no digit and is a path or member expression (`self.password`,
+///   `config::SECRET`) or names the credential word itself (`other_secret`);
+/// - the line is not a `key=value;key=value` connection string;
+/// - the match is a source assignment: a statement that BEGINS with
+///   `let/const/var/static` (optionally `pub`) and ends with `;` (path or
+///   names-the-word value), or a whole `ident: value,` / `ident: value;` field
+///   line whose value starts with `self.` or contains `::` (an empty tail does
+///   not count: that is YAML).
+///
+/// Env, shell, YAML and flag forms never qualify. In doubt, redact.
+fn is_source_reference(before: &str, after: &str, key: &str, sep: &str, value: &str) -> bool {
+    if key.chars().any(|c| c.is_ascii_uppercase()) && !key.chars().any(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    if value.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let before_line = before.rsplit('\n').next().unwrap_or("");
+    let after_line = after.split('\n').next().unwrap_or("");
+    let line = format!("{before_line}{key}{sep}{value}{after_line}");
+    let pairs = line
+        .split(';')
+        .filter(|part| {
+            let part = part.trim();
+            part.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '-'))
+            })
+        })
+        .count();
+    if pairs >= 2 {
+        return false;
+    }
+    let head = before_line.trim_start();
+    let head = head
+        .strip_prefix("pub ")
+        .or_else(|| head.strip_prefix("pub(crate) "))
+        .unwrap_or(head);
+    let binding = ["let", "const", "var", "static"].iter().any(|keyword| {
+        head.strip_prefix(keyword)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace()))
+    });
+    let tail = after_line.trim();
+    let field = before_line.trim().is_empty() && sep.contains(':') && matches!(tail, "," | ";");
+    if !(binding || field) {
+        return false;
+    }
+    let is_expression = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'));
+    if !is_expression {
+        return false;
+    }
+    let normalized: String = value
+        .chars()
+        .filter(|c| *c != '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let is_path = value.contains('.') || value.contains("::");
+    if field {
+        // A field line (`    password: self.password,`) is exempt only for a
+        // member of self or a `::` path; never for a value that merely names
+        // the word, which is what a YAML `password: mysecretpassword` looks like.
+        return value.starts_with("self.") || value.contains("::");
+    }
+    // A leading binding must end its statement.
+    if tail != ";" {
+        return false;
+    }
+    let names_the_word = [
+        "authorization",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "secretkey",
+        "signingkey",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "token",
+    ]
+    .iter()
+    .any(|word| normalized.contains(word));
+    is_path || names_the_word
+}
+
+/// A whole line `key: value` with nothing after the value and no `,`/`;`
+/// terminator: YAML or similar config, not a Rust or TS field.
+fn is_config_line(before: &str, after: &str, sep: &str) -> bool {
+    let before_line = before.rsplit('\n').next().unwrap_or("");
+    let after_line = after.split('\n').next().unwrap_or("");
+    before_line.trim().is_empty() && sep.contains(':') && after_line.trim().is_empty()
+}
+
+fn is_credential_value(key: &str, value: &str, config_line: bool) -> bool {
+    let quoted = value.len() >= 3
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')));
+    if quoted {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("bearer ") || lower.starts_with("basic ") {
+        return true;
+    }
+    if value.chars().any(|c| "()<>{}[]".contains(c)) {
+        return false;
+    }
+    if value.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    const NOT_VALUES: &[&str] = &[
+        "string",
+        "str",
+        "usize",
+        "isize",
+        "bool",
+        "char",
+        "self",
+        "none",
+        "null",
+        "nil",
+        "true",
+        "false",
+        "undefined",
+        "option",
+        "vec",
+        "box",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "f32",
+        "f64",
+    ];
+    if NOT_VALUES.contains(&lower.as_str()) {
+        return false;
+    }
+    let name: String = key
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    const STRONG: &[&str] = &[
+        "authorization",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "secretkey",
+        "signingkey",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+    ];
+    if STRONG.iter().any(|word| name.ends_with(word)) {
+        return true;
+    }
+    // An ALL_CAPS key is an environment variable, never a bare code name.
+    if key.chars().any(|c| c.is_ascii_uppercase()) && !key.chars().any(|c| c.is_ascii_lowercase()) {
+        return true;
+    }
+    // YAML-style `token: value` on its own line is configuration.
+    if config_line {
+        return true;
+    }
+    // A bare `token` key: code names tokens all the time, so the value must
+    // look like one.
+    let has_digit = value.chars().any(|c| c.is_ascii_digit());
+    (has_digit && value.len() >= 8)
+        || (value.len() >= 24 && !value.contains('.'))
+        || (value.len() >= 16 && value.contains(['/', '+', '=']))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DavinciProcessRun {
     pub exit_code: i32,
@@ -42,9 +338,7 @@ impl DavinciProcessRun {
     pub fn bounded_diagnostic(&self) -> String {
         const LIMIT: usize = 2_048;
         let combined = format!("{}\n{}", self.stdout_lines.join("\n"), self.stderr);
-        let redacted = regex::Regex::new(r#"(?i)(authorization|api[_-]?key)\s*[:=]\s*[^\s,"}]+"#)
-            .expect("static credential pattern")
-            .replace_all(&combined, "$1=[REDACTED]");
+        let redacted = redact_credentials(&combined);
         redacted
             .chars()
             .rev()
@@ -338,6 +632,234 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
     }
 
     #[test]
+    fn redaction_covers_prefixed_env_keys_json_keys_and_bearer() {
+        for (input, secret) in [
+            ("OPENAI_API_KEY=fakevalue-0123 run", "fakevalue-0123"),
+            ("export GITHUB_TOKEN=fakevalue-4567", "fakevalue-4567"),
+            (r#"{"token": "abc-fake-1"}"#, "abc-fake-1"),
+            (r#"{"client_secret":"abc fake 2"}"#, "abc fake 2"),
+            (r#"{"password": 'pw fake 3'}"#, "pw fake 3"),
+            ("Authorization: Bearer fakebearer4 ok", "fakebearer4"),
+            (r#"{"Authorization": "Bearer fakebearer5"}"#, "fakebearer5"),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_covers_credential_names_and_value_shapes() {
+        // (input, the secret that must be gone)
+        for (input, secret) in [
+            (
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG",
+                "wJalrXUtnFEMI/K7MDENG",
+            ),
+            ("access_key=AKIAabc", "AKIAabc"),
+            ("DB_PRIVATE_KEY=abcdef123", "abcdef123"),
+            ("aws id AKIAIOSFODNN7EXAMPLE here", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "slack xoxb-1234567890-abcdefghij",
+                "xoxb-1234567890-abcdefghij",
+            ),
+            (
+                "slack xoxp-1234567890-abcdefghij",
+                "xoxp-1234567890-abcdefghij",
+            ),
+            (
+                "pat ghp_0123456789abcdefghij0123",
+                "ghp_0123456789abcdefghij0123",
+            ),
+            ("key sk-fake-0123456789abcdef", "sk-fake-0123456789abcdef"),
+            (
+                "curl -H 'Authorization: Bearer abcdefgh12345'",
+                "abcdefgh12345",
+            ),
+            ("sent Bearer abcdefgh12345 upstream", "abcdefgh12345"),
+            (r#"api_key = "hunter2-fake""#, "hunter2-fake"),
+            (r#"{"password": "pw-fake-1"}"#, "pw-fake-1"),
+            ("export STRIPE_SECRET=fakevalue-9876", "fakevalue-9876"),
+            (r#"{"token": "plain words allowed"}"#, "plain words allowed"),
+            ("auth_token: abcdef0123456789", "abcdef0123456789"),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_covers_flags_userinfo_and_provider_shapes() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAfakefakefake\nabcdefghijklmnop\n-----END RSA PRIVATE KEY-----";
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJlZmFrZQ";
+        let wrapped = format!(
+            "key:
+{pem}
+end"
+        );
+        let saw = format!("saw {jwt} in log");
+        for (input, secret) in [
+            ("curl --password hunter2 host", "hunter2"),
+            ("mysql --api-key abc123xyz host", "abc123xyz"),
+            ("tool --token xq9 host", "xq9"),
+            ("tool --client-secret 'two words' go", "two words"),
+            ("tool --api_key abcdef", "abcdef"),
+            ("psql postgres://user:hunter2@db/app", "hunter2"),
+            (
+                "git clone https://bot:ghfake-pw@example.com/r.git",
+                "ghfake-pw",
+            ),
+            (
+                "charge sk_live_FAKEFAKEFAKE0123",
+                "sk_live_FAKEFAKEFAKE0123",
+            ),
+            (
+                "charge sk_test_FAKEFAKEFAKE0123",
+                "sk_test_FAKEFAKEFAKE0123",
+            ),
+            (
+                "restricted rk_live_FAKEFAKEFAKE0123",
+                "rk_live_FAKEFAKEFAKE0123",
+            ),
+            (pem, "MIIEowIBAAKCAQEAfakefakefake"),
+            (wrapped.as_str(), "abcdefghijklmnop"),
+            (
+                "-----BEGIN PRIVATE KEY-----\nMIIfaketruncatedbody",
+                "MIIfaketruncatedbody",
+            ),
+            (saw.as_str(), jwt),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{input} -> {out}");
+        }
+        // The user name and host of a URL survive, so the log stays readable.
+        assert_eq!(
+            redact_credentials("psql postgres://user:hunter2@db/app"),
+            "psql postgres://user:[REDACTED]@db/app"
+        );
+        // The short `-p` is ambiguous (port, path, password) and is left alone.
+        assert_eq!(
+            redact_credentials("mysql -p 3306 host"),
+            "mysql -p 3306 host"
+        );
+        // A flag whose next word is another flag has no value to redact.
+        assert_eq!(
+            redact_credentials("tool --token --verbose"),
+            "tool --token --verbose"
+        );
+        // Ordinary URLs and flags are untouched.
+        for input in [
+            "https://example.com:8080/path",
+            "git@github.com:org/repo.git",
+            "tool --max-tokens 5 --token-file creds.txt",
+            "cargo test --password-policy strict",
+        ] {
+            assert_eq!(redact_credentials(input), input);
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_the_original_separator_so_json_stays_valid() {
+        let json = r#"{"password": "pw-fake-1", "token":"abc-fake-1", "api_key" : 'k-fake-2'}"#;
+        let out = redact_credentials(json);
+        assert!(
+            !out.contains("pw-fake-1") && !out.contains("abc-fake-1") && !out.contains("k-fake-2")
+        );
+        assert_eq!(
+            out,
+            r#"{"password": "[REDACTED]", "token":"[REDACTED]", "api_key" : '[REDACTED]'}"#
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&redact_credentials(r#"{"password": "pw-fake-1", "n": 1}"#))
+                .unwrap();
+        assert_eq!(parsed["password"], "[REDACTED]");
+        assert_eq!(
+            redact_credentials("export API_KEY = fake-0123"),
+            "export API_KEY = [REDACTED]"
+        );
+        assert_eq!(
+            redact_credentials("auth_token: abcdef0123456789"),
+            "auth_token: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn strong_keys_keep_source_references_but_never_env_or_config_values() {
+        // Source code: a binding or field whose value is a path or names the
+        // same credential word is a reference, not a literal.
+        for input in [
+            "let secret = other_secret;",
+            "let password = self.password;",
+            "const SECRET: &str = crate::keys::SECRET;",
+            "let secret = settings::SECRET_VALUE;",
+            "static PASSWORD_FILE: &str = config.password_file;",
+            "    password: self.password,",
+            "var apiKey = old_api_key;",
+        ] {
+            assert_eq!(redact_credentials(input), input);
+        }
+        // Env, shell and config forms are always redacted, whatever the shape
+        // of the value, and so are source literals.
+        for (input, secret) in [
+            (r#"let secret = "hunter2-fake";"#, "hunter2-fake"),
+            ("secret=hunter2", "hunter2"),
+            ("PASSWORD=Tr0ub4dor", "Tr0ub4dor"),
+            ("DB_PASSWORD=correct_horse_battery", "correct_horse_battery"),
+            ("export API_TOKEN=abc_def", "abc_def"),
+            ("password: hunter_two", "hunter_two"),
+            ("password = other_word", "other_word"),
+            ("export SECRET=old_secret", "old_secret"),
+            (
+                "let password = correct_horse_battery;",
+                "correct_horse_battery",
+            ),
+            ("db:\n  password: hunter_two,", "hunter_two"),
+            (
+                "tool --password correct_horse_battery",
+                "correct_horse_battery",
+            ),
+        ] {
+            let out = redact_credentials(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_code_and_numbers_alone() {
+        for input in [
+            "let token = read_token();",
+            "token: usize",
+            "max_token: 5",
+            r#"{"input_token": 900}"#,
+            "pub struct Cfg { token: String }",
+            "pub token: usize,",
+            "let secret = load_secret();",
+            "password: String",
+            "primary_key: u32",
+            "cache_key = compute(a)",
+            "token = self.next()",
+            "secret: Option<String>",
+        ] {
+            assert_eq!(redact_credentials(input), input);
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_non_secret_text_unchanged() {
+        for input in [
+            "tokenizer: x",
+            "max_tokens: 5",
+            r#"{"input_tokens": 900, "output_tokens": 3}"#,
+            "secretary: Jo",
+            "the password policy was reviewed",
+        ] {
+            assert_eq!(redact_credentials(input), input);
+        }
+    }
+
+    #[test]
     fn bounded_diagnostic_redacts_credentials_and_limits_output() {
         let run = DavinciProcessRun {
             exit_code: 1,
@@ -350,7 +872,7 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             timed_out: false,
         };
         let diagnostic = run.bounded_diagnostic();
-        assert!(diagnostic.contains("Authorization=[REDACTED]"));
+        assert!(diagnostic.contains("Authorization: [REDACTED]"));
         assert!(diagnostic.contains("api_key=[REDACTED]"));
         assert!(!diagnostic.contains("bearer-secret"));
         assert!(!diagnostic.contains("key-secret"));

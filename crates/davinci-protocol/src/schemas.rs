@@ -155,6 +155,29 @@ pub struct Usage {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub cache_write_unreported: bool,
+    /// The provider's usage object carried no input count, so `input` is a
+    /// placeholder 0 and not a measured zero.
+    #[serde(
+        rename = "inputUnreported",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub input_unreported: bool,
+    /// As `input_unreported`, for the output count.
+    #[serde(
+        rename = "outputUnreported",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub output_unreported: bool,
+    /// As `input_unreported`, for the cached-read count: a provider that does
+    /// not say how much was cached has not said it was nothing.
+    #[serde(
+        rename = "cacheReadUnreported",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub cache_read_unreported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
     #[serde(rename = "totalTokens")]
@@ -183,6 +206,9 @@ impl Usage {
             cache_read,
             cache_write,
             cache_write_unreported: false,
+            input_unreported: false,
+            output_unreported: false,
+            cache_read_unreported: false,
             reasoning: None,
             total_tokens: input + output + cache_read + cache_write,
             cost,

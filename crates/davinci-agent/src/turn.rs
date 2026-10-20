@@ -242,12 +242,21 @@ impl Agent {
         T: Into<crate::CompleteOutput>,
     {
         self.ensure_session_persistence()?;
+        // Before the outbox replay: that replay may add results for calls whose
+        // assistant message lives only in the journal.
+        self.validate_loaded_tool_history()?;
         self.recover_pending_operation_publications()?;
+        // Replayed results join the history here; a result whose call is not
+        // in it must not reach the provider either.
+        self.reject_orphan_tool_results()?;
+        self.reconcile_unresolved_tool_calls()?;
         self.require_prompt_checkpoint_persistence()?;
         let run_started = std::time::Instant::now();
         let result = self.run_loop_body(emit_prompt_messages, complete);
         self.completion_context.clear();
         self.invalidate_context_image();
+        self.persist_mutation_verification();
+        self.persist_tool_exposure();
         let rewind_persistence = self.settle_prompt_checkpoint();
         let persistence = self.ensure_session_persistence();
         crate::RunStats::add_elapsed(&mut self.stats.wall_ms, run_started.elapsed());
@@ -313,6 +322,246 @@ impl Agent {
             runtime.mark_turn_failed();
             runtime.emit_turn_end(false);
         }
+    }
+
+    /// Answer every persisted tool call that has no result after a restart.
+    ///
+    /// A hard stop can land after `persist_assistant` and before the result,
+    /// leaving a call the provider would reject as unpaired. The answer is
+    /// anchored in durable state and never fabricates success or re-runs the
+    /// tool: a call whose effect may have started reports "outcome unknown", a
+    /// call that never started reports "not executed". Pairing is by call id.
+    /// Calls with a durable result waiting in the outbox are left to the
+    /// publication replay, which runs first. Idle agents only: a streaming
+    /// agent has calls that are legitimately in flight.
+    pub(crate) fn reconcile_unresolved_tool_calls(&mut self) -> Result<(), String> {
+        if self.is_streaming || self.unresolved_tool_calls().is_empty() {
+            return Ok(());
+        }
+        self.recover_pending_operation_publications()?;
+        let unresolved = self.unresolved_tool_calls();
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+        let mut repaired: Vec<(usize, ChatMessage)> = Vec::new();
+        for (index, id, name) in unresolved {
+            let mut message = tool_result_message(
+                &id,
+                &name,
+                self.unresolved_call_result(&id),
+                self.auto_resize_images,
+            );
+            self.annotate_tool_result_wire_kind(&mut message);
+            repaired.push((index, message));
+        }
+        // Back to front so earlier insertion points stay valid. Only the
+        // newest exchange sits at the session leaf and can be appended
+        // durably; older ones are repaired in memory, identically per load.
+        let tail_start = self.messages.iter().rposition(|m| m.role == "assistant");
+        // One assistant message can carry several calls: its group goes in
+        // together, in call order, after any results it already has.
+        while let Some(&(index, _)) = repaired.last() {
+            let split = repaired.partition_point(|(other, _)| *other < index);
+            let group = repaired.split_off(split);
+            let mut at = index + 1;
+            while self
+                .messages
+                .get(at)
+                .is_some_and(|next| next.role == "toolResult")
+            {
+                at += 1;
+            }
+            let durable = Some(index) == tail_start && at == self.messages.len();
+            for (_, message) in group {
+                if durable {
+                    self.persist_full_message(&message);
+                }
+                self.messages.insert(at, message);
+                at += 1;
+            }
+        }
+        self.ensure_session_persistence()
+    }
+
+    fn validate_loaded_tool_history(&mut self) -> Result<(), String> {
+        if self.is_streaming {
+            return Ok(());
+        }
+        self.drop_duplicate_tool_results();
+        self.reject_orphan_tool_results()
+    }
+
+    /// A second result for one call id would reach the provider as a second
+    /// output. The first one answered the call; later ones are dropped.
+    fn drop_duplicate_tool_results(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.messages.retain(|message| {
+            message.role != "toolResult"
+                || message
+                    .tool_call_id
+                    .as_ref()
+                    .is_none_or(|id| seen.insert(id.clone()))
+        });
+    }
+
+    /// A result whose call id was never issued by an earlier assistant message
+    /// cannot be repaired by guessing; the history is refused before any
+    /// provider request is built from it.
+    fn reject_orphan_tool_results(&mut self) -> Result<(), String> {
+        // Only a persisted conversation is checked: its history came from disk
+        // and may be damaged. Hosts that build `messages` in memory own them.
+        if self.session.is_none() {
+            return Ok(());
+        }
+        let mut called = std::collections::HashSet::new();
+        let mut orphans: Vec<String> = Vec::new();
+        for message in &self.messages {
+            if message.role == "assistant" {
+                for content in &message.content {
+                    if let davinci_ai::MessageContent::ToolCall { id, .. } = content {
+                        called.insert(id.as_str());
+                    }
+                }
+            } else if message.role == "toolResult" {
+                if let Some(id) = message.tool_call_id.as_deref() {
+                    if !called.contains(id) {
+                        orphans.push(id.to_string());
+                    }
+                }
+            }
+        }
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        // The assistant message is the record of a model's call. The operation
+        // journal records every call that ran, including ones the host issued
+        // itself (checks, handoffs), which never had an assistant message. A
+        // result the journal accounts for cannot be sent alone, but refusing
+        // every later prompt would strand the session: it is withheld from the
+        // provider, with a warning. An id nothing accounts for fails closed.
+        let mut withheld: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let (Some(journal), Some(session)) = (self.operation_journal(), self.session.as_ref()) {
+            let snapshot = journal
+                .snapshot()
+                .map_err(|error| format!("operation journal could not be read: {error}"))?;
+            for id in &orphans {
+                if snapshot.operations.iter().any(|spec| {
+                    spec.context().session_id == session.header.id
+                        && spec.context().wire_tool_call_id.as_deref() == Some(id.as_str())
+                }) {
+                    withheld.insert(id.clone());
+                }
+            }
+        }
+        if let Some(id) = orphans.iter().find(|id| !withheld.contains(*id)) {
+            return Err(format!(
+                "Tool result {id} has no matching tool call earlier in the conversation; refusing to send an unpaired history."
+            ));
+        }
+        eprintln!(
+            "warning: withholding {} tool result(s) with no matching tool call from the provider request: {}",
+            withheld.len(),
+            withheld.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        self.messages.retain(|message| {
+            !(message.role == "toolResult"
+                && message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| withheld.contains(id)))
+        });
+        Ok(())
+    }
+
+    /// `(assistant index, call id, tool name)` for calls with no toolResult.
+    fn unresolved_tool_calls(&self) -> Vec<(usize, String, String)> {
+        let answered: std::collections::HashSet<&str> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut unresolved = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if message.role != "assistant" {
+                continue;
+            }
+            for content in &message.content {
+                if let davinci_ai::MessageContent::ToolCall { id, name, .. } = content {
+                    if !answered.contains(id.as_str()) && seen.insert(id.clone()) {
+                        unresolved.push((index, id.clone(), name.clone()));
+                    }
+                }
+            }
+        }
+        unresolved
+    }
+
+    fn unresolved_call_result(&self, call_id: &str) -> crate::ToolResult {
+        use crate::runtime::operations::EffectStatus;
+        const UNKNOWN: &str = "Outcome unknown: the session ended after this call started, \
+so it may or may not have taken effect. It was not re-run. Check the current state \
+(files, processes, external systems) before retrying.";
+        const NOT_EXECUTED: &str = "Not executed: the session ended before this call started. \
+Issue the call again if it is still needed.";
+        let (unknown, source) = if let Some(journal) = self.operation_journal() {
+            let session_id = self
+                .session
+                .as_ref()
+                .map(|session| session.header.id.clone());
+            match journal.snapshot() {
+                Err(_) => (true, "operation_journal_unreadable"),
+                Ok(snapshot) => {
+                    let operation = snapshot.operations.iter().find(|spec| {
+                        spec.context().wire_tool_call_id.as_deref() == Some(call_id)
+                            && Some(&spec.context().session_id) == session_id.as_ref()
+                    });
+                    let latest = operation.and_then(|spec| {
+                        snapshot
+                            .attempts
+                            .iter()
+                            .filter(|attempt| attempt.operation_id() == spec.operation_id())
+                            .max_by_key(|attempt| attempt.attempt_number())
+                    });
+                    match latest {
+                        Some(attempt) => (
+                            !matches!(
+                                attempt.effect_status(),
+                                EffectStatus::NotStarted | EffectStatus::KnownNoEffect
+                            ),
+                            "operation_journal",
+                        ),
+                        None => (self.ledger_says_started(call_id), "tool_ledger"),
+                    }
+                }
+            }
+        } else {
+            (self.ledger_says_started(call_id), "tool_ledger")
+        };
+        crate::ToolResult {
+            content: if unknown { UNKNOWN } else { NOT_EXECUTED }.into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "toolRecovery": {
+                    "outcome": if unknown { "unknown" } else { "not_executed" },
+                    "source": source,
+                }
+            })),
+        }
+    }
+
+    fn ledger_says_started(&self, call_id: &str) -> bool {
+        use crate::tool_ledger::{AttemptOutcome, ToolExecutionStatus};
+        self.tool_ledger.lock().map_or(true, |ledger| {
+            ledger.records().get(call_id).is_some_and(|record| {
+                record.outcome != AttemptOutcome::NotStarted
+                    || matches!(
+                        record.status,
+                        ToolExecutionStatus::Executing | ToolExecutionStatus::Blocked
+                    )
+            })
+        })
     }
 
     fn finish_run(&mut self, events: &mut Vec<AgentEvent>, new_messages: Vec<ChatMessage>) {
@@ -1292,9 +1541,9 @@ impl Agent {
                     let native_responses_resume = output.native_responses_resume.clone();
                     let message = output.message;
                     if let Some(usage) = &message.usage {
-                        self.tool_context.cache.record_provider_usage_with_write(
-                            usage.input,
-                            usage.cache_read,
+                        self.tool_context.cache.record_provider_usage_counts(
+                            (!usage.input_unreported).then_some(usage.input),
+                            (!usage.cache_read_unreported).then_some(usage.cache_read),
                             (!usage.cache_write_unreported).then_some(usage.cache_write),
                         );
                         self.tool_context
@@ -4991,10 +5240,16 @@ impl Agent {
                 );
             }
             if self.session.is_some() && self.persist_operation_chat_result(message)? {
+                self.persist_mutation_verification();
+                self.persist_tool_exposure();
                 return self.ensure_session_persistence();
             }
         }
         self.persist_full_message(message);
+        if message.role == "toolResult" {
+            self.persist_mutation_verification();
+            self.persist_tool_exposure();
+        }
         self.ensure_session_persistence()
     }
 
@@ -5491,6 +5746,32 @@ mod tests {
             agent.lane_for_call("agent", crate::permission::ToolClass::Other, &shared),
             crate::scheduler::ToolLane::Parallel
         );
+    }
+
+    #[test]
+    fn per_call_refinement_cannot_upgrade_a_serial_barrier() {
+        // Only the `agent` tool is refined per call, and only downward. Worktree
+        // isolation in the arguments of any other tool does not buy a lane.
+        let mut agent = Agent::new("lane fixture");
+        let isolated = serde_json::json!({"command": "make", "isolation": "worktree"});
+        for mode in [
+            crate::PermissionMode::Edits,
+            crate::PermissionMode::Auto,
+            crate::PermissionMode::AlwaysApprove,
+        ] {
+            agent.set_permission_mode(mode);
+            for (tool, class) in [
+                ("bash", crate::permission::ToolClass::Shell),
+                ("write", crate::permission::ToolClass::Edit),
+                ("unregistered_tool", crate::permission::ToolClass::Other),
+            ] {
+                assert_eq!(
+                    agent.lane_for_call(tool, class, &isolated),
+                    crate::scheduler::ToolLane::Serial,
+                    "{tool} in {mode:?}"
+                );
+            }
+        }
     }
 
     #[test]

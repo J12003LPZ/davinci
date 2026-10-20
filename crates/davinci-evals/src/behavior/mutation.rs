@@ -214,6 +214,7 @@ mod tests {
             unverified_claim_rate: 0.02,
             unrelated_edit_rate: 0.02,
             unnecessary_permission_prompt_rate: 0.0,
+            task_identity: None,
         };
 
         // Case 1: Useful module (ablation causes pass rate drop)

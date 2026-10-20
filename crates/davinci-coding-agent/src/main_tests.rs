@@ -4628,9 +4628,10 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
     assert!(!child.tools.contains(&"write".into()));
     assert!(!child.tools.contains(&"agent".into()));
     assert_eq!(child.max_model_turns, Some(60));
-    // Plan Mode keeps a worktree worker read-only. Every other parent mode,
-    // including the default Manual mode, edits inside the isolated lease: the
-    // child has no approver, so `Ask` there could only deny every write.
+    // A worktree worker runs in its parent's mode, with one deliberate
+    // exception: Manual asks before every edit and the worker has no
+    // approver, so inside its own lease (edits confined by the worktree
+    // boundary, merged back only by the lead) it runs in Accept Edits.
     for (parent, expected) in [
         (
             davinci_agent::PermissionMode::ReadOnly,
@@ -4667,7 +4668,104 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
 }
 
 #[test]
-fn shared_workers_and_inheriting_profiles_edit_files_outside_plan_mode() {
+fn delegated_worker_does_not_exceed_parent_permission() {
+    use davinci_agent::PermissionMode as Mode;
+    // How much a mode lets a run do without asking, least to most.
+    let rank = |mode: Mode| match mode {
+        Mode::ReadOnly => 0,
+        Mode::Ask => 1,
+        Mode::Edits => 2,
+        Mode::Auto => 3,
+        Mode::AlwaysApprove => 4,
+    };
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        project_trust_override: Some(true),
+        ..Default::default()
+    };
+    for parent in Mode::ALL {
+        for worktree in [None, Some(dir.path().to_path_buf())] {
+            let req = davinci_agent::SubagentRequest {
+                tools: vec!["read".into(), "write".into(), "bash".into()],
+                parent_tools: Some(vec!["read".into(), "write".into(), "bash".into()]),
+                parent_permission_mode: Some(parent),
+                worktree_path: worktree.clone(),
+                ..Default::default()
+            };
+            let (child, _) = build_worker_agent(
+                &parsed,
+                dir.path(),
+                &davinci_agent::McpRegistry::default(),
+                &req,
+            )
+            .unwrap();
+            // The one exception: a Manual lease worker edits inside its lease.
+            let manual_lease = parent == Mode::Ask && worktree.is_some();
+            assert!(
+                rank(child.permission_mode()) <= rank(parent)
+                    || (manual_lease && child.permission_mode() == Mode::Edits),
+                "a worker under {parent:?} ran in {:?} (worktree: {})",
+                child.permission_mode(),
+                worktree.is_some()
+            );
+        }
+    }
+}
+
+#[test]
+fn auto_worker_shell_runs_recognized_checks_and_refuses_the_rest() {
+    // An Auto worker is offered `bash`, but the child policy is Auto's own
+    // classifier and the child has no approver: a recognized local command
+    // runs, anything else asks, and an ask in a run that cannot ask is a
+    // refusal (turn.rs: "this run cannot ask").
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        project_trust_override: Some(true),
+        ..Default::default()
+    };
+    let req = davinci_agent::SubagentRequest {
+        tools: vec!["read".into(), "bash".into()],
+        parent_tools: Some(vec!["read".into(), "bash".into()]),
+        parent_permission_mode: Some(davinci_agent::PermissionMode::Auto),
+        worktree_path: Some(dir.path().to_path_buf()),
+        ..Default::default()
+    };
+    let (child, _) = build_worker_agent(
+        &parsed,
+        dir.path(),
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    assert!(child.approver.is_none() && child.approval_responder.is_none());
+    assert!(child.tools.contains(&"bash".into()));
+    let policy = child.permissions.lock().unwrap();
+    let ask = |command: &str| {
+        matches!(
+            policy.decide(
+                "t",
+                "bash",
+                &serde_json::json!({"command": command}),
+                dir.path()
+            ),
+            davinci_agent::PermissionVerdict::Ask(_)
+        )
+    };
+    assert!(ask("rm -rf build"));
+    assert!(ask("unknown-tool"));
+    assert!(!ask("git status"));
+}
+
+#[test]
+fn shared_workers_and_inheriting_profiles_follow_the_parent_mode() {
     let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
@@ -4693,12 +4791,17 @@ fn shared_workers_and_inheriting_profiles_edit_files_outside_plan_mode() {
             ),
             (
                 davinci_agent::PermissionMode::Ask,
+                davinci_agent::PermissionMode::Ask,
+                false,
+            ),
+            (
+                davinci_agent::PermissionMode::Edits,
                 davinci_agent::PermissionMode::Edits,
                 true,
             ),
             (
                 davinci_agent::PermissionMode::Auto,
-                davinci_agent::PermissionMode::Edits,
+                davinci_agent::PermissionMode::Auto,
                 true,
             ),
         ] {

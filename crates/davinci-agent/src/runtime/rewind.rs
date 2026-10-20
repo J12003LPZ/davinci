@@ -2454,6 +2454,7 @@ impl crate::Agent {
                 .map(crate::delegation_forbidden_from_session)
                 .unwrap_or(checkpoint.delegation_forbidden_before);
             self.restore_living_plan();
+            self.restore_branch_state();
         }
         Ok(RewindOutcome {
             checkpoint_id: checkpoint_id.into(),
@@ -2526,6 +2527,50 @@ mod prompt_rewind_tests {
             "{:?}",
             agent.messages
         );
+    }
+
+    /// A transcript rewind derives the mutation-verification and tool-exposure
+    /// state from the branch it lands on, the same way a session load does.
+    #[test]
+    fn transcript_rewind_rederives_mutation_and_tool_exposure_state() {
+        let dir = tempdir().unwrap();
+        let mut agent = agent_at(dir.path());
+        agent.prompt("first");
+        let first = agent.prompt_checkpoints()[0].id.clone();
+        let initial = agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap()
+            .visible_names()
+            .clone();
+        let deferred = agent
+            .tools
+            .iter()
+            .find(|name| !initial.contains(*name))
+            .cloned()
+            .expect("a tool that starts deferred");
+        agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap()
+            .activate_authorized(&deferred, true);
+        tool_turn(
+            &mut agent,
+            "write",
+            json!({"path":"edited.txt","content":"one"}),
+        );
+        assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+        let preview = agent.preview_prompt_rewind(&first).unwrap();
+        agent
+            .apply_prompt_rewind(&first, &preview.preview_digest, &select(false, true))
+            .unwrap();
+        // The branch we landed on holds neither the edit nor the discovery.
+        assert_eq!(agent.mutation_verification_state().mutation_generation, 0);
+        let exposure = agent.tool_context.tool_exposure.lock().unwrap();
+        assert!(!exposure.is_visible(&deferred));
+        assert_eq!(exposure.visible_names(), &initial);
     }
 
     fn select(code: bool, transcript: bool) -> RewindSelection {

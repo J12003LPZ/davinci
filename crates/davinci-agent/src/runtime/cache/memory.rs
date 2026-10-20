@@ -523,10 +523,41 @@ impl CacheRuntime {
     /// is not a measured zero, so it adds nothing to the write total and is
     /// counted in [`Self::provider_cache_write_coverage`] instead.
     pub fn record_provider_usage_with_write(&self, input: u64, read: u64, write: Option<u64>) {
+        self.record_provider_usage_counts(Some(input), Some(read), write);
+    }
+
+    /// Any count may be `None` when the provider's usage object omitted it. An
+    /// omitted count is unknown, not zero: it adds nothing and is counted in
+    /// the matching `*_unreported_requests` field. An omitted cached-read count
+    /// also voids that request's ordinary input, which was derived assuming
+    /// nothing was cached.
+    pub fn record_provider_usage_counts(
+        &self,
+        input: Option<u64>,
+        read: Option<u64>,
+        write: Option<u64>,
+    ) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let provider = &mut state.stats.provider;
-        provider.input_tokens = provider.input_tokens.saturating_add(input);
-        provider.cache_read_tokens = provider.cache_read_tokens.saturating_add(read);
+        match input {
+            Some(input) if read.is_some() => {
+                provider.input_tokens = provider.input_tokens.saturating_add(input);
+            }
+            Some(_) => {}
+            None => {
+                provider.input_unreported_requests =
+                    provider.input_unreported_requests.saturating_add(1);
+            }
+        }
+        match read {
+            Some(read) => {
+                provider.cache_read_tokens = provider.cache_read_tokens.saturating_add(read);
+            }
+            None => {
+                provider.cache_read_unreported_requests =
+                    provider.cache_read_unreported_requests.saturating_add(1);
+            }
+        }
         match write {
             Some(write) => {
                 provider.cache_write_tokens = provider.cache_write_tokens.saturating_add(write);

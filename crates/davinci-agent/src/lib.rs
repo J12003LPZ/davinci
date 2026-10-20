@@ -149,6 +149,8 @@ pub use prompt::{
 pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
 /// Code on every error that reports a lost session write.
 pub const PERSISTENCE_FAILURE: &str = "PERSISTENCE_FAILURE";
+const MUTATION_VERIFICATION_ENTRY_TYPE: &str = "mutation_verification";
+const TOOL_EXPOSURE_ENTRY_TYPE: &str = "tool_exposure";
 pub use runtime::{
     conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
     find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
@@ -630,6 +632,9 @@ pub struct Agent {
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
+    /// Last state written to the session, so unchanged state is not rewritten.
+    persisted_mutation_verification: Option<MutationVerificationState>,
+    persisted_tool_exposure: Option<std::collections::BTreeSet<String>>,
     completion_state: Arc<Mutex<completion::CompletionState>>,
     /// Bounded request suffix; never session/WAL history or compaction input.
     completion_context: Vec<completion::CompletionContextMessage>,
@@ -820,6 +825,8 @@ impl Agent {
             last_verification_notice: None,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
+            persisted_mutation_verification: None,
+            persisted_tool_exposure: None,
             completion_state: Arc::new(Mutex::new(completion::CompletionState::default())),
             completion_context: Vec::new(),
             pending_transaction_verification: Arc::new(Mutex::new(
@@ -1254,6 +1261,193 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    /// Write the mutation and verification state to the session when it changed,
+    /// so a resumed session still knows an edit has not been verified.
+    pub(crate) fn persist_mutation_verification(&mut self) {
+        let state = self.mutation_verification_state();
+        if self.persisted_mutation_verification.as_ref() == Some(&state)
+            || (self.persisted_mutation_verification.is_none()
+                && state == MutationVerificationState::default())
+        {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Ok(data) = serde_json::to_value(&state) else {
+            return;
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("data".into(), data);
+        let appended = session.append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some(MUTATION_VERIFICATION_ENTRY_TYPE.into()),
+            extra,
+        });
+        if appended.is_ok() {
+            self.persisted_mutation_verification = Some(state);
+        }
+    }
+
+    /// Write the set of tool schemas the model has been shown to the session
+    /// when it changed, so a resumed session does not have to rediscover them.
+    /// The set is a hint: restoring re-checks it against current authority.
+    pub fn persist_tool_exposure(&mut self) {
+        let visible = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .discovered_names()
+            .clone();
+        if self.persisted_tool_exposure.as_ref() == Some(&visible)
+            || (self.persisted_tool_exposure.is_none() && visible.is_empty())
+        {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("data".into(), serde_json::json!({ "discovered": visible }));
+        let appended = session.append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some(TOOL_EXPOSURE_ENTRY_TYPE.into()),
+            extra,
+        });
+        if appended.is_ok() {
+            self.persisted_tool_exposure = Some(visible);
+        }
+    }
+
+    /// Re-expose the tools the session had discovered, but only those that are
+    /// active and authorized in this process. A saved name can narrow nothing
+    /// and widen nothing: it is a hint, never authority.
+    fn restore_tool_exposure(&mut self) {
+        let (saved, legacy_visible): (Vec<String>, bool) = self
+            .session
+            .as_ref()
+            .and_then(|session| {
+                davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+                    .into_iter()
+                    .rev()
+                    .find(|entry| {
+                        entry.entry_type == "custom"
+                            && entry.custom_type.as_deref() == Some(TOOL_EXPOSURE_ENTRY_TYPE)
+                    })
+                    .map(|entry| {
+                        // Sessions saved before the discovered-only format
+                        // stored the whole visible set under `visible`.
+                        let data = entry.extra.get("data");
+                        let names = |key: &str| -> Option<Vec<String>> {
+                            Some(
+                                data?
+                                    .get(key)?
+                                    .as_array()?
+                                    .iter()
+                                    .filter_map(|name| name.as_str().map(str::to_string))
+                                    .collect(),
+                            )
+                        };
+                        match names("discovered") {
+                            Some(discovered) => (discovered, false),
+                            None => (names("visible").unwrap_or_default(), true),
+                        }
+                    })
+            })
+            .unwrap_or_default();
+        self.sync_tool_authorization();
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut exposure = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Rebuild from the branch: drop what this process had discovered, then
+        // apply what the branch saved.
+        exposure.reset_discovered();
+        for name in saved {
+            // In the legacy format, names visible by default are not discoveries.
+            if legacy_visible && exposure.is_visible(&name) {
+                continue;
+            }
+            if self.tools.contains(&name) && authorized.contains(&name) {
+                exposure.activate_authorized(&name, true);
+            }
+        }
+        self.persisted_tool_exposure = Some(exposure.discovered_names().clone());
+    }
+
+    /// Derive every piece of branch-owned state from the session's current
+    /// branch. A session load and a transcript rewind both call this, so the
+    /// two cannot disagree about what the branch holds.
+    pub(crate) fn restore_branch_state(&mut self) {
+        self.restore_mutation_verification();
+        self.restore_tool_exposure();
+    }
+
+    /// Restore the state persisted on the session's current branch. Without
+    /// one, the state is empty: it belongs to the session, not to the agent.
+    fn restore_mutation_verification(&mut self) {
+        let saved = self.session.as_ref().and_then(|session| {
+            davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+                .into_iter()
+                .rev()
+                .find(|entry| {
+                    entry.entry_type == "custom"
+                        && entry.custom_type.as_deref() == Some(MUTATION_VERIFICATION_ENTRY_TYPE)
+                })
+                .map(|entry| entry.extra.get("data").cloned())
+        });
+        let (state, persisted) = match saved {
+            None => (MutationVerificationState::default(), None),
+            Some(data) => match data
+                .and_then(|data| serde_json::from_value::<MutationVerificationState>(data).ok())
+            {
+                Some(state) => (state.clone(), Some(state)),
+                // An entry exists but cannot be read: an edit may be pending.
+                // Never fall back to "nothing happened"; treat the work as
+                // edited and unverified until a check passes.
+                None => {
+                    eprintln!(
+                        "warning: the saved mutation-verification state could not be read; treating the session as having unverified edits"
+                    );
+                    (
+                        MutationVerificationState {
+                            mutation_generation: 1,
+                            unknown_mutation_paths: true,
+                            last_classification_reason: Some(
+                                "saved mutation-verification state could not be read".into(),
+                            ),
+                            ..MutationVerificationState::default()
+                        },
+                        None,
+                    )
+                }
+            },
+        };
+        *self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = state;
+        self.persisted_mutation_verification = persisted;
     }
 
     /// Classify whether the current run has evidence for its latest mutation.
@@ -2106,6 +2300,9 @@ impl Agent {
         internal: Option<InternalPromptOrigin>,
     ) -> ChatMessage {
         self.flush_pending_bash_messages();
+        // A call left unanswered by a restart is closed before this prompt,
+        // so the result stays adjacent to its call in the session.
+        let _ = self.reconcile_unresolved_tool_calls();
         // A job that finished while the user was typing is in context
         // before what they typed, so the model reads the news first.
         for notice in self.job_notice_messages() {
@@ -4618,6 +4815,7 @@ impl Agent {
         }
         self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
         self.set_runtime(candidate);
+        self.restore_branch_state();
         self.install_prompt_checkpoints(rewind);
         self.restore_living_plan();
         let _ = self.restore_prompt_session();
@@ -4799,6 +4997,10 @@ impl Agent {
         if let Some(session) = &self.session {
             self.messages = messages_from_session(session);
         }
+        // Mutation verification and tool exposure belong to the branch. Left
+        // alone, the abandoned branch's state stays live and the next persist
+        // writes it onto the branch just switched to.
+        self.restore_branch_state();
         self.restore_prompt_checkpoints()?;
         self.restore_plan()?;
         Ok(TreeNavigateResult {

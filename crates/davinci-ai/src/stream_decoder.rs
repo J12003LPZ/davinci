@@ -921,6 +921,27 @@ pub(crate) fn cache_write_unreported(usage: &Value) -> bool {
     .all(|pointer| usage.pointer(pointer).and_then(Value::as_u64).is_none())
 }
 
+/// Flags the input, output and cached-read counts the provider's usage object
+/// did not carry under any key the decoders read. Those fields of `Usage` are
+/// then placeholder zeros, not measurements.
+pub(crate) fn mark_unreported_counts(usage: &Value, computed: &mut davinci_protocol::Usage) {
+    let absent = |pointers: &[&str]| {
+        pointers
+            .iter()
+            .all(|pointer| usage.pointer(pointer).and_then(Value::as_u64).is_none())
+    };
+    computed.input_unreported = absent(&["/prompt_tokens", "/input_tokens", "/inputTokens"]);
+    computed.output_unreported = absent(&["/completion_tokens", "/output_tokens", "/outputTokens"]);
+    computed.cache_read_unreported = absent(&[
+        "/cache_read_input_tokens",
+        "/cacheReadInputTokens",
+        "/prompt_tokens_details/cached_tokens",
+        "/input_tokens_details/cached_tokens",
+        "/prompt_cache_hit_tokens",
+        "/cached_tokens",
+    ]);
+}
+
 /// TS `finalizeResponse` usage mapping: OpenAI counts cached and cache-write
 /// tokens inside `input_tokens`, so both are subtracted, and the cost is
 /// applied from the model's table.
@@ -945,6 +966,7 @@ pub(crate) fn responses_usage(model: &Model, usage: &Value) -> davinci_protocol:
     let mut computed = crate::calculate_usage(model, input, output, cached, cache_write);
     computed.reasoning = reasoning;
     computed.cache_write_unreported = cache_write_unreported(usage);
+    mark_unreported_counts(usage, &mut computed);
     let total = get("total_tokens");
     if total > 0 {
         computed.total_tokens = total;
