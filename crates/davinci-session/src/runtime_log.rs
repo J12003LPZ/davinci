@@ -405,7 +405,7 @@ mod tests {
             res,
             Err(RuntimeLogError::UnsupportedSchemaVersion {
                 found: 99,
-                supported: 1
+                supported: CURRENT_RUNTIME_SCHEMA_VERSION
             })
         ));
     }
