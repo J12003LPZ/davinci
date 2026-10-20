@@ -4876,6 +4876,10 @@ impl Agent {
         if let Some(session) = &self.session {
             self.messages = messages_from_session(session);
         }
+        // Mutation verification and tool exposure belong to the branch. Left
+        // alone, the abandoned branch's state stays live and the next persist
+        // writes it onto the branch just switched to.
+        self.restore_branch_state();
         self.restore_prompt_checkpoints()?;
         self.restore_plan()?;
         Ok(TreeNavigateResult {

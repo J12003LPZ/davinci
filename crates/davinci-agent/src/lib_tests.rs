@@ -5283,3 +5283,102 @@ fn failed_auto_compaction_with_headroom_still_sends_the_request() {
     });
     assert!(dispatched, "headroom left: the turn proceeds");
 }
+
+#[test]
+fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent
+        .load_from_session(JsonlSession::create(sessions.path(), "tree", None).unwrap())
+        .unwrap();
+    agent.prompt("start");
+    agent.record_assistant("first answer");
+    let fork = agent
+        .session
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.entry_type == "message"
+                && entry
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.get("role"))
+                    .and_then(|role| role.as_str())
+                    == Some("assistant")
+        })
+        .map(|entry| entry.id.clone())
+        .expect("an assistant entry to fork from");
+    let initial = agent
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .visible_names()
+        .clone();
+    let deferred = agent
+        .tools
+        .iter()
+        .find(|name| !initial.contains(*name))
+        .cloned()
+        .expect("a tool that starts deferred");
+
+    // Work done after the fork: an unverified edit and a discovered tool.
+    agent.prompt("edit a file");
+    agent.record_assistant("second answer");
+    std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.txt")]);
+    agent
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .activate_authorized(&deferred, true);
+    agent.persist_mutation_verification();
+    agent.persist_tool_exposure();
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+    assert!(agent
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .discovered_names()
+        .contains(&deferred));
+
+    // Back to the fork: that branch never saw the edit or the tool.
+    agent
+        .navigate_tree_entry(&fork, false, None, false, 16_384)
+        .unwrap();
+    assert_eq!(
+        agent.mutation_verification_state(),
+        MutationVerificationState::default(),
+        "the abandoned branch's edit is still live"
+    );
+    assert!(
+        !agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap()
+            .discovered_names()
+            .contains(&deferred),
+        "the abandoned branch's discovered tool is still exposed"
+    );
+    // Nothing from the other branch is written onto this one.
+    let customs = |agent: &Agent| {
+        agent
+            .session
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| entry.entry_type == "custom")
+            .count()
+    };
+    let before = customs(&agent);
+    agent.persist_mutation_verification();
+    agent.persist_tool_exposure();
+    assert_eq!(customs(&agent), before);
+}
