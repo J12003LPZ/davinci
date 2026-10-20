@@ -286,14 +286,19 @@ pub fn repair_step(memory: &Arc<Mutex<VectorMemory>>) -> Step {
 /// local mode: nothing is contacted.
 fn remote_catch_up(memory: &Arc<Mutex<VectorMemory>>) -> Option<ProjectionRepairReceipt> {
     use super::setup::REINDEX_BATCHES;
-    let snapshot = memory.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // The epoch is read under the same lock as the clone, so a clear either
+    // is in the snapshot or moves the epoch past it.
+    let (snapshot, epoch) = {
+        let guard = memory.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.clone(), guard.remote_clear_epoch())
+    };
     if !snapshot.remote_projection_enabled() {
         return None;
     }
     let batch = snapshot.config.projection.batch_size;
     let mut total = ProjectionRepairReceipt::default();
     for _ in 0..REINDEX_BATCHES {
-        let pass = snapshot.reconcile_remote(batch);
+        let pass = snapshot.reconcile_remote_at(batch, Some(epoch));
         total.indexed += pass.indexed;
         total.removed += pass.removed;
         total.lag = pass.lag;
@@ -306,6 +311,18 @@ fn remote_catch_up(memory: &Arc<Mutex<VectorMemory>>) -> Option<ProjectionRepair
         }
     }
     Some(total)
+}
+
+/// Deliver a remote clear the user already confirmed but that could not reach
+/// Qdrant at the time, without waiting for the next write. Network use is on a
+/// snapshot, never under the memory lock. Does nothing, and contacts nothing,
+/// when no clear is owed. True when none is left.
+pub fn finish_owed_remote_clear(memory: &Arc<Mutex<VectorMemory>>) -> bool {
+    let snapshot = memory.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !snapshot.remote_clear_pending() {
+        return true;
+    }
+    snapshot.deliver_remote_clears()
 }
 
 fn remote_note(remote: Option<&ProjectionRepairReceipt>) -> String {

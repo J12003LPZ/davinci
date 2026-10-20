@@ -694,7 +694,23 @@ fn a_pending_clear_runs_before_anything_written_after_it() {
     // Back online: the old vector goes, the new one stays, and the next
     // reconcile finds nothing missing.
     fake.set_down(false);
+    let before = fake.requests().len();
     memory.index_messages(&[note("delta four")]).unwrap();
+    // The owed delete reaches Qdrant before any point written after the clear;
+    // the other order would delete the new points with the old ones.
+    let later = &fake.requests()[before..];
+    let first_delete = later
+        .iter()
+        .position(|request| request.method == "POST" && request.path.contains("/points/delete"))
+        .expect("the owed clear ran");
+    let first_upload = later
+        .iter()
+        .position(|request| request.method == "PUT" && request.path.contains("/points?wait=true"))
+        .expect("the new point was sent");
+    assert!(
+        first_delete < first_upload,
+        "an upload ran before the owed clear: {later:?}"
+    );
     let receipt = memory.reconcile_remote(10);
     assert!(receipt.is_complete(), "{receipt:?}");
     assert!(!memory.remote_clear_pending());
@@ -754,4 +770,246 @@ fn a_recreated_collection_is_refilled_from_local_records() {
     );
     assert_eq!(remote_points(&fake, &memory), 5);
     assert_eq!(memory.remote_projection_lag(), 0);
+}
+
+use davinci_coding_agent::native_extensions::memory_backends::qdrant::point_id;
+use davinci_coding_agent::native_extensions::setup_actions::finish_owed_remote_clear;
+use std::sync::{Arc, Mutex};
+
+fn foreign_point(id: &str, repo_id: &str) -> ProjectionPoint {
+    ProjectionPoint {
+        id: id.into(),
+        vector: vec![0.0, 0.0, 1.0],
+        repo_id: repo_id.into(),
+    }
+}
+
+#[test]
+fn another_clones_points_do_not_hide_a_recreated_collection() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory
+        .index_messages(&[note("alpha one"), note("beta two"), note("alpha three")])
+        .unwrap();
+    assert_eq!(remote_points(&fake, &memory), 3);
+
+    // The collection is deleted. Another clone of the same repository (same
+    // repo id) writes to the recreated one before this clone looks: it holds
+    // at least as many points as this clone's ledger, none of them ours.
+    fake.delete_collection(&memory.remote_collection_name());
+    let other = QdrantProjection::new(&config, &memory.repo_id).unwrap();
+    let foreign: Vec<ProjectionPoint> = (0..4)
+        .map(|n| foreign_point(&format!("foreign-{n}"), &memory.repo_id))
+        .collect();
+    other.upsert(&foreign).unwrap();
+    assert_eq!(remote_points(&fake, &memory), 4);
+
+    for _ in 0..4 {
+        let pass = memory.reconcile_remote(10);
+        assert_eq!(pass.failures, 0, "{pass:?}");
+        if pass.lag == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        remote_points(&fake, &memory),
+        7,
+        "ours came back, theirs stayed"
+    );
+    let collection = fake.collection(&memory.remote_collection_name()).unwrap();
+    for record in memory.records() {
+        assert!(
+            collection.points.contains_key(&point_id(&record.id)),
+            "{} was not re-sent",
+            record.id
+        );
+    }
+}
+
+#[test]
+fn counting_held_ids_ignores_other_points_and_is_chunked() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let client = QdrantProjection::new(&qdrant_config(&fake, &embedder), "repo-x").unwrap();
+    let mut points: Vec<ProjectionPoint> = (0..600).map(|n| one_point(&format!("p{n}"))).collect();
+    points.push(foreign_point("other-repo", "repo-y"));
+    points.push(foreign_point("same-repo-not-asked", "repo-x"));
+    client.upsert(&points).unwrap();
+
+    let mut asked: Vec<String> = (0..600).map(|n| format!("p{n}")).collect();
+    asked.push("never-sent".into());
+    asked.push("other-repo".into());
+    let before = fake.count_matching("POST", "/points/count");
+    assert_eq!(client.count_held(&asked, "repo-x").unwrap(), 600);
+    assert_eq!(
+        fake.count_matching("POST", "/points/count") - before,
+        2,
+        "602 ids go out as two requests of at most 512"
+    );
+    assert_eq!(client.count_held(&[], "repo-x").unwrap(), 0);
+}
+
+#[test]
+fn a_pending_clear_survives_a_change_of_collection() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory
+        .index_messages(&[note("alpha one"), note("beta two")])
+        .unwrap();
+    let old_collection = memory.remote_collection_name();
+    fake.set_down(true);
+    memory.clear().unwrap();
+    drop(memory);
+
+    // A restart with another embedding model: a different collection name.
+    fake.set_down(false);
+    let mut changed = config;
+    changed.embedding_model = "another-model".into();
+    let restarted = VectorMemory::with_config(dir.path().to_path_buf(), changed);
+    assert_ne!(restarted.remote_collection_name(), old_collection);
+    assert!(
+        restarted.remote_clear_pending(),
+        "the owed clear was forgotten"
+    );
+
+    let receipt = restarted.reconcile_remote(10);
+    assert_eq!(receipt.failures, 0, "{receipt:?}");
+    assert!(!restarted.remote_clear_pending());
+    assert_eq!(
+        fake.collection(&old_collection).unwrap().points.len(),
+        0,
+        "the old collection was emptied, not the new one by mistake"
+    );
+}
+
+#[test]
+fn an_offline_clear_removes_only_what_it_cleared() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory
+        .index_messages(&[note("alpha one"), note("beta two")])
+        .unwrap();
+    fake.set_down(true);
+    memory.clear().unwrap();
+    drop(memory);
+
+    // Another clone uploads to the same namespace after the clear.
+    fake.set_down(false);
+    let restarted = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    let other = QdrantProjection::new(&config, &restarted.repo_id).unwrap();
+    other
+        .upsert(&[foreign_point("their-memory", &restarted.repo_id)])
+        .unwrap();
+    assert_eq!(remote_points(&fake, &restarted), 3);
+
+    let receipt = restarted.reconcile_remote(10);
+    assert_eq!(receipt.failures, 0, "{receipt:?}");
+    assert!(!restarted.remote_clear_pending());
+    let collection = fake
+        .collection(&restarted.remote_collection_name())
+        .unwrap();
+    assert_eq!(collection.points.len(), 1);
+    assert!(collection.points.contains_key(&point_id("their-memory")));
+}
+
+#[test]
+fn a_restart_delivers_an_owed_clear_without_waiting_for_a_write() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    fake.set_down(true);
+    memory.clear().unwrap();
+    drop(memory);
+    fake.set_down(false);
+
+    let restarted = Arc::new(Mutex::new(VectorMemory::with_config(
+        dir.path().to_path_buf(),
+        config.clone(),
+    )));
+    assert!(finish_owed_remote_clear(&restarted));
+    let guard = restarted.lock().unwrap();
+    assert!(!guard.remote_clear_pending());
+    assert_eq!(remote_points(&fake, &guard), 0);
+
+    // With nothing owed the startup path contacts nothing.
+    let clean_dir = tempfile::tempdir().unwrap();
+    let clean = Arc::new(Mutex::new(VectorMemory::with_config(
+        clean_dir.path().to_path_buf(),
+        config,
+    )));
+    let before = fake.request_count();
+    assert!(finish_owed_remote_clear(&clean));
+    assert_eq!(fake.request_count(), before);
+}
+
+#[test]
+fn a_catch_up_snapshot_cannot_re_upload_what_a_clear_removed() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    // Written while Qdrant was down, so the remote lacks them.
+    fake.set_down(true);
+    memory
+        .index_messages(&[note("alpha one"), note("beta two")])
+        .unwrap();
+    fake.set_down(false);
+
+    // The catch-up takes its snapshot, then the user clears.
+    let snapshot = memory.clone();
+    let epoch = memory.remote_clear_epoch();
+    memory.clear().unwrap();
+
+    let pass = snapshot.reconcile_remote_at(10, Some(epoch));
+    assert_eq!(pass.indexed, 0, "{pass:?}");
+    assert_eq!(
+        remote_points(&fake, &memory),
+        0,
+        "cleared records came back"
+    );
+    assert_eq!(memory.remote_projection_lag(), 0);
+}
+
+#[test]
+fn a_finished_clear_that_cannot_be_recorded_is_not_treated_as_finished() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    fake.set_down(true);
+    memory.clear().unwrap();
+    fake.set_down(false);
+
+    // The state file can no longer be written.
+    let ledger = memory.local_path().with_file_name("projection-state.json");
+    std::fs::remove_file(&ledger).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+    let receipt = memory.reconcile_remote(10);
+    assert_eq!(receipt.failures, 1, "{receipt:?}");
+    assert!(
+        memory.remote_clear_pending(),
+        "claimed finished, disk disagrees"
+    );
+    assert!(memory.remote_projection_lag() >= 1);
+
+    // Writable again: the repeat delete is harmless and the clear finishes.
+    std::fs::remove_dir(&ledger).unwrap();
+    let receipt = memory.reconcile_remote(10);
+    assert_eq!(receipt.failures, 0, "{receipt:?}");
+    assert!(!memory.remote_clear_pending());
 }

@@ -235,6 +235,12 @@ pub fn start_qdrant_recovery(
 ) {
     let effective = load_effective_setup(&agent_dir, &process_env);
     if !super::qdrant_supervisor::start_wanted(&agent_dir, &effective) {
+        // Nothing to start, but a clear confirmed in an earlier session may
+        // still be owed to a Qdrant the user runs themselves. Local files
+        // only unless one is owed, and then one bounded request.
+        if let Some(memory) = &memory {
+            super::setup_actions::finish_owed_remote_clear(memory);
+        }
         return;
     }
     std::thread::spawn(move || {
@@ -252,6 +258,11 @@ pub fn start_qdrant_recovery(
             push_notice(notice);
         }
         if health.state == HealthState::Ready {
+            // A clear the user confirmed is not derived-data repair: it runs
+            // whatever the safe-repair setting says.
+            if let Some(memory) = &memory {
+                super::setup_actions::finish_owed_remote_clear(memory);
+            }
             if let (true, Some(memory)) = (effective.profile.memory.safe_repair, &memory) {
                 let _ = super::setup_actions::repair_step(memory);
             }

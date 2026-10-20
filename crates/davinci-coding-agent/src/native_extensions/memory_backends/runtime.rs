@@ -51,10 +51,27 @@ struct SyncFile {
     collection: String,
     #[serde(default)]
     synced: BTreeSet<String>,
-    /// A namespace clear was confirmed locally but has not reached the remote.
-    /// It survives a restart and is dropped only after the remote delete worked.
+    /// Clears confirmed locally that have not reached the remote. Each names
+    /// the collection it applies to, so a change of embedding model or repo id
+    /// (which renames the collection) does not forget it. They survive a
+    /// restart and are dropped only after the remote delete worked.
     #[serde(default)]
-    pending_clear: bool,
+    pending_clears: Vec<PendingClear>,
+    /// Bumped by every clear. A catch-up that works on a snapshot compares it
+    /// before and after uploading and backs off if a clear happened meanwhile.
+    #[serde(default)]
+    clear_epoch: u64,
+}
+
+/// A remote delete the user already confirmed locally.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingClear {
+    /// The collection the clear applies to.
+    pub collection: String,
+    /// Exactly the records the clear removed, taken when it was confirmed:
+    /// the ledger plus the local records. Later uploads from this or another
+    /// clone of the same repository are not touched when it runs.
+    pub ids: Vec<String>,
 }
 
 #[derive(Default)]
@@ -167,37 +184,120 @@ impl ProjectionRuntime {
         Self::save_sync(&inner.sync, path);
     }
 
-    /// Record, durably, that this namespace must be emptied on the remote.
-    /// Errors when the marker cannot be written: the caller must not confirm
-    /// the clear then, because nothing would remember to finish it.
-    pub fn begin_clear(&self, path: &Path, collection: &str) -> Result<(), String> {
+    /// Record, durably, that these ids must leave the remote collection, and
+    /// forget the ledger. Errors when the marker cannot be written: the caller
+    /// must not confirm the clear then, because nothing would remember to
+    /// finish it. With no ids there is nothing to owe, so no marker is kept.
+    pub fn begin_clear(
+        &self,
+        path: &Path,
+        collection: &str,
+        ids: Vec<String>,
+    ) -> Result<(), String> {
         let mut inner = self.lock();
         Self::load_sync(&mut inner.sync, path, collection);
-        let synced = std::mem::take(&mut inner.sync.file.synced);
-        let was_pending = inner.sync.file.pending_clear;
-        inner.sync.file.pending_clear = true;
+        let before = (
+            inner.sync.file.synced.clone(),
+            inner.sync.file.pending_clears.clone(),
+            inner.sync.file.clear_epoch,
+        );
+        inner.sync.file.synced.clear();
+        inner.sync.file.clear_epoch += 1;
+        if !ids.is_empty() {
+            let file = &mut inner.sync.file;
+            match file
+                .pending_clears
+                .iter_mut()
+                .find(|pending| pending.collection == collection)
+            {
+                Some(pending) => {
+                    let merged: BTreeSet<String> = pending.ids.iter().cloned().chain(ids).collect();
+                    pending.ids = merged.into_iter().collect();
+                }
+                None => {
+                    let unique: BTreeSet<String> = ids.into_iter().collect();
+                    file.pending_clears.push(PendingClear {
+                        collection: collection.to_string(),
+                        ids: unique.into_iter().collect(),
+                    });
+                }
+            }
+        }
         let saved = Self::save_sync_checked(&inner.sync, path);
         if saved.is_err() {
-            inner.sync.file.synced = synced;
-            inner.sync.file.pending_clear = was_pending;
+            inner.sync.file.synced = before.0;
+            inner.sync.file.pending_clears = before.1;
+            inner.sync.file.clear_epoch = before.2;
         }
         saved
     }
 
-    /// Whether a confirmed clear still has to reach the remote.
-    pub fn pending_clear(&self, path: &Path, collection: &str) -> bool {
+    /// Every clear still owed to the remote, for any collection.
+    pub fn pending_clears(&self, path: &Path, collection: &str) -> Vec<PendingClear> {
         let mut inner = self.lock();
         Self::load_sync(&mut inner.sync, path, collection);
-        inner.sync.file.pending_clear
+        inner.sync.file.pending_clears.clone()
     }
 
-    /// The remote delete worked: drop the marker and the ledger with it.
-    pub fn finish_clear(&self, path: &Path, collection: &str) {
+    /// Whether a confirmed clear still has to reach the remote.
+    pub fn pending_clear(&self, path: &Path, collection: &str) -> bool {
+        !self.pending_clears(path, collection).is_empty()
+    }
+
+    /// How many clears this state has seen.
+    pub fn clear_epoch(&self, path: &Path, collection: &str) -> u64 {
         let mut inner = self.lock();
         Self::load_sync(&mut inner.sync, path, collection);
-        inner.sync.file.pending_clear = false;
+        inner.sync.file.clear_epoch
+    }
+
+    /// The whole namespace of `collection` was deleted on the remote: drop
+    /// every owed clear for it and the ledger. If the file cannot be written
+    /// the in-memory state is left as it was, so it never claims more than the
+    /// disk does.
+    pub fn finish_clear(&self, path: &Path, collection: &str) -> Result<(), String> {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        let before = (
+            inner.sync.file.synced.clone(),
+            inner.sync.file.pending_clears.clone(),
+        );
         inner.sync.file.synced.clear();
-        Self::save_sync(&inner.sync, path);
+        inner
+            .sync
+            .file
+            .pending_clears
+            .retain(|pending| pending.collection != collection);
+        let saved = Self::save_sync_checked(&inner.sync, path);
+        if saved.is_err() {
+            inner.sync.file.synced = before.0;
+            inner.sync.file.pending_clears = before.1;
+        }
+        saved
+    }
+
+    /// One owed clear reached the remote: drop it, and only it. The ledger
+    /// belongs to the current collection and is not touched. Same rule on a
+    /// failed write as [`Self::finish_clear`].
+    pub fn finish_pending(
+        &self,
+        path: &Path,
+        collection: &str,
+        done: &PendingClear,
+    ) -> Result<(), String> {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        let before = inner.sync.file.pending_clears.clone();
+        inner
+            .sync
+            .file
+            .pending_clears
+            .retain(|pending| pending != done);
+        let saved = Self::save_sync_checked(&inner.sync, path);
+        if saved.is_err() {
+            inner.sync.file.pending_clears = before;
+        }
+        saved
     }
 
     fn load_sync(sync: &mut SyncState, path: &Path, collection: &str) {
@@ -209,11 +309,14 @@ impl ProjectionRuntime {
             sync.loaded_from = Some(path.to_path_buf());
         }
         // Another model or repo means another collection: nothing is synced.
+        // A clear still owed to the old collection is kept, with the name it
+        // applies to.
         if sync.file.collection != collection {
             sync.file = SyncFile {
                 collection: collection.to_string(),
                 synced: BTreeSet::new(),
-                pending_clear: false,
+                pending_clears: std::mem::take(&mut sync.file.pending_clears),
+                clear_epoch: sync.file.clear_epoch,
             };
         }
     }

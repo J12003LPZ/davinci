@@ -141,6 +141,19 @@ impl QdrantProjection {
         &self.collection
     }
 
+    /// The same server, key and limits, aimed at another collection.
+    fn in_collection(&self, collection: &str) -> Self {
+        Self {
+            base: self.base.clone(),
+            collection: collection.to_string(),
+            dimensions: self.dimensions,
+            api_key: self.api_key.clone(),
+            batch_size: self.batch_size,
+            agent: self.agent.clone(),
+            ready: AtomicBool::new(false),
+        }
+    }
+
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, CallError> {
         let url = format!("{}{path}", self.base);
         let mut request = self.agent.request(method, &url);
@@ -383,23 +396,76 @@ impl VectorProjection for QdrantProjection {
         Ok(())
     }
 
-    fn count(&self, repo_id: &str) -> Result<usize, ProjectionError> {
+    fn delete_from(
+        &self,
+        collection: &str,
+        ids: &[String],
+        repo_id: &str,
+    ) -> Result<(), ProjectionError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let target = self.in_collection(collection);
+        target
+            .call("GET", "/readyz", None)
+            .map_err(|error| target.fail(error, "readiness check"))?;
+        let path = format!("/collections/{collection}");
+        match target.call("GET", &path, None) {
+            Ok(_) => {}
+            // Nothing there, so nothing to remove. Never created here.
+            Err(CallError::Status(404)) => return Ok(()),
+            Err(error) => return Err(target.fail(error, "collection check")),
+        }
+        // Not made by DaVinci: not ours to delete from.
+        if !target.has_marker()? {
+            return Ok(());
+        }
+        for batch in ids.chunks(self.batch_size) {
+            let point_ids: Vec<String> = batch.iter().map(|id| point_id(id)).collect();
+            let path = format!("/collections/{collection}/points/delete?wait=true");
+            target
+                .call(
+                    "POST",
+                    &path,
+                    Some(json!({"filter": {"must": [
+                        {"has_id": point_ids},
+                        {"key": "repo_id", "match": {"value": repo_id}},
+                    ]}})),
+                )
+                .map_err(|error| target.fail(error, "delete"))?;
+        }
+        Ok(())
+    }
+
+    fn count_held(&self, ids: &[String], repo_id: &str) -> Result<usize, ProjectionError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
         self.ensure_ready()?;
         let path = format!("/collections/{}/points/count", self.collection);
-        let body = json!({
-            "exact": true,
-            "filter": {"must": [{"key": "repo_id", "match": {"value": repo_id}}]},
-        });
-        match self.call("POST", &path, Some(body)) {
-            Ok(reply) => Ok(reply["result"]["count"].as_u64().unwrap_or(0) as usize),
-            // Deleted since the last check: it holds nothing, and the next call
-            // checks readiness again, which recreates and marks it.
-            Err(CallError::Status(404)) => {
-                self.ready.store(false, Ordering::SeqCst);
-                Ok(0)
+        let mut held = 0;
+        // The id lists of two chunks never overlap, so the counts add up.
+        for batch in ids.chunks(MAX_BATCH) {
+            let point_ids: Vec<String> = batch.iter().map(|id| point_id(id)).collect();
+            let body = json!({
+                "exact": true,
+                "filter": {"must": [
+                    {"has_id": point_ids},
+                    {"key": "repo_id", "match": {"value": repo_id}},
+                ]},
+            });
+            match self.call("POST", &path, Some(body)) {
+                Ok(reply) => held += reply["result"]["count"].as_u64().unwrap_or(0) as usize,
+                // Deleted since the last check: it holds nothing, and the next
+                // call checks readiness again, which recreates and marks it.
+                Err(CallError::Status(404)) => {
+                    self.ready.store(false, Ordering::SeqCst);
+                    return Ok(0);
+                }
+                Err(error) => return Err(self.fail(error, "count")),
             }
-            Err(error) => Err(self.fail(error, "count")),
         }
+        Ok(held)
     }
 }
 

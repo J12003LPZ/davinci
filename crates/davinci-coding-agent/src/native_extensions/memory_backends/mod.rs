@@ -210,9 +210,22 @@ pub trait VectorProjection: Send + Sync {
     /// Remove every point of this namespace. Other namespaces in the same
     /// collection, and other collections, are never touched.
     fn clear_namespace(&self, repo_id: &str) -> Result<(), ProjectionError>;
-    /// How many points of `repo_id` the remote holds. A collection that is
-    /// gone counts as zero, so a deleted and recreated remote reads as empty.
-    fn count(&self, repo_id: &str) -> Result<usize, ProjectionError>;
+    /// Remove these ids of `repo_id` from a named collection, which may not be
+    /// the one this projection uses (the name follows the embedding model and
+    /// the repo id, and a clear can outlive a change of either). A collection
+    /// that is gone, or that DaVinci did not make, holds nothing to remove and
+    /// is left alone; it is never created.
+    fn delete_from(
+        &self,
+        collection: &str,
+        ids: &[String],
+        repo_id: &str,
+    ) -> Result<(), ProjectionError>;
+    /// How many of exactly these ids the remote holds for `repo_id`. Other
+    /// points of the same `repo_id` (another clone of the repository writes to
+    /// it too) do not count. A collection that is gone counts as zero, so a
+    /// deleted and recreated remote reads as empty.
+    fn count_held(&self, ids: &[String], repo_id: &str) -> Result<usize, ProjectionError>;
 }
 
 #[cfg(test)]
