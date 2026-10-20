@@ -127,6 +127,13 @@ fn repeated_restart_reconciles_without_manual_commands() {
     let seeded = fs::read(&records).unwrap();
     assert!(!seeded.is_empty(), "the seed record was not written");
     write_config(agent.path(), &down);
+    // The memory store is a project resource: the folder holds a record now, so
+    // it is only read once the folder is trusted.
+    fs::write(
+        agent.path().join("settings.json"),
+        serde_json::json!({"trusted_projects": [project.path().to_string_lossy()]}).to_string(),
+    )
+    .unwrap();
     let first = launch(agent.path(), project.path());
     assert_eq!(first["health"][0]["code"], "INSTALL_REQUIRED", "{first}");
 

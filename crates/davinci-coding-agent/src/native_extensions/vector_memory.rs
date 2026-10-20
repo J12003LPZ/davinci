@@ -1399,7 +1399,14 @@ pub struct VectorMemory {
     /// nothing is written to that file: the in-memory state is not the file's
     /// state, and rewriting from it would destroy what is there.
     store_error: Option<String>,
+    /// Whether the project folder is trusted. The store lives in the working
+    /// tree, so an untrusted folder's records are neither read nor written,
+    /// and nothing is sent to the remote projection.
+    project_trusted: bool,
 }
+
+/// What every memory entry point answers while the folder is not trusted.
+pub const MEMORY_UNTRUSTED: &str = "memory unavailable: project not trusted";
 
 /// Stable code for an existing record file that cannot be read (for example
 /// not UTF-8 or no access). The file is left exactly as it is.
@@ -1585,6 +1592,15 @@ impl VectorMemory {
     }
 
     pub fn with_config(cwd: PathBuf, config: VectorMemoryConfig) -> Self {
+        Self::with_config_for_project(cwd, config, true)
+    }
+
+    /// Like [`Self::with_config`], but an untrusted folder's store is not read.
+    pub fn with_config_for_project(
+        cwd: PathBuf,
+        config: VectorMemoryConfig,
+        project_trusted: bool,
+    ) -> Self {
         let repo_id = resolve_repo_id(&cwd);
         let mut memory = Self {
             config,
@@ -1601,11 +1617,40 @@ impl VectorMemory {
             dense_offline_until: Arc::new(Mutex::new(None)),
             projection: Arc::new(ProjectionRuntime::default()),
             store_error: None,
+            project_trusted,
         };
         // A failed read is kept (`store_error`), not discarded: it blocks
         // writes to that file and shows up in `status()`.
-        let _ = memory.load_local();
+        if project_trusted {
+            let _ = memory.load_local();
+        }
         memory
+    }
+
+    pub fn project_trusted(&self) -> bool {
+        self.project_trusted
+    }
+
+    /// Follow the folder's trust decision. Losing trust drops what was read
+    /// from the folder; gaining it reads the store.
+    pub fn set_project_trusted(&mut self, trusted: bool) {
+        if self.project_trusted == trusted {
+            return;
+        }
+        self.project_trusted = trusted;
+        if trusted {
+            let _ = self.load_local();
+        } else {
+            self.records.clear();
+            self.foreign_lines.clear();
+            self.tombstones.clear();
+            self.supersessions.clear();
+            self.provenances.clear();
+            self.known.clear();
+            self.last_indexed = 0;
+            self.last_indexed_at = None;
+            self.store_error = None;
+        }
     }
 
     pub fn store_health(&self) -> LocalStoreHealth {
@@ -1636,6 +1681,9 @@ impl VectorMemory {
     }
 
     fn load_local(&mut self) -> Result<(), ToolError> {
+        if !self.project_trusted {
+            return Err(ToolError::Failed(MEMORY_UNTRUSTED.into()));
+        }
         let path = self.local_path();
         let content = match fs::read(&path).map(String::from_utf8) {
             Ok(Ok(content)) => content,
@@ -1728,6 +1776,9 @@ impl VectorMemory {
     }
 
     fn persist_local_with(&mut self, merge: bool) -> Result<(), ToolError> {
+        if !self.project_trusted {
+            return Err(ToolError::Failed(MEMORY_UNTRUSTED.into()));
+        }
         if let Some(message) = &self.store_error {
             return Err(ToolError::Failed(message.clone()));
         }
@@ -2446,6 +2497,9 @@ impl VectorMemory {
     }
 
     pub fn search_tool(&self, args: &Value) -> Result<ToolResult, ToolError> {
+        if !self.project_trusted {
+            return Err(ToolError::Failed(MEMORY_UNTRUSTED.into()));
+        }
         let query = args
             .get("query")
             .and_then(Value::as_str)
@@ -2650,7 +2704,7 @@ impl VectorMemory {
     /// Why it stays the default until a measured break-even:
     /// `docs/superpowers/plans/2026-09-15-memory-projection-decision.md`.
     pub fn remote_projection_enabled(&self) -> bool {
-        self.config.projection.backend == MemoryProjectionBackend::Qdrant
+        self.project_trusted && self.config.projection.backend == MemoryProjectionBackend::Qdrant
     }
 
     /// Dense ranking from the remote projection, as `(candidate index, score)`.
@@ -2948,6 +3002,7 @@ impl VectorMemory {
             "automaticRetrieval": self.config.automatic_retrieval,
             "denseAvailable": self.dense_available(),
             "projectionProfile": MEMORY_PROJECTION_PROFILE,
+            "projectTrusted": self.project_trusted,
             "remoteProjectionEnabled": self.remote_projection_enabled(),
             "projectionBackend": self.config.projection.backend.name(),
             "projection": {

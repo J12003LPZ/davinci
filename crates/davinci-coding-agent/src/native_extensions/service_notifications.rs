@@ -228,11 +228,17 @@ pub fn qdrant_recovery_round(
 
 /// Start the Qdrant recovery for this session: once, in the background, and
 /// only if the user turned the projection on and consented to the start. When
-/// Qdrant is back, the remote copy is caught up.
+/// Qdrant is back, the remote copy is caught up. Not at all for an untrusted
+/// folder: its memory must not reach Qdrant, and a clear it owes is not its
+/// own to deliver. The decision is taken at launch; `/trust` applies to the
+/// memory tools at the next turn and to this recovery at the next start.
 pub fn start_qdrant_recovery(
     agent_dir: PathBuf,
     memory: Option<Arc<Mutex<super::vector_memory::VectorMemory>>>,
 ) {
+    if !memory_trusted(memory.as_ref()) {
+        return;
+    }
     let effective = load_effective_setup(&agent_dir, &process_env);
     if !super::qdrant_supervisor::start_wanted(&agent_dir, &effective) {
         // Nothing to start, but a clear confirmed in an earlier session may
@@ -270,6 +276,16 @@ pub fn start_qdrant_recovery(
     });
 }
 
+/// False only when there is a memory and its folder is not trusted.
+fn memory_trusted(memory: Option<&Arc<Mutex<super::vector_memory::VectorMemory>>>) -> bool {
+    memory.is_none_or(|memory| {
+        memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .project_trusted()
+    })
+}
+
 /// Start the background recovery for this session, if the user set it up.
 /// Returns the stop flag; set it to end the thread.
 pub fn start_recovery(
@@ -291,8 +307,12 @@ pub fn start_recovery(
             }
             let Some(wait) = round.retry_in else {
                 // Ollama answers: embed whatever was written while it was
-                // down, if the user left safe repair on. Derived data only.
-                if round.health.state == HealthState::Ready {
+                // down, if the user left safe repair on. The embeddings are
+                // derived, but the repair also reads the folder's records and
+                // sends them to Qdrant when that is on, so an untrusted folder
+                // is skipped. Starting Ollama itself is a user-level service
+                // and stays.
+                if round.health.state == HealthState::Ready && memory_trusted(memory.as_ref()) {
                     let effective = load_effective_setup(&agent_dir, &process_env);
                     if let (true, Some(memory)) = (effective.profile.memory.safe_repair, &memory) {
                         let _ = super::setup_actions::repair_step(memory);

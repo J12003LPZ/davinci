@@ -458,9 +458,15 @@ impl NativeExtensionHost {
             agent_dir,
             learning_config,
         )));
-        let memory = Arc::new(Mutex::new(VectorMemory::with_config(
+        // The store is read from the working tree, so an untrusted folder's is
+        // not. `--approve` is not known here; the host corrects this with
+        // `set_project_trusted` once launch options are resolved, and every turn.
+        let memory_trusted =
+            agent_dir.is_none() || crate::settings::is_trusted(&merged_settings, cwd, None);
+        let memory = Arc::new(Mutex::new(VectorMemory::with_config_for_project(
             cwd.to_path_buf(),
             memory_config,
+            memory_trusted,
         )));
         let mut graph = GraphController::new(cwd.to_path_buf());
         graph.memory = Some(Arc::clone(&memory));
@@ -852,6 +858,11 @@ impl NativeExtensionHost {
 
     pub fn set_learning_project_trusted(&mut self, trusted: bool) {
         self.learning().set_project_trusted(trusted);
+        // Memory is project-controlled data too: it follows the same decision.
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_project_trusted(trusted);
     }
 
     pub fn drain_learning_notifications(&mut self) -> Vec<String> {
@@ -983,6 +994,9 @@ impl NativeExtensionHost {
             }
             "memory-search" => {
                 let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                if !memory.project_trusted() {
+                    return Err(vector_memory::MEMORY_UNTRUSTED.into());
+                }
                 Ok(Some(memory.search_text(args)))
             }
             "memory-reindex" => {
@@ -997,6 +1011,9 @@ impl NativeExtensionHost {
                 // The page probes the embedding server (seconds). Work on a copy
                 // so a turn that needs memory never waits behind the probe.
                 let snapshot = self.memory.lock().map_err(|err| err.to_string())?.clone();
+                if !snapshot.project_trusted() {
+                    return Err(vector_memory::MEMORY_UNTRUSTED.into());
+                }
                 Ok(Some(memory_page::command(&snapshot, args)?))
             }
             "cache-status" => {

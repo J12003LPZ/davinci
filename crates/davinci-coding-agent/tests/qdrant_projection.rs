@@ -1333,3 +1333,130 @@ fn an_unsigned_clear_is_dropped_even_when_it_names_this_checkout() {
     assert_eq!(remote_points(&fake, &restarted), 1);
     assert!(pending_in_file(&state).is_empty());
 }
+
+use davinci_coding_agent::native_extensions::vector_memory::MEMORY_UNTRUSTED;
+
+#[test]
+fn an_untrusted_folder_loads_nothing_and_sends_nothing() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    // The folder's own store: one synced record, one written while Qdrant was
+    // down, so a catch-up would have something to send.
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    fake.set_down(true);
+    memory.index_messages(&[note("beta two")]).unwrap();
+    fake.set_down(false);
+    assert_eq!(memory.records().len(), 2);
+    drop(memory);
+
+    let baseline = fake.request_count();
+    let mut untrusted =
+        VectorMemory::with_config_for_project(dir.path().to_path_buf(), config.clone(), false);
+    assert!(
+        untrusted.records().is_empty(),
+        "the folder's records were loaded"
+    );
+    assert!(!untrusted.remote_projection_enabled());
+    assert_eq!(untrusted.status()["projectTrusted"], false);
+    assert!(untrusted.search("alpha", 3).is_empty());
+    let error = untrusted
+        .search_tool(&serde_json::json!({"query": "alpha"}))
+        .expect_err("refused");
+    assert!(error.to_string().contains(MEMORY_UNTRUSTED), "{error}");
+    assert!(untrusted.index_messages(&[note("gamma")]).is_err());
+    assert!(untrusted.clear().is_err());
+    assert!(untrusted.reindex().is_err());
+    let receipt = untrusted.reconcile_remote(10);
+    assert_eq!(
+        (receipt.indexed, receipt.removed, receipt.failures),
+        (0, 0, 0)
+    );
+    untrusted.upsert_remote(&[]).unwrap();
+
+    // The startup paths: the owed-clear delivery, the catch-up the repair step
+    // makes, and the Qdrant recovery all skip it too.
+    let shared = Arc::new(Mutex::new(untrusted));
+    assert!(finish_owed_remote_clear(&shared));
+    let agent = tempfile::tempdir().unwrap();
+    davinci_coding_agent::native_extensions::service_notifications::start_qdrant_recovery(
+        agent.path().to_path_buf(),
+        Some(shared.clone()),
+    );
+    assert_eq!(
+        fake.request_count(),
+        baseline,
+        "an untrusted folder's memory reached Qdrant"
+    );
+    // Still nothing on disk was rewritten by the untrusted instance.
+    let on_disk = std::fs::read_to_string(shared.lock().unwrap().local_path()).unwrap();
+    assert!(on_disk.contains("alpha one") && on_disk.contains("beta two"));
+
+    // Trust granted (as `/trust` does, at the next turn): the store is read and
+    // the remote copy catches up exactly as it does for a trusted folder.
+    shared.lock().unwrap().set_project_trusted(true);
+    let guard = shared.lock().unwrap();
+    assert_eq!(guard.records().len(), 2);
+    assert!(guard.remote_projection_enabled());
+    let receipt = guard.reconcile_remote(10);
+    assert_eq!(receipt.failures, 0, "{receipt:?}");
+    assert!(fake.request_count() > baseline);
+    assert_eq!(remote_points(&fake, &guard), 2);
+}
+
+#[test]
+fn losing_trust_drops_what_was_read_and_blocks_the_memory_commands() {
+    use davinci_coding_agent::native_extensions::NativeExtensionHost;
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let project = tempfile::tempdir().unwrap();
+    let agent = tempfile::tempdir().unwrap();
+    let config = qdrant_config(&fake, &embedder);
+    let mut seed = VectorMemory::with_config(project.path().to_path_buf(), config);
+    seed.index_messages(&[note("alpha one")]).unwrap();
+    drop(seed);
+
+    // The folder ships a memory store and nobody trusted it.
+    let mut host = NativeExtensionHost::new_with_agent_dir(
+        "untrusted-memory",
+        project.path(),
+        Some(agent.path()),
+    );
+    let error = host.command("memory-search", "alpha").unwrap_err();
+    assert!(error.contains(MEMORY_UNTRUSTED), "{error}");
+    let error = host.command("memory-page", "--no-open").unwrap_err();
+    assert!(error.contains(MEMORY_UNTRUSTED), "{error}");
+    assert!(host.memory_inject("alpha").is_none());
+    assert!(host.memory_index_messages(&[note("beta")]).is_err());
+
+    // Trusted: as before.
+    host.set_learning_project_trusted(true);
+    let found = host.command("memory-search", "alpha").unwrap().unwrap();
+    assert_eq!(found["count"], 1, "{found}");
+
+    // Revoked: what was read is dropped again.
+    host.set_learning_project_trusted(false);
+    assert!(host.command("memory-search", "alpha").is_err());
+    assert!(host.memory_inject("alpha").is_none());
+}
+
+#[test]
+fn a_folder_that_ships_a_memory_store_asks_for_trust() {
+    use davinci_coding_agent::trust::{
+        has_trust_requiring_project_resources, trust_requiring_project_resource_names,
+    };
+    let empty = tempfile::tempdir().unwrap();
+    assert!(!has_trust_requiring_project_resources(empty.path()));
+    for config_dir in [".davinci", ".pi"] {
+        let shipped = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(shipped.path().join(config_dir).join("vector-memory")).unwrap();
+        assert!(
+            has_trust_requiring_project_resources(shipped.path()),
+            "{config_dir}/vector-memory did not count"
+        );
+        assert!(trust_requiring_project_resource_names(shipped.path())
+            .contains(&"vector-memory".to_string()));
+    }
+}
