@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod compare;
 pub mod context_lifecycle;
 pub mod context_vm;
+pub mod design_studio;
 pub mod executor;
 pub mod gate;
 pub mod json_events;
@@ -26,6 +27,7 @@ pub use context_lifecycle::{
     audit_statuses, run_context_lifecycle_evals, AuditStatus, ContextLifecycleScorecard,
 };
 pub use context_vm::{context_vm_fixture_names, run_context_vm_evals, ContextVmEvalResult};
+pub use design_studio::{run_design_studio_evals, DesignStudioEvalResult, DesignStudioReport};
 pub use executor::{
     execute_multiturn_synthetic_scenario, execute_scenario, MultiTurnSoakResult, ScenarioRunResult,
     WorkspaceDiff,

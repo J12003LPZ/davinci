@@ -1114,6 +1114,32 @@ pub fn plugins_step(agent_dir: &Path) -> Step {
     .with_action(format!("read them with /plugins, then {action}"))
 }
 
+/// Design artifacts, only when they are on: a workspace that never opted in
+/// has nothing to fix. Cheap checks only; a deep verification hashes every
+/// pinned file and belongs to the run that is about to use them.
+pub fn design_step(cwd: &Path) -> Step {
+    use crate::design::health::{assess, HealthProbe, HealthState};
+    const ID: &str = "design";
+    const TITLE: &str = "design artifacts";
+    let probe = HealthProbe::from_environment(cwd, false);
+    if !probe.enabled {
+        return Step::new(ID, TITLE, StepState::Skipped, "turned off".into());
+    }
+    let health = assess(&probe);
+    if health.state == HealthState::Ready {
+        return Step::new(ID, TITLE, StepState::Ready, "runtime installed".into());
+    }
+    let detail = health
+        .diagnostics
+        .first()
+        .map_or_else(|| "not ready".to_string(), |first| first.message.clone());
+    let step = Step::new(ID, TITLE, StepState::Action, detail);
+    match health.fix_action {
+        Some(fix) => step.with_action(fix.describe()),
+        None => step,
+    }
+}
+
 struct LanguageCheck {
     language: &'static str,
     markers: &'static [&'static str],

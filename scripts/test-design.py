@@ -7,10 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {
-    "design_acceptance", "design_baseline", "design_budget", "design_commands",
-    "design_controller", "design_export", "design_generation", "design_handoff",
+    "design_acceptance", "design_artifact_diagnostics", "design_baseline",
+    "design_budget", "design_commands", "design_companion_e2e", "design_controller", "design_export", "design_generation", "design_handoff",
     "design_host", "design_interaction", "design_limits", "design_model",
-    "design_profiles", "design_quality", "design_recovery", "design_runtime",
+    "design_preflight", "design_profiles", "design_quality", "design_recovery", "design_runtime",
     "design_security", "design_store", "design_sync", "design_types",
 }
 
@@ -26,7 +26,7 @@ def main():
     if missing:
         raise SystemExit("Missing design targets: " + ", ".join(sorted(missing)))
     print(json.dumps({"coding_agent_targets": targets,
-                      "eval_targets": ["design_quality"],
+                      "eval_targets": ["design_quality", "design_studio"],
                       "native_ignored_tests_included": False}), flush=True)
     if args.inventory_only:
         return
@@ -34,7 +34,8 @@ def main():
     commands = [
         common + ["-p", "davinci-coding-agent"]
         + [item for target in targets for item in ["--test", target]],
-        common + ["-p", "davinci-evals", "--test", "design_quality"],
+        common + ["-p", "davinci-evals", "--test", "design_quality",
+                  "--test", "design_studio"],
     ]
     for command in commands:
         result = subprocess.run(command, cwd=ROOT, check=False)

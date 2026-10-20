@@ -41,6 +41,7 @@ pub fn needs_runtime(command: &DesignCommand) -> bool {
     match command {
         DesignCommand::Create { .. }
         | DesignCommand::Revise { .. }
+        | DesignCommand::Resume { .. }
         | DesignCommand::Verify { .. }
         | DesignCommand::Open { .. } => true,
         DesignCommand::Export { format, .. } => *format != ExportFormat::Source,

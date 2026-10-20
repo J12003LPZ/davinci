@@ -65,6 +65,23 @@ Before this can become release-ready:
 4. Review the full workspace test limitation and CI on the PR's exact source. Any later live comparison or installed release remains a separate explicitly authorized action.
 5. Complete the native source/HTML/PNG export and reimport round trip. Source and export validation tests passed, but the complete native path has not been certified.
 
+## Natural-language studio (phase 4)
+
+What changed: `/design <brief>` takes a sentence, infers the kind and makes three concepts; a generation that returns malformed JSON is repaired in place or stops with the exact phase, expected schema, a redacted bounded snippet and a resume command; a finished run opens the studio and a browser that will not open leaves the reason and `/design open <id>`; a concept can be chosen, the choice persists, and a revision then changes only that concept; `/setup` and `/design` name a missing, switched-off or refused runtime and its one fix.
+
+| Area | Verified offline (recorded replies, scripted host, fake runtime) | Not verified |
+| --- | --- | --- |
+| Command parsing and kind inference | 32 labelled briefs in `crates/davinci-evals/fixtures/behavior/design-studio.json` plus parse tests: apostrophes, subcommand-looking first words, legacy `new --kind --variants` | A keyword table is not understanding: a brief with no keyword gets `landing`. No model-based classification was tried or measured. |
+| Malformed output | In-place plan and critique retries, `variants` shape repair, bounded retries, the failing phase kept, `resume` inside the original allowance, redaction of tokens and `Bearer` credentials (the eval found the latter leaking the token after the scheme name; fixed) | Behaviour against a live provider. The October 2026 Windows attempt hit a usage limit; no clean live completion is recorded. |
+| Opening the studio | Scripted host: only a loopback pairing address reaches the opener, the address never enters a result, failure keeps the reason, the clipboard route and the recovery command, an unreachable studio stops at once | A real Chromium opened by the OS from a real host process. The studio chain after a run is interactive-shell only; print mode prints the next command and does not block. |
+| Selection | Persistence across a reloaded session, stale and unknown choices refused, idempotent and conflicting operation ids, other concepts and their files byte-identical after a targeted revision, a stubborn reply ends at Generate with the last revision intact, no workspace file changed | An older build reading a session that holds selections was reasoned about (selections are a separate entry type it skips), not run. |
+| Preflight | Missing, disabled and invalid states, a fake runtime whose manifest pins real hashes so the deep pass verifies it and sees a tampered file | The cheap pass does not hash. A real installed runtime was not probed. |
+| Browser UI | Typecheck, bundle build, 14 host unit tests and 3 Playwright tests against real Chromium with a fixture dispatcher: three concepts, choose, revise only the chosen one | The UI against the Rust controller and a real runtime; native confinement; the visual quality of any generated design. No capture thumbnails were exercised (the fixture has none). |
+
+Phase 4 verification: `scripts/test-design.py --offline` passed (78 design integration tests plus 4 ignored native tests, and 3 eval tests); one full `davinci-coding-agent` plus `davinci-evals` run passed 2607 tests with 0 failures and 49 ignored; `cargo fmt --check` and clippy with warnings denied were clean.
+
+The offline evaluation measures routing and validation. **It is not a measure of how good a generated design looks, and no live model quality trial was run for this phase.** The installed design runtime has to be set up again to pick up the rebuilt UI and host allowlist (`select`, `resolve`).
+
 ## Artifact binding and review
 
 The evidence inventory binds local executable, UI, compiler/lock manifest, runtime inventory, browser/font inventories, profile/fixture sources and retained check logs with SHA-256. It excludes the generated inventory itself and this readiness prose from its source-file set to avoid a circular hash. Local binaries, browser packages, screenshots and raw logs are not committed. Companion screenshots prove the workspace UI. Separately retained native screenshots prove the confined fixture's rendering and interaction; neither establishes aesthetic quality.

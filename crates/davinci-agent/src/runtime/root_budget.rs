@@ -343,6 +343,37 @@ impl RootBudget {
         self.write(&ledger)
     }
 
+    /// Reopen a finished operation with exactly its approved limits so a
+    /// blocked run can continue. Requests it already spent stay counted against
+    /// its allowance, and the deadline is the original one: nothing is
+    /// refunded. Fails if the limits differ or another operation is open.
+    pub fn resume_operation(
+        &self,
+        id: &str,
+        max_requests: u64,
+        deadline_unix_ms: u64,
+    ) -> Result<(), String> {
+        let _lock = self.lock()?;
+        let mut ledger = self.read()?;
+        let requested = OperationLimit {
+            max_requests,
+            deadline_unix_ms,
+            closed: false,
+        };
+        let existing = ledger.operations.get(id).ok_or("unknown root operation")?;
+        if existing == &requested {
+            return Ok(());
+        }
+        if existing.max_requests != max_requests || existing.deadline_unix_ms != deadline_unix_ms {
+            return Err("operation limits changed".into());
+        }
+        if ledger.operations.values().any(|limit| !limit.closed) {
+            return Err("another operation owns this root".into());
+        }
+        ledger.operations.insert(id.into(), requested);
+        self.write(&ledger)
+    }
+
     /// Host-owned completion releases only the narrower scope. Unsettled
     /// reservations remain charged to the root and still block future sends.
     pub fn finish_operation(&self, id: &str) -> Result<(), String> {

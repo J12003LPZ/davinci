@@ -20,6 +20,16 @@ pub enum DesignCommand {
         brief: String,
         operation_id: OperationId,
     },
+    /// Choose one concept (or `none`); later revisions touch only that concept.
+    Select {
+        artifact_id: ArtifactId,
+        variant_id: Option<VariantId>,
+    },
+    /// Try the failed phase of a blocked generation again from its checkpoint.
+    Resume {
+        artifact_id: ArtifactId,
+        operation_id: OperationId,
+    },
     Verify {
         artifact_id: ArtifactId,
     },
@@ -56,6 +66,9 @@ pub enum ExportFormat {
     Png,
     Html,
 }
+/// Split a command line into words. A quote opens a quoted section only at
+/// the start of a word and closes it only at the end of one, so an apostrophe
+/// inside prose ("Julien's team", 5" screen) is an ordinary character.
 fn words(input: &str) -> DesignResult<Vec<String>> {
     let mut result = Vec::new();
     let mut word = String::new();
@@ -73,8 +86,10 @@ fn words(input: &str) -> DesignResult<Vec<String>> {
             continue;
         }
         match (quote, ch) {
-            (Some(q), c) if q == c => quote = None,
-            (None, '\'' | '"') => {
+            (Some(q), c) if q == c && chars.peek().is_none_or(|next| next.is_whitespace()) => {
+                quote = None
+            }
+            (None, '\'' | '"') if !present => {
                 quote = Some(ch);
                 present = true;
             }
@@ -119,18 +134,44 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
     {
         tokens.remove(0);
     }
-    let Some(command) = tokens.first().map(String::as_str) else {
+    let Some(command) = tokens.first().cloned() else {
         return Ok(DesignCommand::List {});
     };
+    let command = command.as_str();
     if command == "--" {
         return create(&tokens[1..], BTreeMap::new());
     }
     let reserved = [
-        "new", "list", "open", "status", "revise", "verify", "fork", "restore", "export", "apply",
-        "sync",
+        "new", "list", "open", "status", "revise", "resume", "select", "verify", "fork", "restore",
+        "export", "apply", "sync",
     ];
     if !reserved.contains(&command) {
         return create(&tokens, BTreeMap::new());
+    }
+    // A reserved word is always a verb. When what follows does not fit it
+    // (no argument, an empty one, a mistyped id) that is a usage error, never
+    // a brief: a typo must not start a paid generation. A brief that begins
+    // with one of these words goes after `new` or `--`.
+    // Ids may be typed in capitals; a brief's own words are never changed.
+    let id_tokens = if matches!(command, "resume" | "select") {
+        2
+    } else {
+        1
+    };
+    for token in tokens.iter_mut().skip(1).take(id_tokens) {
+        *token = normalize_id(token);
+    }
+    let rest = &tokens[1..];
+    let fits = match command {
+        "new" => true,
+        "list" => rest.is_empty(),
+        "sync" => rest.len() == 1 && !rest[0].starts_with("--"),
+        _ => rest
+            .first()
+            .is_some_and(|first| first.parse::<ArtifactId>().is_ok()),
+    };
+    if !fits {
+        return Err(DesignError::InvalidInput(usage(command)));
     }
     let mut positional = Vec::new();
     let mut flags = BTreeMap::new();
@@ -174,7 +215,12 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
             path: positional[0].clone(),
         });
     }
-    if positional.is_empty() || (command != "revise" && positional.len() != 1) {
+    let expected = if matches!(command, "resume" | "select") {
+        2
+    } else {
+        1
+    };
+    if positional.is_empty() || (command != "revise" && positional.len() != expected) {
         return Err(DesignError::InvalidInput(
             "invalid command arguments".into(),
         ));
@@ -190,6 +236,17 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         "open" => DesignCommand::Open { artifact_id },
         "status" => DesignCommand::Status { artifact_id },
         "verify" => DesignCommand::Verify { artifact_id },
+        "select" => DesignCommand::Select {
+            artifact_id,
+            variant_id: match positional[1].as_str() {
+                "none" => None,
+                other => Some(other.parse()?),
+            },
+        },
+        "resume" => DesignCommand::Resume {
+            artifact_id,
+            operation_id: positional[1].parse()?,
+        },
         "revise" if positional.len() > 1 => DesignCommand::Revise {
             artifact_id,
             brief: positional[1..].join(" "),
@@ -257,6 +314,43 @@ pub fn parse_design_command(input: &str) -> DesignResult<DesignCommand> {
         }
     })
 }
+/// A UUID typed in capitals is the same id; everything else is left alone.
+fn normalize_id(token: &str) -> String {
+    let uuid_shaped =
+        token.len() == 36 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-');
+    if uuid_shaped {
+        token.to_ascii_lowercase()
+    } else {
+        token.to_string()
+    }
+}
+
+fn usage(command: &str) -> String {
+    let line = match command {
+        "list" => "/design list",
+        "sync" => "/design sync <relative-path>",
+        "open" => "/design open <artifact-id>",
+        "status" => "/design status <artifact-id>",
+        "verify" => "/design verify <artifact-id>",
+        "revise" => "/design revise <artifact-id> <what to change>",
+        "resume" => "/design resume <artifact-id> <checkpoint-id>",
+        "select" => "/design select <artifact-id> <concept-id|none>",
+        "fork" => "/design fork <artifact-id> --revision <n>",
+        "restore" => "/design restore <artifact-id> --revision <n>",
+        "apply" => "/design apply <artifact-id> --revision <n>",
+        "export" => "/design export <artifact-id> --revision <n> --destination <new-absolute-directory> [--format source|png|html] [--artboard <id>] [--viewport WxH]",
+        _ => "/design new \"<brief>\"",
+    };
+    let id_hint = if matches!(command, "list" | "sync") {
+        ""
+    } else {
+        "the id is the UUID from /design list; "
+    };
+    format!(
+        "usage: {line} ({id_hint}to start a brief that begins with \"{command}\", write /design new \"{command} ...\")"
+    )
+}
+
 fn create(words: &[String], flags: BTreeMap<&str, &str>) -> DesignResult<DesignCommand> {
     if words.iter().any(|s| s.starts_with("--")) {
         return Err(DesignError::InvalidInput(
@@ -265,33 +359,40 @@ fn create(words: &[String], flags: BTreeMap<&str, &str>) -> DesignResult<DesignC
     }
     let brief = words.join(" ");
     validate_text(&brief, 64 * 1024, "brief")?;
-    let kind = match flags.get("--kind").copied().unwrap_or("landing") {
-        "landing" => DesignKind::Landing,
-        "product" => DesignKind::Product,
-        "document" => DesignKind::Document,
-        _ => {
-            return Err(DesignError::InvalidInput(
+    let explicit_kind = flags
+        .get("--kind")
+        .map(|kind| match *kind {
+            "landing" => Ok(DesignKind::Landing),
+            "product" => Ok(DesignKind::Product),
+            "document" => Ok(DesignKind::Document),
+            _ => Err(DesignError::InvalidInput(
                 "kind must be landing, product, or document".into(),
-            ))
-        }
+            )),
+        })
+        .transpose()?;
+    let variants: u32 = match flags.get("--variants") {
+        Some(value) => value
+            .parse()
+            .map_err(|_| DesignError::InvalidInput("invalid variant count".into()))?,
+        None => super::intent::DEFAULT_VARIANTS,
     };
-    let variants: u32 = flags
-        .get("--variants")
-        .copied()
-        .unwrap_or("2")
-        .parse()
-        .map_err(|_| DesignError::InvalidInput("invalid variant count".into()))?;
     if !(1..=3).contains(&variants) {
         return Err(DesignError::InvalidInput("variants must be 1..3".into()));
     }
-    let title = brief.chars().take(80).collect();
+    let resolved = super::intent::DesignIntent {
+        brief,
+        explicit_kind,
+        variants,
+    }
+    .resolve();
+    let title = resolved.brief.chars().take(80).collect();
     Ok(DesignCommand::Create {
         input: CreateDesign {
             title,
-            brief,
-            kind,
+            brief: resolved.brief,
+            kind: resolved.kind,
             operation_id: OperationId::new(),
-            variants,
+            variants: resolved.variants,
         },
     })
 }

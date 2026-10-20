@@ -1100,6 +1100,7 @@ impl NativeExtensionHost {
                         setup::gitignore_step(&cwd, apply),
                         setup::trust_step(&self.agent_dir, &cwd),
                         setup::plugins_step(&self.agent_dir),
+                        setup::design_step(&cwd),
                         setup::language_step(&cwd, lsp_enabled),
                         setup::instructions_step(&cwd),
                     ]
