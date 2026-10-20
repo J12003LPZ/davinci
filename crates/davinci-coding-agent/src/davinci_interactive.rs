@@ -5061,6 +5061,17 @@ pub fn run(
     }
 
     let mut team_mail_since: Option<Instant> = None;
+    // Bring the approved local Ollama back if it is down (only when the user
+    // set that up); the first turn never waits for it.
+    let service_recovery = crate::native_extensions::service_notifications::start_recovery(
+        crate::default_agent_dir(),
+        crate::native_extensions::service_supervisor::system_supervisor(),
+        {
+            let locked = host.lock().unwrap_or_else(|e| e.into_inner());
+            let native = locked.native.lock().unwrap_or_else(|e| e.into_inner());
+            Some(native.memory.clone())
+        },
+    );
     let result = loop {
         let _ = terminal.reacquire();
         if let Some(outcome) = model
@@ -5266,6 +5277,10 @@ pub fn run(
             let rows = agent.tool_context.mcp.rows();
             let up = rows.iter().filter(|row| row.status == "connected").count();
             model.push_toast(format!("MCP: {up} of {} servers ready", rows.len()));
+            model.dirty = true;
+        }
+        for notice in crate::native_extensions::service_notifications::drain_notices() {
+            model.push_toast(notice.text);
             model.dirty = true;
         }
         // Between turns the context bar follows what the next request holds.
@@ -5600,6 +5615,11 @@ pub fn run(
             Err(err) => break Err(err.to_string()),
         }
     };
+    if let Some(stop) = service_recovery {
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // Stop the Ollama this session started; one it found running is left alone.
+    crate::native_extensions::service_supervisor::system_supervisor().shutdown_owned();
 
     {
         let locked = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -7478,6 +7498,15 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
             format!("{embedded} of {records} records carry a vector"),
         ));
     }
+    if value["storeHealth"]["state"] == "unreadable" {
+        health.push((
+            State::Attention,
+            format!(
+                "record file unreadable, writes are blocked and nothing was changed: {}",
+                json_str(&value["storeHealth"], "detail")
+            ),
+        ));
+    }
     if !dense_available {
         health.push((
             State::Attention,
@@ -7578,7 +7607,12 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
         } else {
             format!("{embed_host} · {model_dims}")
         },
-        store: "qdrant".into(),
+        // The local record file is the store; Qdrant is an optional copy.
+        store: if value["remoteProjectionEnabled"].as_bool().unwrap_or(false) {
+            "local file + qdrant".into()
+        } else {
+            "local file".into()
+        },
         collection: json_str(value, "collection"),
         extraction: json_str(value, "extractionModel"),
         config: crate::default_agent_dir()

@@ -11,40 +11,78 @@
 //! servers, so it is never automatic: `/setup trust` records that decision.
 
 use super::memory_page;
+use super::service_authority::{ServiceAction, ServiceAuthorization};
+use super::service_supervisor::find_in_paths;
+#[cfg(test)]
+use super::service_supervisor::is_local_url;
+use super::service_supervisor::{system_supervisor, ManagedServiceSupervisor};
+use super::setup_health::{ComponentHealth, HealthState};
+use super::setup_profile::load_effective_setup;
+use super::token_governor::{GovernorHealth, GovernorState};
+use super::vector_memory::process_env;
 use super::vector_memory::VectorMemory;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Local state Davinci writes under the workspace that should never be
 /// committed: learned durable memory records and graph run journals.
 pub const IGNORED_STATE: &[&str] = &[".davinci/vector-memory/", ".davinci/graph/"];
 /// Records embedded per batch after a pull; the memory lock is released
 /// between batches so a turn is never held behind the whole backlog.
-const REINDEX_BATCHES: usize = 40;
-/// How long `/setup` waits for a freshly started `ollama serve` to answer.
-const SERVE_WAIT: Duration = Duration::from_secs(8);
+pub(crate) const REINDEX_BATCHES: usize = 40;
+/// Records re-embedded per locked batch.
+pub(crate) const REINDEX_BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Report every area and apply the local, reversible steps.
     Apply,
-    /// Report only.
+    /// Report only. Changes nothing and starts nothing.
     Check,
+    /// `Check`, answered as JSON.
+    CheckJson,
+    /// Re-embed records whose vector is stale. Never deletes a record.
+    Repair,
     /// Record that this project is trusted.
     Trust,
+    /// Record the user's yes to one action and do just that action.
+    Approve(super::setup_actions::SetupAction),
+    /// Switch a feature on or off for good (`/setup enable|disable <feature>`).
+    Switch(super::setup_profile::Feature, bool),
 }
 
 pub fn parse_args(args: &str) -> Result<Mode, String> {
-    match args.trim() {
+    let args = args.trim();
+    if let Some(rest) = args.strip_prefix("approve") {
+        let word = rest.trim();
+        return super::setup_actions::SetupAction::parse(word)
+            .map(Mode::Approve)
+            .ok_or_else(|| {
+                format!(
+                    "unknown action `{word}` · use /setup approve start-ollama or /setup approve download-model"
+                )
+            });
+    }
+    for (verb, on) in [("enable", true), ("disable", false)] {
+        if let Some(rest) = args.strip_prefix(verb) {
+            let word = rest.trim();
+            return super::setup_profile::Feature::parse(word)
+                .map(|feature| Mode::Switch(feature, on))
+                .ok_or_else(|| format!("unknown feature `{word}` · use /setup {verb} memory or /setup {verb} governor"));
+        }
+    }
+    match args {
         "" | "apply" => Ok(Mode::Apply),
         "check" | "--check" | "status" => Ok(Mode::Check),
+        "check --json" | "status --json" | "--json" => Ok(Mode::CheckJson),
+        "repair" => Ok(Mode::Repair),
         "trust" => Ok(Mode::Trust),
         other => Err(format!(
-            "unknown /setup argument `{other}` · use /setup, /setup check or /setup trust"
+            "unknown /setup argument `{other}` · use /setup, /setup check [--json], /setup repair, /setup approve <action> or /setup trust"
         )),
     }
 }
@@ -85,20 +123,35 @@ pub struct Step {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Stable error code (`MODEL_MISSING`, `LOCAL_STORE_UNREADABLE`, ...) when
+    /// the step needs the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
 }
 
 impl Step {
-    fn new(id: &'static str, title: &'static str, state: StepState, detail: String) -> Self {
+    pub(crate) fn new(
+        id: &'static str,
+        title: &'static str,
+        state: StepState,
+        detail: String,
+    ) -> Self {
         Self {
             id,
             title,
             state,
             detail,
             action: None,
+            code: None,
         }
     }
 
-    fn with_action(mut self, action: impl Into<String>) -> Self {
+    pub(crate) fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    pub(crate) fn with_action(mut self, action: impl Into<String>) -> Self {
         self.action = Some(action.into());
         self
     }
@@ -115,6 +168,17 @@ impl Step {
 /// The answer every mode returns: `lines` for the transcript, `steps` for
 /// RPC clients and tests.
 pub fn report(mode: Mode, steps: Vec<Step>) -> Value {
+    report_full(mode, steps, Vec::new(), Vec::new())
+}
+
+/// [`report`] with the component health and the configuration issues the
+/// steps were derived from. `/setup check --json` prints this object.
+pub fn report_full(
+    mode: Mode,
+    steps: Vec<Step>,
+    health: Vec<ComponentHealth>,
+    issues: Vec<super::setup_profile::Issue>,
+) -> Value {
     let pending = steps
         .iter()
         .filter(|step| step.state == StepState::Action)
@@ -125,16 +189,203 @@ pub fn report(mode: Mode, steps: Vec<Step>) -> Value {
         (0, true) => "setup continues in the background · run /setup again to follow it".into(),
         (count, _) => format!("{count} step(s) need you"),
     };
+    let lines: Vec<String> = if mode == Mode::CheckJson {
+        let body = json!({
+            "summary": summary,
+            "steps": steps,
+            "health": health,
+            "issues": issues,
+        });
+        serde_json::to_string_pretty(&body)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    } else {
+        steps.iter().map(Step::line).collect()
+    };
     json!({
         "mode": match mode {
             Mode::Apply => "apply",
-            Mode::Check => "check",
+            Mode::Check | Mode::CheckJson => "check",
+            Mode::Repair => "repair",
             Mode::Trust => "trust",
+            Mode::Approve(_) => "approve",
+            Mode::Switch(_, true) => "enable",
+            Mode::Switch(_, false) => "disable",
         },
         "summary": summary,
-        "lines": steps.iter().map(Step::line).collect::<Vec<_>>(),
+        "lines": lines,
         "steps": steps,
+        "health": health,
+        "issues": issues,
     })
+}
+
+/// `/setup enable|disable <feature>`: persist the choice, then apply it to the
+/// running session. Records and stored outputs are never touched.
+pub fn switch_step(
+    agent_dir: &Path,
+    feature: super::setup_profile::Feature,
+    enabled: bool,
+    memory: &Arc<Mutex<VectorMemory>>,
+    governor: &Arc<Mutex<super::token_governor::TokenGovernor>>,
+) -> Step {
+    let (id, title) = match feature {
+        super::setup_profile::Feature::Memory => ("memory", "vector memory"),
+        super::setup_profile::Feature::Governor => ("governor", "token governor"),
+    };
+    // On disk first. If this fails nothing changes and the user is told.
+    if let Err(error) = super::setup_profile::set_feature_enabled(agent_dir, feature, enabled) {
+        return Step::new(id, title, StepState::Action, error)
+            .with_action("fix the setup profile, then run the command again");
+    }
+    let effective = load_effective_setup(agent_dir, &process_env);
+    let now_on = match feature {
+        super::setup_profile::Feature::Memory => effective.memory.enabled,
+        super::setup_profile::Feature::Governor => effective.governor.enabled,
+    };
+    match feature {
+        super::setup_profile::Feature::Memory => {
+            memory
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .config
+                .enabled = now_on;
+        }
+        super::setup_profile::Feature::Governor => {
+            governor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .config
+                .enabled = now_on;
+        }
+    }
+    if enabled && !now_on {
+        // The user said on, but another layer still says off. Say which.
+        return Step::new(
+            id,
+            title,
+            StepState::Action,
+            format!("{id} stays off: {}", effective.off_reason(feature)),
+        )
+        .with_action(format!("fix that, then run /setup enable {id} again"));
+    }
+    if enabled {
+        Step::new(
+            id,
+            title,
+            StepState::Done,
+            format!("{id} is on; run /setup check to see whether it is ready"),
+        )
+    } else {
+        Step::new(
+            id,
+            title,
+            StepState::Done,
+            format!("{id} is off for good: nothing will be probed, started or downloaded; stored data is kept; /setup enable {id} turns it back on"),
+        )
+    }
+}
+
+/// A profile that cannot be read leaves both features off and asks the user to
+/// fix it; it never falls back to the defaults.
+fn profile_health(
+    effective: &super::setup_profile::EffectiveSetupConfig,
+    component: &'static str,
+) -> Option<ComponentHealth> {
+    use super::setup_profile::{ProfileState, PROFILE_CORRUPT, PROFILE_NEWER};
+    let detail = effective.profile_problem()?;
+    let code = match effective.profile_state {
+        ProfileState::Newer(_) => PROFILE_NEWER,
+        _ => PROFILE_CORRUPT,
+    };
+    Some(
+        ComponentHealth::new(component, HealthState::ActionRequired, detail)
+            .with_code(code)
+            .with_remediation(
+                "Fix or move setup-profile.json (it is not replaced). The feature stays off until then.",
+            ),
+    )
+}
+
+/// The governor's health in the same shape as the memory component's.
+pub fn governor_health(
+    health: &GovernorHealth,
+    effective_enabled: bool,
+    effective: &super::setup_profile::EffectiveSetupConfig,
+) -> ComponentHealth {
+    if let Some(problem) = profile_health(effective, "governor") {
+        return problem;
+    }
+    if !effective_enabled || health.state == GovernorState::Disabled {
+        return ComponentHealth::new("governor", HealthState::Disabled, "token governor is off");
+    }
+    match health.state {
+        GovernorState::Degraded => ComponentHealth::new(
+            "governor",
+            HealthState::Degraded,
+            format!(
+                "cannot keep full tool outputs at {}: {}; {} output(s) stayed uncompressed",
+                health.store.display(),
+                health.last_error.as_deref().unwrap_or("store not writable"),
+                health.store_failures
+            ),
+        )
+        .with_code("GOVERNOR_STORE_UNWRITABLE")
+        .with_remediation("make the store folder writable or set storeDir in token-governor.json"),
+        _ => ComponentHealth::new("governor", HealthState::Ready, "token governor is on"),
+    }
+}
+
+/// The memory component's health, from live probes and the store, without
+/// holding the memory lock across the network and without changing anything.
+pub fn memory_health(
+    memory: &Arc<Mutex<VectorMemory>>,
+    effective: &super::setup_profile::EffectiveSetupConfig,
+    ctx: &SetupContext,
+) -> ComponentHealth {
+    use super::setup_health::{assess_memory, probe_ollama, MemoryFacts, ProbeTarget};
+    use super::vector_memory::ConfigFileState;
+    let (config, store, records, lag) = {
+        let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
+        let status = memory.status();
+        (
+            memory.config.clone(),
+            memory.store_health(),
+            status["records"].as_u64().unwrap_or(0) as usize,
+            status["projectionLag"].as_u64().unwrap_or(0) as usize,
+        )
+    };
+    if let Some(problem) = profile_health(effective, "memory") {
+        return problem;
+    }
+    let config_error = match &effective.memory.file {
+        ConfigFileState::Corrupt(error) => Some(error.clone()),
+        _ => None,
+    };
+    let enabled = effective.memory.enabled && config.enabled;
+    // A feature that is off, or whose config is unreadable, is not probed.
+    let probe = (enabled && config_error.is_none() && !store.is_unreadable())
+        .then(|| probe_ollama(&ProbeTarget::from_config(&config)));
+    let installed = probe
+        .as_ref()
+        .filter(|probe| !probe.reachable)
+        .map(|_| ctx.supervisor.launcher().find().is_some());
+    let starting = pull_progress().is_some_and(|progress| !progress.finished);
+    let facts = MemoryFacts {
+        enabled,
+        config_error: config_error.as_deref(),
+        store: &store,
+        probe: probe.as_ref(),
+        ollama_installed: installed,
+        starting,
+        model: &config.embedding_model,
+        configured_dimensions: config.embedding_dimensions,
+        records,
+        lag,
+    };
+    assess_memory(&facts)
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +411,35 @@ pub struct PullProgress {
 fn pulls() -> &'static Mutex<Option<PullProgress>> {
     static PULLS: OnceLock<Mutex<Option<PullProgress>>> = OnceLock::new();
     PULLS.get_or_init(|| Mutex::new(None))
+}
+
+/// Set by [`cancel_pull`]; the running pull checks it between progress lines.
+static PULL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the running model download to stop. The partial download stays in
+/// Ollama's own store; nothing of ours is deleted. Returns false when no
+/// download is running.
+pub fn cancel_pull() -> bool {
+    let running = pull_progress().is_some_and(|progress| !progress.finished);
+    if running {
+        PULL_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    running
+}
+
+/// Forget a failed pull so the next explicit `/setup` may try again. A failed
+/// or interrupted download is reported to the user first; it is never started
+/// again silently.
+fn take_failed_pull(url: &str, model: &str) -> Option<PullProgress> {
+    let mut guard = pulls().lock().unwrap_or_else(|e| e.into_inner());
+    let matches = guard
+        .as_ref()
+        .is_some_and(|p| p.url == url && p.model == model && p.finished && p.error.is_some());
+    if matches {
+        guard.take()
+    } else {
+        None
+    }
 }
 
 pub fn pull_progress() -> Option<PullProgress> {
@@ -210,6 +490,7 @@ fn reserve_pull(slot: &mut Option<PullProgress>, url: &str, model: &str) -> bool
     if slot.as_ref().is_some_and(|existing| !existing.finished) {
         return false;
     }
+    PULL_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     *slot = Some(PullProgress {
         model: model.to_string(),
         url: url.to_string(),
@@ -271,6 +552,9 @@ fn pull_model(url: &str, model: &str) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
+        if PULL_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("cancelled; the partial download stays in Ollama's store".into());
+        }
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -294,7 +578,9 @@ fn pull_model(url: &str, model: &str) -> Result<(), String> {
     if succeeded {
         Ok(())
     } else {
-        Err("the pull ended without reporting success".into())
+        // The stream ended without a verdict: the outcome is unknown. The
+        // next check asks Ollama what it has instead of assuming either way.
+        Err("the download ended without a result; Ollama may still hold a partial copy".into())
     }
 }
 
@@ -302,88 +588,74 @@ fn pull_model(url: &str, model: &str) -> Result<(), String> {
 pub fn embed_backlog(memory: &Arc<Mutex<VectorMemory>>) -> usize {
     let mut total = 0;
     for _ in 0..REINDEX_BATCHES {
-        let mut memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-        memory.clear_dense_offline();
-        let Ok(answer) = memory.reindex() else { break };
-        let embedded = answer["reembedded"].as_u64().unwrap_or(0) as usize;
-        total += embedded;
-        if embedded == 0 || !answer["embeddingError"].is_null() {
+        memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_dense_offline();
+        let receipt = VectorMemory::repair_shared(memory, REINDEX_BATCH_SIZE);
+        total += receipt.reembedded;
+        if receipt.reembedded == 0 || receipt.blocked.is_some() || receipt.error.is_some() {
             break;
         }
     }
     total
 }
 
+/// Probe the embedding service from a config snapshot: the memory lock is
+/// released before the network is touched, so a slow or hung server never
+/// holds up a turn that needs memory.
+fn probe_unlocked(memory: &Arc<Mutex<VectorMemory>>) -> memory_page::Probe {
+    let config = memory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .config
+        .clone();
+    memory_page::probe_config(&config)
+}
+
 fn find_on_path(program: &str) -> Option<PathBuf> {
     find_in_paths(program, &std::env::var_os("PATH")?)
 }
 
-/// First `program` in `path_var`. Only absolute directories count: a relative
-/// entry (`.`, or an empty one) resolves against the process working
-/// directory, which is the project, so a project could plant the executable
-/// that `/setup` then starts.
-fn find_in_paths(program: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path_var)
-        .filter(|directory| directory.is_absolute())
-        .find_map(|directory| {
-            let plain = directory.join(program);
-            let mut candidates = vec![plain.clone()];
-            if cfg!(windows) {
-                for extension in ["exe", "cmd", "bat"] {
-                    candidates.push(plain.with_extension(extension));
-                }
-            }
-            candidates.into_iter().find(|candidate| candidate.is_file())
-        })
+/// What a setup step may use: the host's agent directory (where consent and
+/// the profile live) and the service supervisor.
+pub struct SetupContext<'a> {
+    pub agent_dir: &'a Path,
+    pub supervisor: &'a ManagedServiceSupervisor,
 }
 
-/// Only a local Ollama is ever started; a remote URL is the user's server.
-fn is_local_url(url: &str) -> bool {
-    let Ok(url) = url::Url::parse(url) else {
-        return false;
-    };
-    matches!(url.scheme(), "http" | "https")
-        && matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "0.0.0.0")
-        )
-}
-
-fn spawn_ollama_serve(program: &Path) -> Result<(), String> {
-    let mut command = std::process::Command::new(program);
-    command
-        .arg("serve")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
-    }
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn wait_for_server(memory: &Arc<Mutex<VectorMemory>>) -> memory_page::Probe {
-    let started = Instant::now();
-    loop {
-        let probe = {
-            let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-            memory_page::probe(&memory)
-        };
-        if probe.reachable || started.elapsed() >= SERVE_WAIT {
-            return probe;
+impl<'a> SetupContext<'a> {
+    /// The real machine: this process's supervisor.
+    pub fn system(agent_dir: &'a Path) -> Self {
+        Self {
+            agent_dir,
+            supervisor: system_supervisor(),
         }
-        std::thread::sleep(Duration::from_millis(400));
     }
 }
 
-pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
+pub(crate) fn step_from_health(
+    id: &'static str,
+    title: &'static str,
+    health: &ComponentHealth,
+) -> Step {
+    let state = match health.state {
+        HealthState::Ready => StepState::Ready,
+        HealthState::Disabled => StepState::Skipped,
+        HealthState::Checking | HealthState::Starting => StepState::Running,
+        _ => StepState::Action,
+    };
+    let mut step = Step::new(id, title, state, health.detail.clone());
+    if let Some(code) = health.code {
+        step = step.with_code(code);
+    }
+    if let Some(remediation) = &health.remediation {
+        step = step.with_action(remediation.clone());
+    }
+    step
+}
+
+pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool, ctx: &SetupContext) -> Step {
     const ID: &str = "memory";
     const TITLE: &str = "vector memory";
     let (enabled, url, model, dimensions) = {
@@ -395,69 +667,82 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
             memory.config.embedding_dimensions,
         )
     };
+    // The files on disk decide too: a profile edited since this session began
+    // must not be ignored by the live copy of the settings.
+    let effective = load_effective_setup(ctx.agent_dir, &process_env);
+    if let Some(problem) = profile_health(&effective, "memory") {
+        return step_from_health(ID, TITLE, &problem);
+    }
+    let enabled = enabled && effective.memory.enabled;
     if !enabled {
-        return Step::new(
-            ID,
-            TITLE,
-            StepState::Skipped,
-            "disabled by vector-memory.json or PI_MEMORY_ENABLED=0".into(),
-        );
+        return Step::new(ID, TITLE, StepState::Skipped, {
+            let effective = load_effective_setup(ctx.agent_dir, &process_env);
+            format!(
+                "off: {}; /setup enable memory turns it on",
+                effective.off_reason(super::setup_profile::Feature::Memory)
+            )
+        });
     }
     if let Some(progress) = pull_for(&url, &model).filter(|p| !p.finished) {
         return Step::new(ID, TITLE, StepState::Running, pull_line(&progress));
     }
+    if let super::vector_memory::LocalStoreHealth::Unreadable(error) = memory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .store_health()
+    {
+        return Step::new(ID, TITLE, StepState::Action, error)
+            .with_code(super::vector_memory::LOCAL_STORE_UNREADABLE)
+            .with_action(
+                "the record file was left untouched; fix its permissions or encoding, or move it aside, then run /memory-reindex",
+            );
+    }
 
-    let mut probe = {
-        let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-        memory_page::probe(&memory)
-    };
+    let mut probe = probe_unlocked(memory);
     let mut started_server = false;
     if !probe.reachable {
-        let installed = find_on_path("ollama");
-        match installed {
-            None => {
-                return Step::new(
+        if !apply {
+            // Read-only: say what is wrong without starting anything.
+            let installed = ctx.supervisor.launcher().find();
+            return match installed {
+                None => Step::new(
                     ID,
                     TITLE,
                     StepState::Action,
                     format!("no Ollama at {url}; search uses keywords only"),
                 )
+                .with_code(super::setup_health::INSTALL_REQUIRED)
                 .with_action(format!(
                     "install Ollama from https://ollama.com/download, then run /setup (it pulls {model})"
-                ));
-            }
-            Some(program) if apply && is_local_url(&url) => {
-                if let Err(error) = spawn_ollama_serve(&program) {
-                    return Step::new(
-                        ID,
-                        TITLE,
-                        StepState::Action,
-                        format!("could not start {}: {error}", program.display()),
-                    )
-                    .with_action("start Ollama (`ollama serve`), then run /setup");
-                }
-                probe = wait_for_server(memory);
-                if !probe.reachable {
-                    return Step::new(
-                        ID,
-                        TITLE,
-                        StepState::Action,
-                        format!("started `ollama serve` but {url} did not answer yet"),
-                    )
-                    .with_action("run /setup again in a few seconds");
-                }
-                started_server = true;
-            }
-            Some(_) => {
-                return Step::new(
+                )),
+                Some(_) => Step::new(
                     ID,
                     TITLE,
                     StepState::Action,
                     format!("Ollama is installed but {url} does not answer"),
                 )
-                .with_action("start Ollama (`ollama serve`), then run /setup");
-            }
+                .with_code(super::setup_health::PROVIDER_OFFLINE)
+                .with_action("run /setup to start it (it asks once), or `ollama serve`"),
+            };
         }
+        // The supervisor starts it only with the user's consent and only the
+        // Ollama the user approved; see `service_supervisor`.
+        let effective = load_effective_setup(ctx.agent_dir, &process_env);
+        let health = ctx.supervisor.reconcile(ctx.agent_dir, &effective);
+        if health.state != HealthState::Ready {
+            return step_from_health(ID, TITLE, &health);
+        }
+        probe = probe_unlocked(memory);
+        if !probe.reachable {
+            return Step::new(
+                ID,
+                TITLE,
+                StepState::Action,
+                format!("started `ollama serve` but {url} did not answer yet"),
+            )
+            .with_action("run /setup again in a few seconds");
+        }
+        started_server = true;
     }
     let server = if started_server {
         "started Ollama"
@@ -467,18 +752,22 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
 
     if probe.model_installed == Some(false) {
         if let Some(progress) = pull_for(&url, &model).filter(|p| p.error.is_some()) {
-            if !apply {
-                return Step::new(
-                    ID,
-                    TITLE,
-                    StepState::Action,
-                    format!(
-                        "pulling {model} failed: {}",
-                        progress.error.unwrap_or_default()
-                    ),
-                )
-                .with_action(format!("run /setup to retry, or `ollama pull {model}`"));
+            // A failed or interrupted download is reported, once, and never
+            // restarted by itself: the next explicit /setup may try again.
+            if apply {
+                take_failed_pull(&url, &model);
             }
+            return Step::new(
+                ID,
+                TITLE,
+                StepState::Action,
+                format!(
+                    "downloading {model} did not finish: {}",
+                    progress.error.unwrap_or_default()
+                ),
+            )
+            .with_code(super::setup_health::MODEL_MISSING)
+            .with_action(format!("run /setup to try again, or `ollama pull {model}`"));
         }
         if !apply {
             return Step::new(
@@ -487,13 +776,50 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
                 StepState::Action,
                 format!("{server}; embedding model {model} is not installed"),
             )
-            .with_action(format!("run /setup to pull it, or `ollama pull {model}`"));
+            .with_code(super::setup_health::MODEL_MISSING)
+            .with_action(format!(
+                "run /setup to download it (it asks first), or `ollama pull {model}`"
+            ));
+        }
+        // Downloading is the user's call, made once and recorded.
+        if let Err(reason) =
+            ServiceAuthorization::check(ctx.agent_dir, ServiceAction::DownloadEmbeddingModel)
+        {
+            return Step::new(
+                ID,
+                TITLE,
+                StepState::Action,
+                format!(
+                    "{server}; embedding model {model} is not installed and downloading it needs your approval ({reason})"
+                ),
+            )
+            .with_code(super::service_supervisor::CONSENT_REQUIRED)
+            .with_action(format!(
+                "approve the download of {model} with /setup approve download-model (Ollama reports the size once it starts), then run /setup"
+            ));
         }
         start_pull(Arc::clone(memory), &url, &model);
         let progress = pull_progress().unwrap_or_default();
         return Step::new(ID, TITLE, StepState::Running, pull_line(&progress));
     }
 
+    // A model that answers with the wrong vector size is not "a failed
+    // embedding": say what to change.
+    if let Some(actual) = probe
+        .embed_dimensions
+        .filter(|actual| *actual != dimensions)
+    {
+        return Step::new(
+            ID,
+            TITLE,
+            StepState::Action,
+            format!("{model} returns {actual} dimensions; memory expects {dimensions}"),
+        )
+        .with_code(super::setup_health::EMBEDDING_MISMATCH)
+        .with_action(format!(
+            "set \"embeddingDimensions\": {actual} in ~/.davinci/agent/vector-memory.json, then run /setup repair"
+        ));
+    }
     if !probe.embed_ok {
         return Step::new(
             ID,
@@ -505,20 +831,6 @@ pub fn memory_step(memory: &Arc<Mutex<VectorMemory>>, apply: bool) -> Step {
             ),
         )
         .with_action("check `embeddingModel` in ~/.davinci/agent/vector-memory.json");
-    }
-    if let Some(actual) = probe
-        .embed_dimensions
-        .filter(|actual| *actual != dimensions)
-    {
-        return Step::new(
-            ID,
-            TITLE,
-            StepState::Action,
-            format!("{model} returns {actual} dimensions; memory expects {dimensions}"),
-        )
-        .with_action(format!(
-            "set \"embeddingDimensions\": {actual} in ~/.davinci/agent/vector-memory.json"
-        ));
     }
 
     let (records, lag) = {
@@ -915,6 +1227,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+    use std::time::Instant;
 
     #[test]
     fn arguments_select_the_mode() {
@@ -1134,6 +1447,44 @@ mod tests {
         assert_eq!(answer["steps"][1]["action"], "fix it");
     }
 
+    /// A machine with no `ollama` at all, and a throwaway agent directory.
+    struct NoOllama;
+    impl super::super::service_supervisor::OllamaLauncher for NoOllama {
+        fn find(&self) -> Option<PathBuf> {
+            None
+        }
+        fn version(&self, _: &Path) -> Option<String> {
+            None
+        }
+        fn spawn(
+            &self,
+            _: &Path,
+            _: &Path,
+        ) -> Result<Box<dyn super::super::service_supervisor::OwnedProcess>, String> {
+            Err("no process may be started in this test".into())
+        }
+    }
+
+    struct TestCtx {
+        agent: tempfile::TempDir,
+        supervisor: ManagedServiceSupervisor,
+    }
+
+    impl TestCtx {
+        fn new() -> Self {
+            Self {
+                agent: tempfile::tempdir().unwrap(),
+                supervisor: ManagedServiceSupervisor::new(Box::new(NoOllama)),
+            }
+        }
+        fn ctx(&self) -> SetupContext<'_> {
+            SetupContext {
+                agent_dir: self.agent.path(),
+                supervisor: &self.supervisor,
+            }
+        }
+    }
+
     fn memory_with(dir: &Path, url: String) -> Arc<Mutex<VectorMemory>> {
         let config = VectorMemoryConfig {
             ollama_url: url,
@@ -1148,7 +1499,56 @@ mod tests {
     }
 
     #[test]
+    fn a_model_with_another_vector_size_names_the_dimension_fix() {
+        let tc = TestCtx::new();
+        let dir = tempfile::tempdir().unwrap();
+        // The server answers with 12 dimensions; memory expects 8.
+        let memory = memory_with(
+            dir.path(),
+            super::super::vector_memory::tests::fake_ollama(12),
+        );
+        let step = memory_step(&memory, false, &tc.ctx());
+        assert_eq!(step.state, StepState::Action, "{}", step.detail);
+        assert_eq!(step.code, Some("EMBEDDING_MISMATCH"));
+        assert!(step.detail.contains("12 dimensions"), "{}", step.detail);
+        assert!(
+            step.action
+                .as_deref()
+                .unwrap_or("")
+                .contains("\"embeddingDimensions\": 12"),
+            "{:?}",
+            step.action
+        );
+    }
+
+    #[test]
+    fn an_unreadable_record_file_is_an_action_not_a_green_step() {
+        let tc = TestCtx::new();
+        let dir = tempfile::tempdir().unwrap();
+        let memory = memory_with(
+            dir.path(),
+            super::super::vector_memory::tests::fake_ollama(8),
+        );
+        let path = memory.lock().unwrap().local_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"\xff\xfe").unwrap();
+        // Rebuild so the constructor sees the bad file.
+        let rebuilt = {
+            let config = memory.lock().unwrap().config.clone();
+            Arc::new(Mutex::new(VectorMemory::with_config(
+                dir.path().to_path_buf(),
+                config,
+            )))
+        };
+        let step = memory_step(&rebuilt, true, &tc.ctx());
+        assert_eq!(step.state, StepState::Action);
+        assert_eq!(step.code, Some("LOCAL_STORE_UNREADABLE"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfe");
+    }
+
+    #[test]
     fn a_ready_server_embeds_records_that_have_no_vector() {
+        let tc = TestCtx::new();
         let dir = tempfile::tempdir().unwrap();
         let dead = {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1170,12 +1570,15 @@ mod tests {
             dir.path(),
             super::super::vector_memory::tests::fake_ollama(8),
         );
-        let checked = memory_step(&memory, false);
+        let checked = memory_step(&memory, false, &tc.ctx());
         assert_eq!(checked.state, StepState::Action, "{}", checked.detail);
-        let applied = memory_step(&memory, true);
+        let applied = memory_step(&memory, true, &tc.ctx());
         assert_eq!(applied.state, StepState::Done, "{}", applied.detail);
         assert!(applied.detail.contains("embedded 1"), "{}", applied.detail);
-        assert_eq!(memory_step(&memory, false).state, StepState::Ready);
+        assert_eq!(
+            memory_step(&memory, false, &tc.ctx()).state,
+            StepState::Ready
+        );
     }
 
     /// Ollama without the embedding model: `/api/tags` lists nothing and
@@ -1243,6 +1646,7 @@ Connection: close
 
     #[test]
     fn folder_trust_does_not_grant_service_start() {
+        let tc = TestCtx::new();
         let agent = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".davinci")).unwrap();
@@ -1271,7 +1675,7 @@ Connection: close
         // With the folder trusted, a check still only observes: it probes the
         // server (model list, one test embedding) and neither pulls a model
         // nor starts a server.
-        let checked = memory_step(&memory, false);
+        let checked = memory_step(&memory, false, &tc.ctx());
         assert_eq!(checked.state, StepState::Action, "{}", checked.detail);
         let seen = requests.lock().unwrap().clone();
         assert!(
@@ -1300,16 +1704,25 @@ Connection: close
 
     #[test]
     fn a_missing_model_is_pulled_in_the_background() {
+        let tc = TestCtx::new();
         let dir = tempfile::tempdir().unwrap();
         let memory = memory_with(dir.path(), ollama_without_model());
-        let checked = memory_step(&memory, false);
+        let checked = memory_step(&memory, false, &tc.ctx());
         assert_eq!(checked.state, StepState::Action);
         assert!(checked
             .action
             .unwrap()
             .contains("ollama pull embeddinggemma"));
 
-        let applied = memory_step(&memory, true);
+        // Without the user's yes the download does not start.
+        let refused = memory_step(&memory, true, &tc.ctx());
+        assert_eq!(refused.state, StepState::Action, "{}", refused.detail);
+        assert_eq!(refused.code, Some("CONSENT_REQUIRED"));
+        super::super::service_authority::ServiceConsentStore::open(tc.agent.path())
+            .set(ServiceAction::DownloadEmbeddingModel, true)
+            .unwrap();
+
+        let applied = memory_step(&memory, true, &tc.ctx());
         assert_eq!(applied.state, StepState::Running, "{}", applied.detail);
         let started = Instant::now();
         while !pull_progress().is_some_and(|p| p.finished) {

@@ -162,97 +162,156 @@ impl Default for VectorMemoryConfig {
 impl VectorMemoryConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        config.apply_env();
+        config.apply_env_with(&process_env);
         config
     }
 
+    /// The config file merged over defaults, then the environment. A file that
+    /// exists but cannot be read or parsed never turns into the defaults:
+    /// memory stays off until the file is fixed (see [`Self::load_file`]).
     pub fn from_file(path: &Path) -> Self {
-        let mut config = fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-            .unwrap_or_default();
-        config.apply_env();
-        config
+        Self::load_file(path, &process_env).0
     }
 
-    fn apply_env(&mut self) {
+    /// Like [`Self::from_file`], with the file's state and an injectable
+    /// environment, so setup can say what was read and what the environment
+    /// overrode. A UTF-8 byte order mark is accepted.
+    pub fn load_file(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> (Self, ConfigFileState) {
+        let (mut config, state) = match fs::read(path) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                match serde_json::from_str::<Self>(text) {
+                    Ok(config) => (config, ConfigFileState::Present),
+                    Err(error) => (
+                        Self::fail_closed(),
+                        ConfigFileState::Corrupt(error.to_string()),
+                    ),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Self::default(), ConfigFileState::Missing)
+            }
+            Err(error) => (
+                Self::fail_closed(),
+                ConfigFileState::Corrupt(error.to_string()),
+            ),
+        };
+        config.apply_env_with(env);
+        (config, state)
+    }
+
+    /// What an unreadable config file stands for: the defaults, switched off.
+    fn fail_closed() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// Every environment variable that can override this config, with the
+    /// field it sets. Setup lists the ones that are set.
+    pub const ENV_OVERRIDES: &'static [(&'static str, &'static str)] = &[
+        ("PI_MEMORY_ENABLED", "enabled"),
+        ("PI_MEMORY_OLLAMA_URL", "ollamaUrl"),
+        ("PI_MEMORY_EMBEDDING_MODEL", "embeddingModel"),
+        ("PI_MEMORY_EMBEDDING_DIMENSIONS", "embeddingDimensions"),
+        ("PI_MEMORY_EXTRACTION_MODEL", "extractionModel"),
+        ("PI_MEMORY_QDRANT_URL", "qdrantUrl"),
+        ("PI_MEMORY_COLLECTION", "collection"),
+        ("PI_MEMORY_AUTOMATIC_RETRIEVAL", "automaticRetrieval"),
+        ("PI_MEMORY_RESULT_LIMIT", "resultLimit"),
+        ("PI_MEMORY_CANDIDATE_LIMIT", "candidateLimit"),
+        ("PI_MEMORY_MAX_INDEX_CHUNKS", "maxIndexChunks"),
+        ("PI_MEMORY_MAX_INJECTED_TOKENS", "maxInjectedTokens"),
+        ("PI_MEMORY_MINIMUM_SCORE", "minimumScore"),
+        ("PI_MEMORY_PROMOTION", "promotion"),
+    ];
+
+    fn apply_env_with(&mut self, get: &dyn Fn(&str) -> Option<String>) {
         let config = self;
-        if let Some(value) = env_bool("PI_MEMORY_ENABLED") {
+        if let Some(value) = env_bool(get, "PI_MEMORY_ENABLED") {
             config.enabled = value;
         }
-        if let Some(value) = env_string("PI_MEMORY_OLLAMA_URL") {
+        if let Some(value) = env_string(get, "PI_MEMORY_OLLAMA_URL") {
             config.ollama_url = value;
         }
-        if let Some(value) = env_string("PI_MEMORY_EMBEDDING_MODEL") {
+        if let Some(value) = env_string(get, "PI_MEMORY_EMBEDDING_MODEL") {
             config.embedding_model = value;
         }
-        if let Some(value) = env_usize("PI_MEMORY_EMBEDDING_DIMENSIONS") {
+        if let Some(value) = env_usize(get, "PI_MEMORY_EMBEDDING_DIMENSIONS") {
             config.embedding_dimensions = value.max(1);
         }
-        if let Some(value) = env_string("PI_MEMORY_EXTRACTION_MODEL") {
+        if let Some(value) = env_string(get, "PI_MEMORY_EXTRACTION_MODEL") {
             config.extraction_model = value;
         }
-        if let Some(value) = env_string("PI_MEMORY_QDRANT_URL") {
+        if let Some(value) = env_string(get, "PI_MEMORY_QDRANT_URL") {
             config.qdrant_url = value;
         }
-        if let Some(value) = env_string("PI_MEMORY_COLLECTION") {
+        if let Some(value) = env_string(get, "PI_MEMORY_COLLECTION") {
             config.collection = value;
         }
-        if let Some(value) = env_bool("PI_MEMORY_AUTOMATIC_RETRIEVAL") {
+        if let Some(value) = env_bool(get, "PI_MEMORY_AUTOMATIC_RETRIEVAL") {
             config.automatic_retrieval = value;
         }
-        if let Some(value) = env_usize("PI_MEMORY_RESULT_LIMIT") {
+        if let Some(value) = env_usize(get, "PI_MEMORY_RESULT_LIMIT") {
             config.result_limit = value.clamp(1, 20);
         }
-        if let Some(value) = env_usize("PI_MEMORY_CANDIDATE_LIMIT") {
+        if let Some(value) = env_usize(get, "PI_MEMORY_CANDIDATE_LIMIT") {
             config.candidate_limit = value.clamp(1, 100);
         }
-        if let Some(value) = env_usize("PI_MEMORY_MAX_INDEX_CHUNKS") {
+        if let Some(value) = env_usize(get, "PI_MEMORY_MAX_INDEX_CHUNKS") {
             config.max_index_chunks = value.clamp(1, 512);
         }
-        if let Some(value) = env_usize("PI_MEMORY_MAX_INJECTED_TOKENS") {
+        if let Some(value) = env_usize(get, "PI_MEMORY_MAX_INJECTED_TOKENS") {
             config.max_injected_tokens = value.max(100);
         }
-        if let Some(value) = std::env::var("DAVINCI_MEMORY_MINIMUM_SCORE")
-            .or_else(|_| std::env::var("PI_MEMORY_MINIMUM_SCORE"))
-            .ok()
+        if let Some(value) = get("DAVINCI_MEMORY_MINIMUM_SCORE")
+            .or_else(|| get("PI_MEMORY_MINIMUM_SCORE"))
             .and_then(|value| value.parse::<f32>().ok())
         {
             config.minimum_score = value.clamp(0.0, 1.0);
         }
-        if let Some(value) = env_bool("PI_MEMORY_PROMOTION") {
+        if let Some(value) = env_bool(get, "PI_MEMORY_PROMOTION") {
             config.promotion = value;
         }
     }
 }
 
-fn env_string(name: &str) -> Option<String> {
+/// What reading a config file found. `Corrupt` covers a file that exists but
+/// cannot be read or parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFileState {
+    Missing,
+    Present,
+    Corrupt(String),
+}
+
+/// The real process environment, as an injectable getter.
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+type EnvGet<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn env_raw(get: EnvGet, name: &str) -> Option<String> {
     let davinci_name = name.replace("PI_", "DAVINCI_");
-    std::env::var(&davinci_name)
-        .or_else(|_| std::env::var(name))
-        .ok()
+    get(&davinci_name).or_else(|| get(name))
+}
+fn env_string(get: EnvGet, name: &str) -> Option<String> {
+    env_raw(get, name)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
-fn env_bool(name: &str) -> Option<bool> {
-    let davinci_name = name.replace("PI_", "DAVINCI_");
-    let val = std::env::var(&davinci_name)
-        .or_else(|_| std::env::var(name))
-        .ok()?;
-    match val.trim().to_ascii_lowercase().as_str() {
+fn env_bool(get: EnvGet, name: &str) -> Option<bool> {
+    match env_raw(get, name)?.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
 }
-fn env_usize(name: &str) -> Option<usize> {
-    let davinci_name = name.replace("PI_", "DAVINCI_");
-    std::env::var(&davinci_name)
-        .or_else(|_| std::env::var(name))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+fn env_usize(get: EnvGet, name: &str) -> Option<usize> {
+    env_raw(get, name)?.trim().parse().ok()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1287,6 +1346,173 @@ pub struct VectorMemory {
     /// Set when an embedding request failed; dense retrieval and document
     /// embedding are skipped until it passes.
     dense_offline_until: Arc<Mutex<Option<Instant>>>,
+    /// Why the record file could not be read, when it could not. While set,
+    /// nothing is written to that file: the in-memory state is not the file's
+    /// state, and rewriting from it would destroy what is there.
+    store_error: Option<String>,
+}
+
+/// Stable code for an existing record file that cannot be read (for example
+/// not UTF-8 or no access). The file is left exactly as it is.
+pub const LOCAL_STORE_UNREADABLE: &str = "LOCAL_STORE_UNREADABLE";
+
+/// A repair batch between planning and applying. It owns copies, so the
+/// network call that fills it in needs no lock on the memory.
+#[derive(Debug)]
+pub struct RepairPlan {
+    receipt: RepairReceipt,
+    config: VectorMemoryConfig,
+    pending: Vec<(String, String)>,
+    finished: bool,
+}
+
+impl RepairPlan {
+    /// Ask the embedding service. A first test vector separates a wrong vector
+    /// size (`EMBEDDING_MISMATCH`) and an unreachable service from a real
+    /// batch, so a blocked repair changes nothing.
+    pub fn embed(&self) -> Result<Vec<Vec<f32>>, (&'static str, String)> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        let blocked = |error: ToolError| {
+            let message = error.to_string();
+            let code = if message.contains("EMBEDDING_MISMATCH") {
+                "EMBEDDING_MISMATCH"
+            } else {
+                "PROVIDER_OFFLINE"
+            };
+            (code, message)
+        };
+        embed_with_config(&self.config, &["repair preflight".to_string()], DOC_PREFIX)
+            .map_err(blocked)?;
+        let texts: Vec<String> = self.pending.iter().map(|(_, text)| text.clone()).collect();
+        let vectors = embed_with_config(&self.config, &texts, DOC_PREFIX).map_err(|error| {
+            // A failure after the preflight is reported, not blocked.
+            ("EMBED_FAILED", error.to_string())
+        })?;
+        if vectors.len() != texts.len() {
+            return Err((
+                "EMBED_FAILED",
+                "embedding rebuild response count does not match request".into(),
+            ));
+        }
+        Ok(vectors)
+    }
+}
+
+fn embed_with_config(
+    config: &VectorMemoryConfig,
+    texts: &[String],
+    prefix: &str,
+) -> Result<Vec<Vec<f32>>, ToolError> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let base_url = config.ollama_url.trim_end_matches('/');
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(config.embed_timeout_seconds))
+        .build();
+
+    // Ollama's current endpoint accepts a batch under `input` and returns
+    // `embeddings`.  Try it first, while retaining the older endpoint for
+    // installations that have not yet adopted `/api/embed`.
+    let modern_payload = embedding_request_payload(&config.embedding_model, texts, prefix);
+    let modern_error = match agent
+        .post(&format!("{base_url}/api/embed"))
+        .send_json(modern_payload)
+    {
+        Ok(response) => match response.into_json::<Value>() {
+            Ok(value) => {
+                match parse_embedding_responses(&value, config.embedding_dimensions, texts.len()) {
+                    Ok(embeddings) => return Ok(embeddings),
+                    // The server answered with vectors of another size:
+                    // the older endpoint would say the same, once per text.
+                    Err(error) if error.to_string().contains("EMBEDDING_MISMATCH") => {
+                        return Err(error)
+                    }
+                    Err(error) => error,
+                }
+            }
+            Err(error) => ToolError::Failed(error.to_string()),
+        },
+        // Only a server that does not know `/api/embed` gets the older
+        // per-text endpoint. A host that is down or slow would fail that
+        // one too, once per text, each with the full timeout.
+        Err(ureq::Error::Status(404, _)) => {
+            ToolError::Failed("/api/embed is not served (404)".into())
+        }
+        Err(error) => return Err(ToolError::Failed(error.to_string())),
+    };
+
+    let mut embeddings = Vec::with_capacity(texts.len());
+    for text in texts {
+        let prefixed = format!("{prefix}{text}");
+        let legacy_response = agent
+            .post(&format!("{base_url}/api/embeddings"))
+            .send_json(json!({
+                "model": config.embedding_model,
+                "prompt": prefixed
+            }))
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let legacy_value: Value = legacy_response
+            .into_json()
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let embedding = parse_embedding_response(&legacy_value, config.embedding_dimensions)
+            .map_err(|error| {
+                ToolError::Failed(format!(
+                    "modern embedding request failed ({modern_error}); legacy response invalid ({error})"
+                ))
+            })?;
+        embeddings.push(embedding);
+    }
+    Ok(embeddings)
+}
+
+/// What one [`VectorMemory::repair_projection`] batch did. `records_before`
+/// always equals `records_after`: repair never removes a record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairReceipt {
+    pub records_before: usize,
+    pub records_after: usize,
+    /// Records without a current vector when the batch began.
+    pub stale_before: usize,
+    pub reembedded: usize,
+    /// Records still without a current vector; run again while above zero.
+    pub remaining: usize,
+    /// Shared ids that were made unique.
+    pub repaired_ids: usize,
+    /// Why nothing was done: `LOCAL_STORE_UNREADABLE`, `EMBEDDING_MISMATCH` or
+    /// `PROVIDER_OFFLINE`.
+    pub blocked: Option<&'static str>,
+    pub error: Option<String>,
+}
+
+impl RepairReceipt {
+    /// Nothing was lost and nothing is left to do.
+    pub fn is_complete(&self) -> bool {
+        self.blocked.is_none() && self.error.is_none() && self.remaining == 0
+    }
+}
+
+/// What the last read of the local record file found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalStoreHealth {
+    /// Read fine, or the file does not exist yet (created on first write).
+    Ok,
+    /// The file exists and could not be read; the reason is attached.
+    Unreadable(String),
+}
+
+impl LocalStoreHealth {
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_))
+    }
+
+    /// `Some(LOCAL_STORE_UNREADABLE)` when unreadable.
+    pub fn code(&self) -> Option<&'static str> {
+        self.is_unreadable().then_some(LOCAL_STORE_UNREADABLE)
+    }
 }
 
 fn known_key_scoped(kind: MemoryKind, hash: &str, profile: Option<&str>) -> String {
@@ -1324,9 +1550,19 @@ impl VectorMemory {
             last_indexed: 0,
             last_indexed_at: None,
             dense_offline_until: Arc::new(Mutex::new(None)),
+            store_error: None,
         };
+        // A failed read is kept (`store_error`), not discarded: it blocks
+        // writes to that file and shows up in `status()`.
         let _ = memory.load_local();
         memory
+    }
+
+    pub fn store_health(&self) -> LocalStoreHealth {
+        match &self.store_error {
+            Some(error) => LocalStoreHealth::Unreadable(error.clone()),
+            None => LocalStoreHealth::Ok,
+        }
     }
 
     pub fn local_path(&self) -> PathBuf {
@@ -1350,11 +1586,16 @@ impl VectorMemory {
     }
 
     fn load_local(&mut self) -> Result<(), ToolError> {
-        let content = match fs::read_to_string(self.local_path()) {
-            Ok(content) => content,
+        let path = self.local_path();
+        let content = match fs::read(&path).map(String::from_utf8) {
+            Ok(Ok(content)) => content,
+            Ok(Err(_)) => {
+                return Err(self.mark_store_unreadable(&path, "the file is not valid UTF-8"))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(ToolError::Failed(error.to_string())),
+            Err(error) => return Err(self.mark_store_unreadable(&path, &error.to_string())),
         };
+        self.store_error = None;
         self.records.clear();
         self.foreign_lines.clear();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
@@ -1379,10 +1620,78 @@ impl VectorMemory {
         Ok(())
     }
 
-    fn persist_local(&self) -> Result<(), ToolError> {
+    fn mark_store_unreadable(&mut self, path: &Path, reason: &str) -> ToolError {
+        let message = format!(
+            "{LOCAL_STORE_UNREADABLE}: cannot read {}: {reason}. The file was left untouched; fix or move it, then run /memory-reindex.",
+            path.display()
+        );
+        self.store_error = Some(message.clone());
+        ToolError::Failed(message)
+    }
+
+    /// Write the records. Under a file lock it first folds in what another
+    /// session wrote since this one loaded, so two sessions on one repo never
+    /// drop each other's records.
+    fn persist_local(&mut self) -> Result<(), ToolError> {
+        self.persist_local_with(true)
+    }
+
+    /// Records another session added (or embedded) since the last load. A
+    /// record counts as new when neither its id nor its content key is known
+    /// here. Lines this repo does not own are kept too. Never removes anything.
+    fn merge_from_disk(&mut self, path: &Path) -> Result<(), ToolError> {
+        let content = match fs::read(path).map(String::from_utf8) {
+            Ok(Ok(content)) => content,
+            Ok(Err(_)) => {
+                return Err(self.mark_store_unreadable(path, "the file is not valid UTF-8"))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(self.mark_store_unreadable(path, &error.to_string())),
+        };
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            match serde_json::from_str::<MemoryRecord>(line) {
+                Ok(record) if record.repo_id == self.repo_id || record.repo_id == "*" => {
+                    if let Some(ours) = self.records.iter_mut().find(|item| item.id == record.id) {
+                        if ours.embedding.is_none() && record.embedding.is_some() {
+                            ours.embedding = record.embedding;
+                            ours.embedding_identity = record.embedding_identity;
+                        }
+                        continue;
+                    }
+                    let key = known_key_scoped(
+                        record.kind,
+                        &record.content_hash,
+                        record.agent_profile_name.as_deref(),
+                    );
+                    if self.known.insert(key) {
+                        self.records.push(record);
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    if !self.foreign_lines.iter().any(|ours| ours == line) {
+                        self.foreign_lines.push(line.to_string());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_local_with(&mut self, merge: bool) -> Result<(), ToolError> {
+        if let Some(message) = &self.store_error {
+            return Err(ToolError::Failed(message.clone()));
+        }
         let path = self.local_path();
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))
             .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let _lock = davinci_sys::lock::ExclusiveFileLock::acquire(
+            &davinci_sys::lock::lock_path_for(&path),
+            Duration::from_secs(5),
+        )
+        .map_err(|err| ToolError::Failed(format!("memory store is busy: {err}")))?;
+        if merge {
+            self.merge_from_disk(&path)?;
+        }
 
         let mut records = self.records.iter().collect::<Vec<_>>();
         records.sort_by_key(|record| record.created_at);
@@ -2211,7 +2520,8 @@ impl VectorMemory {
         cleared.known.clear();
         cleared.last_indexed = 0;
         cleared.last_indexed_at = None;
-        cleared.persist_local()?;
+        // Clearing is deliberate: it must not fold other records back in.
+        cleared.persist_local_with(false)?;
         *self = cleared;
         Ok(self.status())
     }
@@ -2303,6 +2613,141 @@ impl VectorMemory {
         Ok(updated)
     }
 
+    /// Re-embed one bounded batch of records whose vector is missing or was
+    /// made by another model or size. The records themselves (text,
+    /// tombstones, supersessions, source hashes) are never changed or removed:
+    /// only the derived vectors are rebuilt. Call it again while
+    /// `remaining > 0`; each call is safe to repeat and to interrupt.
+    ///
+    /// Before touching anything it asks the embedding service for one test
+    /// vector. A wrong vector size (`EMBEDDING_MISMATCH`) or an unreachable
+    /// service stops the repair with nothing changed, instead of dropping the
+    /// old vectors and then failing to replace them.
+    pub fn repair_projection(&mut self, max_batch: usize) -> RepairReceipt {
+        let plan = self.repair_plan(max_batch);
+        let outcome = plan.embed();
+        self.repair_apply(plan, outcome)
+    }
+
+    /// Step one of a repair, done under the memory lock: reload, fix shared
+    /// ids and pick the batch. No network call happens here.
+    pub fn repair_plan(&mut self, max_batch: usize) -> RepairPlan {
+        let mut receipt = RepairReceipt::default();
+        let mut plan = RepairPlan {
+            receipt: RepairReceipt::default(),
+            config: self.config.clone(),
+            pending: Vec::new(),
+            finished: true,
+        };
+        if let Err(error) = self.load_local() {
+            receipt.blocked = Some(LOCAL_STORE_UNREADABLE);
+            receipt.error = Some(error.to_string());
+            plan.receipt = receipt;
+            return plan;
+        }
+        receipt.records_before = self.records.len();
+        let repaired_ids = self.repair_duplicate_ids();
+        if repaired_ids > 0 {
+            if let Err(error) = self.persist_local() {
+                receipt.error = Some(error.to_string());
+                receipt.records_after = self.records.len();
+                plan.receipt = receipt;
+                return plan;
+            }
+        }
+        receipt.repaired_ids = repaired_ids;
+        receipt.stale_before = self.local_projection_lag();
+        receipt.remaining = receipt.stale_before;
+        receipt.records_after = self.records.len();
+        if receipt.stale_before == 0 || !self.config.enabled {
+            plan.receipt = receipt;
+            return plan;
+        }
+        let current = self.current_embedding_identity();
+        plan.pending = self
+            .records
+            .iter()
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+                    && (record.embedding.is_none()
+                        || !embedding_identity_compatible(
+                            record.embedding_identity.as_ref(),
+                            &current,
+                        ))
+            })
+            .take(max_batch.max(1))
+            .map(|record| (record.id.clone(), record.text.clone()))
+            .collect();
+        plan.finished = false;
+        plan.receipt = receipt;
+        plan
+    }
+
+    /// Step three, under the lock again: store each vector only where the
+    /// record is still the one that was embedded and still lacks a current
+    /// vector. A record another session changed or already embedded is left.
+    pub fn repair_apply(
+        &mut self,
+        plan: RepairPlan,
+        outcome: Result<Vec<Vec<f32>>, (&'static str, String)>,
+    ) -> RepairReceipt {
+        let mut receipt = plan.receipt;
+        if plan.finished {
+            return receipt;
+        }
+        let vectors = match outcome {
+            Ok(vectors) => vectors,
+            Err((code, message)) => {
+                if code != "EMBED_FAILED" {
+                    receipt.blocked = Some(code);
+                }
+                receipt.error = Some(message);
+                return receipt;
+            }
+        };
+        let identity = EmbeddingIdentity::from_config(&plan.config);
+        let mut updated = 0usize;
+        for ((id, text), embedding) in plan.pending.into_iter().zip(vectors) {
+            if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
+                let stale = record.embedding.is_none()
+                    || !embedding_identity_compatible(
+                        record.embedding_identity.as_ref(),
+                        &identity,
+                    );
+                if record.text == text && stale {
+                    record.embedding = Some(embedding);
+                    record.embedding_identity = Some(identity.clone());
+                    updated += 1;
+                }
+            }
+        }
+        if updated > 0 {
+            if let Err(error) = self.persist_local() {
+                receipt.error = Some(error.to_string());
+            }
+        }
+        receipt.reembedded = updated;
+        receipt.remaining = self.local_projection_lag();
+        receipt.records_after = self.records.len();
+        receipt
+    }
+
+    /// One repair batch for callers that share the memory behind a mutex: the
+    /// lock is held to plan and to apply, never while the embedding server
+    /// answers.
+    pub fn repair_shared(memory: &Mutex<VectorMemory>, max_batch: usize) -> RepairReceipt {
+        let plan = memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .repair_plan(max_batch);
+        let outcome = plan.embed();
+        memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .repair_apply(plan, outcome)
+    }
+
     pub fn status(&self) -> Value {
         let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
         for record in &self.records {
@@ -2319,6 +2764,10 @@ impl VectorMemory {
             .count();
         json!({
             "enabled": self.config.enabled,
+            "storeHealth": match &self.store_error {
+                Some(error) => json!({"state": "unreadable", "code": LOCAL_STORE_UNREADABLE, "detail": error}),
+                None => json!({"state": "ok"}),
+            },
             "repoId": self.repo_id,
             "collection": self.config.collection,
             "records": self.records.len(),
@@ -2363,66 +2812,7 @@ impl VectorMemory {
         texts: &[String],
         prefix: &str,
     ) -> Result<Vec<Vec<f32>>, ToolError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let base_url = self.config.ollama_url.trim_end_matches('/');
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(self.config.embed_timeout_seconds))
-            .build();
-
-        // Ollama's current endpoint accepts a batch under `input` and returns
-        // `embeddings`.  Try it first, while retaining the older endpoint for
-        // installations that have not yet adopted `/api/embed`.
-        let modern_payload = embedding_request_payload(&self.config.embedding_model, texts, prefix);
-        let modern_error = match agent
-            .post(&format!("{base_url}/api/embed"))
-            .send_json(modern_payload)
-        {
-            Ok(response) => match response.into_json::<Value>() {
-                Ok(value) => {
-                    match parse_embedding_responses(
-                        &value,
-                        self.config.embedding_dimensions,
-                        texts.len(),
-                    ) {
-                        Ok(embeddings) => return Ok(embeddings),
-                        Err(error) => error,
-                    }
-                }
-                Err(error) => ToolError::Failed(error.to_string()),
-            },
-            // Only a server that does not know `/api/embed` gets the older
-            // per-text endpoint. A host that is down or slow would fail that
-            // one too, once per text, each with the full timeout.
-            Err(ureq::Error::Status(404, _)) => {
-                ToolError::Failed("/api/embed is not served (404)".into())
-            }
-            Err(error) => return Err(ToolError::Failed(error.to_string())),
-        };
-
-        let mut embeddings = Vec::with_capacity(texts.len());
-        for text in texts {
-            let prefixed = format!("{prefix}{text}");
-            let legacy_response = agent
-                .post(&format!("{base_url}/api/embeddings"))
-                .send_json(json!({
-                    "model": self.config.embedding_model,
-                    "prompt": prefixed
-                }))
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
-            let legacy_value: Value = legacy_response
-                .into_json()
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
-            let embedding = parse_embedding_response(&legacy_value, self.config.embedding_dimensions)
-                .map_err(|error| {
-                    ToolError::Failed(format!(
-                        "modern embedding request failed ({modern_error}); legacy response invalid ({error})"
-                    ))
-                })?;
-            embeddings.push(embedding);
-        }
-        Ok(embeddings)
+        embed_with_config(&self.config, texts, prefix)
     }
 
     /// Best-effort Qdrant upsert. Local persistence remains authoritative when
@@ -2636,9 +3026,10 @@ fn parse_embedding_vector(
     expected_dimensions: usize,
 ) -> Result<Vec<f32>, ToolError> {
     if vector.len() != expected_dimensions {
-        return Err(ToolError::Failed(
-            "embedding dimensions do not match configuration".into(),
-        ));
+        return Err(ToolError::Failed(format!(
+            "EMBEDDING_MISMATCH: the server returned {} dimensions; memory is configured for {expected_dimensions}",
+            vector.len()
+        )));
     }
     vector
         .iter()
