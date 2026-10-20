@@ -434,8 +434,20 @@ fn redact_structured_secrets(input: &str) -> String {
             .collect()
     });
     let mut output = input.to_string();
-    for (pattern, replacement) in passes {
-        output = pattern.replace_all(&output, *replacement).into_owned();
+    for (index, (pattern, replacement)) in passes.iter().enumerate() {
+        // A value an earlier pass already masked (`key=sk-[REDACTED]`) keeps
+        // its more specific marker. Header lines are always redacted whole.
+        output = pattern
+            .replace_all(&output, |caps: &regex::Captures| {
+                let whole = caps.get(0).map_or("", |m| m.as_str());
+                if index > 2 && whole.contains("[REDACTED") {
+                    return whole.to_string();
+                }
+                let mut expanded = String::new();
+                caps.expand(replacement, &mut expanded);
+                expanded
+            })
+            .into_owned();
     }
     output
 }

@@ -347,3 +347,11 @@ fn the_roster_activity_line_is_redacted_before_it_is_clipped() {
     assert!(!line.contains("abcdef"), "{line}");
     assert!(line.contains("API_KEY=[RED"), "{line}");
 }
+
+#[test]
+fn a_cookie_with_one_masked_value_is_still_masked_whole() {
+    use davinci_agent::runtime::worker_activity::safe_summary;
+    let out = safe_summary("Cookie: token=abc123secretvalue; sid=zzz999othersecret");
+    assert!(!out.contains("zzz999othersecret"), "{out}");
+    assert!(!out.contains("abc123secretvalue"), "{out}");
+}
