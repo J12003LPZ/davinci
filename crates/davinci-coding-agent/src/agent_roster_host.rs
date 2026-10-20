@@ -35,6 +35,17 @@ const PAGE: usize = 200;
 /// What the user is told when a message reaches a worker that already ended.
 pub(crate) const FINISHED_REASON: &str = "worker already finished; send a follow-up to main";
 
+/// A send that was accepted but not fully recorded, asked again under its id.
+struct Retry {
+    out: davinci_tui::davinci::roster::WorkerOutbound,
+    command_id: Uuid,
+    attempts: u32,
+    at: Instant,
+}
+
+const RETRY_AFTER: Duration = Duration::from_secs(1);
+const MAX_ATTEMPTS: u32 = 4;
+
 /// A finished probe: the worker it was for and the paths it found.
 type ProbeResult = (String, Vec<String>);
 
@@ -45,6 +56,7 @@ pub(crate) struct RosterHost {
     probed: Arc<Mutex<Option<ProbeResult>>>,
     /// Worktree path of each listed worker, for the probe.
     worktrees: HashMap<String, std::path::PathBuf>,
+    retries: Vec<Retry>,
 }
 
 impl RosterHost {
@@ -147,8 +159,40 @@ impl RosterHost {
     /// mailbox's own: nothing is called queued unless the mailbox holds it.
     fn deliver(&mut self, runtime: &RuntimeHandle, model: &mut Model) {
         for out in model.take_worker_outbox() {
-            let (state, reason, id) = send_to_worker(runtime, &out.agent_id, &out.text);
+            let command_id = Uuid::new_v4();
+            let (state, reason, id) = send_to_worker(runtime, &out.agent_id, &out.text, command_id);
             model.set_worker_receipt(&out.agent_id, out.local, id, &state, reason);
+            // Accepted but not fully recorded: ask again under the same id, so
+            // the answer comes from the mailbox and nothing is sent twice.
+            if state == "unknown" {
+                self.retries.push(Retry {
+                    out,
+                    command_id,
+                    attempts: 1,
+                    at: Instant::now(),
+                });
+            }
+        }
+        let due: Vec<Retry> = {
+            let (due, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retries)
+                .into_iter()
+                .partition(|retry| retry.at.elapsed() >= RETRY_AFTER);
+            self.retries = wait;
+            due
+        };
+        for mut retry in due {
+            let (state, reason, id) = send_to_worker(
+                runtime,
+                &retry.out.agent_id,
+                &retry.out.text,
+                retry.command_id,
+            );
+            model.set_worker_receipt(&retry.out.agent_id, retry.out.local, id, &state, reason);
+            retry.attempts += 1;
+            retry.at = Instant::now();
+            if state == "unknown" && retry.attempts < MAX_ATTEMPTS {
+                self.retries.push(retry);
+            }
         }
     }
 
@@ -222,6 +266,7 @@ pub(crate) fn send_to_worker(
     runtime: &RuntimeHandle,
     agent: &str,
     text: &str,
+    id: Uuid,
 ) -> (String, Option<String>, Option<String>) {
     let Ok(agent_id) = agent.parse::<AgentId>() else {
         return ("rejected".into(), Some("unknown_worker".into()), None);
@@ -239,7 +284,7 @@ pub(crate) fn send_to_worker(
     steer_command(
         runtime,
         WorkerControlCommand {
-            id: Uuid::new_v4(),
+            id,
             root_run_id: runtime.run_id,
             agent_id,
             generation: runtime.registry.get_generation(&agent_id),
@@ -262,6 +307,7 @@ pub(crate) fn steer_command(
     command: WorkerControlCommand,
 ) -> (String, Option<String>, Option<String>) {
     let controller = WorkerController::new(runtime.registry.clone());
+    let command_id = command.id;
     let message_id = command.id.to_string();
     match runtime.operations.clone() {
         // The journaled path: the intent is written before the mailbox takes
@@ -291,25 +337,47 @@ pub(crate) fn steer_command(
                         ("rejected".into(), Some("unexpected_receipt".into()), None)
                     }
                 },
-                // The journal could not prove the outcome: say so, and keep
-                // the id so the receipt can still follow the mailbox.
-                Err(ControlOperationError::RecoveryRequired) => (
+                // The mailbox took the message but the journal could not say
+                // so: it is accepted, its receipt is incomplete. Keep the id so
+                // a retry is answered from the mailbox instead of duplicating.
+                Err(ControlOperationError::AcceptedUnrecorded { message_id, reason }) => (
                     "unknown".into(),
-                    Some("recovery_required".into()),
-                    Some(message_id),
+                    Some(format!("accepted; receipt incomplete: {reason}")),
+                    Some(message_id.to_string()),
                 ),
+                // A resend of an id the journal cannot finish: the mailbox is
+                // the authority on whether it holds the message.
+                Err(ControlOperationError::RecoveryRequired) => {
+                    match runtime.mailbox.get_steering_receipt(&command_id) {
+                        Some(held) if held.state != "rejected" => (
+                            held.state,
+                            Some("journal incomplete".into()),
+                            Some(message_id),
+                        ),
+                        _ => (
+                            "unknown".into(),
+                            Some("recovery_required".into()),
+                            Some(message_id),
+                        ),
+                    }
+                }
+                // Nothing was accepted: the sender is told so.
                 Err(error) => (
                     "rejected".into(),
-                    Some(format!("not recorded: {error}")),
+                    Some(format!("not queued: {error}")),
                     None,
                 ),
             }
         }
         None => {
             let outcome = controller.execute_steer(&runtime.mailbox, command, true);
+            let reason = match &outcome.delivery_error {
+                Some(error) => Some(format!("not queued: {error}")),
+                None => outcome.reason(),
+            };
             (
                 outcome.state().to_string(),
-                outcome.reason(),
+                reason,
                 outcome
                     .steering
                     .as_ref()
@@ -560,7 +628,8 @@ mod tests {
         };
         let (rpc_state, _, rpc_id) = steer_command(&runtime, command);
         // What the view does.
-        let (view_state, _, view_id) = send_to_worker(&runtime, &worker.to_string(), "from tui");
+        let (view_state, _, view_id) =
+            send_to_worker(&runtime, &worker.to_string(), "from tui", Uuid::new_v4());
         assert_eq!(
             (rpc_state.as_str(), view_state.as_str()),
             ("queued", "queued")
@@ -593,5 +662,43 @@ mod tests {
         assert_ne!(stale, "queued", "{reason:?}");
         assert!(id.is_none());
         assert_eq!(runtime.mailbox.pending_count(&worker), 2);
+    }
+
+    struct FullDisk;
+
+    impl davinci_agent::runtime::RuntimeSubscriber for FullDisk {
+        fn on_event(
+            &self,
+            _event: &davinci_agent::runtime::RuntimeEventEnvelope,
+        ) -> davinci_agent::runtime::RuntimeDecision {
+            davinci_agent::runtime::RuntimeDecision::Continue
+        }
+
+        fn record_durably(
+            &self,
+            _event: &davinci_agent::runtime::RuntimeEventEnvelope,
+        ) -> Result<(), String> {
+            Err("runtime log append failed: no space left on device".into())
+        }
+    }
+
+    #[test]
+    fn a_failed_log_write_shows_not_queued_and_leaves_nothing_behind() {
+        for journaled in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let (runtime, worker) = fixture(journaled.then(|| workspace.path()));
+            runtime.bus.subscribe_session(Arc::new(FullDisk));
+            let mut model = model();
+            let mut host = RosterHost::default();
+            typed(&mut model, worker, "important change");
+            host.pump(&runtime, &mut model);
+            let view = &model.roster.views[&worker.to_string()];
+            let receipt = view.receipts.back().unwrap();
+            assert_eq!(receipt.state, "rejected", "journaled={journaled}");
+            let reason = receipt.reason.clone().unwrap_or_default();
+            assert!(reason.starts_with("not queued:"), "{reason}");
+            assert!(reason.contains("no space left"), "{reason}");
+            assert_eq!(runtime.mailbox.pending_count(&worker), 0);
+        }
     }
 }

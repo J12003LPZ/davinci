@@ -4,7 +4,7 @@
 
 use davinci_agent::runtime::session::RuntimeLogSubscriber;
 use davinci_agent::runtime::{
-    AgentId, AgentKind, AgentMailbox, AgentRecord, AgentState, RunId, RuntimeBus,
+    AgentId, AgentKind, AgentMailbox, AgentRecord, AgentState, MailboxError, RunId, RuntimeBus,
     RuntimeEventEnvelope, RuntimeRegistry,
 };
 use std::path::{Path, PathBuf};
@@ -240,4 +240,61 @@ fn different_session_never_consumes_queue() {
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].content, "for session a");
     assert!(after.mailbox.get_steering_receipt(&id_b).is_none());
+}
+
+/// A log that cannot be written: the disk is full, the file is read-only.
+struct FailingLog(std::sync::atomic::AtomicBool);
+
+impl davinci_agent::runtime::RuntimeSubscriber for FailingLog {
+    fn on_event(&self, _event: &RuntimeEventEnvelope) -> davinci_agent::runtime::RuntimeDecision {
+        davinci_agent::runtime::RuntimeDecision::Continue
+    }
+
+    fn record_durably(&self, _event: &RuntimeEventEnvelope) -> Result<(), String> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("runtime log append failed: no space left on device".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn a_message_the_log_could_not_keep_is_not_queued() {
+    let agent = AgentId::new();
+    let run = RunId::new();
+    let registry = RuntimeRegistry::new();
+    registry.register_agent(record(agent, run)).unwrap();
+    registry.transition(agent, AgentState::Running).unwrap();
+    let bus = RuntimeBus::new();
+    let log = Arc::new(FailingLog(std::sync::atomic::AtomicBool::new(true)));
+    bus.subscribe_session(log.clone());
+    let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+    let id = Uuid::new_v4();
+    let generation = registry.get_generation(&agent);
+
+    let error = mailbox
+        .send_steer_with_id(id, agent, generation, "do not lose me".into(), false)
+        .unwrap_err();
+    assert!(
+        matches!(error, MailboxError::NotRecorded(ref reason) if reason.contains("no space")),
+        "{error:?}"
+    );
+    assert_eq!(
+        mailbox.pending_count(&agent),
+        0,
+        "the queue was rolled back"
+    );
+    assert!(
+        mailbox.get_steering_receipt(&id).is_none(),
+        "no receipt claims it"
+    );
+
+    // The disk recovers; the same id can be sent again and is queued once.
+    log.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    let receipt = mailbox
+        .send_steer_with_id(id, agent, generation, "do not lose me".into(), false)
+        .unwrap();
+    assert_eq!(receipt.state, "queued");
+    assert_eq!(mailbox.pending_count(&agent), 1);
 }

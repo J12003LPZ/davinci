@@ -4558,7 +4558,11 @@ fn mid_turn_esc_in_a_worker_view_with_a_popup_only_closes_the_popup() {
     assert!(!mid_turn_key(&mut model, esc(), &abort));
     assert!(!abort.load(Ordering::Relaxed), "Esc interrupted main");
     assert!(model.suggestions.is_none());
-    assert_eq!(model.viewing_worker(), Some("w1"), "closing the popup stays put");
+    assert_eq!(
+        model.viewing_worker(),
+        Some("w1"),
+        "closing the popup stays put"
+    );
     assert_eq!(model.queued, vec!["later".to_string()]);
 
     // Next Esc goes back to main, still without touching the turn.

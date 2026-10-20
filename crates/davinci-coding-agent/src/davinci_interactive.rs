@@ -11296,6 +11296,7 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
                         runtime,
                         &id.to_string(),
                         &text.join(" "),
+                        uuid::Uuid::new_v4(),
                     );
                     if matches!(state.as_str(), "queued" | "delivered" | "applied") {
                         format!("sent to {name}")

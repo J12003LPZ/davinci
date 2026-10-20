@@ -103,6 +103,8 @@ pub enum MailboxError {
     },
     #[error("duplicate message id: {0}")]
     DuplicateMessage(Uuid),
+    #[error("the message could not be recorded: {0}")]
+    NotRecorded(String),
     #[error("failed to wake agent {0}: {1}")]
     WakeError(AgentId, String),
     #[error("mailbox queue full for agent {0}")]
@@ -147,6 +149,23 @@ impl AgentMailbox {
                 seq, run_id, None, agent, None, payload,
             ));
         }
+    }
+
+    /// Like `announce`, but the step must be kept: the caller undoes what it
+    /// did and tells the sender when it was not.
+    fn announce_durably(
+        &self,
+        run_id: RunId,
+        agent: Option<AgentId>,
+        payload: RuntimeEvent,
+    ) -> Result<(), String> {
+        let Some(bus) = &self.bus else {
+            return Ok(());
+        };
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        bus.emit_durable(RuntimeEventEnvelope::new(
+            seq, run_id, None, agent, None, payload,
+        ))
     }
 
     fn run_of(&self, agent_id: &AgentId) -> RunId {
@@ -529,7 +548,7 @@ impl AgentMailbox {
         // The acceptance is announced (and so written to the runtime log)
         // before the caller can show "queued": without this event a restart
         // forgot every steering message.
-        self.announce(
+        if let Err(reason) = self.announce_durably(
             run_id,
             None,
             RuntimeEvent::AgentMessageQueued {
@@ -537,7 +556,19 @@ impl AgentMailbox {
                 message_id: msg_id,
                 message: Some(msg),
             },
-        );
+        ) {
+            // Not written, so not accepted: take it back out, forget the
+            // receipt, and let the same id be sent again.
+            if let Ok(mut queues) = self.queues.write() {
+                if let Some(queue) = queues.get_mut(&to) {
+                    queue.retain(|queued| queued.id != msg_id);
+                }
+            }
+            if let Ok(mut receipts) = self.steering_receipts.write() {
+                receipts.remove(&msg_id);
+            }
+            return Err(MailboxError::NotRecorded(reason));
+        }
 
         Ok(receipt)
     }
@@ -688,57 +719,54 @@ impl AgentMailbox {
             return Vec::new();
         }
 
-        let _lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let drained: Vec<AgentMessage> = {
-            let Ok(mut queues) = self.queues.write() else {
-                return Vec::new();
+            // The queue and the receipts change under the lifecycle lock; the
+            // log write (an fsync, and any hooks) happens after it is released
+            // so a sender is never held up behind it.
+            let _lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let drained: Vec<AgentMessage> = {
+                let Ok(mut queues) = self.queues.write() else {
+                    return Vec::new();
+                };
+                if let Some(queue) = queues.get_mut(&agent_id) {
+                    let count = limit.min(queue.len());
+                    let mut items = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        if let Some(msg) = queue.pop_front() {
+                            items.push(msg);
+                        }
+                    }
+                    items
+                } else {
+                    Vec::new()
+                }
             };
-            if let Some(queue) = queues.get_mut(&agent_id) {
-                let count = limit.min(queue.len());
-                let mut items = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if let Some(msg) = queue.pop_front() {
-                        items.push(msg);
+            if let Ok(mut receipts) = self.steering_receipts.write() {
+                for msg in &drained {
+                    if let Some(r) = receipts.get_mut(&msg.id) {
+                        if r.state == "queued" {
+                            r.state = "delivered".to_string();
+                        }
                     }
                 }
-                items
-            } else {
-                Vec::new()
             }
+            drained
         };
 
-        // Announce delivery before the receipts say delivered, so no caller
-        // can apply a message whose delivery event has not been emitted.
-        if let Some(bus) = &self.bus {
-            for msg in &drained {
-                let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-                let envelope = RuntimeEventEnvelope::new(
-                    seq,
-                    msg.run_id,
-                    None,
-                    Some(agent_id),
-                    None,
-                    RuntimeEvent::AgentMessageDelivered {
-                        to: agent_id,
-                        message_id: msg.id,
-                    },
-                );
-                bus.emit_observe(envelope);
-            }
-        }
-
-        // Transition queued receipts to delivered
-        if let Ok(mut receipts) = self.steering_receipts.write() {
-            for msg in &drained {
-                if let Some(r) = receipts.get_mut(&msg.id) {
-                    if r.state == "queued" {
-                        r.state = "delivered".to_string();
-                    }
-                }
-            }
+        // Announced before this returns, so the caller cannot apply a message
+        // whose delivery has not been logged: only the drainer holds it yet.
+        for msg in &drained {
+            self.announce(
+                msg.run_id,
+                Some(agent_id),
+                RuntimeEvent::AgentMessageDelivered {
+                    to: agent_id,
+                    message_id: msg.id,
+                },
+            );
         }
 
         drained
