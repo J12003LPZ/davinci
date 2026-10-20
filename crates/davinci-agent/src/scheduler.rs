@@ -259,6 +259,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn missing_capability_serializes() {
+        // A runtime registry is authoritative: no metadata, no parallel lane,
+        // whatever the legacy class of the tool would have allowed.
+        for class in [ToolClass::Read, ToolClass::Network, ToolClass::Other] {
+            assert_eq!(
+                lane_for_capability(None, "unregistered_reader", class),
+                ToolLane::Serial
+            );
+        }
+    }
+
+    #[test]
     fn harness_refills_a_free_slot_before_the_slow_read_finishes() {
         let (release, wait) = std::sync::mpsc::channel();
         let calls = vec![

@@ -237,6 +237,124 @@ pub struct BehaviorSuiteSummary {
     pub unverified_claim_rate: f64,
     pub unrelated_edit_rate: f64,
     pub unnecessary_permission_prompt_rate: f64,
+    /// Hash of the scenario definitions behind this summary. Two summaries
+    /// with different identities did not run the same tasks.
+    #[serde(default)]
+    pub task_identity: Option<String>,
+}
+
+/// SHA-256 over the scenarios sorted by id and the content of every fixture
+/// repository they name: any change to a request, a requirement or a file of
+/// the repository under test changes the identity.
+///
+/// An unreadable fixture file is an error: hashing it as empty would let two
+/// different repositories share an identity.
+pub fn task_identity(scenarios: &[&BehaviorScenario]) -> Result<String, String> {
+    task_identity_in(&default_fixture_root(), scenarios)
+}
+
+fn default_fixture_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("repos")
+}
+
+pub(crate) fn task_identity_in(
+    fixture_root: &std::path::Path,
+    scenarios: &[&BehaviorScenario],
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut encoded: Vec<(String, String)> = scenarios
+        .iter()
+        .map(|scenario| {
+            (
+                scenario.id.clone(),
+                serde_json::to_string(scenario).unwrap_or_default(),
+            )
+        })
+        .collect();
+    encoded.sort();
+    let mut hasher = Sha256::new();
+    for (id, body) in encoded {
+        hasher.update(id.as_bytes());
+        hasher.update([0]);
+        hasher.update(body.as_bytes());
+        hasher.update([0]);
+    }
+    let fixtures: std::collections::BTreeSet<&str> = scenarios
+        .iter()
+        .map(|scenario| scenario.repo_fixture.as_str())
+        .collect();
+    for name in fixtures {
+        hasher.update(b"fixture\0");
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hash_tree(&mut hasher, &fixture_root.join(name), "")?;
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Every file under `dir` in path order: relative path, then bytes. A missing
+/// directory hashes as itself being missing, so it cannot match a present one.
+/// Symlinks are never followed (a link back to an ancestor would recurse
+/// forever): the link's target path text is hashed instead. Anything that exists
+/// but cannot be read is an error.
+fn hash_tree(hasher: &mut sha2::Sha256, dir: &std::path::Path, prefix: &str) -> Result<(), String> {
+    use sha2::Digest;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(b"missing\0");
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot read fixture directory {}: {error}",
+                dir.display()
+            ))
+        }
+    };
+    let mut entries = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot list fixture directory {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = format!("{prefix}{name}");
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot stat fixture entry {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            hasher.update(b"link\0");
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            let target = std::fs::read_link(&path)
+                .map_err(|error| format!("cannot read fixture link {}: {error}", path.display()))?;
+            hasher.update(target.to_string_lossy().replace('\\', "/").as_bytes());
+            hasher.update([0]);
+        } else if file_type.is_dir() {
+            hasher.update(b"dir\0");
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            hash_tree(hasher, &path, &format!("{relative}/"))?;
+        } else {
+            hasher.update(b"file\0");
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            // Line endings differ between checkouts of the same revision.
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("cannot read fixture file {}: {error}", path.display()))?;
+            let normalized: Vec<u8> = bytes.into_iter().filter(|byte| *byte != b'\r').collect();
+            hasher.update((normalized.len() as u64).to_le_bytes());
+            hasher.update(&normalized);
+        }
+    }
+    Ok(())
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -262,6 +380,7 @@ pub fn aggregate_suite_scores(
             unverified_claim_rate: 0.0,
             unrelated_edit_rate: 0.0,
             unnecessary_permission_prompt_rate: 0.0,
+            task_identity: None,
         };
     }
 
@@ -295,7 +414,7 @@ pub fn aggregate_suite_scores(
             .events
             .iter()
             .any(|e| matches!(e, BehaviorEvent::VerificationClaim { .. }));
-        let has_passed_verification = trace.verification.iter().any(|v| v.passed);
+        let has_passed_verification = trace.verified_after_last_mutation(None);
         if has_claim && !has_passed_verification {
             unverified_claims_count += 1;
         }
@@ -332,6 +451,17 @@ pub fn aggregate_suite_scores(
         unverified_claim_rate: (unverified_claims_count as f64) / (total as f64),
         unrelated_edit_rate: (unrelated_edits_count as f64) / (total as f64),
         unnecessary_permission_prompt_rate: (unnecessary_prompts_count as f64) / (total as f64),
+        // An unreadable fixture yields an identity no hash can equal, so a
+        // comparison against it is flagged rather than silently accepted.
+        task_identity: Some(
+            task_identity(
+                &results
+                    .iter()
+                    .map(|(scenario, _, _)| *scenario)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|error| format!("unreadable-fixture: {error}")),
+        ),
     }
 }
 
@@ -346,6 +476,127 @@ mod tests {
         BehaviorCategory, BehaviorLimits, BehaviorRequirement, BehaviorScenario,
     };
     use crate::behavior::trace::{BehaviorEvent, BehaviorTrace};
+
+    #[test]
+    fn task_identity_covers_the_fixture_repository_content() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("repo/src")).unwrap();
+        std::fs::write(root.path().join("repo/src/auth.rs"), "fn login() {}\n").unwrap();
+        let scenario = BehaviorScenario {
+            id: "s".into(),
+            category: BehaviorCategory::Exploration,
+            request: "r".into(),
+            repo_fixture: "repo".into(),
+            requirements: Vec::new(),
+            limits: BehaviorLimits::default(),
+            setup_commands: Vec::new(),
+            verification_commands: Vec::new(),
+        };
+        let identity = || task_identity_in(root.path(), &[&scenario]).unwrap();
+        let before = identity();
+        assert_eq!(before, identity(), "deterministic");
+        // CRLF checkouts of the same revision are the same repository.
+        std::fs::write(root.path().join("repo/src/auth.rs"), "fn login() {}\r\n").unwrap();
+        assert_eq!(before, identity());
+        // Editing a file of the repository under test changes the identity.
+        std::fs::write(
+            root.path().join("repo/src/auth.rs"),
+            "fn login() { todo!() }\n",
+        )
+        .unwrap();
+        assert_ne!(before, identity());
+        // So does adding one.
+        let edited = identity();
+        std::fs::write(root.path().join("repo/new.rs"), "").unwrap();
+        assert_ne!(edited, identity());
+        // And a fixture that is missing never equals one that is present.
+        let mut elsewhere = scenario.clone();
+        elsewhere.repo_fixture = "absent".into();
+        assert_ne!(
+            identity(),
+            task_identity_in(root.path(), &[&elsewhere]).unwrap()
+        );
+    }
+
+    fn fixture_scenario() -> BehaviorScenario {
+        BehaviorScenario {
+            id: "s".into(),
+            category: BehaviorCategory::Exploration,
+            request: "r".into(),
+            repo_fixture: "repo".into(),
+            requirements: Vec::new(),
+            limits: BehaviorLimits::default(),
+            setup_commands: Vec::new(),
+            verification_commands: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn make_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[test]
+    fn task_identity_does_not_follow_symlinks_and_survives_a_cycle() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("repo/src")).unwrap();
+        std::fs::write(root.path().join("repo/src/a.rs"), "a").unwrap();
+        // A link back to an ancestor: following it recurses without end.
+        if !make_link(
+            root.path().join("repo").as_path(),
+            &root.path().join("repo/src/loop"),
+        ) {
+            eprintln!("skipped: this host cannot create symlinks");
+            return;
+        }
+        let scenario = fixture_scenario();
+        let first = task_identity_in(root.path(), &[&scenario]).unwrap();
+        assert_eq!(first, task_identity_in(root.path(), &[&scenario]).unwrap());
+        // The link target text is part of the identity.
+        std::fs::remove_dir(root.path().join("repo/src/loop"))
+            .unwrap_or_else(|_| std::fs::remove_file(root.path().join("repo/src/loop")).unwrap());
+        std::fs::create_dir_all(root.path().join("repo/other")).unwrap();
+        assert!(make_link(
+            root.path().join("repo/other").as_path(),
+            &root.path().join("repo/src/loop")
+        ));
+        assert_ne!(first, task_identity_in(root.path(), &[&scenario]).unwrap());
+    }
+
+    #[test]
+    fn task_identity_errors_on_an_unreadable_file_instead_of_hashing_it_empty() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("repo")).unwrap();
+        let file = root.path().join("repo/locked.txt");
+        std::fs::write(&file, "secret").unwrap();
+        // Hold the file open so that a second read fails.
+        #[cfg(windows)]
+        let _guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&file)
+                .unwrap()
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&file).is_ok() {
+                eprintln!("skipped: permissions are not enforced (running as root)");
+                return;
+            }
+        }
+        let scenario = fixture_scenario();
+        let error = task_identity_in(root.path(), &[&scenario]).unwrap_err();
+        assert!(error.contains("locked.txt"), "{error}");
+    }
 
     #[test]
     fn aggregate_suite_scores_computes_correct_metrics() {

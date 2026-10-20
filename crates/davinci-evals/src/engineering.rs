@@ -783,15 +783,14 @@ fn behavior_trace_metrics(
     metrics
 }
 
-fn token_metric(value: u64, name: &str) -> MetricReceipt {
-    if value == 0 {
-        MetricReceipt::missing(
+fn token_metric(value: Option<u64>, name: &str) -> MetricReceipt {
+    match value {
+        Some(value) => MetricReceipt::observed(value as f64, "tokens", "behavior_trace.stats"),
+        None => MetricReceipt::missing(
             "tokens",
             "behavior_trace.stats",
             format!("{name} usage was not emitted"),
-        )
-    } else {
-        MetricReceipt::observed(value as f64, "tokens", "behavior_trace.stats")
+        ),
     }
 }
 

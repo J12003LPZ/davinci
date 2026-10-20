@@ -58,6 +58,11 @@ struct TokenCounts {
     cache_write: u64,
     /// Set once a usage object carried `cache_creation_input_tokens`.
     cache_write_reported: bool,
+    /// Set once any usage object carried the count. A count never reported is
+    /// unknown, not zero.
+    input_reported: bool,
+    output_reported: bool,
+    cache_read_reported: bool,
     reasoning: Option<u64>,
 }
 
@@ -124,6 +129,9 @@ impl AnthropicDecoder {
             cache_read: count(&usage, "cache_read_input_tokens").unwrap_or(0),
             cache_write: count(&usage, "cache_creation_input_tokens").unwrap_or(0),
             cache_write_reported: count(&usage, "cache_creation_input_tokens").is_some(),
+            input_reported: count(&usage, "input_tokens").is_some(),
+            output_reported: count(&usage, "output_tokens").is_some(),
+            cache_read_reported: count(&usage, "cache_read_input_tokens").is_some(),
             reasoning: None,
         };
         self.recompute_usage();
@@ -142,6 +150,9 @@ impl AnthropicDecoder {
         );
         usage.reasoning = counts.reasoning;
         usage.cache_write_unreported = !counts.cache_write_reported;
+        usage.input_unreported = !counts.input_reported;
+        usage.output_unreported = !counts.output_reported;
+        usage.cache_read_unreported = !counts.cache_read_reported;
         self.message.usage = Some(usage);
     }
 
@@ -371,12 +382,15 @@ impl AnthropicDecoder {
         if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
             if let Some(input) = count(usage, "input_tokens") {
                 self.counts.input = input;
+                self.counts.input_reported = true;
             }
             if let Some(output) = count(usage, "output_tokens") {
                 self.counts.output = output;
+                self.counts.output_reported = true;
             }
             if let Some(cache_read) = count(usage, "cache_read_input_tokens") {
                 self.counts.cache_read = cache_read;
+                self.counts.cache_read_reported = true;
             }
             if let Some(cache_write) = count(usage, "cache_creation_input_tokens") {
                 self.counts.cache_write = cache_write;

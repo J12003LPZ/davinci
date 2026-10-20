@@ -130,6 +130,8 @@ pub fn persist_eval_artifact_references(
     Ok(references)
 }
 
+/// Writes the trace and prompt manifest through `ArtifactRoot`, the one writer
+/// that strips credential-shaped strings before anything reaches disk.
 pub fn persist_behavior_trace_artifacts(
     run_directory: &Path,
     scenario_id: &str,
@@ -137,17 +139,14 @@ pub fn persist_behavior_trace_artifacts(
 ) -> Result<(PathBuf, Option<PathBuf>), String> {
     let scenario_dir = run_directory.join(scenario_id);
     std::fs::create_dir_all(&scenario_dir).map_err(|err| err.to_string())?;
+    let writer = crate::behavior::ArtifactRoot::new(&scenario_dir);
 
+    writer.write_json("behavior-trace.json", trace)?;
     let trace_path = scenario_dir.join("behavior-trace.json");
-    let trace_json = serde_json::to_string_pretty(trace).map_err(|err| err.to_string())?;
-    std::fs::write(&trace_path, trace_json).map_err(|err| err.to_string())?;
 
     let manifest_path = if let Some(manifest) = &trace.prompt_manifest {
-        let p = scenario_dir.join("prompt-manifest.json");
-        let manifest_json =
-            serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
-        std::fs::write(&p, manifest_json).map_err(|err| err.to_string())?;
-        Some(p)
+        writer.write_json("prompt-manifest.json", manifest)?;
+        Some(scenario_dir.join("prompt-manifest.json"))
     } else {
         None
     };

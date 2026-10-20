@@ -579,6 +579,24 @@ impl Fixture {
             .unwrap()
     }
 
+    /// The assistant message that issued a call. Production persists it before
+    /// the call is dispatched, so any journaled call has one in the session.
+    fn persist_call(&self, call_id: &str, tool: &str, arguments: &Value) {
+        let call = ChatMessage {
+            role: "assistant".into(),
+            content: vec![davinci_ai::MessageContent::ToolCall {
+                id: call_id.into(),
+                name: tool.into(),
+                arguments: arguments.clone(),
+            }],
+            ..ChatMessage::default()
+        };
+        let mut session = JsonlSession::open(&self.session_path).unwrap();
+        let mut entry = SessionEntry::message("assistant", Value::Null);
+        entry.message = Some(serde_json::to_value(call).unwrap());
+        session.append_entry(entry).unwrap();
+    }
+
     fn complete_provider_call(
         &self,
         call_id: &str,
@@ -841,9 +859,41 @@ fn result_transition_and_session_outbox_are_atomic() {
 }
 
 #[test]
+fn replayed_result_without_its_call_in_history_is_withheld_from_the_provider() {
+    // The journal holds a result whose assistant message the session does not
+    // have (a host-run command, or a damaged session). Replaying it alone
+    // would send an unpaired history, so it is withheld, and the session keeps
+    // working.
+    let fixture = Fixture::new();
+    fixture.complete_provider_call(
+        "lost-call",
+        "read",
+        &json!({"path": "output.txt"}),
+        &rich_result(false),
+    );
+    let mut agent = fixture.agent();
+    let mut requests = 0;
+    agent
+        .run_loop(|agent| {
+            requests += 1;
+            assert!(
+                !agent
+                    .messages
+                    .iter()
+                    .any(|message| message.tool_call_id.as_deref() == Some("lost-call")),
+                "an unpaired result reached the provider"
+            );
+            Ok(done_response())
+        })
+        .unwrap();
+    assert_eq!(requests, 1);
+}
+
+#[test]
 fn reopening_a_session_replays_pending_result_before_provider_continuation() {
     let fixture = Fixture::new();
     let raw = rich_result(false);
+    fixture.persist_call("recover-call", "read", &json!({"path": "output.txt"}));
     let attempt_id = fixture.complete_provider_call(
         "recover-call",
         "read",
@@ -898,6 +948,20 @@ fn append_before_ack_crash_is_deduplicated_and_acknowledged_after_reopen() {
     );
     let (ready, outbox_id) = fixture.ready_for(attempt_id);
     let mut session = JsonlSession::open(&fixture.session_path).unwrap();
+    // The assistant message is persisted before the call is dispatched, so a
+    // crash after the result append still leaves the call in the history.
+    let call = ChatMessage {
+        role: "assistant".into(),
+        content: vec![davinci_ai::MessageContent::ToolCall {
+            id: "append-crash-call".into(),
+            name: "write".into(),
+            arguments: json!({"path": "output.txt", "content": "saved"}),
+        }],
+        ..ChatMessage::default()
+    };
+    let mut call_entry = SessionEntry::message("assistant", Value::Null);
+    call_entry.message = Some(serde_json::to_value(call).unwrap());
+    session.append_entry(call_entry).unwrap();
     let entry = projection_entry(&ready, &raw, false);
     let parent = session.leaf_id.clone();
     session
@@ -1065,6 +1129,11 @@ fn duplicate_batch_child_publication_is_acknowledged_without_a_second_entry() {
         None,
     )
     .unwrap();
+    fixture.persist_call(
+        "batch-parent-call",
+        "batch",
+        &json!({"operations": [{"tool": "read", "args": {"path": "child.txt"}}]}),
+    );
     let parent = fixture.admit_and_start(parent_plan);
     let child_plan = fixture.batch_child_plan(&parent.spec);
     let child = fixture.admit_and_start(child_plan);

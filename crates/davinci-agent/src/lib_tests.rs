@@ -2980,6 +2980,190 @@ fn shell_edits_invalidate_an_earlier_check_generation() {
 }
 
 #[test]
+fn resumed_session_keeps_unverified_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent
+        .load_from_session(JsonlSession::create(sessions.path(), "mutation", None).unwrap())
+        .unwrap();
+    agent.cwd = dir.path().to_path_buf();
+    agent.prompt("edit a file and stop");
+    agent
+        .run_loop(scripted_tool_calls(vec![(
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        )]))
+        .unwrap();
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let path = agent.session.as_ref().unwrap().path.clone();
+    drop(agent);
+
+    // A new process: nothing is in memory but the session file.
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    resumed.cwd = dir.path().to_path_buf();
+    let state = resumed.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 1);
+    assert_eq!(state.mutation_paths, vec![PathBuf::from("a.txt")]);
+    assert_eq!(
+        resumed.completion_evidence(),
+        CompletionEvidence::Unverified
+    );
+}
+
+#[test]
+fn sessions_saved_with_the_old_visible_set_still_restore_discovered_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let probe = verifying_agent(dir.path());
+    let initial = probe
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .visible_names()
+        .clone();
+    let deferred = probe
+        .tools
+        .iter()
+        .find(|name| !initial.contains(*name))
+        .cloned()
+        .expect("a tool that starts deferred");
+    drop(probe);
+    // The earlier format stored the whole visible set: host-initial tools
+    // plus anything discovered, and whatever else had been visible.
+    let mut visible: Vec<String> = initial.iter().cloned().collect();
+    visible.push(deferred.clone());
+    visible.push("tool_that_no_longer_exists".into());
+    let mut session = JsonlSession::create(sessions.path(), "old-exposure", None).unwrap();
+    let mut extra = serde_json::Map::new();
+    extra.insert("data".into(), serde_json::json!({ "visible": visible }));
+    session
+        .append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some("tool_exposure".into()),
+            extra,
+        })
+        .unwrap();
+    let path = session.path.clone();
+    drop(session);
+
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    let exposure = resumed.tool_context.tool_exposure.lock().unwrap();
+    assert!(
+        exposure.is_visible(&deferred),
+        "the discovered tool returns"
+    );
+    assert!(
+        !exposure.is_visible("tool_that_no_longer_exists"),
+        "authorization is re-checked, never trusted from the file"
+    );
+    assert!(exposure.discovered_names().contains(&deferred));
+    assert!(
+        !initial
+            .iter()
+            .any(|name| exposure.discovered_names().contains(name)),
+        "host-initial tools are not counted as discovered"
+    );
+}
+
+#[test]
+fn unreadable_mutation_state_fails_closed_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut session = JsonlSession::create(sessions.path(), "corrupt", None).unwrap();
+    let mut extra = serde_json::Map::new();
+    // Valid JSON of the wrong shape: schema drift or a hand edit.
+    extra.insert(
+        "data".into(),
+        serde_json::json!({"mutation_generation": "three"}),
+    );
+    session
+        .append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some("mutation_verification".into()),
+            extra,
+        })
+        .unwrap();
+    let path = session.path.clone();
+    drop(session);
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    // Not "nothing happened": an edit may be pending and nothing verified it.
+    assert_eq!(
+        resumed.completion_evidence(),
+        CompletionEvidence::Unverified
+    );
+    assert!(resumed.mutation_verification_state().unknown_mutation_paths);
+}
+
+#[test]
+fn last_mutation_generation_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent
+        .load_from_session(JsonlSession::create(sessions.path(), "fold", None).unwrap())
+        .unwrap();
+    agent.cwd = dir.path().to_path_buf();
+    agent.compaction.keep_recent_tokens = 1;
+    agent.summarizer = Some(Summarizer::new(|_| {
+        Ok(SummarizeResponse {
+            text: "Lossy summary that says nothing about edits.".into(),
+            usage: Default::default(),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.prompt(&format!("edit a file and stop {}", "x".repeat(400)));
+    agent
+        .run_loop(scripted_tool_calls(vec![(
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        )]))
+        .unwrap();
+    for turn in 0..4 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("answer {turn} {}", "y".repeat(400)));
+    }
+    assert!(agent.compact(None).compacted, "the fold must happen");
+    let before = agent.mutation_verification_state();
+    assert_eq!(before.mutation_generation, 1);
+    let path = agent.session.as_ref().unwrap().path.clone();
+    drop(agent);
+
+    let mut resumed = verifying_agent(dir.path());
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    assert_eq!(resumed.mutation_verification_state(), before);
+    assert_eq!(
+        resumed.completion_evidence(),
+        CompletionEvidence::Unverified
+    );
+}
+
+#[test]
 fn source_edits_during_a_passing_check_cannot_verify_the_new_generation() {
     let dir = tempfile::tempdir().unwrap();
     let agent = verifying_agent(dir.path());
@@ -4300,6 +4484,92 @@ fn harness_rerun_respects_permission_denial() {
 }
 
 #[test]
+fn failed_command_retains_exit_status_and_relevant_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("run the failing command");
+    let mut script = scripted_tool_calls(vec![(
+        shell_tool(),
+        serde_json::json!({"command":"python -c \"import sys; print('widget 7 is missing'); sys.exit(3)\""}),
+    )]);
+    // What the provider is actually sent on each request.
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = requests.clone();
+    agent
+        .run_loop(move |current| {
+            let wire = current
+                .messages_for_provider()
+                .iter()
+                .filter(|message| message.role == "toolResult")
+                .map(|message| content_text(&message.content))
+                .collect::<Vec<_>>()
+                .join(
+                    "
+---
+",
+                );
+            seen.lock().unwrap().push(wire);
+            script(current)
+        })
+        .unwrap();
+    let requests = requests.lock().unwrap();
+    let last = requests.last().expect("a request followed the tool result");
+    // The output that matters and the exit status both reach the model.
+    assert!(last.contains("widget 7 is missing"), "{last}");
+    let result = agent
+        .messages
+        .iter()
+        .find(|message| message.role == "toolResult")
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let exit_code = result
+        .extra
+        .get("details")
+        .and_then(|details| details.get("exitCode"))
+        .and_then(serde_json::Value::as_i64)
+        .expect("the exit status stays in the tool result details");
+    assert_ne!(exit_code, 0);
+    assert!(
+        last.trim_end()
+            .ends_with(&format!("Command exited with code {exit_code}")),
+        "{last}"
+    );
+}
+
+#[test]
+fn permission_denied_never_auto_retries_privileged_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = asked.clone();
+    agent.approver = Some(ToolApprover(Arc::new(move |_| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ToolApprovalDecision::Deny
+    })));
+    agent.prompt("publish the release");
+    let marker = dir.path().join("published.txt");
+    let command = format!(
+        "python -c \"open(r'{}', 'w').write('x')\"",
+        marker.display()
+    );
+    agent
+        .run_loop(scripted_tool_calls(vec![(
+            shell_tool(),
+            serde_json::json!({ "command": command }),
+        )]))
+        .unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!marker.exists(), "a denied tool must not run, now or later");
+    let denied: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|message| message.role == "toolResult")
+        .collect();
+    assert_eq!(denied.len(), 1);
+    assert!(content_text(&denied[0].content).contains("Permission denied"));
+}
+
+#[test]
 fn harness_rerun_preserves_context_and_stops_on_cancellation() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let original = tempfile::tempdir().unwrap();
@@ -5014,4 +5284,103 @@ fn failed_auto_compaction_with_headroom_still_sends_the_request() {
         Err::<crate::CompleteOutput, String>("stop here".into())
     });
     assert!(dispatched, "headroom left: the turn proceeds");
+}
+
+#[test]
+fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent
+        .load_from_session(JsonlSession::create(sessions.path(), "tree", None).unwrap())
+        .unwrap();
+    agent.prompt("start");
+    agent.record_assistant("first answer");
+    let fork = agent
+        .session
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.entry_type == "message"
+                && entry
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.get("role"))
+                    .and_then(|role| role.as_str())
+                    == Some("assistant")
+        })
+        .map(|entry| entry.id.clone())
+        .expect("an assistant entry to fork from");
+    let initial = agent
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .visible_names()
+        .clone();
+    let deferred = agent
+        .tools
+        .iter()
+        .find(|name| !initial.contains(*name))
+        .cloned()
+        .expect("a tool that starts deferred");
+
+    // Work done after the fork: an unverified edit and a discovered tool.
+    agent.prompt("edit a file");
+    agent.record_assistant("second answer");
+    std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.txt")]);
+    agent
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .activate_authorized(&deferred, true);
+    agent.persist_mutation_verification();
+    agent.persist_tool_exposure();
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+    assert!(agent
+        .tool_context
+        .tool_exposure
+        .lock()
+        .unwrap()
+        .discovered_names()
+        .contains(&deferred));
+
+    // Back to the fork: that branch never saw the edit or the tool.
+    agent
+        .navigate_tree_entry(&fork, false, None, false, 16_384)
+        .unwrap();
+    assert_eq!(
+        agent.mutation_verification_state(),
+        MutationVerificationState::default(),
+        "the abandoned branch's edit is still live"
+    );
+    assert!(
+        !agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap()
+            .discovered_names()
+            .contains(&deferred),
+        "the abandoned branch's discovered tool is still exposed"
+    );
+    // Nothing from the other branch is written onto this one.
+    let customs = |agent: &Agent| {
+        agent
+            .session
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| entry.entry_type == "custom")
+            .count()
+    };
+    let before = customs(&agent);
+    agent.persist_mutation_verification();
+    agent.persist_tool_exposure();
+    assert_eq!(customs(&agent), before);
 }

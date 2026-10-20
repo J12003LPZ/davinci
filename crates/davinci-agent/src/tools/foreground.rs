@@ -428,7 +428,7 @@ mod tests {
         .unwrap();
         assert!(result.is_error);
         assert_eq!(result.details.unwrap()["exitCode"], 7);
-        assert_eq!(result.content, "out\nerr");
+        assert_eq!(result.content, "out\nerr\nCommand exited with code 7");
         let receipt = receipt
             .take()
             .expect("supervised output must produce a receipt");
