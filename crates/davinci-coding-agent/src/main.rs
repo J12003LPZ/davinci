@@ -1301,6 +1301,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
     }
     let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
+    // The host guessed trust without `--approve`; settle it now, before any
+    // memory is used or any recovery thread starts.
+    host.set_project_trusted(project_trusted_for_sandbox);
     startup_mark("extensions loaded");
     let language_owner = {
         let native = host

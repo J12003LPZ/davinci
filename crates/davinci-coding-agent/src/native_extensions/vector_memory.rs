@@ -4,6 +4,10 @@
 //! lexical fallback and network failures are deliberately fail-open so memory
 //! cannot make an otherwise healthy agent turn fail.
 
+use super::memory_backends::{
+    MemoryProjectionBackend, ProjectionConfig, ProjectionError, ProjectionPoint,
+    ProjectionRepairReceipt, ProjectionRuntime, Secret, QDRANT_OFFLINE, QDRANT_REFUSED,
+};
 use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
 use davinci_agent::runtime::events::AgentKind;
 use davinci_agent::{ToolError, ToolResult};
@@ -87,6 +91,9 @@ pub struct VectorMemoryConfig {
     pub extraction_timeout_seconds: u64,
     #[serde(default = "default_true")]
     pub promotion: bool,
+    /// The optional remote projection. `Local` unless chosen.
+    #[serde(default)]
+    pub projection: ProjectionConfig,
 }
 
 fn default_true() -> bool {
@@ -155,11 +162,19 @@ impl Default for VectorMemoryConfig {
             embed_timeout_seconds: default_embed_timeout(),
             extraction_timeout_seconds: default_extraction_timeout(),
             promotion: true,
+            projection: ProjectionConfig::default(),
         }
     }
 }
 
 impl VectorMemoryConfig {
+    /// True when the environment pins the backend, whichever way.
+    pub fn env_sets_backend(get: &dyn Fn(&str) -> Option<String>) -> bool {
+        env_string(get, "PI_MEMORY_BACKEND")
+            .and_then(|word| MemoryProjectionBackend::parse(&word))
+            .is_some()
+    }
+
     pub fn from_env() -> Self {
         let mut config = Self::default();
         config.apply_env_with(&process_env);
@@ -226,6 +241,9 @@ impl VectorMemoryConfig {
         ("PI_MEMORY_MAX_INJECTED_TOKENS", "maxInjectedTokens"),
         ("PI_MEMORY_MINIMUM_SCORE", "minimumScore"),
         ("PI_MEMORY_PROMOTION", "promotion"),
+        ("PI_MEMORY_BACKEND", "projection.backend"),
+        ("PI_MEMORY_QDRANT_API_KEY", "projection.apiKey"),
+        ("PI_MEMORY_QDRANT_ALLOW_REMOTE", "projection.allowRemote"),
     ];
 
     fn apply_env_with(&mut self, get: &dyn Fn(&str) -> Option<String>) {
@@ -274,6 +292,17 @@ impl VectorMemoryConfig {
         }
         if let Some(value) = env_bool(get, "PI_MEMORY_PROMOTION") {
             config.promotion = value;
+        }
+        if let Some(value) = env_string(get, "PI_MEMORY_BACKEND")
+            .and_then(|word| MemoryProjectionBackend::parse(&word))
+        {
+            config.projection.backend = value;
+        }
+        if let Some(value) = env_string(get, "PI_MEMORY_QDRANT_API_KEY").and_then(Secret::new) {
+            config.projection.api_key = Some(value);
+        }
+        if let Some(value) = env_bool(get, "PI_MEMORY_QDRANT_ALLOW_REMOTE") {
+            config.projection.allow_remote = value;
         }
     }
 }
@@ -1300,7 +1329,24 @@ impl ContextSource for MemoryContextSource {
                 request.memory_scope.as_deref(),
             ),
         };
+        // A fallback must be visible here too, not only in the explicit tool:
+        // while the remote copy is down or refused, say once that these came
+        // from local search. Always `None` for the default local backend.
+        let fallback = memory.projection.health(&memory.config).code;
+        let mut note_pending = !hits.is_empty() && fallback.is_some();
         hits.into_iter()
+            .map(|hit| {
+                let mut hit = hit;
+                if note_pending {
+                    note_pending = false;
+                    hit.text.push_str(&format!(
+                        "\n[{}] remote vector search is unavailable; memories came from local search.",
+                        fallback.unwrap_or(QDRANT_OFFLINE)
+                    ));
+                    hit.estimated_tokens += 24;
+                }
+                hit
+            })
             .map(|hit| ContextItem {
                 source: "vector_memory".to_string(),
                 content: hit.text,
@@ -1346,11 +1392,21 @@ pub struct VectorMemory {
     /// Set when an embedding request failed; dense retrieval and document
     /// embedding are skipped until it passes.
     dense_offline_until: Arc<Mutex<Option<Instant>>>,
+    /// The optional remote projection's client and outage state. Shared by
+    /// clones, like the dense backoff, so one failure is seen everywhere.
+    pub projection: Arc<ProjectionRuntime>,
     /// Why the record file could not be read, when it could not. While set,
     /// nothing is written to that file: the in-memory state is not the file's
     /// state, and rewriting from it would destroy what is there.
     store_error: Option<String>,
+    /// Whether the project folder is trusted. The store lives in the working
+    /// tree, so an untrusted folder's records are neither read nor written,
+    /// and nothing is sent to the remote projection.
+    project_trusted: bool,
 }
+
+/// What every memory entry point answers while the folder is not trusted.
+pub const MEMORY_UNTRUSTED: &str = "memory unavailable: project not trusted";
 
 /// Stable code for an existing record file that cannot be read (for example
 /// not UTF-8 or no access). The file is left exactly as it is.
@@ -1536,6 +1592,15 @@ impl VectorMemory {
     }
 
     pub fn with_config(cwd: PathBuf, config: VectorMemoryConfig) -> Self {
+        Self::with_config_for_project(cwd, config, true)
+    }
+
+    /// Like [`Self::with_config`], but an untrusted folder's store is not read.
+    pub fn with_config_for_project(
+        cwd: PathBuf,
+        config: VectorMemoryConfig,
+        project_trusted: bool,
+    ) -> Self {
         let repo_id = resolve_repo_id(&cwd);
         let mut memory = Self {
             config,
@@ -1550,12 +1615,42 @@ impl VectorMemory {
             last_indexed: 0,
             last_indexed_at: None,
             dense_offline_until: Arc::new(Mutex::new(None)),
+            projection: Arc::new(ProjectionRuntime::default()),
             store_error: None,
+            project_trusted,
         };
         // A failed read is kept (`store_error`), not discarded: it blocks
         // writes to that file and shows up in `status()`.
-        let _ = memory.load_local();
+        if project_trusted {
+            let _ = memory.load_local();
+        }
         memory
+    }
+
+    pub fn project_trusted(&self) -> bool {
+        self.project_trusted
+    }
+
+    /// Follow the folder's trust decision. Losing trust drops what was read
+    /// from the folder; gaining it reads the store.
+    pub fn set_project_trusted(&mut self, trusted: bool) {
+        if self.project_trusted == trusted {
+            return;
+        }
+        self.project_trusted = trusted;
+        if trusted {
+            let _ = self.load_local();
+        } else {
+            self.records.clear();
+            self.foreign_lines.clear();
+            self.tombstones.clear();
+            self.supersessions.clear();
+            self.provenances.clear();
+            self.known.clear();
+            self.last_indexed = 0;
+            self.last_indexed_at = None;
+            self.store_error = None;
+        }
     }
 
     pub fn store_health(&self) -> LocalStoreHealth {
@@ -1586,6 +1681,9 @@ impl VectorMemory {
     }
 
     fn load_local(&mut self) -> Result<(), ToolError> {
+        if !self.project_trusted {
+            return Err(ToolError::Failed(MEMORY_UNTRUSTED.into()));
+        }
         let path = self.local_path();
         let content = match fs::read(&path).map(String::from_utf8) {
             Ok(Ok(content)) => content,
@@ -1678,6 +1776,9 @@ impl VectorMemory {
     }
 
     fn persist_local_with(&mut self, merge: bool) -> Result<(), ToolError> {
+        if !self.project_trusted {
+            return Err(ToolError::Failed(MEMORY_UNTRUSTED.into()));
+        }
         if let Some(message) = &self.store_error {
             return Err(ToolError::Failed(message.clone()));
         }
@@ -2011,38 +2112,43 @@ impl VectorMemory {
         })
         .flatten();
 
-        let mut dense_ranked = query_embedding
-            .as_ref()
-            .map(|query_vector| {
-                let mut ranked = candidates
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, record)| {
-                        if !embedding_identity_compatible(
-                            record.embedding_identity.as_ref(),
-                            &embedding_identity,
-                        ) {
-                            return None;
-                        }
-                        let embedding = record.embedding.as_ref()?;
-                        if embedding.len() != query_vector.len() {
-                            return None;
-                        }
-                        let score = cosine_similarity(query_vector, embedding);
-                        (score > 0.0).then_some((index, score))
-                    })
-                    .collect::<Vec<_>>();
-                ranked.sort_by(|left, right| {
-                    right
-                        .1
-                        .partial_cmp(&left.1)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
-                });
-                ranked.truncate(candidate_limit);
-                ranked
-            })
-            .unwrap_or_default();
+        let remote_ranked = query_embedding.as_ref().and_then(|query_vector| {
+            self.remote_dense_ranked(query_vector, &candidates, candidate_limit)
+        });
+        let mut dense_ranked = remote_ranked.unwrap_or_else(|| {
+            query_embedding
+                .as_ref()
+                .map(|query_vector| {
+                    let mut ranked = candidates
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| {
+                            if !embedding_identity_compatible(
+                                record.embedding_identity.as_ref(),
+                                &embedding_identity,
+                            ) {
+                                return None;
+                            }
+                            let embedding = record.embedding.as_ref()?;
+                            if embedding.len() != query_vector.len() {
+                                return None;
+                            }
+                            let score = cosine_similarity(query_vector, embedding);
+                            (score > 0.0).then_some((index, score))
+                        })
+                        .collect::<Vec<_>>();
+                    ranked.sort_by(|left, right| {
+                        right
+                            .1
+                            .partial_cmp(&left.1)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
+                    });
+                    ranked.truncate(candidate_limit);
+                    ranked
+                })
+                .unwrap_or_default()
+        });
 
         #[derive(Default, Clone, Copy)]
         struct RankState {
@@ -2391,6 +2497,9 @@ impl VectorMemory {
     }
 
     pub fn search_tool(&self, args: &Value) -> Result<ToolResult, ToolError> {
+        if !self.project_trusted {
+            return Err(ToolError::Failed(MEMORY_UNTRUSTED.into()));
+        }
         let query = args
             .get("query")
             .and_then(Value::as_str)
@@ -2401,17 +2510,27 @@ impl VectorMemory {
             .map(|value| (value as usize).clamp(1, SEARCH_LIMIT_CAP))
             .unwrap_or(self.config.result_limit);
         let hits = without_embeddings(self.search(query, limit));
-        let content = hits
+        let mut content = hits
             .iter()
             .map(|hit| format!("[{:.2}] {}", hit.score, hit.record.text))
             .collect::<Vec<_>>()
             .join("\n");
+        let health = self.projection.health(&self.config);
+        if let Some(code) = health.code {
+            // Visible, not silent: the answer above came from the local index.
+            content.push_str(&format!(
+                "\n[{code}] remote vector search is unavailable; local search was used."
+            ));
+        }
         Ok(ToolResult {
             content,
             is_error: false,
-            details: Some(
-                json!({"vectorMemory": {"query": query, "count": hits.len(), "hits": hits}}),
-            ),
+            details: Some(json!({"vectorMemory": {
+                "query": query,
+                "count": hits.len(),
+                "hits": hits,
+                "projection": {"code": health.code, "detail": health.detail},
+            }})),
         })
     }
 
@@ -2468,7 +2587,11 @@ impl VectorMemory {
         } else {
             (0, None)
         };
+        let remote = self
+            .remote_projection_enabled()
+            .then(|| self.reconcile_remote(self.config.projection.batch_size));
         let mut status = self.status();
+        status["remoteReconcile"] = json!(remote);
         status["repairedIds"] = json!(repaired_ids);
         status["reembedded"] = json!(embedded);
         status["embeddingError"] = json!(embedding_error);
@@ -2516,21 +2639,122 @@ impl VectorMemory {
         // and only publish the cleared state after the atomic write succeeds.
         let mut cleared = self.clone();
         cleared.load_local()?;
+        // The remote copy goes with it, and a down remote must not keep it
+        // forever: write the marker before the clear is confirmed, so a restart
+        // still knows the remote has to be emptied. If it cannot be written,
+        // nothing changes and the caller is told.
+        if cleared.remote_projection_enabled() {
+            // Exactly what this clear removes: the ledger plus the local
+            // records. A clear that has to wait deletes these ids, not the
+            // namespace, so points another clone uploads later are kept.
+            let path = cleared.projection_state_path();
+            let collection = cleared.remote_collection_name();
+            let mut ids: std::collections::BTreeSet<String> = cleared
+                .projection
+                .synced_ids(&path, &collection)
+                .into_iter()
+                .collect();
+            ids.extend(
+                cleared
+                    .records
+                    .iter()
+                    .filter(|record| record.repo_id == cleared.repo_id)
+                    .map(|record| record.id.clone()),
+            );
+            cleared
+                .projection
+                .begin_clear(&path, &collection, &cleared.repo_id, ids.into_iter().collect())
+                .map_err(|error| {
+                    ToolError::Failed(format!(
+                        "memory not cleared: the pending remote clear could not be recorded: {error}"
+                    ))
+                })?;
+        }
         cleared.records.clear();
         cleared.known.clear();
         cleared.last_indexed = 0;
         cleared.last_indexed_at = None;
         // Clearing is deliberate: it must not fold other records back in.
         cleared.persist_local_with(false)?;
+        // Try the remote now. Down or refused, the marker stays and the next
+        // reconcile retries; only a successful delete removes it.
+        if cleared.remote_projection_enabled() {
+            if let Some(client) = cleared
+                .projection
+                .acquire(&cleared.config, &cleared.repo_id)
+            {
+                let outcome = client.clear_namespace(&cleared.repo_id);
+                if outcome.is_ok() {
+                    // If the file cannot record it, the marker stays and the
+                    // delete simply runs again later; status keeps showing it.
+                    let _ = cleared.projection.finish_clear(
+                        &cleared.projection_state_path(),
+                        &cleared.remote_collection_name(),
+                    );
+                }
+                cleared.projection.record(&cleared.config, outcome);
+            }
+        }
         *self = cleared;
         Ok(self.status())
     }
 
-    /// The selected Phase 3 projection is deliberately local. Remote write
-    /// amplification stays disabled until a filtered remote retrieval path
-    /// demonstrates the documented quality/latency break-even.
+    /// The single switch for every remote call. `Local` (the default) means
+    /// no Qdrant request is made anywhere; the bounded local index answers.
+    /// Why it stays the default until a measured break-even:
+    /// `docs/superpowers/plans/2026-09-15-memory-projection-decision.md`.
     pub fn remote_projection_enabled(&self) -> bool {
-        false
+        self.project_trusted && self.config.projection.backend == MemoryProjectionBackend::Qdrant
+    }
+
+    /// Dense ranking from the remote projection, as `(candidate index, score)`.
+    /// `None` means "rank locally": remote off, down, refused, or not able to
+    /// answer for these candidates. The remote returns ids and scores only;
+    /// they are resolved against the local candidates, which already exclude
+    /// tombstoned, superseded and out-of-scope records, so a stale remote point
+    /// cannot surface a memory the local store has retired.
+    fn remote_dense_ranked(
+        &self,
+        query_vector: &[f32],
+        candidates: &[&MemoryRecord],
+        candidate_limit: usize,
+    ) -> Option<Vec<(usize, f32)>> {
+        if query_vector.len() != self.config.embedding_dimensions
+            || candidates
+                .iter()
+                .any(|record| record.repo_id != self.repo_id)
+        {
+            return None;
+        }
+        let client = self.projection.acquire(&self.config, &self.repo_id)?;
+        // Over-fetch: scope and tombstone filtering happens here, after.
+        let fetch = (candidate_limit * 3).min(256);
+        match client.query(query_vector, &self.repo_id, fetch) {
+            Ok(hits) => {
+                self.projection.record(&self.config, Ok(()));
+                let by_id: std::collections::HashMap<&str, usize> = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| (record.id.as_str(), index))
+                    .collect();
+                let mut ranked: Vec<(usize, f32)> = hits
+                    .iter()
+                    .filter_map(|hit| by_id.get(hit.id.as_str()).map(|index| (*index, hit.score)))
+                    .filter(|(_, score)| *score > 0.0)
+                    .collect();
+                ranked.truncate(candidate_limit);
+                // An empty answer for a store that has vectors means the
+                // remote is stale or was wiped: let the local index answer.
+                if ranked.is_empty() && candidates.iter().any(|record| record.embedding.is_some()) {
+                    return None;
+                }
+                Some(ranked)
+            }
+            Err(error) => {
+                self.projection.record(&self.config, Err(error));
+                None
+            }
+        }
     }
 
     fn current_embedding_identity(&self) -> EmbeddingIdentity {
@@ -2778,8 +3002,18 @@ impl VectorMemory {
             "automaticRetrieval": self.config.automatic_retrieval,
             "denseAvailable": self.dense_available(),
             "projectionProfile": MEMORY_PROJECTION_PROFILE,
+            "projectTrusted": self.project_trusted,
             "remoteProjectionEnabled": self.remote_projection_enabled(),
+            "projectionBackend": self.config.projection.backend.name(),
+            "projection": {
+                "state": format!("{:?}", self.projection.health(&self.config).state).to_lowercase(),
+                "code": self.projection.health(&self.config).code,
+                "detail": self.projection.health(&self.config).detail,
+            },
             "projectionLag": self.local_projection_lag(),
+            "remoteProjectionLag": self.remote_projection_lag(),
+            "remoteClearPending": self.remote_clear_pending(),
+            "remoteCollection": self.remote_projection_enabled().then(|| self.remote_collection_name()),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
             "embeddingModel": self.config.embedding_model,
@@ -2818,33 +3052,387 @@ impl VectorMemory {
     /// Best-effort Qdrant upsert. Local persistence remains authoritative when
     /// the service is unavailable.
     pub fn upsert_remote(&self, records: &[MemoryRecord]) -> Result<(), ToolError> {
-        if records.is_empty() {
+        if !self.remote_projection_enabled() || records.is_empty() {
+            return Ok(());
+        }
+        // A clear still owed to the remote runs first: the clear would delete
+        // points written ahead of it, and the ledger would say they were kept.
+        if self.remote_clear_pending() {
+            let _ = self.reconcile_remote(self.config.projection.batch_size);
             return Ok(());
         }
         let points = records
             .iter()
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+            })
             .filter_map(|record| {
-                record
-                    .embedding
-                    .as_ref()
-                    .map(|vector| json!({"id": record.id, "vector": vector, "payload": record}))
+                record.embedding.as_ref().map(|vector| ProjectionPoint {
+                    id: record.id.clone(),
+                    vector: vector.clone(),
+                    repo_id: record.repo_id.clone(),
+                })
             })
             .collect::<Vec<_>>();
         if points.is_empty() {
             return Ok(());
         }
-        let url = format!(
-            "{}/collections/{}/points?wait=true",
-            self.config.qdrant_url.trim_end_matches('/'),
-            self.config.collection
+        let Some(client) = self.projection.acquire(&self.config, &self.repo_id) else {
+            return Ok(());
+        };
+        let outcome = client.upsert(&points);
+        self.projection.record(&self.config, outcome.clone());
+        match outcome {
+            Ok(()) => {
+                self.projection.update_synced(
+                    &self.projection_state_path(),
+                    &self.remote_collection_name(),
+                    points.iter().map(|point| point.id.clone()),
+                    [],
+                );
+                // The remote is back: catch up one bounded batch of anything
+                // missed while it was down, and drop what was retired.
+                let _ = self.reconcile_remote(self.config.projection.batch_size);
+                Ok(())
+            }
+            Err(error) => Err(ToolError::Failed(error.to_string())),
+        }
+    }
+
+    /// The namespaced remote collection for this repo and embedding model.
+    pub fn remote_collection_name(&self) -> String {
+        super::memory_backends::qdrant::collection_name(
+            &self.config.projection.collection_prefix,
+            &self.repo_id,
+            &self.current_embedding_identity(),
+        )
+    }
+
+    /// Which record ids the remote is known to hold. Derived, rebuildable:
+    /// losing this file only means the next reconcile re-sends.
+    fn projection_state_path(&self) -> PathBuf {
+        self.local_path().with_file_name("projection-state.json")
+    }
+
+    /// Records the remote does not yet mirror, plus retired records it still
+    /// holds. Zero in local mode (there is no remote to lag behind).
+    pub fn remote_projection_lag(&self) -> usize {
+        if !self.remote_projection_enabled() {
+            return 0;
+        }
+        let (unsynced, stale, _) = self.remote_delta();
+        unsynced.len() + stale.len() + usize::from(self.remote_clear_pending())
+    }
+
+    /// A clear was confirmed locally but the remote still holds its vectors.
+    pub fn remote_clear_pending(&self) -> bool {
+        self.remote_projection_enabled()
+            && self.projection.pending_clear(
+                &self.projection_state_path(),
+                &self.remote_collection_name(),
+            )
+    }
+
+    /// `(to send, to remove, skipped)` against what the remote is known to hold.
+    fn remote_delta(&self) -> (Vec<&MemoryRecord>, Vec<String>, usize) {
+        let identity = self.current_embedding_identity();
+        let synced = self.projection.synced_ids(
+            &self.projection_state_path(),
+            &self.remote_collection_name(),
         );
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(self.config.request_timeout_seconds))
-            .build()
-            .put(&url)
-            .send_json(json!({"points": points}))
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
-        Ok(())
+        let present: HashSet<&str> = self
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        // An unreadable or empty in-memory store says nothing about the
+        // remote: only explicit tombstones and supersessions retire records.
+        let store_trusted = self.store_error.is_none() && !self.records.is_empty();
+        let retired = |id: &str| {
+            self.tombstones.contains(id)
+                || self.supersessions.contains_key(id)
+                || (store_trusted && !present.contains(id))
+        };
+        let mut skipped = 0usize;
+        let mut unsynced = Vec::new();
+        for record in &self.records {
+            if record.repo_id != self.repo_id || retired(&record.id) {
+                continue;
+            }
+            if record.embedding.is_some()
+                && embedding_identity_compatible(record.embedding_identity.as_ref(), &identity)
+            {
+                if !synced.contains(&record.id) {
+                    unsynced.push(record);
+                }
+            } else {
+                skipped += 1;
+            }
+        }
+        let stale = synced
+            .iter()
+            .filter(|id| retired(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        (unsynced, stale, skipped)
+    }
+
+    /// One bounded, idempotent catch-up pass: send up to `max_batch` records
+    /// the remote lacks and remove up to `max_batch` it should no longer hold.
+    /// Local records are never changed. Run again while `lag > 0`. Safe to
+    /// interrupt: the sync file only gains an id after the remote accepted it.
+    pub fn reconcile_remote(&self, max_batch: usize) -> ProjectionRepairReceipt {
+        self.reconcile_remote_at(max_batch, None)
+    }
+
+    /// The clear epoch of the remote state, for a catch-up that works on a
+    /// snapshot: see [`Self::reconcile_remote_at`].
+    pub fn remote_clear_epoch(&self) -> u64 {
+        self.projection.clear_epoch(
+            &self.projection_state_path(),
+            &self.remote_collection_name(),
+        )
+    }
+
+    /// Deliver every clear owed to the remote. True when none is left. No
+    /// upload happens here, so it is safe to run from a snapshot.
+    pub fn deliver_remote_clears(&self) -> bool {
+        if !self.remote_projection_enabled() {
+            return true;
+        }
+        let path = self.projection_state_path();
+        let collection = self.remote_collection_name();
+        let owed = self.projection.pending_clears(&path, &collection);
+        owed.is_empty()
+            || matches!(
+                self.run_owed_clears(&path, &collection, &owed),
+                OwedClears::Delivered
+            )
+    }
+
+    fn run_owed_clears(
+        &self,
+        path: &Path,
+        collection: &str,
+        owed: &[super::memory_backends::runtime::PendingClear],
+    ) -> OwedClears {
+        let Some(client) = self.projection.acquire(&self.config, &self.repo_id) else {
+            return OwedClears::Unavailable;
+        };
+        for pending in owed {
+            let outcome = client.delete_from(&pending.collection, &pending.ids, &pending.repo_id);
+            if let Err(error) = outcome {
+                self.projection.record(&self.config, Err(error.clone()));
+                return OwedClears::Failed(error);
+            }
+            if let Err(error) = self.projection.finish_pending(path, collection, pending) {
+                return OwedClears::Failed(ProjectionError::Offline(format!(
+                    "the finished clear could not be recorded: {error}"
+                )));
+            }
+        }
+        self.projection.record(&self.config, Ok(()));
+        OwedClears::Delivered
+    }
+
+    /// [`Self::reconcile_remote`] for a caller that works on a snapshot taken
+    /// when the clear epoch was `expected_epoch`. If a clear happens before the
+    /// snapshot's records are uploaded, nothing from the snapshot is sent or
+    /// recorded as synced: they are records that clear just removed.
+    pub fn reconcile_remote_at(
+        &self,
+        max_batch: usize,
+        expected_epoch: Option<u64>,
+    ) -> ProjectionRepairReceipt {
+        let mut receipt = ProjectionRepairReceipt::default();
+        if !self.remote_projection_enabled() {
+            return receipt;
+        }
+        let path = self.projection_state_path();
+        let collection = self.remote_collection_name();
+        let fail = |receipt: &mut ProjectionRepairReceipt, error: ProjectionError| {
+            receipt.failures += 1;
+            receipt.code = Some(match error {
+                ProjectionError::Offline(_) => QDRANT_OFFLINE,
+                ProjectionError::Refused(_) => QDRANT_REFUSED,
+            });
+            receipt.error = Some(error.to_string());
+            self.projection.record(&self.config, Err(error));
+        };
+        let moved = || {
+            expected_epoch
+                .is_some_and(|epoch| self.projection.clear_epoch(&path, &collection) != epoch)
+        };
+        let owed = self.projection.pending_clears(&path, &collection);
+        let ledger: Vec<String> = self
+            .projection
+            .synced_ids(&path, &collection)
+            .into_iter()
+            .collect();
+        // Before trusting the ledger, ask the remote: an owed clear runs first,
+        // and a remote that lacks ledger ids it should hold was reset
+        // (collection deleted and recreated), so everything is sent again.
+        // The count is restricted to the ledger's own ids: other points of the
+        // same repo id, written by another clone, must not hide the loss.
+        if !owed.is_empty() {
+            match self.run_owed_clears(&path, &collection, &owed) {
+                OwedClears::Delivered => {}
+                OwedClears::Unavailable => {
+                    let health = self.projection.health(&self.config);
+                    receipt.code = health.code;
+                    receipt.error = Some(health.detail).filter(|detail| !detail.is_empty());
+                    let (unsynced, stale, skipped) = self.remote_delta();
+                    receipt.skipped = skipped;
+                    receipt.lag = unsynced.len() + stale.len() + 1;
+                    return receipt;
+                }
+                OwedClears::Failed(error) => {
+                    receipt.failures += 1;
+                    receipt.code = Some(match error {
+                        ProjectionError::Offline(_) => QDRANT_OFFLINE,
+                        ProjectionError::Refused(_) => QDRANT_REFUSED,
+                    });
+                    receipt.error = Some(error.to_string());
+                    let (unsynced, stale, skipped) = self.remote_delta();
+                    receipt.skipped = skipped;
+                    receipt.lag = unsynced.len() + stale.len() + 1;
+                    return receipt;
+                }
+            }
+        } else if !ledger.is_empty() {
+            if let Some(client) = self.projection.acquire(&self.config, &self.repo_id) {
+                match client.count_held(&ledger, &self.repo_id) {
+                    Ok(held) if held < ledger.len() => {
+                        self.projection.forget_synced(&path, &collection);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        fail(&mut receipt, error);
+                        let (unsynced, stale, skipped) = self.remote_delta();
+                        receipt.skipped = skipped;
+                        receipt.lag = unsynced.len() + stale.len();
+                        return receipt;
+                    }
+                }
+            }
+        }
+        let (unsynced, stale, skipped) = self.remote_delta();
+        receipt.skipped = skipped;
+        receipt.lag = unsynced.len() + stale.len();
+        if receipt.lag == 0 {
+            return receipt;
+        }
+        let Some(client) = self.projection.acquire(&self.config, &self.repo_id) else {
+            // Backing off or refused: report it, change nothing.
+            let health = self.projection.health(&self.config);
+            receipt.code = health.code;
+            receipt.error = Some(health.detail).filter(|detail| !detail.is_empty());
+            return receipt;
+        };
+        // The client carries at most MAX_BATCH per request; a larger setting
+        // must not turn one write into an unbounded synchronous backlog.
+        let batch = max_batch.clamp(1, super::memory_backends::qdrant::MAX_BATCH);
+        if moved() {
+            return receipt;
+        }
+
+        let removing: Vec<String> = stale.into_iter().take(batch).collect();
+        if !removing.is_empty() {
+            match client.delete(&removing, &self.repo_id) {
+                Ok(()) => {
+                    receipt.removed = removing.len();
+                    self.projection
+                        .update_synced(&path, &collection, [], removing.clone());
+                }
+                Err(error) => {
+                    fail(&mut receipt, error);
+                    return receipt;
+                }
+            }
+        }
+        let sending: Vec<ProjectionPoint> = unsynced
+            .iter()
+            .take(batch)
+            .filter_map(|record| {
+                Some(ProjectionPoint {
+                    id: record.id.clone(),
+                    vector: record.embedding.clone()?,
+                    repo_id: record.repo_id.clone(),
+                })
+            })
+            .collect();
+        if !sending.is_empty() {
+            if moved() {
+                return receipt;
+            }
+            match client.upsert(&sending) {
+                Ok(()) if moved() => {
+                    // A clear landed while this was in flight: these are
+                    // records it removed. Take them back out, record nothing.
+                    let ids: Vec<String> = sending.iter().map(|point| point.id.clone()).collect();
+                    if let Err(error) = client.delete(&ids, &self.repo_id) {
+                        // They would stay as ghosts: owe the delete, so a later
+                        // reconcile retries it, and say so in the receipt.
+                        let _ = self
+                            .projection
+                            .owe_clear(&path, &collection, &self.repo_id, ids);
+                        fail(&mut receipt, error);
+                    }
+                    return receipt;
+                }
+                Ok(()) => {
+                    receipt.indexed = sending.len();
+                    self.projection.update_synced(
+                        &path,
+                        &collection,
+                        sending.iter().map(|point| point.id.clone()),
+                        [],
+                    );
+                }
+                Err(error) => {
+                    fail(&mut receipt, error);
+                    return receipt;
+                }
+            }
+        }
+        self.projection.record(&self.config, Ok(()));
+        receipt.lag = receipt
+            .lag
+            .saturating_sub(receipt.indexed + receipt.removed);
+        receipt
+    }
+
+    /// Delete this repo's points from the remote and forget what was synced,
+    /// then send everything again in bounded batches on the next reconcile.
+    /// Only this repo's namespace is touched.
+    pub fn rebuild_remote(&self) -> ProjectionRepairReceipt {
+        let mut receipt = ProjectionRepairReceipt::default();
+        let Some(client) = self.projection.acquire(&self.config, &self.repo_id) else {
+            receipt.code = self.projection.health(&self.config).code;
+            return receipt;
+        };
+        if let Err(error) = client.clear_namespace(&self.repo_id) {
+            receipt.failures = 1;
+            receipt.code = Some(match error {
+                ProjectionError::Offline(_) => QDRANT_OFFLINE,
+                ProjectionError::Refused(_) => QDRANT_REFUSED,
+            });
+            receipt.error = Some(error.to_string());
+            self.projection.record(&self.config, Err(error));
+            return receipt;
+        }
+        if let Err(error) = self.projection.finish_clear(
+            &self.projection_state_path(),
+            &self.remote_collection_name(),
+        ) {
+            receipt.failures = 1;
+            receipt.error = Some(format!(
+                "the cleared namespace could not be recorded: {error}"
+            ));
+            return receipt;
+        }
+        self.reconcile_remote(self.config.projection.batch_size)
     }
 
     /// Learning re-derived a claim it already stored, so the claim holds for
@@ -3084,6 +3672,14 @@ fn promote_chunk(chunk: &MemoryChunk) -> Option<MemoryChunk> {
         source: format!("{}:promoted", chunk.source),
         importance: chunk.importance.max(0.9),
     })
+}
+
+/// How running the clears owed to the remote ended.
+enum OwedClears {
+    Delivered,
+    /// No client: backing off or refused.
+    Unavailable,
+    Failed(ProjectionError),
 }
 
 #[cfg(test)]
@@ -3903,6 +4499,75 @@ pub(crate) mod tests {
         std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
         assert_eq!(source.collect(&request(AgentKind::GraphWorker)).len(), 1);
         assert!(source.collect(&request(AgentKind::Main)).is_empty());
+    }
+
+    /// The automatic path labels a fallback, like the explicit tool does, and
+    /// stays silent for the default local backend and for a healthy remote.
+    #[test]
+    fn automatic_context_says_when_it_fell_back_from_the_remote() {
+        use crate::native_extensions::memory_backends::{MemoryProjectionBackend, ProjectionError};
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.mark_dense_offline();
+        memory
+            .index_learning_memory(
+                "graph_scheduler drops lanes when the queue is empty; drain the queue before swap",
+                MemoryKind::Fix,
+                0.9,
+                0.9,
+                "session",
+                1,
+                None,
+            )
+            .unwrap();
+        let request = ContextRequest {
+            run_id: davinci_agent::RunId::new(),
+            agent_id: davinci_agent::AgentId::new(),
+            goal: "why does graph_scheduler drop lanes when the queue is empty".to_string(),
+            provider: "mock".to_string(),
+            model_id: "mock".to_string(),
+            tools: Vec::new(),
+            max_tokens: 2_500,
+            kind: AgentKind::Main,
+            agent_profile_name: None,
+            memory_scope: None,
+        };
+        std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(memory));
+        let source = MemoryContextSource::new(shared.clone());
+
+        // Local backend: even a stale failure is not shown.
+        {
+            let memory = shared.lock().unwrap();
+            memory
+                .projection
+                .record(&memory.config, Err(ProjectionError::Offline("down".into())));
+        }
+        let local = source.collect(&request);
+        assert_eq!(local.len(), 1);
+        assert!(
+            !local[0].content.contains("QDRANT_"),
+            "{}",
+            local[0].content
+        );
+
+        shared.lock().unwrap().config.projection.backend = MemoryProjectionBackend::Qdrant;
+        let offline = source.collect(&request);
+        assert_eq!(offline.len(), 1);
+        assert!(
+            offline[0].content.contains("[QDRANT_OFFLINE]"),
+            "{}",
+            offline[0].content
+        );
+        assert!(offline[0].content.contains("local search"));
+
+        {
+            let memory = shared.lock().unwrap();
+            memory.projection.record(&memory.config, Ok(()));
+        }
+        let healthy = source.collect(&request);
+        assert!(!healthy[0].content.contains("QDRANT_"));
     }
 
     /// Labeled precision fixture for automatic recall. Each prompt names the

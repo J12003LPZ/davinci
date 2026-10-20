@@ -16,6 +16,7 @@
 //!   it back on; the conflict is reported instead.
 //! - Writes are atomic, and the previous file is kept as `.bak`.
 
+use super::memory_backends::MemoryProjectionBackend;
 use super::token_governor::TokenGovernorConfig;
 use super::vector_memory::{ConfigFileState, VectorMemoryConfig};
 use serde::{Deserialize, Serialize};
@@ -38,28 +39,60 @@ pub struct MemoryChoices {
     /// `Some(false)` is the user's explicit "off"; `None` means no choice yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// `"local"`: the JSONL store is authoritative. Nothing else is offered.
-    #[serde(default = "default_backend")]
-    pub backend: String,
+    /// Which projection backs recall. The JSONL store is authoritative either
+    /// way; `Qdrant` adds a rebuildable remote copy and is chosen explicitly.
+    #[serde(default)]
+    pub backend: MemoryProjectionBackend,
     /// Start an approved local Ollama by itself when it is down.
     #[serde(default = "yes")]
     pub autostart: bool,
     /// Re-embed stale vectors by itself. Never deletes records.
     #[serde(default = "yes")]
     pub safe_repair: bool,
-    /// Qdrant is an optional projection, never a dependency.
+    /// Qdrant is an optional projection, never a dependency. These apply only
+    /// when `backend` is `Qdrant`.
     #[serde(default)]
-    pub qdrant: bool,
+    pub qdrant_setup: QdrantChoices,
+}
+
+/// What the user chose for Qdrant. Every field is off or empty until `/setup`
+/// records a choice.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QdrantChoices {
+    /// Overrides `qdrantUrl` in `vector-memory.json` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The user agreed that a non-loopback Qdrant may receive vectors.
+    #[serde(default)]
+    pub allow_remote: bool,
+    /// The one container the user told DaVinci is its own. Only this one may
+    /// ever be started, and only with `allow_start_owned_qdrant_container`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_container: Option<OwnedContainer>,
+    /// The user wants the command DaVinci shows for creating its container to
+    /// include `--restart unless-stopped`. DaVinci never changes a restart
+    /// policy itself; this only changes the text it prints.
+    #[serde(default)]
+    pub keep_running: bool,
+}
+
+/// A container recorded as DaVinci's. Matched by id, never by name alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedContainer {
+    pub id: String,
+    pub name: String,
 }
 
 impl Default for MemoryChoices {
     fn default() -> Self {
         Self {
             enabled: None,
-            backend: default_backend(),
+            backend: MemoryProjectionBackend::Local,
             autostart: true,
             safe_repair: true,
-            qdrant: false,
+            qdrant_setup: QdrantChoices::default(),
         }
     }
 }
@@ -130,9 +163,6 @@ fn yes() -> bool {
 }
 fn schema() -> u32 {
     PROFILE_SCHEMA
-}
-fn default_backend() -> String {
-    "local".into()
 }
 
 /// What reading the profile found.
@@ -380,6 +410,31 @@ fn parse_bool(value: &str) -> Option<bool> {
 ///
 /// `env` is the environment (use [`super::vector_memory::process_env`] for the
 /// real one), so a test or `/setup check` can resolve without touching it.
+/// The profile's Qdrant choice onto the config. The environment still wins:
+/// `PI_MEMORY_BACKEND=local` is the escape hatch that turns the remote off
+/// without editing a file. A profile that cannot be read changes nothing.
+fn apply_profile_projection(
+    profile: &SetupProfile,
+    config: &mut VectorMemoryConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) {
+    if profile.memory.backend != MemoryProjectionBackend::Qdrant {
+        return;
+    }
+    if VectorMemoryConfig::env_sets_backend(env) {
+        return;
+    }
+    config.projection.backend = MemoryProjectionBackend::Qdrant;
+    if let Some(url) = &profile.memory.qdrant_setup.url {
+        if env_value(env, "PI_MEMORY_QDRANT_URL").is_none() {
+            config.qdrant_url = url.clone();
+        }
+    }
+    if profile.memory.qdrant_setup.allow_remote {
+        config.projection.allow_remote = true;
+    }
+}
+
 pub fn load_effective_setup(
     agent_dir: &Path,
     env: &dyn Fn(&str) -> Option<String>,
@@ -426,6 +481,7 @@ pub fn load_effective_setup(
         )
     };
     memory_config.enabled = enabled;
+    apply_profile_projection(&profile, &mut memory_config, env);
     let memory = FeatureConfig {
         config: memory_config,
         file: memory_file,

@@ -202,6 +202,90 @@ pub fn recovery_wanted(agent_dir: &Path) -> bool {
         && ServiceAuthorization::check(agent_dir, ServiceAction::StartLocalOllama).is_ok()
 }
 
+/// One attempt to bring DaVinci's own Qdrant container back after a relaunch.
+/// `None` health means nothing was wanted: the default setup, a disabled
+/// intent, or no consent. Docker is not asked in those cases.
+pub fn qdrant_recovery_round(
+    agent_dir: &Path,
+    docker: &dyn super::docker_discovery::DockerRunner,
+    starter: &dyn super::qdrant_supervisor::ContainerStarter,
+    tracker: &mut IncidentTracker,
+) -> Option<(ComponentHealth, Option<ServiceNotice>)> {
+    let effective = load_effective_setup(agent_dir, &process_env);
+    if !super::qdrant_supervisor::start_wanted(agent_dir, &effective) {
+        return None;
+    }
+    let health = super::qdrant_supervisor::reconcile_owned_qdrant(
+        agent_dir,
+        &effective,
+        docker,
+        starter,
+        super::qdrant_supervisor::DEADLINE,
+    );
+    let notice = tracker.observe(&health);
+    Some((health, notice))
+}
+
+/// Start the Qdrant recovery for this session: once, in the background, and
+/// only if the user turned the projection on and consented to the start. When
+/// Qdrant is back, the remote copy is caught up. Not at all for an untrusted
+/// folder: its memory must not reach Qdrant, and a clear it owes is not its
+/// own to deliver. The decision is taken at launch; `/trust` applies to the
+/// memory tools at the next turn and to this recovery at the next start.
+pub fn start_qdrant_recovery(
+    agent_dir: PathBuf,
+    memory: Option<Arc<Mutex<super::vector_memory::VectorMemory>>>,
+) {
+    if !memory_trusted(memory.as_ref()) {
+        return;
+    }
+    let effective = load_effective_setup(&agent_dir, &process_env);
+    if !super::qdrant_supervisor::start_wanted(&agent_dir, &effective) {
+        // Nothing to start, but a clear confirmed in an earlier session may
+        // still be owed to a Qdrant the user runs themselves. Local files
+        // only unless one is owed, and then one bounded request.
+        if let Some(memory) = &memory {
+            super::setup_actions::finish_owed_remote_clear(memory);
+        }
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut tracker = IncidentTracker::default();
+        let round = qdrant_recovery_round(
+            &agent_dir,
+            &super::docker_discovery::SystemDockerRunner,
+            &super::qdrant_supervisor::SystemContainerStarter,
+            &mut tracker,
+        );
+        let Some((health, notice)) = round else {
+            return;
+        };
+        if let Some(notice) = notice {
+            push_notice(notice);
+        }
+        if health.state == HealthState::Ready {
+            // A clear the user confirmed is not derived-data repair: it runs
+            // whatever the safe-repair setting says.
+            if let Some(memory) = &memory {
+                super::setup_actions::finish_owed_remote_clear(memory);
+            }
+            if let (true, Some(memory)) = (effective.profile.memory.safe_repair, &memory) {
+                let _ = super::setup_actions::repair_step(memory);
+            }
+        }
+    });
+}
+
+/// False only when there is a memory and its folder is not trusted.
+fn memory_trusted(memory: Option<&Arc<Mutex<super::vector_memory::VectorMemory>>>) -> bool {
+    memory.is_none_or(|memory| {
+        memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .project_trusted()
+    })
+}
+
 /// Start the background recovery for this session, if the user set it up.
 /// Returns the stop flag; set it to end the thread.
 pub fn start_recovery(
@@ -223,8 +307,12 @@ pub fn start_recovery(
             }
             let Some(wait) = round.retry_in else {
                 // Ollama answers: embed whatever was written while it was
-                // down, if the user left safe repair on. Derived data only.
-                if round.health.state == HealthState::Ready {
+                // down, if the user left safe repair on. The embeddings are
+                // derived, but the repair also reads the folder's records and
+                // sends them to Qdrant when that is on, so an untrusted folder
+                // is skipped. Starting Ollama itself is a user-level service
+                // and stays.
+                if round.health.state == HealthState::Ready && memory_trusted(memory.as_ref()) {
                     let effective = load_effective_setup(&agent_dir, &process_env);
                     if let (true, Some(memory)) = (effective.profile.memory.safe_repair, &memory) {
                         let _ = super::setup_actions::repair_step(memory);

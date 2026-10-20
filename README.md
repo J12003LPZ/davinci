@@ -780,7 +780,7 @@ The memory system supports:
 - secret redaction;
 - lexical retrieval;
 - optional local embeddings;
-- optional Ollama/Qdrant acceleration;
+- optional local Ollama embeddings, and an optional Qdrant copy of the vectors that is off unless you turn it on (`/setup qdrant`); records always stay in the local file;
 - bounded automatic injection;
 - direct memory search.
 

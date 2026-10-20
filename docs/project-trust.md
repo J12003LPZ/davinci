@@ -2,8 +2,9 @@
 
 A project folder can ship configuration that runs code or changes the agent's
 prompt and permissions: hooks, MCP servers, extensions, skills, prompts,
-agents, packages and project settings (`.davinci/` or `.pi/`, plus
-`.agents/skills`). DaVinci asks before loading any of it. Trusting a folder only
+agents, packages, project settings and the vector-memory store
+(`.davinci/` or `.pi/`, plus `.agents/skills`). DaVinci asks before loading any
+of it. Trusting a folder only
 lets DaVinci load that configuration. It does not approve a tool call, start a
 service, install software or relax the sandbox.
 
@@ -67,6 +68,20 @@ stable code `UNTRUSTED_PROJECT`:
   `code: "UNTRUSTED_PROJECT"`, `path` and `diagnostic`, and `get_state` reports
   `projectTrusted` and `projectTrustCode`;
 - SDK: `CreateAgentSessionResult::project_trust_diagnostic`.
+
+## Memory
+
+`.davinci/vector-memory/` (or `.pi/vector-memory/`) holds the records that are
+injected into prompts and `projection-state.json`, which names the deletes owed
+to Qdrant. It lives in the working tree, so a checkout can ship one. In a folder
+that is not trusted DaVinci does not read or write it: the memory tools answer
+`memory unavailable: project not trusted`, nothing is sent to Qdrant, the
+Qdrant recovery and the repair that follows an Ollama start are skipped, and a
+clear the folder owes is not delivered. Starting the local Ollama is a
+user-level service and still follows its own consent. Trust is re-read at every
+turn, so granting it with `/trust` loads the store at the next turn and revoking
+it drops what was read. The recovery threads are decided at launch; a grant
+given mid-session starts them at the next launch.
 
 ## Packages and graph verification
 

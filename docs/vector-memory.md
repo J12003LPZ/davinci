@@ -80,11 +80,119 @@ after the command returns, so run `/setup` again to follow it. Trust is never
 granted by `/setup` alone, because a trusted project can run its own hooks,
 extensions and MCP servers.
 
+
+## Optional Qdrant
+
+Qdrant is off. Memory is searched from the local record file, which is the
+authority for every record, and nothing contacts Qdrant or Docker unless you
+choose it. In local mode a `/setup` run asks Docker nothing.
+
+**What it is.** A second, rebuildable copy of the memory *vectors* (numbers
+and an id, never memory text) that Qdrant answers nearest-neighbour queries
+from. DaVinci resolves each answer against the local records, so a record that
+was removed, replaced or is outside the scope cannot come back from a stale
+remote point.
+
+**Benefit.** Faster nearest-neighbour search on a very large store, and one
+vector index other tools on this machine can share.
+
+**Downsides.** It needs Qdrant running (usually in Docker), uses more memory
+and disk, and is one more service that can be down. On a normal store the
+local search is already fast. The speed-up has **not** been measured against a
+real Qdrant yet (see the addendum in
+`docs/superpowers/plans/2026-09-15-memory-projection-decision.md`), so it is
+not the default anywhere.
+
+**Turning it on and off.**
+
+| Command | Effect |
+| --- | --- |
+| `/setup qdrant` | Explains the above and looks, read-only, at what is on this machine: does Qdrant answer, is Docker installed, is its engine running, does a Qdrant container exist, is it DaVinci's. |
+| `/setup qdrant enable` / `disable` | Writes the choice to `setup-profile.json`. Disabling stops all Qdrant and Docker traffic at once; the remote collection is kept as it is. |
+| `/setup qdrant own <container-id>` / `release` | Records (or forgets) the one container you say is DaVinci's. Needs 12 or more characters of the id from `docker ps --no-trunc`, and the container must carry the label `io.davinci.owner=davinci-memory` (the `docker run` command DaVinci prints sets it). Recording a different container, or releasing, withdraws the start approval. |
+| `/setup approve start-qdrant` | Your yes to starting the recorded container with `docker start <id>`. |
+| `/setup qdrant keep-running on\|off` | Adds `--restart unless-stopped` to the `docker run` command DaVinci prints. DaVinci never changes a restart policy itself. |
+
+Environment: `PI_MEMORY_BACKEND=local` turns the remote off without editing a
+file, whatever the profile says. `PI_MEMORY_BACKEND=qdrant` turns it on.
+
+**Configuration** (`vector-memory.json`; the URL keeps its existing keys):
+
+```json
+{
+  "qdrantUrl": "http://127.0.0.1:6333",
+  "projection": {
+    "backend": "qdrant",
+    "apiKey": "optional, or PI_MEMORY_QDRANT_API_KEY",
+    "allowRemote": false,
+    "collectionPrefix": "davinci",
+    "batchSize": 64,
+    "offlineBackoffSeconds": 60
+  }
+}
+```
+
+The API key is sent as the `api-key` header and nowhere else: it is not
+written back by DaVinci, not shown in status or logs, and not part of any
+payload. A URL that is not on this machine is refused unless `allowRemote` is
+true.
+
+**Collections.** One collection per repository and embedding model, named
+`davinci-<12 hex of the repo>-<8 hex of the model identity>`. The old global
+`pi_memory_v1` is not used. A collection that already exists with another
+vector size or distance is reported (`QDRANT_REFUSED`) and left untouched.
+Every query and delete carries the repository id; `/memory-clear` and a
+rebuild delete only this repository's points.
+
+**When Qdrant is down.** Search falls back to the local index and says so:
+`memory_search` ends with `[QDRANT_OFFLINE] remote vector search is
+unavailable; local search was used.`, the memories injected into a turn
+automatically start with the same marker on their first line, and status shows
+the code. Nothing is
+lost: records are written locally first. The remote is skipped for
+`offlineBackoffSeconds` after a failure, so a stopped Qdrant costs one timeout.
+`remoteProjectionLag` in the status counts records the remote does not hold
+yet (plus retired ones it should drop). It is caught up in bounded, idempotent
+batches by indexing, `/memory-reindex` and `/setup repair`; a lost
+`projection-state.json` only makes the next pass send everything again.
+
+**Docker.** Discovery runs `docker version` and `docker ps` with a five second
+timeout and nothing else. DaVinci does not install Docker or Qdrant, does not
+start Docker, does not change Docker Desktop settings, and touches no
+container that is not the one you recorded. Ownership is the recorded id and
+nothing else; the label `io.davinci.owner=davinci-memory` is only a check that
+the recorded container is still the one DaVinci's command made. A labelled
+container nobody recorded is never started, wherever `docker ps` lists it. With
+nothing running it prints the `docker run` command for you to run yourself.
+
+**Collection ownership.** When DaVinci creates a collection it writes one
+marker point (no repo id, no text) into it. A collection with the derived name
+but no marker was not made by DaVinci: it is reported (`QDRANT_REFUSED`), never
+adopted, and nothing is written to it or deleted from it. Delete it yourself or
+set `collectionPrefix` to another name.
+
+**API key.** It is sent only over `https://`, or over `http://` to this
+machine. A plain `http://` URL to another host with a key set is refused with
+an error, and redirects are not followed, so the header never goes anywhere
+else. `batchSize` is clamped to 512 points per request.
+
+**Known limits.** `/setup approve start-qdrant` runs on the interactive loop and
+can block it for up to about a minute while Docker answers (every call has a
+timeout). `/setup qdrant` (show, enable, own) asks Docker even while the
+backend is local, because you asked it to; `/setup check` and everything
+automatic do not. An empty answer from a reachable Qdrant falls back to local
+search without a label, because Qdrant is up; `remoteProjectionLag` shows the
+gap.
+
+**Rollback.** `/setup qdrant disable` (or `PI_MEMORY_BACKEND=local`). Local
+search and every record are exactly as before; delete the remote
+collection in Qdrant if you want it gone.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `/setup [check [--json]\|repair\|approve <action>\|enable\|disable <feature>\|trust]` | Sets up vector memory and the other features above. See `docs/setup.md`. |
+| `/setup [check [--json]\|repair\|approve <action>\|enable\|disable <feature>\|qdrant ...\|trust]` | Sets up vector memory and the other features above. See `docs/setup.md`. |
 | `/memory-page [--no-open] [query]` | Writes `.davinci/vector-memory/memory-page.html` beside the records and opens it. |
 | `/memory-status` | Opens the memory sheet with record counts and configuration. |
 | `/memory-search <query>` | Runs the broad search (every kind, including stale claims) without the injection gate. |

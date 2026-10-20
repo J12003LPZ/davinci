@@ -23,6 +23,10 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: &[&str] = &[
     "agents",
     "git",
     "npm",
+    // The vector-memory store. Its records are loaded into prompts and its
+    // projection state names remote deletes, so a checkout cannot be allowed to
+    // supply it unasked.
+    "vector-memory",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

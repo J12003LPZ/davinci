@@ -6,14 +6,17 @@ pub mod build_intelligence;
 pub mod change_impact;
 pub mod content_router;
 mod credential_redaction;
+pub mod docker_discovery;
 pub mod ecosystem;
 pub mod engineering_snapshot;
 pub mod git_intelligence;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
+pub mod memory_backends;
 pub mod memory_page;
 pub mod package_intelligence;
+pub mod qdrant_supervisor;
 pub mod repo_intelligence;
 pub mod security_scan;
 pub mod service_authority;
@@ -23,6 +26,7 @@ pub mod setup;
 pub mod setup_actions;
 pub mod setup_health;
 pub mod setup_profile;
+pub mod setup_qdrant;
 pub mod test_impact;
 pub mod token_governor;
 pub mod vector_memory;
@@ -371,9 +375,28 @@ pub struct NativeExtensionHost {
     /// Who starts Ollama for `/setup`. `None` is this process's real
     /// supervisor; tests inject one with a fake launcher.
     supervisor: Option<Arc<service_supervisor::ManagedServiceSupervisor>>,
+    /// Read-only Docker questions for `/setup qdrant`; tests inject a fake.
+    docker: Option<Arc<dyn docker_discovery::DockerRunner>>,
+    container_starter: Option<Arc<dyn qdrant_supervisor::ContainerStarter>>,
 }
 
 impl NativeExtensionHost {
+    /// Use `supervisor` for `/setup` instead of the real machine.
+    /// Use `docker` for the read-only Docker questions of `/setup qdrant`.
+    pub fn with_docker(mut self, docker: Arc<dyn docker_discovery::DockerRunner>) -> Self {
+        self.docker = Some(docker);
+        self
+    }
+
+    /// Use `starter` to start DaVinci's own Qdrant container; tests inject a fake.
+    pub fn with_container_starter(
+        mut self,
+        starter: Arc<dyn qdrant_supervisor::ContainerStarter>,
+    ) -> Self {
+        self.container_starter = Some(starter);
+        self
+    }
+
     /// Use `supervisor` for `/setup` instead of the real machine.
     pub fn with_supervisor(
         mut self,
@@ -435,9 +458,15 @@ impl NativeExtensionHost {
             agent_dir,
             learning_config,
         )));
-        let memory = Arc::new(Mutex::new(VectorMemory::with_config(
+        // The store is read from the working tree, so an untrusted folder's is
+        // not. `--approve` is not known here; the host corrects this with
+        // `set_project_trusted` once launch options are resolved, and every turn.
+        let memory_trusted =
+            agent_dir.is_none() || crate::settings::is_trusted(&merged_settings, cwd, None);
+        let memory = Arc::new(Mutex::new(VectorMemory::with_config_for_project(
             cwd.to_path_buf(),
             memory_config,
+            memory_trusted,
         )));
         let mut graph = GraphController::new(cwd.to_path_buf());
         graph.memory = Some(Arc::clone(&memory));
@@ -565,6 +594,8 @@ impl NativeExtensionHost {
             cwd: cwd.to_path_buf(),
             agent_dir: repo_agent_dir,
             supervisor: None,
+            docker: None,
+            container_starter: None,
         }
     }
 
@@ -827,6 +858,11 @@ impl NativeExtensionHost {
 
     pub fn set_learning_project_trusted(&mut self, trusted: bool) {
         self.learning().set_project_trusted(trusted);
+        // Memory is project-controlled data too: it follows the same decision.
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_project_trusted(trusted);
     }
 
     pub fn drain_learning_notifications(&mut self) -> Vec<String> {
@@ -958,6 +994,9 @@ impl NativeExtensionHost {
             }
             "memory-search" => {
                 let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                if !memory.project_trusted() {
+                    return Err(vector_memory::MEMORY_UNTRUSTED.into());
+                }
                 Ok(Some(memory.search_text(args)))
             }
             "memory-reindex" => {
@@ -972,6 +1011,9 @@ impl NativeExtensionHost {
                 // The page probes the embedding server (seconds). Work on a copy
                 // so a turn that needs memory never waits behind the probe.
                 let snapshot = self.memory.lock().map_err(|err| err.to_string())?.clone();
+                if !snapshot.project_trusted() {
+                    return Err(vector_memory::MEMORY_UNTRUSTED.into());
+                }
                 Ok(Some(memory_page::command(&snapshot, args)?))
             }
             "cache-status" => {
@@ -1050,13 +1092,21 @@ impl NativeExtensionHost {
                 } else {
                     self.cwd.clone()
                 };
-                let ctx = match &self.supervisor {
+                let mut ctx = match &self.supervisor {
                     Some(supervisor) => setup::SetupContext {
                         agent_dir: &self.agent_dir,
                         supervisor,
+                        docker: &docker_discovery::SystemDockerRunner,
+                        containers: &qdrant_supervisor::SystemContainerStarter,
                     },
                     None => setup::SetupContext::system(&self.agent_dir),
                 };
+                if let Some(docker) = &self.docker {
+                    ctx.docker = docker.as_ref();
+                }
+                if let Some(starter) = &self.container_starter {
+                    ctx.containers = starter.as_ref();
+                }
                 let steps = if mode == setup::Mode::Trust {
                     vec![setup::trust_project(&self.agent_dir, &cwd)]
                 } else if let setup::Mode::Approve(action) = mode {
@@ -1076,6 +1126,8 @@ impl NativeExtensionHost {
                         }
                     }
                     vec![step]
+                } else if let setup::Mode::Qdrant(command) = &mode {
+                    setup_qdrant::command(command.clone(), &self.memory, &ctx)
                 } else if let setup::Mode::Switch(feature, on) = mode {
                     vec![setup::switch_step(
                         &self.agent_dir,
@@ -1097,6 +1149,7 @@ impl NativeExtensionHost {
                         .unwrap_or(false);
                     vec![
                         setup::memory_step(&self.memory, apply, &ctx),
+                        setup_qdrant::summary_step(&ctx),
                         setup::gitignore_step(&cwd, apply),
                         setup::trust_step(&self.agent_dir, &cwd),
                         setup::plugins_step(&self.agent_dir),

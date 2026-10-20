@@ -37,7 +37,7 @@ pub(crate) const REINDEX_BATCHES: usize = 40;
 /// Records re-embedded per locked batch.
 pub(crate) const REINDEX_BATCH_SIZE: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// Report every area and apply the local, reversible steps.
     Apply,
@@ -53,6 +53,8 @@ pub enum Mode {
     Approve(super::setup_actions::SetupAction),
     /// Switch a feature on or off for good (`/setup enable|disable <feature>`).
     Switch(super::setup_profile::Feature, bool),
+    /// `/setup qdrant ...`: the optional Qdrant projection.
+    Qdrant(super::setup_qdrant::QdrantCommand),
 }
 
 pub fn parse_args(args: &str) -> Result<Mode, String> {
@@ -66,6 +68,9 @@ pub fn parse_args(args: &str) -> Result<Mode, String> {
                     "unknown action `{word}` · use /setup approve start-ollama or /setup approve download-model"
                 )
             });
+    }
+    if args == "qdrant" || args.starts_with("qdrant ") {
+        return super::setup_qdrant::parse(&args["qdrant".len()..]).map(Mode::Qdrant);
     }
     for (verb, on) in [("enable", true), ("disable", false)] {
         if let Some(rest) = args.strip_prefix(verb) {
@@ -213,6 +218,7 @@ pub fn report_full(
             Mode::Approve(_) => "approve",
             Mode::Switch(_, true) => "enable",
             Mode::Switch(_, false) => "disable",
+            Mode::Qdrant(_) => "qdrant",
         },
         "summary": summary,
         "lines": lines,
@@ -622,6 +628,11 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
 pub struct SetupContext<'a> {
     pub agent_dir: &'a Path,
     pub supervisor: &'a ManagedServiceSupervisor,
+    /// Read-only Docker questions for the optional Qdrant step. Asked only
+    /// when Qdrant is the chosen backend or the user ran `/setup qdrant`.
+    pub docker: &'a dyn super::docker_discovery::DockerRunner,
+    /// Starts DaVinci's own Qdrant container, after consent and nothing else.
+    pub containers: &'a dyn super::qdrant_supervisor::ContainerStarter,
 }
 
 impl<'a> SetupContext<'a> {
@@ -630,6 +641,8 @@ impl<'a> SetupContext<'a> {
         Self {
             agent_dir,
             supervisor: system_supervisor(),
+            docker: &super::docker_discovery::SystemDockerRunner,
+            containers: &super::qdrant_supervisor::SystemContainerStarter,
         }
     }
 }
@@ -1507,6 +1520,8 @@ mod tests {
             SetupContext {
                 agent_dir: self.agent.path(),
                 supervisor: &self.supervisor,
+                docker: &super::super::docker_discovery::AbsentDocker,
+                containers: &super::super::docker_discovery::AbsentDocker,
             }
         }
     }

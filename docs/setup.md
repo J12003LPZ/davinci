@@ -13,6 +13,8 @@ your records.
 | `/setup status` | Same as `check`. |
 | `/setup approve start-ollama` | Records your yes to start the local Ollama you have installed, then starts it. |
 | `/setup approve download-model` | Records your yes to download the embedding model, then starts the download. |
+| `/setup qdrant [enable\|disable\|own <id>\|release\|keep-running on\|off]` | The optional Qdrant copy of the vectors: explains it, looks (read-only) at Docker and Qdrant, and records your choice. Off by default. See `docs/vector-memory.md`. |
+| `/setup approve start-qdrant` | Records your yes to starting the one Qdrant container you recorded as DaVinci's, then starts it. A later session restarts the same container if the projection is on. |
 | `/setup repair` | Re-embeds records whose vector is missing or from another model, in batches. Derived data only: no record is changed or removed. |
 | `/setup disable memory\|governor` | Turns the feature off for good (saved in `setup-profile.json`, previous file kept as `.bak`). |
 | `/setup enable memory\|governor` | Turns it back on. If another layer still says off, it names which. |
