@@ -9,6 +9,12 @@ use crate::davinci::theme::State;
 use crate::davinci::ui::{section_detail, section_row, span};
 use ratatui::text::Line;
 
+/// Names, activity and paths come from model-chosen tool arguments and agent
+/// names: one line of plain text, no control bytes.
+fn safe(text: &str) -> String {
+    crate::davinci::sanitize::terminal_safe(text).replace('\n', " ")
+}
+
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width;
@@ -36,19 +42,25 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         let is_selected = i == sheet.selected_index;
 
         let title = if !agent.activity.is_empty() {
-            format!("{} · {}", agent.name, agent.activity)
+            format!("{} · {}", safe(&agent.name), safe(&agent.activity))
         } else if !agent.role.is_empty() {
-            format!("{} · {}", agent.name, agent.role)
+            format!("{} · {}", safe(&agent.name), safe(&agent.role))
         } else {
-            agent.name.clone()
+            safe(&agent.name)
         };
 
-        rows.push(section_row(width, th, is_selected, &title, &agent.elapsed));
+        rows.push(section_row(
+            width,
+            th,
+            is_selected,
+            &title,
+            &safe(&agent.elapsed),
+        ));
 
         let owns_str = if agent.owned_paths.is_empty() {
             "owns: (none)".to_string()
         } else {
-            format!("owns: {}", agent.owned_paths.join(", "))
+            format!("owns: {}", safe(&agent.owned_paths.join(", ")))
         };
         rows.extend(section_detail(width, th, &format!("  {owns_str}")));
 
@@ -64,9 +76,9 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         };
 
         let status_str = if agent.disconnected {
-            format!("{} [disconnected]", agent.status)
+            format!("{} [disconnected]", safe(&agent.status))
         } else {
-            agent.status.clone()
+            safe(&agent.status)
         };
 
         let stats_str = format!(
@@ -76,7 +88,8 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         rows.extend(section_detail(width, th, &stats_str));
 
         if let Some(waiting) = &agent.waiting_on {
-            let mut waiting_rows = section_detail(width, th, &format!("  waiting on: {waiting}"));
+            let mut waiting_rows =
+                section_detail(width, th, &format!("  waiting on: {}", safe(waiting)));
             for row in &mut waiting_rows {
                 for span in &mut row.spans {
                     span.style.fg = Some(th.warning);
@@ -95,11 +108,11 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             &format!("Available agents ({})", sheet.profiles.len()),
         ));
         for profile in &sheet.profiles {
-            rows.push(section_row(width, th, false, &profile.name, ""));
+            rows.push(section_row(width, th, false, &safe(&profile.name), ""));
             let description = if profile.description.is_empty() {
-                "(no description)"
+                "(no description)".to_string()
             } else {
-                profile.description.as_str()
+                safe(&profile.description)
             };
             rows.extend(section_detail(width, th, &format!("  {description}")));
         }
@@ -190,6 +203,31 @@ mod tests {
             ..Default::default()
         });
         m
+    }
+
+    #[test]
+    fn hostile_agent_text_cannot_inject_terminal_controls() {
+        let mut m = sample_model(80);
+        let hostile = "x\u{1b}]52;c;ZXZpbA==\u{7}\u{1b}[2J\r\nfake: approved";
+        let sheet = m.agents.as_mut().unwrap();
+        sheet.agents[0].name = hostile.into();
+        sheet.agents[0].activity = hostile.into();
+        sheet.agents[0].owned_paths = vec![hostile.into()];
+        sheet.agents[0].status = hostile.into();
+        sheet.agents[1].waiting_on = Some(hostile.into());
+        sheet.profiles = vec![AgentProfileRow {
+            name: hostile.into(),
+            description: hostile.into(),
+        }];
+        for line in lines(&m) {
+            for span in &line.spans {
+                assert!(
+                    !span.content.chars().any(|ch| ch.is_control()),
+                    "control byte reached a cell: {:?}",
+                    span.content
+                );
+            }
+        }
     }
 
     #[test]

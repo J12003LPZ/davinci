@@ -889,7 +889,21 @@ fn subagent_outcome(row: &SubagentRow) -> String {
     }
 }
 
+/// A worker row as safe display text: the label and recent calls come from
+/// model-chosen tool arguments, so control bytes and line breaks are removed
+/// before anything reaches a terminal cell.
+fn clean_worker_row(row: &SubagentRow) -> SubagentRow {
+    let one_line = |text: &str| super::super::sanitize::terminal_safe(text).replace('\n', " ");
+    SubagentRow {
+        label: one_line(&row.label),
+        recent: row.recent.iter().map(|call| one_line(call)).collect(),
+        ..row.clone()
+    }
+}
+
 fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'static>> {
+    let cleaned: Vec<SubagentRow> = rows.iter().map(clean_worker_row).collect();
+    let rows = cleaned.as_slice();
     let th = &model.theme;
     let cc = th.cc();
     let line = |text: String, failed: bool| {
@@ -1907,6 +1921,33 @@ mod tests {
             .iter()
             .map(text)
             .collect()
+    }
+
+    /// A worker's label and recent calls come from model-chosen tool arguments.
+    /// Whatever they carry, no control byte may reach a terminal cell.
+    #[test]
+    fn hostile_worker_text_cannot_inject_terminal_controls() {
+        let hostile = "Read(\u{1b}]52;c;ZXZpbA==\u{7}\u{1b}[2Jsrc/a.rs\u{8}\r\nSEND)";
+        let m = model(100);
+        for rows in [
+            vec![worker(hostile, SubagentRowState::Running, 1, &[hostile])],
+            vec![worker(hostile, SubagentRowState::Done, 1, &[hostile])],
+            vec![
+                worker(hostile, SubagentRowState::Running, 1, &[hostile]),
+                worker("second", SubagentRowState::Failed, 1, &[hostile]),
+            ],
+        ] {
+            let lines = entry_lines(&m, &Entry::Subagents(rows), m.width);
+            for line in &lines {
+                for span in &line.spans {
+                    assert!(
+                        !span.content.chars().any(|ch| ch.is_control()),
+                        "control byte reached a cell: {:?}",
+                        span.content
+                    );
+                }
+            }
+        }
     }
 
     #[test]
