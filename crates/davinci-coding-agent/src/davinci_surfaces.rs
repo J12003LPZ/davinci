@@ -534,6 +534,14 @@ pub fn agents_from_snapshots(
                 s.usage.source() == davinci_agent::subagent_progress::UsageSource::Estimated;
             row.cache_read = s.usage.cache_read;
             row.cache_write = s.usage.cache_write;
+            row.workspace = match (s.workspace.kind, &s.workspace.branch) {
+                (davinci_agent::runtime::WorkspaceKind::Shared, _) => "shared".into(),
+                (davinci_agent::runtime::WorkspaceKind::Unavailable, _) => "worktree gone".into(),
+                (_, Some(branch)) => format!("\u{2387} {branch}"),
+                (_, None) if s.workspace.detached => "\u{2387} detached".into(),
+                (_, None) => "\u{2387} worktree".into(),
+            };
+            row.workspace_detail = s.workspace.label();
             row.owned_paths = owned_paths;
             row.tool_count = s.tool_count;
             row.waiting_on = s.waiting_on.clone();

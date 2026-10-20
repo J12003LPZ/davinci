@@ -1507,6 +1507,11 @@ fn mid_turn_key(
     abort: &Arc<AtomicBool>,
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
+    // The roster and a worker's view own their keys first: Esc in a worker's
+    // view goes back to main and never reaches the interrupt below.
+    if davinci_tui::davinci::views::agent_focus::handle_key(model, key) {
+        return false;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if let Some(data) = davinci_tui::key_event_bytes(&key) {
         if model.keybindings.matches(&data, "davinci.tools.expand") {
@@ -1662,6 +1667,10 @@ fn run_turn(
     let mut last_tick = Instant::now();
     // The job book, read on every tick while the worker holds the agent.
     let jobs = agent.tool_context.jobs.clone();
+    // The runtime and roster feed, read the same way: the worker owns the
+    // agent for the turn, this loop owns the screen.
+    let roster_runtime = agent.runtime.clone();
+    let mut roster_host = crate::agent_roster_host::RosterHost::default();
     // The working line above the composer, for as long as the turn runs.
     let started = Instant::now();
     let verb_seed = model
@@ -1710,6 +1719,9 @@ fn run_turn(
                 model.dirty = true;
                 last_tick = Instant::now();
                 poll_jobs(&jobs, model);
+                if let Some(runtime) = &roster_runtime {
+                    roster_host.tick(runtime, model);
+                }
             }
             while let Ok(event) = event_rx.try_recv() {
                 apply(model, &mut turn, &event);
@@ -1853,7 +1865,11 @@ fn run_turn(
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {
-                        if mid_turn_key(model, key, &abort) {
+                        let hung = mid_turn_key(model, key, &abort);
+                        if let Some(runtime) = &roster_runtime {
+                            roster_host.pump(runtime, model);
+                        }
+                        if hung {
                             // The abort flag was already up and the worker is
                             // not answering it: a hung read holds it somewhere
                             // with no timeout left to fire. Give the terminal
@@ -4831,6 +4847,7 @@ pub fn run(
     let startup_settings =
         crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
     model.show_tool_output = startup_settings.show_tool_output.unwrap_or(false);
+    model.roster.enabled = startup_settings.agent_focus_ui.unwrap_or(true);
     model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(
         startup_settings.context_bar.as_deref().unwrap_or("compact"),
     );
@@ -4989,6 +5006,7 @@ pub fn run(
     // The `5a` sheet shows a run that is progressing on its own thread; it is
     // re-read from `graph-status` once a second while it is open.
     let mut last_graph_refresh = Instant::now();
+    let mut roster_host = crate::agent_roster_host::RosterHost::default();
     // The question the `Ask` instrument is currently putting, if any. It lives
     // here rather than in the model because only this module knows what the
     // rows mean.
@@ -5123,6 +5141,13 @@ pub fn run(
                 model.workflows_running = workflows;
                 model.dirty = true;
             }
+            if let Some(runtime) = &agent.runtime {
+                roster_host.tick(runtime, &mut model);
+            }
+        }
+        // A message typed in a worker's view goes out now, not on the next tick.
+        if let Some(runtime) = &agent.runtime {
+            roster_host.pump(runtime, &mut model);
         }
         // Lines shared code printed while the screen was ours belong in the
         // transcript, which is the only place a davinci shell can say anything

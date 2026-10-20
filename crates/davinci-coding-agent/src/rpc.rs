@@ -858,17 +858,19 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                     // the message; the controller alone checks freshness and
                     // delivers nothing.
                     let result_val = if action_name == "steer" {
-                        let outcome = controller.execute_steer(&runtime_handle.mailbox, cmd, true);
-                        let held = outcome.is_held();
+                        // The same journaled path the TUI's worker view uses.
+                        let (state, reason, message_id) =
+                            crate::agent_roster_host::steer_command(runtime_handle, cmd);
+                        let held = matches!(state.as_str(), "queued" | "delivered" | "applied");
                         serde_json::json!({
                             "operationId": op_id,
                             "agentId": agent_id.to_string(),
-                            "status": if held { "accepted" } else { outcome.state() },
+                            "status": if held { "accepted" } else { state.as_str() },
                             "action": "steer",
-                            "completed": !held || outcome.state() == "applied",
-                            "reason": outcome.reason(),
-                            "delivery": outcome.state(),
-                            "messageId": outcome.steering.as_ref().map(|s| s.message_id.to_string()),
+                            "completed": !held || state == "applied",
+                            "reason": reason,
+                            "delivery": state,
+                            "messageId": message_id,
                         })
                     } else {
                         let receipt = controller.execute_command(cmd, true);

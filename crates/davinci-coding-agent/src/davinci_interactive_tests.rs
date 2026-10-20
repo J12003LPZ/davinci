@@ -4459,3 +4459,51 @@ fn agents_msg_reaches_the_live_worker_mailbox() {
     assert_eq!(reply, "sent to scout");
     assert_eq!(runtime.mailbox.pending_count(&id), 1);
 }
+
+#[test]
+fn esc_in_a_worker_view_returns_to_main_and_never_interrupts_or_drops_the_queue() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use davinci_tui::davinci::model::AgentRow;
+    let mut model = model();
+    model.set_workers(vec![AgentRow::new(
+        "w1".to_string(),
+        "scout".to_string(),
+        State::Active,
+    )]);
+    model.queued.push("after this".into());
+    model.focus_agent("w1");
+    let abort = Arc::new(AtomicBool::new(false));
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+    // In the worker's view Esc only goes back.
+    assert!(!mid_turn_key(&mut model, esc, &abort));
+    assert!(
+        !abort.load(Ordering::Relaxed),
+        "Esc in a worker view interrupted the turn"
+    );
+    assert_eq!(model.viewing_worker(), None);
+    assert_eq!(model.queued, vec!["after this".to_string()]);
+
+    // On main it keeps interrupting, and the queued follow-up survives.
+    assert!(!mid_turn_key(&mut model, esc, &abort));
+    assert!(abort.load(Ordering::Relaxed));
+    assert_eq!(model.queued, vec!["after this".to_string()]);
+}
+
+#[test]
+fn the_roster_flag_reads_from_settings_and_defaults_on() {
+    let off: crate::settings::Settings =
+        serde_json::from_str(r#"{"agentFocusUi": false}"#).unwrap();
+    assert_eq!(off.agent_focus_ui, Some(false));
+    let unset: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+    assert_eq!(unset.agent_focus_ui.unwrap_or(true), true);
+    let mut model = model();
+    model.roster.enabled = off.agent_focus_ui.unwrap_or(true);
+    model.set_workers(vec![davinci_tui::davinci::model::AgentRow::new(
+        "w1".to_string(),
+        "scout".to_string(),
+        State::Active,
+    )]);
+    // Off: nothing of the roster is drawn or reachable.
+    assert!(!model.roster_visible());
+}

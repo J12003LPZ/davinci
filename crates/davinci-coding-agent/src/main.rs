@@ -1,5 +1,6 @@
 use davinci_coding_agent::agent_profiles;
 use davinci_coding_agent::args;
+mod agent_roster_host;
 mod auth_cmd;
 #[cfg(test)]
 mod browser_integration_tests;
@@ -8256,6 +8257,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
                 .filter(|count| (1..=256).contains(count));
         }
         "agent-teams" => stored.agent_teams = Some(value == "true"),
+        "agent-focus-ui" => stored.agent_focus_ui = Some(value == "true"),
         "codemode" => {
             // Keep any custom nodePath/hostPath; only the mode changes.
             let mut codemode = match stored.codemode.take() {
