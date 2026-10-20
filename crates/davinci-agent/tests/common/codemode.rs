@@ -1189,40 +1189,37 @@ fn read_only_broker_allows_bounded_parallel_children() {
     let mut context = broker_context(&agent);
     context.limits.parallelism = 2;
     let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
+    let call = |request_id| {
+        broker.call(CodeModeCall {
+            request_id,
+            tool: "read".into(),
+            args: json!({"path":"input.txt"}),
+        })
+    };
+    // Generous: a loaded CI runner may take seconds to schedule a thread. A
+    // passing run returns as soon as the event arrives.
+    let entered = || entered_rx.recv_timeout(std::time::Duration::from_secs(10));
     std::thread::scope(|scope| {
-        let first = scope.spawn(|| {
-            broker.call(CodeModeCall {
-                request_id: 1,
-                tool: "read".into(),
-                args: json!({"path":"input.txt"}),
-            })
-        });
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
-        let second = scope.spawn(|| {
-            broker.call(CodeModeCall {
-                request_id: 2,
-                tool: "read".into(),
-                args: json!({"path":"input.txt"}),
-            })
-        });
-        // Generous: a loaded CI runner may take seconds to schedule the thread. A passing run returns at once.
-        let second_entered = entered_rx.recv_timeout(std::time::Duration::from_secs(10));
-        release_tx.send(()).unwrap();
-        if second_entered.is_err() {
-            // Unblock the serialized second call so the regression exits cleanly.
-            entered_rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap();
-        }
-        release_tx.send(()).unwrap();
+        let first = scope.spawn(|| call(1));
+        entered().expect("first child enters");
+        let second = scope.spawn(|| call(2));
+        entered().expect("read-only children should overlap up to the parallelism limit");
+        // Two are held, which is the limit: a third must wait for a free slot.
+        let third = scope.spawn(|| call(3));
         assert!(
-            second_entered.is_ok(),
-            "read-only children should overlap up to the Codemode parallelism limit"
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a third child ran beside two held ones, past parallelism 2"
         );
+        // Freeing one slot lets the third in.
+        release_tx.send(()).unwrap();
+        entered().expect("the third child enters once a slot frees");
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
         assert!(first.join().unwrap().is_ok());
         assert!(second.join().unwrap().is_ok());
+        assert!(third.join().unwrap().is_ok());
     });
     assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
