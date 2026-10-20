@@ -44,6 +44,11 @@ pub struct ServerConfig {
     /// authorize tools. Discovery and project trust do not imply this opt-in.
     #[serde(default, rename = "trustReadOnlyHints")]
     pub trust_read_only_hints: bool,
+    /// Set by the host when the server came from the project's own `mcp.json`
+    /// (never read from a file). Lets the host stop exactly those servers when
+    /// trust in the project is withdrawn.
+    #[serde(skip)]
+    pub project_origin: bool,
 }
 
 impl ServerConfig {

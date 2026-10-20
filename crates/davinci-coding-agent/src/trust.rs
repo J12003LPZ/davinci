@@ -87,7 +87,6 @@ impl ProjectTrustStore {
         })
     }
 
-    #[allow(dead_code)]
     pub fn set(&self, cwd: &Path, decision: Option<bool>) -> Result<(), String> {
         self.set_many(&[ProjectTrustUpdate {
             path: canonicalize_trust_path(cwd),
@@ -117,6 +116,42 @@ impl ProjectTrustStore {
     }
 }
 
+/// Trust that global (user-owned) settings grant without a stored decision:
+/// a `trustedProjects` entry or `defaultProjectTrust: always`. A project cannot
+/// set either, so both count as the explicit trusted-host override.
+fn host_configured_trust(
+    cwd: &Path,
+    default_project_trust: Option<&str>,
+    trusted_projects: &[String],
+) -> bool {
+    let wanted = comparable_path(&canonicalize_trust_path(cwd));
+    if trusted_projects
+        .iter()
+        .any(|entry| comparable_path(&canonicalize_trust_path(Path::new(entry))) == wanted)
+    {
+        return true;
+    }
+    matches!(default_project_trust.unwrap_or("ask"), "always")
+}
+
+/// A path spelled so two spellings of one folder compare equal: no verbatim
+/// prefix, one separator, no trailing separator, and on Windows no case.
+fn comparable_path(path: &str) -> String {
+    let stripped = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let mut text = if cfg!(windows) {
+        stripped.replace('/', r"\").to_lowercase()
+    } else {
+        stripped.to_string()
+    };
+    while text.len() > 1 && (text.ends_with('/') || text.ends_with('\\')) {
+        if cfg!(windows) && text.len() == 3 && text.as_bytes()[1] == b':' {
+            break;
+        }
+        text.pop();
+    }
+    text
+}
+
 /// TS `resolveProjectTrusted` without the interactive ask / extension hook.
 pub fn resolve_project_trusted(
     agent_dir: &Path,
@@ -138,15 +173,167 @@ pub fn resolve_project_trusted(
         // `defaultProjectTrust` or `trustedProjects`.
         Err(_) => return false,
     }
-    let canonical = canonicalize_trust_path(cwd);
-    let display = cwd.to_string_lossy();
-    if trusted_projects
-        .iter()
-        .any(|path| path == &canonical || path.as_str() == display.as_ref())
-    {
-        return true;
+    host_configured_trust(cwd, default_project_trust, trusted_projects)
+}
+
+/// Stable machine-readable code for "project resources were not loaded because
+/// the folder is not trusted". Headless callers match on this string.
+pub const UNTRUSTED_PROJECT: &str = "UNTRUSTED_PROJECT";
+
+/// Who can answer a trust question for this launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMode {
+    /// A terminal user can be asked.
+    Interactive,
+    /// `--print`, `--mode json|rpc`, the SDK: nobody can be asked.
+    Headless,
+}
+
+/// What startup must do about project trust before any project-controlled
+/// resource (hooks, MCP servers, extensions, skills, packages) loads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustGateDecision {
+    /// Nothing to ask: no trust-requiring resources, a stored grant, a CLI
+    /// override, or a trusted-host setting. Project resources may load.
+    Preapproved,
+    /// An explicit denial is stored (or `--no-approve`). No prompt; project
+    /// resources stay unloaded.
+    Declined,
+    /// The user's global `defaultProjectTrust` is `never` and nothing is
+    /// stored for this folder: no prompt, resources stay unloaded.
+    Never,
+    /// Interactive launch with trust-requiring resources and no stored
+    /// decision: ask `No - Exit DaVinci` / `Yes, I trust this folder`.
+    Prompt,
+    /// Headless launch with trust-requiring resources and no grant: nobody can
+    /// be asked, so project resources stay unloaded and the caller reports
+    /// [`UNTRUSTED_PROJECT`].
+    Unavailable,
+    /// The trust store could not be read. Fails closed; the message names the
+    /// file and the parse or IO error.
+    StoreUnreadable(String),
+}
+
+/// Host-owned inputs to the trust decision. None of them can come from the
+/// project: the override is a CLI flag and the rest is global settings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustPolicy<'a> {
+    pub override_trust: Option<bool>,
+    pub default_project_trust: Option<&'a str>,
+    pub trusted_projects: &'a [String],
+}
+
+/// Decide, without side effects, whether startup must ask about `cwd`.
+pub fn preflight_project_trust(
+    agent_dir: &Path,
+    cwd: &Path,
+    policy: &TrustPolicy<'_>,
+    mode: HostMode,
+) -> TrustGateDecision {
+    if let Some(value) = policy.override_trust {
+        return if value {
+            TrustGateDecision::Preapproved
+        } else {
+            TrustGateDecision::Declined
+        };
     }
-    matches!(default_project_trust.unwrap_or("ask"), "always")
+    if !has_trust_requiring_project_resources(cwd) {
+        return TrustGateDecision::Preapproved;
+    }
+    match ProjectTrustStore::open(agent_dir).try_get(cwd) {
+        Ok(Some(true)) => return TrustGateDecision::Preapproved,
+        Ok(Some(false)) => return TrustGateDecision::Declined,
+        Ok(None) => {}
+        Err(message) => return TrustGateDecision::StoreUnreadable(message),
+    }
+    if host_configured_trust(cwd, policy.default_project_trust, policy.trusted_projects) {
+        return TrustGateDecision::Preapproved;
+    }
+    if policy.default_project_trust == Some("never") {
+        return TrustGateDecision::Never;
+    }
+    match mode {
+        HostMode::Interactive => TrustGateDecision::Prompt,
+        HostMode::Headless => TrustGateDecision::Unavailable,
+    }
+}
+
+/// The answer to the startup question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustGateChoice {
+    /// `No - Exit DaVinci`. The default.
+    Exit,
+    /// `Yes, I trust this folder`.
+    Trust,
+}
+
+/// Persist the startup answer to the canonical trust store (the same store
+/// `/trust` and `/setup trust` write), keyed by the canonical project path.
+pub fn record_gate_choice(
+    agent_dir: &Path,
+    cwd: &Path,
+    choice: TrustGateChoice,
+) -> Result<(), String> {
+    ProjectTrustStore::open(agent_dir).set(cwd, Some(choice == TrustGateChoice::Trust))
+}
+
+/// A structured report that project resources were left unloaded because the
+/// folder is not trusted. Headless entrypoints (print/json mode, RPC, the SDK)
+/// return this instead of dropping the resources silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustDiagnostic {
+    /// Always [`UNTRUSTED_PROJECT`].
+    pub code: &'static str,
+    /// Canonical project path.
+    pub path: String,
+    /// One line, starting with the code.
+    pub message: String,
+    /// What the host can do about it.
+    pub remediation: String,
+}
+
+impl TrustDiagnostic {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "code": self.code,
+            "path": self.path,
+            "message": self.message,
+            "remediation": self.remediation,
+        })
+    }
+}
+
+/// The diagnostic a headless caller owes for `decision`, or `None` when the
+/// project loads normally.
+pub fn trust_diagnostic(decision: &TrustGateDecision, cwd: &Path) -> Option<TrustDiagnostic> {
+    let path = canonicalize_trust_path(cwd);
+    let why = match decision {
+        TrustGateDecision::Preapproved => return None,
+        TrustGateDecision::Declined => "it is saved as Do not trust".to_string(),
+        TrustGateDecision::Never => "the global defaultProjectTrust setting is never".to_string(),
+        TrustGateDecision::Unavailable | TrustGateDecision::Prompt => {
+            "no trust decision is saved and there is nobody to ask".to_string()
+        }
+        TrustGateDecision::StoreUnreadable(error) => {
+            format!("the trust store cannot be read ({error})")
+        }
+    };
+    let remediation = "Trust the folder once from an interactive session, pass --approve, or set defaultProjectTrust to \"always\" (or list the folder under trustedProjects) in the global settings.".to_string();
+    Some(TrustDiagnostic {
+        code: UNTRUSTED_PROJECT,
+        message: format!(
+            "{UNTRUSTED_PROJECT}: {path} has project hooks, MCP servers, extensions, skills or packages that were not loaded: {why}. {remediation}"
+        ),
+        remediation,
+        path,
+    })
+}
+
+/// [`trust_diagnostic`] for a folder that is simply not trusted.
+pub fn untrusted_project_message(cwd: &Path) -> String {
+    trust_diagnostic(&TrustGateDecision::Unavailable, cwd)
+        .map(|diagnostic| diagnostic.message)
+        .unwrap_or_default()
 }
 
 pub fn canonicalize_trust_path(path: &Path) -> String {
@@ -164,10 +351,21 @@ pub fn get_project_trust_parent_path(cwd: &Path) -> Option<String> {
     let trust_path = PathBuf::from(canonicalize_trust_path(cwd));
     let parent = trust_path.parent()?;
     if parent == trust_path {
-        None
-    } else {
-        Some(parent.to_string_lossy().into_owned())
+        return None;
     }
+    // A grant on a drive root, or on the home directory or anything above it,
+    // would trust every unrelated project underneath. Offer no such option.
+    parent.parent()?;
+    // Without a known home directory the floor cannot be checked: offer
+    // nothing rather than a grant that might cover it.
+    let home = davinci_session::home_dir().filter(|home| !home.as_os_str().is_empty())?;
+    let home = comparable_path(&canonicalize_trust_path(&home));
+    let candidate = comparable_path(&parent.to_string_lossy());
+    let sep = if cfg!(windows) { '\\' } else { '/' };
+    if home == candidate || home.starts_with(&format!("{candidate}{sep}")) {
+        return None;
+    }
+    Some(parent.to_string_lossy().into_owned())
 }
 
 pub fn get_project_trust_options(
@@ -188,16 +386,13 @@ pub fn get_project_trust_options(
         options.push(ProjectTrustOption {
             label: format!("Trust parent folder ({parent_path})"),
             trusted: true,
-            updates: vec![
-                ProjectTrustUpdate {
-                    path: parent_path.clone(),
-                    decision: Some(true),
-                },
-                ProjectTrustUpdate {
-                    path: trust_path.clone(),
-                    decision: None,
-                },
-            ],
+            // Only the parent is written. Clearing the folder's own entry
+            // here used to erase a saved "Do not trust", which must outlive
+            // a broader grant above it.
+            updates: vec![ProjectTrustUpdate {
+                path: parent_path.clone(),
+                decision: Some(true),
+            }],
             saved_path: Some(parent_path),
         });
     }
@@ -229,21 +424,104 @@ pub fn get_project_trust_options(
     options
 }
 
+/// What a saved trust decision changes in a running session, and what needs a
+/// restart. `/reload` re-reads the store and re-discovers skills, prompts,
+/// agent profiles and context files; MCP servers, hooks, extensions and
+/// permission rules are built once at startup.
+pub fn trust_effect_note(trusted: bool) -> &'static str {
+    if trusted {
+        "/reload loads its skills and prompts now. Restart DaVinci to connect its MCP servers and load its hooks, extensions and permission rules."
+    } else {
+        "Its hooks and MCP servers stop now. /reload drops its skills and prompts. Restart DaVinci to drop its extensions and permission rules."
+    }
+}
+
+/// The line shown after a `/trust` choice is saved. It reads the store back,
+/// so a choice that did not change this folder's own decision says so (a
+/// broader grant above a saved "Do not trust" leaves the folder denied).
+pub fn describe_saved_choice(
+    agent_dir: &Path,
+    cwd: &Path,
+    label: &str,
+    trusted: bool,
+    persisted: bool,
+) -> String {
+    if !persisted {
+        return format!(
+            "not saved: {label} is a this-session-only choice and changes nothing on disk."
+        );
+    }
+    match ProjectTrustStore::open(agent_dir).try_get(cwd) {
+        Err(error) => format!("saved: {label}, but the trust store cannot be read back: {error}"),
+        Ok(Some(false)) if trusted => format!(
+            "saved: {label}. {} keeps its own saved Do not trust; choose Trust on that folder to override it.",
+            canonicalize_trust_path(cwd)
+        ),
+        Ok(_) => format!("saved: {label}. {}", trust_effect_note(trusted)),
+    }
+}
+
+/// The user's own `~/.agents/skills`, which is user config, not a project
+/// resource. `None` when the home directory is unknown: an empty home must not
+/// turn into a relative `.agents/skills` that matches the project's.
+fn user_agents_skills_dir() -> Option<String> {
+    let home = davinci_session::home_dir().filter(|path| !path.as_os_str().is_empty())?;
+    Some(canonicalize_trust_path(
+        &home.join(".agents").join("skills"),
+    ))
+}
+
+/// The canonical home directory, when known. The upward search for a
+/// project's `.agents/skills` stops there: what lives at or above the home
+/// directory is the user's, not the project's.
+fn user_home_key() -> Option<String> {
+    let home = davinci_session::home_dir().filter(|path| !path.as_os_str().is_empty())?;
+    Some(comparable_path(&canonicalize_trust_path(&home)))
+}
+
+/// Names of the project resources that make `cwd` ask for trust, for the
+/// startup question. Same list as [`has_trust_requiring_project_resources`].
+pub fn trust_requiring_project_resource_names(cwd: &Path) -> Vec<String> {
+    let current = PathBuf::from(canonicalize_trust_path(cwd));
+    let mut names: Vec<String> = TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES
+        .iter()
+        .filter(|name| crate::project_config::any_exists(&current, &[name]))
+        .map(|name| (*name).to_string())
+        .collect();
+    let user_agents_skills = user_agents_skills_dir();
+    let home = user_home_key();
+    let mut dir = Some(current.as_path());
+    while let Some(candidate) = dir {
+        if Some(comparable_path(&candidate.to_string_lossy())) == home {
+            break;
+        }
+        let agents_skills = canonicalize_trust_path(&candidate.join(".agents").join("skills"));
+        if Some(&agents_skills) != user_agents_skills.as_ref() && Path::new(&agents_skills).exists()
+        {
+            names.push(".agents/skills".to_string());
+            break;
+        }
+        dir = candidate.parent().filter(|parent| *parent != candidate);
+    }
+    names
+}
+
 /// TS `hasTrustRequiringProjectResources`.
 pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
-    let home = davinci_session::home_dir()
-        .map(|path| canonicalize_trust_path(&path))
-        .unwrap_or_default();
-    let user_agents_skills = PathBuf::from(&home).join(".agents").join("skills");
-    let user_agents_skills = canonicalize_trust_path(&user_agents_skills);
+    let user_agents_skills = user_agents_skills_dir();
+    let home = user_home_key();
     let mut current = PathBuf::from(canonicalize_trust_path(cwd));
     if crate::project_config::any_exists(&current, TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES) {
         return true;
     }
     loop {
+        if Some(comparable_path(&current.to_string_lossy())) == home {
+            return false;
+        }
         let agents_skills = current.join(".agents").join("skills");
         let agents_skills = canonicalize_trust_path(&agents_skills);
-        if agents_skills != user_agents_skills && Path::new(&agents_skills).exists() {
+        if Some(&agents_skills) != user_agents_skills.as_ref() && Path::new(&agents_skills).exists()
+        {
             return true;
         }
         let Some(parent) = current.parent() else {
@@ -388,6 +666,15 @@ mod tests {
         assert!(!options
             .iter()
             .any(|option| option.label.contains("session only")));
+        // Choosing the parent writes only the parent: the folder's own saved
+        // decision, if any, is never cleared by a broader grant.
+        let parent_option = options
+            .iter()
+            .find(|option| option.label.starts_with("Trust parent folder"))
+            .unwrap();
+        assert_eq!(parent_option.updates.len(), 1);
+        assert_eq!(parent_option.updates[0].decision, Some(true));
+        assert!(parent_option.updates.iter().all(|u| u.decision.is_some()));
         let with_session = get_project_trust_options(Path::new("/parent/project"), true);
         assert!(with_session
             .iter()
@@ -520,5 +807,316 @@ mod tests {
             Some("always"),
             &[]
         ));
+    }
+
+    fn project_with_hooks(root: &Path) -> PathBuf {
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(project.join(".pi").join("hooks.json"), "{}").unwrap();
+        project
+    }
+
+    fn policy<'a>(
+        override_trust: Option<bool>,
+        default: Option<&'a str>,
+        trusted: &'a [String],
+    ) -> TrustPolicy<'a> {
+        TrustPolicy {
+            override_trust,
+            default_project_trust: default,
+            trusted_projects: trusted,
+        }
+    }
+
+    #[test]
+    fn preflight_asks_only_when_resources_exist_and_no_decision_is_stored() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        let none = policy(None, None, &[]);
+        assert_eq!(
+            preflight_project_trust(&agent, &plain, &none, HostMode::Interactive),
+            TrustGateDecision::Preapproved
+        );
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Interactive),
+            TrustGateDecision::Prompt
+        );
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Headless),
+            TrustGateDecision::Unavailable
+        );
+    }
+
+    #[test]
+    fn preflight_honors_stored_grants_and_denials_without_asking() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let none = policy(None, None, &[]);
+        let store = ProjectTrustStore::open(&agent);
+        store.set(&project, Some(true)).unwrap();
+        for mode in [HostMode::Interactive, HostMode::Headless] {
+            assert_eq!(
+                preflight_project_trust(&agent, &project, &none, mode),
+                TrustGateDecision::Preapproved
+            );
+        }
+        store.set(&project, Some(false)).unwrap();
+        for mode in [HostMode::Interactive, HostMode::Headless] {
+            assert_eq!(
+                preflight_project_trust(&agent, &project, &none, mode),
+                TrustGateDecision::Declined
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_host_overrides_only_come_from_host_inputs() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(Some(true), None, &[]),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Preapproved
+        );
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(Some(false), Some("always"), &[]),
+                HostMode::Interactive
+            ),
+            TrustGateDecision::Declined
+        );
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(None, Some("always"), &[]),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Preapproved
+        );
+        let listed = [canonicalize_trust_path(&project)];
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(None, Some("ask"), &listed),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Preapproved
+        );
+    }
+
+    #[test]
+    fn preflight_stored_denial_beats_default_always() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(None, Some("always"), &[]),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Declined
+        );
+    }
+
+    #[test]
+    fn preflight_reports_an_unreadable_store_instead_of_asking() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json"), "{ not json").unwrap();
+        let decision = preflight_project_trust(
+            &agent,
+            &project,
+            &policy(None, Some("always"), &[]),
+            HostMode::Interactive,
+        );
+        match decision {
+            TrustGateDecision::StoreUnreadable(message) => {
+                assert!(message.contains("trust store"), "{message}");
+                assert!(message.contains("trust.json"), "{message}");
+            }
+            other => panic!("expected StoreUnreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recorded_gate_choices_persist_and_feed_the_next_preflight() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let none = policy(None, None, &[]);
+        record_gate_choice(&agent, &project, TrustGateChoice::Exit).unwrap();
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Interactive),
+            TrustGateDecision::Declined
+        );
+        record_gate_choice(&agent, &project, TrustGateChoice::Trust).unwrap();
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &none, HostMode::Interactive),
+            TrustGateDecision::Preapproved
+        );
+    }
+
+    #[test]
+    fn untrusted_project_diagnostic_leads_with_the_stable_code() {
+        let dir = tempdir().unwrap();
+        let project = project_with_hooks(dir.path());
+        assert!(untrusted_project_message(&project).starts_with("UNTRUSTED_PROJECT: "));
+        let diagnostic = trust_diagnostic(&TrustGateDecision::Declined, &project).unwrap();
+        assert_eq!(diagnostic.to_json()["code"], "UNTRUSTED_PROJECT");
+        assert_eq!(
+            diagnostic.to_json()["path"],
+            canonicalize_trust_path(&project)
+        );
+        assert!(diagnostic.message.contains("Do not trust"));
+        let unreadable = trust_diagnostic(
+            &TrustGateDecision::StoreUnreadable("bad trust.json".into()),
+            &project,
+        )
+        .unwrap();
+        assert!(unreadable.message.contains("bad trust.json"));
+        assert_eq!(
+            trust_diagnostic(&TrustGateDecision::Preapproved, &project),
+            None
+        );
+    }
+
+    #[test]
+    fn saved_choice_text_is_truthful_about_reload_and_denials() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let parent = dir.path().join("work");
+        let child = parent.join("repo");
+        fs::create_dir_all(&child).unwrap();
+        let store = ProjectTrustStore::open(&agent);
+        store.set(&child, Some(true)).unwrap();
+        let text = describe_saved_choice(&agent, &child, "Trust", true, true);
+        assert!(text.contains("/reload"), "{text}");
+        assert!(text.contains("Restart DaVinci"), "{text}");
+        assert!(!text.contains("next start"), "{text}");
+        // A parent grant over a saved denial does not change the folder.
+        store.set(&child, Some(false)).unwrap();
+        store.set(&parent, Some(true)).unwrap();
+        let text = describe_saved_choice(&agent, &child, "Trust parent folder", true, true);
+        assert!(text.contains("keeps its own saved Do not trust"), "{text}");
+        let text = describe_saved_choice(&agent, &child, "Do not trust", false, true);
+        assert!(text.contains("MCP servers stop now"), "{text}");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json"), "{ nope").unwrap();
+        assert!(
+            describe_saved_choice(&agent, &child, "Trust", true, true).contains("cannot be read")
+        );
+    }
+
+    #[test]
+    fn default_never_denies_without_asking_but_a_stored_grant_still_wins() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let never = policy(None, Some("never"), &[]);
+        for mode in [HostMode::Interactive, HostMode::Headless] {
+            assert_eq!(
+                preflight_project_trust(&agent, &project, &never, mode),
+                TrustGateDecision::Never
+            );
+        }
+        let diagnostic = trust_diagnostic(&TrustGateDecision::Never, &project).unwrap();
+        assert!(
+            diagnostic.message.contains("never"),
+            "{}",
+            diagnostic.message
+        );
+        ProjectTrustStore::open(&agent)
+            .set(&project, Some(true))
+            .unwrap();
+        assert_eq!(
+            preflight_project_trust(&agent, &project, &never, HostMode::Interactive),
+            TrustGateDecision::Preapproved
+        );
+    }
+
+    #[test]
+    fn trusted_projects_match_any_spelling_of_the_folder() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = project_with_hooks(dir.path());
+        let canonical = canonicalize_trust_path(&project);
+        let mut spellings = vec![
+            format!("{canonical}/"),
+            format!("{canonical}{}", std::path::MAIN_SEPARATOR),
+        ];
+        if cfg!(windows) {
+            spellings.push(canonical.replace('\\', "/"));
+            spellings.push(canonical.to_uppercase());
+            spellings.push(canonical.to_lowercase());
+            spellings.push(format!(r"\\?\{canonical}"));
+        }
+        for spelling in spellings {
+            let listed = [spelling.clone()];
+            assert_eq!(
+                preflight_project_trust(
+                    &agent,
+                    &project,
+                    &policy(None, Some("ask"), &listed),
+                    HostMode::Headless
+                ),
+                TrustGateDecision::Preapproved,
+                "{spelling}"
+            );
+        }
+        // A sibling or a parent is not the folder.
+        let other = [canonicalize_trust_path(dir.path())];
+        assert_eq!(
+            preflight_project_trust(
+                &agent,
+                &project,
+                &policy(None, Some("ask"), &other),
+                HostMode::Headless
+            ),
+            TrustGateDecision::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_choice_that_is_not_persisted_says_not_saved() {
+        let dir = tempdir().unwrap();
+        let text = describe_saved_choice(
+            dir.path(),
+            dir.path(),
+            "Trust (this session only)",
+            true,
+            false,
+        );
+        assert!(text.starts_with("not saved:"), "{text}");
+        assert!(!text.contains("/reload"), "{text}");
+    }
+
+    #[test]
+    fn a_root_level_parent_is_not_offered() {
+        let root = Path::new(if cfg!(windows) {
+            r"C:\project"
+        } else {
+            "/project"
+        });
+        assert_eq!(get_project_trust_parent_path(root), None);
     }
 }

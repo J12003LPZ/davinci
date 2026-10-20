@@ -239,6 +239,11 @@ fn cd_runs_the_agent_and_its_session_in_the_named_directory() {
             "-p",
             "write the marker",
         ])
+        // The project search stops at the home directory. Home is the test
+        // root so a real `~/.agents/skills` above the temp dir is not a
+        // project resource of this fixture.
+        .env("HOME", root.path())
+        .env("USERPROFILE", root.path())
         .env(
             "PI_OFFLINE_TOOL_CALL",
             json!({"name": "write", "arguments": {"path": "marker.txt", "content": "here"}})

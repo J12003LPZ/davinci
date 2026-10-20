@@ -315,17 +315,26 @@ pub fn embed_backlog(memory: &Arc<Mutex<VectorMemory>>) -> usize {
 }
 
 fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|directory| {
-        let plain = directory.join(program);
-        let mut candidates = vec![plain.clone()];
-        if cfg!(windows) {
-            for extension in ["exe", "cmd", "bat"] {
-                candidates.push(plain.with_extension(extension));
+    find_in_paths(program, &std::env::var_os("PATH")?)
+}
+
+/// First `program` in `path_var`. Only absolute directories count: a relative
+/// entry (`.`, or an empty one) resolves against the process working
+/// directory, which is the project, so a project could plant the executable
+/// that `/setup` then starts.
+fn find_in_paths(program: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .filter(|directory| directory.is_absolute())
+        .find_map(|directory| {
+            let plain = directory.join(program);
+            let mut candidates = vec![plain.clone()];
+            if cfg!(windows) {
+                for extension in ["exe", "cmd", "bat"] {
+                    candidates.push(plain.with_extension(extension));
+                }
             }
-        }
-        candidates.into_iter().find(|candidate| candidate.is_file())
-    })
+            candidates.into_iter().find(|candidate| candidate.is_file())
+        })
 }
 
 /// Only a local Ollama is ever started; a remote URL is the user's server.
@@ -723,7 +732,17 @@ pub fn trust_step(agent_dir: &Path, cwd: &Path) -> Step {
             "you chose not to trust this project; its .davinci/.pi resources stay off".into(),
         )
         .with_action("/setup trust to change that"),
-        _ => Step::new(
+        // The store may hold a decision we cannot read. Say so with the
+        // reader's own message (it names the file) instead of the generic
+        // "not trusted" text, and do not offer a grant that cannot be saved.
+        Err(error) => Step::new(
+            ID,
+            TITLE,
+            StepState::Action,
+            format!("the trust store cannot be read, so this project stays untrusted: {error}"),
+        )
+        .with_action("fix or remove that file, then /setup trust"),
+        Ok(_) => Step::new(
             ID,
             TITLE,
             StepState::Action,
@@ -741,7 +760,7 @@ pub fn trust_project(agent_dir: &Path, cwd: &Path) -> Step {
             StepState::Done,
             format!("trusted {}", crate::trust::display_path(cwd)),
         )
-        .with_action("restart davinci to load the project's resources"),
+        .with_action("/reload loads its skills and prompts; restart davinci for MCP servers, hooks and extensions"),
         Err(error) => Step::new(
             "trust",
             "project trust",
@@ -1053,6 +1072,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_trust_store_is_reported_not_swallowed() {
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".davinci")).unwrap();
+        std::fs::write(project.path().join(".davinci").join("hooks.json"), "{}").unwrap();
+        std::fs::write(agent.path().join("trust.json"), "{ not json").unwrap();
+
+        let step = trust_step(agent.path(), project.path());
+        assert_eq!(step.state, StepState::Action, "{}", step.detail);
+        assert!(step.detail.contains("trust.json"), "{}", step.detail);
+        assert!(step.detail.contains("cannot be read"), "{}", step.detail);
+        // The damaged file is left for the user to inspect.
+        assert_eq!(
+            std::fs::read_to_string(agent.path().join("trust.json")).unwrap(),
+            "{ not json"
+        );
+        // Granting trust cannot paper over it either.
+        let granted = trust_project(agent.path(), project.path());
+        assert_eq!(granted.state, StepState::Action);
+        assert!(granted.detail.contains("trust.json"), "{}", granted.detail);
+    }
+
+    #[test]
     fn a_project_without_language_markers_skips_language_servers() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(language_step(dir.path(), true).state, StepState::Skipped);
@@ -1168,6 +1210,92 @@ mod tests {
             }
         });
         format!("http://{address}")
+    }
+
+    /// An Ollama stand-in that records every request line it is sent.
+    fn recording_ollama(requests: Arc<Mutex<Vec<String>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let request = super::super::vector_memory::tests::read_http_request(&mut stream);
+                requests
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_string());
+                let body = json!({"models": []}).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn folder_trust_does_not_grant_service_start() {
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".davinci")).unwrap();
+        std::fs::write(project.path().join(".davinci").join("hooks.json"), "{}").unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let url = recording_ollama(Arc::clone(&requests));
+        let memory_dir = tempfile::tempdir().unwrap();
+        let memory = memory_with(memory_dir.path(), url);
+
+        // Granting trust, and reading the trust state back, touch no service.
+        assert_eq!(
+            trust_project(agent.path(), project.path()).state,
+            StepState::Done
+        );
+        assert_eq!(
+            trust_step(agent.path(), project.path()).state,
+            StepState::Ready
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "trusting a folder reached the embedding service: {:?}",
+            requests.lock().unwrap()
+        );
+
+        // With the folder trusted, a check still only observes: it probes the
+        // server (model list, one test embedding) and neither pulls a model
+        // nor starts a server.
+        let checked = memory_step(&memory, false);
+        assert_eq!(checked.state, StepState::Action, "{}", checked.detail);
+        let seen = requests.lock().unwrap().clone();
+        assert!(
+            !seen.iter().any(|line| line.contains("/api/pull")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_entry_cannot_supply_the_executable_setup_starts() {
+        // `Cargo.toml` sits in the test's working directory (the crate root),
+        // which is what `.` and an empty entry mean to a launched process.
+        let relative =
+            std::env::join_paths([std::path::Path::new("."), std::path::Path::new("")]).unwrap();
+        assert_eq!(find_in_paths("Cargo.toml", &relative), None);
+        let absolute = std::env::join_paths([
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        ])
+        .unwrap();
+        assert_eq!(
+            find_in_paths("Cargo.toml", &absolute),
+            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        );
     }
 
     #[test]

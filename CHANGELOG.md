@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+- Strict project trust. Before any project hook, MCP server, extension, skill or package loads, an interactive launch in a folder with such resources and no stored decision asks `No - Exit DaVinci` (default) or `Yes, I trust this folder`. No stores a denial and exits cleanly. Headless launches (print, json, RPC, SDK) do not prompt: they load project resources only with a stored grant, `--approve`, or the global `defaultProjectTrust: always` / `trustedProjects`, and report `UNTRUSTED_PROJECT` otherwise (stderr, an RPC notify event plus `get_state`, `CreateAgentSessionResult::project_trust_diagnostic`). `davinci update` and `davinci install -l` and graph verification respect trust. Esc, Ctrl+C and terminal errors at the question store nothing; `defaultProjectTrust: "never"` skips the question and leaves the project unloaded; json mode prints a `project_trust` event; "Trust parent folder" is refused for a drive root or the home directory; `trustedProjects` entries compare in canonical form. After `/trust` deny, `/reload` stops project MCP servers and project hooks check the store on every run. A host-owned `service-consent.json` (all false by default) is the seam for `/setup` service start. See `docs/project-trust.md`.
+
+### Changed
+- A trusted project's `permissions.mode` can tighten the approval mode but no longer loosen it past the mode in your own settings (warning at startup, row in `/permissions`). `/setup` ignores relative `PATH` entries when looking for `ollama`.
+
+### Fixed
+- Withdrawing project trust stops the project's MCP servers by origin: `/trust` "Do not trust" stops them at once and `/reload` does the same, even if `mcp.json` was renamed or broken. A user or plugin server with the same name is never stopped. `remove -l` needs a trusted project like `install -l`. Project hooks check trust live on the legacy hook path too. "Trust parent folder" is not offered when the home directory is unknown.
+- "Trust parent folder" no longer erases a folder's saved "Do not trust". `/setup` shows an unreadable trust store's error instead of "not trusted".
+
 ### Changed
 - OpenAI has two logins, not three: `openai` (API key) and `openai-codex` (OAuth). `/login openai-codex` now signs in with the Codex CLI OAuth client and requests go to the ChatGPT Codex backend, the route Codex CLI uses. `/login openai-codex-backend` and the Sign in with ChatGPT login flow are removed from the provider list. A Sign in with ChatGPT login stored by an earlier build keeps working on the documented route until `/login openai-codex` replaces it. Model catalog refresh and the plan-account email check still read a Sign in with ChatGPT token, so they are skipped for a Codex CLI login and the built-in catalog is used. Not live-tested from DaVinci. See `docs/cache/chatgpt-backend-route.md`.
 

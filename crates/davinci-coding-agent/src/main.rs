@@ -127,6 +127,7 @@ mod slash;
 mod startup;
 mod tools_manager;
 use davinci_coding_agent::trust;
+mod trust_gate;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -624,6 +625,23 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         }
     };
 
+    // Before the session directory, migrations or the agent: nothing the
+    // project controls (hooks, MCP servers, extensions, skills) loads until
+    // trust is settled.
+    let gate_mode = if print_mode || parsed.mode == Some(Mode::Rpc) {
+        trust::HostMode::Headless
+    } else {
+        trust::HostMode::Interactive
+    };
+    if let trust_gate::GateOutcome::Exit(code) = trust_gate::enforce_startup_trust(
+        &default_agent_dir(),
+        &cwd,
+        parsed.project_trust_override,
+        gate_mode,
+        parsed.mode == Some(Mode::Json),
+    ) {
+        return Ok(code);
+    }
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
     // `DAVINCI_MCP_BLOCKING=1` waits for the servers before the first frame.
@@ -974,6 +992,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         );
         for warning in warnings {
             eprintln!("Warning: {warning}");
+        }
+        if let Some(ignored) = permission_sources
+            .ignored_project_mode()
+            .filter(|_| parsed.permission_mode.is_none())
+        {
+            eprintln!(
+                "Warning: this project asks for {} approvals; a project can tighten the permission mode but not loosen it, so it is ignored",
+                ignored.label()
+            );
         }
         policy.filesystem_boundary.extra_roots = roots;
     }
@@ -3228,11 +3255,15 @@ fn complete_prompt_with_host(
     )));
 
     let pre_hooks = user_hooks.clone();
+    let pre_cwd = agent.cwd.clone();
+    let pre_agent_dir = default_agent_dir();
     let pre_plugin_hooks = plugin_hooks.clone();
     let pre_plugin_base = plugin_hook_base.clone();
     agent.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, args| {
         if std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
-            if let Some(reason) = hooks::run_pre_tool(&pre_hooks, name, args) {
+            if let Some(reason) =
+                hooks::run_pre_tool_live(&pre_hooks, &pre_cwd, &pre_agent_dir, name, args)
+            {
                 return Some(reason);
             }
         }
@@ -4112,6 +4143,7 @@ fn run_print_turns(
         if let Some(session) = &agent.session {
             print!("{}", encode_header(&session.header));
         }
+        trust_gate::flush_pending_json_event();
         write_prompt_manifest_json_event(agent)?;
     }
     let mut approval_required = None;
@@ -4599,6 +4631,34 @@ fn run_rpc_with_host(
         cwd,
         available_models(parsed),
     );
+    let (project_trusted, trust_diagnostic) = trust_gate::headless_trust_report(
+        &default_agent_dir(),
+        &runtime.cwd,
+        parsed.project_trust_override,
+    );
+    runtime.project_trusted = project_trusted;
+    if let Some(diagnostic) = &trust_diagnostic {
+        // A known event type with extra fields, so existing clients keep
+        // working and new ones can match on `code`.
+        let mut notice = rpc::extension_ui_request(
+            &uuid::Uuid::new_v4().to_string(),
+            "notify",
+            serde_json::json!({
+                "message": diagnostic.message,
+                "notifyType": "warning",
+                "code": diagnostic.code,
+                "path": diagnostic.path,
+            }),
+        );
+        if let Some(object) = notice.as_object_mut() {
+            object.insert("diagnostic".into(), diagnostic.to_json());
+        }
+        output::write_raw_stdout_line(
+            &serde_json::to_string(&notice).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    runtime.project_trust_diagnostic = trust_diagnostic;
     host.lock()
         .unwrap_or_else(|err| err.into_inner())
         .emit(ExtensionEvent::SessionStart);
@@ -6960,6 +7020,16 @@ fn apply_session_action(
         }
         SessionAction::SelectTrust { trusted, updates } => {
             apply_trust_decision(session, trusted, &updates)?;
+            // A denial takes effect now, through the same path /reload uses.
+            let settings = load_merged_settings_with_override(
+                &default_agent_dir(),
+                &agent.cwd,
+                parsed.project_trust_override,
+            );
+            let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+            if project_mcp_withdrawn(parsed, &agent.cwd, trusted) {
+                stop_project_mcp_servers(agent);
+            }
             Ok(true)
         }
         SessionAction::SelectThinking(level) => apply_thinking_level(agent, session, &level, false),
@@ -9766,6 +9836,31 @@ fn run_plugin_completion_hooks(
     result.block
 }
 
+/// Stop the MCP servers that came from the project's own `mcp.json`, judged
+/// by the origin recorded when they connected (not by re-reading the file, so
+/// a renamed or broken file changes nothing). A user or plugin server with the
+/// same name is left alone. Shared by `/reload` and `/trust`.
+fn stop_project_mcp_servers(agent: &mut Agent) {
+    if agent.tool_context.mcp.disconnect_project() > 0 {
+        agent.refresh_mcp();
+    }
+}
+
+/// Whether project MCP servers must not keep running: the folder is not
+/// trusted, or a "Do not trust" is stored (or the store cannot be read) even
+/// though the folder no longer shows any resource that would need trust, for
+/// example after its `mcp.json` was renamed away while the server ran.
+fn project_mcp_withdrawn(parsed: &Args, cwd: &Path, trusted: bool) -> bool {
+    if parsed.project_trust_override == Some(true) {
+        return false;
+    }
+    !trusted
+        || !matches!(
+            ProjectTrustStore::open(&default_agent_dir()).try_get(cwd),
+            Ok(None) | Ok(Some(true))
+        )
+}
+
 fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
@@ -9773,6 +9868,11 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         parsed.project_trust_override,
     );
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    if project_mcp_withdrawn(parsed, &agent.cwd, trusted) {
+        // Trust withdrawn (or never given): the project's MCP servers must not
+        // keep running just because they connected before the decision.
+        stop_project_mcp_servers(agent);
+    }
     let plugins = davinci_coding_agent::plugins::active(&default_agent_dir());
     // What `run_nested_subagent` resolves, in the same precedence, so the
     // `agent` tool schema names every profile a call can start.
@@ -10665,8 +10765,9 @@ fn apply_trust_decision(
         .collect();
     store.set_many(&mapped)?;
     session.chrome.status = format!(
-        "Saved trust decision: {}. Restart pi for this to take effect.",
-        if trusted { "trusted" } else { "untrusted" }
+        "Saved trust decision: {}. {}",
+        if trusted { "trusted" } else { "untrusted" },
+        trust::trust_effect_note(trusted)
     );
     println!("{}", session.chrome.status);
     Ok(())
@@ -10681,7 +10782,7 @@ fn apply_project_trust_warning(session: &mut InteractiveSession, parsed: &Args, 
     }
     session.chrome.transcript.push(
         "warning",
-        "This project is not trusted. Project .pi resources and packages are ignored. Use /trust to save a trust decision, then restart pi.",
+        "This project is not trusted. Project .pi resources and packages are ignored. Use /trust to save a trust decision, then /reload or restart pi.",
     );
 }
 

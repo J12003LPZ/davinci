@@ -16,6 +16,7 @@ pub mod memory_page;
 pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
+pub mod service_authority;
 pub mod setup;
 pub mod test_impact;
 pub mod token_governor;
@@ -399,9 +400,7 @@ impl NativeExtensionHost {
         ) {
             governor_config.store_dir = Some(dir.join("token-governor"));
         }
-        let memory_config = agent_dir
-            .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
-            .unwrap_or_else(VectorMemoryConfig::from_env);
+        let memory_config = host_memory_config(agent_dir);
         let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
         let _ = governor_value.sweep_stale_outputs();
         let governor = Arc::new(Mutex::new(governor_value));
@@ -1184,6 +1183,15 @@ impl NativeExtensionHost {
         }
         specs
     }
+}
+
+/// The memory service config. It comes from the host's agent directory (or
+/// the environment), never from the project: a repository must not be able to
+/// point the embedding client at a server or switch on a service start.
+fn host_memory_config(agent_dir: Option<&Path>) -> VectorMemoryConfig {
+    agent_dir
+        .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
+        .unwrap_or_else(VectorMemoryConfig::from_env)
 }
 
 #[cfg(test)]

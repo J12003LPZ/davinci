@@ -3607,6 +3607,221 @@ fn extension_reload_does_not_load_untrusted_project_skills() {
 }
 
 #[test]
+fn project_switch_and_reload_recheck_trust() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _davinci_agent_dir =
+        EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let project = |name: &str| {
+        let root = dir.path().join(name);
+        let skill = root
+            .join(".pi")
+            .join("skills")
+            .join(format!("{name}-skill"));
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---
+name: {name}-skill
+description: x
+---
+# x
+"
+            ),
+        )
+        .unwrap();
+        root
+    };
+    let (a, b) = (project("alpha"), project("beta"));
+    let store = ProjectTrustStore::open(&agent_dir);
+    let parsed = Args::default();
+    let skills = |agent: &Agent| -> Vec<String> {
+        let mut names: Vec<String> = agent
+            .skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+        names.retain(|name| name.ends_with("-skill"));
+        names.sort();
+        names
+    };
+    let mut agent = Agent::new("x");
+
+    // No decision: neither project's skills load.
+    agent.cwd = a.clone();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+
+    // A grant is read live on reload, with no restart.
+    store.set(&a, Some(true)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert_eq!(skills(&agent), ["alpha-skill"]);
+
+    // Switching to another root applies that root's decision and keeps nothing
+    // of the previous one.
+    agent.cwd = b.clone();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+    store.set(&b, Some(true)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert_eq!(skills(&agent), ["beta-skill"]);
+
+    // A revoked grant drops the skills on the next reload.
+    store.set(&b, Some(false)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+
+    // An explicit child denial beats a trusted parent on reload.
+    store.set(dir.path(), Some(true)).unwrap();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert!(skills(&agent).is_empty(), "{:?}", skills(&agent));
+    agent.cwd = a.clone();
+    apply_discovered_resources(&parsed, &mut agent);
+    assert_eq!(skills(&agent), ["alpha-skill"]);
+}
+
+#[test]
+fn revoking_trust_and_reloading_stops_the_projects_mcp_servers() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _a = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _b = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    let fixture = dir.path().join("server.json");
+    std::fs::write(
+        &fixture,
+        r#"{"initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+            "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".pi").join("mcp.json"),
+        serde_json::json!({"mcpServers": {"planted": {"url": format!("fixture:{}", fixture.display())}}})
+            .to_string(),
+    )
+    .unwrap();
+    let store = ProjectTrustStore::open(&agent_dir);
+    store.set(&project, Some(true)).unwrap();
+
+    let mut agent = Agent::new("x");
+    agent.cwd = project.clone();
+    let config = mcp::load(&agent_dir, &project, true, false);
+    agent.attach_mcp(davinci_agent::McpRegistry::connect(&config, &project));
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__planted__ping"]);
+
+    // Still trusted: a reload keeps it.
+    apply_discovered_resources(&Args::default(), &mut agent);
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__planted__ping"]);
+
+    // "Do not trust", then /reload: the server is gone, not merely hidden,
+    // even though the file that configured it has been renamed away.
+    std::fs::rename(
+        project.join(".pi").join("mcp.json"),
+        project.join(".pi").join("mcp.json.gone"),
+    )
+    .unwrap();
+    store.set(&project, Some(false)).unwrap();
+    apply_discovered_resources(&Args::default(), &mut agent);
+    assert!(agent.tool_context.mcp.tool_names().is_empty());
+    assert!(agent.tool_context.mcp.rows().is_empty());
+}
+
+fn project_and_user_mcp_fixture(
+    dir: &std::path::Path,
+    agent_dir: &std::path::Path,
+) -> (std::path::PathBuf, Agent) {
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    std::fs::create_dir_all(agent_dir).unwrap();
+    let fixture = dir.join("server.json");
+    std::fs::write(
+        &fixture,
+        r#"{"initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+            "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}}"#,
+    )
+    .unwrap();
+    let entry = |name: &str| {
+        serde_json::json!({"mcpServers": {name: {"url": format!("fixture:{}", fixture.display())}}})
+            .to_string()
+    };
+    // The user and the project both name a server "shared"; the project also
+    // has its own "planted".
+    std::fs::write(agent_dir.join("mcp.json"), entry("shared")).unwrap();
+    let both = serde_json::json!({"mcpServers": {
+        "shared": {"url": format!("fixture:{}", fixture.display())},
+        "planted": {"url": format!("fixture:{}", fixture.display())}}});
+    std::fs::write(project.join(".pi").join("mcp.json"), both.to_string()).unwrap();
+    let mut agent = Agent::new("x");
+    agent.cwd = project.clone();
+    (project, agent)
+}
+
+#[test]
+fn a_user_mcp_server_named_like_a_project_entry_survives_a_denial() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _a = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _b = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let (project, mut agent) = project_and_user_mcp_fixture(dir.path(), &agent_dir);
+
+    // Untrusted at startup: only the user's "shared" connects.
+    let config = mcp::load(&agent_dir, &project, false, false);
+    agent.attach_mcp(davinci_agent::McpRegistry::connect(&config, &project));
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__shared__ping"]);
+    ProjectTrustStore::open(&agent_dir)
+        .set(&project, Some(false))
+        .unwrap();
+    apply_discovered_resources(&Args::default(), &mut agent);
+    assert_eq!(agent.tool_context.mcp.tool_names(), ["mcp__shared__ping"]);
+}
+
+#[test]
+fn trust_deny_stops_project_mcp_servers_at_once() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _a = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _b = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let (project, mut agent) = project_and_user_mcp_fixture(dir.path(), &agent_dir);
+    ProjectTrustStore::open(&agent_dir)
+        .set(&project, Some(true))
+        .unwrap();
+    let config = mcp::load(&agent_dir, &project, true, false);
+    agent.attach_mcp(davinci_agent::McpRegistry::connect(&config, &project));
+    assert_eq!(
+        agent.tool_context.mcp.tool_names(),
+        ["mcp__planted__ping", "mcp__shared__ping"]
+    );
+
+    // The /trust "Do not trust" action, no /reload afterwards.
+    let (parsed, _, mut session) = test_session();
+    let action = SessionAction::SelectTrust {
+        trusted: false,
+        updates: vec![TrustUpdate {
+            path: project.to_string_lossy().into_owned(),
+            decision: Some(false),
+        }],
+    };
+    apply_session_action(&parsed, &mut agent, &mut session, action, None).unwrap();
+    assert!(agent.tool_context.mcp.tool_names().is_empty());
+    assert!(session.chrome.status.contains("MCP servers stop now"));
+}
+
+#[test]
 fn suspend_dry_run_sets_status() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()
