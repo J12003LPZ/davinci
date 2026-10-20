@@ -222,11 +222,48 @@ impl ProgressReporter {
 
     /// The worker exists; draw its row before its first tool call.
     pub fn started(&self) {
+        let label = self.snapshot().label;
+        self.note(
+            crate::runtime::WorkerActivityKind::Started,
+            None,
+            &format!("started {label}"),
+            None,
+        );
         self.update(|_| {});
     }
 
+    /// Add one entry to the worker's activity history, when it has one.
+    fn note(
+        &self,
+        kind: crate::runtime::WorkerActivityKind,
+        tool_call_id: Option<&str>,
+        summary: &str,
+        outcome: Option<&str>,
+    ) {
+        if let Some((registry, agent_id)) = &self.registry {
+            registry.activity().append(
+                *agent_id,
+                registry.get_generation(agent_id),
+                kind,
+                tool_call_id,
+                summary,
+                outcome,
+            );
+        }
+    }
+
     pub fn tool_started(&self, tool_name: &str, args: &Value) {
+        self.tool_started_with_id(None, tool_name, args);
+    }
+
+    fn tool_started_with_id(&self, tool_call_id: Option<&str>, tool_name: &str, args: &Value) {
         let summary = call_summary(tool_name, args);
+        self.note(
+            crate::runtime::WorkerActivityKind::ToolStarted,
+            tool_call_id,
+            &summary,
+            None,
+        );
         self.update(|progress| {
             progress.tool_uses += 1;
             progress.recent.push(summary);
@@ -326,6 +363,12 @@ impl ProgressReporter {
                 inner.frozen_ms = Some(inner.started.elapsed().as_millis() as u64);
             }
         }
+        self.note(
+            crate::runtime::WorkerActivityKind::Finished,
+            None,
+            if success { "finished" } else { "failed" },
+            Some(if success { "done" } else { "failed" }),
+        );
         self.update(|progress| {
             progress.state = if success {
                 SubagentProgressState::Done
@@ -339,8 +382,21 @@ impl ProgressReporter {
     pub fn observe(&self, event: &AgentEvent) {
         match event {
             AgentEvent::ToolExecutionStart {
-                tool_name, args, ..
-            } => self.tool_started(tool_name, args),
+                tool_call_id,
+                tool_name,
+                args,
+            } => self.tool_started_with_id(Some(tool_call_id), tool_name, args),
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                is_error,
+                ..
+            } => self.note(
+                crate::runtime::WorkerActivityKind::ToolFinished,
+                Some(tool_call_id),
+                tool_name,
+                Some(if *is_error { "error" } else { "ok" }),
+            ),
             AgentEvent::MessageUpdate { message, .. } if message.role == "assistant" => {
                 self.streaming(message)
             }

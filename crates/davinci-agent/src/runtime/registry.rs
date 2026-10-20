@@ -72,9 +72,15 @@ pub struct RuntimeRegistry {
     /// call, and the time it stopped counting. One source for the TUI roster,
     /// RPC and the `/agents` sheet.
     progress: Arc<RwLock<HashMap<AgentId, crate::subagent_progress::SubagentProgress>>>,
+    /// Bounded, sanitized per-worker activity, shared by every clone.
+    activity: super::worker_activity::WorkerActivityStore,
 }
 
 impl RuntimeRegistry {
+    pub fn activity(&self) -> &super::worker_activity::WorkerActivityStore {
+        &self.activity
+    }
+
     /// Keep a worker's newest progress next to its record.
     pub fn set_progress(&self, id: AgentId, progress: crate::subagent_progress::SubagentProgress) {
         if let Ok(mut map) = self.progress.write() {
@@ -114,6 +120,7 @@ impl RuntimeRegistry {
             last_activity_ms: Arc::new(RwLock::new(HashMap::new())),
             tool_counts: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
+            activity: super::worker_activity::WorkerActivityStore::new(),
         }
     }
 
@@ -127,6 +134,7 @@ impl RuntimeRegistry {
             last_activity_ms: Arc::new(RwLock::new(HashMap::new())),
             tool_counts: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
+            activity: super::worker_activity::WorkerActivityStore::new(),
         }
     }
 

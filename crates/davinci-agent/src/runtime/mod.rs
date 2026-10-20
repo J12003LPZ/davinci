@@ -34,6 +34,7 @@ pub mod session;
 pub mod source_manifest;
 mod task_migration;
 pub mod transactions;
+pub mod worker_activity;
 pub use task_migration::LegacyTaskRecovery;
 pub mod task_store;
 pub mod task_transport;
@@ -123,6 +124,9 @@ pub use tasks::{
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{
     task_create_tool, task_get_tool, task_list_tool, task_tool_specs, task_update_tool,
+};
+pub use worker_activity::{
+    ActivityPage, WorkerActivityEvent, WorkerActivityKind, WorkerActivityStore,
 };
 pub use workflow::{
     find_saved_workflow, is_mutating_tool, is_mutating_tool_with_registry,
