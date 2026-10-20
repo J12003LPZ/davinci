@@ -6,6 +6,7 @@
 //! the action and refuses when the yes is not on file. Nothing here runs from
 //! a health check, and a project file can neither record nor widen a yes.
 
+use super::memory_backends::ProjectionRepairReceipt;
 use super::service_authority::{ServiceAction, ServiceAuthorization, ServiceConsentStore};
 use super::service_supervisor::{approve_installed_ollama, CONSENT_REQUIRED};
 use super::setup::{start_pull, step_from_health, SetupContext, Step, StepState};
@@ -25,14 +26,17 @@ pub enum SetupAction {
     /// Re-embed records whose vector is stale. Derived data only; no record
     /// is ever removed, so it needs no approval beyond asking for it.
     RepairProjection,
+    /// Start the one Qdrant container the user recorded as DaVinci's.
+    StartQdrant,
 }
 
 impl SetupAction {
-    pub const ALL: [SetupAction; 4] = [
+    pub const ALL: [SetupAction; 5] = [
         SetupAction::Install,
         SetupAction::DownloadModel,
         SetupAction::StartService,
         SetupAction::RepairProjection,
+        SetupAction::StartQdrant,
     ];
 
     /// The word used after `/setup approve`.
@@ -42,6 +46,7 @@ impl SetupAction {
             Self::DownloadModel => "download-model",
             Self::StartService => "start-ollama",
             Self::RepairProjection => "repair",
+            Self::StartQdrant => super::docker_discovery::START_QDRANT,
         }
     }
 
@@ -57,6 +62,7 @@ impl SetupAction {
             Self::Install | Self::RepairProjection => None,
             Self::DownloadModel => Some(ServiceAction::DownloadEmbeddingModel),
             Self::StartService => Some(ServiceAction::StartLocalOllama),
+            Self::StartQdrant => Some(ServiceAction::StartOwnedQdrantContainer),
         }
     }
 }
@@ -75,6 +81,27 @@ pub fn approve_action(action: SetupAction, ctx: &SetupContext) -> Result<String,
             action.name()
         ));
     };
+    if action == SetupAction::StartQdrant {
+        let effective = load_effective_setup(ctx.agent_dir, &process_env);
+        if effective.memory.config.projection.backend
+            != super::memory_backends::MemoryProjectionBackend::Qdrant
+        {
+            return Err(
+                "the Qdrant projection is off; /setup qdrant enable turns it on first".into(),
+            );
+        }
+        ServiceConsentStore::open(ctx.agent_dir).set(consent, true)?;
+        return Ok(
+            match effective.profile.memory.qdrant_setup.owned_container.as_ref() {
+                Some(container) => format!(
+                    "approved starting DaVinci's own Qdrant container {} ({}); no other container is ever started",
+                    container.name,
+                    container.id.chars().take(12).collect::<String>()
+                ),
+                None => "approved starting DaVinci's own Qdrant container, but none is recorded yet: record one with /setup qdrant own <id>; nothing is started until then".into(),
+            },
+        );
+    }
     if action == SetupAction::StartService {
         let identity = approve_installed_ollama(ctx.agent_dir, ctx.supervisor.launcher())?;
         ServiceConsentStore::open(ctx.agent_dir).set(consent, true)?;
@@ -139,6 +166,17 @@ pub fn execute_approved_action(
             step_from_health(ID, TITLE, &health)
         }
         SetupAction::RepairProjection => repair_step(memory),
+        SetupAction::StartQdrant => {
+            let effective = load_effective_setup(ctx.agent_dir, &process_env);
+            let health = super::qdrant_supervisor::reconcile_owned_qdrant(
+                ctx.agent_dir,
+                &effective,
+                ctx.docker,
+                ctx.containers,
+                super::qdrant_supervisor::DEADLINE,
+            );
+            step_from_health("qdrant", "Qdrant projection", &health)
+        }
         SetupAction::DownloadModel => {
             let (url, model) = {
                 let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
@@ -188,6 +226,7 @@ pub fn repair_step(memory: &Arc<Mutex<VectorMemory>>) -> Step {
         }
     }
     let receipt = last.unwrap_or_default();
+    let remote = remote_catch_up(memory);
     if let Some(code) = receipt.blocked {
         let action = match code {
             "EMBEDDING_MISMATCH" => {
@@ -235,8 +274,67 @@ pub fn repair_step(memory: &Arc<Mutex<VectorMemory>>) -> Step {
         TITLE,
         StepState::Done,
         format!(
-            "re-embedded {total} record(s); {} record(s) kept",
-            receipt.records_after
+            "re-embedded {total} record(s); {} record(s) kept{}",
+            receipt.records_after,
+            remote_note(remote.as_ref())
         ),
     )
+}
+
+/// Bring the optional remote copy up to date, a bounded batch at a time. The
+/// network is used on a snapshot, never under the memory lock. `None` in
+/// local mode: nothing is contacted.
+fn remote_catch_up(memory: &Arc<Mutex<VectorMemory>>) -> Option<ProjectionRepairReceipt> {
+    use super::setup::REINDEX_BATCHES;
+    // The epoch is read under the same lock as the clone, so a clear either
+    // is in the snapshot or moves the epoch past it.
+    let (snapshot, epoch) = {
+        let guard = memory.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.clone(), guard.remote_clear_epoch())
+    };
+    if !snapshot.remote_projection_enabled() {
+        return None;
+    }
+    let batch = snapshot.config.projection.batch_size;
+    let mut total = ProjectionRepairReceipt::default();
+    for _ in 0..REINDEX_BATCHES {
+        let pass = snapshot.reconcile_remote_at(batch, Some(epoch));
+        total.indexed += pass.indexed;
+        total.removed += pass.removed;
+        total.lag = pass.lag;
+        total.skipped = pass.skipped;
+        total.failures += pass.failures;
+        total.code = pass.code;
+        total.error = pass.error;
+        if pass.failures > 0 || pass.lag == 0 || pass.indexed + pass.removed == 0 {
+            break;
+        }
+    }
+    Some(total)
+}
+
+/// Deliver a remote clear the user already confirmed but that could not reach
+/// Qdrant at the time, without waiting for the next write. Network use is on a
+/// snapshot, never under the memory lock. Does nothing, and contacts nothing,
+/// when no clear is owed. True when none is left.
+pub fn finish_owed_remote_clear(memory: &Arc<Mutex<VectorMemory>>) -> bool {
+    let snapshot = memory.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !snapshot.remote_clear_pending() {
+        return true;
+    }
+    snapshot.deliver_remote_clears()
+}
+
+fn remote_note(remote: Option<&ProjectionRepairReceipt>) -> String {
+    match remote {
+        None => String::new(),
+        Some(receipt) if receipt.is_complete() => {
+            format!("; Qdrant copy in sync ({} sent)", receipt.indexed)
+        }
+        Some(receipt) => format!(
+            "; {} Qdrant copy not finished: {} record(s) still to mirror, local search is in use (nothing was lost)",
+            receipt.code.unwrap_or("QDRANT_PENDING"),
+            receipt.lag
+        ),
+    }
 }

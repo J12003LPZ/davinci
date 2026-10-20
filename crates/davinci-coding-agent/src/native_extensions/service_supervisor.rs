@@ -257,14 +257,19 @@ pub fn approve_installed_ollama(
     Ok(identity)
 }
 
-struct StartLock {
+pub(crate) struct StartLock {
     path: PathBuf,
 }
 
 impl StartLock {
     /// `None` when another live start holds it.
     fn acquire(agent_dir: &Path) -> Option<Self> {
-        let path = agent_dir.join(LOCK_FILE);
+        Self::acquire_named(agent_dir, LOCK_FILE)
+    }
+
+    /// The same lock under another file name (one lock per service).
+    pub(crate) fn acquire_named(agent_dir: &Path, name: &str) -> Option<Self> {
+        let path = agent_dir.join(name);
         let _ = std::fs::create_dir_all(agent_dir);
         for _ in 0..2 {
             match std::fs::OpenOptions::new()
