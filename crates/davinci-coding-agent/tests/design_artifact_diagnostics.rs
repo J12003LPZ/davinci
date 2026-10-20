@@ -408,7 +408,7 @@ fn resume_with_another_designs_checkpoint_stops_before_any_provider_call() {
     let mut r = renderer();
     let blocked = run_it(&store, &mut agent, dir.path(), &request, &mut m, &mut r);
     let checkpoint = blocked.failure.expect("receipt").checkpoint;
-    let ctx = AuthorizedDesignContext::from_agent(&mut agent, dir.path()).unwrap();
+    let ctx = AuthorizedDesignContext::from_agent(&agent, dir.path()).unwrap();
     let session = agent.session.as_ref().unwrap();
     let before = latest_run(&store, &ctx, session, checkpoint)
         .unwrap()
@@ -431,7 +431,7 @@ fn resume_with_another_designs_checkpoint_stops_before_any_provider_call() {
         Err(DesignError::Conflict(message)) => assert!(message.contains("different design")),
         other => panic!("conflict expected, got {other:?}"),
     }
-    let ctx = AuthorizedDesignContext::from_agent(&mut agent, dir.path()).unwrap();
+    let ctx = AuthorizedDesignContext::from_agent(&agent, dir.path()).unwrap();
     let session = agent.session.as_ref().unwrap();
     let after = latest_run(&controller.store, &ctx, session, checkpoint)
         .unwrap()
