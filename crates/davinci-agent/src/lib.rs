@@ -79,9 +79,9 @@ pub use compaction::{
 };
 pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
-    context_file_charges, load_context_files, load_context_files_for_targets, repository_root,
-    ContextBudgetReport, ContextContribution, ContextFile, ContextPriority, RootContextAccount,
-    SelectedRootContext, INSTRUCTION_FILE,
+    context_file_charges, load_context_files, repository_root, ContextBudgetReport,
+    ContextContribution, ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
+    INSTRUCTION_FILE,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
@@ -147,6 +147,8 @@ pub use prompt::{
 };
 
 pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
+/// Code on every error that reports a lost session write.
+pub const PERSISTENCE_FAILURE: &str = "PERSISTENCE_FAILURE";
 pub use runtime::{
     conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
     find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
@@ -669,6 +671,13 @@ pub struct Agent {
     provider_system_prompt_suffix: Option<String>,
     /// Last prepared context manifest before provider dispatch.
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
+    /// The first session write that failed outside the session's own sticky
+    /// error, with the session file it belongs to. Cleared when a session is
+    /// opened (`load_from_session`), including the same path again: a failed
+    /// append leaves the old handle failing for good, so a later write can
+    /// only succeed on a reopened one.
+    /// `ensure_session_persistence` reports it as PERSISTENCE_FAILURE.
+    persistence_failure: Option<(std::path::PathBuf, String)>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
     /// The bus created solely for prompt checkpoints. Host-bound runtimes
@@ -685,6 +694,9 @@ pub struct Agent {
     /// Separate from mutable public session/runtime fields to reject stale reuse.
     runtime_session: Option<(PathBuf, String, RunId)>,
 }
+
+/// Summarizer requests one fold may make. Past it the fold fails closed.
+const MAX_FOLD_CHUNKS: usize = 12;
 
 impl Agent {
     pub fn new(system_prompt: impl Into<String>) -> Self {
@@ -833,6 +845,7 @@ impl Agent {
             prepared_manifest_revisions: (0, 0),
             provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
+            persistence_failure: None,
             runtime: None,
             prompt_checkpoint_bus: None,
             runtime_session: None,
@@ -2098,11 +2111,14 @@ impl Agent {
         for notice in self.job_notice_messages() {
             self.messages.push(notice.clone());
             if let Some(session) = &mut self.session {
-                let _ = session.append_entry(chat_entry(
+                if let Err(error) = session.append_entry(chat_entry(
                     "user",
                     serde_json::to_value(&notice.content).unwrap_or(Value::Null),
                     &notice.extra,
-                ));
+                )) {
+                    self.persistence_failure
+                        .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+                }
             }
             self.pending_prompt_messages.push(notice);
         }
@@ -2146,11 +2162,14 @@ impl Agent {
         }
         self.messages.push(message.clone());
         if let Some(session) = &mut self.session {
-            let _ = session.append_entry(chat_entry(
+            if let Err(error) = session.append_entry(chat_entry(
                 "user",
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
                 &message.extra,
-            ));
+            )) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
         if let Some(checkpoint) = rewind_start {
             self.record_prompt_checkpoint(checkpoint);
@@ -2850,6 +2869,24 @@ impl Agent {
         prompt
     }
 
+    /// The manifest of what the next request will carry, built now. The turn
+    /// loop calls this before every active-mode dispatch; `/context inspect`
+    /// calls it in any mode, so the sheet shows the real projection and not a
+    /// stale or empty one. Revision counters stay at their current values, so
+    /// calling it never recompiles an unchanged image.
+    pub fn context_manifest_now(
+        &mut self,
+        request_id: &str,
+    ) -> runtime::context_manifest::PreparedContextManifest {
+        let run_id = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.run_id)
+            .unwrap_or_default();
+        let (source_revision, overlay_revision) = self.prepared_manifest_revisions;
+        self.prepare_context_manifest(request_id, run_id, source_revision, overlay_revision)
+    }
+
     /// Captures the complete prepared provider context manifest.
     pub fn prepare_context_manifest(
         &mut self,
@@ -3174,15 +3211,33 @@ impl Agent {
 
     /// Execution cannot continue after a session write has an uncertain outcome.
     /// Recovery must reopen the durable session before issuing another request.
+    /// Record a failed session write made outside the agent (a plugin's
+    /// `appendEntry`), so the next turn stops with PERSISTENCE_FAILURE.
+    pub fn record_persistence_failure(&mut self, error: impl std::fmt::Display) {
+        if let Some(session) = &self.session {
+            self.persistence_failure
+                .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+        }
+    }
+
     pub fn ensure_session_persistence(&self) -> Result<(), String> {
-        match self
+        if let Some(error) = self
             .session
             .as_ref()
             .and_then(JsonlSession::persistence_error)
         {
-            Some(error) => Err(format!("Session recovery required: {error}")),
-            None => Ok(()),
+            return Err(format!(
+                "{PERSISTENCE_FAILURE}: Session recovery required: {error}"
+            ));
         }
+        if let (Some(session), Some((path, error))) = (&self.session, &self.persistence_failure) {
+            if &session.path == path {
+                return Err(format!(
+                    "{PERSISTENCE_FAILURE}: a session write failed and the turn is not saved ({error}). Reopen the session to recover."
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn cache_operation_presentation(&self, call_id: &str, result: ToolResult) {
@@ -3214,7 +3269,10 @@ impl Agent {
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
             );
             entry.message = Some(serde_json::to_value(message).unwrap_or(Value::Null));
-            let _ = session.append_entry(entry);
+            if let Err(error) = session.append_entry(entry) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
     }
 
@@ -3340,7 +3398,7 @@ impl Agent {
         if let Some(session) = &mut self.session {
             let mut extra = serde_json::Map::new();
             extra.insert("data".into(), value);
-            let _ = session.append_entry(SessionEntry {
+            if let Err(error) = session.append_entry(SessionEntry {
                 id: String::new(),
                 entry_type: "custom".into(),
                 parent_id: None,
@@ -3349,7 +3407,10 @@ impl Agent {
                 message: None,
                 custom_type: Some(TODO_ENTRY_TYPE.into()),
                 extra,
-            });
+            }) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
     }
 
@@ -3433,7 +3494,7 @@ impl Agent {
                     extra.insert(key.to_string(), value.clone());
                 }
             }
-            let _ = session.append_entry(SessionEntry {
+            if let Err(error) = session.append_entry(SessionEntry {
                 id: String::new(),
                 entry_type: "custom_message".into(),
                 parent_id: None,
@@ -3445,7 +3506,10 @@ impl Agent {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 extra,
-            });
+            }) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
         self.messages.push(message.clone());
         self.pending_prompt_messages.push(message.clone());
@@ -3460,10 +3524,13 @@ impl Agent {
         let message = ChatMessage::text("assistant", text);
         self.messages.push(message);
         if let Some(session) = &mut self.session {
-            let _ = session.append_entry(SessionEntry::message(
+            if let Err(error) = session.append_entry(SessionEntry::message(
                 "assistant",
                 serde_json::json!([{"type":"text","text": text}]),
-            ));
+            )) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
         }
     }
 
@@ -3995,96 +4062,141 @@ impl Agent {
         // An earlier fold already turned older events into the parent state,
         // so the summarizer gets only the newer ones. Validation below still
         // sees every event, so a value may cite an older source.
-        let unfolded = events
+        let mut unfolded = events
             .iter()
             .filter(|event| event.seq > folded_through)
             .cloned()
             .collect::<Vec<_>>();
-        let observations = self.provider_observation_scope("compaction");
-        let proposal = self.summarizer.as_ref().and_then(|summarizer| {
-            let request = runtime::context_vm::fold_request(
-                &parent,
-                &unfolded,
-                custom_instructions,
-                self.context_window,
-                &self.provider,
-                &self.model_id,
-            )?;
-            // A failed proposal falls back to the deterministic checkpoint.
-            let proposal = summarizer.summarize(&request).and_then(|response| {
-                match compaction::get_summarization_failure(&response, "context fold") {
-                    Some(failure) => Err(failure),
-                    None => runtime::context_vm::parse_checkpoint_proposal(&response.text),
+        let mut parent = parent;
+        let mut chunks = 0usize;
+        // Oldest first, in chunks that each fit the summarizer's window, so
+        // every unfolded event reaches the ledger. Each chunk is committed and
+        // checkpointed before the next is asked for: a failure part-way keeps
+        // the chunks already folded, and the history is never rewritten.
+        let (root, before_tokens, after_tokens) = loop {
+            chunks += 1;
+            let mut chunk_len = unfolded.len();
+            let mut request = None;
+            if self.summarizer.is_some() && !unfolded.is_empty() {
+                if chunks > MAX_FOLD_CHUNKS {
+                    return Err(format!(
+                        "{}: the unfolded history needs more than {MAX_FOLD_CHUNKS} summarizer requests; the folds so far are kept and the history is unchanged",
+                        compaction::CONTEXT_ADMISSION_FAILED
+                    ));
                 }
-            });
-            proposal
-                .map_err(|error| {
-                    runtime.context_vm.record_failure(
-                        "fold_proposal",
-                        format!("{error}; used the deterministic checkpoint"),
-                    )
-                })
-                .ok()
-        });
-        let observed = observations.finish(if proposal.is_some() {
-            "completed"
-        } else {
-            "failed"
-        });
-        for observation in observed {
-            self.stats.note_provider_observation(&observation);
-            self.emit_live(AgentEvent::ProviderObservation {
-                observation: Box::new(observation),
-            });
-        }
-        // The checkpoint entry below is the durable record of this fold. If it
-        // cannot be written, the in-memory VM must not stay a fold ahead of
-        // the session it reloads from (WOR-61).
-        let undo = runtime.context_vm.fold_undo_point();
-        let root = match runtime
-            .context_vm
-            .fold_with_proposal(reason, &events, proposal)
-        {
-            Ok(root) => root,
-            Err(error) => {
-                runtime.context_vm.undo_fold(undo);
-                return Err(error);
+                // When the instructions and the state alone fill the window (a
+                // very small one), no request can be made: nothing is sent and
+                // the deterministic state carries the rest, as it always has.
+                if let Some(chunk) = runtime::context_vm::fold_chunk(
+                    &parent,
+                    &unfolded,
+                    custom_instructions,
+                    self.context_window,
+                    &self.provider,
+                    &self.model_id,
+                ) {
+                    chunk_len = chunk.covered;
+                    request = Some(chunk.request);
+                }
             }
-        };
-        // Only the active mode sends a compiled image whose prefix is worth
-        // recording; compiling one for any other mode is wasted work.
-        let prefix_digest = if self.context_vm_mode() == ContextVmMode::Active {
-            self.prepared_context_image()
-                .map(|image| image.prefix_digest.clone())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let (before_tokens, after_tokens) = runtime.context_vm.last_fold_tokens().unwrap_or((0, 0));
-        if let Some(session) = &mut self.session {
-            let seq = session
-                .entries
-                .iter()
-                .map(|entry| entry.seq)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            let entry = runtime::context_vm::context_checkpoint_entry(
-                &root,
-                events.iter().map(|event| event.seq).max().unwrap_or(0),
-                &prefix_digest,
-                session.leaf_id.clone(),
-                seq,
-            );
-            if let Err(error) = session.append_entry(entry) {
-                runtime.context_vm.undo_fold(undo);
-                let error = format!("context checkpoint persistence failed: {error}");
-                runtime
-                    .context_vm
-                    .record_failure("fold", format!("{error}; the fold was rolled back"));
-                return Err(error);
+            let last = chunk_len >= unfolded.len();
+            let through = if last {
+                u64::MAX
+            } else {
+                unfolded[chunk_len - 1].seq
+            };
+            let observations = self.provider_observation_scope("compaction");
+            let proposal = request.as_ref().and_then(|request| {
+                let summarizer = self.summarizer.as_ref()?;
+                // A failed proposal falls back to the deterministic checkpoint.
+                let proposal = summarizer.summarize(request).and_then(|response| {
+                    match compaction::get_summarization_failure(&response, "context fold") {
+                        Some(failure) => Err(failure),
+                        None => runtime::context_vm::parse_checkpoint_proposal(&response.text),
+                    }
+                });
+                proposal
+                    .map_err(|error| {
+                        runtime.context_vm.record_failure(
+                            "fold_proposal",
+                            format!("{error}; used the deterministic checkpoint"),
+                        )
+                    })
+                    .ok()
+            });
+            let observed = observations.finish(if proposal.is_some() {
+                "completed"
+            } else {
+                "failed"
+            });
+            for observation in observed {
+                self.stats.note_provider_observation(&observation);
+                self.emit_live(AgentEvent::ProviderObservation {
+                    observation: Box::new(observation),
+                });
             }
-        }
+            // The checkpoint entry below is the durable record of this fold. If it
+            // cannot be written, the in-memory VM must not stay a fold ahead of
+            // the session it reloads from (WOR-61).
+            let undo = runtime.context_vm.fold_undo_point();
+            let root = match runtime
+                .context_vm
+                .fold_with_proposal_through(reason, &events, through, proposal)
+            {
+                Ok(root) => root,
+                Err(error) => {
+                    runtime.context_vm.undo_fold(undo);
+                    return Err(error);
+                }
+            };
+            // Only the active mode sends a compiled image whose prefix is worth
+            // recording; compiling one for any other mode is wasted work.
+            let prefix_digest = if self.context_vm_mode() == ContextVmMode::Active {
+                self.prepared_context_image()
+                    .map(|image| image.prefix_digest.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let (before_tokens, after_tokens) =
+                runtime.context_vm.last_fold_tokens().unwrap_or((0, 0));
+            if let Some(session) = &mut self.session {
+                let seq = session
+                    .entries
+                    .iter()
+                    .map(|entry| entry.seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let entry = runtime::context_vm::context_checkpoint_entry(
+                    &root,
+                    if last {
+                        events.iter().map(|event| event.seq).max().unwrap_or(0)
+                    } else {
+                        through
+                    },
+                    &prefix_digest,
+                    session.leaf_id.clone(),
+                    seq,
+                );
+                if let Err(error) = session.append_entry(entry) {
+                    runtime.context_vm.undo_fold(undo);
+                    let error = format!("context checkpoint persistence failed: {error}");
+                    runtime
+                        .context_vm
+                        .record_failure("fold", format!("{error}; the fold was rolled back"));
+                    return Err(error);
+                }
+            }
+            if last {
+                break (root, before_tokens, after_tokens);
+            }
+            unfolded.drain(..chunk_len);
+            parent = runtime
+                .context_vm
+                .load_state_from_root()
+                .unwrap_or_default();
+        };
         if reason != runtime::context_vm::FoldReason::Manual {
             runtime.context_vm.push_notice(format!(
                 "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \
@@ -4236,7 +4348,9 @@ impl Agent {
             });
             let provider = self.provider.clone();
             let model_id = self.model_id.clone();
+            let window = self.context_window;
             let bound = self.summarizer.clone().map(|inner| {
+                let budget = inner.input_budget().unwrap_or(window / 100 * 95);
                 Summarizer::new(move |request| {
                     let mut request = request.clone();
                     if request.provider.is_empty() {
@@ -4247,6 +4361,7 @@ impl Agent {
                     }
                     inner.summarize(&request)
                 })
+                .with_input_budget(budget)
             });
             let observations = self.provider_observation_scope("compaction");
             let result = compact_messages_with_options(
@@ -4408,7 +4523,10 @@ impl Agent {
                     .map_err(|error| format!("Runtime recovery required: {error}"))?
             }
             (None, None) => runtime::session::restore_session_runtime(
-                RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new()),
+                // The agent's cache, not a fresh in-memory one: the context pages a
+                // fold wrote to disk must be readable after a cold resume.
+                RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+                    .with_cache(self.tool_context.cache.clone()),
                 &session,
             )
             .map_err(|error| {
@@ -4492,6 +4610,9 @@ impl Agent {
         }
         self.pending_prompt_messages.clear();
         self.session = Some(session);
+        // A reopened session is a new file handle with no sticky error, even
+        // at the same path; the earlier failure belonged to the old handle.
+        self.persistence_failure = None;
         if let Some(budget) = session_budget {
             self.root_budget = Some(budget);
         }
@@ -4533,7 +4654,7 @@ impl Agent {
                 custom_type: Some(PROMPT_SESSION_ENTRY_TYPE.into()),
                 extra,
             })
-            .map_err(|error| format!("Session recovery required: {error}"))
+            .map_err(|error| format!("{PERSISTENCE_FAILURE}: Session recovery required: {error}"))
     }
 
     /// Restore prompt session state and identity from persisted custom session entries.

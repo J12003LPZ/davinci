@@ -1,5 +1,52 @@
 # Context VM and graph hardening measurements
 
+## October 19, 2026: offline lifecycle gate
+
+`cargo test -p davinci-evals --lib context_lifecycle` runs one deterministic
+300-turn session per context mode: a 64k-token window, a requirement at turn 0,
+5 and 12 (the turn-5 one buried in a long paste), a correction, a synthetic
+notice in the user role, compaction or folds, a cold resume in a new `Agent`
+over the same agent directory, and a branch back to an early turn. The
+summarizer is a fixture that keeps only the constraint lines the serializer
+attributes to the user. No live model is called, so this measures the
+plumbing, not model quality.
+
+| Mode | Compactions or folds | Requirement hits | Result |
+| --- | --- | --- | --- |
+| Off | 0 | 883 / 883 | clean (baseline, never compacted at 64k) |
+| Hybrid | 1 compaction, 6 summarizer requests | 883 / 883 | clean, including cold resume and branch |
+| Active | 22 | 883 / 883 | clean, including cold resume and branch |
+
+Findings:
+
+- Active cold resume lost every folded constraint. `load_from_session` built the
+  restored runtime on a fresh in-memory cache, so the context pages written to
+  disk were unreadable ("replay/rebuild required") and the state fell back to the
+  deterministic rebuild. Fixed: the restored runtime uses the agent's cache
+  (`crates/davinci-agent/src/lib.rs`, regression:
+  `tests/context_page_cold_load.rs` and the lifecycle eval).
+- Hybrid lost early requirements (843 / 883 before the fix). A fold sent all
+  unfolded events in one request that had to fit the window; the oldest events
+  were omitted from it (`omitted_events`) and never reached the ledger, and the
+  deterministic fallback keeps only a bounded number of goals. Fixed:
+  `fold_context` now folds oldest first in chunks (`fold_chunk` in
+  `runtime/context_vm/fold.rs`), each sized to the summarizer window, and
+  commits and checkpoints each chunk before asking for the next. A fold is
+  capped at 12 requests (`MAX_FOLD_CHUNKS`); past the cap it fails closed with
+  `CONTEXT_ADMISSION_FAILED`, keeps the chunks already committed, and leaves the
+  history unchanged. When the instructions and state alone fill a very small
+  window, no request is made and the deterministic state carries the rest (the
+  behavior `tests/context_vm_hybrid.rs` documents). Cost: a long unfolded history now takes several summarizer
+  requests instead of one lossy one (6 in this scenario). Regression:
+  `tests/context_fold_chunks.rs` and the Hybrid row above.
+- Not covered here: the live-model quality campaign (needs authorization), the
+  10k-entry resume benchmark, and an indexed checkpoint.
+
+Audit status per finding is in `audit_statuses()` in
+`crates/davinci-evals/src/behavior/context_lifecycle.rs`. "overlay has no
+production source" stays open: there is no user-facing command that installs one,
+and the request path already honors an installed overlay.
+
 ## October 10, 2026: hybrid mode
 
 Same scripted session and fixture summarizer as below, run to 300 turns so

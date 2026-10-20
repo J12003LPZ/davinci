@@ -877,7 +877,10 @@ fn session_persistence_failure_reaches_host_reply_and_json_event() {
         Some(Arc::new(Mutex::new(ExtensionHost::default()))),
         false,
     );
-    assert!(reply.starts_with("Session recovery required:"), "{reply}");
+    assert!(
+        reply.starts_with("PERSISTENCE_FAILURE: Session recovery required:"),
+        "{reply}"
+    );
     assert_eq!(print_text_exit(&events), (1, Some(reply.clone())));
     let event = to_json_print_event(events.last().unwrap()).unwrap();
     let mut state = native_extensions::graph::WorkerEventState::default();

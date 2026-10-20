@@ -10654,17 +10654,17 @@ fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
     Next::Go
 }
 
-fn open_context_inspector_sheet(agent: &davinci_agent::Agent, model: &mut Model) {
-    if let Some(manifest) = &agent.last_prepared_manifest {
-        model.context_inspector = Some(
-            crate::davinci_surfaces::context_inspector_sheet_from_manifest(
-                manifest, None, false, false,
-            ),
-        );
-    } else {
-        model.context_inspector =
-            Some(davinci_tui::davinci::model::ContextInspectorSheet::default());
-    }
+fn open_context_inspector_sheet(agent: &mut davinci_agent::Agent, model: &mut Model) {
+    // Built now, from what the next request would carry, in every mode.
+    let manifest = agent.context_manifest_now("inspect");
+    model.context_inspector = Some(
+        crate::davinci_surfaces::context_inspector_sheet_from_manifest(
+            &manifest,
+            agent.context_overlay(),
+            false,
+            false,
+        ),
+    );
     open_sheet(model, Screen::ContextInspector);
 }
 

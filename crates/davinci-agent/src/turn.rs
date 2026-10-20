@@ -633,14 +633,35 @@ impl Agent {
                 }
             }
 
-            if self
+            // The manifest of what is about to be sent: the inspector shows
+            // it, and a mandatory item that is not selected stops the request.
+            // Other modes build it on demand (`/context inspect`); they pay
+            // nothing per turn and their requests are not touched.
+            if active_context_vm {
+                let request_id = format!("req-{}", self.stats.model_turns + 1);
+                self.context_manifest_now(&request_id);
+            }
+            if let Some(manifest) = self
                 .last_prepared_manifest
                 .as_ref()
-                .is_some_and(|m| m.is_mandatory_violated())
+                .filter(|m| m.is_mandatory_violated())
             {
-                return Err(
-                    "Request blocked: mandatory context policy is violated or unavailable".into(),
-                );
+                let reasons = manifest
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.mandatory && !entry.selected)
+                    .map(|entry| {
+                        format!(
+                            "{}: {}",
+                            entry.id,
+                            entry.selection_reason.as_deref().unwrap_or("not selected")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "Request blocked: mandatory context policy is violated or unavailable ({reasons})"
+                ));
             }
 
             self.ensure_session_persistence()?;
@@ -5012,7 +5033,7 @@ impl Agent {
                     message[key] = value.clone();
                 }
             }
-            let _ = session.append_entry(davinci_session::SessionEntry {
+            if let Err(error) = session.append_entry(davinci_session::SessionEntry {
                 id: String::new(),
                 entry_type: "message".into(),
                 parent_id: None,
@@ -5021,7 +5042,10 @@ impl Agent {
                 message: Some(message),
                 custom_type: None,
                 extra: serde_json::Map::new(),
-            });
+            }) {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+            }
             // Native tapes include exact request inputs. An ephemeral overlay
             // must not enter saved session history through this second route.
             if let Some(record) =
@@ -5030,7 +5054,7 @@ impl Agent {
                 if let Ok(data) = serde_json::to_value(record) {
                     let mut extra = serde_json::Map::new();
                     extra.insert("data".into(), data);
-                    let _ = session.append_entry(davinci_session::SessionEntry {
+                    if let Err(error) = session.append_entry(davinci_session::SessionEntry {
                         id: String::new(),
                         entry_type: "custom".into(),
                         parent_id: None,
@@ -5039,7 +5063,10 @@ impl Agent {
                         message: None,
                         custom_type: Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE.to_string()),
                         extra,
-                    });
+                    }) {
+                        self.persistence_failure
+                            .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+                    }
                 }
             }
         }

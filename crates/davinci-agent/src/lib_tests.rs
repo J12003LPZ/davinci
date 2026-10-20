@@ -4994,7 +4994,9 @@ fn a_full_context_with_failed_auto_compaction_blocks_the_request() {
         .unwrap_err();
     assert!(!dispatched, "no provider request may follow the failure");
     assert!(error.contains("automatic compaction failed"), "{error}");
-    assert!(error.contains("provider timed out"), "{error}");
+    // The history is real user text over the model's window: it cannot be
+    // capped, so the summarizer is never asked and the request is refused.
+    assert!(error.contains("CONTEXT_ADMISSION_FAILED"), "{error}");
     assert_eq!(agent.messages.len(), before, "history is untouched");
 }
 

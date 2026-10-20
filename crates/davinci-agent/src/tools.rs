@@ -382,7 +382,8 @@ pub fn tool_specs() -> Vec<AgentTool> {
                     "sourceRef":{"type":"string"},
                     "query":{"type":"string"},
                     "offset":{"type":"integer","minimum":0},
-                    "limit":{"type":"integer","minimum":0,"maximum":400}
+                    "limit":{"type":"integer","minimum":0,"maximum":400},
+                    "byteOffset":{"type":"integer","minimum":0,"description":"Exact bytes from this offset (a UTF-8 boundary). Use it to read the rest of a line a page cut. Not with offset or query."}
                 },
                 "oneOf":[{"required":["page"]},{"required":["sourceRef"]}]
             }),

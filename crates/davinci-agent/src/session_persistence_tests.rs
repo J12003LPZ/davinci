@@ -233,3 +233,92 @@ fn noncompleted_patch_turns_never_execute_or_continue() {
         assert_eq!(agent.run_stats().tool_calls, 0);
     }
 }
+
+#[test]
+fn write_failure_surfaces_before_successful_turn_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = Agent::new("write failure");
+    agent.cwd = dir.path().to_path_buf();
+    agent.session = Some(session);
+    agent.prompt("remember this request");
+
+    // The storage breaks while the model answers: the answer is not reported
+    // as a finished turn, and the error carries the stable code.
+    let mut calls = 0;
+    let result = agent.run_loop(|_| {
+        calls += 1;
+        break_storage(&path);
+        Ok(completion(false))
+    });
+    let error = result.expect_err("the turn finished as if it were saved");
+    assert!(error.starts_with("PERSISTENCE_FAILURE"), "{error}");
+    assert_eq!(calls, 1);
+
+    // The session on disk is still readable and holds the saved request.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(path.with_extension("backup"), &path).unwrap();
+    let reopened = JsonlSession::open(&path).unwrap();
+    let saved = crate::messages_from_session(&reopened);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0].role, "user");
+}
+
+#[test]
+fn a_dropped_write_outside_the_sticky_error_still_blocks_the_next_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = Agent::new("recorded failure");
+    agent.session = Some(session);
+    agent.persistence_failure = Some((path, "disk full".into()));
+    let error = agent
+        .run_loop(|_| -> Result<AssistantMessage, String> {
+            panic!("a request was sent after a lost write")
+        })
+        .unwrap_err();
+    assert!(error.starts_with("PERSISTENCE_FAILURE"), "{error}");
+    assert!(error.contains("disk full"));
+    // Another session is not blamed for the first one's failure.
+    let other = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    agent.session = Some(other);
+    assert!(agent.ensure_session_persistence().is_ok());
+}
+
+#[test]
+fn reopening_the_same_path_after_a_failed_write_lets_the_next_turn_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = Agent::new("same path");
+    agent.session = Some(session);
+    agent.prompt("first request");
+    agent.persistence_failure = Some((path.clone(), "disk full".into()));
+    assert!(agent
+        .run_loop(|_| -> Result<AssistantMessage, String> { panic!("sent after a lost write") })
+        .unwrap_err()
+        .starts_with("PERSISTENCE_FAILURE"));
+
+    // The disk recovered and the user resumes the very same file.
+    agent
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .expect("the session reopens");
+    assert!(agent.ensure_session_persistence().is_ok());
+    agent.prompt("second request");
+    agent
+        .run_loop(|_| Ok(completion(false)))
+        .expect("a reopened session runs a turn");
+}
+
+#[test]
+fn a_host_side_write_failure_is_recorded_for_the_open_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let mut agent = Agent::new("plugin write");
+    agent.session = Some(session);
+    agent.record_persistence_failure("plugin appendEntry: disk full");
+    let error = agent.ensure_session_persistence().unwrap_err();
+    assert!(error.starts_with("PERSISTENCE_FAILURE"), "{error}");
+    assert!(error.contains("plugin appendEntry: disk full"), "{error}");
+}
