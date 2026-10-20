@@ -699,6 +699,16 @@ pub fn redact_secrets(input: &str) -> String {
         let mut cursor = 0usize;
         while let Some(relative) = output[cursor..].find(prefix) {
             let start = cursor + relative;
+            // A credential prefix starts a token. Inside a word ("task-1",
+            // a run id ending in "sk") it is just text.
+            if output[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric())
+            {
+                cursor = start + prefix.len();
+                continue;
+            }
             let value_start = start + prefix.len();
             let end = output[value_start..]
                 .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';'))
@@ -4131,6 +4141,24 @@ pub(crate) mod tests {
         assert!(!value.contains("hunter2"));
         let json = redact_secrets(r#"{"api_key": "abc", "token":"xyz"}"#);
         assert!(!json.contains("abc") && !json.contains("xyz"), "{json}");
+    }
+
+    #[test]
+    fn credential_prefix_inside_a_word_is_not_redacted() {
+        // A graph run id is base36 digits, a dash and hex: one ending in
+        // "sk" used to read as an `sk-` key and vanish from its own memory.
+        let text = "Verified graph run mq3zsk-1a2b3c4d completed: fix task-42 and risk-review";
+        assert_eq!(redact_secrets(text), text);
+        // Real keys still go, at the start of a token or after punctuation.
+        let value = redact_secrets("key=sk-secret1 (sk-secret2) ghp_abc AKIAABCD x-Bearer q");
+        assert!(
+            !value.contains("secret1") && !value.contains("secret2"),
+            "{value}"
+        );
+        assert!(
+            !value.contains("ghp_abc") && !value.contains("AKIAABCD"),
+            "{value}"
+        );
     }
 
     #[test]
