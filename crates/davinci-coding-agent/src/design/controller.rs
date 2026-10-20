@@ -226,6 +226,11 @@ pub fn with_next_step(mut value: Value, artifact_id: ArtifactId) -> Value {
         })),
         Some("blocked") => {
             let retryable = value["failure"]["retryable"].as_bool().unwrap_or(false);
+            let staged = value["failure"]["staged_revision"].as_u64().is_some()
+                || value["failure"]["staged_revision"].is_string();
+            let unverified = value["failure"]["head_unverified"]
+                .as_bool()
+                .unwrap_or(false);
             let checkpoint = value["failure"]["checkpoint"].as_str().unwrap_or_default();
             if retryable && !checkpoint.is_empty() {
                 Some(json!({
@@ -235,7 +240,13 @@ pub fn with_next_step(mut value: Value, artifact_id: ArtifactId) -> Value {
             } else {
                 Some(json!({
                     "action": format!("/design revise {artifact_id} <what to change>"),
-                    "why": "this run cannot be resumed; the last committed revision stays readable",
+                    "why": if staged {
+                        "this run cannot be resumed; the revision that failed to render was taken off the head and kept in history, the last good revision is the head"
+                    } else if unverified {
+                        "this run cannot be resumed; the head never rendered, treat it as unverified"
+                    } else {
+                        "this run cannot be resumed; the last committed revision stays readable"
+                    },
                 }))
             }
         }

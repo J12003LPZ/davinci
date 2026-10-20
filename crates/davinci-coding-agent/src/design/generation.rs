@@ -236,6 +236,13 @@ pub struct DesignFailureReceipt {
     pub checkpoint: OperationId,
     /// The retained model reply, when there is one.
     pub draft: Option<ArtifactRef>,
+    /// A revision that did not compile or render and was taken off the head.
+    /// It stays in history; `revision` is then the last good one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_revision: Option<RevisionId>,
+    /// The head never rendered: there was no earlier good revision to keep.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub head_unverified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +327,13 @@ pub struct DesignRunState {
     /// change are read from it, however many repairs the run takes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<RevisionId>,
+    /// The newest revision of this design that rendered: the head when the run
+    /// started, then each revision the renderer accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_good: Option<RevisionId>,
+    /// A broken revision taken off the head (see `DesignFailureReceipt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_revision: Option<RevisionId>,
 }
 /// Trusted host injection, never constructible by a browser or generated tool call.
 /// Implementations return measured evidence; they cannot publish acceptance.
@@ -1055,6 +1069,8 @@ fn run_accounted(
             quality: None,
             failure: None,
             baseline,
+            last_good: (manifest.revision.0 > 0).then_some(manifest.revision),
+            staged_revision: None,
         };
         checkpoint(store, &ctx, agent, &state)?;
         state
@@ -1129,7 +1145,8 @@ fn failure_receipt(
                 | DesignError::BudgetExceeded(_)
                 | DesignError::IoFailure(_)
                 | DesignError::Cancelled
-        ) && !state.progress.in_flight,
+        ) && !state.progress.in_flight
+            && state.staged_revision.is_none(),
         code,
         message: sanitize_snippet(&message, 400),
         artifact: state.request.artifact_id,
@@ -1141,6 +1158,55 @@ fn failure_receipt(
         snippet,
         checkpoint: state.request.operation_id,
         draft: state.reply.clone(),
+        staged_revision: state.staged_revision,
+        head_unverified: phase == RunPhase::Render
+            && state.staged_revision.is_none()
+            && state.last_good != Some(state.last_revision),
+    }
+}
+
+/// The repairs are used up and the newest revision still does not compile or
+/// render. If an earlier revision did, copy it back as the head and keep the
+/// broken one in history (staged, restorable); otherwise say the head never
+/// rendered. Returns the error that ends the run.
+fn withdraw_unrendered(
+    store: &DesignStore,
+    ctx: &AuthorizedDesignContext,
+    agent: &mut Agent,
+    state: &mut DesignRunState,
+    message: &str,
+) -> DesignError {
+    let broken = state.last_revision;
+    let Some(good) = state.last_good.filter(|good| *good != broken) else {
+        return DesignError::InvalidInput(format!(
+            "{message} (two repair rounds exhausted; revision {} never rendered and is the only revision, so it stays the head, unverified)",
+            broken.0
+        ));
+    };
+    let restored = session(agent).and_then(|session| {
+        store.restore(
+            ctx,
+            session,
+            state.request.artifact_id,
+            broken,
+            good,
+            OperationId::new(),
+        )
+    });
+    match restored {
+        Ok(head) => {
+            state.staged_revision = Some(broken);
+            state.last_revision = head.revision;
+            state.last_good = Some(head.revision);
+            DesignError::InvalidInput(format!(
+                "{message} (two repair rounds exhausted; revision {} did not render and was taken off the head. Revision {} is the head again, a copy of the last good revision {}. Revision {} stays in history: /design fork {} --revision {} to look at it)",
+                broken.0, head.revision.0, good.0, broken.0, state.request.artifact_id, broken.0
+            ))
+        }
+        Err(error) => DesignError::InvalidInput(format!(
+            "{message} (two repair rounds exhausted; revision {} did not render and could not be taken off the head: {error})",
+            broken.0
+        )),
     }
 }
 
@@ -1202,10 +1268,13 @@ fn run_phases(
                     .flat_map(|check| check.failures.clone())
                     .collect();
                     state.quality = Some(report);
+                    state.last_good = Some(state.last_revision);
                     state.progress.phase = RunPhase::Review;
                 }
                 Err(DesignError::InvalidInput(message)) => {
-                    repair_with(state, &message, false)?;
+                    if repair_with(state, &message, false).is_err() {
+                        return Err(withdraw_unrendered(store, ctx, agent, state, &message));
+                    }
                     state.findings = vec![message];
                 }
                 Err(error) => return Err(error),
@@ -1433,8 +1502,15 @@ fn run_phases(
                 state.findings.dedup();
                 if state.findings.is_empty() {
                     state.progress.phase = RunPhase::Complete;
-                } else {
-                    state.progress.begin_repair()?;
+                } else if state.progress.begin_repair().is_err() {
+                    // The same critique would be read again and fail the same
+                    // way: not a failure `resume` can mend. The revision under
+                    // review rendered, so it stays the head.
+                    return Err(DesignError::Conflict(format!(
+                        "the review still reports {} problem(s) after two repair rounds; revision {} rendered and stays the head. Ask for the change with /design revise",
+                        state.findings.len(),
+                        state.last_revision.0
+                    )));
                 }
             }
             _ => return Err(DesignError::Conflict("unexpected run phase".into())),
