@@ -80,6 +80,37 @@ Several tasks in one call draw as a tree:
 
 The progress travels as a Davinci-only `subagent_progress` agent event keyed by the lead's `agent` call. JSON and RPC hosts receive it too and may ignore it.
 
+## The agent roster
+
+While any worker exists, a roster sits under the composer: one row for `main` and one per worker. A row shows a status glyph, the name, one line of what the worker is doing, elapsed time, tokens and where it works (`shared`, or `⎇ branch` for a worktree). On a terminal too small for the list it collapses to one line.
+
+| Do | Result |
+| --- | --- |
+| `Down` on an empty composer | focus moves into the roster |
+| `Up` / `Down`, `Enter` | open that worker's live transcript (read-only) |
+| click a row | the same |
+| `Esc`, or click `main` | back to the main conversation |
+| `PageUp` / `PageDown`, `Up` / `Down` on an empty composer | scroll the worker's transcript |
+| `Enter` in a worker view | send the text to that worker (the composer shows `Message @name`) |
+
+`Esc` in a worker view only goes back. It never interrupts the turn and never clears queued follow-ups. `Esc` on the main screen still interrupts a running turn, and follow-ups you queued before it stay queued and run afterwards.
+
+The worker view keeps the last 200 events (2 KiB each, secrets redacted, terminal control sequences removed). Older events are counted as a gap. A worker with its own worktree shows its verified branch and `HEAD` and a read-only list of changed files, refreshed about every 3 seconds; a worker in the shared workspace shows `shared workspace — no separate branch`.
+
+**Tokens** are input plus output for that worker. The detail view splits out cache reads and writes. `~` marks an estimate and `unknown` means the provider reported no usage; a missing number is never shown as 0. Elapsed time stops when the worker reaches a terminal state.
+
+**Messages to a worker** get a stable id and are written to the operation journal and the runtime log before the receipt says `queued`. A receipt then moves `queued`, `delivered`, `applied`, or ends `rejected`. `unknown` means a restart happened after delivery and nothing proves the worker used the message; it is never re-sent. A message to a finished worker is rejected with `worker already finished; send a follow-up to main` and the worker is not restarted. The RPC `agent_control steer` command goes through the same function and reports the same `delivery` state and `messageId`.
+
+### Turning the roster off
+
+The roster is on by default. To get back the previous behavior (the `/agents` panel only):
+
+```json
+{ "agentFocusUi": false }
+```
+
+in `~/.davinci/agent/settings.json` or the project's `.davinci/settings.json`, then restart. The settings key is `agentFocusUi`. With it off, nothing is drawn under the composer, no roster keys are bound, and `Esc` behaves as before except that queued follow-ups are still kept.
+
 ## Modes and lifecycle
 
 The `agent` tool accepts `oneshot`, `background` and (with agent teams on) `teammate`. Unknown modes are errors. A call can carry up to eight tasks, four running at once. One-shot calls return their result directly. Background workers run once and report their result to the lead's mailbox. `--print` rejects `background` and `teammate`, because a print run cannot keep them alive.

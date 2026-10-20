@@ -35,11 +35,14 @@ const PAGE: usize = 200;
 /// What the user is told when a message reaches a worker that already ended.
 pub(crate) const FINISHED_REASON: &str = "worker already finished; send a follow-up to main";
 
+/// A finished probe: the worker it was for and the paths it found.
+type ProbeResult = (String, Vec<String>);
+
 #[derive(Default)]
 pub(crate) struct RosterHost {
     last_probe: Option<Instant>,
     probing: Arc<AtomicBool>,
-    probed: Arc<Mutex<Option<(String, Vec<String>)>>>,
+    probed: Arc<Mutex<Option<ProbeResult>>>,
     /// Worktree path of each listed worker, for the probe.
     worktrees: HashMap<String, std::path::PathBuf>,
 }

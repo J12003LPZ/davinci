@@ -126,9 +126,9 @@ impl WorkerActivityStore {
             generation,
             timestamp_ms,
             kind,
-            tool_call_id: tool_call_id.map(|id| safe_summary(id)),
+            tool_call_id: tool_call_id.map(safe_summary),
             summary,
-            outcome: outcome.map(|text| safe_summary(text)),
+            outcome: outcome.map(safe_summary),
         });
         while ring.events.len() > MAX_EVENTS_PER_WORKER {
             ring.events.pop_front();

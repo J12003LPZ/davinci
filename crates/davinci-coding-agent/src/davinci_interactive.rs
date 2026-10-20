@@ -11275,17 +11275,19 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
                     // User steering: an unregistered sender id, delivered to
                     // the teammate as plain user text (see
                     // take_labeled_messages), and it wakes an idle teammate.
-                    let generation = runtime.registry.get_generation(&id);
-                    match runtime
-                        .mailbox
-                        .send_steer(id, generation, text.join(" "), false)
-                    {
-                        Ok(receipt) if receipt.state == "rejected" => format!(
+                    // The same journaled path as the worker view and the RPC.
+                    let (state, reason, _) = crate::agent_roster_host::send_to_worker(
+                        runtime,
+                        &id.to_string(),
+                        &text.join(" "),
+                    );
+                    if matches!(state.as_str(), "queued" | "delivered" | "applied") {
+                        format!("sent to {name}")
+                    } else {
+                        format!(
                             "{name} did not accept the message ({})",
-                            receipt.reason.unwrap_or_else(|| "rejected".into())
-                        ),
-                        Ok(_) => format!("sent to {name}"),
-                        Err(error) => error.to_string(),
+                            reason.unwrap_or(state)
+                        )
                     }
                 }
                 Err(error) => error,

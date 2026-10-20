@@ -154,7 +154,7 @@ impl AgentMailbox {
             .as_ref()
             .and_then(|registry| registry.get(agent_id))
             .map(|record| record.run_id)
-            .unwrap_or_else(RunId::new)
+            .unwrap_or_default()
     }
 
     fn notify_waiters(&self) {

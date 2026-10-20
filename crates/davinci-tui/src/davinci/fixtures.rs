@@ -2360,36 +2360,6 @@ pub fn context_inspector_fixture() -> crate::davinci::model::ContextInspectorShe
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::davinci::theme::{ColorDepth, Theme};
-
-    #[test]
-    fn the_mockup_transcripts_carry_every_block_kind() {
-        let entries = transcript();
-        assert!(entries.iter().any(|e| matches!(e, Entry::User(_))));
-        assert!(entries.iter().any(|e| matches!(e, Entry::Agent(_))));
-        assert!(entries.iter().any(|e| matches!(e, Entry::Tool { .. })));
-        assert!(entries.iter().any(|e| matches!(e, Entry::Failure { .. })));
-        assert!(entries.iter().any(|e| matches!(e, Entry::Studio(_))));
-        assert!(entries.iter().any(|e| matches!(e, Entry::Prose(_))));
-        assert!(entries.iter().any(|e| matches!(e, Entry::Delta { .. })));
-    }
-
-    #[test]
-    fn dressing_a_narrow_window_drops_to_the_narrow_transcript() {
-        let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
-        let mut wide = Model::new(theme, 100, 44, true);
-        dress(&mut wide);
-        assert_eq!(wide.transcript.len(), transcript().len());
-
-        let mut narrow = Model::new(theme, 80, 24, true);
-        dress(&mut narrow);
-        assert_eq!(narrow.transcript.len(), narrow_transcript().len());
-    }
-}
-
 /// The multi-worker scenario of the agent-focus parity contract: a one-shot, a
 /// background and a teammate worker, with fixed times, usage and workspaces.
 /// No screenshot of the reference product exists in the repository, so the
@@ -2488,5 +2458,35 @@ impl AgentParityScenario {
             m.push_worker_lines(id, lines.clone(), 0);
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    #[test]
+    fn the_mockup_transcripts_carry_every_block_kind() {
+        let entries = transcript();
+        assert!(entries.iter().any(|e| matches!(e, Entry::User(_))));
+        assert!(entries.iter().any(|e| matches!(e, Entry::Agent(_))));
+        assert!(entries.iter().any(|e| matches!(e, Entry::Tool { .. })));
+        assert!(entries.iter().any(|e| matches!(e, Entry::Failure { .. })));
+        assert!(entries.iter().any(|e| matches!(e, Entry::Studio(_))));
+        assert!(entries.iter().any(|e| matches!(e, Entry::Prose(_))));
+        assert!(entries.iter().any(|e| matches!(e, Entry::Delta { .. })));
+    }
+
+    #[test]
+    fn dressing_a_narrow_window_drops_to_the_narrow_transcript() {
+        let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
+        let mut wide = Model::new(theme, 100, 44, true);
+        dress(&mut wide);
+        assert_eq!(wide.transcript.len(), transcript().len());
+
+        let mut narrow = Model::new(theme, 80, 24, true);
+        dress(&mut narrow);
+        assert_eq!(narrow.transcript.len(), narrow_transcript().len());
     }
 }

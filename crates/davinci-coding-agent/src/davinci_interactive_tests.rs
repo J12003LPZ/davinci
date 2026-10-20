@@ -4496,7 +4496,7 @@ fn the_roster_flag_reads_from_settings_and_defaults_on() {
         serde_json::from_str(r#"{"agentFocusUi": false}"#).unwrap();
     assert_eq!(off.agent_focus_ui, Some(false));
     let unset: crate::settings::Settings = serde_json::from_str("{}").unwrap();
-    assert_eq!(unset.agent_focus_ui.unwrap_or(true), true);
+    assert!(unset.agent_focus_ui.unwrap_or(true));
     let mut model = model();
     model.roster.enabled = off.agent_focus_ui.unwrap_or(true);
     model.set_workers(vec![davinci_tui::davinci::model::AgentRow::new(

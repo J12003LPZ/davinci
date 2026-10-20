@@ -116,3 +116,12 @@ To guarantee that parallel agents do not corrupt working trees or produce race c
 
 - **No Privilege Escalation**: Subagents, team workers, and workflow phases inherit the parent session's `PermissionMode`. A session in `ReadOnly` mode rejects mutating workflows and removes mutating tools from scoped agent requests. Outside Plan Mode, shared workers read and edit files (no shell) and take turns through the shared-write lease; an allowed profile may set its own mode within the parent permission ceiling.
 - **Untrusted Projects**: In an untrusted checkout, project-level workflows (`.davinci/workflows/*.json`) and custom agent profiles cannot be loaded or executed until the user explicitly runs `/trust`.
+
+## 4. Worker Messaging and Recovery
+
+- **One path**: A message to a running worker (from the roster's worker view, `/agents msg`, or the RPC `agent_control steer`) is a `Steer` control command with a stable id. The host admits it to the operation journal (`ControlOperationAdapter::execute_worker_control`), the mailbox queues it and announces `AgentMessageQueued` on the bus, and the runtime log (`<session>.runtime.jsonl`, synced on every append) holds it before the caller can show `queued`.
+- **States**: `queued` -> `delivered` (the worker's loop drained it) -> `applied` (taken into its next request) or `rejected`. `AgentMessageDelivered`, `AgentMessageApplied` and `AgentMessageRejected` events record each step.
+- **Restart**: Replay of the runtime log restores each message in exactly one state. Undelivered messages return to the queue unless the recipient already finished (then `rejected`, `recipient_terminal_after_restart`). Delivered-but-unapplied messages become `unknown` (`restart_before_apply`): they are not re-queued, so they cannot apply twice, and they are not reported as applied. Applied and rejected receipts are kept. The same message id sent again returns the first receipt.
+- **Terminal workers**: A message to a completed, failed or cancelled worker is rejected and never wakes it.
+- **Limit**: `applied` means the message was handed to the worker's next model request at a safe boundary. It does not prove the model followed it.
+- **UI flag**: `agentFocusUi` (default `true`) gates the roster and worker view only. Messaging, receipts and recovery do not depend on it.
