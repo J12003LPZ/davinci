@@ -4524,12 +4524,12 @@ impl Model {
         true
     }
 
-    /// ctrl+c interrupts the run, never the app (design.md §6). What was
-    /// waiting to be sent goes with it: the user stopped this train of
-    /// thought, not just this turn.
+    /// ctrl+c and Esc interrupt the run, never the app (design.md §6). What
+    /// was waiting to be sent stays: it was shown as queued, so dropping it
+    /// would be an acknowledged instruction vanishing without a word. The
+    /// queue is sent, in order, once the interrupted turn has ended.
     pub fn interrupt(&mut self) {
         self.running = false;
-        self.queued.clear();
         if let Some(working) = self.working.as_mut() {
             working.interrupting = true;
         }
@@ -5199,7 +5199,7 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_typed_mid_turn_waits_its_place_and_an_interrupt_drops_it() {
+    fn a_follow_up_typed_mid_turn_waits_its_place_and_survives_an_interrupt() {
         let mut m = model(120);
         m.type_char("run the tests");
         m.submit();
@@ -5211,10 +5211,11 @@ mod tests {
         assert_eq!(m.composer, "", "queuing clears the line being typed");
         assert!(!m.queue(), "an empty composer queues nothing");
 
-        // ctrl+c stops the train of thought, not only the turn in flight.
+        // An interrupt ends the turn in flight, not the instruction the user
+        // was already shown as queued.
         m.interrupt();
         assert!(!m.running);
-        assert!(m.queued.is_empty());
+        assert_eq!(m.queued, vec!["then commit".to_string()]);
     }
 
     #[test]
