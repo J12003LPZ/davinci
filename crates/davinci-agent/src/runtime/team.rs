@@ -400,6 +400,31 @@ fn lifecycle_exit(
     }
 }
 
+const REDELIVERY_BACKOFF_START: Duration = Duration::from_millis(100);
+const REDELIVERY_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+/// The wait after a delivery that could not be logged: 100 ms, doubling to 5 s.
+/// A drain that delivers resets the caller to zero.
+fn next_redelivery_backoff(previous: Duration) -> Duration {
+    if previous.is_zero() {
+        REDELIVERY_BACKOFF_START
+    } else {
+        (previous * 2).min(REDELIVERY_BACKOFF_CAP)
+    }
+}
+
+/// Sleep for `total`, waking every 100 ms to notice a stop request.
+fn sleep_unless_stopped(worker: &RuntimeHandle, total: Duration) {
+    let deadline = std::time::Instant::now() + total;
+    while !stop_requested(worker) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
 /// Drive a persistent teammate: run a turn, report it, go idle, wake on the
 /// next message. `turn` runs one model turn for the given prompt and
 /// returns its final text. The caller owns the terminal registry transition
@@ -416,6 +441,7 @@ where
     let me = worker.agent_id;
     let mut prompt = first_prompt.to_string();
     let mut failures = 0_u32;
+    let mut backoff = Duration::ZERO;
     loop {
         if stop_requested(worker) {
             return TeammateExit::Stopped;
@@ -448,15 +474,19 @@ where
                 MailboxWait::Ready => {
                     let messages = worker.take_labeled_messages(WAKE_BATCH);
                     if !messages.is_empty() {
+                        backoff = Duration::ZERO;
                         break messages.join("\n\n");
                     }
                     if stop_requested(worker) {
                         return TeammateExit::Stopped;
                     }
                     // A message that stays pending is waiting on a log write
-                    // that failed: do not spin on it.
+                    // that failed: back off instead of spinning on it. The
+                    // idle timeout cannot fire meanwhile, because the mailbox
+                    // reports Ready while anything is pending.
                     if worker.mailbox.pending_count(&me) > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        backoff = next_redelivery_backoff(backoff);
+                        sleep_unless_stopped(worker, backoff);
                     }
                 }
                 MailboxWait::Stopped => return TeammateExit::Stopped,
@@ -487,6 +517,17 @@ where
 mod tests {
     use super::*;
     use crate::runtime::ids::RunId;
+
+    #[test]
+    fn redelivery_backoff_doubles_from_100ms_to_a_5s_cap() {
+        let mut wait = Duration::ZERO;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            wait = next_redelivery_backoff(wait);
+            seen.push(wait.as_millis());
+        }
+        assert_eq!(seen, [100, 200, 400, 800, 1600, 3200, 5000, 5000]);
+    }
 
     #[test]
     fn wor116_admitting_a_worker_twice_keeps_cancel_reaching_the_first_holder() {

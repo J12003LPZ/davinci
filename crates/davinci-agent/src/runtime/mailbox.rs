@@ -136,9 +136,31 @@ pub struct AgentMailbox {
     /// queued before it is delivered, delivered before it can be applied, and
     /// a receipt never moves backwards (WOR-86, WOR-89).
     lifecycle: Arc<Mutex<()>>,
+    /// Agents whose last delivery record failed to write. The warning is
+    /// printed when an agent enters this set and again when it leaves, not on
+    /// every retry.
+    log_failing: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl AgentMailbox {
+    /// Note a failed delivery record. True only for the first failure of a
+    /// streak, which is the one worth a warning.
+    fn note_delivery_failure(&self, agent_id: AgentId) -> bool {
+        self.log_failing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(agent_id)
+    }
+
+    /// Note a delivery whose record was written. True only when it ends a
+    /// failure streak.
+    fn note_delivery_recovered(&self, agent_id: AgentId) -> bool {
+        self.log_failing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&agent_id)
+    }
+
     /// Announce a message lifecycle step on the bus. `agent` is the envelope
     /// owner: host steering has no registered sender, so it passes `None` and
     /// replay never mistakes it for the runtime's own identity.
@@ -229,6 +251,7 @@ impl AgentMailbox {
             seq: Arc::new(AtomicU64::new(0)),
             signal: Arc::new((Mutex::new(0), Condvar::new())),
             lifecycle: Arc::new(Mutex::new(())),
+            log_failing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -243,6 +266,7 @@ impl AgentMailbox {
             seq: Arc::new(AtomicU64::new(0)),
             signal: Arc::new((Mutex::new(0), Condvar::new())),
             lifecycle: Arc::new(Mutex::new(())),
+            log_failing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -656,6 +680,14 @@ impl AgentMailbox {
 
     /// Reject any undelivered messages for an agent that has cancelled.
     pub fn reject_undelivered_for_cancelled(&self, agent_id: &AgentId, reason: &str) {
+        // Same lock as `drain`, taken first: a drain that is writing its
+        // delivered record has popped messages it may still put back, and a
+        // cancel that ran meanwhile would find an empty queue and leave them
+        // queued after the agent is gone.
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut rejected = Vec::new();
         if let Ok(mut queues) = self.queues.write() {
             if let Some(q) = queues.remove(agent_id) {
@@ -763,13 +795,18 @@ impl AgentMailbox {
                 },
             );
             if let Err(error) = logged {
-                eprintln!(
-                    "[davinci-runtime] message {} stays queued, its delivery was not recorded: {error}",
-                    msg.id
-                );
+                if self.note_delivery_failure(agent_id) {
+                    eprintln!(
+                        "[davinci-runtime] message {} stays queued, its delivery was not recorded                          (retrying quietly until the log recovers): {error}",
+                        msg.id
+                    );
+                }
                 break;
             }
             kept += 1;
+        }
+        if kept == drained.len() && kept > 0 && self.note_delivery_recovered(agent_id) {
+            eprintln!("[davinci-runtime] delivery records are being written again");
         }
         let unlogged = drained.split_off(kept);
 
@@ -1605,6 +1642,83 @@ mod tests {
             .filter(|e| matches!(e.payload, RuntimeEvent::AgentMessageDelivered { .. }))
             .count();
         assert_eq!(records, 2, "one delivered record per message");
+    }
+
+    /// A cancel that lands while a drain is writing its delivered record must
+    /// still reject the message the drain puts back; it cannot be left queued
+    /// for an agent that is gone.
+    #[test]
+    fn a_cancel_during_a_failing_drain_still_rejects_the_put_back_message() {
+        struct CancelDuringWrite {
+            mailbox: Mutex<Option<AgentMailbox>>,
+            agent: AgentId,
+            cancel: Mutex<Option<std::thread::JoinHandle<()>>>,
+        }
+        impl RuntimeSubscriber for CancelDuringWrite {
+            fn on_event(&self, _event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                RuntimeDecision::Continue
+            }
+            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+                if matches!(event.payload, RuntimeEvent::AgentMessageDelivered { .. }) {
+                    let mailbox = self.mailbox.lock().unwrap().clone().unwrap();
+                    let agent = self.agent;
+                    *self.cancel.lock().unwrap() = Some(std::thread::spawn(move || {
+                        mailbox.reject_undelivered_for_cancelled(&agent, "stopped");
+                    }));
+                    // Let the cancel reach the mailbox while this write is open.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    return Err("injected log failure".into());
+                }
+                Ok(())
+            }
+        }
+        let bus = RuntimeBus::new();
+        let registry = RuntimeRegistry::new();
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        let log = Arc::new(CancelDuringWrite {
+            mailbox: Mutex::new(None),
+            agent,
+            cancel: Mutex::new(None),
+        });
+        bus.subscribe(log.clone());
+        let mailbox = AgentMailbox::with_registry_and_bus(registry, bus);
+        *log.mailbox.lock().unwrap() = Some(mailbox.clone());
+        let message = AgentMessage::new(run, AgentId::new(), agent, "late");
+        mailbox.send(message.clone()).unwrap();
+
+        assert!(mailbox.drain(agent, 1).is_empty());
+        log.cancel.lock().unwrap().take().unwrap().join().unwrap();
+
+        assert_eq!(
+            mailbox.pending_count(&agent),
+            0,
+            "rejected message re-queued"
+        );
+        assert_eq!(
+            mailbox.get_steering_receipt(&message.id).unwrap().state,
+            "rejected"
+        );
+    }
+
+    /// One warning per failure streak, one line when it ends.
+    #[test]
+    fn a_failure_streak_warns_once_and_reports_recovery_once() {
+        let mailbox = AgentMailbox::new();
+        let agent = AgentId::new();
+        assert!(!mailbox.note_delivery_recovered(agent));
+        assert!(mailbox.note_delivery_failure(agent));
+        assert!(!mailbox.note_delivery_failure(agent));
+        assert!(!mailbox.note_delivery_failure(agent));
+        assert!(mailbox.note_delivery_recovered(agent));
+        assert!(!mailbox.note_delivery_recovered(agent));
+        assert!(
+            mailbox.note_delivery_failure(agent),
+            "a new streak warns again"
+        );
     }
 
     /// When the log fails part way, the messages already recorded are handed
