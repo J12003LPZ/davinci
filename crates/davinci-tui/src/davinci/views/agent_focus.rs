@@ -208,16 +208,17 @@ fn receipt_text(receipt: &Receipt) -> String {
     let id = receipt
         .id
         .as_deref()
-        .map(|id| format!(" {}", id.chars().take(8).collect::<String>()))
+        .map(|id| format!(" {}", plain(id).chars().take(8).collect::<String>()))
         .unwrap_or_default();
     let reason = receipt
         .reason
         .as_deref()
-        .map(|reason| format!(" ({reason})"))
+        .map(|reason| format!(" ({})", plain(reason)))
         .unwrap_or_default();
     format!(
         "to worker{id}: {}{reason} · {}",
-        receipt.state, receipt.text
+        plain(&receipt.state),
+        plain(&receipt.text)
     )
 }
 
@@ -282,11 +283,11 @@ pub fn worker_body(model: &Model, height: usize) -> Vec<Line<'static>> {
     }
     let view = model.roster.views.get(id);
     if let Some(view) = view.filter(|view| !view.changed_paths.is_empty()) {
-        let shown: Vec<&str> = view
+        let shown: Vec<String> = view
             .changed_paths
             .iter()
             .take(4)
-            .map(String::as_str)
+            .map(|path| plain(path))
             .collect();
         let more = view.changed_paths.len().saturating_sub(shown.len());
         let tail = if more > 0 {
@@ -533,5 +534,60 @@ pub fn click(model: &mut Model, index: usize) -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::davinci::roster::WorkerViewState;
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    /// Escape, OSC 52, OSC 8 hyperlink and a newline in one string.
+    const HOSTILE: &str = "x\u{1b}[2J\u{1b}]52;c;ZXZpbA==\u{7}\u{1b}]8;;http://evil\u{7}link\u{1b}]8;;\u{7}\r\nfake: approved";
+
+    #[test]
+    fn hostile_paths_and_receipts_cannot_inject_terminal_controls() {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            200,
+            24,
+            false,
+        );
+        m.roster.scope = ViewScope::Worker("agent-1".into());
+        // Fields are set directly, past the ingress sanitizing, so the
+        // renderer is the only line of defense under test.
+        m.roster.views.insert(
+            "agent-1".into(),
+            WorkerViewState {
+                agent_id: "agent-1".into(),
+                changed_paths: vec![HOSTILE.into(), HOSTILE.into()],
+                receipts: [Receipt {
+                    local: 1,
+                    id: Some(HOSTILE.into()),
+                    text: HOSTILE.into(),
+                    state: HOSTILE.into(),
+                    reason: Some(HOSTILE.into()),
+                }]
+                .into(),
+                ..WorkerViewState::default()
+            },
+        );
+        let lines = worker_body(&m, 20);
+        let joined: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(joined.contains("changed (read-only)"), "{joined:?}");
+        assert!(joined.contains("to worker"), "{joined:?}");
+        for line in &lines {
+            for span in &line.spans {
+                assert!(
+                    !span.content.chars().any(|ch| ch.is_control()),
+                    "control byte reached a cell: {:?}",
+                    span.content
+                );
+            }
+        }
     }
 }
