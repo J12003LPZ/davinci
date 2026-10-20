@@ -279,3 +279,71 @@ fn another_runs_workers_are_not_in_this_runs_store() {
     assert!(two.activity().after(a, 0, 10).events.is_empty());
     assert_eq!(one.activity().after(a, 0, 10).events.len(), 1);
 }
+
+#[test]
+fn credentials_in_any_common_shape_never_reach_a_summary() {
+    use davinci_agent::runtime::worker_activity::safe_summary;
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.c2lnbmF0dXJlMTIz";
+    let cases = [
+        ("export API_KEY=abc123secretvalue", "abc123secretvalue"),
+        (
+            "curl --token abc123secretvalue https://x",
+            "abc123secretvalue",
+        ),
+        ("curl --password=abc123secretvalue", "abc123secretvalue"),
+        (
+            r#"{"access_token": "abc123secretvalue", "n": 1}"#,
+            "abc123secretvalue",
+        ),
+        (
+            r#"{"clientSecret":"abc123secretvalue"}"#,
+            "abc123secretvalue",
+        ),
+        (
+            "Authorization: Basic abc123secretvalue",
+            "abc123secretvalue",
+        ),
+        ("authorization:Bearerabc123secretvalue", "abc123secretvalue"),
+        ("Bearerabc123secretvalue", "abc123secretvalue"),
+        (
+            "Cookie: sid=abc123secretvalue; theme=dark",
+            "abc123secretvalue",
+        ),
+        (
+            "Set-Cookie: sid=abc123secretvalue; HttpOnly",
+            "abc123secretvalue",
+        ),
+        ("token gho_abc123secretvalue", "abc123secretvalue"),
+        (
+            "ghs_abc123secretvalue and ghu_abc123secretvalue",
+            "abc123secretvalue",
+        ),
+        (&format!("echo {jwt}"), "c2lnbmF0dXJl"),
+        ("sk-proj1234567890abcdef", "sk-proj1234567890abcdef"),
+        ("DB_PASSWORD='abc123secretvalue' ./run", "abc123secretvalue"),
+    ];
+    for (input, secret) in cases {
+        let out = safe_summary(input);
+        assert!(!out.contains(secret), "{input:?} leaked: {out:?}");
+        assert!(out.contains("REDACTED"), "{input:?} -> {out:?}");
+    }
+    // Ordinary text is left alone.
+    assert_eq!(safe_summary("Read(src/lib.rs)"), "Read(src/lib.rs)");
+    assert_eq!(
+        safe_summary("cargo test -p davinci-agent"),
+        "cargo test -p davinci-agent"
+    );
+}
+
+#[test]
+fn the_roster_activity_line_is_redacted_before_it_is_clipped() {
+    use davinci_agent::subagent_progress::call_summary;
+    // The secret starts inside the 60 character window and ends beyond it.
+    let command = format!(
+        "{} export API_KEY=abcdefghijklmnopqrstuvwxyz0123456789",
+        "x".repeat(40)
+    );
+    let line = call_summary("bash", &serde_json::json!({ "command": command }));
+    assert!(!line.contains("abcdef"), "{line}");
+    assert!(line.contains("API_KEY=[RED"), "{line}");
+}

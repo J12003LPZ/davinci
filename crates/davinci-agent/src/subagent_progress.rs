@@ -440,7 +440,12 @@ pub fn call_summary(tool_name: &str, args: &Value) -> String {
         keys.iter()
             .find_map(|key| args.get(*key).and_then(Value::as_str))
             .map(|value| {
-                let line = value.lines().next().unwrap_or("").trim();
+                // Redact before clipping, so a secret cut by the clip cannot
+                // leave its first characters behind.
+                let line = crate::runtime::worker_activity::safe_summary(
+                    value.lines().next().unwrap_or("").trim(),
+                );
+                let line = line.as_str();
                 let mut clipped: String = line.chars().take(60).collect();
                 if line.chars().count() > 60 {
                     clipped.push('…');

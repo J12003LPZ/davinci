@@ -298,3 +298,32 @@ fn a_message_the_log_could_not_keep_is_not_queued() {
     assert_eq!(receipt.state, "queued");
     assert_eq!(mailbox.pending_count(&agent), 1);
 }
+
+#[test]
+fn outcome_records_are_versioned_so_an_older_build_stops_with_a_version_error() {
+    let (_dir, log, agent, run) = fixture();
+    let live = process(&log, agent, run, AgentState::Running);
+    let id = Uuid::new_v4();
+    steer(&live, id, "version me");
+    live.mailbox.drain(agent, 10);
+    assert!(live.mailbox.mark_applied(&agent, 1, &id));
+
+    // What a build that only knows version 1 would see line by line.
+    let versions: Vec<(String, u64)> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            (
+                value["payload"]["kind"].as_str().unwrap().to_string(),
+                value["schema_version"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let version_of = |kind: &str| versions.iter().find(|(k, _)| k == kind).map(|(_, v)| *v);
+    assert_eq!(version_of("agent_message_queued"), Some(1));
+    assert_eq!(version_of("agent_message_delivered"), Some(1));
+    assert_eq!(version_of("agent_message_applied"), Some(2));
+    // This build reads all of it.
+    assert_eq!(events(&log).len(), versions.len());
+}

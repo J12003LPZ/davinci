@@ -59,6 +59,12 @@ impl AgentRecord {
 }
 
 pub const RUNTIME_EVENT_SCHEMA_VERSION: u16 = 1;
+/// Records that carry an event older builds cannot parse (message applied,
+/// message rejected) are written at this version, so an older build that opens
+/// the log stops with "Unsupported runtime log schema version" rather than a
+/// corrupt-record error in the middle of the file. Every other record stays at
+/// version 1 and stays readable by older builds.
+pub const RUNTIME_EVENT_SCHEMA_VERSION_MESSAGE_OUTCOMES: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeEventEnvelope {
@@ -88,7 +94,13 @@ impl RuntimeEventEnvelope {
         payload: RuntimeEvent,
     ) -> Self {
         Self {
-            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            schema_version: match payload {
+                RuntimeEvent::AgentMessageApplied { .. }
+                | RuntimeEvent::AgentMessageRejected { .. } => {
+                    RUNTIME_EVENT_SCHEMA_VERSION_MESSAGE_OUTCOMES
+                }
+                _ => RUNTIME_EVENT_SCHEMA_VERSION,
+            },
             event_id: Uuid::now_v7(),
             sequence,
             timestamp_ms: std::time::SystemTime::now()
