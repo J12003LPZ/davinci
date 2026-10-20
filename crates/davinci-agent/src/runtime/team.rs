@@ -453,6 +453,11 @@ where
                     if stop_requested(worker) {
                         return TeammateExit::Stopped;
                     }
+                    // A message that stays pending is waiting on a log write
+                    // that failed: do not spin on it.
+                    if worker.mailbox.pending_count(&me) > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                 }
                 MailboxWait::Stopped => return TeammateExit::Stopped,
                 MailboxWait::TimedOut => return TeammateExit::IdleTimeout,

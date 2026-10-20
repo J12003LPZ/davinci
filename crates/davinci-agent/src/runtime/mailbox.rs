@@ -714,52 +714,47 @@ impl AgentMailbox {
     }
 
     /// Drain up to `limit` messages for the given agent ID.
+    ///
+    /// A message is handed over only after its delivered record is in the
+    /// runtime log. If that write fails, the message goes back to the front of
+    /// the queue as `queued` and is not returned, so it is delivered once
+    /// later and replay never sees a queued record with no delivered record
+    /// for an instruction the worker already acted on. Messages whose record
+    /// was written before the failure are returned; the rest stay pending.
     pub fn drain(&self, agent_id: AgentId, limit: usize) -> Vec<AgentMessage> {
         if limit == 0 {
             return Vec::new();
         }
 
-        let drained: Vec<AgentMessage> = {
-            // The queue and the receipts change under the lifecycle lock; the
-            // log write (an fsync, and any hooks) happens after it is released
-            // so a sender is never held up behind it.
-            let _lifecycle = self
-                .lifecycle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let drained: Vec<AgentMessage> = {
-                let Ok(mut queues) = self.queues.write() else {
-                    return Vec::new();
-                };
-                if let Some(queue) = queues.get_mut(&agent_id) {
-                    let count = limit.min(queue.len());
-                    let mut items = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        if let Some(msg) = queue.pop_front() {
-                            items.push(msg);
-                        }
-                    }
-                    items
-                } else {
-                    Vec::new()
-                }
+        // Held through the log write, as `send` holds it across its event, so
+        // no other drain can overtake messages that may be put back.
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut drained: Vec<AgentMessage> = {
+            let Ok(mut queues) = self.queues.write() else {
+                return Vec::new();
             };
-            if let Ok(mut receipts) = self.steering_receipts.write() {
-                for msg in &drained {
-                    if let Some(r) = receipts.get_mut(&msg.id) {
-                        if r.state == "queued" {
-                            r.state = "delivered".to_string();
-                        }
+            if let Some(queue) = queues.get_mut(&agent_id) {
+                let count = limit.min(queue.len());
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if let Some(msg) = queue.pop_front() {
+                        items.push(msg);
                     }
                 }
+                items
+            } else {
+                Vec::new()
             }
-            drained
         };
 
-        // Announced before this returns, so the caller cannot apply a message
+        // Written before this returns, so the caller cannot apply a message
         // whose delivery has not been logged: only the drainer holds it yet.
+        let mut kept = 0;
         for msg in &drained {
-            self.announce(
+            let logged = self.announce_durably(
                 msg.run_id,
                 Some(agent_id),
                 RuntimeEvent::AgentMessageDelivered {
@@ -767,6 +762,33 @@ impl AgentMailbox {
                     message_id: msg.id,
                 },
             );
+            if let Err(error) = logged {
+                eprintln!(
+                    "[davinci-runtime] message {} stays queued, its delivery was not recorded: {error}",
+                    msg.id
+                );
+                break;
+            }
+            kept += 1;
+        }
+        let unlogged = drained.split_off(kept);
+
+        if let Ok(mut receipts) = self.steering_receipts.write() {
+            for msg in &drained {
+                if let Some(r) = receipts.get_mut(&msg.id) {
+                    if r.state == "queued" {
+                        r.state = "delivered".to_string();
+                    }
+                }
+            }
+        }
+        if !unlogged.is_empty() {
+            if let Ok(mut queues) = self.queues.write() {
+                let queue = queues.entry(agent_id).or_default();
+                for msg in unlogged.into_iter().rev() {
+                    queue.push_front(msg);
+                }
+            }
         }
 
         drained
@@ -1510,6 +1532,162 @@ mod tests {
         let replayed = AgentMailbox::new();
         replayed.rehydrate_from_events(&envelopes);
         assert_eq!(replayed.pending_count(&agent), 0);
+    }
+
+    /// A runtime log whose durable write can be made to fail, keeping every
+    /// envelope it did accept so a restart can be replayed from it.
+    #[derive(Default)]
+    struct FlakyLog {
+        fail: std::sync::atomic::AtomicBool,
+        kept: Mutex<Vec<RuntimeEventEnvelope>>,
+    }
+
+    impl RuntimeSubscriber for FlakyLog {
+        fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+            self.kept.lock().unwrap().push(event.clone());
+            RuntimeDecision::Continue
+        }
+
+        fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("injected log failure".into());
+            }
+            self.on_event(event);
+            Ok(())
+        }
+    }
+
+    fn flaky_mailbox() -> (AgentMailbox, Arc<FlakyLog>, RuntimeRegistry, AgentId, RunId) {
+        let bus = RuntimeBus::new();
+        let log = Arc::new(FlakyLog::default());
+        bus.subscribe(log.clone());
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        (mailbox, log, registry, agent, run)
+    }
+
+    /// A delivery that cannot be logged is not handed to the worker: the
+    /// message stays queued and a retry delivers it exactly once.
+    #[test]
+    fn a_failed_delivery_record_keeps_the_message_queued_until_a_retry() {
+        let (mailbox, log, _registry, agent, run) = flaky_mailbox();
+        let first = AgentMessage::new(run, AgentId::new(), agent, "first");
+        let second = AgentMessage::new(run, AgentId::new(), agent, "second");
+        mailbox.send(first.clone()).unwrap();
+        mailbox.send(second.clone()).unwrap();
+
+        log.fail.store(true, Ordering::SeqCst);
+        assert!(mailbox.drain(agent, 10).is_empty());
+        assert_eq!(mailbox.pending_count(&agent), 2);
+        for id in [first.id, second.id] {
+            assert_eq!(mailbox.get_steering_receipt(&id).unwrap().state, "queued");
+        }
+        assert!(!mailbox.mark_applied(&agent, 1, &first.id));
+
+        log.fail.store(false, Ordering::SeqCst);
+        let delivered = mailbox.drain(agent, 10);
+        assert_eq!(
+            delivered.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [first.id, second.id],
+            "order is kept across the failed attempt"
+        );
+        assert!(mailbox.drain(agent, 10).is_empty());
+        let records = log
+            .kept
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.payload, RuntimeEvent::AgentMessageDelivered { .. }))
+            .count();
+        assert_eq!(records, 2, "one delivered record per message");
+    }
+
+    /// When the log fails part way, the messages already recorded are handed
+    /// over and the rest stay pending, so no message is both unrecorded and
+    /// delivered.
+    #[test]
+    fn a_log_failure_part_way_hands_over_only_recorded_messages() {
+        struct FailAfter {
+            inner: FlakyLog,
+            allowed: std::sync::atomic::AtomicUsize,
+        }
+        impl RuntimeSubscriber for FailAfter {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                self.inner.on_event(event)
+            }
+            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+                let left = self.allowed.load(Ordering::SeqCst);
+                if left == 0 {
+                    return Err("injected log failure".into());
+                }
+                self.allowed.store(left - 1, Ordering::SeqCst);
+                self.inner.record_durably(event)
+            }
+        }
+        let bus = RuntimeBus::new();
+        let log = Arc::new(FailAfter {
+            inner: FlakyLog::default(),
+            allowed: std::sync::atomic::AtomicUsize::new(1),
+        });
+        bus.subscribe(log.clone());
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        let first = AgentMessage::new(run, AgentId::new(), agent, "first");
+        let second = AgentMessage::new(run, AgentId::new(), agent, "second");
+        mailbox.send(first.clone()).unwrap();
+        mailbox.send(second.clone()).unwrap();
+
+        let delivered = mailbox.drain(agent, 10);
+        assert_eq!(
+            delivered.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [first.id]
+        );
+        assert_eq!(
+            mailbox
+                .peek(&agent)
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            [second.id]
+        );
+        assert_eq!(
+            mailbox.get_steering_receipt(&first.id).unwrap().state,
+            "delivered"
+        );
+        assert_eq!(
+            mailbox.get_steering_receipt(&second.id).unwrap().state,
+            "queued"
+        );
+    }
+
+    /// A crash right after the durable delivered record: replay finds the
+    /// delivery and does not queue the instruction a second time.
+    #[test]
+    fn replay_after_a_recorded_delivery_does_not_requeue_the_message() {
+        let (mailbox, log, _registry, agent, run) = flaky_mailbox();
+        let message = AgentMessage::new(run, AgentId::new(), agent, "do it once");
+        mailbox.send(message.clone()).unwrap();
+        assert_eq!(mailbox.drain(agent, 1).len(), 1);
+        // The process dies here: nothing was applied.
+
+        let envelopes = log.kept.lock().unwrap().clone();
+        let restarted = AgentMailbox::new();
+        restarted.rehydrate_from_events(&envelopes);
+        assert_eq!(restarted.pending_count(&agent), 0);
+        assert!(restarted.drain(agent, 10).is_empty());
+        let receipt = restarted.get_steering_receipt(&message.id).unwrap();
+        assert_eq!(receipt.state, "unknown");
+        assert_eq!(receipt.reason.as_deref(), Some("restart_before_apply"));
     }
 
     /// WOR-91: a failed wake withdraws the message, so an error never hides
