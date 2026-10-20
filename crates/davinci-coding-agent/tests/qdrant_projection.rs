@@ -1013,3 +1013,152 @@ fn a_finished_clear_that_cannot_be_recorded_is_not_treated_as_finished() {
     assert_eq!(receipt.failures, 0, "{receipt:?}");
     assert!(!memory.remote_clear_pending());
 }
+
+use davinci_coding_agent::native_extensions::memory_backends::runtime::ProjectionRuntime;
+use davinci_coding_agent::native_extensions::memory_backends::ProjectionHit;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[test]
+fn an_owed_clear_uses_the_repo_id_it_was_written_under() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory
+        .index_messages(&[note("alpha one"), note("beta two")])
+        .unwrap();
+    let old_collection = memory.remote_collection_name();
+    fake.set_down(true);
+    memory.clear().unwrap();
+    drop(memory);
+    fake.set_down(false);
+
+    // The repo id follows the branch and the git config: it changed before
+    // the retry. A delete filtered by the new one would match nothing and
+    // still look like success.
+    let mut restarted = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    restarted.repo_id = "the-same-repo-on-another-branch".into();
+    assert!(restarted.remote_clear_pending());
+    assert_ne!(restarted.remote_collection_name(), old_collection);
+
+    let receipt = restarted.reconcile_remote(10);
+    assert_eq!(receipt.failures, 0, "{receipt:?}");
+    assert!(!restarted.remote_clear_pending());
+    assert_eq!(
+        fake.collection(&old_collection).unwrap().points.len(),
+        0,
+        "the vectors are still there although the marker was dropped"
+    );
+}
+
+/// A real client whose upload can be followed by a clear, and whose delete can
+/// be made to fail.
+struct Meddling {
+    inner: QdrantProjection,
+    clear_after_upload: Box<dyn Fn() + Send + Sync>,
+    fail_deletes: AtomicBool,
+}
+
+impl VectorProjection for Meddling {
+    fn ensure_ready(&self) -> Result<(), ProjectionError> {
+        self.inner.ensure_ready()
+    }
+    fn upsert(&self, points: &[ProjectionPoint]) -> Result<(), ProjectionError> {
+        self.inner.upsert(points)?;
+        (self.clear_after_upload)();
+        Ok(())
+    }
+    fn query(
+        &self,
+        vector: &[f32],
+        repo_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectionHit>, ProjectionError> {
+        self.inner.query(vector, repo_id, limit)
+    }
+    fn delete(&self, ids: &[String], repo_id: &str) -> Result<(), ProjectionError> {
+        if self.fail_deletes.load(Ordering::SeqCst) {
+            return Err(ProjectionError::Offline("injected".into()));
+        }
+        self.inner.delete(ids, repo_id)
+    }
+    fn clear_namespace(&self, repo_id: &str) -> Result<(), ProjectionError> {
+        self.inner.clear_namespace(repo_id)
+    }
+    fn delete_from(
+        &self,
+        collection: &str,
+        ids: &[String],
+        repo_id: &str,
+    ) -> Result<(), ProjectionError> {
+        self.inner.delete_from(collection, ids, repo_id)
+    }
+    fn count_held(&self, ids: &[String], repo_id: &str) -> Result<usize, ProjectionError> {
+        self.inner.count_held(ids, repo_id)
+    }
+}
+
+#[test]
+fn points_that_could_not_be_taken_back_after_a_clear_are_owed_not_forgotten() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    fake.set_down(true);
+    memory
+        .index_messages(&[note("alpha one"), note("beta two")])
+        .unwrap();
+    fake.set_down(false);
+
+    // A clear lands while the catch-up's upload is in flight (the epoch moves),
+    // and then the compensating delete fails.
+    let state = memory.local_path().with_file_name("projection-state.json");
+    let collection = memory.remote_collection_name();
+    let repo_id = memory.repo_id.clone();
+    let runtime: Arc<ProjectionRuntime> = memory.projection.clone();
+    let meddling = Arc::new(Meddling {
+        inner: QdrantProjection::new(&config, &repo_id).unwrap(),
+        clear_after_upload: Box::new({
+            let runtime = runtime.clone();
+            let fired = AtomicBool::new(false);
+            move || {
+                if !fired.swap(true, Ordering::SeqCst) {
+                    runtime
+                        .begin_clear(&state, &collection, &repo_id, Vec::new())
+                        .unwrap();
+                }
+            }
+        }),
+        fail_deletes: AtomicBool::new(true),
+    });
+    memory.projection.inject(meddling.clone());
+
+    let epoch = memory.remote_clear_epoch();
+    let pass = memory.reconcile_remote_at(10, Some(epoch));
+    assert_eq!(pass.failures, 1, "{pass:?}");
+    assert_eq!(pass.indexed, 0, "{pass:?}");
+    assert_eq!(
+        remote_points(&fake, &memory),
+        2,
+        "the ghosts are on the remote"
+    );
+    assert!(
+        memory.remote_clear_pending(),
+        "nobody is going to remove them"
+    );
+
+    // The remote answers again: the owed delete runs, then the records that
+    // are still local are sent once more.
+    meddling.fail_deletes.store(false, Ordering::SeqCst);
+    let deletes_before = fake.count_matching("POST", "/points/delete");
+    let pass = memory.reconcile_remote(10);
+    assert_eq!(pass.failures, 0, "{pass:?}");
+    assert!(!memory.remote_clear_pending());
+    assert!(
+        fake.count_matching("POST", "/points/delete") > deletes_before,
+        "the owed delete never ran"
+    );
+    assert_eq!(remote_points(&fake, &memory), 2);
+}

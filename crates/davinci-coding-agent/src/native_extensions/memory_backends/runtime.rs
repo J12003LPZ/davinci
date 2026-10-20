@@ -68,6 +68,12 @@ struct SyncFile {
 pub struct PendingClear {
     /// The collection the clear applies to.
     pub collection: String,
+    /// The repo id the ids were written under. It follows the checked-out
+    /// branch and git config, so it can differ by the time the clear is
+    /// retried; the delete filter must use this one. Empty in a file written
+    /// before this field existed: the current repo id is used then.
+    #[serde(default)]
+    pub repo_id: String,
     /// Exactly the records the clear removed, taken when it was confirmed:
     /// the ledger plus the local records. Later uploads from this or another
     /// clone of the same repository are not touched when it runs.
@@ -192,6 +198,7 @@ impl ProjectionRuntime {
         &self,
         path: &Path,
         collection: &str,
+        repo_id: &str,
         ids: Vec<String>,
     ) -> Result<(), String> {
         let mut inner = self.lock();
@@ -203,26 +210,7 @@ impl ProjectionRuntime {
         );
         inner.sync.file.synced.clear();
         inner.sync.file.clear_epoch += 1;
-        if !ids.is_empty() {
-            let file = &mut inner.sync.file;
-            match file
-                .pending_clears
-                .iter_mut()
-                .find(|pending| pending.collection == collection)
-            {
-                Some(pending) => {
-                    let merged: BTreeSet<String> = pending.ids.iter().cloned().chain(ids).collect();
-                    pending.ids = merged.into_iter().collect();
-                }
-                None => {
-                    let unique: BTreeSet<String> = ids.into_iter().collect();
-                    file.pending_clears.push(PendingClear {
-                        collection: collection.to_string(),
-                        ids: unique.into_iter().collect(),
-                    });
-                }
-            }
-        }
+        Self::merge_owed(&mut inner.sync.file, collection, repo_id, ids);
         let saved = Self::save_sync_checked(&inner.sync, path);
         if saved.is_err() {
             inner.sync.file.synced = before.0;
@@ -230,6 +218,50 @@ impl ProjectionRuntime {
             inner.sync.file.clear_epoch = before.2;
         }
         saved
+    }
+
+    /// Owe the remote a delete of these ids without touching the ledger or the
+    /// epoch: points that were uploaded and could not be taken back out.
+    pub fn owe_clear(
+        &self,
+        path: &Path,
+        collection: &str,
+        repo_id: &str,
+        ids: Vec<String>,
+    ) -> Result<(), String> {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        let before = inner.sync.file.pending_clears.clone();
+        Self::merge_owed(&mut inner.sync.file, collection, repo_id, ids);
+        let saved = Self::save_sync_checked(&inner.sync, path);
+        if saved.is_err() {
+            inner.sync.file.pending_clears = before;
+        }
+        saved
+    }
+
+    fn merge_owed(file: &mut SyncFile, collection: &str, repo_id: &str, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        match file
+            .pending_clears
+            .iter_mut()
+            .find(|pending| pending.collection == collection && pending.repo_id == repo_id)
+        {
+            Some(pending) => {
+                let merged: BTreeSet<String> = pending.ids.iter().cloned().chain(ids).collect();
+                pending.ids = merged.into_iter().collect();
+            }
+            None => {
+                let unique: BTreeSet<String> = ids.into_iter().collect();
+                file.pending_clears.push(PendingClear {
+                    collection: collection.to_string(),
+                    repo_id: repo_id.to_string(),
+                    ids: unique.into_iter().collect(),
+                });
+            }
+        }
     }
 
     /// Every clear still owed to the remote, for any collection.

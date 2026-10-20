@@ -2609,7 +2609,7 @@ impl VectorMemory {
             );
             cleared
                 .projection
-                .begin_clear(&path, &collection, ids.into_iter().collect())
+                .begin_clear(&path, &collection, &cleared.repo_id, ids.into_iter().collect())
                 .map_err(|error| {
                     ToolError::Failed(format!(
                         "memory not cleared: the pending remote clear could not be recorded: {error}"
@@ -3166,7 +3166,12 @@ impl VectorMemory {
             return OwedClears::Unavailable;
         };
         for pending in owed {
-            let outcome = client.delete_from(&pending.collection, &pending.ids, &self.repo_id);
+            let repo_id = if pending.repo_id.is_empty() {
+                self.repo_id.as_str()
+            } else {
+                pending.repo_id.as_str()
+            };
+            let outcome = client.delete_from(&pending.collection, &pending.ids, repo_id);
             if let Err(error) = outcome {
                 self.projection.record(&self.config, Err(error.clone()));
                 return OwedClears::Failed(error);
@@ -3316,7 +3321,14 @@ impl VectorMemory {
                     // A clear landed while this was in flight: these are
                     // records it removed. Take them back out, record nothing.
                     let ids: Vec<String> = sending.iter().map(|point| point.id.clone()).collect();
-                    let _ = client.delete(&ids, &self.repo_id);
+                    if let Err(error) = client.delete(&ids, &self.repo_id) {
+                        // They would stay as ghosts: owe the delete, so a later
+                        // reconcile retries it, and say so in the receipt.
+                        let _ = self
+                            .projection
+                            .owe_clear(&path, &collection, &self.repo_id, ids);
+                        fail(&mut receipt, error);
+                    }
                     return receipt;
                 }
                 Ok(()) => {
