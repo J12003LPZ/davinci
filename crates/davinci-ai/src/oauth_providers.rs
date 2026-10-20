@@ -472,11 +472,11 @@ fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, St
         .then(|| std::env::var("PI_OAUTH_TOKEN_URL").ok())
         .flatten()
         .unwrap_or_else(|| request.url.clone());
-    let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+    let mut response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .post(&url)
-        .set("content-type", &request.content_type)
-        .set("accept", "application/json")
-        .send_string(&request.body)
+        .header("content-type", &request.content_type)
+        .header("accept", "application/json")
+        .send(&request.body)
         .map_err(|err| {
             format!(
                 "Token exchange request failed. url={url}; redirect_uri={}; response_type=authorization_code; details={}",
@@ -484,7 +484,7 @@ fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, St
                 err
             )
         })?;
-    let body = response.into_string().map_err(|err| {
+    let body = response.body_mut().read_to_string().map_err(|err| {
         format!(
             "Token exchange request failed. url={url}; redirect_uri={}; response_type=authorization_code; details={}",
             request.redirect_uri,

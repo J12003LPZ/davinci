@@ -133,20 +133,23 @@ fn post_form(
         .finish();
     let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .post(url)
-        .set("content-type", "application/x-www-form-urlencoded")
-        .set("accept", "application/json");
+        .config()
+        // Device endpoints answer pending and slow_down as 4xx JSON bodies.
+        .http_status_as_error(false)
+        .build()
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json");
     if let Some(user_agent) = user_agent {
-        request = request.set("user-agent", user_agent);
+        request = request.header("user-agent", user_agent);
     }
     // Device endpoints report pending/slow_down as 4xx JSON bodies.
-    let response = match request.send_string(&body) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(error) => return Err(format!("Device login request to {url} failed: {error}")),
-    };
-    let status = response.status();
+    let mut response = request
+        .send(&body)
+        .map_err(|error| format!("Device login request to {url} failed: {error}"))?;
+    let status = response.status().as_u16();
     let text = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|error| format!("Device login response from {url} unreadable: {error}"))?;
     Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
 }
@@ -339,17 +342,18 @@ pub fn copilot_token(github_token: &str) -> Result<OauthTokens, String> {
 pub(crate) fn copilot_token_at(url: &str, github_token: &str) -> Result<OauthTokens, String> {
     let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .get(url)
-        .set("accept", "application/json")
-        .set("authorization", &format!("Bearer {github_token}"));
+        .header("accept", "application/json")
+        .header("authorization", &format!("Bearer {github_token}"));
     for (name, value) in crate::auth::copilot_headers() {
-        request = request.set(name, value);
+        request = request.header(name, value);
     }
-    let response = request
+    let mut response = request
         .call()
         .map_err(|error| format!("Copilot token request failed: {error}"))?;
     let body: Value = serde_json::from_str(
         &response
-            .into_string()
+            .body_mut()
+            .read_to_string()
             .map_err(|error| format!("Copilot token response unreadable: {error}"))?,
     )
     .map_err(|_| "Invalid Copilot token response".to_string())?;

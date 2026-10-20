@@ -129,10 +129,13 @@ impl QdrantProjection {
             api_key: projection.api_key.clone(),
             batch_size: projection.batch_size.clamp(1, MAX_BATCH),
             // No redirects: the api-key header must not follow one elsewhere.
-            agent: ureq::AgentBuilder::new()
-                .timeout(timeout)
-                .redirects(0)
-                .build(),
+            agent: crate::http_client::config()
+                .timeout_global(Some(timeout))
+                // A 3xx comes back as the answer, as it did in ureq 2.
+                .max_redirects(0)
+                .max_redirects_will_error(false)
+                .build()
+                .into(),
             ready: AtomicBool::new(false),
         })
     }
@@ -156,18 +159,49 @@ impl QdrantProjection {
 
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, CallError> {
         let url = format!("{}{path}", self.base);
-        let mut request = self.agent.request(method, &url);
-        if let Some(key) = &self.api_key {
-            request = request.set("api-key", key.expose());
-        }
-        let outcome = match body {
-            Some(body) => request.send_json(body),
-            None => request.call(),
+        let key = self.api_key.as_ref().map(|key| key.expose());
+        // ureq 2 let any method carry a body; here only POST and PUT do.
+        let outcome = match (method, body) {
+            ("POST", body) => {
+                let mut request = self.agent.post(&url);
+                if let Some(key) = key {
+                    request = request.header("api-key", key);
+                }
+                match body {
+                    Some(body) => crate::http_client::send_json(request, &body),
+                    None => request.send_empty(),
+                }
+            }
+            ("PUT", body) => {
+                let mut request = self.agent.put(&url);
+                if let Some(key) = key {
+                    request = request.header("api-key", key);
+                }
+                match body {
+                    Some(body) => crate::http_client::send_json(request, &body),
+                    None => request.send_empty(),
+                }
+            }
+            (method, body) => {
+                let mut request = match method {
+                    "DELETE" => self.agent.delete(&url),
+                    _ => self.agent.get(&url),
+                };
+                if let Some(key) = key {
+                    request = request.header("api-key", key);
+                }
+                match body {
+                    Some(body) => crate::http_client::send_json(request.force_send_body(), &body),
+                    None => request.call(),
+                }
+            }
         };
         match outcome {
-            Ok(response) => Ok(response.into_json::<Value>().unwrap_or(Value::Null)),
-            Err(ureq::Error::Status(status, _)) => Err(CallError::Status(status)),
-            Err(ureq::Error::Transport(error)) => Err(CallError::Transport(error.to_string())),
+            Ok(mut response) => {
+                Ok(crate::http_client::read_json::<Value>(&mut response).unwrap_or(Value::Null))
+            }
+            Err(ureq::Error::StatusCode(status)) => Err(CallError::Status(status)),
+            Err(error) => Err(CallError::Transport(error.to_string())),
         }
     }
 

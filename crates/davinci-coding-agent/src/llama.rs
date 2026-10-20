@@ -325,26 +325,35 @@ fn llama_request(
         return Ok(serde_json::json!({ "ok": true, "path": path, "method": method }));
     }
     let url = format!("{}{path}", normalize_llama_server_url(server_url)?);
-    let mut request = match method {
-        "POST" => ureq::post(&url),
-        _ => ureq::get(&url),
-    };
-    if let Ok(key) = std::env::var("LLAMA_API_KEY") {
-        if !key.is_empty() {
-            request = request.set("Authorization", &format!("Bearer {key}"));
+    let agent = davinci_coding_agent::http_client::agent();
+    let authorization = std::env::var("LLAMA_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(|key| format!("Bearer {key}"));
+    let outcome = if method == "POST" {
+        let mut request = agent.post(&url);
+        if let Some(authorization) = &authorization {
+            request = request.header("Authorization", authorization);
         }
-    }
-    let response = if let Some(body) = body {
-        request
-            .send_json(body)
-            .map_err(|err| format!("Could not connect to the server. {err}"))?
+        match body {
+            Some(body) => davinci_coding_agent::http_client::send_json(request, &body),
+            None => request.send_empty(),
+        }
     } else {
-        request
-            .call()
-            .map_err(|err| format!("Could not connect to the server. {err}"))?
+        let mut request = agent.get(&url);
+        if let Some(authorization) = &authorization {
+            request = request.header("Authorization", authorization);
+        }
+        match body {
+            Some(body) => {
+                davinci_coding_agent::http_client::send_json(request.force_send_body(), &body)
+            }
+            None => request.call(),
+        }
     };
-    let status = response.status();
-    let payload = response.into_json::<Value>().ok();
+    let mut response = outcome.map_err(|err| format!("Could not connect to the server. {err}"))?;
+    let status = response.status().as_u16();
+    let payload = davinci_coding_agent::http_client::read_json::<Value>(&mut response).ok();
     if !(200..300).contains(&status) {
         return Err(llama_error_message(
             payload.as_ref(),
@@ -455,25 +464,37 @@ pub fn watch_live(
         return Ok(());
     }
     let url = format!("{}/models/sse", normalize_llama_server_url(server_url)?);
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_millis(200))
-        .timeout_write(Duration::from_secs(5))
-        .build();
+    // A silent socket must hand control back every 200 ms to look at `cancel`.
+    let agent = davinci_ai::idle_read_agent(
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+    );
     let mut request = agent.get(&url);
     if let Ok(key) = std::env::var("LLAMA_API_KEY") {
         if !key.is_empty() {
-            request = request.set("Authorization", &format!("Bearer {key}"));
+            request = request.header("Authorization", &format!("Bearer {key}"));
         }
     }
     let response = request
         .call()
         .map_err(|err| format!("llama.cpp SSE returned HTTP {err}"))?;
-    let status = response.status();
+    let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(format!("llama.cpp SSE returned HTTP {status}"));
     }
-    read_sse_stream(response.into_reader(), cancel, &mut on_event)
+    read_sse_stream(response.into_body().into_reader(), cancel, &mut on_event)
+}
+
+/// An idle read: the OS kind, or ureq 3's timeout wrapped in an `io::Error`.
+fn is_read_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) || err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .is_some_and(|inner| matches!(inner, ureq::Error::Timeout(_)))
 }
 
 fn read_sse_stream(
@@ -516,8 +537,7 @@ fn read_sse_stream(
                     }
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(err) if is_read_timeout(&err) => continue,
             Err(err) => {
                 if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                     return Ok(());
@@ -854,11 +874,11 @@ pub fn list_models_opts(server_url: &str, reload: bool) -> Result<Vec<LlamaModel
         "/models"
     };
     let url = format!("{}{path}", normalize_llama_server_url(server_url)?);
-    let response = ureq::get(&url)
+    let mut response = davinci_coding_agent::http_client::agent()
+        .get(&url)
         .call()
         .map_err(|err| format!("Could not connect to the server. {err}"))?;
-    let payload: Value = response
-        .into_json()
+    let payload: Value = davinci_coding_agent::http_client::read_json(&mut response)
         .map_err(|err| format!("llama.cpp returned an invalid model catalog: {err}"))?;
     parse_models_catalog(&payload)
 }
@@ -882,10 +902,13 @@ pub fn router_autoload(server_url: &str, catalog: &[LlamaModelInfo]) -> bool {
     let Ok(url) = normalize_llama_server_url(server_url) else {
         return false;
     };
-    ureq::get(&format!("{url}/props"))
+    davinci_coding_agent::http_client::agent()
+        .get(&format!("{url}/props"))
         .call()
         .ok()
-        .and_then(|response| response.into_json::<Value>().ok())
+        .and_then(|mut response| {
+            davinci_coding_agent::http_client::read_json::<Value>(&mut response).ok()
+        })
         .and_then(|value| value.get("models_autoload").and_then(Value::as_bool))
         .unwrap_or(false)
 }
@@ -956,18 +979,23 @@ fn hugging_face_request(path: &str) -> Result<Value, String> {
         return Ok(serde_json::json!({ "id": "org/model", "gated": false, "siblings": [] }));
     }
     let url = format!("{}{path}", hugging_face_base_url());
-    let mut request = ureq::get(&url);
+    let mut request = davinci_coding_agent::http_client::agent()
+        .get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build();
     if let Some(token) = find_hugging_face_token() {
-        request = request.set("Authorization", &format!("Bearer {token}"));
+        request = request.header("Authorization", &format!("Bearer {token}"));
     }
-    let response = request
-        .timeout(std::time::Duration::from_secs(15))
+    let mut response = request
         .call()
         .map_err(|err| format!("Could not connect to Hugging Face. {err}"))?;
-    let status = response.status();
-    let retry_after = response.header("retry-after").map(str::to_string);
-    let ratelimit = response.header("ratelimit").map(str::to_string);
-    let payload = response.into_json::<Value>().ok();
+    let status = response.status().as_u16();
+    let retry_after =
+        davinci_coding_agent::http_client::header(&response, "retry-after").map(str::to_string);
+    let ratelimit =
+        davinci_coding_agent::http_client::header(&response, "ratelimit").map(str::to_string);
+    let payload = davinci_coding_agent::http_client::read_json::<Value>(&mut response).ok();
     if status == 429 {
         let delay = retry_after
             .as_deref()
@@ -1528,6 +1556,63 @@ mod tests {
         assert_eq!(got[0].event, "model_status");
         let progress = parse_load_progress(got[0].data.as_ref().unwrap()).unwrap();
         assert_eq!(progress.message, "Loading text model");
+    }
+
+    fn sse_server(frames: Vec<(u64, &'static str)>, hold_open_ms: u64) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                );
+                for (wait_ms, body) in frames {
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+                    let _ = stream.write_all(chunk.as_bytes());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(hold_open_ms));
+                let _ = stream.write_all(b"0\r\n\r\n");
+            }
+        });
+        url
+    }
+
+    const SSE_FRAME: &str = "data: {\"model\":\"local\",\"event\":\"model_status\",\"data\":{\"status\":\"loaded\"}}\n\n";
+
+    /// ureq 2 woke every 200 ms (`timeout_read`) and kept reading. A server that
+    /// is quiet for several of those intervals must not end the watch.
+    #[test]
+    fn live_sse_watch_survives_gaps_longer_than_the_idle_read() {
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PI_LLAMA_SSE_REPLY");
+        std::env::remove_var("PI_LLAMA_DRY_RUN");
+        let url = sse_server(vec![(0, SSE_FRAME), (900, SSE_FRAME)], 0);
+        let mut got = Vec::new();
+        watch_live(&url, |event| got.push(event), None).unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    #[test]
+    fn live_sse_watch_stops_on_cancel_while_the_server_is_silent() {
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PI_LLAMA_SSE_REPLY");
+        std::env::remove_var("PI_LLAMA_DRY_RUN");
+        let url = sse_server(vec![(0, SSE_FRAME)], 6_000);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let mut got = Vec::new();
+        watch_live(&url, |event| got.push(event), Some(&cancel)).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[test]

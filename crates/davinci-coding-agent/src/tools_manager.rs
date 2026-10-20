@@ -268,19 +268,18 @@ fn latest_version(repo: &str) -> Result<String, String> {
         );
     }
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(NETWORK_TIMEOUT_MS))
-        .build();
-    let response = agent
+    let agent = davinci_coding_agent::http_client::agent_with_timeout(Duration::from_millis(
+        NETWORK_TIMEOUT_MS,
+    ));
+    let mut response = agent
         .get(&url)
-        .set("User-Agent", &format!("{APP_NAME}-coding-agent"))
+        .header("User-Agent", &format!("{APP_NAME}-coding-agent"))
         .call()
         .map_err(|err| format!("GitHub API error: {err}"))?;
-    if response.status() >= 400 {
-        return Err(format!("GitHub API error: {}", response.status()));
+    if response.status().as_u16() >= 400 {
+        return Err(format!("GitHub API error: {}", response.status().as_u16()));
     }
-    let value: serde_json::Value = response
-        .into_json()
+    let value: serde_json::Value = davinci_coding_agent::http_client::read_json(&mut response)
         .map_err(|err| format!("GitHub API error: {err}"))?;
     let tag = value
         .get("tag_name")
@@ -303,17 +302,20 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
             "refusing live HTTP (set PI_TOOL_DOWNLOAD_REPLY or PI_ALLOW_TOOL_DOWNLOAD)".into(),
         );
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(DOWNLOAD_TIMEOUT_MS))
-        .build();
+    let agent = davinci_coding_agent::http_client::agent_with_timeout(Duration::from_millis(
+        DOWNLOAD_TIMEOUT_MS,
+    ));
     let response = agent
         .get(url)
         .call()
         .map_err(|err| format!("Failed to download: {err}"))?;
-    if response.status() >= 400 {
-        return Err(format!("Failed to download: {}", response.status()));
+    if response.status().as_u16() >= 400 {
+        return Err(format!(
+            "Failed to download: {}",
+            response.status().as_u16()
+        ));
     }
-    let mut reader = response.into_reader();
+    let mut reader = response.into_body().into_reader();
     let mut file = fs::File::create(dest).map_err(|err| err.to_string())?;
     std::io::copy(&mut reader, &mut file).map_err(|err| err.to_string())?;
     Ok(())

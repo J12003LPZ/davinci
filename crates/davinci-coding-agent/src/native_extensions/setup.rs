@@ -543,15 +543,18 @@ pub fn start_pull(memory: Arc<Mutex<VectorMemory>>, url: &str, model: &str) -> b
 
 fn pull_model(url: &str, model: &str) -> Result<(), String> {
     // A pull streams progress lines for minutes; only a stalled read fails it.
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(120))
-        .build();
-    let response = agent
-        .post(&format!("{url}/api/pull"))
-        .send_json(json!({"model": model, "name": model, "stream": true}))
-        .map_err(|error| error.to_string())?;
-    let reader = BufReader::new(response.into_reader());
+    let agent = davinci_ai::idle_read_agent(
+        Duration::from_secs(10),
+        Duration::from_secs(120),
+        // ureq 2 left writes unbounded here; the request is a few bytes.
+        Duration::from_secs(60),
+    );
+    let response = crate::http_client::send_json(
+        agent.post(&format!("{url}/api/pull")),
+        &json!({"model": model, "name": model, "stream": true}),
+    )
+    .map_err(|error| error.to_string())?;
+    let reader = BufReader::new(response.into_body().into_reader());
     let mut succeeded = false;
     for line in reader.lines() {
         let line = line.map_err(|error| error.to_string())?;

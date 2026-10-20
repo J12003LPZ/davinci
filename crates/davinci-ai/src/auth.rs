@@ -325,13 +325,14 @@ impl AuthStorage {
                 "provider": provider,
                 "refresh": refresh,
             });
-            let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+            let mut response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
                 .post(&url)
-                .set("content-type", "application/json")
-                .send_string(&body.to_string())
+                .header("content-type", "application/json")
+                .send(&body.to_string())
                 .map_err(|err| AuthStorageError::Read(err.to_string()))?;
             let text = response
-                .into_string()
+                .body_mut()
+                .read_to_string()
                 .map_err(|err| AuthStorageError::Read(err.to_string()))?;
             let value: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|err| AuthStorageError::Invalid(err.to_string()))?;
@@ -917,21 +918,21 @@ pub fn fetch_github_copilot_available_model_ids(access: &str) -> Vec<String> {
     if url.is_empty() {
         return Vec::new();
     }
-    let response = match crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+    let mut response = match crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .get(&url)
-        .set("accept", "application/json")
-        .set("authorization", &format!("Bearer {access}"))
-        .set("user-agent", COPILOT_USER_AGENT)
-        .set("editor-version", COPILOT_EDITOR_VERSION)
-        .set("editor-plugin-version", COPILOT_PLUGIN_VERSION)
-        .set("copilot-integration-id", COPILOT_INTEGRATION_ID)
-        .set("x-github-api-version", COPILOT_API_VERSION)
+        .header("accept", "application/json")
+        .header("authorization", &format!("Bearer {access}"))
+        .header("user-agent", COPILOT_USER_AGENT)
+        .header("editor-version", COPILOT_EDITOR_VERSION)
+        .header("editor-plugin-version", COPILOT_PLUGIN_VERSION)
+        .header("copilot-integration-id", COPILOT_INTEGRATION_ID)
+        .header("x-github-api-version", COPILOT_API_VERSION)
         .call()
     {
         Ok(response) => response,
         Err(_) => return Vec::new(),
     };
-    let text = response.into_string().unwrap_or_default();
+    let text = response.body_mut().read_to_string().unwrap_or_default();
     parse_copilot_available_model_ids(&text)
 }
 

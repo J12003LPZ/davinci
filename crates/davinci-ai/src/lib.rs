@@ -75,6 +75,7 @@ mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
 mod stream_http;
+pub use stream_http::idle_read_agent;
 mod stream_reader;
 mod thinking;
 pub mod trace;

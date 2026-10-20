@@ -7,6 +7,7 @@ pub mod completion_delivery;
 pub mod design;
 pub mod execution_boundary;
 pub mod hooks;
+pub mod http_client;
 pub mod interaction_testing;
 pub mod interactive_tui;
 pub mod native_extensions;

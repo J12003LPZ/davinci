@@ -58,8 +58,8 @@ pub(crate) fn classify_stream_read_error(error: &std::io::Error) -> ResponseStre
         && matches!(
             error
                 .get_ref()
-                .and_then(|inner| inner.downcast_ref::<ureq_stream::Error>()),
-            Some(ureq_stream::Error::Timeout(_))
+                .and_then(|inner| inner.downcast_ref::<ureq::Error>()),
+            Some(ureq::Error::Timeout(_))
         )
     {
         return ResponseStreamFailure::TransportInterrupted;
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn wrapped_ureq_idle_timeout_is_an_interruption_not_arbitrary_other() {
-        let timeout = ureq_stream::Error::Timeout(ureq_stream::Timeout::RecvBody).into_io();
+        let timeout = ureq::Error::Timeout(ureq::Timeout::RecvBody).into_io();
         assert_eq!(timeout.kind(), std::io::ErrorKind::Other);
         assert_eq!(
             classify_stream_read_error(&timeout),
@@ -383,10 +383,8 @@ mod tests {
                 ResponseStreamFailure::Unknown,
             ),
         ] {
-            let contradictory = std::io::Error::new(
-                kind,
-                ureq_stream::Error::Timeout(ureq_stream::Timeout::RecvBody),
-            );
+            let contradictory =
+                std::io::Error::new(kind, ureq::Error::Timeout(ureq::Timeout::RecvBody));
             assert_eq!(classify_stream_read_error(&contradictory), expected);
         }
     }

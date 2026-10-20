@@ -498,20 +498,21 @@ fn exchange_adc(adc: &Value, now: SystemTime) -> Result<(String, Duration), Stri
     let body = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(form.iter().map(|(key, value)| (*key, value.as_str())))
         .finish();
-    let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+    let mut response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .post(&token_uri)
-        .set("content-type", "application/x-www-form-urlencoded")
-        .set("accept", "application/json")
-        .send_string(&body)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json")
+        .send(&body)
         .map_err(|error| match error {
-            ureq::Error::Status(status, _) => {
+            ureq::Error::StatusCode(status) => {
                 format!("Google token exchange was rejected (status {status})")
             }
             other => format!("Google token exchange failed: {other}"),
         })?;
     let reply: Value = serde_json::from_str(
         &response
-            .into_string()
+            .body_mut()
+            .read_to_string()
             .map_err(|error| format!("Google token response unreadable: {error}"))?,
     )
     .map_err(|_| "Google token response is not JSON".to_string())?;

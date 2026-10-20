@@ -6,10 +6,10 @@ use std::time::Duration;
 
 pub(crate) const PROVIDER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Returns a pooled agent whose timeout bounds each socket read.
+/// Returns a pooled agent whose timeout bounds each socket read. 4xx and 5xx
+/// answers are `Err(ureq::Error::StatusCode)`; use `.config()` on a request to
+/// read the error body instead.
 pub(crate) fn agent(idle: Duration) -> ureq::Agent {
     static AGENTS: OnceLock<Mutex<HashMap<(Duration, bool), ureq::Agent>>> = OnceLock::new();
     let budgeted = crate::provider_observation::active_budget().is_some();
@@ -17,16 +17,20 @@ pub(crate) fn agent(idle: Duration) -> ureq::Agent {
     let mut agents = agents.lock().unwrap_or_else(|err| err.into_inner());
     agents
         .entry((idle, budgeted))
-        .or_insert_with(|| {
-            ureq::AgentBuilder::new()
-                // A redirect is another unreserved request to an unvalidated URL.
-                .redirects(if budgeted { 0 } else { 5 })
-                .timeout_connect(CONNECT_TIMEOUT)
-                .timeout_read(idle)
-                .timeout_write(WRITE_TIMEOUT)
-                .build()
-        })
+        .or_insert_with(|| crate::stream_http::pooled_agent(idle))
         .clone()
+}
+
+/// ureq 2's `into_json` had no size cap (`read_json` caps at 10 MB), and an
+/// image answer is base64 in JSON.
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
+    response: &mut ureq::http::Response<ureq::Body>,
+) -> Result<T, ureq::Error> {
+    response
+        .body_mut()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
 }
 
 #[cfg(test)]
@@ -94,9 +98,7 @@ mod tests {
                     None,
                 );
             } else {
-                let _ = agent(Duration::from_millis(200))
-                    .post(&url)
-                    .send_string("{}");
+                let _ = agent(Duration::from_millis(200)).post(&url).send("{}");
             }
             server.join().unwrap();
             assert_eq!(
@@ -121,7 +123,7 @@ mod tests {
         let started = Instant::now();
         let result = agent(Duration::from_millis(300))
             .post(&format!("http://{addr}/v1/x"))
-            .send_string("{}");
+            .send("{}");
 
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));

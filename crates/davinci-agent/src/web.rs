@@ -227,13 +227,53 @@ fn guarded_resolve(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
         .map_err(|why| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why))
 }
 
+/// `guarded_resolve` behind ureq's resolver seam. The guard takes ureq 2's
+/// `host:port` string, so the port is always present (scheme default).
+#[derive(Debug)]
+struct GuardedResolver;
+
+impl ureq::unversioned::resolver::Resolver for GuardedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        use ureq::unversioned::resolver::DefaultResolver;
+        let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
+            return Err(ureq::Error::HostNotFound);
+        };
+        let netloc =
+            DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
+        let mut out = self.empty();
+        // The result holds 16 addresses at most.
+        for addr in guarded_resolve(&netloc)?.into_iter().take(16) {
+            out.push(addr);
+        }
+        if out.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(out)
+    }
+}
+
 fn build_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(TIMEOUT)
-        .redirects(0)
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(TIMEOUT))
+        // A redirect is a decision for the caller, which re-checks every hop.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        // The caller reports a 4xx or 5xx with the first line of its body.
+        .http_status_as_error(false)
+        // ureq 2 never read the proxy environment.
+        .proxy(None)
         .user_agent(USER_AGENT)
-        .resolver(guarded_resolve)
-        .build()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        GuardedResolver,
+    )
 }
 
 /// Read at most `cap` bytes; the flag says whether more was left behind.
@@ -360,37 +400,39 @@ fn redirect_location(status: u16, location: Option<&str>) -> Option<String> {
 }
 
 fn live_hop(agent: &ureq::Agent, url: &Url) -> Result<Hop, String> {
-    let response = match agent
+    let mut response = agent
         .get(url.as_str())
-        .set(
+        .header(
             "Accept",
             "text/html, application/json, text/plain;q=0.9, */*;q=0.5",
         )
         .call()
-    {
-        Ok(response) => response,
-        Err(ureq::Error::Status(code, response)) => {
-            let text = response.into_string().unwrap_or_default();
-            return Err(format!(
-                "{url} answered {code}{}",
-                text.lines()
-                    .next()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(|line| format!(": {}", line.trim()))
-                    .unwrap_or_default()
-            ));
-        }
-        Err(err) => return Err(format!("could not fetch {url}: {err}")),
+        .map_err(|err| format!("could not fetch {url}: {err}"))?;
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!(
+            "{url} answered {status}{}",
+            text.lines()
+                .next()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| format!(": {}", line.trim()))
+                .unwrap_or_default()
+        ));
+    }
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
     };
-    let status = response.status();
-    if let Some(location) = redirect_location(status, response.header("location")) {
+    if let Some(location) = redirect_location(status, header("location")) {
         return Ok(Hop::Redirect(location));
     }
-    let content_type = response
-        .header("content-type")
+    let content_type = header("content-type")
         .unwrap_or("application/octet-stream")
         .to_string();
-    let (bytes, truncated_body) = read_capped(response.into_reader(), BODY_CAP)
+    let (bytes, truncated_body) = read_capped(response.into_body().into_reader(), BODY_CAP)
         .map_err(|err| format!("could not read {url}: {err}"))?;
     if davinci_ai::trace::enabled() {
         davinci_ai::trace::log(&format!(
@@ -579,22 +621,26 @@ fn search(query: &str, limit: usize) -> Result<(String, Vec<SearchResult>), Stri
     if network_disabled() {
         return Err("network disabled (PI_OFFLINE / PI_DISABLE_NETWORK)".into());
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(TIMEOUT)
-        .redirects(5)
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(TIMEOUT))
+        .max_redirects(5)
+        // ureq 2 never read the proxy environment.
+        .proxy(None)
         .user_agent(USER_AGENT)
-        .build();
+        .build()
+        .into();
     if let Some(key) = brave_key() {
-        let response = agent
+        let mut response = agent
             .get("https://api.search.brave.com/res/v1/web/search")
             .query("q", query)
-            .query("count", &limit.to_string())
-            .set("Accept", "application/json")
-            .set("X-Subscription-Token", &key)
+            .query("count", limit.to_string())
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", &key)
             .call()
             .map_err(|err| format!("Brave search failed: {err}"))?;
         let body: Value = response
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|err| format!("Brave search answered badly: {err}"))?;
         let results = body
             .get("web")
@@ -623,13 +669,14 @@ fn search(query: &str, limit: usize) -> Result<(String, Vec<SearchResult>), Stri
             .unwrap_or_default();
         return Ok(("brave".into(), results));
     }
-    let response = agent
+    let mut response = agent
         .get("https://html.duckduckgo.com/html/")
         .query("q", query)
         .call()
         .map_err(|err| format!("DuckDuckGo search failed: {err}"))?;
     let html = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|err| format!("DuckDuckGo answered badly: {err}"))?;
     if davinci_ai::trace::enabled() {
         davinci_ai::trace::log(&format!(
@@ -1935,5 +1982,68 @@ No results.</div></div>"#;
         assert_eq!(duckduckgo_block(EMPTY), None);
         // A page with results is never a block, whatever else it says.
         assert_eq!(duckduckgo_block(DDG), None);
+    }
+
+    /// The live agent: the address guard runs inside the connection, a 3xx is
+    /// handed back instead of followed, and a 4xx keeps the first body line.
+    #[test]
+    fn the_live_agent_guards_addresses_and_reports_hops_and_errors() {
+        use std::io::{BufRead, BufReader, Write};
+        let _guard = env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let reply = if request_line.contains("/redir") {
+                    "HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if request_line.contains("/missing") {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 11\r\nConnection: close\r\n\r\nnope\nmore\n!"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                };
+                socket.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let agent = build_agent();
+        let at = |path: &str| Url::parse(&format!("http://127.0.0.1:{port}{path}")).unwrap();
+
+        std::env::remove_var("PI_WEB_FETCH_ALLOW_PRIVATE");
+        let refused = live_hop(&agent, &at("/ok"))
+            .err()
+            .expect("loopback refused");
+        assert!(refused.contains("could not fetch"), "{refused}");
+        assert!(refused.contains("127.0.0.1"), "{refused}");
+
+        std::env::set_var("PI_WEB_FETCH_ALLOW_PRIVATE", "1");
+        let page = live_hop(&agent, &at("/ok"));
+        let redirect = live_hop(&agent, &at("/redir"));
+        let missing = live_hop(&agent, &at("/missing"));
+        std::env::remove_var("PI_WEB_FETCH_ALLOW_PRIVATE");
+        server.join().unwrap();
+        match page.unwrap() {
+            Hop::Page(page) => {
+                assert_eq!(page.status, 200);
+                assert_eq!(page.body, "hello");
+                assert_eq!(page.content_type, "text/plain");
+            }
+            Hop::Redirect(location) => panic!("unexpected redirect {location}"),
+        }
+        match redirect.unwrap() {
+            Hop::Redirect(location) => assert_eq!(location, "/ok"),
+            Hop::Page(_) => panic!("a 302 was read as a page"),
+        }
+        let missing = missing.err().expect("404 is an error");
+        assert!(missing.ends_with("answered 404: nope"), "{missing}");
     }
 }

@@ -8043,13 +8043,15 @@ fn upload_radius_artifact(agent: &Agent, token: &str) -> Result<String, String> 
     let body = std::fs::read(&session.path).map_err(|err| err.to_string())?;
     let url =
         format!("{DEFAULT_RADIUS_GATEWAY}/v1/artifacts?visibility=organization&title=Pi%20session");
-    let response = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/x-ndjson")
-        .send_bytes(&body)
+    let mut response = davinci_coding_agent::http_client::agent()
+        .post(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/x-ndjson")
+        .send(&body)
         .map_err(|err| format!("Failed to upload Radius artifact: {err}"))?;
     let text = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|err| format!("Failed to upload Radius artifact: {err}"))?;
     parse_radius_artifact_reply(&text)
 }

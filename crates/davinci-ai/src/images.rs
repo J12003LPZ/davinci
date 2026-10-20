@@ -159,20 +159,19 @@ fn post_images(
         .unwrap_or(crate::http::PROVIDER_IDLE_TIMEOUT);
     let mut request = crate::http::agent(idle).post(&url);
     if let Some(key) = &options.api_key {
-        request = request.set("Authorization", &format!("Bearer {key}"));
+        request = request.header("Authorization", &format!("Bearer {key}"));
     }
-    request = request.set("content-type", "application/json");
+    request = request.header("content-type", "application/json");
     for (key, value) in &model.headers {
-        request = request.set(key, value);
+        request = request.header(key, value);
     }
     for (key, value) in &options.headers {
-        request = request.set(key, value);
+        request = request.header(key, value);
     }
-    let response = request
-        .send_string(&body.to_string())
+    let mut response = request
+        .send(&body.to_string())
         .map_err(|err| err.to_string())?;
-    response
-        .into_json()
+    crate::http::read_json(&mut response)
         .map_err(|err| format!("Unable to read provider response: {err}"))
 }
 

@@ -1,13 +1,13 @@
 //! Cancellable provider HTTP reads. Poll beneath TLS and HTTP framing so a
 //! timeout never discards a partial TLS record, chunk header, or SSE line.
-use crate::provider_retry::{ProviderError, RequestPhase};
+use crate::provider_retry::ProviderError;
 use std::io::{self, Read};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
-use ureq_stream::unversioned::transport::{
+use ureq::unversioned::transport::{
     Buffers, ConnectionDetails, Connector, NextTimeout, RustlsConnector, TcpConnector, Transport,
 };
 
@@ -24,7 +24,7 @@ impl Cancellation {
         self.closed.store(true, Ordering::Relaxed);
     }
 
-    fn check(&self) -> Result<(), ureq_stream::Error> {
+    fn check(&self) -> Result<(), ureq::Error> {
         if self.closed.load(Ordering::Relaxed)
             || self
                 .abort
@@ -51,7 +51,7 @@ impl<T: Transport> Connector<T> for CancelConnector {
         &self,
         _: &ConnectionDetails,
         chained: Option<T>,
-    ) -> Result<Option<Self::Out>, ureq_stream::Error> {
+    ) -> Result<Option<Self::Out>, ureq::Error> {
         self.cancellation.check()?;
         Ok(chained.map(|inner| CancelTransport {
             inner,
@@ -72,29 +72,25 @@ impl<T: Transport> Transport for CancelTransport<T> {
     fn buffers(&mut self) -> &mut dyn Buffers {
         self.inner.buffers()
     }
-    fn transmit_output(
-        &mut self,
-        amount: usize,
-        timeout: NextTimeout,
-    ) -> Result<(), ureq_stream::Error> {
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.cancellation.check()?;
         self.inner.transmit_output(amount, timeout)
     }
-    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq_stream::Error> {
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
         let started = Instant::now();
         let limit = self.idle.min(*timeout.after);
         loop {
             self.cancellation.check()?;
             let remaining = limit.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                return Err(ureq_stream::Error::Timeout(timeout.reason));
+                return Err(ureq::Error::Timeout(timeout.reason));
             }
             let slice = NextTimeout {
                 after: remaining.min(CANCEL_POLL).into(),
                 reason: timeout.reason,
             };
             match self.inner.await_input(slice) {
-                Err(ureq_stream::Error::Timeout(_)) => continue,
+                Err(ureq::Error::Timeout(_)) => continue,
                 result => return result,
             }
         }
@@ -108,7 +104,7 @@ impl<T: Transport> Transport for CancelTransport<T> {
 }
 
 pub(crate) struct Response {
-    response: ureq_stream::http::Response<ureq_stream::Body>,
+    response: ureq::http::Response<ureq::Body>,
     cancellation: Cancellation,
 }
 
@@ -148,6 +144,85 @@ impl Response {
     }
 }
 
+/// Timeouts and behavior of one agent. `idle` bounds each socket read (ureq 2
+/// `timeout_read`); the connector also watches `cancellation` beneath TLS and
+/// HTTP framing.
+struct AgentSpec {
+    idle: Duration,
+    connect: Duration,
+    write: Duration,
+    cancellation: Cancellation,
+    /// Keep sockets for reuse. A per-request agent must not: a cancellation
+    /// flag belongs to one request.
+    pooled: bool,
+    /// ureq 2's `Err` for a 4xx or 5xx answer. When off, the caller reads the
+    /// status itself.
+    status_as_error: bool,
+}
+
+impl AgentSpec {
+    fn build(self) -> ureq::Agent {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(self.status_as_error)
+            // Match the existing provider agent: no environment proxy feature.
+            .proxy(None)
+            // Budget admission covers exactly one send to the validated endpoint.
+            .max_redirects(if crate::provider_observation::active_budget().is_some() {
+                0
+            } else {
+                5
+            })
+            .timeout_connect(Some(self.connect))
+            .timeout_resolve(Some(self.connect))
+            .timeout_send_request(Some(self.write))
+            .timeout_send_body(Some(self.write))
+            .max_idle_connections(if self.pooled { 10 } else { 0 })
+            .build();
+        let connector = TcpConnector::default()
+            .chain(CancelConnector {
+                cancellation: self.cancellation,
+                idle: self.idle,
+            })
+            .chain(RustlsConnector::default());
+        ureq::Agent::with_parts(
+            config,
+            connector,
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        )
+    }
+}
+
+/// The pooled agent for control and non-streaming provider requests. A 4xx or
+/// 5xx is an `Err`; a request that needs the error body turns that off with
+/// `.config()`.
+pub(crate) fn pooled_agent(idle: Duration) -> ureq::Agent {
+    AgentSpec {
+        idle,
+        connect: Duration::from_secs(30),
+        write: Duration::from_secs(60),
+        cancellation: Cancellation::default(),
+        pooled: true,
+        status_as_error: true,
+    }
+    .build()
+}
+
+/// An agent for hosts outside this crate whose reads must give up after
+/// `idle` of silence instead of waiting forever (ureq 2 `timeout_read`). A
+/// 4xx or 5xx is an `Err`, as in ureq 2. After an idle timeout the body
+/// reader reports `ureq::Error::Timeout`.
+pub fn idle_read_agent(connect: Duration, idle: Duration, write: Duration) -> ureq::Agent {
+    AgentSpec {
+        idle,
+        connect,
+        write,
+        cancellation: Cancellation::default(),
+        pooled: false,
+        status_as_error: true,
+    }
+    .build()
+}
+
 pub(crate) fn send(
     url: &str,
     headers: &[(String, String)],
@@ -164,30 +239,15 @@ pub(crate) fn send(
         abort,
         ..Cancellation::default()
     };
-    let config = ureq_stream::Agent::config_builder()
-        .http_status_as_error(false)
-        // Match the existing provider agent: no environment proxy feature.
-        .proxy(None)
-        // Budget admission covers exactly one send to the validated endpoint.
-        .max_redirects(if crate::provider_observation::active_budget().is_some() { 0 } else { 5 })
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_resolve(Some(Duration::from_secs(30)))
-        .timeout_send_request(Some(Duration::from_secs(60)))
-        .timeout_send_body(Some(Duration::from_secs(60)))
-        // A cancellation flag belongs to one request, never a pooled socket.
-        .max_idle_connections(0)
-        .build();
-    let connector = TcpConnector::default()
-        .chain(CancelConnector {
-            cancellation: cancellation.clone(),
-            idle,
-        })
-        .chain(RustlsConnector::default());
-    let agent = ureq_stream::Agent::with_parts(
-        config,
-        connector,
-        ureq_stream::unversioned::resolver::DefaultResolver::default(),
-    );
+    let agent = AgentSpec {
+        idle,
+        connect: Duration::from_secs(30),
+        write: Duration::from_secs(60),
+        cancellation: cancellation.clone(),
+        pooled: false,
+        status_as_error: false,
+    }
+    .build();
     let mut request = agent.post(url);
     for (key, value) in headers {
         request = request.header(key.as_str(), value.as_str());
@@ -201,18 +261,9 @@ pub(crate) fn send(
     } else {
         body.to_string().into_bytes()
     };
-    let response = request.send(bytes.as_slice()).map_err(|error| {
-        let phase = match &error {
-            ureq_stream::Error::HostNotFound | ureq_stream::Error::ConnectionFailed => {
-                RequestPhase::Connect
-            }
-            ureq_stream::Error::Io(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                RequestPhase::Connect
-            }
-            _ => RequestPhase::Response,
-        };
-        ProviderError::new(None, format!("Provider request failed: {error}")).with_phase(phase)
-    })?;
+    let response = request
+        .send(bytes.as_slice())
+        .map_err(crate::provider_retry::provider_error_from_ureq)?;
     let response = Response {
         response,
         cancellation,
