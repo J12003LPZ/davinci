@@ -9,6 +9,26 @@ use crate::davinci::theme::State;
 use crate::davinci::ui::{section_detail, section_row, span};
 use ratatui::text::Line;
 
+/// `24k`, `~24k` when part of it is an estimate, `unknown` when nothing was
+/// reported or estimated. Never `0` for a worker that has not been counted.
+pub fn tokens_cell(agent: &crate::davinci::model::AgentRow) -> String {
+    match (agent.usage_unknown, agent.tokens) {
+        (true, _) | (false, None) => "unknown".to_string(),
+        (false, Some(tokens)) => {
+            let count = if tokens >= 1000 {
+                format!("{}k", tokens / 1000)
+            } else {
+                tokens.to_string()
+            };
+            if agent.tokens_estimated {
+                format!("~{count}")
+            } else {
+                count
+            }
+        }
+    }
+}
+
 /// Names, activity and paths come from model-chosen tool arguments and agent
 /// names: one line of plain text, no control bytes.
 fn safe(text: &str) -> String {
@@ -64,16 +84,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         };
         rows.extend(section_detail(width, th, &format!("  {owns_str}")));
 
-        let tokens_str = match (agent.usage_unknown, agent.tokens) {
-            (true, _) | (false, None) => "unknown".to_string(),
-            (false, Some(tok)) => {
-                if tok >= 1000 {
-                    format!("{}k", tok / 1000)
-                } else {
-                    tok.to_string()
-                }
-            }
-        };
+        let tokens_str = tokens_cell(agent);
 
         let status_str = if agent.disconnected {
             format!("{} [disconnected]", safe(&agent.status))

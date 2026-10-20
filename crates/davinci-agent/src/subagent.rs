@@ -949,14 +949,20 @@ pub fn run_tool(
             .transpose()
             .map_err(ToolError::Failed)?;
         let progress = match (&parent.event_sink, &parent.tool_call_id) {
-            (Some(sink), Some(call)) => Some(crate::subagent_progress::ProgressReporter::new(
-                call.clone(),
-                sink.clone(),
-                child_agent_id.to_string(),
-                progress_label(spec),
-                (position, total),
-                spec.mode.to_string(),
-            )),
+            (Some(sink), Some(call)) => Some(
+                crate::subagent_progress::ProgressReporter::new(
+                    call.clone(),
+                    sink.clone(),
+                    child_agent_id.to_string(),
+                    progress_label(spec),
+                    (position, total),
+                    spec.mode.to_string(),
+                )
+                .with_registry_if(
+                    parent.runtime.as_ref().map(|rt| rt.registry.clone()),
+                    child_agent_id,
+                ),
+            ),
             _ => None,
         };
         requests.push(SubagentRequest {

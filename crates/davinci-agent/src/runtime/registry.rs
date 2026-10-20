@@ -68,9 +68,24 @@ pub struct RuntimeRegistry {
     revisions: Arc<RwLock<HashMap<AgentId, u64>>>,
     last_activity_ms: Arc<RwLock<HashMap<AgentId, i64>>>,
     tool_counts: Arc<RwLock<HashMap<AgentId, u64>>>,
+    /// The newest progress each worker's reporter produced: usage, latest
+    /// call, and the time it stopped counting. One source for the TUI roster,
+    /// RPC and the `/agents` sheet.
+    progress: Arc<RwLock<HashMap<AgentId, crate::subagent_progress::SubagentProgress>>>,
 }
 
 impl RuntimeRegistry {
+    /// Keep a worker's newest progress next to its record.
+    pub fn set_progress(&self, id: AgentId, progress: crate::subagent_progress::SubagentProgress) {
+        if let Ok(mut map) = self.progress.write() {
+            map.insert(id, progress);
+        }
+    }
+
+    pub fn get_progress(&self, id: &AgentId) -> Option<crate::subagent_progress::SubagentProgress> {
+        self.progress.read().ok()?.get(id).cloned()
+    }
+
     pub fn set_worktree(&self, id: AgentId, path: std::path::PathBuf) {
         if let Ok(mut records) = self.records.write() {
             if let Some(record) = records.get_mut(&id) {
@@ -98,6 +113,7 @@ impl RuntimeRegistry {
             revisions: Arc::new(RwLock::new(HashMap::new())),
             last_activity_ms: Arc::new(RwLock::new(HashMap::new())),
             tool_counts: Arc::new(RwLock::new(HashMap::new())),
+            progress: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -110,6 +126,7 @@ impl RuntimeRegistry {
             revisions: Arc::new(RwLock::new(HashMap::new())),
             last_activity_ms: Arc::new(RwLock::new(HashMap::new())),
             tool_counts: Arc::new(RwLock::new(HashMap::new())),
+            progress: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

@@ -699,6 +699,8 @@ pub struct SubagentRow {
     pub state: SubagentRowState,
     pub tool_uses: u64,
     pub tokens: u64,
+    /// Part of `tokens` is an estimate (drawn with `~`).
+    pub tokens_estimated: bool,
     /// Newest last: `Read(src/lib.rs)`.
     pub recent: Vec<String>,
     pub elapsed_secs: u64,
@@ -2397,7 +2399,16 @@ pub struct AgentRow {
     pub elapsed: String,
     pub owned_paths: Vec<String>,
     pub tool_count: u64,
+    /// Cumulative input + output tokens; `None` when nothing was reported or
+    /// estimated (shown as `unknown`, never as 0).
     pub tokens: Option<u64>,
+    /// Part of `tokens` is DaVinci's estimate (shown with `~`).
+    pub tokens_estimated: bool,
+    /// Cache reads and writes, kept apart from `tokens` (detail view only).
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Wall seconds the worker has run, frozen once it is finished.
+    pub elapsed_secs: u64,
     pub waiting_on: Option<String>,
     pub disconnected: bool,
     pub usage_unknown: bool,

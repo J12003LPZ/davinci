@@ -3851,6 +3851,7 @@ fn delegated_workers_draw_live_under_their_agent_call() {
             state,
             tool_uses: uses,
             tokens: 1_500,
+            usage: Default::default(),
             recent: recent.iter().map(|call| call.to_string()).collect(),
             elapsed_ms: 3_000,
         },

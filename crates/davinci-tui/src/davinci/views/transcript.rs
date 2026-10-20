@@ -855,6 +855,15 @@ fn compact_elapsed(seconds: u64) -> String {
     }
 }
 
+/// `23.4k`, or `~23.4k` while part of the count is an estimate.
+fn tokens_text(row: &SubagentRow) -> String {
+    if row.tokens_estimated {
+        format!("~{}", compact_tokens(row.tokens))
+    } else {
+        compact_tokens(row.tokens)
+    }
+}
+
 /// `7 tool uses · 23.4k tokens · 41s`, leaving out what is still zero.
 fn subagent_stats(row: &SubagentRow, with_time: bool) -> String {
     let mut parts = Vec::new();
@@ -866,7 +875,7 @@ fn subagent_stats(row: &SubagentRow, with_time: bool) -> String {
         });
     }
     if row.tokens > 0 {
-        parts.push(format!("{} tokens", compact_tokens(row.tokens)));
+        parts.push(format!("{} tokens", tokens_text(row)));
     }
     if with_time && row.elapsed_secs > 0 {
         parts.push(compact_elapsed(row.elapsed_secs));
@@ -971,7 +980,7 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             });
         }
         if row.tokens > 0 {
-            tally.push(format!("{} tokens", compact_tokens(row.tokens)));
+            tally.push(format!("{} tokens", tokens_text(row)));
         }
         if !tally.is_empty() {
             let hint = if hidden == 0 || model.show_tool_output {

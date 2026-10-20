@@ -33,6 +33,55 @@ pub enum SubagentProgressState {
     Failed,
 }
 
+/// Where a worker's token count comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    /// Nothing reported and nothing estimated yet: shown as `unknown`, never 0.
+    #[default]
+    Unknown,
+    /// Every counted reply carried the provider's own usage.
+    Reported,
+    /// At least part of the count is DaVinci's estimate (shown with `~`).
+    Estimated,
+}
+
+/// Cumulative tokens one worker has used, input and output counted once per
+/// reply. Cache reads and writes are kept apart (they overlap the input the
+/// provider already counts) and are never added to the headline number.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Replies whose provider reported a total but no input/output split.
+    pub unsplit: u64,
+    /// Estimated tokens: replies without reported usage, plus the reply that
+    /// is still streaming. Replaced, never added twice, when usage arrives.
+    pub estimated: u64,
+    /// Replies counted from reported usage.
+    pub reported_replies: u64,
+}
+
+impl SubagentUsage {
+    /// The headline count: input + output (+ estimates).
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.unsplit + self.estimated
+    }
+
+    pub fn source(&self) -> UsageSource {
+        if self.estimated > 0 {
+            UsageSource::Estimated
+        } else if self.reported_replies > 0 {
+            UsageSource::Reported
+        } else {
+            UsageSource::Unknown
+        }
+    }
+}
+
 /// One worker's progress, as the lead's host draws it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,7 +95,11 @@ pub struct SubagentProgress {
     pub mode: String,
     pub state: SubagentProgressState,
     pub tool_uses: u64,
+    /// `usage.total()`: input + output (+ estimates). Zero with an unknown
+    /// source means no usage yet, not a measured zero.
     pub tokens: u64,
+    #[serde(default)]
+    pub usage: SubagentUsage,
     /// Newest last, at most [`RECENT_CALLS`]: `Read(src/lib.rs)`.
     pub recent: Vec<String>,
     pub elapsed_ms: u64,
@@ -55,12 +108,21 @@ pub struct SubagentProgress {
 struct Inner {
     progress: SubagentProgress,
     started: Instant,
-    /// Tokens of finished replies, as the provider reported them.
-    settled: u64,
+    /// Tokens of finished replies.
+    settled: SubagentUsage,
     /// Estimate for the reply still streaming; replaced by its reported
     /// usage when it ends.
     streaming: u64,
     last_estimate: Option<Instant>,
+    /// Elapsed time once the worker is finished: it stops counting there.
+    frozen_ms: Option<u64>,
+}
+
+impl Inner {
+    fn elapsed_ms(&self) -> u64 {
+        self.frozen_ms
+            .unwrap_or_else(|| self.started.elapsed().as_millis() as u64)
+    }
 }
 
 /// Collects one worker's activity and forwards it to the lead.
@@ -69,6 +131,9 @@ pub struct ProgressReporter {
     tool_call_id: String,
     sink: crate::EventSink,
     inner: Arc<Mutex<Inner>>,
+    /// Where the newest snapshot is also kept, so the roster and RPC read the
+    /// same numbers the transcript does.
+    registry: Option<(crate::runtime::RuntimeRegistry, crate::runtime::AgentId)>,
 }
 
 impl std::fmt::Debug for ProgressReporter {
@@ -91,6 +156,7 @@ impl ProgressReporter {
         Self {
             tool_call_id: tool_call_id.into(),
             sink,
+            registry: None,
             inner: Arc::new(Mutex::new(Inner {
                 progress: SubagentProgress {
                     agent_id: agent_id.into(),
@@ -101,11 +167,44 @@ impl ProgressReporter {
                     ..SubagentProgress::default()
                 },
                 started: Instant::now(),
-                settled: 0,
+                settled: SubagentUsage::default(),
                 streaming: 0,
                 last_estimate: None,
+                frozen_ms: None,
             })),
         }
+    }
+
+    /// Also keep every snapshot in `registry` under `agent_id`.
+    pub fn with_registry(
+        mut self,
+        registry: crate::runtime::RuntimeRegistry,
+        agent_id: crate::runtime::AgentId,
+    ) -> Self {
+        self.registry = Some((registry, agent_id));
+        self
+    }
+
+    /// `with_registry` when there is a runtime to keep the numbers in.
+    pub fn with_registry_if(
+        self,
+        registry: Option<crate::runtime::RuntimeRegistry>,
+        agent_id: crate::runtime::AgentId,
+    ) -> Self {
+        match registry {
+            Some(registry) => self.with_registry(registry, agent_id),
+            None => self,
+        }
+    }
+
+    fn emit(&self, snapshot: SubagentProgress) {
+        if let Some((registry, agent_id)) = &self.registry {
+            registry.set_progress(*agent_id, snapshot.clone());
+        }
+        (self.sink.0)(&AgentEvent::SubagentProgress {
+            tool_call_id: self.tool_call_id.clone(),
+            progress: snapshot,
+        });
     }
 
     fn update(&self, change: impl FnOnce(&mut SubagentProgress)) {
@@ -115,13 +214,10 @@ impl ProgressReporter {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             change(&mut inner.progress);
-            inner.progress.elapsed_ms = inner.started.elapsed().as_millis() as u64;
+            inner.progress.elapsed_ms = inner.elapsed_ms();
             inner.progress.clone()
         };
-        (self.sink.0)(&AgentEvent::SubagentProgress {
-            tool_call_id: self.tool_call_id.clone(),
-            progress: snapshot,
-        });
+        self.emit(snapshot);
     }
 
     /// The worker exists; draw its row before its first tool call.
@@ -139,9 +235,30 @@ impl ProgressReporter {
         });
     }
 
-    pub fn add_tokens(&self, tokens: u64) {
+    /// A reply ended with the provider's usage: it replaces the streaming
+    /// estimate for that reply.
+    pub fn add_reply_usage(&self, usage: &Value) {
         self.update_tokens(|inner| {
-            inner.settled += tokens;
+            let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let (input, output) = (field("input"), field("output"));
+            inner.settled.input += input;
+            inner.settled.output += output;
+            inner.settled.cache_read += field("cacheRead");
+            inner.settled.cache_write += field("cacheWrite");
+            if input + output == 0 {
+                inner.settled.unsplit += field("totalTokens");
+            }
+            inner.settled.reported_replies += 1;
+            inner.streaming = 0;
+            inner.last_estimate = None;
+            true
+        });
+    }
+
+    /// A reply ended without usage: keep an estimate for it, tagged as one.
+    pub fn add_estimated_reply(&self, tokens: u64) {
+        self.update_tokens(|inner| {
+            inner.settled.estimated += tokens;
             inner.streaming = 0;
             inner.last_estimate = None;
             true
@@ -177,21 +294,21 @@ impl ProgressReporter {
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let before = inner.progress.tokens;
+            let before = inner.progress.usage.clone();
             if !change(&mut inner) {
                 return;
             }
-            inner.progress.tokens = inner.settled + inner.streaming;
-            if inner.progress.tokens == before {
+            let mut usage = inner.settled.clone();
+            usage.estimated += inner.streaming;
+            inner.progress.tokens = usage.total();
+            if usage == before {
                 return;
             }
-            inner.progress.elapsed_ms = inner.started.elapsed().as_millis() as u64;
+            inner.progress.usage = usage;
+            inner.progress.elapsed_ms = inner.elapsed_ms();
             inner.progress.clone()
         };
-        (self.sink.0)(&AgentEvent::SubagentProgress {
-            tool_call_id: self.tool_call_id.clone(),
-            progress: snapshot,
-        });
+        self.emit(snapshot);
     }
 
     pub fn backgrounded(&self) {
@@ -199,6 +316,16 @@ impl ProgressReporter {
     }
 
     pub fn finish(&self, success: bool) {
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Time stops at the first terminal report, whatever follows.
+            if inner.frozen_ms.is_none() {
+                inner.frozen_ms = Some(inner.started.elapsed().as_millis() as u64);
+            }
+        }
         self.update(|progress| {
             progress.state = if success {
                 SubagentProgressState::Done
@@ -218,14 +345,11 @@ impl ProgressReporter {
                 self.streaming(message)
             }
             AgentEvent::MessageEnd { message } if message.role == "assistant" => {
-                // A reply without reported usage keeps its streamed estimate.
-                let reported = message_tokens(message);
-                let tokens = if reported > 0 {
-                    reported
-                } else {
-                    crate::compaction::estimate_tokens(message)
-                };
-                self.add_tokens(tokens)
+                match message.extra.get("usage") {
+                    Some(usage) if message_tokens(message) > 0 => self.add_reply_usage(usage),
+                    // A reply without reported usage keeps an estimate, tagged.
+                    _ => self.add_estimated_reply(crate::compaction::estimate_tokens(message)),
+                }
             }
             _ => {}
         }
@@ -337,7 +461,10 @@ mod tests {
         assert_eq!(seen.first().unwrap().state, SubagentProgressState::Running);
         assert_eq!(last.state, SubagentProgressState::Done);
         assert_eq!(last.tool_uses, 1);
-        assert_eq!(last.tokens, 1250);
+        // Input + output; the 50 cached tokens are shown apart, not added.
+        assert_eq!(last.tokens, 1200);
+        assert_eq!(last.usage.cache_read, 50);
+        assert_eq!(last.usage.source(), UsageSource::Reported);
         assert_eq!(last.recent, vec!["Read(src/auth.rs)".to_string()]);
         assert_eq!(last.label, "map auth");
     }
@@ -361,6 +488,97 @@ mod tests {
         );
         reporter.observe(&AgentEvent::MessageEnd { message: answer });
         assert_eq!(seen.lock().unwrap().last().unwrap().tokens, 3500);
+    }
+
+    fn reply_with_usage(usage: serde_json::Value) -> davinci_ai::ChatMessage {
+        let mut reply = davinci_ai::ChatMessage::text("assistant", "ok");
+        reply.extra.insert("usage".into(), usage);
+        reply
+    }
+
+    #[test]
+    fn unknown_usage_is_never_shown_as_a_measured_zero() {
+        let (sink, seen) = collecting();
+        let reporter = ProgressReporter::new("c", sink, "a", "x", (0, 1), "oneshot");
+        reporter.started();
+        let first = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(first.tokens, 0);
+        assert_eq!(first.usage.source(), UsageSource::Unknown);
+        // A reply whose usage is all zero reports nothing either.
+        reporter.observe(&AgentEvent::MessageEnd {
+            message: reply_with_usage(serde_json::json!({"input": 0, "output": 0})),
+        });
+        let after = reporter.snapshot();
+        assert_eq!(after.usage.reported_replies, 0, "{after:?}");
+        assert_eq!(after.usage.source(), UsageSource::Estimated);
+    }
+
+    #[test]
+    fn a_streaming_estimate_is_replaced_by_reported_usage_not_added_to_it() {
+        let (sink, _) = collecting();
+        let reporter = ProgressReporter::new("c", sink, "a", "x", (0, 1), "oneshot");
+        reporter.streaming(&davinci_ai::ChatMessage::text(
+            "assistant",
+            "word ".repeat(400),
+        ));
+        let live = reporter.snapshot();
+        assert!(live.tokens > 0);
+        assert_eq!(live.usage.source(), UsageSource::Estimated);
+        reporter.observe(&AgentEvent::MessageEnd {
+            message: reply_with_usage(serde_json::json!({"input": 100, "output": 20})),
+        });
+        let settled = reporter.snapshot();
+        assert_eq!(settled.tokens, 120, "{settled:?}");
+        assert_eq!(settled.usage.estimated, 0);
+        assert_eq!(settled.usage.source(), UsageSource::Reported);
+    }
+
+    #[test]
+    fn a_reply_without_usage_is_counted_as_an_estimate_and_says_so() {
+        let (sink, _) = collecting();
+        let reporter = ProgressReporter::new("c", sink, "a", "x", (0, 1), "oneshot");
+        reporter.observe(&AgentEvent::MessageEnd {
+            message: davinci_ai::ChatMessage::text("assistant", "word ".repeat(200)),
+        });
+        let snapshot = reporter.snapshot();
+        assert!(snapshot.tokens > 0);
+        assert_eq!(snapshot.usage.source(), UsageSource::Estimated);
+        // Reported replies afterwards keep the estimate flagged: the total
+        // is still partly an estimate.
+        reporter.observe(&AgentEvent::MessageEnd {
+            message: reply_with_usage(serde_json::json!({"input": 10, "output": 5})),
+        });
+        assert_eq!(reporter.snapshot().usage.source(), UsageSource::Estimated);
+    }
+
+    #[test]
+    fn a_total_without_a_split_still_counts_once() {
+        let (sink, _) = collecting();
+        let reporter = ProgressReporter::new("c", sink, "a", "x", (0, 1), "oneshot");
+        reporter.observe(&AgentEvent::MessageEnd {
+            message: reply_with_usage(serde_json::json!({"totalTokens": 900})),
+        });
+        let snapshot = reporter.snapshot();
+        assert_eq!(snapshot.tokens, 900);
+        assert_eq!(snapshot.usage.source(), UsageSource::Reported);
+    }
+
+    #[test]
+    fn elapsed_time_stops_when_the_worker_finishes() {
+        let (sink, seen) = collecting();
+        let reporter = ProgressReporter::new("c", sink, "a", "x", (0, 1), "oneshot");
+        reporter.started();
+        std::thread::sleep(Duration::from_millis(30));
+        reporter.finish(true);
+        let at_finish = seen.lock().unwrap().last().unwrap().elapsed_ms;
+        assert!(at_finish >= 30, "{at_finish}");
+        std::thread::sleep(Duration::from_millis(60));
+        // Anything reported after the end (a late token count, a snapshot)
+        // carries the frozen time.
+        reporter.add_estimated_reply(10);
+        reporter.started();
+        assert_eq!(seen.lock().unwrap().last().unwrap().elapsed_ms, at_finish);
+        assert_eq!(reporter.snapshot().elapsed_ms, at_finish);
     }
 
     #[test]

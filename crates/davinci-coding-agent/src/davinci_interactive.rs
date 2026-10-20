@@ -363,6 +363,8 @@ fn subagent_row(progress: &davinci_agent::subagent_progress::SubagentProgress) -
         },
         tool_uses: progress.tool_uses,
         tokens: progress.tokens,
+        tokens_estimated: progress.usage.source()
+            == davinci_agent::subagent_progress::UsageSource::Estimated,
         recent: progress.recent.clone(),
         elapsed_secs: progress.elapsed_ms / 1000,
     }
