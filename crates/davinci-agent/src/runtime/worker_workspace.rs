@@ -6,9 +6,11 @@
 //! at all. A worker in the shared workspace has no branch of its own and is
 //! never given one.
 //!
-//! Reading `HEAD` is a few small file reads and is safe on any thread at any
-//! rate. The dirty/changed-files probe runs `git`, so it has a timeout and the
-//! caller runs it off the UI thread, for one worker at a time.
+//! Reading `HEAD` is a few small file reads, but on a drive that stopped
+//! answering even those hang, so snapshots go through [`WorkspaceCache`]: it
+//! reads on its own thread and the UI only ever sees the last known value. The
+//! dirty/changed-files probe runs `git`, so it has a timeout and the caller
+//! runs it off the UI thread, for one worker at a time.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -245,4 +247,207 @@ pub fn probe_changes(path: &Path, timeout: Duration) -> (Option<bool>, Vec<Strin
     }
     let dirty = !text.trim_matches('\0').is_empty();
     (Some(dirty), paths)
+}
+
+/// How long a cached workspace is trusted before it is read again.
+const FRESH_FOR: Duration = Duration::from_secs(2);
+/// A read that has not finished after this long marks the worktree
+/// unavailable, and is not started again while it is still stuck.
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct CachedWorkspace {
+    value: WorkerWorkspace,
+    read_at: Option<std::time::Instant>,
+    /// A read in flight, and when it began.
+    reading_since: Option<std::time::Instant>,
+}
+
+/// The last known workspace of each worker, refreshed off the caller's thread.
+///
+/// `snapshot_workspace` touches the disk; on a network drive that stopped
+/// answering it would hold the caller for as long as the drive does. The UI
+/// reads this cache instead: it never waits, shows the last value it has, and
+/// shows `worktree unavailable` for a read that is stuck.
+#[derive(Clone, Default)]
+pub struct WorkspaceCache {
+    entries: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<super::ids::AgentId, CachedWorkspace>>,
+    >,
+}
+
+impl WorkspaceCache {
+    pub fn get(&self, record: &AgentRecord) -> WorkerWorkspace {
+        self.get_with(record, snapshot_workspace, FRESH_FOR, READ_TIMEOUT)
+    }
+
+    fn get_with(
+        &self,
+        record: &AgentRecord,
+        read: fn(&AgentRecord) -> WorkerWorkspace,
+        fresh_for: Duration,
+        timeout: Duration,
+    ) -> WorkerWorkspace {
+        // No worktree: nothing to read.
+        let Some(path) = record.worktree.as_ref() else {
+            return WorkerWorkspace::default();
+        };
+        let now = std::time::Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entries.entry(record.id).or_insert_with(|| CachedWorkspace {
+            // Until the first read lands: a worktree, branch not known yet.
+            value: WorkerWorkspace {
+                kind: WorkspaceKind::Worktree,
+                path: Some(path.clone()),
+                ..WorkerWorkspace::default()
+            },
+            read_at: None,
+            reading_since: None,
+        });
+        if let Some(since) = entry.reading_since {
+            if now.duration_since(since) >= timeout {
+                entry.value = WorkerWorkspace {
+                    kind: WorkspaceKind::Unavailable,
+                    path: Some(path.clone()),
+                    ..WorkerWorkspace::default()
+                };
+            }
+            return entry.value.clone();
+        }
+        let stale = entry
+            .read_at
+            .is_none_or(|at| now.duration_since(at) >= fresh_for);
+        if stale {
+            entry.reading_since = Some(now);
+            let (cache, record) = (self.clone(), record.clone());
+            let spawned = std::thread::Builder::new()
+                .name("davinci-workspace-read".into())
+                .spawn(move || {
+                    let value = read(&record);
+                    let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = entries.get_mut(&record.id) {
+                        entry.value = value;
+                        entry.read_at = Some(std::time::Instant::now());
+                        entry.reading_since = None;
+                    }
+                });
+            if spawned.is_err() {
+                entry.reading_since = None;
+            }
+        }
+        entry.value.clone()
+    }
+}
+
+/// The process-wide cache the snapshots use.
+pub fn cached_workspace(record: &AgentRecord) -> WorkerWorkspace {
+    static CACHE: std::sync::OnceLock<WorkspaceCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(WorkspaceCache::default).get(record)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::runtime::{AgentId, AgentKind, AgentState, RunId};
+
+    fn record(worktree: Option<PathBuf>) -> AgentRecord {
+        AgentRecord {
+            id: AgentId::new(),
+            run_id: RunId::new(),
+            parent: None,
+            kind: AgentKind::Subagent,
+            name: "w".into(),
+            provider: String::new(),
+            model_id: String::new(),
+            cwd: PathBuf::from("."),
+            state: AgentState::Running,
+            task_id: None,
+            worktree,
+            started_ms: 0,
+            updated_ms: 0,
+            failure_reason: None,
+        }
+    }
+
+    fn slow_read(record: &AgentRecord) -> WorkerWorkspace {
+        std::thread::sleep(Duration::from_millis(400));
+        WorkerWorkspace {
+            kind: WorkspaceKind::Worktree,
+            path: record.worktree.clone(),
+            branch: Some("late".into()),
+            ..WorkerWorkspace::default()
+        }
+    }
+
+    fn quick_read(record: &AgentRecord) -> WorkerWorkspace {
+        WorkerWorkspace {
+            kind: WorkspaceKind::Worktree,
+            path: record.worktree.clone(),
+            branch: Some("fast".into()),
+            ..WorkerWorkspace::default()
+        }
+    }
+
+    #[test]
+    fn a_stuck_read_never_holds_the_caller_and_ends_as_unavailable() {
+        let cache = WorkspaceCache::default();
+        let record = record(Some(PathBuf::from("/net/worktree")));
+        let started = std::time::Instant::now();
+        let first = cache.get_with(
+            &record,
+            slow_read,
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the caller waited"
+        );
+        assert_eq!(
+            first.branch, None,
+            "nothing is known yet, and none is invented"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        let second = cache.get_with(
+            &record,
+            slow_read,
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        );
+        assert_eq!(second.kind, WorkspaceKind::Unavailable);
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "still did not wait"
+        );
+        // The slow read finally lands and the real value replaces the marker.
+        std::thread::sleep(Duration::from_millis(500));
+        let third = cache.get_with(
+            &record,
+            slow_read,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(third.branch.as_deref(), Some("late"));
+    }
+
+    #[test]
+    fn a_fresh_value_is_reused_and_a_stale_one_is_read_again() {
+        let cache = WorkspaceCache::default();
+        let record = record(Some(PathBuf::from("/w")));
+        let _ = cache.get_with(
+            &record,
+            quick_read,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        let value = cache.get_with(
+            &record,
+            quick_read,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        assert_eq!(value.branch.as_deref(), Some("fast"));
+        // A shared worker never reads the disk at all.
+        assert_eq!(cache.get(&self::record(None)), WorkerWorkspace::default());
+    }
 }

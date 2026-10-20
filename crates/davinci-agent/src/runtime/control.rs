@@ -714,7 +714,7 @@ impl WorkerController {
             .map(|progress| progress.usage.clone())
             .unwrap_or_default();
         let activity = progress.and_then(|progress| progress.recent.last().cloned());
-        let workspace = super::worker_workspace::snapshot_workspace(&record);
+        let workspace = super::worker_workspace::cached_workspace(&record);
 
         let disconnected = matches!(record.state, AgentState::Failed)
             && record.failure_reason.as_deref() == Some("process_terminated");
