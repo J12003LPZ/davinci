@@ -1457,6 +1457,7 @@ mod tests {
             state,
             tool_uses: uses,
             tokens: 23_400,
+            tokens_estimated: false,
             recent: recent.iter().map(|call| call.to_string()).collect(),
             elapsed_secs: 41,
         }
