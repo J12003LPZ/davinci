@@ -1329,7 +1329,24 @@ impl ContextSource for MemoryContextSource {
                 request.memory_scope.as_deref(),
             ),
         };
+        // A fallback must be visible here too, not only in the explicit tool:
+        // while the remote copy is down or refused, say once that these came
+        // from local search. Always `None` for the default local backend.
+        let fallback = memory.projection.health(&memory.config).code;
+        let mut note_pending = !hits.is_empty() && fallback.is_some();
         hits.into_iter()
+            .map(|hit| {
+                let mut hit = hit;
+                if note_pending {
+                    note_pending = false;
+                    hit.text.push_str(&format!(
+                        "\n[{}] remote vector search is unavailable; memories came from local search.",
+                        fallback.unwrap_or(QDRANT_OFFLINE)
+                    ));
+                    hit.estimated_tokens += 24;
+                }
+                hit
+            })
             .map(|hit| ContextItem {
                 source: "vector_memory".to_string(),
                 content: hit.text,
@@ -3079,7 +3096,9 @@ impl VectorMemory {
             receipt.error = Some(health.detail).filter(|detail| !detail.is_empty());
             return receipt;
         };
-        let batch = max_batch.max(1);
+        // The client carries at most MAX_BATCH per request; a larger setting
+        // must not turn one write into an unbounded synchronous backlog.
+        let batch = max_batch.clamp(1, super::memory_backends::qdrant::MAX_BATCH);
         let path = self.projection_state_path();
         let collection = self.remote_collection_name();
         let fail = |receipt: &mut ProjectionRepairReceipt, error: ProjectionError| {
@@ -4223,6 +4242,75 @@ pub(crate) mod tests {
         std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
         assert_eq!(source.collect(&request(AgentKind::GraphWorker)).len(), 1);
         assert!(source.collect(&request(AgentKind::Main)).is_empty());
+    }
+
+    /// The automatic path labels a fallback, like the explicit tool does, and
+    /// stays silent for the default local backend and for a healthy remote.
+    #[test]
+    fn automatic_context_says_when_it_fell_back_from_the_remote() {
+        use crate::native_extensions::memory_backends::{MemoryProjectionBackend, ProjectionError};
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.mark_dense_offline();
+        memory
+            .index_learning_memory(
+                "graph_scheduler drops lanes when the queue is empty; drain the queue before swap",
+                MemoryKind::Fix,
+                0.9,
+                0.9,
+                "session",
+                1,
+                None,
+            )
+            .unwrap();
+        let request = ContextRequest {
+            run_id: davinci_agent::RunId::new(),
+            agent_id: davinci_agent::AgentId::new(),
+            goal: "why does graph_scheduler drop lanes when the queue is empty".to_string(),
+            provider: "mock".to_string(),
+            model_id: "mock".to_string(),
+            tools: Vec::new(),
+            max_tokens: 2_500,
+            kind: AgentKind::Main,
+            agent_profile_name: None,
+            memory_scope: None,
+        };
+        std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(memory));
+        let source = MemoryContextSource::new(shared.clone());
+
+        // Local backend: even a stale failure is not shown.
+        {
+            let memory = shared.lock().unwrap();
+            memory
+                .projection
+                .record(&memory.config, Err(ProjectionError::Offline("down".into())));
+        }
+        let local = source.collect(&request);
+        assert_eq!(local.len(), 1);
+        assert!(
+            !local[0].content.contains("QDRANT_"),
+            "{}",
+            local[0].content
+        );
+
+        shared.lock().unwrap().config.projection.backend = MemoryProjectionBackend::Qdrant;
+        let offline = source.collect(&request);
+        assert_eq!(offline.len(), 1);
+        assert!(
+            offline[0].content.contains("[QDRANT_OFFLINE]"),
+            "{}",
+            offline[0].content
+        );
+        assert!(offline[0].content.contains("local search"));
+
+        {
+            let memory = shared.lock().unwrap();
+            memory.projection.record(&memory.config, Ok(()));
+        }
+        let healthy = source.collect(&request);
+        assert!(!healthy[0].content.contains("QDRANT_"));
     }
 
     /// Labeled precision fixture for automatic recall. Each prompt names the

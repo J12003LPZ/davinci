@@ -109,8 +109,8 @@ not the default anywhere.
 | --- | --- |
 | `/setup qdrant` | Explains the above and looks, read-only, at what is on this machine: does Qdrant answer, is Docker installed, is its engine running, does a Qdrant container exist, is it DaVinci's. |
 | `/setup qdrant enable` / `disable` | Writes the choice to `setup-profile.json`. Disabling stops all Qdrant and Docker traffic at once; the remote collection is kept as it is. |
-| `/setup qdrant own <container-id>` / `release` | Records (or forgets) the one container you say is DaVinci's. Needs 12 or more characters of the id from `docker ps --no-trunc`. |
-| `/setup approve start-qdrant` | Your yes to starting that one container with `docker start <id>`. |
+| `/setup qdrant own <container-id>` / `release` | Records (or forgets) the one container you say is DaVinci's. Needs 12 or more characters of the id from `docker ps --no-trunc`, and the container must carry the label `io.davinci.owner=davinci-memory` (the `docker run` command DaVinci prints sets it). Recording a different container, or releasing, withdraws the start approval. |
+| `/setup approve start-qdrant` | Your yes to starting the recorded container with `docker start <id>`. |
 | `/setup qdrant keep-running on\|off` | Adds `--restart unless-stopped` to the `docker run` command DaVinci prints. DaVinci never changes a restart policy itself. |
 
 Environment: `PI_MEMORY_BACKEND=local` turns the remote off without editing a
@@ -146,7 +146,9 @@ rebuild delete only this repository's points.
 
 **When Qdrant is down.** Search falls back to the local index and says so:
 `memory_search` ends with `[QDRANT_OFFLINE] remote vector search is
-unavailable; local search was used.`, and status shows the code. Nothing is
+unavailable; local search was used.`, the memories injected into a turn
+automatically start with the same marker on their first line, and status shows
+the code. Nothing is
 lost: records are written locally first. The remote is skipped for
 `offlineBackoffSeconds` after a failure, so a stopped Qdrant costs one timeout.
 `remoteProjectionLag` in the status counts records the remote does not hold
@@ -157,9 +159,30 @@ batches by indexing, `/memory-reindex` and `/setup repair`; a lost
 **Docker.** Discovery runs `docker version` and `docker ps` with a five second
 timeout and nothing else. DaVinci does not install Docker or Qdrant, does not
 start Docker, does not change Docker Desktop settings, and touches no
-container that is not the one you recorded (or that carries the label
-`io.davinci.owner=davinci-memory`). With nothing running it prints the
-`docker run` command for you to run yourself.
+container that is not the one you recorded. Ownership is the recorded id and
+nothing else; the label `io.davinci.owner=davinci-memory` is only a check that
+the recorded container is still the one DaVinci's command made. A labelled
+container nobody recorded is never started, wherever `docker ps` lists it. With
+nothing running it prints the `docker run` command for you to run yourself.
+
+**Collection ownership.** When DaVinci creates a collection it writes one
+marker point (no repo id, no text) into it. A collection with the derived name
+but no marker was not made by DaVinci: it is reported (`QDRANT_REFUSED`), never
+adopted, and nothing is written to it or deleted from it. Delete it yourself or
+set `collectionPrefix` to another name.
+
+**API key.** It is sent only over `https://`, or over `http://` to this
+machine. A plain `http://` URL to another host with a key set is refused with
+an error, and redirects are not followed, so the header never goes anywhere
+else. `batchSize` is clamped to 512 points per request.
+
+**Known limits.** `/setup approve start-qdrant` runs on the interactive loop and
+can block it for up to about a minute while Docker answers (every call has a
+timeout). `/setup qdrant` (show, enable, own) asks Docker even while the
+backend is local, because you asked it to; `/setup check` and everything
+automatic do not. An empty answer from a reachable Qdrant falls back to local
+search without a label, because Qdrant is up; `remoteProjectionLag` shows the
+gap.
 
 **Rollback.** `/setup qdrant disable` (or `PI_MEMORY_BACKEND=local`). Local
 search and every record are exactly as before; delete the remote

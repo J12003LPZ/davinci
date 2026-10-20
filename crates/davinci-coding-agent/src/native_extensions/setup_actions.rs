@@ -92,8 +92,14 @@ pub fn approve_action(action: SetupAction, ctx: &SetupContext) -> Result<String,
         }
         ServiceConsentStore::open(ctx.agent_dir).set(consent, true)?;
         return Ok(
-            "approved starting DaVinci's own Qdrant container (only the one recorded with /setup qdrant own, or labelled by DaVinci)"
-                .into(),
+            match effective.profile.memory.qdrant_setup.owned_container.as_ref() {
+                Some(container) => format!(
+                    "approved starting DaVinci's own Qdrant container {} ({}); no other container is ever started",
+                    container.name,
+                    container.id.chars().take(12).collect::<String>()
+                ),
+                None => "approved starting DaVinci's own Qdrant container, but none is recorded yet: record one with /setup qdrant own <id>; nothing is started until then".into(),
+            },
         );
     }
     if action == SetupAction::StartService {

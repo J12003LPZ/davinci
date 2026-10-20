@@ -1,6 +1,7 @@
 //! Optional Qdrant projection: local mode contacts nothing, remote mode is a
 //! rebuildable copy of the local store. Fakes only; no Docker, no real Qdrant.
 
+use davinci_coding_agent::native_extensions::memory_backends::fake_qdrant::dead_url;
 use davinci_coding_agent::native_extensions::memory_backends::fake_qdrant::FakeQdrant;
 use davinci_coding_agent::native_extensions::memory_backends::MemoryProjectionBackend;
 use davinci_coding_agent::native_extensions::setup_profile::{
@@ -18,7 +19,7 @@ fn local_memory(dir: &std::path::Path, qdrant_url: &str) -> VectorMemory {
     let config = VectorMemoryConfig {
         qdrant_url: qdrant_url.to_string(),
         // Nothing listens here: embedding falls back to lexical, quickly.
-        ollama_url: "http://127.0.0.1:9".into(),
+        ollama_url: dead_url(),
         embed_timeout_seconds: 1,
         request_timeout_seconds: 1,
         promotion: false,
@@ -473,4 +474,155 @@ fn setup_repair_catches_the_remote_up_and_says_so() {
         step.detail
     );
     assert_eq!(shared.lock().unwrap().remote_projection_lag(), 0);
+}
+
+// ---- critic fixes: ownership marker, key transport, batch clamp ----
+
+fn one_point(id: &str) -> ProjectionPoint {
+    ProjectionPoint {
+        id: id.into(),
+        vector: vec![1.0, 0.0, 0.0],
+        repo_id: "repo-x".into(),
+    }
+}
+
+#[test]
+fn a_collection_of_the_right_shape_without_the_marker_is_never_adopted() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let client = QdrantProjection::new(&qdrant_config(&fake, &embedder), "repo-x").unwrap();
+    // Someone else made a collection with our name and our shape.
+    fake.preload_collection(client.collection(), DIMS, "Cosine");
+
+    let error = client.ensure_ready().unwrap_err();
+    assert!(matches!(error, ProjectionError::Refused(_)), "{error}");
+    assert!(error.to_string().contains("did not create"), "{error}");
+    assert!(matches!(
+        client.upsert(&[one_point("a")]),
+        Err(ProjectionError::Refused(_))
+    ));
+    assert!(matches!(
+        client.delete(&["a".into()], "repo-x"),
+        Err(ProjectionError::Refused(_))
+    ));
+    assert!(matches!(
+        client.clear_namespace("repo-x"),
+        Err(ProjectionError::Refused(_))
+    ));
+    assert!(
+        fake.requests()
+            .iter()
+            .filter(|request| request.path != "/readyz")
+            .all(|request| request.method == "GET"),
+        "only reads were sent: {:?}",
+        fake.requests()
+    );
+    assert!(fake
+        .collection(client.collection())
+        .unwrap()
+        .points
+        .is_empty());
+}
+
+#[test]
+fn a_collection_davinci_made_is_marked_and_the_marker_outlives_every_clear() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let client = QdrantProjection::new(&qdrant_config(&fake, &embedder), "repo-x").unwrap();
+    client.upsert(&[one_point("a")]).unwrap();
+    let marker = |fake: &FakeQdrant| fake.collection(client.collection()).unwrap().marker;
+    assert_eq!(
+        marker(&fake)
+            .expect("created collections carry a marker")
+            .payload["davinci_marker"],
+        "davinci-memory"
+    );
+    // The marker has no repo id, so no query returns it and no clear removes it.
+    let hits = client.query(&[1.0, 0.0, 0.0], "repo-x", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    client.clear_namespace("repo-x").unwrap();
+    assert!(marker(&fake).is_some());
+    // A second client (a restart) recognises its own collection.
+    let again = QdrantProjection::new(&qdrant_config(&fake, &embedder), "repo-x").unwrap();
+    again.upsert(&[one_point("b")]).unwrap();
+}
+
+#[test]
+fn the_api_key_never_travels_over_plain_http_to_another_host() {
+    let embedder = ollama();
+    let fake = FakeQdrant::start();
+    let mut config = qdrant_config(&fake, &embedder);
+    config.projection.api_key = Secret::new("k-123-secret");
+    config.projection.allow_remote = true;
+
+    config.qdrant_url = "http://qdrant.example.com:6333".into();
+    let error = QdrantProjection::new(&config, "r").err().expect("refused");
+    assert!(matches!(error, ProjectionError::Refused(_)));
+    assert!(error.to_string().contains("plain http"), "{error}");
+    assert!(!error.to_string().contains("k-123-secret"));
+
+    // https to another host, http on this machine, and no key over http are fine.
+    config.qdrant_url = "HTTPS://qdrant.example.com:6333".into();
+    assert!(QdrantProjection::new(&config, "r").is_ok());
+    config.qdrant_url = fake.url();
+    assert!(QdrantProjection::new(&config, "r").is_ok());
+    config.qdrant_url = "http://qdrant.example.com:6333".into();
+    config.projection.api_key = None;
+    assert!(QdrantProjection::new(&config, "r").is_ok());
+}
+
+/// A server that answers every request with a redirect to `target`.
+fn redirecting_server(target: String) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/readyz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    format!("http://{address}")
+}
+
+#[test]
+fn a_redirect_is_not_followed_with_the_api_key() {
+    let embedder = ollama();
+    let elsewhere = FakeQdrant::start();
+    let mut config = qdrant_config(&elsewhere, &embedder);
+    config.qdrant_url = redirecting_server(elsewhere.url());
+    config.projection.api_key = Secret::new("k-123-secret");
+    let client = QdrantProjection::new(&config, "r").unwrap();
+    assert!(client.ensure_ready().is_err());
+    assert_eq!(
+        elsewhere.request_count(),
+        0,
+        "the redirect target never saw a request, so never saw the key"
+    );
+}
+
+#[test]
+fn one_request_never_carries_more_than_the_client_maximum() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let mut config = qdrant_config(&fake, &embedder);
+    config.projection.batch_size = 1_000_000;
+    let client = QdrantProjection::new(&config, "repo-x").unwrap();
+    let points: Vec<ProjectionPoint> = (0..600).map(|n| one_point(&format!("p{n}"))).collect();
+    client.upsert(&points).unwrap();
+    let sizes: Vec<usize> = fake
+        .requests()
+        .iter()
+        .filter(|request| request.method == "PUT" && request.path.contains("wait=true"))
+        .map(|request| request.body["points"].as_array().map_or(0, Vec::len))
+        .collect();
+    // The marker write, then 512 and 88.
+    assert_eq!(sizes, vec![1, 512, 88], "{sizes:?}");
 }

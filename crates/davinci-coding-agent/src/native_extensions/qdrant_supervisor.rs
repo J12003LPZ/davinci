@@ -12,9 +12,11 @@
 //! - nothing already answers at the URL (an existing Qdrant is reused);
 //! - the Docker engine answers (Docker itself is never started and its
 //!   settings are never touched);
-//! - the container is DaVinci's: its id is the one the user recorded, or it
-//!   carries DaVinci's label. Any other container, Qdrant or not, is left
-//!   exactly as it is;
+//! - the container is DaVinci's: its id is the one the user recorded with
+//!   `/setup qdrant own` and it still carries DaVinci's label. A label alone
+//!   never makes a container DaVinci's, and the recorded container is the one
+//!   considered wherever `docker ps` lists it. Any other container, Qdrant or
+//!   not, is left exactly as it is;
 //! - no other DaVinci is starting it (a lock file in the agent directory).
 //!
 //! No restart policy is changed, no container is created or removed, and

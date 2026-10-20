@@ -3,6 +3,7 @@
 //! Offline: loopback fakes only, no real `ollama`, no download. The real
 //! Windows / real-Ollama matrix is not covered here (see docs/setup.md).
 
+use davinci_coding_agent::native_extensions::memory_backends::fake_qdrant::dead_url;
 use davinci_coding_agent::native_extensions::service_supervisor::{
     ManagedServiceSupervisor, OllamaLauncher, OwnedProcess,
 };
@@ -101,7 +102,7 @@ fn repeated_restart_reconciles_without_manual_commands() {
     let project = tempfile::tempdir().unwrap();
     let healthy = fake("{\"models\":[{\"name\":\"embeddinggemma:latest\"}]}");
     let no_model = fake("{\"models\":[]}");
-    let down = "http://127.0.0.1:9".to_string();
+    let down = dead_url();
 
     // One real record written before any relaunch; its bytes must survive all of them.
     let mut seed = VectorMemory::with_config(

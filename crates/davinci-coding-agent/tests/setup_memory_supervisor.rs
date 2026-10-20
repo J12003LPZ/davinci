@@ -3,13 +3,14 @@
 //! Everything here is offline: temp directories, loopback fakes and an
 //! injected launcher. No real `ollama`, no download, no real user profile.
 
+use davinci_coding_agent::native_extensions::memory_backends::fake_qdrant::dead_url;
 use davinci_coding_agent::native_extensions::{MemoryKind, VectorMemory, VectorMemoryConfig};
 use std::fs;
 
 fn memory_in(cwd: &std::path::Path) -> VectorMemory {
     let config = VectorMemoryConfig {
         // A closed loopback port: nothing here may wait on a server.
-        ollama_url: "http://127.0.0.1:9".into(),
+        ollama_url: dead_url(),
         ..VectorMemoryConfig::default()
     };
     let memory = VectorMemory::with_config(cwd.to_path_buf(), config);
@@ -311,7 +312,7 @@ fn health_does_not_claim_dense_ready_when_ollama_down() {
 
     // Nothing listens: Degraded with PROVIDER_OFFLINE. The dense cooldown
     // flag is not an input at all.
-    let down = probe_ollama(&target("http://127.0.0.1:9", 768));
+    let down = probe_ollama(&target(&dead_url(), 768));
     assert!(!down.reachable);
     let health = assess_memory(&facts(Some(&down), &store));
     assert_eq!(health.state, HealthState::Degraded);
@@ -1545,7 +1546,7 @@ fn unreadable_profile_keeps_both_features_off_and_untouched() {
     // Words that name no feature are refused.
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let mut host = setup_host(agent.path(), project.path(), "http://127.0.0.1:9");
+    let mut host = setup_host(agent.path(), project.path(), &dead_url());
     assert!(host.command("setup", "disable everything").is_err());
 }
 

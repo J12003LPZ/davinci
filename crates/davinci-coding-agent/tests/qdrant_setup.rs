@@ -4,6 +4,7 @@
 use davinci_coding_agent::native_extensions::docker_discovery::{
     discover, DockerQuery, DockerReply, DockerRunner, EngineState, Owner, ServiceState,
 };
+use davinci_coding_agent::native_extensions::memory_backends::fake_qdrant::dead_url;
 use davinci_coding_agent::native_extensions::memory_backends::fake_qdrant::FakeQdrant;
 use davinci_coding_agent::native_extensions::service_supervisor::{
     ManagedServiceSupervisor, OllamaLauncher, OwnedProcess,
@@ -122,7 +123,8 @@ fn existing_qdrant_detected_no_unapproved_docker_mutation() {
 
 #[test]
 fn engine_reachable_and_container_exists_are_separate_facts() {
-    let down_url = "http://127.0.0.1:9";
+    let down = dead_url();
+    let down_url = down.as_str();
 
     // Docker missing: install guidance, no list call.
     let missing = FakeDocker::new(DockerReply::NotInstalled, DockerReply::NotInstalled);
@@ -177,13 +179,17 @@ fn engine_reachable_and_container_exists_are_separate_facts() {
 }
 
 #[test]
-fn ownership_comes_from_the_label_or_a_recorded_id_only() {
-    let down_url = "http://127.0.0.1:9";
+fn ownership_needs_the_recorded_id_and_the_label() {
+    let down = dead_url();
+    let down_url = down.as_str();
     let both = FakeDocker::running_with(&[external_qdrant(), davinci_qdrant("exited")]);
+    // The label alone is a hint, not ownership.
     let found = discover(down_url, false, None, both.as_ref());
+    assert_eq!(found.owner, Owner::External);
+    assert_eq!(found.candidates.len(), 2);
+    let found = discover(down_url, false, Some(&DAVINCI_ID[..12]), both.as_ref());
     assert_eq!(found.owner, Owner::DaVinci);
     assert_eq!(found.container.as_ref().unwrap().name, "davinci-qdrant");
-    assert_eq!(found.candidates.len(), 2);
     let health = found.health(false);
     assert_eq!(health.code, Some("QDRANT_OFFLINE"));
     assert!(health
@@ -191,10 +197,10 @@ fn ownership_comes_from_the_label_or_a_recorded_id_only() {
         .unwrap()
         .contains("/setup approve start-qdrant"));
 
-    // A container with only a recorded id is ours; one with a similar name is not.
+    // A recorded id without the label is not ours either; one with a similar name is not.
     let by_id = FakeDocker::running_with(&[row(DAVINCI_ID, "x", "qdrant/qdrant", "exited", "")]);
     let found = discover(down_url, false, Some(&DAVINCI_ID[..12]), by_id.as_ref());
-    assert_eq!(found.owner, Owner::DaVinci);
+    assert_eq!(found.owner, Owner::External);
     let lookalike = FakeDocker::running_with(&[row(
         OTHER_ID,
         "davinci-qdrant",
@@ -206,7 +212,7 @@ fn ownership_comes_from_the_label_or_a_recorded_id_only() {
     assert_eq!(found.owner, Owner::External);
     assert_eq!(found.health(false).code, Some("QDRANT_NOT_OWNED"));
     // A recorded prefix shorter than 12 characters matches nothing.
-    let found = discover(down_url, false, Some("aaaa"), by_id.as_ref());
+    let found = discover(down_url, false, Some("aaaa"), both.as_ref());
     assert_eq!(found.owner, Owner::External);
 }
 
@@ -319,27 +325,33 @@ fn setup_qdrant_explains_then_enable_and_disable_round_trip() {
 fn own_records_only_a_container_the_engine_lists() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let docker = FakeDocker::running_with(&[external_qdrant()]);
+    let docker = FakeDocker::running_with(&[external_qdrant(), davinci_qdrant("exited")]);
     let mut host = host(agent.path(), project.path(), docker);
 
-    for bad in ["qdrant own abc", "qdrant own ffffffffffff"] {
+    // Too short, unknown, and a listed container without DaVinci's label.
+    for bad in [
+        "qdrant own abc".to_string(),
+        "qdrant own ffffffffffff".to_string(),
+        format!("qdrant own {}", &OTHER_ID[..12]),
+    ] {
+        let bad = bad.as_str();
         let report = host.command("setup", bad).unwrap().unwrap();
         assert_eq!(report["steps"][0]["state"], "action", "{bad}: {report}");
     }
     assert!(!agent.path().join("setup-profile.json").exists());
 
     let report = host
-        .command("setup", &format!("qdrant own {}", &OTHER_ID[..12]))
+        .command("setup", &format!("qdrant own {}", &DAVINCI_ID[..12]))
         .unwrap()
         .unwrap();
     assert_eq!(report["steps"][0]["state"], "done", "{report}");
     let profile = std::fs::read_to_string(agent.path().join("setup-profile.json")).unwrap();
-    assert!(profile.contains(OTHER_ID), "{profile}");
+    assert!(profile.contains(DAVINCI_ID), "{profile}");
 
     let report = host.command("setup", "qdrant release").unwrap().unwrap();
     assert_eq!(report["steps"][0]["state"], "done");
     let profile = std::fs::read_to_string(agent.path().join("setup-profile.json")).unwrap();
-    assert!(!profile.contains(OTHER_ID));
+    assert!(!profile.contains(DAVINCI_ID));
 }
 
 // ---- Task 5: DaVinci's own container, consent-gated ----
@@ -414,6 +426,11 @@ fn machine(owned_rows: &[String]) -> Machine {
     .unwrap();
     let mut profile = SetupProfile::default();
     profile.memory.backend = MemoryProjectionBackend::Qdrant;
+    // The user recorded DaVinci's container; a label alone is never enough.
+    profile.memory.qdrant_setup.owned_container = Some(OwnedContainer {
+        id: DAVINCI_ID.into(),
+        name: "davinci-qdrant".into(),
+    });
     profile.save(agent.path()).unwrap();
     let docker = FakeDocker::running_with(owned_rows);
     let starter = FakeStarter::new(qdrant.clone());
@@ -563,19 +580,17 @@ fn only_a_container_davinci_owns_is_ever_started() {
     assert_eq!(step["code"], "QDRANT_NOT_OWNED", "{step}");
     assert!(machine.starter.started().is_empty());
 
-    // A recorded id makes it DaVinci's: the user's explicit statement.
+    // Recording its id is not enough while it carries no DaVinci label.
     let mut profile = SetupProfile::load(machine.agent.path()).0;
     profile.memory.qdrant_setup.owned_container = Some(OwnedContainer {
         id: OTHER_ID.into(),
         name: "team-qdrant".into(),
     });
     profile.save(machine.agent.path()).unwrap();
-    let report = host
-        .command("setup", "approve start-qdrant")
+    host.command("setup", "approve start-qdrant")
         .unwrap()
         .unwrap();
-    assert_eq!(step_of(&report)["state"], "ready", "{report}");
-    assert_eq!(machine.starter.started(), vec![OTHER_ID.to_string()]);
+    assert!(machine.starter.started().is_empty());
 }
 
 fn step_of(report: &Value) -> &Value {
@@ -669,4 +684,155 @@ fn approving_needs_qdrant_to_be_chosen_and_a_failed_start_is_reported() {
     let step = step_of(&report);
     assert_eq!(step["code"], "SERVICE_START_FAILED", "{step}");
     assert_eq!(failing.started().len(), 1);
+}
+
+// ---- critic fixes: only the recorded container, and only while it is labelled ----
+
+fn record_owned(machine: &Machine, id: &str, name: &str) {
+    let mut profile = SetupProfile::load(machine.agent.path()).0;
+    profile.memory.qdrant_setup.owned_container = Some(OwnedContainer {
+        id: id.into(),
+        name: name.into(),
+    });
+    profile.save(machine.agent.path()).unwrap();
+}
+
+/// The machine starts with DaVinci's container recorded; some tests need none.
+fn unrecord(machine: &Machine) {
+    let mut profile = SetupProfile::load(machine.agent.path()).0;
+    profile.memory.qdrant_setup.owned_container = None;
+    profile.save(machine.agent.path()).unwrap();
+}
+
+fn approve(machine: &Machine) {
+    davinci_coding_agent::native_extensions::service_authority::ServiceConsentStore::open(
+        machine.agent.path(),
+    )
+    .set(
+        davinci_coding_agent::native_extensions::service_authority::ServiceAction::StartOwnedQdrantContainer,
+        true,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_labelled_container_listed_ahead_of_the_recorded_one_is_never_started() {
+    // docker ps lists the newer, labelled impostor first.
+    let impostor = row(
+        OTHER_ID,
+        "impostor",
+        "qdrant/qdrant",
+        "exited",
+        "io.davinci.owner=davinci-memory",
+    );
+    let machine = machine(&[impostor, davinci_qdrant("exited")]);
+    record_owned(&machine, DAVINCI_ID, "davinci-qdrant");
+    approve(&machine);
+
+    let health = reconcile_owned_qdrant(
+        machine.agent.path(),
+        &effective(&machine),
+        machine.docker.as_ref(),
+        machine.starter.as_ref(),
+        short_deadline(),
+    );
+    assert_eq!(health.state, HealthState::Ready, "{health:?}");
+    assert_eq!(
+        machine.starter.started(),
+        vec![DAVINCI_ID.to_string()],
+        "the recorded container, not the first labelled one"
+    );
+}
+
+#[test]
+fn a_label_alone_never_makes_a_container_davincis() {
+    let machine = machine(&[davinci_qdrant("exited")]);
+    unrecord(&machine);
+    approve(&machine);
+
+    // Nothing recorded: the labelled container is not started.
+    let health = reconcile_owned_qdrant(
+        machine.agent.path(),
+        &effective(&machine),
+        machine.docker.as_ref(),
+        machine.starter.as_ref(),
+        short_deadline(),
+    );
+    assert_eq!(health.code, Some("QDRANT_NOT_OWNED"), "{health:?}");
+    assert!(machine.starter.started().is_empty());
+
+    // Another container recorded: the labelled one is still left alone.
+    record_owned(&machine, OTHER_ID, "elsewhere");
+    let health = reconcile_owned_qdrant(
+        machine.agent.path(),
+        &effective(&machine),
+        machine.docker.as_ref(),
+        machine.starter.as_ref(),
+        short_deadline(),
+    );
+    assert!(machine.starter.started().is_empty(), "{health:?}");
+}
+
+#[test]
+fn a_recorded_container_that_lost_its_label_is_not_started() {
+    let unlabelled = row(DAVINCI_ID, "davinci-qdrant", "qdrant/qdrant", "exited", "");
+    let machine = machine(&[unlabelled]);
+    record_owned(&machine, DAVINCI_ID, "davinci-qdrant");
+    approve(&machine);
+    let health = reconcile_owned_qdrant(
+        machine.agent.path(),
+        &effective(&machine),
+        machine.docker.as_ref(),
+        machine.starter.as_ref(),
+        short_deadline(),
+    );
+    assert_eq!(health.code, Some("QDRANT_NOT_OWNED"), "{health:?}");
+    assert!(machine.starter.started().is_empty());
+}
+
+#[test]
+fn recording_a_container_needs_the_label_and_releasing_withdraws_the_approval() {
+    let machine = machine(&[external_qdrant(), davinci_qdrant("exited")]);
+    unrecord(&machine);
+    let mut host = davinci_host(&machine);
+
+    // An unlabelled container cannot be recorded.
+    let report = host
+        .command("setup", &format!("qdrant own {}", &OTHER_ID[..12]))
+        .unwrap()
+        .unwrap();
+    assert!(
+        report.to_string().contains("does not carry the label"),
+        "{report}"
+    );
+    assert!(SetupProfile::load(machine.agent.path())
+        .0
+        .memory
+        .qdrant_setup
+        .owned_container
+        .is_none());
+
+    // The labelled one can, and the approval names it.
+    host.command("setup", &format!("qdrant own {}", &DAVINCI_ID[..12]))
+        .unwrap()
+        .unwrap();
+    let report = host
+        .command("setup", "approve start-qdrant")
+        .unwrap()
+        .unwrap();
+    assert!(
+        report.to_string().contains("davinci-qdrant"),
+        "approval names the container: {report}"
+    );
+    assert_eq!(machine.starter.started(), vec![DAVINCI_ID.to_string()]);
+
+    // Releasing withdraws the approval: recording again needs a fresh yes.
+    host.command("setup", "qdrant release").unwrap().unwrap();
+    let consent =
+        davinci_coding_agent::native_extensions::service_authority::ServiceConsentStore::open(
+            machine.agent.path(),
+        )
+        .load()
+        .unwrap();
+    assert!(!consent.allow_start_owned_qdrant_container);
 }

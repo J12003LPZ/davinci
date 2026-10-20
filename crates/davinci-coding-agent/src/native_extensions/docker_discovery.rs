@@ -176,7 +176,8 @@ pub enum ServiceState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Owner {
-    /// Recorded id or DaVinci's label. The only case a start may be offered for.
+    /// The recorded id, still carrying DaVinci's label. The only case a start
+    /// may be offered for.
     DaVinci,
     /// A Qdrant container that is someone else's. Never touched.
     External,
@@ -192,8 +193,8 @@ pub struct QdrantDiscovery {
     /// Every Qdrant container the engine listed (empty when the engine could
     /// not be asked, which `docker_engine` says).
     pub candidates: Vec<ContainerInfo>,
-    /// The container this discovery considers relevant: DaVinci's own when
-    /// there is one, otherwise the first other Qdrant container.
+    /// The container this discovery considers relevant: the recorded one when
+    /// it is listed, otherwise the first Qdrant container.
     pub container: Option<ContainerInfo>,
     pub owner: Owner,
 }
@@ -205,11 +206,19 @@ fn matches_recorded(container: &ContainerInfo, recorded: &str) -> bool {
         && (container.id.starts_with(recorded) || recorded.starts_with(&container.id))
 }
 
-/// DaVinci owns a container when the user recorded its id, or it carries
-/// DaVinci's label (set by the command DaVinci shows the user).
+/// Whether the container carries DaVinci's label. Only a hint: the label alone
+/// never makes a container DaVinci's.
+pub fn has_owner_label(container: &ContainerInfo) -> bool {
+    container.labels.get(OWNER_LABEL).map(String::as_str) == Some(OWNER_VALUE)
+}
+
+/// DaVinci owns a container only when its id is the one the user recorded AND
+/// it still carries DaVinci's label. A labelled container nobody recorded is
+/// someone else's; a recorded id that lost its label (or was recreated under
+/// another id) is not started either.
 pub fn is_owned(container: &ContainerInfo, recorded_id: Option<&str>) -> bool {
     recorded_id.is_some_and(|recorded| matches_recorded(container, recorded))
-        || container.labels.get(OWNER_LABEL).map(String::as_str) == Some(OWNER_VALUE)
+        && has_owner_label(container)
 }
 
 fn parse_labels(text: &str) -> BTreeMap<String, String> {
@@ -287,10 +296,14 @@ pub fn discover(
     } else {
         Vec::new()
     };
-    let owned = candidates
-        .iter()
-        .find(|container| is_owned(container, recorded_id));
-    let container = owned.or_else(|| candidates.first()).cloned();
+    // The recorded container comes first, wherever `docker ps` lists it.
+    let recorded = recorded_id.and_then(|id| {
+        candidates
+            .iter()
+            .find(|container| matches_recorded(container, id))
+    });
+    let owned = recorded.filter(|container| is_owned(container, recorded_id));
+    let container = recorded.or_else(|| candidates.first()).cloned();
     let owner = match (&container, owned) {
         (None, _) => Owner::None,
         (Some(_), Some(_)) => Owner::DaVinci,

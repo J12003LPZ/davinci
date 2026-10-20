@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+const MARKER_ID: &str = super::qdrant::MARKER_POINT_ID;
+
 /// One request the fake saw.
 #[derive(Debug, Clone)]
 pub struct LoggedRequest {
@@ -32,6 +34,8 @@ pub struct Collection {
     pub size: usize,
     pub distance: String,
     pub points: BTreeMap<String, StoredPoint>,
+    /// DaVinci's ownership marker, kept apart so `points` counts user data only.
+    pub marker: Option<StoredPoint>,
 }
 
 #[derive(Default)]
@@ -60,6 +64,15 @@ impl std::fmt::Debug for FakeQdrant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FakeQdrant({})", self.address)
     }
+}
+
+/// A loopback URL nothing listens on: a port that was bound and then
+/// released, so a dead service in a test is not a guess about port 9.
+pub fn dead_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a throwaway port");
+    let address = listener.local_addr().expect("local address");
+    drop(listener);
+    format!("http://{address}")
 }
 
 pub struct FakeQdrant {
@@ -156,6 +169,7 @@ impl FakeQdrant {
                 size,
                 distance: distance.to_string(),
                 points: BTreeMap::new(),
+                marker: None,
             },
         );
     }
@@ -182,6 +196,7 @@ impl FakeQdrant {
     }
 
     /// Drop every point of every collection: the remote lost its data.
+    /// The ownership marker survives: only the data was lost.
     pub fn wipe_points(&self) {
         for collection in self.shared.state.lock().unwrap().collections.values_mut() {
             collection.points.clear();
@@ -343,6 +358,27 @@ fn handle(mut stream: TcpStream, shared: &Shared) {
             ),
             None => respond(&mut stream, 404, &json!({"status": {"error": "Not found"}})),
         },
+        ("GET", ["collections", name, "points", id]) => {
+            let point = state.collections.get(*name).and_then(|collection| {
+                collection
+                    .marker
+                    .as_ref()
+                    .filter(|_| *id == MARKER_ID)
+                    .or_else(|| collection.points.get(*id))
+            });
+            match point {
+                Some(point) => respond(
+                    &mut stream,
+                    200,
+                    &json!({"result": {"id": id, "payload": point.payload}}),
+                ),
+                None => respond(&mut stream, 404, &json!({"status": {"error": "Not found"}})),
+            }
+        }
+        ("DELETE", ["collections", name]) => {
+            state.collections.remove(*name);
+            respond(&mut stream, 200, &json!({"result": true}))
+        }
         ("PUT", ["collections", name]) => {
             let size = body["vectors"]["size"].as_u64().unwrap_or(0) as usize;
             let distance = body["vectors"]["distance"]
@@ -358,6 +394,7 @@ fn handle(mut stream: TcpStream, shared: &Shared) {
                     size,
                     distance,
                     points: BTreeMap::new(),
+                    marker: None,
                 },
             );
             respond(&mut stream, 200, &json!({"result": true}))
@@ -384,13 +421,15 @@ fn handle(mut stream: TcpStream, shared: &Shared) {
                         &json!({"status": {"error": "Wrong input: vector dimension"}}),
                     );
                 }
-                collection.points.insert(
-                    id,
-                    StoredPoint {
-                        vector,
-                        payload: point["payload"].clone(),
-                    },
-                );
+                let stored = StoredPoint {
+                    vector,
+                    payload: point["payload"].clone(),
+                };
+                if id == MARKER_ID {
+                    collection.marker = Some(stored);
+                } else {
+                    collection.points.insert(id, stored);
+                }
             }
             respond(
                 &mut stream,

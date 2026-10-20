@@ -6,10 +6,16 @@
 //!   `pi_memory_v1` is not used and is never touched.
 //! - A collection that exists with a different vector size or distance is
 //!   refused, not repaired, not deleted. It may belong to someone else.
+//! - DaVinci writes a marker point into every collection it creates. A
+//!   collection of the derived name without that marker was not made by
+//!   DaVinci: it is refused, never adopted, and nothing is written to it or
+//!   deleted from it.
 //! - Points carry ids, numbers and a repo id. No memory text leaves the
 //!   machine through this file.
 //! - A Qdrant that is not on this machine is refused unless the user allowed
-//!   it. The API key goes in a header and nowhere else, and is never printed.
+//!   it. The API key goes in a header and nowhere else, and is never printed;
+//!   it is never sent over plain http to a host that is not this machine, and
+//!   redirects are not followed, so the header cannot be forwarded elsewhere.
 
 use super::{
     ProjectionConfig, ProjectionError, ProjectionHit, ProjectionPoint, Secret, VectorProjection,
@@ -23,6 +29,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const DISTANCE: &str = "Cosine";
+
+/// The point DaVinci writes when it creates a collection. It has no `repo_id`,
+/// so no query, delete or namespace clear ever matches it.
+pub const MARKER_POINT_ID: &str = "da71c100-0000-4000-8000-000000000001";
+pub const MARKER_VALUE: &str = "davinci-memory";
+
+/// The largest batch one request carries, whatever the configuration says.
+pub const MAX_BATCH: usize = 512;
 
 /// `davinci-<12 hex of repo>-<8 hex of model identity>`. Pure and stable, so a
 /// restart finds the same collection and a model change starts a fresh one.
@@ -92,6 +106,20 @@ impl QdrantProjection {
                     .into(),
             ));
         }
+        if projection.api_key.is_some()
+            && !config
+                .qdrant_url
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("https://")
+            && !is_local_url(&config.qdrant_url)
+        {
+            return Err(ProjectionError::Refused(
+                "the Qdrant API key would travel over plain http to a host that is not this \
+                 machine; use an https:// URL, or remove the API key"
+                    .into(),
+            ));
+        }
         let identity = EmbeddingIdentity::from_config(config);
         let timeout = Duration::from_secs(config.request_timeout_seconds.max(1));
         Ok(Self {
@@ -99,8 +127,12 @@ impl QdrantProjection {
             collection: collection_name(&projection.collection_prefix, repo_id, &identity),
             dimensions: config.embedding_dimensions,
             api_key: projection.api_key.clone(),
-            batch_size: projection.batch_size.clamp(1, 512),
-            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            batch_size: projection.batch_size.clamp(1, MAX_BATCH),
+            // No redirects: the api-key header must not follow one elsewhere.
+            agent: ureq::AgentBuilder::new()
+                .timeout(timeout)
+                .redirects(0)
+                .build(),
             ready: AtomicBool::new(false),
         })
     }
@@ -159,6 +191,46 @@ impl QdrantProjection {
     }
 }
 
+impl QdrantProjection {
+    /// Does the collection carry DaVinci's marker point?
+    fn has_marker(&self) -> Result<bool, ProjectionError> {
+        let path = format!("/collections/{}/points/{MARKER_POINT_ID}", self.collection);
+        match self.call("GET", &path, None) {
+            Ok(reply) => {
+                Ok(reply["result"]["payload"]["davinci_marker"].as_str() == Some(MARKER_VALUE))
+            }
+            Err(CallError::Status(404)) => Ok(false),
+            Err(error) => Err(self.fail(error, "collection marker check")),
+        }
+    }
+
+    fn write_marker(&self) -> Result<(), CallError> {
+        let mut vector = vec![0.0_f32; self.dimensions];
+        if let Some(first) = vector.first_mut() {
+            *first = 1.0;
+        }
+        let path = format!("/collections/{}/points?wait=true", self.collection);
+        self.call(
+            "PUT",
+            &path,
+            Some(json!({"points": [{
+                "id": MARKER_POINT_ID,
+                "vector": vector,
+                "payload": {"davinci_marker": MARKER_VALUE},
+            }]})),
+        )
+        .map(|_| ())
+    }
+
+    fn refuse_unmarked(&self) -> ProjectionError {
+        ProjectionError::Refused(format!(
+            "collection {} exists but DaVinci did not create it (no ownership marker); it was \
+             left untouched. Delete it yourself, or set projection.collectionPrefix to another name",
+            self.collection
+        ))
+    }
+}
+
 enum CallError {
     Transport(String),
     Status(u16),
@@ -173,7 +245,12 @@ impl VectorProjection for QdrantProjection {
             .map_err(|error| self.fail(error, "readiness check"))?;
         let path = format!("/collections/{}", self.collection);
         match self.call("GET", &path, None) {
-            Ok(info) => self.validate_collection(&info)?,
+            Ok(info) => {
+                self.validate_collection(&info)?;
+                if !self.has_marker()? {
+                    return Err(self.refuse_unmarked());
+                }
+            }
             Err(CallError::Status(404)) => {
                 let created = self.call(
                     "PUT",
@@ -181,13 +258,28 @@ impl VectorProjection for QdrantProjection {
                     Some(json!({"vectors": {"size": self.dimensions, "distance": DISTANCE}})),
                 );
                 match created {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // Ours: mark it. If the marker cannot be written, take the
+                        // empty collection back so it is not left unmarked.
+                        if let Err(error) = self.write_marker() {
+                            let _ = self.call("DELETE", &path, None);
+                            return Err(self.fail(error, "collection marker write"));
+                        }
+                    }
                     // Someone created it between our GET and PUT: validate theirs.
+                    // Their marker may not be written yet, so a missing one is a
+                    // retry, not a refusal.
                     Err(CallError::Status(409)) => {
                         let info = self
                             .call("GET", &path, None)
                             .map_err(|error| self.fail(error, "collection check"))?;
                         self.validate_collection(&info)?;
+                        if !self.has_marker()? {
+                            return Err(ProjectionError::Offline(format!(
+                                "collection {} was just created by someone else; checking again later",
+                                self.collection
+                            )));
+                        }
                     }
                     Err(error) => return Err(self.fail(error, "collection create")),
                 }

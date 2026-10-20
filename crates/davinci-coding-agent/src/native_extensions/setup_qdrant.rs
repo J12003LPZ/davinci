@@ -5,8 +5,13 @@
 //! the user recorded as DaVinci's. The default `/setup` listing shows one line
 //! for it and asks Docker nothing while the backend is local.
 
-use super::docker_discovery::{discover, docker_run_command_with, QdrantDiscovery, START_QDRANT};
+use super::docker_discovery::{
+    discover, docker_run_command_with, has_owner_label, start_consent, QdrantDiscovery,
+    OWNER_LABEL, OWNER_VALUE, START_QDRANT,
+};
+
 use super::memory_backends::MemoryProjectionBackend;
+use super::service_authority::ServiceConsentStore;
 use super::setup::{step_from_health, SetupContext, Step, StepState};
 use super::setup_profile::{load_effective_setup, OwnedContainer, SetupProfile};
 use super::vector_memory::{process_env, VectorMemory};
@@ -62,6 +67,15 @@ pub fn explanation() -> Step {
             .to_string(),
     )
     .with_action("/setup qdrant enable turns it on; /setup qdrant disable turns it off again")
+}
+
+fn recorded_id(ctx: &SetupContext) -> Option<String> {
+    SetupProfile::load(ctx.agent_dir)
+        .0
+        .memory
+        .qdrant_setup
+        .owned_container
+        .map(|container| container.id)
 }
 
 fn discovery(ctx: &SetupContext) -> (QdrantDiscovery, SetupProfile) {
@@ -191,35 +205,58 @@ pub fn command(
                     )
                 });
             };
+            if !has_owner_label(container) {
+                return fail(format!(
+                    "{} does not carry the label {OWNER_LABEL}={OWNER_VALUE}, so it is not a \
+                     container DaVinci's command created; nothing was recorded. Create one with: {}",
+                    container.name,
+                    docker_run_command_with(false)
+                ));
+            }
             let record = OwnedContainer {
                 id: container.id.clone(),
                 name: container.name.clone(),
             };
+            let changed = recorded_id(ctx).as_deref() != Some(record.id.as_str());
             match update_profile(ctx, |profile| {
                 profile.memory.qdrant_setup.owned_container = Some(record.clone());
             }) {
-                Ok(_) => vec![Step::new(
-                    ID,
-                    TITLE,
-                    StepState::Done,
-                    format!(
+                Ok(_) => {
+                    // The yes to starting a container was given for the one
+                    // recorded then. A different container needs its own yes.
+                    if changed {
+                        if let Err(error) =
+                            ServiceConsentStore::open(ctx.agent_dir).set(start_consent(), false)
+                        {
+                            return fail(error);
+                        }
+                    }
+                    vec![Step::new(
+                        ID,
+                        TITLE,
+                        StepState::Done,
+                        format!(
                         "recorded {} as DaVinci's Qdrant container; it can be started only after \
                          /setup approve {START_QDRANT}, and no other container is ever touched",
                         record.name
                     ),
-                )],
+                    )]
+                }
                 Err(error) => fail(error),
             }
         }
         QdrantCommand::Release => match update_profile(ctx, |profile| {
             profile.memory.qdrant_setup.owned_container = None;
         }) {
-            Ok(_) => vec![Step::new(
+            Ok(_) => {
+                let _ = ServiceConsentStore::open(ctx.agent_dir).set(start_consent(), false);
+                vec![Step::new(
                 ID,
                 TITLE,
                 StepState::Done,
-                "forgot the recorded container; it was not touched".to_string(),
-            )],
+                "forgot the recorded container and withdrew the approval to start it; the container was not touched".to_string(),
+            )]
+            }
             Err(error) => fail(error),
         },
         QdrantCommand::KeepRunning(on) => {
