@@ -2409,6 +2409,10 @@ pub struct AgentRow {
     pub cache_write: u64,
     /// Wall seconds the worker has run, frozen once it is finished.
     pub elapsed_secs: u64,
+    /// Where it works, short: `shared`, `⎇ davinci/agent/x`, `⎇ detached`.
+    pub workspace: String,
+    /// The same, in words, for the worker view.
+    pub workspace_detail: String,
     pub waiting_on: Option<String>,
     pub disconnected: bool,
     pub usage_unknown: bool,
@@ -3037,6 +3041,8 @@ pub struct Model {
     pub terminal_task: Option<TerminalTask>,
     /// The last drawn frame's pointer targets; empty until the first draw.
     pub hit_cache: std::cell::RefCell<Option<HitCache>>,
+    /// The agent roster, worker focus and the messages sent to workers.
+    pub roster: super::roster::RosterState,
     /// Where the composer drew its text, as of the last frame.
     pub composer_hit: std::cell::Cell<Option<ComposerHit>>,
     /// Prompts sent in this run, newest first.
@@ -3567,6 +3573,7 @@ impl Model {
             quit_armed: None,
             terminal_task: None,
             hit_cache: std::cell::RefCell::new(None),
+            roster: super::roster::RosterState::default(),
             composer_hit: std::cell::Cell::new(None),
             session_history: Vec::new(),
             history_all: None,

@@ -1,6 +1,7 @@
 //! One module per instrument. Every view takes data and a theme and knows
 //! nothing else.
 
+pub mod agent_focus;
 pub mod agents;
 pub mod approval_modal;
 pub mod ask;

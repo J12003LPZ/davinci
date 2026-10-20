@@ -2389,3 +2389,104 @@ mod tests {
         assert_eq!(narrow.transcript.len(), narrow_transcript().len());
     }
 }
+
+/// The multi-worker scenario of the agent-focus parity contract: a one-shot, a
+/// background and a teammate worker, with fixed times, usage and workspaces.
+/// No screenshot of the reference product exists in the repository, so the
+/// contract is the semantic rows listed in
+/// `tests/agent_focus_parity.rs`; the pixel comparison is unverified.
+pub struct AgentParityScenario {
+    pub workers: Vec<super::model::AgentRow>,
+    /// `(agent id, activity lines oldest first)`.
+    pub activity: Vec<(String, Vec<super::roster::WorkerLine>)>,
+}
+
+pub fn agent_parity() -> AgentParityScenario {
+    use super::model::AgentRow;
+    use super::roster::{WorkerLine, WorkerLineKind};
+    let mut oneshot = AgentRow::new("w-map-auth", "map-auth", State::Active);
+    oneshot.role = "subagent".into();
+    oneshot.status = "working".into();
+    oneshot.activity = "Read(src/auth/login.rs)".into();
+    oneshot.elapsed = "1:23".into();
+    oneshot.elapsed_secs = 83;
+    oneshot.tokens = Some(23_400);
+    oneshot.tool_count = 7;
+    oneshot.workspace = "shared".into();
+    oneshot.workspace_detail = "shared workspace — no separate branch".into();
+
+    let mut background = AgentRow::new("w-ci-watch", "ci-watch", State::Active);
+    background.role = "background".into();
+    background.status = "working".into();
+    background.activity = "Bash(cargo test)".into();
+    background.elapsed = "12:05".into();
+    background.elapsed_secs = 725;
+    background.tokens = Some(8_100);
+    background.tokens_estimated = true;
+    background.cache_read = 52_000;
+    background.tool_count = 31;
+    background.workspace = "⎇ davinci/agent/ci".into();
+    background.workspace_detail = "davinci/agent/ci @ 1a2b3c4 · dirty".into();
+
+    let mut teammate = AgentRow::new("w-reviewer", "reviewer", State::Done);
+    teammate.role = "teammate".into();
+    teammate.status = "completed".into();
+    teammate.activity = "finished".into();
+    teammate.elapsed = "4:40".into();
+    teammate.elapsed_secs = 280;
+    teammate.usage_unknown = true;
+    teammate.workspace = "⎇ detached".into();
+    teammate.workspace_detail = "detached HEAD @ 9f8e7d6".into();
+
+    let line = |sequence: u64, kind: WorkerLineKind, text: &str| WorkerLine {
+        sequence,
+        kind,
+        text: text.to_string(),
+    };
+    AgentParityScenario {
+        workers: vec![oneshot, background, teammate],
+        activity: vec![
+            (
+                "w-map-auth".into(),
+                vec![
+                    line(1, WorkerLineKind::Started, "started map-auth"),
+                    line(2, WorkerLineKind::Call, "Search(\"login\")"),
+                    line(3, WorkerLineKind::Call, "Read(src/auth/login.rs)"),
+                ],
+            ),
+            (
+                "w-ci-watch".into(),
+                vec![
+                    line(4, WorkerLineKind::Started, "started ci-watch"),
+                    line(5, WorkerLineKind::Call, "Bash(cargo test)"),
+                ],
+            ),
+            (
+                "w-reviewer".into(),
+                vec![
+                    line(6, WorkerLineKind::Started, "started reviewer"),
+                    line(7, WorkerLineKind::Call, "Read(docs/spec.md)"),
+                    line(8, WorkerLineKind::Finished, "finished"),
+                ],
+            ),
+        ],
+    }
+}
+
+impl AgentParityScenario {
+    /// A model showing the scenario on the main transcript.
+    pub fn model(&self, width: u16, height: u16) -> Model {
+        use super::theme::{ColorDepth, Theme};
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            width,
+            height,
+            false,
+        );
+        m.set_workers(self.workers.clone());
+        for (id, lines) in &self.activity {
+            m.push_worker_lines(id, lines.clone(), 0);
+        }
+        m
+    }
+}
