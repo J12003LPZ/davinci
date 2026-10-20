@@ -2585,14 +2585,31 @@ impl VectorMemory {
         // and only publish the cleared state after the atomic write succeeds.
         let mut cleared = self.clone();
         cleared.load_local()?;
+        // The remote copy goes with it, and a down remote must not keep it
+        // forever: write the marker before the clear is confirmed, so a restart
+        // still knows the remote has to be emptied. If it cannot be written,
+        // nothing changes and the caller is told.
+        if cleared.remote_projection_enabled() {
+            cleared
+                .projection
+                .begin_clear(
+                    &cleared.projection_state_path(),
+                    &cleared.remote_collection_name(),
+                )
+                .map_err(|error| {
+                    ToolError::Failed(format!(
+                        "memory not cleared: the pending remote clear could not be recorded: {error}"
+                    ))
+                })?;
+        }
         cleared.records.clear();
         cleared.known.clear();
         cleared.last_indexed = 0;
         cleared.last_indexed_at = None;
         // Clearing is deliberate: it must not fold other records back in.
         cleared.persist_local_with(false)?;
-        // The remote copy of this repo goes with it. Best effort: a down
-        // remote only keeps vectors that no local record can resolve to.
+        // Try the remote now. Down or refused, the marker stays and the next
+        // reconcile retries; only a successful delete removes it.
         if cleared.remote_projection_enabled() {
             if let Some(client) = cleared
                 .projection
@@ -2600,7 +2617,7 @@ impl VectorMemory {
             {
                 let outcome = client.clear_namespace(&cleared.repo_id);
                 if outcome.is_ok() {
-                    cleared.projection.forget_synced(
+                    cleared.projection.finish_clear(
                         &cleared.projection_state_path(),
                         &cleared.remote_collection_name(),
                     );
@@ -2924,6 +2941,7 @@ impl VectorMemory {
             },
             "projectionLag": self.local_projection_lag(),
             "remoteProjectionLag": self.remote_projection_lag(),
+            "remoteClearPending": self.remote_clear_pending(),
             "remoteCollection": self.remote_projection_enabled().then(|| self.remote_collection_name()),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
@@ -2964,6 +2982,12 @@ impl VectorMemory {
     /// the service is unavailable.
     pub fn upsert_remote(&self, records: &[MemoryRecord]) -> Result<(), ToolError> {
         if !self.remote_projection_enabled() || records.is_empty() {
+            return Ok(());
+        }
+        // A clear still owed to the remote runs first: the clear would delete
+        // points written ahead of it, and the ledger would say they were kept.
+        if self.remote_clear_pending() {
+            let _ = self.reconcile_remote(self.config.projection.batch_size);
             return Ok(());
         }
         let points = records
@@ -3027,7 +3051,16 @@ impl VectorMemory {
             return 0;
         }
         let (unsynced, stale, _) = self.remote_delta();
-        unsynced.len() + stale.len()
+        unsynced.len() + stale.len() + usize::from(self.remote_clear_pending())
+    }
+
+    /// A clear was confirmed locally but the remote still holds its vectors.
+    pub fn remote_clear_pending(&self) -> bool {
+        self.remote_projection_enabled()
+            && self.projection.pending_clear(
+                &self.projection_state_path(),
+                &self.remote_collection_name(),
+            )
     }
 
     /// `(to send, to remove, skipped)` against what the remote is known to hold.
@@ -3083,6 +3116,62 @@ impl VectorMemory {
         if !self.remote_projection_enabled() {
             return receipt;
         }
+        let path = self.projection_state_path();
+        let collection = self.remote_collection_name();
+        let fail = |receipt: &mut ProjectionRepairReceipt, error: ProjectionError| {
+            receipt.failures += 1;
+            receipt.code = Some(match error {
+                ProjectionError::Offline(_) => QDRANT_OFFLINE,
+                ProjectionError::Refused(_) => QDRANT_REFUSED,
+            });
+            receipt.error = Some(error.to_string());
+            self.projection.record(&self.config, Err(error));
+        };
+        let pending_clear = self.projection.pending_clear(&path, &collection);
+        let ledger_len = self.projection.synced_ids(&path, &collection).len();
+        // Before trusting the ledger, ask the remote: an owed clear runs first,
+        // and a remote holding fewer points than the ledger says it was reset
+        // (collection deleted and recreated), so everything is sent again.
+        if pending_clear || ledger_len > 0 {
+            match self.projection.acquire(&self.config, &self.repo_id) {
+                Some(client) if pending_clear => match client.clear_namespace(&self.repo_id) {
+                    Ok(()) => {
+                        self.projection.finish_clear(&path, &collection);
+                        self.projection.record(&self.config, Ok(()));
+                    }
+                    Err(error) => {
+                        fail(&mut receipt, error);
+                        let (unsynced, stale, skipped) = self.remote_delta();
+                        receipt.skipped = skipped;
+                        receipt.lag = unsynced.len() + stale.len() + 1;
+                        return receipt;
+                    }
+                },
+                Some(client) => match client.count(&self.repo_id) {
+                    Ok(held) if held < ledger_len => {
+                        self.projection.forget_synced(&path, &collection);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        fail(&mut receipt, error);
+                        let (unsynced, stale, skipped) = self.remote_delta();
+                        receipt.skipped = skipped;
+                        receipt.lag = unsynced.len() + stale.len();
+                        return receipt;
+                    }
+                },
+                None if pending_clear => {
+                    let health = self.projection.health(&self.config);
+                    receipt.code = health.code;
+                    receipt.error = Some(health.detail).filter(|detail| !detail.is_empty());
+                    let (unsynced, stale, skipped) = self.remote_delta();
+                    receipt.skipped = skipped;
+                    receipt.lag = unsynced.len() + stale.len() + 1;
+                    return receipt;
+                }
+                None => {}
+            }
+        }
         let (unsynced, stale, skipped) = self.remote_delta();
         receipt.skipped = skipped;
         receipt.lag = unsynced.len() + stale.len();
@@ -3099,17 +3188,6 @@ impl VectorMemory {
         // The client carries at most MAX_BATCH per request; a larger setting
         // must not turn one write into an unbounded synchronous backlog.
         let batch = max_batch.clamp(1, super::memory_backends::qdrant::MAX_BATCH);
-        let path = self.projection_state_path();
-        let collection = self.remote_collection_name();
-        let fail = |receipt: &mut ProjectionRepairReceipt, error: ProjectionError| {
-            receipt.failures += 1;
-            receipt.code = Some(match error {
-                ProjectionError::Offline(_) => QDRANT_OFFLINE,
-                ProjectionError::Refused(_) => QDRANT_REFUSED,
-            });
-            receipt.error = Some(error.to_string());
-            self.projection.record(&self.config, Err(error));
-        };
 
         let removing: Vec<String> = stale.into_iter().take(batch).collect();
         if !removing.is_empty() {
@@ -3179,7 +3257,7 @@ impl VectorMemory {
             self.projection.record(&self.config, Err(error));
             return receipt;
         }
-        self.projection.forget_synced(
+        self.projection.finish_clear(
             &self.projection_state_path(),
             &self.remote_collection_name(),
         );

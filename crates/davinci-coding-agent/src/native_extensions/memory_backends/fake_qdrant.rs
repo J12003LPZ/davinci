@@ -195,6 +195,11 @@ impl FakeQdrant {
             .collect()
     }
 
+    /// Remove a whole collection, marker included: the remote was reset.
+    pub fn delete_collection(&self, name: &str) {
+        self.shared.state.lock().unwrap().collections.remove(name);
+    }
+
     /// Drop every point of every collection: the remote lost its data.
     /// The ownership marker survives: only the data was lost.
     pub fn wipe_points(&self) {
@@ -469,6 +474,17 @@ fn handle(mut stream: TcpStream, shared: &Shared) {
                 })
                 .collect();
             respond(&mut stream, 200, &json!({"result": {"points": points}}))
+        }
+        ("POST", ["collections", name, "points", "count"]) => {
+            let Some(collection) = state.collections.get(*name) else {
+                return respond(&mut stream, 404, &json!({"status": {"error": "Not found"}}));
+            };
+            let count = collection
+                .points
+                .iter()
+                .filter(|(id, point)| filter_matches(&body["filter"], id, &point.payload))
+                .count();
+            respond(&mut stream, 200, &json!({"result": {"count": count}}))
         }
         ("POST", ["collections", name, "points", "delete"]) => {
             let Some(collection) = state.collections.get_mut(*name) else {

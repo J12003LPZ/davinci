@@ -300,6 +300,18 @@ fn instant_retry(mut config: VectorMemoryConfig) -> VectorMemoryConfig {
     config
 }
 
+/// After `before` requests, the remote saw reads and the point count that
+/// checks the ledger against it, but no write or delete.
+fn assert_only_reads(fake: &FakeQdrant, before: usize, why: &str) {
+    let later = &fake.requests()[before..];
+    assert!(
+        later
+            .iter()
+            .all(|request| request.method == "GET" || request.path.contains("/points/count")),
+        "{why}: {later:?}"
+    );
+}
+
 fn remote_points(fake: &FakeQdrant, memory: &VectorMemory) -> usize {
     fake.collection(&memory.remote_collection_name())
         .map(|collection| collection.points.len())
@@ -349,7 +361,7 @@ fn qdrant_rebuild_and_outage_keep_local_memory() {
     assert_eq!(remote_points(&fake, &memory), 2);
     let before = fake.request_count();
     assert_eq!(memory.reconcile_remote(10).indexed, 0);
-    assert_eq!(fake.request_count(), before, "nothing left means no calls");
+    assert_only_reads(&fake, before, "nothing left means nothing is written");
     assert!(memory.status()["projection"]["code"].is_null());
 
     // A tombstone removes the remote point; the local record stays.
@@ -404,7 +416,7 @@ fn reconcile_is_bounded_and_survives_a_restart() {
     assert_eq!(again.remote_projection_lag(), 0);
     let before = fake.request_count();
     assert!(again.reconcile_remote(10).is_complete());
-    assert_eq!(fake.request_count(), before);
+    assert_only_reads(&fake, before, "a restart does not re-send");
 }
 
 #[test]
@@ -625,4 +637,121 @@ fn one_request_never_carries_more_than_the_client_maximum() {
         .collect();
     // The marker write, then 512 and 88.
     assert_eq!(sizes, vec![1, 512, 88], "{sizes:?}");
+}
+
+#[test]
+fn a_clear_made_offline_empties_the_remote_after_a_restart() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
+    memory
+        .index_messages(&[note("alpha one"), note("beta two")])
+        .unwrap();
+    assert_eq!(remote_points(&fake, &memory), 2);
+
+    // Clearing the last records while Qdrant is down.
+    fake.set_down(true);
+    memory.clear().unwrap();
+    assert!(memory.records().is_empty());
+    assert_eq!(
+        remote_points(&fake, &memory),
+        2,
+        "the remote still holds them"
+    );
+    assert_eq!(memory.status()["remoteClearPending"], true);
+    assert!(memory.remote_projection_lag() >= 1);
+    drop(memory);
+
+    // A fresh process in the same directory still owes the delete.
+    fake.set_down(false);
+    let restarted = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    assert!(restarted.remote_clear_pending());
+    let receipt = restarted.reconcile_remote(10);
+    assert_eq!(receipt.failures, 0, "{receipt:?}");
+    assert!(receipt.is_complete(), "{receipt:?}");
+    assert_eq!(remote_points(&fake, &restarted), 0);
+    assert!(!restarted.remote_clear_pending());
+    assert_eq!(restarted.status()["remoteClearPending"], false);
+    assert_eq!(restarted.remote_projection_lag(), 0);
+}
+
+#[test]
+fn a_pending_clear_runs_before_anything_written_after_it() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    memory.index_messages(&[note("alpha one")]).unwrap();
+
+    fake.set_down(true);
+    memory.clear().unwrap();
+    memory.index_messages(&[note("gamma three")]).unwrap();
+    assert_eq!(memory.records().len(), 1);
+
+    // Back online: the old vector goes, the new one stays, and the next
+    // reconcile finds nothing missing.
+    fake.set_down(false);
+    memory.index_messages(&[note("delta four")]).unwrap();
+    let receipt = memory.reconcile_remote(10);
+    assert!(receipt.is_complete(), "{receipt:?}");
+    assert!(!memory.remote_clear_pending());
+    assert_eq!(memory.records().len(), 2);
+    assert_eq!(remote_points(&fake, &memory), 2);
+}
+
+#[test]
+fn a_clear_is_refused_when_its_pending_marker_cannot_be_written() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let config = instant_retry(qdrant_config(&fake, &embedder));
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    memory.index_messages(&[note("alpha one")]).unwrap();
+    // A directory where the ledger file goes: it cannot be written.
+    let ledger = memory.local_path().with_file_name("projection-state.json");
+    let _ = std::fs::remove_file(&ledger);
+    std::fs::create_dir(&ledger).unwrap();
+    let error = memory.clear().unwrap_err().to_string();
+    assert!(error.contains("pending remote clear"), "{error}");
+    assert_eq!(memory.records().len(), 1, "nothing was cleared");
+    assert_eq!(remote_points(&fake, &memory), 1);
+}
+
+#[test]
+fn a_recreated_collection_is_refilled_from_local_records() {
+    let fake = FakeQdrant::start();
+    let embedder = ollama();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = instant_retry(qdrant_config(&fake, &embedder));
+    config.projection.batch_size = 2;
+    let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config);
+    let notes: Vec<MemoryMessage> = (0..5).map(|i| note(&format!("alpha note {i}"))).collect();
+    memory.index_messages(&notes).unwrap();
+    for _ in 0..3 {
+        memory.reconcile_remote(2);
+    }
+    assert_eq!(remote_points(&fake, &memory), 5);
+    assert_eq!(memory.remote_projection_lag(), 0, "the ledger says synced");
+
+    // The collection is deleted and made again empty by the next use.
+    fake.delete_collection(&memory.remote_collection_name());
+    let mut sent = Vec::new();
+    for _ in 0..6 {
+        let pass = memory.reconcile_remote(2);
+        assert_eq!(pass.failures, 0, "{pass:?}");
+        sent.push(pass.indexed);
+        if pass.lag == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        sent,
+        vec![2, 2, 1],
+        "re-sent in batches of the configured size"
+    );
+    assert_eq!(remote_points(&fake, &memory), 5);
+    assert_eq!(memory.remote_projection_lag(), 0);
 }

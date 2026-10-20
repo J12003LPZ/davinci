@@ -210,6 +210,9 @@ pub trait VectorProjection: Send + Sync {
     /// Remove every point of this namespace. Other namespaces in the same
     /// collection, and other collections, are never touched.
     fn clear_namespace(&self, repo_id: &str) -> Result<(), ProjectionError>;
+    /// How many points of `repo_id` the remote holds. A collection that is
+    /// gone counts as zero, so a deleted and recreated remote reads as empty.
+    fn count(&self, repo_id: &str) -> Result<usize, ProjectionError>;
 }
 
 #[cfg(test)]

@@ -51,6 +51,10 @@ struct SyncFile {
     collection: String,
     #[serde(default)]
     synced: BTreeSet<String>,
+    /// A namespace clear was confirmed locally but has not reached the remote.
+    /// It survives a restart and is dropped only after the remote delete worked.
+    #[serde(default)]
+    pending_clear: bool,
 }
 
 #[derive(Default)]
@@ -154,14 +158,45 @@ impl ProjectionRuntime {
         Self::save_sync(&inner.sync, path);
     }
 
-    /// The remote lost this namespace (or it was cleared on purpose).
+    /// The remote lost this namespace: forget what it held so the next
+    /// reconcile sends everything again. A pending clear is kept.
     pub fn forget_synced(&self, path: &Path, collection: &str) {
         let mut inner = self.lock();
-        inner.sync.loaded_from = Some(path.to_path_buf());
-        inner.sync.file = SyncFile {
-            collection: collection.to_string(),
-            synced: BTreeSet::new(),
-        };
+        Self::load_sync(&mut inner.sync, path, collection);
+        inner.sync.file.synced.clear();
+        Self::save_sync(&inner.sync, path);
+    }
+
+    /// Record, durably, that this namespace must be emptied on the remote.
+    /// Errors when the marker cannot be written: the caller must not confirm
+    /// the clear then, because nothing would remember to finish it.
+    pub fn begin_clear(&self, path: &Path, collection: &str) -> Result<(), String> {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        let synced = std::mem::take(&mut inner.sync.file.synced);
+        let was_pending = inner.sync.file.pending_clear;
+        inner.sync.file.pending_clear = true;
+        let saved = Self::save_sync_checked(&inner.sync, path);
+        if saved.is_err() {
+            inner.sync.file.synced = synced;
+            inner.sync.file.pending_clear = was_pending;
+        }
+        saved
+    }
+
+    /// Whether a confirmed clear still has to reach the remote.
+    pub fn pending_clear(&self, path: &Path, collection: &str) -> bool {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        inner.sync.file.pending_clear
+    }
+
+    /// The remote delete worked: drop the marker and the ledger with it.
+    pub fn finish_clear(&self, path: &Path, collection: &str) {
+        let mut inner = self.lock();
+        Self::load_sync(&mut inner.sync, path, collection);
+        inner.sync.file.pending_clear = false;
+        inner.sync.file.synced.clear();
         Self::save_sync(&inner.sync, path);
     }
 
@@ -178,22 +213,24 @@ impl ProjectionRuntime {
             sync.file = SyncFile {
                 collection: collection.to_string(),
                 synced: BTreeSet::new(),
+                pending_clear: false,
             };
         }
     }
 
     /// Best effort: a file that cannot be written only costs a re-send.
     fn save_sync(sync: &SyncState, path: &Path) {
-        let Ok(bytes) = serde_json::to_vec(&sync.file) else {
-            return;
-        };
+        let _ = Self::save_sync_checked(sync, path);
+    }
+
+    fn save_sync_checked(sync: &SyncState, path: &Path) -> Result<(), String> {
+        let bytes = serde_json::to_vec(&sync.file).map_err(|error| error.to_string())?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         let temporary = path.with_extension("json.tmp");
-        if std::fs::write(&temporary, bytes).is_ok() {
-            let _ = std::fs::rename(&temporary, path);
-        }
+        std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
     }
 
     /// True while a recent failure keeps the remote out of use.

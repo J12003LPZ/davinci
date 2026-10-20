@@ -382,6 +382,25 @@ impl VectorProjection for QdrantProjection {
         .map_err(|error| self.fail(error, "namespace clear"))?;
         Ok(())
     }
+
+    fn count(&self, repo_id: &str) -> Result<usize, ProjectionError> {
+        self.ensure_ready()?;
+        let path = format!("/collections/{}/points/count", self.collection);
+        let body = json!({
+            "exact": true,
+            "filter": {"must": [{"key": "repo_id", "match": {"value": repo_id}}]},
+        });
+        match self.call("POST", &path, Some(body)) {
+            Ok(reply) => Ok(reply["result"]["count"].as_u64().unwrap_or(0) as usize),
+            // Deleted since the last check: it holds nothing, and the next call
+            // checks readiness again, which recreates and marks it.
+            Err(CallError::Status(404)) => {
+                self.ready.store(false, Ordering::SeqCst);
+                Ok(0)
+            }
+            Err(error) => Err(self.fail(error, "count")),
+        }
+    }
 }
 
 #[cfg(test)]
