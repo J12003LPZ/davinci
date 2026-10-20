@@ -137,6 +137,26 @@ pub struct AgentMailbox {
 }
 
 impl AgentMailbox {
+    /// Announce a message lifecycle step on the bus. `agent` is the envelope
+    /// owner: host steering has no registered sender, so it passes `None` and
+    /// replay never mistakes it for the runtime's own identity.
+    fn announce(&self, run_id: RunId, agent: Option<AgentId>, payload: RuntimeEvent) {
+        if let Some(bus) = &self.bus {
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            bus.emit_observe(RuntimeEventEnvelope::new(
+                seq, run_id, None, agent, None, payload,
+            ));
+        }
+    }
+
+    fn run_of(&self, agent_id: &AgentId) -> RunId {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.get(agent_id))
+            .map(|record| record.run_id)
+            .unwrap_or_else(RunId::new)
+    }
+
     fn notify_waiters(&self) {
         let (lock, cvar) = &*self.signal;
         let mut generation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -506,6 +526,19 @@ impl AgentMailbox {
             }
         }
 
+        // The acceptance is announced (and so written to the runtime log)
+        // before the caller can show "queued": without this event a restart
+        // forgot every steering message.
+        self.announce(
+            run_id,
+            None,
+            RuntimeEvent::AgentMessageQueued {
+                to,
+                message_id: msg_id,
+                message: Some(msg),
+            },
+        );
+
         Ok(receipt)
     }
 
@@ -546,17 +579,42 @@ impl AgentMailbox {
         if let Some(r) = receipt {
             r.state = "applied".to_string();
         }
+        drop(receipts);
+        self.announce(
+            self.run_of(agent_id),
+            Some(*agent_id),
+            RuntimeEvent::AgentMessageApplied {
+                to: *agent_id,
+                message_id: *message_id,
+            },
+        );
 
         true
     }
 
     /// Mark a steering receipt as rejected with reason.
     pub fn mark_rejected(&self, message_id: &Uuid, reason: impl Into<String>) {
+        let reason = reason.into();
+        let mut changed = None;
         if let Ok(mut receipts) = self.steering_receipts.write() {
             if let Some(r) = receipts.get_mut(message_id) {
+                if r.state != "rejected" {
+                    changed = Some(r.agent_id);
+                }
                 r.state = "rejected".to_string();
-                r.reason = Some(reason.into());
+                r.reason = Some(reason.clone());
             }
+        }
+        if let Some(to) = changed {
+            self.announce(
+                self.run_of(&to),
+                Some(to),
+                RuntimeEvent::AgentMessageRejected {
+                    to,
+                    message_id: *message_id,
+                    reason,
+                },
+            );
         }
     }
 
@@ -567,6 +625,7 @@ impl AgentMailbox {
 
     /// Reject any undelivered messages for an agent that has cancelled.
     pub fn reject_undelivered_for_cancelled(&self, agent_id: &AgentId, reason: &str) {
+        let mut rejected = Vec::new();
         if let Ok(mut queues) = self.queues.write() {
             if let Some(q) = queues.remove(agent_id) {
                 if let Ok(mut receipts) = self.steering_receipts.write() {
@@ -574,10 +633,22 @@ impl AgentMailbox {
                         if let Some(r) = receipts.get_mut(&msg.id) {
                             r.state = "rejected".to_string();
                             r.reason = Some(reason.to_string());
+                            rejected.push(msg.id);
                         }
                     }
                 }
             }
+        }
+        for message_id in rejected {
+            self.announce(
+                self.run_of(agent_id),
+                Some(*agent_id),
+                RuntimeEvent::AgentMessageRejected {
+                    to: *agent_id,
+                    message_id,
+                    reason: reason.to_string(),
+                },
+            );
         }
     }
 
@@ -694,11 +765,23 @@ impl AgentMailbox {
 
     /// Rehydrate mailbox state from historical runtime event envelopes.
     ///
-    /// Undelivered queued messages remain in the recipient's mailbox.
+    /// Every message ends in exactly one state, and none is applied twice:
+    /// * queued, never delivered: back in the recipient's queue, unless the
+    ///   recipient already finished, then rejected (`recipient_terminal_after_restart`);
+    /// * delivered but not applied: `unknown`. The worker that took it died with
+    ///   the old process, and nothing proves whether it reached a request, so it
+    ///   is neither re-queued (it could apply twice) nor called applied;
+    /// * applied / rejected: the receipt is restored as it was.
     pub fn rehydrate_from_events(&self, events: &[RuntimeEventEnvelope]) {
+        struct Seen {
+            to: AgentId,
+            state: &'static str,
+            reason: Option<String>,
+            message: Option<AgentMessage>,
+        }
         // Event order is the enqueue order: keep it, never re-sort by clock.
-        let mut unread_messages: HashMap<Uuid, AgentMessage> = HashMap::new();
-        let mut queue_order: Vec<Uuid> = Vec::new();
+        let mut messages: HashMap<Uuid, Seen> = HashMap::new();
+        let mut order: Vec<Uuid> = Vec::new();
         let mut seen = match self.seen_message_ids.write() {
             Ok(s) => s,
             Err(e) => e.into_inner(),
@@ -707,42 +790,121 @@ impl AgentMailbox {
         for envelope in events {
             match &envelope.payload {
                 RuntimeEvent::AgentMessageQueued {
+                    to,
                     message_id,
                     message,
-                    ..
                 } => {
                     seen.insert(*message_id);
-                    if let Some(msg) = message {
-                        if unread_messages.insert(*message_id, msg.clone()).is_none() {
-                            queue_order.push(*message_id);
-                        }
+                    if !messages.contains_key(message_id) {
+                        order.push(*message_id);
+                        messages.insert(
+                            *message_id,
+                            Seen {
+                                to: *to,
+                                state: "queued",
+                                reason: None,
+                                message: message.clone(),
+                            },
+                        );
                     }
                 }
                 RuntimeEvent::AgentMessageDelivered { message_id, .. } => {
-                    unread_messages.remove(message_id);
+                    if let Some(entry) = messages.get_mut(message_id) {
+                        if entry.state == "queued" {
+                            entry.state = "delivered";
+                        }
+                    }
+                }
+                RuntimeEvent::AgentMessageApplied { message_id, .. } => {
+                    if let Some(entry) = messages.get_mut(message_id) {
+                        if entry.state != "rejected" {
+                            entry.state = "applied";
+                        }
+                    }
+                }
+                RuntimeEvent::AgentMessageRejected {
+                    message_id, reason, ..
+                } => {
+                    if let Some(entry) = messages.get_mut(message_id) {
+                        entry.state = "rejected";
+                        entry.reason = Some(reason.clone());
+                    }
                 }
                 _ => {}
             }
         }
+        drop(seen);
 
         let mut queues = match self.queues.write() {
             Ok(q) => q,
             Err(e) => e.into_inner(),
         };
+        let mut receipts = match self.steering_receipts.write() {
+            Ok(r) => r,
+            Err(e) => e.into_inner(),
+        };
+        let mut applied = match self.applied_messages.write() {
+            Ok(a) => a,
+            Err(e) => e.into_inner(),
+        };
 
-        for id in queue_order {
-            let Some(msg) = unread_messages.remove(&id) else {
+        for id in order {
+            let Some(entry) = messages.remove(&id) else {
                 continue;
             };
-            let queue = queues.entry(msg.to).or_default();
-            // Replaying a stream that is already reflected in memory must not
-            // queue the same message twice.
-            if queue.iter().any(|queued| queued.id == msg.id) {
-                continue;
+            let generation = self
+                .registry
+                .as_ref()
+                .map(|registry| registry.get_generation(&entry.to))
+                .filter(|generation| *generation > 0)
+                .unwrap_or(1);
+            let terminal = self
+                .registry
+                .as_ref()
+                .and_then(|registry| registry.get(&entry.to))
+                .is_some_and(|record| {
+                    matches!(
+                        record.state,
+                        AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+                    )
+                });
+            let (state, reason) = match entry.state {
+                "queued" if terminal => (
+                    "rejected",
+                    Some("recipient_terminal_after_restart".to_string()),
+                ),
+                "queued" => ("queued", None),
+                "delivered" => ("unknown", Some("restart_before_apply".to_string())),
+                other => (other, entry.reason),
+            };
+            // A receipt already held in memory is newer than the log.
+            receipts.entry(id).or_insert_with(|| SteeringReceipt {
+                message_id: id,
+                agent_id: entry.to,
+                generation,
+                state: state.to_string(),
+                applies_after_boundary: true,
+                reason,
+            });
+            match state {
+                "applied" => {
+                    applied.entry(entry.to).or_default().insert(id);
+                }
+                "queued" => {
+                    let Some(msg) = entry.message else {
+                        continue;
+                    };
+                    let queue = queues.entry(msg.to).or_default();
+                    // Replaying a stream that is already reflected in memory
+                    // must not queue the same message twice.
+                    if !queue.iter().any(|queued| queued.id == msg.id) {
+                        queue.push_back(msg);
+                    }
+                }
+                _ => {}
             }
-            queue.push_back(msg);
         }
-        drop(queues);
+        drop((queues, receipts, applied));
         self.notify_waiters();
     }
 }

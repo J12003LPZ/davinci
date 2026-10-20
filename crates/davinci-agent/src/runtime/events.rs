@@ -160,6 +160,17 @@ pub enum RuntimeEvent {
         to: AgentId,
         message_id: Uuid,
     },
+    /// The worker took the delivered message into its next request.
+    AgentMessageApplied {
+        to: AgentId,
+        message_id: Uuid,
+    },
+    /// The message will never be applied (worker finished, stopped, replaced).
+    AgentMessageRejected {
+        to: AgentId,
+        message_id: Uuid,
+        reason: String,
+    },
     TaskCreated {
         task_id: TaskId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
