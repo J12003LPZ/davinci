@@ -1181,7 +1181,7 @@ fn read_only_broker_allows_bounded_parallel_children() {
         hook_release
             .lock()
             .unwrap()
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(std::time::Duration::from_secs(15))
             .unwrap();
         hook_active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         None
@@ -1198,7 +1198,7 @@ fn read_only_broker_allows_bounded_parallel_children() {
             })
         });
         entered_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         let second = scope.spawn(|| {
             broker.call(CodeModeCall {
@@ -1207,12 +1207,13 @@ fn read_only_broker_allows_bounded_parallel_children() {
                 args: json!({"path":"input.txt"}),
             })
         });
-        let second_entered = entered_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Generous: a loaded CI runner may take seconds to schedule the thread. A passing run returns at once.
+        let second_entered = entered_rx.recv_timeout(std::time::Duration::from_secs(10));
         release_tx.send(()).unwrap();
         if second_entered.is_err() {
             // Unblock the serialized second call so the regression exits cleanly.
             entered_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(std::time::Duration::from_secs(10))
                 .unwrap();
         }
         release_tx.send(()).unwrap();
