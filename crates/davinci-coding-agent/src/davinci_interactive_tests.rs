@@ -4507,3 +4507,126 @@ fn the_roster_flag_reads_from_settings_and_defaults_on() {
     // Off: nothing of the roster is drawn or reachable.
     assert!(!model.roster_visible());
 }
+
+/// A model viewing a worker, with two commands to offer in a popup.
+fn worker_view_model() -> Model {
+    use davinci_tui::davinci::model::AgentRow;
+    let mut model = model();
+    model.slash_commands = ["compact", "rewind"]
+        .into_iter()
+        .map(|name| davinci_tui::SlashCommandSpec {
+            name: name.into(),
+            description: String::new(),
+            argument_hint: None,
+            argument_items: Vec::new(),
+        })
+        .collect();
+    model.set_workers(vec![AgentRow::new(
+        "w1".to_string(),
+        "scout".to_string(),
+        State::Active,
+    )]);
+    model.focus_agent("w1");
+    model
+}
+
+fn esc() -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    )
+}
+
+/// The idle loop's order: the double-escape pre-handler, then `app::handle_key`.
+/// Returns whether the pre-handler saw a double escape.
+fn idle_esc(model: &mut Model, last: &mut Option<Instant>) -> bool {
+    let doubled = double_escape(model, esc(), last);
+    if !doubled {
+        let _ = davinci_tui::davinci::app::handle_key(model, esc());
+    }
+    doubled
+}
+
+#[test]
+fn mid_turn_esc_in_a_worker_view_with_a_popup_only_closes_the_popup() {
+    let mut model = worker_view_model();
+    model.queued.push("later".into());
+    model.type_char("/");
+    assert!(model.suggestions.is_some(), "the popup must be open");
+    let abort = Arc::new(AtomicBool::new(false));
+
+    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!abort.load(Ordering::Relaxed), "Esc interrupted main");
+    assert!(model.suggestions.is_none());
+    assert_eq!(model.viewing_worker(), Some("w1"), "closing the popup stays put");
+    assert_eq!(model.queued, vec!["later".to_string()]);
+
+    // Next Esc goes back to main, still without touching the turn.
+    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!abort.load(Ordering::Relaxed));
+    assert_eq!(model.viewing_worker(), None);
+}
+
+#[test]
+fn mid_turn_esc_in_a_worker_view_with_an_overlay_only_closes_the_overlay() {
+    let mut model = worker_view_model();
+    model.toggle_overlay(Overlay::Sessions);
+    assert!(model.overlay.is_some());
+    let abort = Arc::new(AtomicBool::new(false));
+
+    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!abort.load(Ordering::Relaxed), "Esc interrupted main");
+    assert!(model.overlay.is_none());
+    assert_eq!(model.viewing_worker(), Some("w1"));
+}
+
+#[test]
+fn mid_turn_ctrl_c_in_a_worker_view_still_interrupts_main_and_says_so() {
+    let mut model = worker_view_model();
+    let abort = Arc::new(AtomicBool::new(false));
+    let ctrl_c = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert!(!mid_turn_key(&mut model, ctrl_c, &abort));
+    assert!(abort.load(Ordering::Relaxed));
+    assert!(model
+        .toast
+        .as_ref()
+        .is_some_and(|(text, _)| text.contains("interrupting main")));
+}
+
+#[test]
+fn idle_double_esc_never_runs_the_main_action_from_a_worker_view() {
+    let mut model = worker_view_model();
+    let mut last = None;
+    // First Esc: leaves the worker view and arms nothing.
+    assert!(!idle_esc(&mut model, &mut last));
+    assert_eq!(model.viewing_worker(), None);
+    assert!(last.is_none(), "a worker-view Esc armed the double escape");
+    // Second Esc, right away, on main: only arms. No /rewind.
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(last.is_some());
+    // A genuine pair on main still fires.
+    assert!(idle_esc(&mut model, &mut last));
+}
+
+#[test]
+fn idle_esc_with_a_popup_or_overlay_in_a_worker_view_closes_it_and_arms_nothing() {
+    let mut model = worker_view_model();
+    let mut last = None;
+    model.type_char("/");
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(model.suggestions.is_none());
+    assert_eq!(model.viewing_worker(), Some("w1"));
+
+    model.composer.set_text(String::new());
+    model.toggle_overlay(Overlay::Sessions);
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(model.overlay.is_none());
+    assert_eq!(model.viewing_worker(), Some("w1"));
+    assert!(last.is_none());
+    // Two quick Escapes in the view: back to main, and still nothing fires.
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(!idle_esc(&mut model, &mut last));
+}

@@ -1501,6 +1501,34 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
 /// the terminal back and leave. That path restores the screen first, which is
 /// what killing the process from outside never did.
 #[must_use]
+/// Whether this Esc is the second of a pair on main. An Esc in a worker's view
+/// is never one: it returns to main, and the pair starts over from there.
+fn double_escape(
+    model: &Model,
+    key: crossterm::event::KeyEvent,
+    last: &mut Option<Instant>,
+) -> bool {
+    let eligible = key.code == crossterm::event::KeyCode::Esc
+        && key.modifiers.is_empty()
+        && model.viewing_worker().is_none()
+        && model.overlay.is_none()
+        && model.suggestions.is_none()
+        && model.screen == davinci_tui::davinci::model::Screen::Agent
+        && !model.codex_open()
+        && model.composer.trim().is_empty()
+        && model.double_escape_action != "none";
+    if !eligible {
+        *last = None;
+        return false;
+    }
+    let now = Instant::now();
+    let doubled = last.is_some_and(|prev| {
+        now.duration_since(prev) < Duration::from_millis(davinci_tui::DOUBLE_ESCAPE_MS)
+    });
+    *last = if doubled { None } else { Some(now) };
+    doubled
+}
+
 fn mid_turn_key(
     model: &mut Model,
     key: crossterm::event::KeyEvent,
@@ -1532,6 +1560,11 @@ fn mid_turn_key(
             return again;
         }
         KeyCode::Char('c') if ctrl => {
+            // Ctrl+C is the explicit interrupt and acts on main, also from a
+            // worker's view; say so.
+            if model.viewing_worker().is_some() {
+                model.push_toast("interrupting main".into());
+            }
             let again = abort.swap(true, Ordering::Relaxed);
             model.interrupt();
             return again;
@@ -5445,22 +5478,8 @@ pub fn run(
                         // Two escapes on an empty composer, within the same window
                         // the legacy chrome uses, run the stored double-escape
                         // action: rewind by default, with tree and fork still configurable.
-                        if key.code == crossterm::event::KeyCode::Esc
-                            && key.modifiers.is_empty()
-                            && model.overlay.is_none()
-                            && model.suggestions.is_none()
-                            && model.screen == davinci_tui::davinci::model::Screen::Agent
-                            && !model.codex_open()
-                            && model.composer.trim().is_empty()
-                            && model.double_escape_action != "none"
-                        {
-                            let now = Instant::now();
-                            let doubled = last_escape.is_some_and(|prev| {
-                                now.duration_since(prev)
-                                    < Duration::from_millis(davinci_tui::DOUBLE_ESCAPE_MS)
-                            });
-                            if doubled {
-                                last_escape = None;
+                        if double_escape(&model, key, &mut last_escape) {
+                            {
                                 match davinci_tui::DoubleEscapeAction::parse(
                                     &model.double_escape_action,
                                 ) {
@@ -5494,9 +5513,6 @@ pub fn run(
                                 }
                                 continue;
                             }
-                            last_escape = Some(now);
-                        } else {
-                            last_escape = None;
                         }
                         let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
                             && key

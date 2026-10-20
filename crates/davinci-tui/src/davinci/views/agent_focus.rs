@@ -392,11 +392,32 @@ pub fn recipient_row(model: &Model) -> Option<Line<'static>> {
         span("  ", cc.inactive),
         span_strong(label, cc.permission, &model.theme),
         span(
-            "  enter sends to this worker · esc returns to main",
+            "  enter sends text here · /commands run on main · esc back",
             cc.inactive,
         ),
     ];
     Some(Line::from(truncate_run(spans, model.width)))
+}
+
+fn esc_in_worker_view(model: &mut Model) {
+    use crate::davinci::model::Overlay;
+    model.dirty = true;
+    if let Some(overlay) = model.overlay {
+        // A permission or question panel is answered, not dismissed.
+        if overlay != Overlay::Ask {
+            model.overlay = None;
+        }
+    } else if model.viewer.is_some() {
+        model.viewer = None;
+    } else if model.history_search.is_some() {
+        model.history_search = None;
+    } else if model.suggestions.is_some() {
+        model.dismiss_suggestions();
+    } else if model.roster.focus.is_some() {
+        model.roster.focus = None;
+    } else {
+        model.focus_main();
+    }
 }
 
 /// Keys that belong to the roster and the worker view. Returns whether the
@@ -405,6 +426,17 @@ pub fn recipient_row(model: &Model) -> Option<Line<'static>> {
 /// never reaches the interrupt.
 pub fn handle_key(model: &mut Model, key: crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    // In a worker's view a plain Esc is always used up here: it closes what is
+    // open on top of the view, or goes back to main. It never falls through to
+    // the interrupt, the double-escape action or the rest of the key handling.
+    if key.code == KeyCode::Esc
+        && key.kind != KeyEventKind::Release
+        && key.modifiers.is_empty()
+        && matches!(model.roster.scope, ViewScope::Worker(_))
+    {
+        esc_in_worker_view(model);
+        return true;
+    }
     if !model.roster.enabled
         || key.kind == KeyEventKind::Release
         || model.overlay.is_some()
