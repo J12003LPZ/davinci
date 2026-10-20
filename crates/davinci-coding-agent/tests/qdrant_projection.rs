@@ -1302,39 +1302,34 @@ fn a_recorded_clear_is_signed_and_a_tampered_copy_is_dropped() {
 }
 
 #[test]
-fn an_unsigned_clear_from_before_signing_still_runs_against_this_checkout() {
+fn an_unsigned_clear_is_dropped_even_when_it_names_this_checkout() {
     let fake = FakeQdrant::start();
     let embedder = ollama();
     let dir = tempfile::tempdir().unwrap();
     let config = instant_retry(qdrant_config(&fake, &embedder));
     let mut memory = VectorMemory::with_config(dir.path().to_path_buf(), config.clone());
     memory.index_messages(&[note("alpha one")]).unwrap();
-    let held = fake
-        .collection(&memory.remote_collection_name())
-        .unwrap()
-        .points
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(held.len(), 1);
     let record_id = memory.records()[0].id.clone();
     let state = state_file(&memory);
+    let collection = memory.remote_collection_name();
     let planted = format!(
-        r#"{{"collection": "{}", "synced": [], "clear_epoch": 0, "pending_clears": [
-            {{"collection": "{}", "ids": ["{record_id}"]}}]}}"#,
-        memory.remote_collection_name(),
-        memory.remote_collection_name()
+        r#"{{"collection": "{collection}", "synced": [], "clear_epoch": 0, "pending_clears": [
+            {{"collection": "{collection}", "ids": ["{record_id}"]}}]}}"#
     );
     drop(memory);
     std::fs::write(&state, planted).unwrap();
 
+    let deletes_before = fake.count_matching("POST", "/points/delete");
     let restarted = VectorMemory::with_config(dir.path().to_path_buf(), config);
     assert!(
-        restarted.remote_clear_pending(),
-        "the legacy entry was dropped"
+        !restarted.remote_clear_pending(),
+        "an unsigned entry was kept"
     );
-    let deletes_before = fake.count_matching("POST", "/points/delete");
     restarted.reconcile_remote(10);
-    assert!(fake.count_matching("POST", "/points/delete") > deletes_before);
-    assert!(!restarted.remote_clear_pending());
+    assert_eq!(
+        fake.count_matching("POST", "/points/delete"),
+        deletes_before
+    );
+    assert_eq!(remote_points(&fake, &restarted), 1);
+    assert!(pending_in_file(&state).is_empty());
 }

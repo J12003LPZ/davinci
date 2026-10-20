@@ -3166,12 +3166,7 @@ impl VectorMemory {
             return OwedClears::Unavailable;
         };
         for pending in owed {
-            let repo_id = if pending.repo_id.is_empty() {
-                self.repo_id.as_str()
-            } else {
-                pending.repo_id.as_str()
-            };
-            let outcome = client.delete_from(&pending.collection, &pending.ids, repo_id);
+            let outcome = client.delete_from(&pending.collection, &pending.ids, &pending.repo_id);
             if let Err(error) = outcome {
                 self.projection.record(&self.config, Err(error.clone()));
                 return OwedClears::Failed(error);

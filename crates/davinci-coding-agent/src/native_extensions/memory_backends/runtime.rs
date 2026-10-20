@@ -71,8 +71,7 @@ pub struct PendingClear {
     pub collection: String,
     /// The repo id the ids were written under. It follows the checked-out
     /// branch and git config, so it can differ by the time the clear is
-    /// retried; the delete filter must use this one. Empty in a file written
-    /// before this field existed: the current repo id is used then.
+    /// retried; the delete filter must use this one.
     #[serde(default)]
     pub repo_id: String,
     /// Exactly the records the clear removed, taken when it was confirmed:
@@ -373,7 +372,7 @@ impl ProjectionRuntime {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_default();
             sync.loaded_from = Some(path.to_path_buf());
-            if Self::drop_untrusted(&mut sync.file, path, collection) {
+            if Self::drop_untrusted(&mut sync.file, path) {
                 Self::save_sync(sync, path);
             }
         }
@@ -393,24 +392,17 @@ impl ProjectionRuntime {
     /// Keep only the owed clears this user recorded. The file is read from the
     /// working tree, where a repository can ship anything: an entry whose MAC
     /// is missing or wrong is dropped with one warning and never executed.
-    /// One exception keeps files from before signing working: an entry with no
-    /// MAC and no repo id, for the current collection, which can only act on
-    /// the current repo id in the current collection, i.e. this checkout.
+    /// No unsigned format was ever released, so there is nothing to migrate.
     /// True when something was dropped.
-    fn drop_untrusted(file: &mut SyncFile, path: &Path, collection: &str) -> bool {
+    fn drop_untrusted(file: &mut SyncFile, path: &Path) -> bool {
         if file.pending_clears.is_empty() {
             return false;
         }
         let key = pending_seal::existing_key();
         let before = file.pending_clears.len();
         file.pending_clears.retain(|pending| {
-            let legacy = pending.mac.is_empty()
-                && pending.repo_id.is_empty()
-                && pending.collection == collection;
-            legacy
-                || key
-                    .as_ref()
-                    .is_some_and(|key| pending_seal::verify(key, pending, path))
+            key.as_ref()
+                .is_some_and(|key| pending_seal::verify(key, pending, path))
         });
         let dropped = before - file.pending_clears.len();
         if dropped > 0 {
