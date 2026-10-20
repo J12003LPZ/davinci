@@ -854,18 +854,36 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                         expected_revision,
                         action,
                     };
-                    let receipt = controller.execute_command(cmd, true);
-                    let is_completed = receipt.status
-                        == davinci_agent::runtime::ControlStatus::Stopped
-                        || receipt.status == davinci_agent::runtime::ControlStatus::Rejected;
-                    let result_val = serde_json::json!({
-                        "operationId": op_id,
-                        "agentId": agent_id.to_string(),
-                        "status": receipt.status.as_str(),
-                        "action": receipt.action,
-                        "completed": is_completed,
-                        "reason": receipt.reason,
-                    });
+                    // A steer is only "accepted" when the worker's mailbox holds
+                    // the message; the controller alone checks freshness and
+                    // delivers nothing.
+                    let result_val = if action_name == "steer" {
+                        let outcome = controller.execute_steer(&runtime_handle.mailbox, cmd, true);
+                        let held = outcome.is_held();
+                        serde_json::json!({
+                            "operationId": op_id,
+                            "agentId": agent_id.to_string(),
+                            "status": if held { "accepted" } else { outcome.state() },
+                            "action": "steer",
+                            "completed": !held || outcome.state() == "applied",
+                            "reason": outcome.reason(),
+                            "delivery": outcome.state(),
+                            "messageId": outcome.steering.as_ref().map(|s| s.message_id.to_string()),
+                        })
+                    } else {
+                        let receipt = controller.execute_command(cmd, true);
+                        let is_completed = receipt.status
+                            == davinci_agent::runtime::ControlStatus::Stopped
+                            || receipt.status == davinci_agent::runtime::ControlStatus::Rejected;
+                        serde_json::json!({
+                            "operationId": op_id,
+                            "agentId": agent_id.to_string(),
+                            "status": receipt.status.as_str(),
+                            "action": receipt.action,
+                            "completed": is_completed,
+                            "reason": receipt.reason,
+                        })
+                    };
                     runtime.control_operations.insert(op_id, result_val.clone());
                     ok(id, &kind, Some(result_val))
                 }
@@ -2138,6 +2156,67 @@ mod tests {
         assert!(queued.success);
         assert!(!runtime.prompt_needs_turn);
         assert_eq!(runtime.agent.queues.follow_up.len(), 1);
+    }
+
+    #[test]
+    fn rpc_steer_is_accepted_only_when_the_worker_mailbox_holds_it() {
+        let run_id = davinci_agent::RunId::new();
+        let agent_id = davinci_agent::AgentId::new();
+        let handle =
+            davinci_agent::RuntimeHandle::new(run_id, agent_id, davinci_agent::RuntimeBus::new());
+        let mailbox = handle.mailbox.clone();
+        let mut agent = davinci_agent::Agent::new_builtin(PromptProfile::Stable);
+        agent.runtime = Some(handle);
+        let mut runtime = RpcRuntime::new(agent, PathBuf::from("/tmp"), PathBuf::from("/tmp"));
+        let worker_id = davinci_agent::AgentId::new();
+        let registry = runtime.agent.runtime.as_ref().unwrap().registry.clone();
+        registry
+            .register_agent(davinci_agent::runtime::AgentRecord {
+                id: worker_id,
+                run_id,
+                parent: Some(agent_id),
+                kind: davinci_agent::runtime::AgentKind::Background,
+                name: "w".into(),
+                provider: "mock".into(),
+                model_id: "mock".into(),
+                cwd: PathBuf::from("/tmp"),
+                state: davinci_agent::runtime::AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 1000,
+                updated_ms: 1000,
+                failure_reason: None,
+            })
+            .unwrap();
+        registry
+            .transition(worker_id, davinci_agent::runtime::AgentState::Running)
+            .unwrap();
+        let steer = |runtime: &mut RpcRuntime, generation: Option<u64>| {
+            handle_rpc(
+                runtime,
+                RpcCommand {
+                    kind: "agent_control".into(),
+                    agent_id: Some(worker_id.to_string()),
+                    action: Some("steer".into()),
+                    message: Some("look at the parser".into()),
+                    expected_generation: generation,
+                    ..RpcCommand::default()
+                },
+            )
+        };
+
+        let held = steer(&mut runtime, None);
+        let data = held.data.as_ref().unwrap();
+        assert_eq!(data["status"], "accepted", "{data}");
+        assert_eq!(data["delivery"], "queued", "{data}");
+        assert!(data["messageId"].is_string());
+        assert_eq!(mailbox.pending_count(&worker_id), 1);
+
+        // A stale generation is refused and puts nothing in the mailbox.
+        let stale = steer(&mut runtime, Some(0));
+        let data = stale.data.as_ref().unwrap();
+        assert_ne!(data["status"], "accepted", "{data}");
+        assert_eq!(mailbox.pending_count(&worker_id), 1);
     }
 
     #[test]

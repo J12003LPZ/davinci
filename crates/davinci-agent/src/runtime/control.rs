@@ -482,7 +482,104 @@ pub struct WorkerController {
     receipt_path: Option<Arc<PathBuf>>,
 }
 
+/// What a steer actually did: the freshness check and, when that passed, the
+/// mailbox's own receipt. `execute_command` alone only checks that the worker
+/// is current; it delivers nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerOutcome {
+    pub control: WorkerControlReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering: Option<super::mailbox::SteeringReceipt>,
+    /// The mailbox refused to take the message (unknown agent, oversize, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
+}
+
+impl SteerOutcome {
+    /// `queued | delivered | applied` only when the mailbox holds the message;
+    /// otherwise `rejected` or `stale` with `reason()` saying why.
+    pub fn state(&self) -> &str {
+        if let Some(steering) = &self.steering {
+            return &steering.state;
+        }
+        match self.control.status {
+            ControlStatus::Stale => "stale",
+            _ => "rejected",
+        }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        if let Some(steering) = &self.steering {
+            return steering.reason.clone();
+        }
+        self.delivery_error
+            .clone()
+            .or_else(|| self.control.reason.clone())
+            .or_else(|| Some(format!("control_{}", self.control.status.as_str())))
+    }
+
+    /// The message is held by the mailbox and will be seen by the worker.
+    pub fn is_held(&self) -> bool {
+        self.steering
+            .as_ref()
+            .is_some_and(|steering| steering.state != "rejected")
+    }
+}
+
 impl WorkerController {
+    /// Steer a worker: check the command is current, then put the message in
+    /// the worker's mailbox under the command's own id (so a repeat of the
+    /// same command answers with the first receipt). Nothing is reported as
+    /// held unless the mailbox holds it.
+    pub fn execute_steer(
+        &self,
+        mailbox: &super::mailbox::AgentMailbox,
+        command: WorkerControlCommand,
+        actor_authorized: bool,
+    ) -> SteerOutcome {
+        let WorkerControlAction::Steer { message, redirect } = command.action.clone() else {
+            return SteerOutcome {
+                control: WorkerControlReceipt {
+                    command_id: command.id,
+                    task_id: command.task_id,
+                    agent_id: command.agent_id,
+                    generation: command.generation,
+                    action: command.action.name().to_string(),
+                    status: ControlStatus::Rejected,
+                    reason: Some("not_a_steer".into()),
+                },
+                steering: None,
+                delivery_error: None,
+            };
+        };
+        let control = self.execute_command(command.clone(), actor_authorized);
+        if control.status != ControlStatus::Accepted {
+            return SteerOutcome {
+                control,
+                steering: None,
+                delivery_error: None,
+            };
+        }
+        match mailbox.send_steer_with_id(
+            command.id,
+            command.agent_id,
+            command.generation,
+            message,
+            redirect,
+        ) {
+            Ok(steering) => SteerOutcome {
+                control,
+                steering: Some(steering),
+                delivery_error: None,
+            },
+            Err(error) => SteerOutcome {
+                control,
+                steering: None,
+                delivery_error: Some(error.to_string()),
+            },
+        }
+    }
+
     pub fn new(registry: RuntimeRegistry) -> Self {
         Self {
             registry,

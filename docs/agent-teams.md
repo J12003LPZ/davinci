@@ -54,7 +54,7 @@ A running `agent` call draws its workers under the call, as Claude Code does:
   ⎿  Search("session")
      Read(src/auth/login.rs)
      Read(src/auth/token.rs)
-     +4 more tool uses (ctrl+t to expand)
+     +4 more tool uses (alt+o to expand)
 ```
 
 When the worker finishes, the block collapses to one line:
@@ -76,7 +76,7 @@ Several tasks in one call draw as a tree:
       ⎿  Initializing…
 ```
 
-`ctrl+t` shows more recent calls and the worker's answer. A background worker shows `Running in background · /agents`. The status bar counts what still runs in the background: `1 job · 2 agents · 1 workflow`.
+`alt+o` (the `davinci.tools.expand` binding) shows more recent calls and the worker's answer. A background worker shows `Running in background · /agents`. The status bar counts what still runs in the background: `1 job · 2 agents · 1 workflow`.
 
 The progress travels as a Davinci-only `subagent_progress` agent event keyed by the lead's `agent` call. JSON and RPC hosts receive it too and may ignore it.
 

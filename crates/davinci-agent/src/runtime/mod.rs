@@ -83,7 +83,7 @@ pub use contracts::{
     ContractError, ScopeViolation, TaskContract,
 };
 pub use control::{
-    control_current, reduce_stop_status, retry_allowed, ControlStatus, ProcessLease,
+    control_current, reduce_stop_status, retry_allowed, ControlStatus, ProcessLease, SteerOutcome,
     WorkerControlAction, WorkerControlCommand, WorkerControlReceipt, WorkerController,
     WorkerSnapshot,
 };

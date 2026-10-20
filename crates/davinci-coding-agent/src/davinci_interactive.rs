@@ -10497,6 +10497,47 @@ fn agents_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     Next::Go
 }
 
+/// Run one control command against a worker at the generation and revision it
+/// has right now. The panel used to send 0 and 0, which no worker ever has, so
+/// every stop and retry came back stale.
+pub(crate) fn panel_control(
+    runtime: &davinci_agent::RuntimeHandle,
+    agent_id: davinci_agent::runtime::AgentId,
+    action: davinci_agent::runtime::WorkerControlAction,
+) -> davinci_agent::runtime::WorkerControlReceipt {
+    let controller = davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
+    controller.execute_command(
+        davinci_agent::runtime::WorkerControlCommand {
+            id: uuid::Uuid::new_v4(),
+            root_run_id: runtime.run_id,
+            agent_id,
+            generation: runtime.registry.get_generation(&agent_id),
+            task_id: None,
+            expected_revision: runtime.registry.get_revision(&agent_id),
+            action,
+        },
+        true,
+    )
+}
+
+/// What a control receipt means for the person who clicked: the outcome and,
+/// when it was not carried out, why.
+pub(crate) fn control_line(
+    verb: &str,
+    name: &str,
+    receipt: &davinci_agent::runtime::WorkerControlReceipt,
+) -> String {
+    let reason = receipt
+        .reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    format!(
+        "{verb} for worker '{name}': {}{reason}",
+        receipt.status.as_str()
+    )
+}
+
 fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {
     let Some(sheet) = shell.model.agents.as_ref() else {
         return Next::Go;
@@ -10528,62 +10569,42 @@ fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
             ));
         }
         "steer" => {
-            if let Some(runtime) = &shell.agent.runtime {
-                let _ = runtime.mailbox.send_steer(
-                    agent_id,
-                    0,
-                    "focus on primary objective".into(),
-                    true,
-                );
-                shell.note(&format!(
-                    "Steering message queued for worker '{}'",
-                    agent_row.name
-                ));
-            }
+            // The sheet has no text field, and a canned instruction is not the
+            // user's words: hand the composer a `/agents msg` for this worker.
+            shell
+                .model
+                .composer
+                .set_text(format!("/agents msg {} ", agent_row.name));
+            shell.model.agents = None;
+            shell.model.screen = Screen::Agent;
+            shell.note(&format!(
+                "Type the message for '{}' and press Enter",
+                agent_row.name
+            ));
         }
         "stop" => {
             if let Some(runtime) = &shell.agent.runtime {
-                let controller =
-                    davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
-                let cmd = davinci_agent::runtime::WorkerControlCommand {
-                    id: uuid::Uuid::new_v4(),
-                    root_run_id: runtime.run_id,
+                let receipt = panel_control(
+                    runtime,
                     agent_id,
-                    generation: 0,
-                    task_id: None,
-                    expected_revision: 0,
-                    action: davinci_agent::runtime::WorkerControlAction::Stop {
+                    davinci_agent::runtime::WorkerControlAction::Stop {
                         reason: Some("stopped via live agent panel".into()),
                     },
-                };
-                let receipt = controller.execute_command(cmd, true);
-                shell.note(&format!(
-                    "Stop requested for worker '{}': status {:?}",
-                    agent_row.name, receipt.status
-                ));
+                );
+                shell.note(&control_line("Stop", &agent_row.name, &receipt));
             }
             open_agents_sheet(shell.agent, shell.model);
         }
         "retry" => {
             if let Some(runtime) = &shell.agent.runtime {
-                let controller =
-                    davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
-                let cmd = davinci_agent::runtime::WorkerControlCommand {
-                    id: uuid::Uuid::new_v4(),
-                    root_run_id: runtime.run_id,
+                let receipt = panel_control(
+                    runtime,
                     agent_id,
-                    generation: 0,
-                    task_id: None,
-                    expected_revision: 0,
-                    action: davinci_agent::runtime::WorkerControlAction::Retry {
+                    davinci_agent::runtime::WorkerControlAction::Retry {
                         reason: Some("retry via live agent panel".into()),
                     },
-                };
-                let receipt = controller.execute_command(cmd, true);
-                shell.note(&format!(
-                    "Retry requested for worker '{}': status {:?}",
-                    agent_row.name, receipt.status
-                ));
+                );
+                shell.note(&control_line("Retry", &agent_row.name, &receipt));
             }
             open_agents_sheet(shell.agent, shell.model);
         }
@@ -11194,11 +11215,22 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
             };
             match davinci_agent::runtime::resolve_worker(runtime, name) {
                 Ok(id) => {
-                    let _ = runtime
-                        .registry
-                        .transition(id, davinci_agent::AgentState::Stopping);
-                    runtime.team.cancel(&id);
-                    format!("stopping {name}")
+                    let receipt = panel_control(
+                        runtime,
+                        id,
+                        davinci_agent::runtime::WorkerControlAction::Stop {
+                            reason: Some("stopped with /agents stop".into()),
+                        },
+                    );
+                    match receipt.status {
+                        davinci_agent::runtime::ControlStatus::Accepted
+                        | davinci_agent::runtime::ControlStatus::Stopping
+                        | davinci_agent::runtime::ControlStatus::Stopped => {
+                            runtime.team.cancel(&id);
+                            format!("stopping {name}")
+                        }
+                        _ => control_line("Stop", name, &receipt),
+                    }
                 }
                 Err(error) => error,
             }

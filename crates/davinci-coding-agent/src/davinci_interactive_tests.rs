@@ -4351,3 +4351,110 @@ fn the_masthead_takes_the_catalog_title_and_the_provider_name() {
     assert_eq!(model.model_title, "local-7b");
     assert_eq!(model.provider_title, "my-router");
 }
+
+fn live_worker_fixture(
+    kind: davinci_agent::AgentKind,
+) -> (
+    davinci_agent::Agent,
+    davinci_agent::RuntimeHandle,
+    davinci_agent::runtime::AgentId,
+) {
+    use davinci_agent::{AgentId, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    let id = AgentId::new();
+    runtime
+        .registry
+        .register_agent(AgentRecord {
+            id,
+            run_id: runtime.run_id,
+            parent: Some(runtime.agent_id),
+            kind,
+            name: "scout".into(),
+            provider: String::new(),
+            model_id: String::new(),
+            cwd: ".".into(),
+            state: AgentState::Starting,
+            task_id: None,
+            worktree: None,
+            started_ms: 0,
+            updated_ms: 0,
+            failure_reason: None,
+        })
+        .unwrap();
+    runtime
+        .registry
+        .transition(id, AgentState::Running)
+        .unwrap();
+    agent.set_runtime(runtime.clone());
+    (agent, runtime, id)
+}
+
+#[test]
+fn panel_stop_uses_the_workers_real_generation_and_is_never_stale() {
+    use davinci_agent::runtime::{ControlStatus, WorkerControlAction};
+    let (_agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    let receipt = panel_control(
+        &runtime,
+        id,
+        WorkerControlAction::Stop {
+            reason: Some("from the panel".into()),
+        },
+    );
+    assert_ne!(receipt.status, ControlStatus::Stale, "{receipt:?}");
+    assert!(
+        matches!(
+            receipt.status,
+            ControlStatus::Stopping | ControlStatus::Stopped | ControlStatus::Accepted
+        ),
+        "{receipt:?}"
+    );
+    assert_eq!(
+        runtime.registry.get(&id).unwrap().state,
+        davinci_agent::AgentState::Stopping
+    );
+}
+
+#[test]
+fn panel_retry_is_judged_on_its_merits_not_on_a_zero_generation() {
+    use davinci_agent::runtime::WorkerControlAction;
+    let (_agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    // A running worker cannot be retried, and the receipt says that reason,
+    // not "stale control version".
+    let receipt = panel_control(&runtime, id, WorkerControlAction::Retry { reason: None });
+    assert_ne!(
+        receipt.reason.as_deref(),
+        Some("stale_control_version"),
+        "{receipt:?}"
+    );
+}
+
+#[test]
+fn agents_stop_goes_through_the_controller_and_says_why_it_refused() {
+    let (agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    assert_eq!(
+        team_command_text(&agent, String::new(), "stop scout"),
+        "stopping scout"
+    );
+    runtime
+        .registry
+        .transition(id, davinci_agent::AgentState::Cancelled)
+        .unwrap();
+    let again = team_command_text(&agent, String::new(), "stop scout");
+    assert!(again.contains("No live agent"), "{again}");
+    // Asked directly, the controller names the reason.
+    let receipt = panel_control(
+        &runtime,
+        id,
+        davinci_agent::runtime::WorkerControlAction::Stop { reason: None },
+    );
+    assert_eq!(receipt.reason.as_deref(), Some("worker_already_terminal"));
+}
+
+#[test]
+fn agents_msg_reaches_the_live_worker_mailbox() {
+    let (agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    let reply = team_command_text(&agent, String::new(), "msg scout look at the parser");
+    assert_eq!(reply, "sent to scout");
+    assert_eq!(runtime.mailbox.pending_count(&id), 1);
+}
