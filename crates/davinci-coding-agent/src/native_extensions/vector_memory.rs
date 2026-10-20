@@ -686,6 +686,9 @@ fn normalize_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Shortest value after `sk-` that is redacted when the prefix sits inside a word.
+const MIN_SK_KEY_TAIL: usize = 20;
+
 pub fn redact_secrets(input: &str) -> String {
     let mut output = super::credential_redaction::quoted_assignments(input);
     let patterns = [
@@ -699,21 +702,25 @@ pub fn redact_secrets(input: &str) -> String {
         let mut cursor = 0usize;
         while let Some(relative) = output[cursor..].find(prefix) {
             let start = cursor + relative;
-            // A credential prefix starts a token. Inside a word ("task-1",
-            // a run id ending in "sk") it is just text.
-            if output[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|ch| ch.is_ascii_alphanumeric())
-            {
-                cursor = start + prefix.len();
-                continue;
-            }
             let value_start = start + prefix.len();
             let end = output[value_start..]
                 .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';'))
                 .map(|offset| value_start + offset)
                 .unwrap_or(output.len());
+            // Inside a word, a short `sk-` tail is not a key: a graph run id
+            // ends in base36 digits that can spell "sk", then `-` and 8 hex
+            // chars ("task-42" is the same shape). Real keys are 20+ chars,
+            // and every other prefix is redacted wherever it appears.
+            if prefix == "sk-"
+                && end - value_start < MIN_SK_KEY_TAIL
+                && output[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric())
+            {
+                cursor = value_start;
+                continue;
+            }
             output.replace_range(start..end, replacement);
             cursor = start + replacement.len();
             if cursor >= output.len() {
@@ -4149,7 +4156,8 @@ pub(crate) mod tests {
         // "sk" used to read as an `sk-` key and vanish from its own memory.
         let text = "Verified graph run mq3zsk-1a2b3c4d completed: fix task-42 and risk-review";
         assert_eq!(redact_secrets(text), text);
-        // Real keys still go, at the start of a token or after punctuation.
+        // Real keys still go, at the start of a token, after punctuation,
+        // and glued onto other text.
         let value = redact_secrets("key=sk-secret1 (sk-secret2) ghp_abc AKIAABCD x-Bearer q");
         assert!(
             !value.contains("secret1") && !value.contains("secret2"),
@@ -4159,6 +4167,22 @@ pub(crate) mod tests {
             !value.contains("ghp_abc") && !value.contains("AKIAABCD"),
             "{value}"
         );
+        let tail24 = "A1b2C3d4E5f6G7h8I9j0K1l2";
+        let ghp36 = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let akia16 = "ABCDEFGH12345678";
+        for hostile in [
+            // A literal backslash and `n`, as in escaped JSON or log text.
+            format!("log\\nsk-{tail24} end"),
+            format!("abcsk-{tail24}"),
+            format!("token:abcsk-{tail24}"),
+            format!("xghp_{ghp36}"),
+            format!("xAKIA{akia16}"),
+        ] {
+            let value = redact_secrets(&hostile);
+            for secret in [tail24, ghp36, akia16] {
+                assert!(!value.contains(secret), "{hostile} -> {value}");
+            }
+        }
     }
 
     #[test]
