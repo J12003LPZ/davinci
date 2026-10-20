@@ -1498,6 +1498,7 @@ mod tests {
                 usage_unknown: false,
                 usage: Default::default(),
                 activity: None,
+                workspace: Default::default(),
             });
         }
         let rows = agents_from_snapshots(&snapshots);
@@ -1529,6 +1530,7 @@ mod tests {
             usage_unknown: usage.source() == UsageSource::Unknown,
             usage,
             activity: Some("Read(src/lib.rs)".into()),
+            workspace: Default::default(),
         }
     }
 

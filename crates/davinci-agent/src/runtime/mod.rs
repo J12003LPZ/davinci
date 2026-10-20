@@ -35,6 +35,7 @@ pub mod source_manifest;
 mod task_migration;
 pub mod transactions;
 pub mod worker_activity;
+pub mod worker_workspace;
 pub use task_migration::LegacyTaskRecovery;
 pub mod task_store;
 pub mod task_transport;
@@ -128,6 +129,7 @@ pub use tools_task::{
 pub use worker_activity::{
     ActivityPage, WorkerActivityEvent, WorkerActivityKind, WorkerActivityStore,
 };
+pub use worker_workspace::{WorkerWorkspace, WorkspaceKind};
 pub use workflow::{
     find_saved_workflow, is_mutating_tool, is_mutating_tool_with_registry,
     save_workflow_to_project, validate_workflow, validate_workflow_with_capabilities,

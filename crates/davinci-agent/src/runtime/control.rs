@@ -363,6 +363,9 @@ pub struct WorkerSnapshot {
     /// The worker's latest visible call, e.g. `Read(src/lib.rs)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// Where it works, verified from the checkout's own `HEAD`.
+    #[serde(default)]
+    pub workspace: super::worker_workspace::WorkerWorkspace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -711,6 +714,7 @@ impl WorkerController {
             .map(|progress| progress.usage.clone())
             .unwrap_or_default();
         let activity = progress.and_then(|progress| progress.recent.last().cloned());
+        let workspace = super::worker_workspace::snapshot_workspace(&record);
 
         let disconnected = matches!(record.state, AgentState::Failed)
             && record.failure_reason.as_deref() == Some("process_terminated");
@@ -744,6 +748,7 @@ impl WorkerController {
             usage_unknown: usage.source() == crate::subagent_progress::UsageSource::Unknown,
             usage,
             activity,
+            workspace,
         })
     }
 
