@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const CURRENT_RUNTIME_SCHEMA_VERSION: u16 = 1;
+pub const CURRENT_RUNTIME_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Error)]
 pub enum RuntimeLogError {
@@ -405,7 +405,7 @@ mod tests {
             res,
             Err(RuntimeLogError::UnsupportedSchemaVersion {
                 found: 99,
-                supported: 1
+                supported: CURRENT_RUNTIME_SCHEMA_VERSION
             })
         ));
     }

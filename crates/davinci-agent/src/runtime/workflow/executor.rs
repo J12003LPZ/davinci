@@ -1052,7 +1052,8 @@ impl WorkflowExecutor {
             worker.id.clone(),
             (0, 1),
             "workflow",
-        );
+        )
+        .with_registry(self.runtime.registry.clone(), aid);
         reporter.started();
         if let Ok(mut map) = self.progress.write() {
             map.insert(aid, reporter.clone());

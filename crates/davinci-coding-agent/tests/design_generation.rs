@@ -7,7 +7,9 @@ fn direction(layout: &str, typography: &str) -> ConceptDirection {
         title: layout.into(),
         layout: layout.into(),
         typography: typography.into(),
-        content_strategy: "Use the supplied factual content and a working primary action".into(),
+        content_strategy: format!(
+            "Lead with {layout}: supplied factual content and a working primary action"
+        ),
     }
 }
 #[test]
@@ -223,6 +225,7 @@ fn setup_with_variants(
         expected_revision: RevisionId(0),
         brief: "Create the design".into(),
         operation_id: OperationId::new(),
+        target_variant: None,
     };
     (dir, agent, store, request)
 }

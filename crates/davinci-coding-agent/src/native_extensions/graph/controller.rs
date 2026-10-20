@@ -102,6 +102,32 @@ fn coordinator_task_tools(
         .collect()
 }
 
+/// Verification commands inferred from the project's `Cargo.toml` or
+/// `package.json`. They run project-defined build scripts and test scripts, so
+/// an untrusted project gets none, the same as its `graph.json` commands.
+pub(super) fn trusted_detected_verify_commands(
+    project_trusted: bool,
+    cwd: &std::path::Path,
+) -> Vec<super::types::VerifyCommandSpec> {
+    if project_trusted {
+        detect_verify_commands(cwd)
+    } else {
+        Vec::new()
+    }
+}
+
+fn no_verification_command_message(project_trusted: bool) -> String {
+    let mut message = "no verification command to run: add verifyCommands to .pi/graph.json \
+         (or a Cargo.toml / package.json test script) so the change can be checked"
+        .to_string();
+    if !project_trusted {
+        message.push_str(
+            "; this project is not trusted, so its verification commands are ignored (trust it with /trust)",
+        );
+    }
+    message
+}
+
 pub struct ControllerDeps {
     pub runner: Arc<WorkerRunner>,
     pub verify_exec: Arc<VerifyExec>,
@@ -2415,14 +2441,13 @@ fn drive_compiled_saved_graph(
             let budgets = execution.snapshot().budgets;
             let commands = collect_verify_commands(&CollectInput {
                 config_commands: &execution.deps.config.verify_commands,
-                detected: &detect_verify_commands(&cwd),
+                detected: &trusted_detected_verify_commands(execution.deps.project_trusted, &cwd),
                 plan: None,
             });
             if commands.is_empty() && !execution.options.dry_run {
-                execution.blocked(
-                    "no verification command to run: add verifyCommands to .pi/graph.json                      (or a Cargo.toml / package.json test script) so the change can be checked"
-                        .to_string(),
-                );
+                execution.blocked(no_verification_command_message(
+                    execution.deps.project_trusted,
+                ));
                 return execution.snapshot();
             }
             let mut verification =
@@ -3324,7 +3349,7 @@ fn deliver_goal(
         let cwd = execution.options.cwd.clone();
         let commands = collect_verify_commands(&CollectInput {
             config_commands: &execution.deps.config.verify_commands,
-            detected: &detect_verify_commands(&cwd),
+            detected: &trusted_detected_verify_commands(execution.deps.project_trusted, &cwd),
             plan: plan.as_ref(),
         });
         let verification_inputs = match execution.verification_inputs(&commands) {
@@ -3345,11 +3370,9 @@ fn deliver_goal(
         // An unverified change is never delivered. With nothing to run there
         // is nothing to revise either, so this blocks rather than looping.
         if commands.is_empty() && !execution.options.dry_run {
-            execution.blocked(
-                "no verification command to run: add verifyCommands to .pi/graph.json \
-                 (or a Cargo.toml / package.json test script) so the change can be checked"
-                    .to_string(),
-            );
+            execution.blocked(no_verification_command_message(
+                execution.deps.project_trusted,
+            ));
             return Delivery::Stop;
         }
         let mut verification: VerificationResult =
@@ -6974,5 +6997,236 @@ mod tests {
         assert_eq!(snapshot.governor_bytes_omitted, 4_096 * workers);
         assert_eq!(snapshot.governor_retrievals, workers);
         assert_eq!(snapshot.prunings, workers);
+    }
+}
+
+#[cfg(test)]
+mod untrusted_verify_detection_tests {
+    use super::*;
+    use crate::native_extensions::graph::types::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A project whose only verification commands would be inferred from its
+    /// own `Cargo.toml` and `package.json` scripts.
+    fn scripted_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node steal.js","lint":"node steal.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]
+name = \"x\"
+",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A real `run_graph` through classify, plan, write, review and verify,
+    /// with no configured verification command. Returns the run and every
+    /// command `verify_exec` was asked to run.
+    fn run_to_verification(project_trusted: bool) -> (GraphRun, Vec<String>) {
+        let dir = scripted_project();
+        let runner: Arc<WorkerRunner> = Arc::new(|spec, _, _| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Bug,
+                    complexity: Complexity::Standard,
+                    rationale: "fixture".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![],
+                    tests_to_add: vec![],
+                    tests_to_run: vec![],
+                    completion_criteria: vec!["done".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => Artifact::PatchReport(Box::new(PatchReport {
+                    changed_files: vec![],
+                    summary: "done".into(),
+                    deviations: vec![],
+                    plan_invalidated: false,
+                    invalidation_reason: None,
+                })),
+                ArtifactKind::Review => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "approved".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+                ArtifactKind::Evidence => unreachable!("fixture has no research tasks"),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+        let ran = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ran_by_exec = Arc::clone(&ran);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_by_exec = Arc::clone(&calls);
+        let run = run_graph(
+            RunOptions {
+                goal: "verify fixture".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            ControllerDeps {
+                runner,
+                verify_exec: Arc::new(move |command, _, _, _| {
+                    calls_by_exec.fetch_add(1, Ordering::SeqCst);
+                    ran_by_exec.lock().unwrap().push(command.to_string());
+                    (0, "ok".into(), 1)
+                }),
+                config: GraphConfig::default(),
+                session_model: None,
+                session_thinking: None,
+                session_service_tier: davinci_ai::CodexServiceTier::Standard,
+                project_trusted,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                language_intelligence: None,
+                processes: None,
+                browser: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            },
+        );
+        let commands = ran.lock().unwrap().clone();
+        (run, commands)
+    }
+
+    #[test]
+    fn the_delivery_verify_path_runs_nothing_for_an_untrusted_project() {
+        let (run, commands) = run_to_verification(false);
+        assert!(commands.is_empty(), "ran project commands: {commands:?}");
+        assert_eq!(run.phase, Phase::Blocked);
+        let reason = run.blocked_reason.unwrap_or_default();
+        assert!(reason.contains("no verification command"), "{reason}");
+        assert!(reason.contains("not trusted"), "{reason}");
+    }
+
+    #[test]
+    fn the_delivery_verify_path_still_infers_commands_for_a_trusted_project() {
+        let (_run, commands) = run_to_verification(true);
+        assert!(
+            commands.iter().any(|command| command == "npm test"),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|command| command.starts_with("cargo ")),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn the_saved_graph_verify_path_runs_nothing_for_an_untrusted_project() {
+        use crate::native_extensions::graph::definitions::*;
+        use crate::native_extensions::graph::topology::*;
+        use std::collections::BTreeMap;
+
+        let run_saved = |project_trusted: bool| {
+            let dir = scripted_project();
+            let saved_def = SavedGraphDefinitionV1 {
+                schema_version: 1,
+                name: "verify-pipeline".into(),
+                description: "Verification pipeline".into(),
+                graph: SavedGraphTopology {
+                    graph_id: "verify-g".into(),
+                    version: 1,
+                    mode: GraphMode::Simple,
+                    nodes: vec![NodeDefinition {
+                        id: "verify-node".into(),
+                        role: Role::TestAnalyzer,
+                        expect: ArtifactKind::Evidence,
+                        required: true,
+                        allows_mutation: false,
+                    }],
+                    edges: vec![],
+                },
+                bindings: vec![SavedStageBinding {
+                    node_id: "verify-node".into(),
+                    stage: "verify".into(),
+                    input_artifacts: vec![],
+                }],
+                budgets: Some(SavedBudgets {
+                    max_duration_ms: Some(10_000),
+                    max_cost_usd: None,
+                    max_tokens: None,
+                }),
+                verification_policy: None,
+                artifact_contract_versions: BTreeMap::new(),
+                parameters: vec![],
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let deps = ControllerDeps {
+                runner: Arc::new(|_, _, _| WorkerResult {
+                    ok: true,
+                    ..WorkerResult::default()
+                }),
+                verify_exec: Arc::new(move |_, _, _, _| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    (0, "ok".into(), 1)
+                }),
+                config: GraphConfig::default(),
+                session_model: None,
+                session_thinking: None,
+                session_service_tier: davinci_ai::CodexServiceTier::Standard,
+                project_trusted,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                language_intelligence: None,
+                processes: None,
+                browser: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            };
+            let options = RunOptions {
+                goal: "verify test".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            };
+            let run = run_saved_graph(options, deps, saved_def);
+            (run, calls.load(Ordering::SeqCst))
+        };
+        let (run, calls) = run_saved(false);
+        assert_eq!(calls, 0, "an untrusted project's commands ran");
+        assert_eq!(run.phase, Phase::Blocked);
+        assert!(run
+            .blocked_reason
+            .unwrap_or_default()
+            .contains("not trusted"));
+        let (_run, calls) = run_saved(true);
+        assert!(calls > 0, "a trusted project still infers commands");
+    }
+
+    #[test]
+    fn the_blocked_message_says_why_when_the_project_is_untrusted() {
+        let trusted = no_verification_command_message(true);
+        assert!(trusted.starts_with("no verification command to run"));
+        assert!(!trusted.contains("not trusted"));
+        assert!(no_verification_command_message(false).contains("not trusted"));
     }
 }

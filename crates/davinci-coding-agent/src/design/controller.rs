@@ -93,6 +93,15 @@ pub enum DesignRequest {
     Accept {
         request: super::acceptance::AcceptRequest,
     },
+    /// What a brief will create (its inferred kind and the default concept
+    /// count), decided by the same classifier as the command line. Pure.
+    Resolve {
+        brief: String,
+    },
+    /// Choose a concept (or clear the choice). Changes no source.
+    Select {
+        request: super::selection::SelectVariant,
+    },
     Sync {
         path: String,
         operation_id: OperationId,
@@ -102,6 +111,7 @@ impl DesignRequest {
     fn authority(&self) -> &'static str {
         match self {
             Self::List {}
+            | Self::Resolve { .. }
             | Self::Status { .. }
             | Self::Read { .. }
             | Self::ReadBinding { .. }
@@ -114,13 +124,138 @@ impl DesignRequest {
             }
             Self::VerifyImplementation { .. } => "design_check",
             Self::Apply { .. } => "design_apply",
-            Self::Edit { .. } | Self::Comment { .. } | Self::Restore { .. } => "design_patch",
+            Self::Edit { .. }
+            | Self::Comment { .. }
+            | Self::Restore { .. }
+            | Self::Select { .. } => "design_patch",
             Self::Verify { .. } | Self::Render { .. } | Self::Interact { .. } => "design_render",
             Self::Export { .. } => "design_export",
             Self::Accept { .. } => "design_accept",
             Self::Sync { .. } => "design_sync",
         }
     }
+}
+
+/// The messages the studio host and the controller exchange. `DesignHostLease`
+/// is the real one; tests supply their own.
+pub trait StudioChannel {
+    fn receive(&mut self, timeout: std::time::Duration) -> DesignResult<Option<Value>>;
+    fn respond(&mut self, id: &str, result: DesignResult<Value>) -> DesignResult<()>;
+    fn cancellation(&self, id: &str)
+        -> DesignResult<std::sync::Arc<std::sync::atomic::AtomicBool>>;
+}
+impl StudioChannel for super::host::DesignHostLease {
+    fn receive(&mut self, timeout: std::time::Duration) -> DesignResult<Option<Value>> {
+        super::host::DesignHostLease::receive(self, timeout)
+    }
+    fn respond(&mut self, id: &str, result: DesignResult<Value>) -> DesignResult<()> {
+        super::host::DesignHostLease::respond(self, id, result)
+    }
+    fn cancellation(
+        &self,
+        id: &str,
+    ) -> DesignResult<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        super::host::DesignHostLease::cancellation(self, id)
+    }
+}
+
+/// What happened when the studio address was opened. The address itself is a
+/// pairing capability, so this never holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StudioOpen {
+    pub opened: bool,
+    /// Why the browser did not open, with the address removed.
+    pub reason: Option<String>,
+    /// How the address was left for manual use, when the browser did not open.
+    pub clipboard: Option<String>,
+}
+
+impl StudioOpen {
+    /// A browser that did not open. The address is cut out of both texts: it
+    /// is a pairing capability and a launcher's error often repeats it.
+    pub fn failure(url: &str, reason: &str, clipboard: Option<&str>) -> Self {
+        let strip = |text: &str| text.replace(url, "[studio address]");
+        Self {
+            opened: false,
+            reason: Some(strip(reason)),
+            clipboard: clipboard.map(strip),
+        }
+    }
+}
+
+/// Open the pairing address in the default browser. On failure the address
+/// goes to the clipboard, not into any message or log.
+fn open_in_browser(url: &str) -> StudioOpen {
+    match davinci_tui::try_open_browser(url) {
+        Ok(_) => StudioOpen {
+            opened: true,
+            reason: None,
+            clipboard: None,
+        },
+        Err(reason) => {
+            let copied = davinci_tui::try_copy_text(url).ok();
+            StudioOpen::failure(url, &reason, copied.as_deref())
+        }
+    }
+}
+
+fn receipt(studio: &Option<StudioOpen>, artifact_id: ArtifactId) -> Value {
+    let recovery = format!("/design open {artifact_id}");
+    match studio {
+        Some(studio) => json!({
+            "opened": studio.opened,
+            "reason": studio.reason,
+            "clipboard": studio.clipboard,
+            "recovery": recovery,
+        }),
+        None => json!({
+            "opened": false,
+            "reason": "the studio host never reported an address",
+            "recovery": recovery,
+        }),
+    }
+}
+
+/// What to do next with a finished run: open the studio when it completed,
+/// resume when it stopped at a checkpoint that can be retried.
+pub fn with_next_step(mut value: Value, artifact_id: ArtifactId) -> Value {
+    let next = match value["progress"]["phase"].as_str() {
+        Some("complete") => Some(json!({
+            "action": format!("/design open {artifact_id}"),
+            "why": "open the studio to compare the concepts",
+        })),
+        Some("blocked") => {
+            let retryable = value["failure"]["retryable"].as_bool().unwrap_or(false);
+            let staged = value["failure"]["staged_revision"].as_u64().is_some()
+                || value["failure"]["staged_revision"].is_string();
+            let unverified = value["failure"]["head_unverified"]
+                .as_bool()
+                .unwrap_or(false);
+            let checkpoint = value["failure"]["checkpoint"].as_str().unwrap_or_default();
+            if retryable && !checkpoint.is_empty() {
+                Some(json!({
+                    "action": format!("/design resume {artifact_id} {checkpoint}"),
+                    "why": "retry the failed phase from its checkpoint",
+                }))
+            } else {
+                Some(json!({
+                    "action": format!("/design revise {artifact_id} <what to change>"),
+                    "why": if staged {
+                        "this run cannot be resumed; the revision that failed to render was taken off the head and kept in history, the last good revision is the head"
+                    } else if unverified {
+                        "this run cannot be resumed; the head never rendered, treat it as unverified"
+                    } else {
+                        "this run cannot be resumed; the last committed revision stays readable"
+                    },
+                }))
+            }
+        }
+        _ => None,
+    };
+    if let (Some(next), Some(object)) = (next, value.as_object_mut()) {
+        object.insert("next".into(), next);
+    }
+    value
 }
 
 #[derive(Clone)]
@@ -469,9 +604,12 @@ impl DesignController {
                     )
                     .is_ok()
                 });
+                let selection =
+                    super::selection::current_selection(&self.store, &ctx, session, artifact_id)?;
                 Ok(
                     json!({"manifest":manifest,"revision":revision,"quality":quality,"comments":comments,"captures":captures,
-                    "runtime_error":runtime_error,"evidence_hash":evidence_hash,"acceptance_gaps":acceptance_gaps,"accepted":accepted}),
+                    "runtime_error":runtime_error,"evidence_hash":evidence_hash,"acceptance_gaps":acceptance_gaps,"accepted":accepted,
+                    "selection":selection}),
                 )
             }
             DesignRequest::Edit { edit } => Ok(serde_json::to_value(super::edits::apply_edit(
@@ -536,6 +674,20 @@ impl DesignController {
                     request,
                 )?)?)
             }
+            DesignRequest::Resolve { brief } => {
+                validate_text(&brief, 64 * 1024, "brief")?;
+                Ok(serde_json::to_value(
+                    super::intent::DesignIntent {
+                        brief,
+                        explicit_kind: None,
+                        variants: super::intent::DEFAULT_VARIANTS,
+                    }
+                    .resolve(),
+                )?)
+            }
+            DesignRequest::Select { request } => Ok(serde_json::to_value(
+                super::selection::select_variant(&self.store, &ctx, session, request)?,
+            )?),
             DesignRequest::Sync { path, operation_id } => {
                 self.store
                     .prepare(&ctx, session, "design_sync", &json!({"path":path}))?;
@@ -592,6 +744,23 @@ impl DesignController {
                         expected_revision: manifest.revision,
                         brief,
                         operation_id: OperationId::new(),
+                        target_variant: None,
+                    },
+                }
+            }
+            DesignCommand::Select {
+                artifact_id,
+                variant_id,
+            } => {
+                let value =
+                    self.execute(agent, workspace, DesignRequest::Status { artifact_id })?;
+                let manifest: ArtifactManifest = serde_json::from_value(value["manifest"].clone())?;
+                DesignRequest::Select {
+                    request: super::selection::SelectVariant {
+                        artifact_id,
+                        revision: manifest.revision,
+                        variant_id,
+                        operation_id: OperationId::new(),
                     },
                 }
             }
@@ -603,14 +772,52 @@ impl DesignController {
                 let value =
                     self.execute(agent, workspace, DesignRequest::Status { artifact_id })?;
                 let manifest: ArtifactManifest = serde_json::from_value(value["manifest"].clone())?;
+                // A chosen concept is the only one a revision touches.
+                let target_variant = serde_json::from_value::<
+                    Option<super::selection::DesignSelectionReceipt>,
+                >(value["selection"].clone())?
+                .and_then(|selection| selection.variant_id);
                 DesignRequest::Generate {
                     request: super::generation::GenerationRequest {
                         artifact_id,
                         expected_revision: manifest.revision,
                         brief,
                         operation_id,
+                        target_variant,
                     },
                 }
+            }
+            DesignCommand::Resume {
+                artifact_id,
+                operation_id,
+            } => {
+                // The checkpoint must belong to this design before anything
+                // is built, spent or sent.
+                let owner = super::generation::checkpoint_artifact(
+                    &self.store,
+                    agent,
+                    workspace,
+                    operation_id,
+                )?;
+                if owner != artifact_id {
+                    return Err(DesignError::Conflict(
+                        "that checkpoint belongs to a different design".into(),
+                    ));
+                }
+                let mut model = super::model::SubscriptionModel::configured(agent)?;
+                let mut renderer = super::generation::ConfinedRenderer {
+                    runtime: super::runtime::TrustedDesignRuntime::configured(workspace)?,
+                };
+                let state = super::generation::resume_operation(
+                    &self.store,
+                    agent,
+                    workspace,
+                    operation_id,
+                    &mut model,
+                    &mut renderer,
+                    None,
+                )?;
+                return Ok(with_next_step(serde_json::to_value(state)?, artifact_id));
             }
             DesignCommand::Open { artifact_id } => {
                 return self.serve(agent, workspace, artifact_id)
@@ -689,7 +896,15 @@ impl DesignController {
                 return self.serve(agent, workspace, artifact_id);
             }
         };
-        self.execute(agent, workspace, request)
+        let artifact = match &request {
+            DesignRequest::Generate { request } => Some(request.artifact_id),
+            _ => None,
+        };
+        let value = self.execute(agent, workspace, request)?;
+        Ok(match artifact {
+            Some(artifact_id) => with_next_step(value, artifact_id),
+            None => value,
+        })
     }
     /// The foreground host owns the only session writer for the life of the workspace.
     pub fn serve(
@@ -698,7 +913,6 @@ impl DesignController {
         workspace: &Path,
         artifact_id: ArtifactId,
     ) -> DesignResult<Value> {
-        use std::time::{Duration, Instant};
         self.execute(agent, workspace, DesignRequest::Status { artifact_id })?;
         let ctx = AuthorizedDesignContext::for_operation(
             agent,
@@ -708,15 +922,37 @@ impl DesignController {
         )?;
         let runtime = super::runtime::TrustedDesignRuntime::configured(workspace)?;
         let mut host = super::host::DesignHostLease::start(&ctx, &runtime)?;
+        self.serve_channel(
+            agent,
+            workspace,
+            artifact_id,
+            &ctx,
+            &mut host,
+            &open_in_browser,
+        )
+    }
+    /// The serving loop, apart from how the host process is started and how
+    /// the address is opened, so both can be replaced in tests. The pairing
+    /// address is handed to `opener` and nowhere else.
+    pub fn serve_channel(
+        &self,
+        agent: &mut Agent,
+        workspace: &Path,
+        artifact_id: ArtifactId,
+        ctx: &AuthorizedDesignContext,
+        host: &mut dyn StudioChannel,
+        opener: &dyn Fn(&str) -> StudioOpen,
+    ) -> DesignResult<Value> {
+        use std::time::{Duration, Instant};
+        let mut studio = None::<StudioOpen>;
         let handshake_deadline = Instant::now() + Duration::from_secs(15);
         let lease_deadline = Instant::now() + Duration::from_secs(8 * 60 * 60);
-        let mut opened = false;
         loop {
             ctx.check("design_host", &json!({"artifact_id":artifact_id}))?;
             if Instant::now() >= lease_deadline {
                 return Err(DesignError::Cancelled);
             }
-            if !opened && Instant::now() >= handshake_deadline {
+            if studio.is_none() && Instant::now() >= handshake_deadline {
                 return Err(DesignError::MissingCapability(
                     "design host did not start".into(),
                 ));
@@ -735,13 +971,18 @@ impl DesignController {
                 if !url.starts_with("http://127.0.0.1:") || !url.contains("/#pair=") {
                     return Err(DesignError::Denied("invalid pairing URL".into()));
                 }
-                let _ = davinci_tui::open_browser(url);
-                opened = true;
+                let outcome = opener(url);
+                let unreachable = !outcome.opened && outcome.clipboard.is_none();
+                studio = Some(outcome);
+                if unreachable {
+                    // Nobody can reach the address; serving for hours helps no one.
+                    return Ok(json!({"closed":true,"studio":receipt(&studio, artifact_id)}));
+                }
                 continue;
             }
             if message["operation"] == "close" {
                 host.respond(id, Ok(json!({"closed":true})))?;
-                return Ok(json!({"closed":true}));
+                return Ok(json!({"closed":true,"studio":receipt(&studio, artifact_id)}));
             }
             let request = serde_json::from_value::<DesignRequest>(
                 json!({"operation":message["operation"],"payload":message["payload"]}),

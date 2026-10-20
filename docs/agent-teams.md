@@ -54,7 +54,7 @@ A running `agent` call draws its workers under the call, as Claude Code does:
   ⎿  Search("session")
      Read(src/auth/login.rs)
      Read(src/auth/token.rs)
-     +4 more tool uses (ctrl+t to expand)
+     +4 more tool uses (alt+o to expand)
 ```
 
 When the worker finishes, the block collapses to one line:
@@ -76,9 +76,40 @@ Several tasks in one call draw as a tree:
       ⎿  Initializing…
 ```
 
-`ctrl+t` shows more recent calls and the worker's answer. A background worker shows `Running in background · /agents`. The status bar counts what still runs in the background: `1 job · 2 agents · 1 workflow`.
+`alt+o` (the `davinci.tools.expand` binding) shows more recent calls and the worker's answer. A background worker shows `Running in background · /agents`. The status bar counts what still runs in the background: `1 job · 2 agents · 1 workflow`.
 
 The progress travels as a Davinci-only `subagent_progress` agent event keyed by the lead's `agent` call. JSON and RPC hosts receive it too and may ignore it.
+
+## The agent roster
+
+While any worker exists, a roster sits under the composer: one row for `main` and one per worker. A row shows a status glyph, the name, one line of what the worker is doing, elapsed time, tokens and where it works (`shared`, or `⎇ branch` for a worktree). On a terminal too small for the list it collapses to one line.
+
+| Do | Result |
+| --- | --- |
+| `Down` on an empty composer | focus moves into the roster |
+| `Up` / `Down`, `Enter` | open that worker's live transcript (read-only) |
+| click a row | the same |
+| `Esc`, or click `main` | back to the main conversation |
+| `PageUp` / `PageDown`, `Up` / `Down` on an empty composer | scroll the worker's transcript |
+| `Enter` in a worker view | send the text to that worker (the composer shows `Message @name`) |
+
+`Esc` in a worker view is always used up there: it closes an open popup, overlay or search first, then returns to main. It never interrupts the turn, never starts the double-`Esc` rewind and never clears queued follow-ups. `Ctrl+C` is the explicit interrupt and still interrupts main from a worker view; the status line says `interrupting main`. Text you type in a worker view goes to the worker; a line starting with `/` runs as a normal command (the hint under the composer says so). `Esc` on the main screen still interrupts a running turn, and follow-ups you queued before it stay queued and run afterwards.
+
+The worker view keeps the last 200 events (2 KiB each, secrets redacted, terminal control sequences removed). Older events are counted as a gap. A worker with its own worktree shows its verified branch and `HEAD` and a read-only list of changed files, refreshed about every 3 seconds; a worker in the shared workspace shows `shared workspace — no separate branch`.
+
+**Tokens** are input plus output for that worker. The detail view splits out cache reads and writes. `~` marks an estimate and `unknown` means the provider reported no usage; a missing number is never shown as 0. Elapsed time stops when the worker reaches a terminal state.
+
+**Messages to a worker** get a stable id and are written to the operation journal and the runtime log before the receipt says `queued`. A receipt then moves `queued`, `delivered`, `applied`, or ends `rejected`. `unknown` means a restart happened after delivery and nothing proves the worker used the message; it is never re-sent. If the runtime log cannot be written, the message is not queued: the receipt reads `not queued: <reason>` and nothing is left in the worker's mailbox. If the mailbox accepted a message but the operation journal could not record it, the receipt reads `unknown` (accepted, receipt incomplete) and the host asks again under the same message id, so the worker never sees it twice. A message to a finished worker is rejected with `worker already finished; send a follow-up to main` and the worker is not restarted. The RPC `agent_control steer` command goes through the same function and reports the same `delivery` state and `messageId`.
+
+### Turning the roster off
+
+The roster is on by default. To get back the previous behavior (the `/agents` panel only):
+
+```json
+{ "agentFocusUi": false }
+```
+
+in `~/.davinci/agent/settings.json` or the project's `.davinci/settings.json`, then restart. The settings key is `agentFocusUi`. With it off, nothing is drawn under the composer, no roster keys are bound, and `Esc` behaves as before except that queued follow-ups are still kept.
 
 ## Modes and lifecycle
 

@@ -855,6 +855,15 @@ fn compact_elapsed(seconds: u64) -> String {
     }
 }
 
+/// `23.4k`, or `~23.4k` while part of the count is an estimate.
+fn tokens_text(row: &SubagentRow) -> String {
+    if row.tokens_estimated {
+        format!("~{}", compact_tokens(row.tokens))
+    } else {
+        compact_tokens(row.tokens)
+    }
+}
+
 /// `7 tool uses · 23.4k tokens · 41s`, leaving out what is still zero.
 fn subagent_stats(row: &SubagentRow, with_time: bool) -> String {
     let mut parts = Vec::new();
@@ -866,7 +875,7 @@ fn subagent_stats(row: &SubagentRow, with_time: bool) -> String {
         });
     }
     if row.tokens > 0 {
-        parts.push(format!("{} tokens", compact_tokens(row.tokens)));
+        parts.push(format!("{} tokens", tokens_text(row)));
     }
     if with_time && row.elapsed_secs > 0 {
         parts.push(compact_elapsed(row.elapsed_secs));
@@ -889,7 +898,21 @@ fn subagent_outcome(row: &SubagentRow) -> String {
     }
 }
 
+/// A worker row as safe display text: the label and recent calls come from
+/// model-chosen tool arguments, so control bytes and line breaks are removed
+/// before anything reaches a terminal cell.
+fn clean_worker_row(row: &SubagentRow) -> SubagentRow {
+    let one_line = |text: &str| super::super::sanitize::terminal_safe(text).replace('\n', " ");
+    SubagentRow {
+        label: one_line(&row.label),
+        recent: row.recent.iter().map(|call| one_line(call)).collect(),
+        ..row.clone()
+    }
+}
+
 fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'static>> {
+    let cleaned: Vec<SubagentRow> = rows.iter().map(clean_worker_row).collect();
+    let rows = cleaned.as_slice();
     let th = &model.theme;
     let cc = th.cc();
     let line = |text: String, failed: bool| {
@@ -957,7 +980,7 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
             });
         }
         if row.tokens > 0 {
-            tally.push(format!("{} tokens", compact_tokens(row.tokens)));
+            tally.push(format!("{} tokens", tokens_text(row)));
         }
         if !tally.is_empty() {
             let hint = if hidden == 0 || model.show_tool_output {
@@ -1434,6 +1457,7 @@ mod tests {
             state,
             tool_uses: uses,
             tokens: 23_400,
+            tokens_estimated: false,
             recent: recent.iter().map(|call| call.to_string()).collect(),
             elapsed_secs: 41,
         }
@@ -1907,6 +1931,33 @@ mod tests {
             .iter()
             .map(text)
             .collect()
+    }
+
+    /// A worker's label and recent calls come from model-chosen tool arguments.
+    /// Whatever they carry, no control byte may reach a terminal cell.
+    #[test]
+    fn hostile_worker_text_cannot_inject_terminal_controls() {
+        let hostile = "Read(\u{1b}]52;c;ZXZpbA==\u{7}\u{1b}[2Jsrc/a.rs\u{8}\r\nSEND)";
+        let m = model(100);
+        for rows in [
+            vec![worker(hostile, SubagentRowState::Running, 1, &[hostile])],
+            vec![worker(hostile, SubagentRowState::Done, 1, &[hostile])],
+            vec![
+                worker(hostile, SubagentRowState::Running, 1, &[hostile]),
+                worker("second", SubagentRowState::Failed, 1, &[hostile]),
+            ],
+        ] {
+            let lines = entry_lines(&m, &Entry::Subagents(rows), m.width);
+            for line in &lines {
+                for span in &line.spans {
+                    assert!(
+                        !span.content.chars().any(|ch| ch.is_control()),
+                        "control byte reached a cell: {:?}",
+                        span.content
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -493,6 +493,11 @@ pub struct CreateAgentSessionResult {
     pub session: AgentSession,
     pub extensions_result: LoadExtensionsResult,
     pub model_fallback_message: Option<String>,
+    /// Set (code `UNTRUSTED_PROJECT`) when the project's own skills, prompts,
+    /// extensions and packages were left unloaded because the folder is not
+    /// trusted. There is no prompt in the SDK: trust comes from a stored grant
+    /// or the global `defaultProjectTrust` / `trustedProjects` settings.
+    pub project_trust_diagnostic: Option<crate::trust::TrustDiagnostic>,
 }
 
 pub fn create_agent_session(
@@ -636,6 +641,7 @@ pub fn create_agent_session(
 
     let model_runtime = embed_model_runtime(&agent_dir);
     let extensions_result = load_extensions_result(&agent_dir, &cwd, &settings.extensions, trusted);
+    let project_trust_diagnostic = project_trust_diagnostic(&agent_dir, &cwd);
 
     Ok(CreateAgentSessionResult {
         session: AgentSession {
@@ -661,7 +667,28 @@ pub fn create_agent_session(
         },
         extensions_result,
         model_fallback_message,
+        project_trust_diagnostic,
     })
+}
+
+/// The SDK cannot ask, so an untrusted project is reported, not prompted for.
+fn project_trust_diagnostic(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Option<crate::trust::TrustDiagnostic> {
+    // Global settings only: a project cannot grant itself trust.
+    let global = crate::settings::load_settings(agent_dir);
+    let decision = crate::trust::preflight_project_trust(
+        agent_dir,
+        cwd,
+        &crate::trust::TrustPolicy {
+            override_trust: None,
+            default_project_trust: global.default_project_trust.as_deref(),
+            trusted_projects: &global.trusted_projects,
+        },
+        crate::trust::HostMode::Headless,
+    );
+    crate::trust::trust_diagnostic(&decision, cwd)
 }
 
 fn embed_model_runtime(agent_dir: &std::path::Path) -> ModelRuntimeSnapshot {
@@ -1234,6 +1261,63 @@ mod tests {
             project_resource_roots(&project, true, "skills"),
             vec![project.join(".pi").join("skills")]
         );
+    }
+
+    #[test]
+    fn sdk_session_reports_an_untrusted_project_instead_of_dropping_it_silently() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".pi").join("skills")).unwrap();
+        let open = |agent_dir: &std::path::Path| {
+            create_agent_session(CreateAgentSessionOptions {
+                cwd: Some(project.clone()),
+                agent_dir: Some(agent_dir.to_path_buf()),
+                session_dir: Some(dir.path().join("sessions")),
+                ..CreateAgentSessionOptions::default()
+            })
+            .unwrap()
+        };
+
+        let untrusted = open(&agent_dir);
+        let diagnostic = untrusted.project_trust_diagnostic.expect("diagnostic");
+        assert_eq!(diagnostic.code, "UNTRUSTED_PROJECT");
+        assert!(diagnostic.message.starts_with("UNTRUSTED_PROJECT: "));
+
+        // Project settings cannot grant the trust they need.
+        std::fs::write(
+            project.join(".pi").join("settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        assert!(open(&agent_dir).project_trust_diagnostic.is_some());
+
+        // A stored grant, or the user's own global setting, loads it quietly.
+        crate::trust::ProjectTrustStore::open(&agent_dir)
+            .set(&project, Some(true))
+            .unwrap();
+        assert!(open(&agent_dir).project_trust_diagnostic.is_none());
+        crate::trust::ProjectTrustStore::open(&agent_dir)
+            .set(&project, None)
+            .unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProjectTrust":"always"}"#,
+        )
+        .unwrap();
+        assert!(open(&agent_dir).project_trust_diagnostic.is_none());
+
+        // A saved denial still wins over the global default and is reported.
+        crate::trust::ProjectTrustStore::open(&agent_dir)
+            .set(&project, Some(false))
+            .unwrap();
+        let denied = open(&agent_dir);
+        assert!(denied
+            .project_trust_diagnostic
+            .expect("diagnostic")
+            .message
+            .contains("Do not trust"));
     }
 
     #[test]

@@ -16,7 +16,13 @@ pub mod memory_page;
 pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
+pub mod service_authority;
+pub mod service_notifications;
+pub mod service_supervisor;
 pub mod setup;
+pub mod setup_actions;
+pub mod setup_health;
+pub mod setup_profile;
 pub mod test_impact;
 pub mod token_governor;
 pub mod vector_memory;
@@ -297,7 +303,7 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "setup",
             "Set up this workspace: vector memory, .gitignore, trust, plugin hooks and language servers.",
-            Some("[check|trust]"),
+            Some("[check [--json]|repair|approve <start-ollama|download-model>|enable|disable <memory|governor>|trust]"),
         ),
     ]
     .into_iter().filter(|(name, _, _)| !name.ends_with("-status")).collect()
@@ -362,9 +368,21 @@ pub struct NativeExtensionHost {
     pub visual_verification_available: bool,
     pub cwd: std::path::PathBuf,
     agent_dir: std::path::PathBuf,
+    /// Who starts Ollama for `/setup`. `None` is this process's real
+    /// supervisor; tests inject one with a fake launcher.
+    supervisor: Option<Arc<service_supervisor::ManagedServiceSupervisor>>,
 }
 
 impl NativeExtensionHost {
+    /// Use `supervisor` for `/setup` instead of the real machine.
+    pub fn with_supervisor(
+        mut self,
+        supervisor: Arc<service_supervisor::ManagedServiceSupervisor>,
+    ) -> Self {
+        self.supervisor = Some(supervisor);
+        self
+    }
+
     pub fn new_with_agent_dir(
         session_key: impl Into<String>,
         cwd: &Path,
@@ -383,7 +401,11 @@ impl NativeExtensionHost {
             None => davinci_agent::runtime::cache::CacheRuntime::default(),
         };
         let mut governor_config = agent_dir
-            .map(|dir| TokenGovernorConfig::from_file(&dir.join("token-governor.json")))
+            .map(|dir| {
+                setup_profile::load_effective_setup(dir, &vector_memory::process_env)
+                    .governor
+                    .config
+            })
             .unwrap_or_else(TokenGovernorConfig::from_env);
         // Stored outputs belong to this host's agent dir, not whatever
         // `USERPROFILE` says: a host started for another agent dir (tests,
@@ -399,9 +421,7 @@ impl NativeExtensionHost {
         ) {
             governor_config.store_dir = Some(dir.join("token-governor"));
         }
-        let memory_config = agent_dir
-            .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
-            .unwrap_or_else(VectorMemoryConfig::from_env);
+        let memory_config = host_memory_config(agent_dir);
         let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
         let _ = governor_value.sweep_stale_outputs();
         let governor = Arc::new(Mutex::new(governor_value));
@@ -544,6 +564,7 @@ impl NativeExtensionHost {
             visual_snapshot,
             cwd: cwd.to_path_buf(),
             agent_dir: repo_agent_dir,
+            supervisor: None,
         }
     }
 
@@ -948,8 +969,10 @@ impl NativeExtensionHost {
                 Ok(Some(memory.clear().map_err(|err| err.to_string())?))
             }
             "memory-page" => {
-                let memory = self.memory.lock().map_err(|err| err.to_string())?;
-                Ok(Some(memory_page::command(&memory, args)?))
+                // The page probes the embedding server (seconds). Work on a copy
+                // so a turn that needs memory never waits behind the probe.
+                let snapshot = self.memory.lock().map_err(|err| err.to_string())?.clone();
+                Ok(Some(memory_page::command(&snapshot, args)?))
             }
             "cache-status" => {
                 let stats = self.cache.stats();
@@ -1029,23 +1052,89 @@ impl NativeExtensionHost {
                 } else {
                     self.cwd.clone()
                 };
+                let ctx = match &self.supervisor {
+                    Some(supervisor) => setup::SetupContext {
+                        agent_dir: &self.agent_dir,
+                        supervisor,
+                    },
+                    None => setup::SetupContext::system(&self.agent_dir),
+                };
                 let steps = if mode == setup::Mode::Trust {
                     vec![setup::trust_project(&self.agent_dir, &cwd)]
+                } else if let setup::Mode::Approve(action) = mode {
+                    // One yes, one action: record it, then do just that.
+                    let approved = setup_actions::approve_action(action, &ctx);
+                    let mut step =
+                        setup_actions::execute_approved_action(action, &self.memory, &ctx);
+                    match approved {
+                        Ok(line) => step.detail = format!("{line}; {}", step.detail),
+                        Err(error) => {
+                            step = setup::Step::new(
+                                "memory",
+                                "vector memory",
+                                setup::StepState::Action,
+                                error,
+                            );
+                        }
+                    }
+                    vec![step]
+                } else if let setup::Mode::Switch(feature, on) = mode {
+                    vec![setup::switch_step(
+                        &self.agent_dir,
+                        feature,
+                        on,
+                        &self.memory,
+                        &self.governor,
+                    )]
+                } else if mode == setup::Mode::Repair {
+                    vec![setup_actions::execute_approved_action(
+                        setup_actions::SetupAction::RepairProjection,
+                        &self.memory,
+                        &ctx,
+                    )]
                 } else {
                     let apply = mode == setup::Mode::Apply;
                     let lsp_enabled = self.language_intelligence.status()["enabled"]
                         .as_bool()
                         .unwrap_or(false);
                     vec![
-                        setup::memory_step(&self.memory, apply),
+                        setup::memory_step(&self.memory, apply, &ctx),
                         setup::gitignore_step(&cwd, apply),
                         setup::trust_step(&self.agent_dir, &cwd),
                         setup::plugins_step(&self.agent_dir),
+                        setup::design_step(&cwd),
                         setup::language_step(&cwd, lsp_enabled),
                         setup::instructions_step(&cwd),
                     ]
                 };
-                Ok(Some(setup::report(mode, steps)))
+                let effective = setup_profile::load_effective_setup(
+                    &self.agent_dir,
+                    &vector_memory::process_env,
+                );
+                // Trusting a folder, approving one action or repairing touches no
+                // service for a status read; only the reporting modes probe.
+                let health = if matches!(
+                    mode,
+                    setup::Mode::Apply | setup::Mode::Check | setup::Mode::CheckJson
+                ) {
+                    let mut health = vec![setup::memory_health(&self.memory, &effective, &ctx)];
+                    if let Ok(governor) = self.governor.lock() {
+                        health.push(setup::governor_health(
+                            &governor.health(),
+                            effective.governor.enabled,
+                            &effective,
+                        ));
+                    }
+                    health
+                } else {
+                    Vec::new()
+                };
+                Ok(Some(setup::report_full(
+                    mode,
+                    steps,
+                    health,
+                    effective.issues(),
+                )))
             }
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name == "security-scan" || name.starts_with("sec-") => {
@@ -1186,6 +1275,21 @@ impl NativeExtensionHost {
         }
         specs
     }
+}
+
+/// The memory service config. It comes from the host's agent directory (the
+/// setup profile, `vector-memory.json`, then the environment), never from the
+/// project: a repository must not be able to point the embedding client at a
+/// server or switch on a service start. An unreadable config file or an
+/// explicit "off" in the profile leaves memory off.
+fn host_memory_config(agent_dir: Option<&Path>) -> VectorMemoryConfig {
+    agent_dir
+        .map(|dir| {
+            setup_profile::load_effective_setup(dir, &vector_memory::process_env)
+                .memory
+                .config
+        })
+        .unwrap_or_else(VectorMemoryConfig::from_env)
 }
 
 #[cfg(test)]

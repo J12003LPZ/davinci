@@ -11,6 +11,16 @@ pub struct RetrieveContextRequest {
     pub query: Option<String>,
     pub offset: usize,
     pub limit: usize,
+    /// Read the source's exact bytes from here (a UTF-8 boundary), up to one
+    /// page. Continues a line that a line page had to cut, and returns
+    /// `\r` and every other byte unchanged. Cannot be combined with
+    /// `offset` or `query`.
+    #[serde(
+        default,
+        rename = "byteOffset",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub byte_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +29,14 @@ pub struct RetrieveContextResult {
     pub content: String,
     pub truncated: bool,
     pub next_offset: Option<usize>,
+    /// Where to continue, as `byteOffset`, when a line was cut or a byte page
+    /// ended before the source did.
+    #[serde(
+        default,
+        rename = "nextByteOffset",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_byte_offset: Option<usize>,
     /// Images the source carried, handed to the model as image content of the
     /// tool result (never serialized into `content`).
     #[serde(skip)]
@@ -73,15 +91,36 @@ fn retrieve_inner(
     // A query matches case-insensitively: the model searching for "error"
     // must find "Error" (WOR-81). The returned lines are exact.
     let query = request.query.as_deref().map(str::to_lowercase);
-    let (content, next_offset) = page_lines(
-        content.lines().filter(|line| {
-            query
-                .as_deref()
-                .is_none_or(|query| line.to_lowercase().contains(query))
-        }),
-        request.offset,
-        limit,
-    );
+    let (content, next_offset, next_byte_offset) = if let Some(start) = request.byte_offset {
+        if request.offset != 0 || query.is_some() {
+            return Err("byteOffset cannot be combined with offset or query".into());
+        }
+        let (slice, next) = page_bytes(&content, start)?;
+        (slice, None, next)
+    } else {
+        let page = page_lines_detail(
+            content.lines().filter(|line| {
+                query
+                    .as_deref()
+                    .is_none_or(|query| line.to_lowercase().contains(query))
+            }),
+            request.offset,
+            limit,
+        );
+        let mut text = page.content;
+        let mut next_byte = None;
+        if let Some(shown) = page.cut {
+            // The cut line's tail is not skipped for good: say where it starts.
+            if let Some(start) = nth_line_start(&content, query.as_deref(), request.offset) {
+                let at = start + shown;
+                text.push_str(&format!(
+                    "\n[the rest of this line: retrieve with byteOffset {at}]"
+                ));
+                next_byte = Some(at);
+            }
+        }
+        (text, page.next_offset, next_byte)
+    };
     // Images ride on the first unfiltered page only, so paging through a
     // long source does not repeat them.
     let (images, image_note) = match material {
@@ -89,15 +128,16 @@ fn retrieve_inner(
             &source,
             material.images,
             material.images_not_retained,
-            request.offset == 0 && query.is_none(),
+            request.offset == 0 && query.is_none() && request.byte_offset.unwrap_or(0) == 0,
         ),
         None => (Vec::new(), None),
     };
     Ok(RetrieveContextResult {
         source,
         content,
-        truncated: next_offset.is_some(),
+        truncated: next_offset.is_some() || next_byte_offset.is_some(),
         next_offset,
+        next_byte_offset,
         images,
         image_note,
     })
@@ -167,17 +207,82 @@ pub const MAX_PAGE_BYTES: usize = 64 * 1024;
 /// A page also stops before [`MAX_PAGE_BYTES`]; `next_offset` then points at
 /// the first line left out. A single line longer than a whole page is cut
 /// at the bound and marked, and the next page starts after it.
+#[cfg(test)]
 fn page_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
     offset: usize,
     limit: usize,
 ) -> (String, Option<usize>) {
+    let page = page_lines_detail(lines, offset, limit);
+    (page.content, page.next_offset)
+}
+
+/// One page of lines, and how much of the first line is shown when that line
+/// alone was longer than the page.
+struct LinePage {
+    content: String,
+    next_offset: Option<usize>,
+    cut: Option<usize>,
+}
+
+/// Where the `n`th line that matches `query` starts in `text`, in bytes. The
+/// same lines `str::lines` yields, with a position.
+fn nth_line_start(text: &str, query: Option<&str>, n: usize) -> Option<usize> {
+    let mut position = 0usize;
+    let mut seen = 0usize;
+    for raw in text.split_inclusive('\n') {
+        let start = position;
+        position += raw.len();
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if query.is_none_or(|query| line.to_lowercase().contains(query)) {
+            if seen == n {
+                return Some(start);
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
+/// Up to one page of the exact bytes of `text` from `start`, and where the
+/// next page starts.
+fn page_bytes(text: &str, start: usize) -> Result<(String, Option<usize>), String> {
+    if start > text.len() {
+        return Err(format!(
+            "byteOffset {start} is past the end of the source ({} bytes)",
+            text.len()
+        ));
+    }
+    if !text.is_char_boundary(start) {
+        return Err(format!("byteOffset {start} is not a UTF-8 boundary"));
+    }
+    let mut end = start.saturating_add(MAX_PAGE_BYTES).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok((
+        text[start..end].to_string(),
+        (end < text.len()).then_some(end),
+    ))
+}
+
+fn page_lines_detail<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    offset: usize,
+    limit: usize,
+) -> LinePage {
     let mut lines = lines.skip(offset);
     let mut page = String::new();
     let mut taken = 0usize;
+    let mut cut_shown = None;
     while taken < limit {
         let Some(line) = lines.next() else {
-            return (page, None);
+            return LinePage {
+                content: page,
+                next_offset: None,
+                cut: None,
+            };
         };
         let separator = usize::from(taken > 0);
         let room = MAX_PAGE_BYTES.saturating_sub(page.len() + separator);
@@ -188,13 +293,18 @@ fn page_lines<'a>(
                     cut -= 1;
                 }
                 page.push_str(&line[..cut]);
+                cut_shown = Some(cut);
                 page.push_str(&format!(
                     " … [line cut at {MAX_PAGE_BYTES} bytes of {}]",
                     line.len()
                 ));
                 taken = 1;
             }
-            return (page, Some(offset.saturating_add(taken)));
+            return LinePage {
+                content: page,
+                next_offset: Some(offset.saturating_add(taken)),
+                cut: cut_shown,
+            };
         }
         if separator == 1 {
             page.push('\n');
@@ -203,7 +313,11 @@ fn page_lines<'a>(
         taken += 1;
     }
     let more = lines.next().is_some();
-    (page, more.then(|| offset.saturating_add(limit)))
+    LinePage {
+        content: page,
+        next_offset: more.then(|| offset.saturating_add(limit)),
+        cut: None,
+    }
 }
 
 pub fn retrieve_context_tool(

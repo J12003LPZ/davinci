@@ -2,7 +2,7 @@ use super::ContextRoot;
 
 /// Per-event text cap in the fold prompt. User turns carry constraints and
 /// corrections, so they get a wider window than tool output and assistant text,
-/// and are sent whole when they fit (see `fold_request`).
+/// and are sent whole when they fit (see `fold_chunk`).
 const EXCERPT_CHARS: usize = 1024;
 const USER_EXCERPT_CHARS: usize = 8 * 1024;
 /// Room kept back for the trailing note that says some events did not fit.
@@ -34,17 +34,33 @@ fn fold_record(event: &super::ContextEvent, cap: usize) -> String {
     record.to_string()
 }
 
-pub(crate) fn fold_request(
+/// One summarizer request over the oldest events that fit, and how many
+/// events it covers.
+pub(crate) struct FoldChunk {
+    pub request: crate::compaction::SummarizeRequest,
+    pub covered: usize,
+}
+
+/// The next chunk of `events` (oldest first) for the summarizer, given the
+/// state `parent` the earlier chunks produced. It takes events from the front
+/// until the next one would not fit the window, so every event reaches some
+/// chunk. An event whose record cannot fit even alone is covered by the
+/// deterministic state and named in `omitted_events`. `None` when `events` is
+/// empty or the instructions and `parent` alone leave no room.
+pub(crate) fn fold_chunk(
     parent: &super::CheckpointState,
     events: &[super::ContextEvent],
     instructions: Option<&str>,
     window: u64,
     provider: &str,
     model_id: &str,
-) -> Option<crate::compaction::SummarizeRequest> {
+) -> Option<FoldChunk> {
     use crate::compaction::{
         SummarizeRequest, CONTEXT_VM_FOLD_PROMPT, CONTEXT_VM_FOLD_SYSTEM_PROMPT,
     };
+    if events.is_empty() {
+        return None;
+    }
     let schema = r#"Fields goals, constraints, completed, in_progress (current strategies), blockers, decisions, modified_files, verification are arrays of {value,source_refs,provenance_kind}. narrative is null or one such object and must use agent_inference. Omitted fields preserve parent values. transitions is an array of {slot,kind,previous,evidence,replacement}. slot is goal|constraint|strategy|blocker|decision|verification|modified_file. kind is resolve|supersede|reject. previous must exactly match the active value. evidence and replacement use the same value/source_refs/provenance_kind format. Supersede requires a replacement. Lifecycle evidence must be newer than the previous value; only a user may change a user constraint. Use transitions for corrections, resolved blockers, passing tests replacing failures, completed goals, and rejected strategies. Never treat assistant speculation as repository/tool evidence. A user_decision or mandatory_policy value must reproduce one or more whole consecutive sentences or clauses of a single cited event, dropping only filler words and punctuation: never cut a clause, quote a question, or add words. Keep values concise, <=1024 UTF-8 bytes. Retrieve source references for details instead of copying bodies."#;
     let base = serde_json::json!({"parent":parent,"instructions":instructions,"schema":schema});
     let max_tokens = 4096.min(window / 4);
@@ -59,7 +75,8 @@ pub(crate) fn fold_request(
         .saturating_sub(OMITTED_NOTE_RESERVE);
     let mut records = Vec::new();
     let mut omitted = 0usize;
-    for event in events.iter().rev() {
+    let mut covered = 0usize;
+    for event in events {
         let cap = if event.kind == super::ContextEventKind::User {
             USER_EXCERPT_CHARS
         } else {
@@ -67,7 +84,7 @@ pub(crate) fn fold_request(
         };
         // A user message goes in whole when it takes at most half of what is
         // left: a constraint can sit anywhere in a long paste, but one paste
-        // must not push every older event out (WOR-66).
+        // must not push every other event out (WOR-66).
         let whole = (event.kind == super::ContextEventKind::User)
             .then(|| fold_record(event, usize::MAX))
             .filter(|record| record.len() < remaining / 2);
@@ -75,25 +92,34 @@ pub(crate) fn fold_request(
         if record.len() + 1 > remaining && cap > EXCERPT_CHARS {
             record = fold_record(event, EXCERPT_CHARS);
         }
-        // One oversized record must not hide the older events behind it.
         if record.len() + 1 > remaining {
+            // The chunk is full: this event opens the next one. Alone in an
+            // empty chunk it cannot be shown, so the deterministic state
+            // carries it and the request says so.
+            if !records.is_empty() {
+                break;
+            }
             omitted += 1;
+            covered += 1;
             continue;
         }
         remaining -= record.len() + 1;
         records.push(record);
+        covered += 1;
     }
     if omitted > 0 {
         records.push(serde_json::json!({"omitted_events":omitted}).to_string());
     }
-    records.reverse();
-    Some(SummarizeRequest {
-        system: CONTEXT_VM_FOLD_SYSTEM_PROMPT.into(),
-        prompt: format!("{prefix}{}", records.join("\n")),
-        max_tokens,
-        label: "context state fold".into(),
-        provider: provider.into(),
-        model_id: model_id.into(),
+    Some(FoldChunk {
+        request: SummarizeRequest {
+            system: CONTEXT_VM_FOLD_SYSTEM_PROMPT.into(),
+            prompt: format!("{prefix}{}", records.join("\n")),
+            max_tokens,
+            label: "context state fold".into(),
+            provider: provider.into(),
+            model_id: model_id.into(),
+        },
+        covered,
     })
 }
 
@@ -240,10 +266,13 @@ mod request_tests {
         }
     }
 
-    fn prompt(events: &[ContextEvent], window: u64) -> String {
-        fold_request(&CheckpointState::default(), events, None, window, "p", "m")
+    fn chunk(events: &[ContextEvent], window: u64) -> FoldChunk {
+        fold_chunk(&CheckpointState::default(), events, None, window, "p", "m")
             .expect("fold request fits")
-            .prompt
+    }
+
+    fn prompt(events: &[ContextEvent], window: u64) -> String {
+        chunk(events, window).request.prompt
     }
 
     #[test]
@@ -264,16 +293,59 @@ mod request_tests {
     }
 
     #[test]
-    fn wor65_oversized_recent_record_does_not_drop_older_events() {
+    fn wor65_oversized_record_does_not_drop_older_events() {
         let mut huge = event(2, ContextEventKind::ToolResult, "recent");
         huge.source_ref = format!("session:{}", "x".repeat(200_000));
         let events = [
             event(1, ContextEventKind::User, "NEVER-TOUCH-MIGRATIONS"),
             huge,
         ];
-        let prompt = prompt(&events, 32_000);
-        assert!(prompt.contains("NEVER-TOUCH-MIGRATIONS"));
-        assert!(prompt.contains("\"omitted_events\":1"));
+        // The first chunk holds the older event and stops before the huge one.
+        let first = chunk(&events, 32_000);
+        assert_eq!(first.covered, 1);
+        assert!(first.request.prompt.contains("NEVER-TOUCH-MIGRATIONS"));
+        // Alone, the huge record cannot be shown: covered, and named.
+        let second = chunk(&events[1..], 32_000);
+        assert_eq!(second.covered, 1);
+        assert!(second.request.prompt.contains("\"omitted_events\":1"));
+    }
+
+    #[test]
+    fn every_event_reaches_some_chunk_oldest_first() {
+        let events: Vec<_> = (1..=400)
+            .map(|n| {
+                event(
+                    n,
+                    ContextEventKind::User,
+                    &format!("CONSTRAINT-{n} {}", "pad ".repeat(200)),
+                )
+            })
+            .collect();
+        let mut rest: &[ContextEvent] = &events;
+        let mut chunks = 0;
+        let mut seen = String::new();
+        while !rest.is_empty() {
+            let next = chunk(rest, 32_000);
+            assert!(next.covered > 0, "a chunk must make progress");
+            seen.push_str(&next.request.prompt);
+            rest = &rest[next.covered..];
+            chunks += 1;
+        }
+        assert!(chunks > 1, "400 events do not fit one request");
+        for n in 1..=400 {
+            assert!(seen.contains(&format!("CONSTRAINT-{n} ")), "event {n} lost");
+        }
+    }
+
+    #[test]
+    fn no_chunk_when_the_state_alone_fills_the_window() {
+        let mut parent = CheckpointState::default();
+        parent.goals.push(crate::runtime::context_vm::StateValue {
+            value: "g".repeat(40_000),
+            provenance: Vec::new(),
+        });
+        let events = [event(1, ContextEventKind::User, "x")];
+        assert!(fold_chunk(&parent, &events, None, 8_000, "p", "m").is_none());
     }
 
     #[test]

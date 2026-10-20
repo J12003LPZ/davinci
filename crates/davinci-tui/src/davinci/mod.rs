@@ -12,6 +12,7 @@ pub mod fixtures;
 pub mod links;
 pub mod model;
 mod paste_burst;
+pub mod roster;
 pub mod runtime;
 pub mod sanitize;
 pub mod selection;

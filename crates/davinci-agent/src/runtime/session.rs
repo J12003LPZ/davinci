@@ -308,14 +308,20 @@ impl WorkerSessionLease {
 
 impl RuntimeSubscriber for RuntimeLogSubscriber {
     fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
-        if let Ok(mut writer) = self.writer.lock() {
-            if let Err(error) = writer.append(event) {
-                eprintln!("[davinci-runtime] runtime sidecar append failed: {error}");
-            }
-        } else {
-            eprintln!("[davinci-runtime] runtime sidecar lock failed");
+        if let Err(error) = self.record_durably(event) {
+            eprintln!("[davinci-runtime] runtime sidecar: {error}");
         }
         RuntimeDecision::Continue
+    }
+
+    fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| "runtime log lock failed".to_string())?;
+        writer
+            .append(event)
+            .map_err(|error| format!("runtime log append failed: {error}"))
     }
 }
 

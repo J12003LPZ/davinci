@@ -294,64 +294,6 @@ pub(crate) fn instruction_chain(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn load_context_files_for_targets(
-    cwd: &Path,
-    enabled: bool,
-    targets: &[PathBuf],
-) -> Vec<ContextFile> {
-    if !enabled || repository_root(cwd).is_none() {
-        return Vec::new();
-    }
-
-    let root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut files = load_context_files(cwd, true);
-    let mut seen = HashSet::new();
-    for file in &files {
-        seen.insert(fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()));
-    }
-
-    for target in targets {
-        let absolute = if target.is_absolute() {
-            target.clone()
-        } else {
-            cwd.join(target)
-        };
-        let start = if absolute.is_dir() {
-            absolute
-        } else {
-            absolute.parent().unwrap_or(cwd).to_path_buf()
-        };
-        let start = fs::canonicalize(&start).unwrap_or(start);
-        if !start.starts_with(&root) {
-            continue;
-        }
-        let mut ancestors = start
-            .ancestors()
-            .take_while(|path| path.starts_with(&root))
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        ancestors.reverse();
-        for directory in ancestors {
-            let path = directory.join(INSTRUCTION_FILE);
-            if !path.is_file() {
-                continue;
-            }
-            let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !seen.insert(identity) {
-                continue;
-            }
-            if let Ok(body) = fs::read_to_string(&path) {
-                files.push(ContextFile {
-                    path,
-                    name: INSTRUCTION_FILE.to_string(),
-                    body,
-                });
-            }
-        }
-    }
-    files
-}
-
 /// `size + mtime` of an on-disk instruction file: what a request-boundary
 /// check can read without opening the file.
 pub(crate) type FileStamp = (Option<std::time::SystemTime>, u64);
@@ -359,6 +301,20 @@ pub(crate) type FileStamp = (Option<std::time::SystemTime>, u64);
 pub(crate) fn file_stamp(path: &Path) -> Option<FileStamp> {
     let meta = fs::metadata(path).ok()?;
     Some((meta.modified().ok(), meta.len()))
+}
+
+/// Writes closer than this to now may share a timestamp with an earlier one
+/// (FAT keeps two seconds; others tick coarsely), so a matching stamp does not
+/// prove the content is the same.
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn is_racy(modified: Option<std::time::SystemTime>) -> bool {
+    match modified {
+        None => true,
+        Some(at) => std::time::SystemTime::now()
+            .duration_since(at)
+            .map_or(true, |age| age < RACY_WINDOW),
+    }
 }
 
 /// `plugin:<name>` entries are SessionStart hook output, not files.
@@ -390,7 +346,10 @@ pub(crate) fn reload_changed_context_files(
             Err(_) => return true,
         };
         let stamp = (meta.modified().ok(), meta.len());
-        if stamps.get(&file.path) == Some(&stamp) {
+        // Same size and mtime is only proof of "unchanged" once the mtime is
+        // old enough that another write could not share it (coarse clocks,
+        // two writes in one tick). A recent file is read and compared.
+        if stamps.get(&file.path) == Some(&stamp) && !is_racy(stamp.0) {
             return true;
         }
         if let Ok(body) = fs::read_to_string(&file.path) {
@@ -695,6 +654,20 @@ mod tests {
     }
 
     #[test]
+    fn a_same_size_edit_inside_one_timestamp_tick_is_still_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        fs::write(&path, "use tabs").unwrap();
+        let (mut files, mut stamps) = loaded(&path);
+        // Same length, written at once: the stamp may well be identical.
+        fs::write(&path, "use gaps").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        stamps.insert(path.clone(), (Some(modified), 8));
+        assert!(reload_changed_context_files(&mut files, &mut stamps));
+        assert_eq!(files[0].body, "use gaps");
+    }
+
+    #[test]
     fn a_touched_file_with_the_same_body_is_not_a_change() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("AGENTS.md");
@@ -867,10 +840,16 @@ mod tests {
         fs::write(root.path().join("src/CLAUDE.md"), "nested claude rules").unwrap();
         fs::write(root.path().join("src/file.rs"), "").unwrap();
 
-        let files =
-            load_context_files_for_targets(root.path(), true, &[PathBuf::from("src/file.rs")]);
+        let files = load_context_files(root.path(), true);
         let bodies: Vec<&str> = files.iter().map(|file| file.body.as_str()).collect();
         assert_eq!(bodies, ["davinci rules"]);
+        // Beside a target, the nested CLAUDE.md is no instruction file either.
+        assert!(governing_instruction_files(
+            root.path(),
+            Path::new("src/file.rs"),
+            &HashSet::from([fs::canonicalize(root.path().join("AGENTS.md")).unwrap()])
+        )
+        .is_empty());
 
         // A directory with CLAUDE.md alone gives davinci no instructions.
         fs::remove_file(root.path().join("AGENTS.md")).unwrap();
@@ -887,10 +866,10 @@ mod tests {
         fs::write(outside.path().join("AGENTS.md"), "@CLAUDE.md").unwrap();
         fs::write(outside.path().join("src/file.rs"), "").unwrap();
         assert!(load_context_files(outside.path(), true).is_empty());
-        assert!(load_context_files_for_targets(
+        assert!(governing_instruction_files(
             outside.path(),
-            true,
-            &[PathBuf::from("src/file.rs")]
+            Path::new("src/file.rs"),
+            &HashSet::new()
         )
         .is_empty());
     }
@@ -934,42 +913,6 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains(r#"paths=["AGENTS.md"]"#), "{prompt}");
-    }
-
-    #[test]
-    fn relative_cwd_loader_preserves_nested_instruction_scope() {
-        let current = std::env::current_dir().unwrap();
-        let root = tempfile::tempdir_in(&current).unwrap();
-        fs::create_dir(root.path().join("src")).unwrap();
-        fs::write(root.path().join("AGENTS.md"), "root instructions").unwrap();
-        fs::write(root.path().join("src/AGENTS.md"), "nested instructions").unwrap();
-        fs::write(root.path().join("src/file.rs"), "").unwrap();
-        let cwd = root.path().strip_prefix(&current).unwrap();
-        let files = load_context_files_for_targets(cwd, true, &[PathBuf::from("src/file.rs")]);
-        let mut prompt = String::new();
-        append_repository_context(&mut prompt, &files, cwd);
-        assert!(prompt.contains("src/AGENTS.md"), "{prompt}");
-        assert!(prompt.contains("root instructions") && prompt.contains("nested instructions"));
-        assert!(!prompt.contains(root.path().to_str().unwrap()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_cwd_loader_preserves_nested_instruction_scope() {
-        let root = tempfile::tempdir().unwrap();
-        let checkout = root.path().join("checkout");
-        fs::create_dir_all(checkout.join(".git")).unwrap();
-        fs::create_dir_all(checkout.join("src")).unwrap();
-        fs::write(checkout.join("src/AGENTS.md"), "nested instructions").unwrap();
-        fs::write(checkout.join("src/file.rs"), "").unwrap();
-        let link = root.path().join("linked-checkout");
-        std::os::unix::fs::symlink(&checkout, &link).unwrap();
-        let files = load_context_files_for_targets(&link, true, &[PathBuf::from("src/file.rs")]);
-        let mut prompt = String::new();
-        append_repository_context(&mut prompt, &files, &link);
-        assert!(prompt.contains("src/AGENTS.md"), "{prompt}");
-        assert!(prompt.contains("nested instructions"), "{prompt}");
-        assert!(!prompt.contains(root.path().to_str().unwrap()));
     }
 
     #[test]

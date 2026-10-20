@@ -71,3 +71,64 @@ test('refresh cannot reuse the consumed pairing capability',async({page})=>{
     await expect(page.getByRole('button',{name:'Create design',exact:true})).toBeDisabled();
   }finally{await host.close();}
 });
+
+function conceptFixture(){
+  const id=crypto.randomUUID(),ids=['Alpha','Beta','Gamma'].map(title=>({id:crypto.randomUUID(),title,board:crypto.randomUUID()}));
+  const manifest={id,title:'Agent dashboard',revision:'1',requested_variants:3};
+  const revision={revision:'1',bindings:[],variants:ids.map(v=>({id:v.id,title:v.title,artboards:[{id:v.board,title:v.title+' desktop',entry_point:v.title+'.html'}]}))};
+  const calls=[];let chosen=null,created=null;
+  const state=()=>({manifest,revision,comments:[],captures:[],quality:null,runtime_error:'Fixture has no native render evidence',evidence_hash:null,acceptance_gaps:null,accepted:false,
+    selection:chosen?{artifact_id:id,revision:manifest.revision,source_hash:'b'.repeat(64),variant_id:chosen,operation_id:crypto.randomUUID()}:null});
+  async function dispatch({operation,payload}){
+    calls.push({operation,payload});
+    switch(operation){
+      case 'list':return created?[manifest]:[];
+      case 'resolve':return {kind:'product',variants:3,brief:payload.brief,source:'inferred'};
+      case 'create':created=payload.input;return manifest;
+      case 'status':return state();
+      case 'select':chosen=payload.request.variant_id;return {};
+      case 'generate':manifest.revision=String(BigInt(manifest.revision)+1n);revision.revision=manifest.revision;
+        return {progress:{phase:'complete'},last_revision:manifest.revision,findings:[],failure:null};
+      case 'close':return {};
+      default:throw new Error('Unexpected fixture operation: '+operation);
+    }
+  }
+  return {dispatch,calls,ids,get created(){return created;},get chosen(){return chosen;}};
+}
+test('a brief makes three comparable concepts and a chosen one is revised alone',async({page})=>{
+  const data=conceptFixture();const host=await createDesignHost({assets:assets(),dispatch:data.dispatch});
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  try{
+    await page.goto(host.url);
+    await expect(page.getByText('Connected to this session',{exact:true})).toBeVisible();
+    await page.getByLabel('New design brief').fill('Create a modern dashboard for AI agents');
+    await page.getByRole('button',{name:'Create design',exact:true}).click();
+    // No hard-coded landing page and two concepts: the host decided.
+    await expect(page.getByRole('button',{name:'Choose this concept'})).toHaveCount(3);
+    expect(data.created).toMatchObject({kind:'product',variants:3});
+    const first=data.calls.find(c=>c.operation==='generate');
+    expect(first.payload.request.target_variant).toBeNull();
+    await expect(page.getByLabel('Concepts')).toContainText('Alpha');
+    await expect(page.getByLabel('Concepts')).toContainText('Gamma');
+    await expect(page.getByRole('button',{name:'Generate revision',exact:true})).toBeVisible();
+
+    await page.getByRole('article').filter({hasText:'Beta'}).getByRole('button',{name:'Choose this concept'}).click();
+    await expect(page.getByRole('button',{name:'Chosen'})).toHaveCount(1);
+    expect(data.chosen).toBe(data.ids[1].id);
+    await expect(page.getByRole('button',{name:'Revise “Beta”'})).toBeVisible();
+    await expect(page.getByText('Changes only “Beta”')).toBeVisible();
+
+    await page.getByLabel('Revision request',{exact:true}).fill('Make Beta more minimal');
+    await page.getByRole('button',{name:'Revise “Beta”'}).click();
+    await expect(page.getByText('Source generation complete.')).toBeVisible();
+    const revise=data.calls.filter(c=>c.operation==='generate').at(-1);
+    expect(revise.payload.request.target_variant).toBe(data.ids[1].id);
+    expect(data.calls.map(c=>c.operation)).not.toContain('apply');
+    await page.screenshot({path:test.info().outputPath('concepts.png'),fullPage:true});
+
+    await page.getByRole('button',{name:'Chosen'}).click();
+    await expect(page.getByRole('button',{name:'Generate revision',exact:true})).toBeVisible();
+    expect(data.chosen).toBeNull();
+    expect(errors).toEqual([]);
+  }finally{await host.close();}
+});

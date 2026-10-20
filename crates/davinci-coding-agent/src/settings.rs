@@ -356,6 +356,10 @@ pub struct Settings {
     /// overrides. No TypeScript counterpart.
     #[serde(default, rename = "agentTeams")]
     pub agent_teams: Option<bool>,
+    /// The agent roster under the composer and the worker view behind it.
+    /// On unless set to `false`; off restores the legacy agents panel alone.
+    #[serde(default, rename = "agentFocusUi")]
+    pub agent_focus_ui: Option<bool>,
     /// `web_search` provider keys. No TypeScript counterpart.
     #[serde(default, rename = "webSearch")]
     pub web_search: Option<WebSearchSettings>,

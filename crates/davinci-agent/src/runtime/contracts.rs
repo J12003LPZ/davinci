@@ -385,6 +385,70 @@ pub fn redact_secrets(input: &str) -> String {
         }
     }
 
+    redact_structured_secrets(&output)
+}
+
+/// Shapes the prefix and `key=value` passes above miss: JWTs, other GitHub
+/// token kinds, `Authorization` and cookie headers (whatever the scheme),
+/// JSON `"secret": "value"` pairs, `NAME_KEY=value` assignments and
+/// `--token value` flags.
+fn redact_structured_secrets(input: &str) -> String {
+    use std::sync::OnceLock;
+    static PASSES: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
+    let passes = PASSES.get_or_init(|| {
+        let word = "(?:token|secret|password|passwd|api[-_]?key|private[-_]?key|credential)";
+        let specs: Vec<(String, &'static str)> = vec![
+            (
+                r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*".to_string(),
+                "[REDACTED_JWT]",
+            ),
+            (r"\bgh[opusr]_[A-Za-z0-9_]{6,}".to_string(), "gh_[REDACTED]"),
+            (
+                r#"(?i)\b(authorization|proxy-authorization|cookie|set-cookie)(["']?\s*[:=]\s*)((?:bearer|basic|digest|token)\s+)?[^\r\n]*"#
+                    .to_string(),
+                "$1$2$3[REDACTED]",
+            ),
+            (
+                format!(r#"(?i)("[A-Za-z0-9_-]*{word}[A-Za-z0-9_-]*"\s*:\s*)"[^"]*""#),
+                "$1\"[REDACTED]\"",
+            ),
+            (
+                format!(r#"(?i)(--?[a-z-]*{word}[a-z-]*)(\s+|=)("[^"]*"|'[^']*'|\S+)"#),
+                "$1$2[REDACTED]",
+            ),
+            (
+                format!(
+                    r#"(?i)\b([a-z0-9_]*(?:key|{word})[a-z0-9_]*)=("[^"]*"|'[^']*'|[^\s&|;,]+)"#
+                ),
+                "$1=[REDACTED]",
+            ),
+        ];
+        specs
+            .into_iter()
+            .map(|(pattern, replacement)| {
+                (
+                    regex::Regex::new(&pattern).expect("redaction pattern"),
+                    replacement,
+                )
+            })
+            .collect()
+    });
+    let mut output = input.to_string();
+    for (index, (pattern, replacement)) in passes.iter().enumerate() {
+        // A value an earlier pass already masked (`key=sk-[REDACTED]`) keeps
+        // its more specific marker. Header lines are always redacted whole.
+        output = pattern
+            .replace_all(&output, |caps: &regex::Captures| {
+                let whole = caps.get(0).map_or("", |m| m.as_str());
+                if index > 2 && whole.contains("[REDACTED") {
+                    return whole.to_string();
+                }
+                let mut expanded = String::new();
+                caps.expand(replacement, &mut expanded);
+                expanded
+            })
+            .into_owned();
+    }
     output
 }
 

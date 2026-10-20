@@ -2,13 +2,13 @@ import React, {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {pair, call as hostCall, captureBlob} from "./api";
 import {InteractionPanel} from "./InteractionPanel";
-import type {ArtifactManifest, Artboard, DesignComment, DesignRevision, DesignRunState, EditableBinding, ExportFormat, ExportReceipt, InteractionReceipt, PrototypeAction, PreparedHandoff, QualityReport, Viewport} from "./contracts.generated";
+import type {ArtifactManifest, Artboard, DesignComment, DesignRevision, DesignRunState, DesignSelectionReceipt, ResolvedDesignBrief, EditableBinding, ExportFormat, ExportReceipt, InteractionReceipt, PrototypeAction, PreparedHandoff, QualityReport, Viewport} from "./contracts.generated";
 import "./style.css";
 
 type Capture = {artboard_id:string; viewport:Viewport; sha256:string};
 type GeometryNode = {id:string; x:number; y:number; width:number; height:number; visible:boolean};
 type ArtifactState = {manifest: ArtifactManifest; revision: DesignRevision | null; quality: QualityReport | null; captures: Capture[]; comments:[DesignComment,boolean][];
-  runtime_error:string|null; evidence_hash:string|null; acceptance_gaps:string[]|null; accepted:boolean};
+  runtime_error:string|null; evidence_hash:string|null; acceptance_gaps:string[]|null; accepted:boolean; selection:DesignSelectionReceipt|null};
 function App() {
   const [ready,setReady]=useState(false), [busy,setBusy]=useState(false), [error,setError]=useState("");
   const [artifacts,setArtifacts]=useState<ArtifactManifest[]>([]), [selected,setSelected]=useState<ArtifactState|null>(null);
@@ -19,7 +19,7 @@ function App() {
   const [destination,setDestination]=useState(""),[exportFormat,setExportFormat]=useState<ExportFormat>("source"),[acknowledged,setAcknowledged]=useState(false);
   const [image,setImage]=useState(""),[geometry,setGeometry]=useState<GeometryNode[]>([]);
   const [targets,setTargets]=useState(""),[proposal,setProposal]=useState<PreparedHandoff|null>(null);
-  const [interaction,setInteraction]=useState<InteractionReceipt|null>(null);
+  const [interaction,setInteraction]=useState<InteractionReceipt|null>(null),[thumbs,setThumbs]=useState<Record<string,string>>({});
   const pending=useRef<AbortController|null>(null);
   function call<T>(operation:string,payload:object):Promise<T>{return hostCall<T>(operation,payload,pending.current?.signal);}
   async function run(action:()=>Promise<void>) {
@@ -29,9 +29,10 @@ function App() {
     finally {pending.current=null;setBusy(false);}
   }
   async function refresh(){setArtifacts(await call<ArtifactManifest[]>("list",{}));}
-  async function open(id:string){
+  async function open(id:string,focus?:string){
     const state=await call<ArtifactState>("status",{artifact_id:id});
-    setSelected(state);setBoard(state.revision?.variants[0]?.artboards[0]||null);setBinding(null);setRevision(state.manifest.revision);
+    const first=state.revision?.variants.find(v=>v.id===focus)??state.revision?.variants[0];
+    setSelected(state);setBoard(first?.artboards[0]||null);setBinding(null);setRevision(state.manifest.revision);
     setAcknowledged(false);
     setProposal(null);
   }
@@ -70,11 +71,36 @@ function App() {
       actions:[...(interaction?.request.actions??[]),action],operation_id:crypto.randomUUID()}});
     setInteraction(result);setNotice("Prototype sequence: "+result.capture.checks.interaction.state+". "+result.capture.checks.interaction.failures.join(" "));
   }
-  async function generate(item:ArtifactManifest,brief:string){
-    const state=await call<DesignRunState>("generate",{request:{artifact_id:item.id,expected_revision:item.revision,brief,operation_id:crypto.randomUUID()}});
-    await refresh();await open(item.id);
-    setNotice(state.progress.phase==="complete"?"Source generation complete. Review the separate evidence checks before acceptance.":"Generation stopped; revision "+state.last_revision+" is retained. "+state.findings.join(" "));
+  async function generate(item:ArtifactManifest,brief:string,target:string|null){
+    const state=await call<DesignRunState>("generate",{request:{artifact_id:item.id,expected_revision:item.revision,brief,operation_id:crypto.randomUUID(),target_variant:target}});
+    await refresh();await open(item.id,target??undefined);
+    const failure=state.failure;
+    setNotice(state.progress.phase==="complete"?"Source generation complete. Review the separate evidence checks before acceptance.":
+      failure?"Generation stopped at "+failure.phase+": "+failure.message+" Expected: "+failure.expected_schema+". Revision "+failure.revision+" is retained."+(failure.retryable?" Resume it from DaVinci with /design resume "+item.id+" "+failure.checkpoint+".":""):
+      "Generation stopped; revision "+state.last_revision+" is retained. "+state.findings.join(" "));
   }
+  async function choose(variantId:string|null){
+    if(!selected?.revision)return;
+    await call("select",{request:{artifact_id:selected.manifest.id,revision:selected.manifest.revision,variant_id:variantId,operation_id:crypto.randomUUID()}});
+    await open(selected.manifest.id,variantId??undefined);
+    setNotice(variantId?"Concept chosen. A revision request now changes only this concept. No application files were changed.":"Choice cleared. A revision request changes every concept.");
+  }
+  useEffect(()=>{
+    setThumbs({});
+    if(busy||!selected?.revision)return;
+    const abort=new AbortController(),urls:string[]=[];
+    const [width,height]=viewport.split("×").map(Number);
+    for(const variant of selected.revision.variants){
+      const first=variant.artboards[0],hit=selected.captures.find(c=>c.artboard_id===first?.id&&c.viewport.width===width&&c.viewport.height===height);
+      if(!first||!hit)continue;
+      void captureBlob({artifact_id:selected.manifest.id,revision:selected.manifest.revision,artboard_id:first.id,viewport:hit.viewport,interaction_id:null},hit.sha256,abort.signal)
+        .then(blob=>{if(abort.signal.aborted)return;const url=URL.createObjectURL(blob);urls.push(url);setThumbs(current=>({...current,[variant.id]:url}));})
+        .catch(e=>{if(!abort.signal.aborted)setNotice("The preview of "+variant.title+" could not be loaded: "+String(e));});
+    }
+    return()=>{abort.abort();urls.forEach(url=>URL.revokeObjectURL(url));};
+  },[selected?.manifest.id,selected?.manifest.revision,viewport,busy,selected?.captures.length]);
+  const chosen=selected?.selection?.variant_id??null;
+  const chosenTitle=selected?.revision?.variants.find(v=>v.id===chosen)?.title;
   const bindings=selected?.revision?.bindings.filter(b=>b.artboard_id===board?.id)||[];
   const dimensions=selected?.quality ? Object.entries(selected.quality).filter(([key])=>!["revision","evidence"].includes(key)): [];
   return <main>
@@ -86,15 +112,24 @@ function App() {
     <div className="workspace" aria-busy={busy}>
       <aside aria-label="Artifacts and artboards"><h2>Artifacts</h2>
         <form onSubmit={e=>{e.preventDefault();void run(async()=>{
-          const item=await call<ArtifactManifest>("create",{input:{title:brief.slice(0,80),brief,kind:"landing",variants:2,operation_id:crypto.randomUUID()}});
-          await refresh();await open(item.id);await generate(item,brief);setBrief("");
+          const plan=await call<ResolvedDesignBrief>("resolve",{brief});
+          const item=await call<ArtifactManifest>("create",{input:{title:brief.slice(0,80),brief,kind:plan.kind,variants:plan.variants,operation_id:crypto.randomUUID()}});
+          await refresh();await open(item.id);await generate(item,brief,null);setBrief("");
         });}}><label htmlFor="brief">New design brief</label><textarea id="brief" required maxLength={65536} value={brief} onChange={e=>setBrief(e.target.value)}/>
           <button disabled={!ready||busy}>Create design</button></form>
         <nav aria-label="Artifact list">{artifacts.map(a=><button key={a.id} aria-current={selected?.manifest.id===a.id?"page":undefined} onClick={()=>void run(()=>open(a.id))}>{a.title}<small>Revision {a.revision}</small></button>)}</nav>
-        {selected&&<form onSubmit={e=>{e.preventDefault();void run(()=>generate(selected.manifest,brief));}}><label htmlFor="revision-brief">Revision request</label><textarea id="revision-brief" required maxLength={65536} value={brief} onChange={e=>setBrief(e.target.value)}/><button disabled={!ready||busy}>Generate revision</button></form>}
+        {selected&&<form onSubmit={e=>{e.preventDefault();void run(()=>generate(selected.manifest,brief,chosen));}}><label htmlFor="revision-brief">Revision request</label><textarea id="revision-brief" required maxLength={65536} value={brief} onChange={e=>setBrief(e.target.value)}/><p className="hint">{chosenTitle?"Changes only “"+chosenTitle+"”. Other concepts stay as they are.":"Changes every concept. Choose one to revise only that concept."}</p><button disabled={!ready||busy}>{chosenTitle?"Revise “"+chosenTitle+"”":"Generate revision"}</button></form>}
         {selected?.revision?.variants.map(v=><section key={v.id}><h3>{v.title}</h3><ul>{v.artboards.map(b=><li key={b.id}><button disabled={busy} aria-pressed={board?.id===b.id} onClick={()=>{setBoard(b);setBinding(null);}}>{b.title}</button></li>)}</ul></section>)}
       </aside>
       <section className="canvas" aria-label="Artboard preview">
+        {!!selected?.revision?.variants.length&&<section className="concepts" aria-label="Concepts">
+          {selected.revision.variants.map(v=><article key={v.id} className="concept" aria-current={board&&v.artboards.some(b=>b.id===board.id)?"true":undefined}>
+            {thumbs[v.id]?<img src={thumbs[v.id]} alt={v.title+" preview"}/>:<div className="thumb-empty">No capture at this viewport yet</div>}
+            <h3>{v.title}</h3>
+            <div className="actions"><button disabled={busy} onClick={()=>{setBoard(v.artboards[0]||null);setBinding(null);}}>Preview</button>
+              <button disabled={busy} aria-pressed={chosen===v.id} onClick={()=>void run(()=>choose(chosen===v.id?null:v.id))}>{chosen===v.id?"Chosen":"Choose this concept"}</button></div>
+          </article>)}
+        </section>}
         <div className="toolbar"><div role="group" aria-label="Workspace mode"><button disabled={busy} aria-pressed={mode==="edit"} onClick={()=>setMode("edit")}>Edit</button><button disabled={busy} aria-pressed={mode==="interact"} onClick={()=>setMode("interact")}>Interact</button></div>
           <label>Viewport<select disabled={busy} value={viewport} onChange={e=>setViewport(e.target.value)}>{["390×844","768×1024","1440×900"].map(v=><option key={v}>{v}</option>)}</select></label>
           <label>Zoom <input aria-label="Zoom" type="range" min={25} max={200} step={25} value={zoom} onChange={e=>setZoom(Number(e.target.value))}/>{zoom}%</label>

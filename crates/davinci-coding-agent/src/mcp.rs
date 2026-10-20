@@ -69,6 +69,9 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool, sandbox_active: bool) -
     };
     let mut project = load_layer(&path);
     resolve_origin(&mut project, true, sandbox_active);
+    for server in project.mcp_servers.values_mut() {
+        server.project_origin = true;
+    }
     davinci_mcp::merge(user, project)
 }
 

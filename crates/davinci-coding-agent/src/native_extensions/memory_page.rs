@@ -13,13 +13,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 pub const PAGE_FILE: &str = "memory-page.html";
 const RECENT_RECORDS: usize = 40;
 const TEXT_PREVIEW_CHARS: usize = 400;
 const QUERY_PREVIEW_CHARS: usize = 160;
-const PROBE_TEXT: &str = "davinci memory page connectivity probe";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOptions {
@@ -60,59 +58,42 @@ pub struct Probe {
     pub embed_error: Option<String>,
 }
 
-fn model_matches(configured: &str, installed: &str) -> bool {
-    installed == configured
-        || (!configured.contains(':')
-            && installed.split(':').next() == Some(configured)
-            && installed.ends_with(":latest"))
-}
+#[cfg(test)]
+use super::setup_health::model_matches;
 
 pub fn probe(memory: &VectorMemory) -> Probe {
+    probe_config(&memory.config)
+}
+
+/// Probe from a config snapshot, so callers need not hold the memory lock
+/// while the network answers (see `setup_health`).
+pub fn probe_config(config: &super::vector_memory::VectorMemoryConfig) -> Probe {
+    use super::setup_health::{probe_ollama, EmbedOutcome, ProbeTarget, EMBEDDING_MISMATCH};
     let mut probe = Probe::default();
-    if !memory.config.enabled {
+    if !config.enabled {
         return probe;
     }
     probe.attempted = true;
-    let base = memory.config.ollama_url.trim_end_matches('/');
-    let timeout = Duration::from_secs(memory.config.request_timeout_seconds.clamp(1, 10));
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
-    match agent
-        .get(&format!("{base}/api/tags"))
-        .call()
-        .map_err(|error| error.to_string())
-        .and_then(|response| {
-            response
-                .into_json::<Value>()
-                .map_err(|error| error.to_string())
-        }) {
-        Ok(tags) => {
-            probe.reachable = true;
-            probe.installed_models = tags["models"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|model| model["name"].as_str().map(str::to_string))
-                .collect();
-            probe.model_installed = Some(
-                probe
-                    .installed_models
-                    .iter()
-                    .any(|name| model_matches(&memory.config.embedding_model, name)),
-            );
-        }
-        Err(error) => {
-            probe.server_error = Some(error);
-            return probe;
-        }
-    }
-    let started = Instant::now();
-    match memory.embed_query_text(PROBE_TEXT) {
-        Ok(vector) => {
+    let result = probe_ollama(&ProbeTarget::from_config(config));
+    probe.reachable = result.reachable;
+    probe.server_error = result.server_error;
+    probe.installed_models = result.installed_models;
+    probe.model_installed = result.model_installed;
+    match result.embed {
+        EmbedOutcome::NotAttempted => {}
+        EmbedOutcome::Ok { dimensions, millis } => {
             probe.embed_ok = true;
-            probe.embed_dimensions = Some(vector.len());
-            probe.embed_ms = Some(started.elapsed().as_millis() as u64);
+            probe.embed_dimensions = Some(dimensions);
+            probe.embed_ms = Some(millis);
         }
-        Err(error) => probe.embed_error = Some(error.to_string()),
+        EmbedOutcome::Mismatch { actual } => {
+            probe.embed_dimensions = Some(actual);
+            probe.embed_error = Some(format!(
+                "{EMBEDDING_MISMATCH}: the server returned {actual} dimensions; memory is configured for {}",
+                config.embedding_dimensions
+            ));
+        }
+        EmbedOutcome::Failed(error) => probe.embed_error = Some(error),
     }
     probe
 }
@@ -224,10 +205,15 @@ pub fn build_report(memory: &VectorMemory, options: &PageOptions) -> Report {
             memory.config.embedding_model, memory.config.embedding_model
         ));
     }
-    if probe.reachable && !probe.embed_ok {
+    if probe.reachable && !probe.embed_ok && probe.model_installed != Some(false) {
         warnings.push(format!(
             "The test embedding failed: {}",
             probe.embed_error.as_deref().unwrap_or("unknown error")
+        ));
+    }
+    if let super::vector_memory::LocalStoreHealth::Unreadable(error) = memory.store_health() {
+        warnings.push(format!(
+            "The local record file cannot be read, so nothing is written to it: {error}"
         ));
     }
     if let Some(dimensions) = probe.embed_dimensions {
@@ -263,7 +249,7 @@ pub fn build_report(memory: &VectorMemory, options: &PageOptions) -> Report {
     let dense_ready = probe.reachable && probe.model_installed != Some(false) && probe.embed_ok;
     let verdict = if !memory.config.enabled {
         Verdict::Disabled
-    } else if dense_ready && lag == 0 {
+    } else if dense_ready && lag == 0 && !memory.store_health().is_unreadable() {
         Verdict::Connected
     } else {
         Verdict::Degraded

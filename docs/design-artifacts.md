@@ -40,10 +40,13 @@ Use `/design` in an existing persistent coding session. The terminal `design` en
 | Command form | Result |
 | --- | --- |
 | `/design list` | List artifacts on the selected session branch. |
-| `/design new "brief" --kind landing --variants 2` | Generate one to three concepts; kinds are `landing`, `product`, `document`. |
-| `/design open <artifact-id>` | Open the paired companion for this session. |
+| `/design <brief>` | Describe what you want in a sentence: `/design Create a modern dashboard for AI agents`. The kind (`landing`, `product` or `document`) is inferred from the words by a fixed keyword table, with `landing` when nothing matches, and three concepts are generated. A brief may start with a word that is also a subcommand (`/design open a cafe landing page`); it is a subcommand only when the rest of the line fits it. An apostrophe inside a word is part of the text. When the run completes, the studio opens in your browser. |
+| `/design new "brief" --kind landing --variants 2` | The explicit form: one to three concepts, with `--kind` overriding inference. |
+| `/design open <artifact-id>` | Open the paired companion for this session. If the browser cannot be opened the address is copied to the clipboard (it is a pairing capability and is never written to the transcript) and the result names the reason and this command. |
+| `/design select <artifact-id> <variant-id\|none>` | Choose one concept, or clear the choice. The choice survives restarts and revisions. It changes no source and no workspace file. |
+| `/design resume <artifact-id> <checkpoint>` | Retry the failed phase of a blocked generation from its checkpoint, inside the same request and time allowance. The failed run's result prints this command. |
 | `/design status <artifact-id>` | Report source and evidence state independently. |
-| `/design revise <artifact-id> "change request"` | Generate a new source revision. |
+| `/design revise <artifact-id> "change request"` | Generate a new source revision. While a concept is chosen, only that concept may change: a reply that alters another concept or the files it uses is sent back, and a model that will not comply ends the run with the exact reason and the last revision intact. |
 | `/design verify <artifact-id>` | Attempt current captures and deterministic checks. |
 | `/design fork <artifact-id> --revision <number>` | Create a separate artifact from retained source. |
 | `/design restore <artifact-id> --revision <number>` | Publish a new head using the historical source. |

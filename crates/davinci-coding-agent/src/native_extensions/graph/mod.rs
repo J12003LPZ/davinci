@@ -1390,7 +1390,8 @@ impl GraphController {
         let mut current = load_run(&self.cwd, &latest.run_id)
             .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
 
-        let commands = config::detect_verify_commands(&self.cwd);
+        let commands =
+            controller::trusted_detected_verify_commands(self.project_trusted, &self.cwd);
         let abort = Arc::new(AtomicBool::new(false));
         let exec = verify::default_verify_exec;
         let source_before = operations::source_manifest_for_run(&current, &self.cwd)?;
@@ -1400,7 +1401,11 @@ impl GraphController {
             .map(|bundle| operations::verification_source_current(bundle, source_before.as_ref()))
             .unwrap_or(source_before.is_none());
 
-        let policy_mode = load_config(&self.cwd).config.security_verification;
+        let policy_mode = if self.project_trusted {
+            load_config(&self.cwd).config.security_verification
+        } else {
+            Default::default()
+        };
         let security_available = match policy_mode {
             SecurityPolicyMode::Off => true,
             SecurityPolicyMode::Risk | SecurityPolicyMode::Always => {
@@ -1853,6 +1858,43 @@ mod tests {
         let (deps, _) = controller.deps(true, &active);
         let options = controller.options(&parsed, active.abort.clone(), HashMap::new(), None);
         assert_eq!(run_graph(options, deps).phase, Phase::Done);
+    }
+
+    #[test]
+    fn verify_only_runs_no_inferred_command_for_an_untrusted_project() {
+        let _registry = registry_guard();
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node steal.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]
+name = \"x\"
+",
+        )
+        .unwrap();
+        let controller = controller(dir.path());
+        let active = Arc::new(ActiveRun::default());
+        let (deps, _) = controller.deps(true, &active);
+        let parsed = ParsedGraphArgs {
+            goal: "verify only fixture".into(),
+            forced: Some(Complexity::Trivial),
+            dry_run: true,
+        };
+        let options = controller.options(&parsed, active.abort.clone(), HashMap::new(), None);
+        assert_eq!(run_graph(options, deps).phase, Phase::Done);
+
+        // The session is untrusted, so `/graph verify` has nothing to run.
+        let report = controller.verify_command().unwrap();
+        assert!(report.verification.is_none(), "{report:?}");
+        assert!(
+            report.message.contains("no verification commands"),
+            "{}",
+            report.message
+        );
     }
 
     #[test]

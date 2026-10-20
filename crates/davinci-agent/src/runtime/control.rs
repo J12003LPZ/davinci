@@ -355,7 +355,17 @@ pub struct WorkerSnapshot {
     pub owned_paths: Vec<PathBuf>,
     pub waiting_on: Option<String>,
     pub disconnected: bool,
+    /// True when the worker has reported no usage and none was estimated.
     pub usage_unknown: bool,
+    /// Cumulative tokens (input + output, cache kept apart), when known.
+    #[serde(default)]
+    pub usage: crate::subagent_progress::SubagentUsage,
+    /// The worker's latest visible call, e.g. `Read(src/lib.rs)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    /// Where it works, verified from the checkout's own `HEAD`.
+    #[serde(default)]
+    pub workspace: super::worker_workspace::WorkerWorkspace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -482,7 +492,104 @@ pub struct WorkerController {
     receipt_path: Option<Arc<PathBuf>>,
 }
 
+/// What a steer actually did: the freshness check and, when that passed, the
+/// mailbox's own receipt. `execute_command` alone only checks that the worker
+/// is current; it delivers nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerOutcome {
+    pub control: WorkerControlReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering: Option<super::mailbox::SteeringReceipt>,
+    /// The mailbox refused to take the message (unknown agent, oversize, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
+}
+
+impl SteerOutcome {
+    /// `queued | delivered | applied` only when the mailbox holds the message;
+    /// otherwise `rejected` or `stale` with `reason()` saying why.
+    pub fn state(&self) -> &str {
+        if let Some(steering) = &self.steering {
+            return &steering.state;
+        }
+        match self.control.status {
+            ControlStatus::Stale => "stale",
+            _ => "rejected",
+        }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        if let Some(steering) = &self.steering {
+            return steering.reason.clone();
+        }
+        self.delivery_error
+            .clone()
+            .or_else(|| self.control.reason.clone())
+            .or_else(|| Some(format!("control_{}", self.control.status.as_str())))
+    }
+
+    /// The message is held by the mailbox and will be seen by the worker.
+    pub fn is_held(&self) -> bool {
+        self.steering
+            .as_ref()
+            .is_some_and(|steering| steering.state != "rejected")
+    }
+}
+
 impl WorkerController {
+    /// Steer a worker: check the command is current, then put the message in
+    /// the worker's mailbox under the command's own id (so a repeat of the
+    /// same command answers with the first receipt). Nothing is reported as
+    /// held unless the mailbox holds it.
+    pub fn execute_steer(
+        &self,
+        mailbox: &super::mailbox::AgentMailbox,
+        command: WorkerControlCommand,
+        actor_authorized: bool,
+    ) -> SteerOutcome {
+        let WorkerControlAction::Steer { message, redirect } = command.action.clone() else {
+            return SteerOutcome {
+                control: WorkerControlReceipt {
+                    command_id: command.id,
+                    task_id: command.task_id,
+                    agent_id: command.agent_id,
+                    generation: command.generation,
+                    action: command.action.name().to_string(),
+                    status: ControlStatus::Rejected,
+                    reason: Some("not_a_steer".into()),
+                },
+                steering: None,
+                delivery_error: None,
+            };
+        };
+        let control = self.execute_command(command.clone(), actor_authorized);
+        if control.status != ControlStatus::Accepted {
+            return SteerOutcome {
+                control,
+                steering: None,
+                delivery_error: None,
+            };
+        }
+        match mailbox.send_steer_with_id(
+            command.id,
+            command.agent_id,
+            command.generation,
+            message,
+            redirect,
+        ) {
+            Ok(steering) => SteerOutcome {
+                control,
+                steering: Some(steering),
+                delivery_error: None,
+            },
+            Err(error) => SteerOutcome {
+                control,
+                steering: None,
+                delivery_error: Some(error.to_string()),
+            },
+        }
+    }
+
     pub fn new(registry: RuntimeRegistry) -> Self {
         Self {
             registry,
@@ -586,11 +693,28 @@ impl WorkerController {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        let elapsed_ms = if now_ms > record.started_ms {
-            (now_ms - record.started_ms) as u64
+        // A finished worker stops counting at the moment it finished.
+        let terminal = matches!(
+            record.state,
+            AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+        );
+        let end_ms = if terminal {
+            record.updated_ms.max(record.started_ms)
+        } else {
+            now_ms
+        };
+        let elapsed_ms = if end_ms > record.started_ms {
+            (end_ms - record.started_ms) as u64
         } else {
             0
         };
+        let progress = self.registry.get_progress(agent_id);
+        let usage = progress
+            .as_ref()
+            .map(|progress| progress.usage.clone())
+            .unwrap_or_default();
+        let activity = progress.and_then(|progress| progress.recent.last().cloned());
+        let workspace = super::worker_workspace::cached_workspace(&record);
 
         let disconnected = matches!(record.state, AgentState::Failed)
             && record.failure_reason.as_deref() == Some("process_terminated");
@@ -621,7 +745,10 @@ impl WorkerController {
             owned_paths,
             waiting_on,
             disconnected,
-            usage_unknown: false,
+            usage_unknown: usage.source() == crate::subagent_progress::UsageSource::Unknown,
+            usage,
+            activity,
+            workspace,
         })
     }
 
@@ -1094,28 +1221,83 @@ mod tests {
         assert_eq!(receipt.reason.as_deref(), Some("agent_not_found"));
     }
 
-    #[test]
-    fn test_missing_usage_shown_unknown() {
-        let mut snapshot = WorkerSnapshot {
-            agent_id: AgentId::new(),
+    fn worker_record(id: AgentId, started_ms: i64) -> AgentRecord {
+        AgentRecord {
+            id,
             run_id: RunId::new(),
+            parent: None,
+            kind: AgentKind::Subagent,
+            name: "w".into(),
+            provider: "mock".into(),
+            model_id: "mock".into(),
+            cwd: PathBuf::from("/t"),
+            state: AgentState::Starting,
             task_id: None,
-            name: "worker".to_string(),
-            kind: AgentKind::Main,
-            state: AgentState::Running,
-            generation: 1,
-            revision: 1,
-            elapsed_ms: 50,
-            last_activity_ms: 1000,
-            tool_count: 0,
-            owned_paths: vec![],
-            waiting_on: None,
-            disconnected: false,
-            usage_unknown: true,
-        };
+            worktree: None,
+            started_ms,
+            updated_ms: started_ms,
+            failure_reason: None,
+        }
+    }
+
+    /// The production path: the snapshot, not a hand-built struct.
+    #[test]
+    fn a_worker_that_reported_nothing_is_unknown_not_zero() {
+        let registry = RuntimeRegistry::new();
+        let id = AgentId::new();
+        registry.register_agent(worker_record(id, 1)).unwrap();
+        registry.transition(id, AgentState::Running).unwrap();
+        let controller = WorkerController::new(registry.clone());
+        let snapshot = controller.build_snapshot(&id).unwrap();
         assert!(snapshot.usage_unknown);
-        snapshot.usage_unknown = false;
+        assert_eq!(snapshot.usage.total(), 0);
+        assert!(snapshot.activity.is_none());
+
+        // Once its reporter has numbers, the snapshot carries them.
+        let reporter = crate::subagent_progress::ProgressReporter::new(
+            "call",
+            crate::EventSink(std::sync::Arc::new(|_| {})),
+            id.to_string(),
+            "w",
+            (0, 1),
+            "oneshot",
+        )
+        .with_registry(registry.clone(), id);
+        reporter.tool_started("read", &serde_json::json!({"path": "src/lib.rs"}));
+        let mut reply = davinci_ai::ChatMessage::text("assistant", "ok");
+        reply.extra.insert(
+            "usage".into(),
+            serde_json::json!({"input": 900, "output": 100, "cacheRead": 5000}),
+        );
+        reporter.observe(&crate::events::AgentEvent::MessageEnd { message: reply });
+        let snapshot = controller.build_snapshot(&id).unwrap();
         assert!(!snapshot.usage_unknown);
+        assert_eq!(snapshot.usage.total(), 1000);
+        assert_eq!(snapshot.usage.cache_read, 5000);
+        assert_eq!(snapshot.activity.as_deref(), Some("Read(src/lib.rs)"));
+    }
+
+    #[test]
+    fn a_finished_workers_elapsed_time_stops() {
+        let registry = RuntimeRegistry::new();
+        let id = AgentId::new();
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 60_000;
+        registry.register_agent(worker_record(id, started)).unwrap();
+        registry.transition(id, AgentState::Running).unwrap();
+        let controller = WorkerController::new(registry.clone());
+        let running = controller.build_snapshot(&id).unwrap().elapsed_ms;
+        assert!(running >= 60_000, "{running}");
+
+        registry.transition(id, AgentState::Completed).unwrap();
+        let first = controller.build_snapshot(&id).unwrap().elapsed_ms;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let later = controller.build_snapshot(&id).unwrap().elapsed_ms;
+        assert_eq!(first, later, "a finished worker does not keep counting");
+        assert!(first >= 60_000);
     }
 
     #[test]

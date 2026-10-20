@@ -164,3 +164,17 @@ Artifacts are under:
 - `slash-final-screens.json`, `terminal-final.log`, and the logs named above: command/UI and suite evidence.
 
 These temporary artifacts can be removed by normal Windows cleanup. The source fixes, regression tests, reusable evals and this report are retained in the project folder.
+
+## Addendum: automatic local memory (Phase 2)
+
+Written after the audit above; the earlier text is unchanged. Findings from reading the memory and governor code, and what changed:
+
+- An unreadable or non-UTF-8 `records.jsonl` was read as an empty store and the next write replaced it. It now stays unreadable (`LOCAL_STORE_UNREADABLE`), writes are refused and the bytes are kept.
+- A corrupt `vector-memory.json` or `token-governor.json` fell back to defaults with the feature on. It now fails closed and `/setup` names the file.
+- The embedding-size check was unreachable: a wrong vector size was dropped silently. It now reports `EMBEDDING_MISMATCH` and the repair changes nothing.
+- "Ready" was inferred from a cooldown flag. Health now comes from probes with no memory lock held across the network.
+- The governor ignored a failed store write and, after a restart, served stored language-tool output without checking its permission. Failures are now counted and shown as `Degraded`; such output is refused after a restart. A test compresses a large output, restarts, and retrieves a hidden line exactly.
+- The TUI memory sheet printed `qdrant` as the store; it now says `local file`.
+- Starting Ollama requires a recorded approval, is limited to the approved path and version, and runs once under a lock file. Users can opt out for good with `/setup disable`.
+
+Open items: `/governor-reset` deletes the session's stored outputs without a confirmation; the repo id changes when git config changes, which hides records as foreign; there is no ongoing outage watch after the first successful recovery; the real Windows and real-Ollama restart matrix has not been run (the simulated matrix is `tests/setup_restart_matrix.rs`). See `docs/setup.md`.

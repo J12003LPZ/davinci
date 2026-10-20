@@ -104,11 +104,21 @@ pub struct SummarizeResponse {
     pub has_tool_call: bool,
 }
 
+/// Code on the error returned when a request cannot be made to fit.
+pub const CONTEXT_ADMISSION_FAILED: &str = "CONTEXT_ADMISSION_FAILED";
+
+/// Per-field caps tried, in order, when a summarizer request is too large.
+/// `None` is the full text. Real user requests are never capped.
+const SUMMARY_FIELD_CAPS: [Option<usize>; 5] = [None, Some(4000), Some(1000), Some(300), Some(80)];
+
 type SummarizerFn = dyn Fn(&SummarizeRequest) -> Result<SummarizeResponse, String> + Send + Sync;
 
 #[derive(Clone)]
 pub struct Summarizer {
     inner: Arc<SummarizerFn>,
+    /// The most tokens one request to this summarizer may hold (its model's
+    /// context window, less a margin). `None`: the caller did not say.
+    input_budget_tokens: Option<u64>,
 }
 
 impl std::fmt::Debug for Summarizer {
@@ -122,7 +132,21 @@ impl Summarizer {
     where
         F: Fn(&SummarizeRequest) -> Result<SummarizeResponse, String> + Send + Sync + 'static,
     {
-        Self { inner: Arc::new(f) }
+        Self {
+            inner: Arc::new(f),
+            input_budget_tokens: None,
+        }
+    }
+
+    /// State how large a request this summarizer's model accepts, so an
+    /// oversized history fails closed instead of being sent.
+    pub fn with_input_budget(mut self, tokens: u64) -> Self {
+        self.input_budget_tokens = (tokens > 0).then_some(tokens);
+        self
+    }
+
+    pub fn input_budget(&self) -> Option<u64> {
+        self.input_budget_tokens
     }
 
     pub fn summarize(&self, request: &SummarizeRequest) -> Result<SummarizeResponse, String> {
@@ -614,9 +638,11 @@ pub fn generate_summary_with_usage(
     previous_summary: Option<&str>,
     summarizer: &Summarizer,
 ) -> Result<(String, Usage), String> {
-    let max_tokens = (reserve_tokens as f64 * 0.8).floor() as u64;
-    let prompt = build_history_prompt(messages, previous_summary, custom_instructions);
-    complete_summarization(&prompt, max_tokens.max(1), "Summarization", summarizer)
+    let max_tokens = ((reserve_tokens as f64 * 0.8).floor() as u64).max(1);
+    let prompt = admit_summary_prompt(summarizer, max_tokens, "Summarization", |cap| {
+        build_history_prompt_capped(messages, previous_summary, custom_instructions, cap)
+    })?;
+    complete_summarization(&prompt, max_tokens, "Summarization", summarizer)
 }
 
 fn generate_turn_prefix_summary(
@@ -624,23 +650,31 @@ fn generate_turn_prefix_summary(
     reserve_tokens: u64,
     summarizer: &Summarizer,
 ) -> Result<(String, Usage), String> {
-    let max_tokens = (reserve_tokens as f64 * 0.5).floor() as u64;
-    let conversation = serialize_conversation(&convert_to_llm_for_summary(messages));
-    let prompt = format!(
-        "<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
-    );
-    complete_summarization(
-        &prompt,
-        max_tokens.max(1),
-        "Turn prefix summarization",
-        summarizer,
-    )
+    let max_tokens = ((reserve_tokens as f64 * 0.5).floor() as u64).max(1);
+    let prompt =
+        admit_summary_prompt(summarizer, max_tokens, "Turn prefix summarization", |cap| {
+            let conversation =
+                serialize_conversation_capped(&convert_to_llm_for_summary(messages), cap);
+            format!(
+            "<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+        )
+        })?;
+    complete_summarization(&prompt, max_tokens, "Turn prefix summarization", summarizer)
 }
 
 pub fn build_history_prompt(
     messages: &[ChatMessage],
     previous_summary: Option<&str>,
     custom_instructions: Option<&str>,
+) -> String {
+    build_history_prompt_capped(messages, previous_summary, custom_instructions, None)
+}
+
+fn build_history_prompt_capped(
+    messages: &[ChatMessage],
+    previous_summary: Option<&str>,
+    custom_instructions: Option<&str>,
+    cap: Option<usize>,
 ) -> String {
     let mut base = if previous_summary.is_some() {
         UPDATE_SUMMARIZATION_PROMPT.to_string()
@@ -651,7 +685,7 @@ pub fn build_history_prompt(
         base.push_str("\n\nAdditional focus: ");
         base.push_str(instructions);
     }
-    let conversation = serialize_conversation(&convert_to_llm_for_summary(messages));
+    let conversation = serialize_conversation_capped(&convert_to_llm_for_summary(messages), cap);
     let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
     if let Some(previous) = previous_summary {
         prompt.push_str("<previous-summary>\n");
@@ -660,6 +694,35 @@ pub fn build_history_prompt(
     }
     prompt.push_str(&base);
     prompt
+}
+
+/// The first prompt (full text, then ever tighter caps on evidence) that fits
+/// the summarizer's request budget with room left for its answer. When even the
+/// tightest one does not fit, nothing is sent: the error carries
+/// `CONTEXT_ADMISSION_FAILED` and the caller keeps the history.
+fn admit_summary_prompt(
+    summarizer: &Summarizer,
+    max_output_tokens: u64,
+    label: &str,
+    build: impl Fn(Option<usize>) -> String,
+) -> Result<String, String> {
+    let Some(budget) = summarizer.input_budget() else {
+        return Ok(build(None));
+    };
+    let fixed = (SUMMARIZATION_SYSTEM_PROMPT.len() as u64).div_ceil(4);
+    let allowed = budget.saturating_sub(max_output_tokens);
+    let mut smallest = u64::MAX;
+    for cap in SUMMARY_FIELD_CAPS {
+        let prompt = build(cap);
+        let needed = fixed + (prompt.len() as u64).div_ceil(4);
+        smallest = smallest.min(needed);
+        if needed <= allowed {
+            return Ok(prompt);
+        }
+    }
+    Err(format!(
+        "{CONTEXT_ADMISSION_FAILED}: {label} request needs about {smallest} tokens, over the {allowed} the model accepts; nothing was sent and the history is unchanged"
+    ))
 }
 
 fn complete_summarization(
@@ -1040,13 +1103,30 @@ fn with_source_timestamp(mut message: ChatMessage, source: &ChatMessage) -> Chat
 
 /// TS `serializeConversation`.
 pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
+    serialize_conversation_capped(messages, None)
+}
+
+/// [`serialize_conversation`] with every piece of evidence (assistant text,
+/// thinking, tool arguments and results, harness messages) cut to `cap`
+/// characters. A real user's request is never cut.
+fn serialize_conversation_capped(messages: &[ChatMessage], cap: Option<usize>) -> String {
+    let limit = |text: &str| match cap {
+        Some(cap) => truncate_for_summary(text, cap),
+        None => text.to_string(),
+    };
     let mut parts = Vec::new();
     for message in messages {
         match message.role.as_str() {
             "user" => {
                 let content = content_text(&message.content);
                 if !content.is_empty() {
-                    parts.push(format!("[{}]: {content}", user_role_label(message)));
+                    let label = user_role_label(message);
+                    let content = if label == "User" {
+                        content
+                    } else {
+                        limit(&content)
+                    };
+                    parts.push(format!("[{label}]: {content}"));
                 }
             }
             "assistant" => {
@@ -1055,7 +1135,7 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
                 for block in &message.content {
                     match block {
                         MessageContent::Thinking { thinking, .. } => {
-                            thinking_parts.push(thinking.clone());
+                            thinking_parts.push(limit(thinking));
                         }
                         MessageContent::ToolCall {
                             name, arguments, ..
@@ -1066,8 +1146,10 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
                                     .map(|(key, value)| {
                                         format!(
                                             "{key}={}",
-                                            serde_json::to_string(value)
-                                                .unwrap_or_else(|_| value.to_string())
+                                            limit(
+                                                &serde_json::to_string(value)
+                                                    .unwrap_or_else(|_| value.to_string())
+                                            )
                                         )
                                     })
                                     .collect::<Vec<_>>()
@@ -1090,7 +1172,10 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
                     .iter()
                     .any(|block| matches!(block, MessageContent::Text { .. }))
                 {
-                    parts.push(format!("[Assistant]: {}", content_text(&message.content)));
+                    parts.push(format!(
+                        "[Assistant]: {}",
+                        limit(&content_text(&message.content))
+                    ));
                 }
                 if !tool_calls.is_empty() {
                     parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
@@ -1101,7 +1186,10 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
                 if !content.is_empty() {
                     parts.push(format!(
                         "[Tool result]: {}",
-                        truncate_tool_result_for_summary(&content, TOOL_RESULT_MAX_CHARS)
+                        truncate_tool_result_for_summary(
+                            &content,
+                            cap.map_or(TOOL_RESULT_MAX_CHARS, |cap| cap.min(TOOL_RESULT_MAX_CHARS))
+                        )
                     ));
                 }
             }
@@ -1508,6 +1596,85 @@ the user said hi and the assistant said hello and then the user said ok",
         assert!(!result.compacted);
         assert!(result.summary.contains("Nothing worth compacting"));
         assert_eq!(result.messages.len(), messages.len());
+    }
+
+    fn counting_summarizer(budget: u64, seen: Arc<std::sync::Mutex<Vec<String>>>) -> Summarizer {
+        Summarizer::new(move |request| {
+            seen.lock().unwrap().push(request.prompt.clone());
+            Ok(SummarizeResponse {
+                text: "## Goal\nship the csv import".into(),
+                usage: Usage::default(),
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        })
+        .with_input_budget(budget)
+    }
+
+    fn call_with_big_arguments(size: usize) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: vec![MessageContent::ToolCall {
+                id: "c1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path": "a.txt", "content": "x".repeat(size)}),
+            }],
+            ..ChatMessage::default()
+        }
+    }
+
+    #[test]
+    fn oversized_history_compacts_or_errors_without_dispatch() {
+        let request = "Please keep the export format stable and add the csv import. ".repeat(3);
+        // Evidence far over the budget (400k characters of tool arguments, a
+        // large tool result): it is capped so the request fits.
+        let messages = vec![
+            ChatMessage::text("user", request.clone()),
+            call_with_big_arguments(400_000),
+            ChatMessage::tool_result("c1", "write", "y".repeat(50_000), false),
+            ChatMessage::text("assistant", "z".repeat(60_000)),
+            ChatMessage::text("user", "continue"),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let summarizer = counting_summarizer(8_000, Arc::clone(&seen));
+        let result =
+            compact_messages_with_options(&messages, None, 1, 2_000, None, Some(&summarizer));
+        assert!(result.compacted, "{}", result.summary);
+        let prompts = seen.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].len() / 4 + 2_000 <= 8_000,
+            "sent {} bytes",
+            prompts[0].len()
+        );
+        assert!(
+            prompts[0].contains(request.trim()),
+            "the user's request was cut"
+        );
+
+        // A history whose own user text is over the budget cannot be capped
+        // (it is the authority): nothing is sent and nothing is lost.
+        let messages = vec![
+            ChatMessage::text("user", "requirement ".repeat(20_000)),
+            ChatMessage::text("assistant", "ok"),
+            ChatMessage::text("user", "continue"),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let summarizer = counting_summarizer(8_000, Arc::clone(&seen));
+        let result =
+            compact_messages_with_options(&messages, None, 1, 2_000, None, Some(&summarizer));
+        assert!(!result.compacted);
+        assert!(
+            result.summary.starts_with(CONTEXT_ADMISSION_FAILED),
+            "{}",
+            result.summary
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an oversized request was dispatched"
+        );
+        assert_eq!(result.messages, messages);
     }
 
     #[test]

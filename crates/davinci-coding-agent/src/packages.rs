@@ -31,28 +31,44 @@ pub fn handle_package_command(
     args: &[String],
     agent_dir: &Path,
 ) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+    handle_package_command_in(command, args, agent_dir, &cwd)
+}
+
+/// [`handle_package_command`] for an explicit project directory.
+pub fn handle_package_command_in(
+    command: &str,
+    args: &[String],
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Result<String, String> {
     let local = args.iter().any(|a| a == "-l" || a == "--local");
     let source = args.iter().find(|a| !a.starts_with('-')).cloned();
     let settings = load_settings(agent_dir);
     match command {
         "install" => {
             let source = source.ok_or("install <source> [-l]")?;
-            let installed = install_and_persist(&source, local, agent_dir)?;
+            if local {
+                ensure_project_trusted_for_packages(agent_dir, cwd, &settings)?;
+            }
+            let installed = install_and_persist(&source, local, agent_dir, cwd)?;
             Ok(format!("Installed {installed}{}", scope(local)))
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
-            let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+            if local {
+                ensure_project_trusted_for_packages(agent_dir, cwd, &settings)?;
+            }
             let normalized = match parse_package_source(&source) {
-                ParsedSource::Local(path) => normalize_local_source(&path, &cwd)?,
+                ParsedSource::Local(path) => normalize_local_source(&path, cwd)?,
                 _ => source.clone(),
             };
-            let settings_dir = settings_dir_for(local, agent_dir, &cwd);
+            let settings_dir = settings_dir_for(local, agent_dir, cwd);
             update_settings(&settings_dir, |settings| {
                 settings.extensions.retain(|item| item != &normalized);
                 settings.packages.retain(|item| item.source() != normalized);
             })?;
-            remove_installed_package(&source, local, agent_dir, &cwd)?;
+            remove_installed_package(&source, local, agent_dir, cwd)?;
             Ok(format!("Removed {normalized}{}", scope(local)))
         }
         "update" => handle_update(args, agent_dir),
@@ -161,15 +177,10 @@ pub fn update_extensions(
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let user = load_settings(agent_dir);
-    let project = load_settings(&cwd.join(".pi"));
+    let (candidates, skipped_project) = update_candidates(agent_dir, &cwd, &user);
     let mut targets = Vec::new();
-    for (pkg, local) in user
-        .packages
-        .iter()
-        .map(|pkg| (pkg, false))
-        .chain(project.packages.iter().map(|pkg| (pkg, true)))
-    {
-        let spec = pkg.source();
+    for (spec, local) in &candidates {
+        let local = *local;
         if let Some(filter) = source {
             if package_identity(spec) != package_identity(filter) && spec != filter {
                 continue;
@@ -194,13 +205,74 @@ pub fn update_extensions(
             }
         }
     }
+    let skipped_note = if skipped_project {
+        format!(
+            "
+{}",
+            crate::trust::untrusted_project_message(&cwd)
+        )
+    } else {
+        String::new()
+    };
     if let Some(filter) = source {
         if targets.is_empty() {
             return Err(format!("No matching package found for {filter}"));
         }
-        return Ok(format!("Updated {}", source.unwrap_or("packages")));
+        return Ok(format!(
+            "Updated {}{skipped_note}",
+            source.unwrap_or("packages")
+        ));
     }
-    Ok("Updated packages".into())
+    Ok(format!("Updated packages{skipped_note}"))
+}
+
+/// Whether this project may contribute package sources: `davinci update` and
+/// `davinci install -l` download and install code, so an untrusted project's
+/// own settings must not decide what runs. Same store and host settings as the
+/// startup gate.
+fn project_packages_trusted(agent_dir: &Path, cwd: &Path, user: &Settings) -> bool {
+    crate::trust::resolve_project_trusted(
+        agent_dir,
+        cwd,
+        None,
+        user.default_project_trust.as_deref(),
+        &user.trusted_projects,
+    )
+}
+
+fn ensure_project_trusted_for_packages(
+    agent_dir: &Path,
+    cwd: &Path,
+    user: &Settings,
+) -> Result<(), String> {
+    if project_packages_trusted(agent_dir, cwd, user) {
+        Ok(())
+    } else {
+        Err(crate::trust::untrusted_project_message(cwd))
+    }
+}
+
+/// Package sources `update` may reinstall, with `true` marking project scope.
+/// The flag is `true` when an untrusted project had packages that were left
+/// out, so the caller can say so.
+fn update_candidates(agent_dir: &Path, cwd: &Path, user: &Settings) -> (Vec<(String, bool)>, bool) {
+    let mut candidates: Vec<(String, bool)> = user
+        .packages
+        .iter()
+        .map(|pkg| (pkg.source().to_string(), false))
+        .collect();
+    if project_packages_trusted(agent_dir, cwd, user) {
+        let project = load_settings(&cwd.join(".pi"));
+        candidates.extend(
+            project
+                .packages
+                .iter()
+                .map(|pkg| (pkg.source().to_string(), true)),
+        );
+        return (candidates, false);
+    }
+    let skipped = !load_settings(&cwd.join(".pi")).packages.is_empty();
+    (candidates, skipped)
 }
 
 pub fn persist_config_toggle(
@@ -340,11 +412,15 @@ fn normalize_local_source(path: &str, cwd: &Path) -> Result<String, String> {
     Ok(crate::trust::display_path(&canonical))
 }
 
-fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+fn install_and_persist(
+    source: &str,
+    local: bool,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Result<String, String> {
     let parsed = parse_package_source(source);
     let stored_source = match &parsed {
-        ParsedSource::Local(path) => normalize_local_source(path, &cwd)?,
+        ParsedSource::Local(path) => normalize_local_source(path, cwd)?,
         ParsedSource::Npm { name, spec } => {
             install_remote_package(agent_dir, "npm", name, spec, local)?;
             source.to_string()
@@ -355,7 +431,7 @@ fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<St
             source.to_string()
         }
     };
-    let settings_dir = settings_dir_for(local, agent_dir, &cwd);
+    let settings_dir = settings_dir_for(local, agent_dir, cwd);
     update_settings(&settings_dir, |settings| {
         if !settings.extensions.contains(&stored_source) {
             settings.extensions.push(stored_source.clone());
@@ -1184,6 +1260,117 @@ mod tests {
         assert!(error.contains("scripts/install-davinci.ps1"), "{error}");
         assert!(!error.contains("pi-mono"), "{error}");
         assert!(!error.contains("Updated davinci from"));
+    }
+
+    fn project_with_packages(root: &Path) -> PathBuf {
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(
+            project.join(".pi").join("settings.json"),
+            r#"{"packages":["npm:project-owned","git:github.com/evil/repo"]}"#,
+        )
+        .unwrap();
+        project
+    }
+
+    #[test]
+    fn project_scoped_remove_needs_a_trusted_project() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let project = project_with_packages(dir.path());
+        let settings = project.join(".pi").join("settings.json");
+        let before = fs::read_to_string(&settings).unwrap();
+        let args = vec!["-l".to_string(), "npm:project-owned".to_string()];
+
+        // The real entry point, as `davinci remove -l <pkg>` reaches it.
+        let error = handle_package_command_in("remove", &args, &agent, &project).unwrap_err();
+        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            before,
+            "an untrusted project's settings were rewritten"
+        );
+    }
+
+    #[test]
+    fn update_skips_project_packages_until_the_folder_is_trusted() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"packages":["npm:user-owned"]}"#,
+        )
+        .unwrap();
+        let project = project_with_packages(dir.path());
+        let user = load_settings(&agent);
+
+        let (candidates, skipped) = update_candidates(&agent, &project, &user);
+        assert_eq!(candidates, vec![("npm:user-owned".to_string(), false)]);
+        assert!(
+            skipped,
+            "the caller must be able to say packages were left out"
+        );
+
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(true))
+            .unwrap();
+        let (candidates, skipped) = update_candidates(&agent, &project, &user);
+        assert!(!skipped);
+        assert_eq!(
+            candidates,
+            vec![
+                ("npm:user-owned".to_string(), false),
+                ("npm:project-owned".to_string(), true),
+                ("git:github.com/evil/repo".to_string(), true),
+            ]
+        );
+
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        let (candidates, skipped) = update_candidates(&agent, &project, &user);
+        assert_eq!(candidates.len(), 1);
+        assert!(skipped);
+    }
+
+    #[test]
+    fn project_scoped_install_needs_a_trusted_project() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let project = project_with_packages(dir.path());
+        let package = dir.path().join("pkg");
+        fs::create_dir_all(&package).unwrap();
+        let args = vec!["-l".to_string(), package.display().to_string()];
+        let before = fs::read_to_string(project.join(".pi").join("settings.json")).unwrap();
+
+        // The real entry point, as `davinci install -l <pkg>` reaches it.
+        let error = handle_package_command_in("install", &args, &agent, &project).unwrap_err();
+        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
+        assert_eq!(
+            fs::read_to_string(project.join(".pi").join("settings.json")).unwrap(),
+            before,
+            "an untrusted project's settings were rewritten"
+        );
+
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(true))
+            .unwrap();
+        let installed = handle_package_command_in("install", &args, &agent, &project).unwrap();
+        assert!(installed.starts_with("Installed "), "{installed}");
+        assert!(
+            fs::read_to_string(project.join(".pi").join("settings.json"))
+                .unwrap()
+                .contains("pkg"),
+        );
+        // A user-scoped install never needed the project's trust.
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        let user_scope = vec![package.display().to_string()];
+        assert!(handle_package_command_in("install", &user_scope, &agent, &project).is_ok());
     }
 
     #[test]

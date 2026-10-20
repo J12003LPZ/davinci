@@ -103,6 +103,8 @@ pub enum MailboxError {
     },
     #[error("duplicate message id: {0}")]
     DuplicateMessage(Uuid),
+    #[error("the message could not be recorded: {0}")]
+    NotRecorded(String),
     #[error("failed to wake agent {0}: {1}")]
     WakeError(AgentId, String),
     #[error("mailbox queue full for agent {0}")]
@@ -134,9 +136,68 @@ pub struct AgentMailbox {
     /// queued before it is delivered, delivered before it can be applied, and
     /// a receipt never moves backwards (WOR-86, WOR-89).
     lifecycle: Arc<Mutex<()>>,
+    /// Agents whose last delivery record failed to write. The warning is
+    /// printed when an agent enters this set and again when it leaves, not on
+    /// every retry.
+    log_failing: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl AgentMailbox {
+    /// Note a failed delivery record. True only for the first failure of a
+    /// streak, which is the one worth a warning.
+    fn note_delivery_failure(&self, agent_id: AgentId) -> bool {
+        self.log_failing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(agent_id)
+    }
+
+    /// Note a delivery whose record was written. True only when it ends a
+    /// failure streak.
+    fn note_delivery_recovered(&self, agent_id: AgentId) -> bool {
+        self.log_failing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&agent_id)
+    }
+
+    /// Announce a message lifecycle step on the bus. `agent` is the envelope
+    /// owner: host steering has no registered sender, so it passes `None` and
+    /// replay never mistakes it for the runtime's own identity.
+    fn announce(&self, run_id: RunId, agent: Option<AgentId>, payload: RuntimeEvent) {
+        if let Some(bus) = &self.bus {
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            bus.emit_observe(RuntimeEventEnvelope::new(
+                seq, run_id, None, agent, None, payload,
+            ));
+        }
+    }
+
+    /// Like `announce`, but the step must be kept: the caller undoes what it
+    /// did and tells the sender when it was not.
+    fn announce_durably(
+        &self,
+        run_id: RunId,
+        agent: Option<AgentId>,
+        payload: RuntimeEvent,
+    ) -> Result<(), String> {
+        let Some(bus) = &self.bus else {
+            return Ok(());
+        };
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        bus.emit_durable(RuntimeEventEnvelope::new(
+            seq, run_id, None, agent, None, payload,
+        ))
+    }
+
+    fn run_of(&self, agent_id: &AgentId) -> RunId {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.get(agent_id))
+            .map(|record| record.run_id)
+            .unwrap_or_default()
+    }
+
     fn notify_waiters(&self) {
         let (lock, cvar) = &*self.signal;
         let mut generation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -190,6 +251,7 @@ impl AgentMailbox {
             seq: Arc::new(AtomicU64::new(0)),
             signal: Arc::new((Mutex::new(0), Condvar::new())),
             lifecycle: Arc::new(Mutex::new(())),
+            log_failing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -204,6 +266,7 @@ impl AgentMailbox {
             seq: Arc::new(AtomicU64::new(0)),
             signal: Arc::new((Mutex::new(0), Condvar::new())),
             lifecycle: Arc::new(Mutex::new(())),
+            log_failing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -506,6 +569,31 @@ impl AgentMailbox {
             }
         }
 
+        // The acceptance is announced (and so written to the runtime log)
+        // before the caller can show "queued": without this event a restart
+        // forgot every steering message.
+        if let Err(reason) = self.announce_durably(
+            run_id,
+            None,
+            RuntimeEvent::AgentMessageQueued {
+                to,
+                message_id: msg_id,
+                message: Some(msg),
+            },
+        ) {
+            // Not written, so not accepted: take it back out, forget the
+            // receipt, and let the same id be sent again.
+            if let Ok(mut queues) = self.queues.write() {
+                if let Some(queue) = queues.get_mut(&to) {
+                    queue.retain(|queued| queued.id != msg_id);
+                }
+            }
+            if let Ok(mut receipts) = self.steering_receipts.write() {
+                receipts.remove(&msg_id);
+            }
+            return Err(MailboxError::NotRecorded(reason));
+        }
+
         Ok(receipt)
     }
 
@@ -546,17 +634,42 @@ impl AgentMailbox {
         if let Some(r) = receipt {
             r.state = "applied".to_string();
         }
+        drop(receipts);
+        self.announce(
+            self.run_of(agent_id),
+            Some(*agent_id),
+            RuntimeEvent::AgentMessageApplied {
+                to: *agent_id,
+                message_id: *message_id,
+            },
+        );
 
         true
     }
 
     /// Mark a steering receipt as rejected with reason.
     pub fn mark_rejected(&self, message_id: &Uuid, reason: impl Into<String>) {
+        let reason = reason.into();
+        let mut changed = None;
         if let Ok(mut receipts) = self.steering_receipts.write() {
             if let Some(r) = receipts.get_mut(message_id) {
+                if r.state != "rejected" {
+                    changed = Some(r.agent_id);
+                }
                 r.state = "rejected".to_string();
-                r.reason = Some(reason.into());
+                r.reason = Some(reason.clone());
             }
+        }
+        if let Some(to) = changed {
+            self.announce(
+                self.run_of(&to),
+                Some(to),
+                RuntimeEvent::AgentMessageRejected {
+                    to,
+                    message_id: *message_id,
+                    reason,
+                },
+            );
         }
     }
 
@@ -567,6 +680,15 @@ impl AgentMailbox {
 
     /// Reject any undelivered messages for an agent that has cancelled.
     pub fn reject_undelivered_for_cancelled(&self, agent_id: &AgentId, reason: &str) {
+        // Same lock as `drain`, taken first: a drain that is writing its
+        // delivered record has popped messages it may still put back, and a
+        // cancel that ran meanwhile would find an empty queue and leave them
+        // queued after the agent is gone.
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rejected = Vec::new();
         if let Ok(mut queues) = self.queues.write() {
             if let Some(q) = queues.remove(agent_id) {
                 if let Ok(mut receipts) = self.steering_receipts.write() {
@@ -574,10 +696,22 @@ impl AgentMailbox {
                         if let Some(r) = receipts.get_mut(&msg.id) {
                             r.state = "rejected".to_string();
                             r.reason = Some(reason.to_string());
+                            rejected.push(msg.id);
                         }
                     }
                 }
             }
+        }
+        for message_id in rejected {
+            self.announce(
+                self.run_of(agent_id),
+                Some(*agent_id),
+                RuntimeEvent::AgentMessageRejected {
+                    to: *agent_id,
+                    message_id,
+                    reason: reason.to_string(),
+                },
+            );
         }
     }
 
@@ -612,16 +746,25 @@ impl AgentMailbox {
     }
 
     /// Drain up to `limit` messages for the given agent ID.
+    ///
+    /// A message is handed over only after its delivered record is in the
+    /// runtime log. If that write fails, the message goes back to the front of
+    /// the queue as `queued` and is not returned, so it is delivered once
+    /// later and replay never sees a queued record with no delivered record
+    /// for an instruction the worker already acted on. Messages whose record
+    /// was written before the failure are returned; the rest stay pending.
     pub fn drain(&self, agent_id: AgentId, limit: usize) -> Vec<AgentMessage> {
         if limit == 0 {
             return Vec::new();
         }
 
+        // Held through the log write, as `send` holds it across its event, so
+        // no other drain can overtake messages that may be put back.
         let _lifecycle = self
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let drained: Vec<AgentMessage> = {
+        let mut drained: Vec<AgentMessage> = {
             let Ok(mut queues) = self.queues.write() else {
                 return Vec::new();
             };
@@ -639,33 +782,48 @@ impl AgentMailbox {
             }
         };
 
-        // Announce delivery before the receipts say delivered, so no caller
-        // can apply a message whose delivery event has not been emitted.
-        if let Some(bus) = &self.bus {
-            for msg in &drained {
-                let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-                let envelope = RuntimeEventEnvelope::new(
-                    seq,
-                    msg.run_id,
-                    None,
-                    Some(agent_id),
-                    None,
-                    RuntimeEvent::AgentMessageDelivered {
-                        to: agent_id,
-                        message_id: msg.id,
-                    },
-                );
-                bus.emit_observe(envelope);
+        // Written before this returns, so the caller cannot apply a message
+        // whose delivery has not been logged: only the drainer holds it yet.
+        let mut kept = 0;
+        for msg in &drained {
+            let logged = self.announce_durably(
+                msg.run_id,
+                Some(agent_id),
+                RuntimeEvent::AgentMessageDelivered {
+                    to: agent_id,
+                    message_id: msg.id,
+                },
+            );
+            if let Err(error) = logged {
+                if self.note_delivery_failure(agent_id) {
+                    eprintln!(
+                        "[davinci-runtime] message {} stays queued, its delivery was not recorded                          (retrying quietly until the log recovers): {error}",
+                        msg.id
+                    );
+                }
+                break;
             }
+            kept += 1;
         }
+        if kept == drained.len() && kept > 0 && self.note_delivery_recovered(agent_id) {
+            eprintln!("[davinci-runtime] delivery records are being written again");
+        }
+        let unlogged = drained.split_off(kept);
 
-        // Transition queued receipts to delivered
         if let Ok(mut receipts) = self.steering_receipts.write() {
             for msg in &drained {
                 if let Some(r) = receipts.get_mut(&msg.id) {
                     if r.state == "queued" {
                         r.state = "delivered".to_string();
                     }
+                }
+            }
+        }
+        if !unlogged.is_empty() {
+            if let Ok(mut queues) = self.queues.write() {
+                let queue = queues.entry(agent_id).or_default();
+                for msg in unlogged.into_iter().rev() {
+                    queue.push_front(msg);
                 }
             }
         }
@@ -694,11 +852,23 @@ impl AgentMailbox {
 
     /// Rehydrate mailbox state from historical runtime event envelopes.
     ///
-    /// Undelivered queued messages remain in the recipient's mailbox.
+    /// Every message ends in exactly one state, and none is applied twice:
+    /// * queued, never delivered: back in the recipient's queue, unless the
+    ///   recipient already finished, then rejected (`recipient_terminal_after_restart`);
+    /// * delivered but not applied: `unknown`. The worker that took it died with
+    ///   the old process, and nothing proves whether it reached a request, so it
+    ///   is neither re-queued (it could apply twice) nor called applied;
+    /// * applied / rejected: the receipt is restored as it was.
     pub fn rehydrate_from_events(&self, events: &[RuntimeEventEnvelope]) {
+        struct Seen {
+            to: AgentId,
+            state: &'static str,
+            reason: Option<String>,
+            message: Option<AgentMessage>,
+        }
         // Event order is the enqueue order: keep it, never re-sort by clock.
-        let mut unread_messages: HashMap<Uuid, AgentMessage> = HashMap::new();
-        let mut queue_order: Vec<Uuid> = Vec::new();
+        let mut messages: HashMap<Uuid, Seen> = HashMap::new();
+        let mut order: Vec<Uuid> = Vec::new();
         let mut seen = match self.seen_message_ids.write() {
             Ok(s) => s,
             Err(e) => e.into_inner(),
@@ -707,42 +877,121 @@ impl AgentMailbox {
         for envelope in events {
             match &envelope.payload {
                 RuntimeEvent::AgentMessageQueued {
+                    to,
                     message_id,
                     message,
-                    ..
                 } => {
                     seen.insert(*message_id);
-                    if let Some(msg) = message {
-                        if unread_messages.insert(*message_id, msg.clone()).is_none() {
-                            queue_order.push(*message_id);
-                        }
+                    if !messages.contains_key(message_id) {
+                        order.push(*message_id);
+                        messages.insert(
+                            *message_id,
+                            Seen {
+                                to: *to,
+                                state: "queued",
+                                reason: None,
+                                message: message.clone(),
+                            },
+                        );
                     }
                 }
                 RuntimeEvent::AgentMessageDelivered { message_id, .. } => {
-                    unread_messages.remove(message_id);
+                    if let Some(entry) = messages.get_mut(message_id) {
+                        if entry.state == "queued" {
+                            entry.state = "delivered";
+                        }
+                    }
+                }
+                RuntimeEvent::AgentMessageApplied { message_id, .. } => {
+                    if let Some(entry) = messages.get_mut(message_id) {
+                        if entry.state != "rejected" {
+                            entry.state = "applied";
+                        }
+                    }
+                }
+                RuntimeEvent::AgentMessageRejected {
+                    message_id, reason, ..
+                } => {
+                    if let Some(entry) = messages.get_mut(message_id) {
+                        entry.state = "rejected";
+                        entry.reason = Some(reason.clone());
+                    }
                 }
                 _ => {}
             }
         }
+        drop(seen);
 
         let mut queues = match self.queues.write() {
             Ok(q) => q,
             Err(e) => e.into_inner(),
         };
+        let mut receipts = match self.steering_receipts.write() {
+            Ok(r) => r,
+            Err(e) => e.into_inner(),
+        };
+        let mut applied = match self.applied_messages.write() {
+            Ok(a) => a,
+            Err(e) => e.into_inner(),
+        };
 
-        for id in queue_order {
-            let Some(msg) = unread_messages.remove(&id) else {
+        for id in order {
+            let Some(entry) = messages.remove(&id) else {
                 continue;
             };
-            let queue = queues.entry(msg.to).or_default();
-            // Replaying a stream that is already reflected in memory must not
-            // queue the same message twice.
-            if queue.iter().any(|queued| queued.id == msg.id) {
-                continue;
+            let generation = self
+                .registry
+                .as_ref()
+                .map(|registry| registry.get_generation(&entry.to))
+                .filter(|generation| *generation > 0)
+                .unwrap_or(1);
+            let terminal = self
+                .registry
+                .as_ref()
+                .and_then(|registry| registry.get(&entry.to))
+                .is_some_and(|record| {
+                    matches!(
+                        record.state,
+                        AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+                    )
+                });
+            let (state, reason) = match entry.state {
+                "queued" if terminal => (
+                    "rejected",
+                    Some("recipient_terminal_after_restart".to_string()),
+                ),
+                "queued" => ("queued", None),
+                "delivered" => ("unknown", Some("restart_before_apply".to_string())),
+                other => (other, entry.reason),
+            };
+            // A receipt already held in memory is newer than the log.
+            receipts.entry(id).or_insert_with(|| SteeringReceipt {
+                message_id: id,
+                agent_id: entry.to,
+                generation,
+                state: state.to_string(),
+                applies_after_boundary: true,
+                reason,
+            });
+            match state {
+                "applied" => {
+                    applied.entry(entry.to).or_default().insert(id);
+                }
+                "queued" => {
+                    let Some(msg) = entry.message else {
+                        continue;
+                    };
+                    let queue = queues.entry(msg.to).or_default();
+                    // Replaying a stream that is already reflected in memory
+                    // must not queue the same message twice.
+                    if !queue.iter().any(|queued| queued.id == msg.id) {
+                        queue.push_back(msg);
+                    }
+                }
+                _ => {}
             }
-            queue.push_back(msg);
         }
-        drop(queues);
+        drop((queues, receipts, applied));
         self.notify_waiters();
     }
 }
@@ -1320,6 +1569,239 @@ mod tests {
         let replayed = AgentMailbox::new();
         replayed.rehydrate_from_events(&envelopes);
         assert_eq!(replayed.pending_count(&agent), 0);
+    }
+
+    /// A runtime log whose durable write can be made to fail, keeping every
+    /// envelope it did accept so a restart can be replayed from it.
+    #[derive(Default)]
+    struct FlakyLog {
+        fail: std::sync::atomic::AtomicBool,
+        kept: Mutex<Vec<RuntimeEventEnvelope>>,
+    }
+
+    impl RuntimeSubscriber for FlakyLog {
+        fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+            self.kept.lock().unwrap().push(event.clone());
+            RuntimeDecision::Continue
+        }
+
+        fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("injected log failure".into());
+            }
+            self.on_event(event);
+            Ok(())
+        }
+    }
+
+    fn flaky_mailbox() -> (AgentMailbox, Arc<FlakyLog>, RuntimeRegistry, AgentId, RunId) {
+        let bus = RuntimeBus::new();
+        let log = Arc::new(FlakyLog::default());
+        bus.subscribe(log.clone());
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        (mailbox, log, registry, agent, run)
+    }
+
+    /// A delivery that cannot be logged is not handed to the worker: the
+    /// message stays queued and a retry delivers it exactly once.
+    #[test]
+    fn a_failed_delivery_record_keeps_the_message_queued_until_a_retry() {
+        let (mailbox, log, _registry, agent, run) = flaky_mailbox();
+        let first = AgentMessage::new(run, AgentId::new(), agent, "first");
+        let second = AgentMessage::new(run, AgentId::new(), agent, "second");
+        mailbox.send(first.clone()).unwrap();
+        mailbox.send(second.clone()).unwrap();
+
+        log.fail.store(true, Ordering::SeqCst);
+        assert!(mailbox.drain(agent, 10).is_empty());
+        assert_eq!(mailbox.pending_count(&agent), 2);
+        for id in [first.id, second.id] {
+            assert_eq!(mailbox.get_steering_receipt(&id).unwrap().state, "queued");
+        }
+        assert!(!mailbox.mark_applied(&agent, 1, &first.id));
+
+        log.fail.store(false, Ordering::SeqCst);
+        let delivered = mailbox.drain(agent, 10);
+        assert_eq!(
+            delivered.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [first.id, second.id],
+            "order is kept across the failed attempt"
+        );
+        assert!(mailbox.drain(agent, 10).is_empty());
+        let records = log
+            .kept
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.payload, RuntimeEvent::AgentMessageDelivered { .. }))
+            .count();
+        assert_eq!(records, 2, "one delivered record per message");
+    }
+
+    /// A cancel that lands while a drain is writing its delivered record must
+    /// still reject the message the drain puts back; it cannot be left queued
+    /// for an agent that is gone.
+    #[test]
+    fn a_cancel_during_a_failing_drain_still_rejects_the_put_back_message() {
+        struct CancelDuringWrite {
+            mailbox: Mutex<Option<AgentMailbox>>,
+            agent: AgentId,
+            cancel: Mutex<Option<std::thread::JoinHandle<()>>>,
+        }
+        impl RuntimeSubscriber for CancelDuringWrite {
+            fn on_event(&self, _event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                RuntimeDecision::Continue
+            }
+            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+                if matches!(event.payload, RuntimeEvent::AgentMessageDelivered { .. }) {
+                    let mailbox = self.mailbox.lock().unwrap().clone().unwrap();
+                    let agent = self.agent;
+                    *self.cancel.lock().unwrap() = Some(std::thread::spawn(move || {
+                        mailbox.reject_undelivered_for_cancelled(&agent, "stopped");
+                    }));
+                    // Let the cancel reach the mailbox while this write is open.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    return Err("injected log failure".into());
+                }
+                Ok(())
+            }
+        }
+        let bus = RuntimeBus::new();
+        let registry = RuntimeRegistry::new();
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        let log = Arc::new(CancelDuringWrite {
+            mailbox: Mutex::new(None),
+            agent,
+            cancel: Mutex::new(None),
+        });
+        bus.subscribe(log.clone());
+        let mailbox = AgentMailbox::with_registry_and_bus(registry, bus);
+        *log.mailbox.lock().unwrap() = Some(mailbox.clone());
+        let message = AgentMessage::new(run, AgentId::new(), agent, "late");
+        mailbox.send(message.clone()).unwrap();
+
+        assert!(mailbox.drain(agent, 1).is_empty());
+        log.cancel.lock().unwrap().take().unwrap().join().unwrap();
+
+        assert_eq!(
+            mailbox.pending_count(&agent),
+            0,
+            "rejected message re-queued"
+        );
+        assert_eq!(
+            mailbox.get_steering_receipt(&message.id).unwrap().state,
+            "rejected"
+        );
+    }
+
+    /// One warning per failure streak, one line when it ends.
+    #[test]
+    fn a_failure_streak_warns_once_and_reports_recovery_once() {
+        let mailbox = AgentMailbox::new();
+        let agent = AgentId::new();
+        assert!(!mailbox.note_delivery_recovered(agent));
+        assert!(mailbox.note_delivery_failure(agent));
+        assert!(!mailbox.note_delivery_failure(agent));
+        assert!(!mailbox.note_delivery_failure(agent));
+        assert!(mailbox.note_delivery_recovered(agent));
+        assert!(!mailbox.note_delivery_recovered(agent));
+        assert!(
+            mailbox.note_delivery_failure(agent),
+            "a new streak warns again"
+        );
+    }
+
+    /// When the log fails part way, the messages already recorded are handed
+    /// over and the rest stay pending, so no message is both unrecorded and
+    /// delivered.
+    #[test]
+    fn a_log_failure_part_way_hands_over_only_recorded_messages() {
+        struct FailAfter {
+            inner: FlakyLog,
+            allowed: std::sync::atomic::AtomicUsize,
+        }
+        impl RuntimeSubscriber for FailAfter {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                self.inner.on_event(event)
+            }
+            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+                let left = self.allowed.load(Ordering::SeqCst);
+                if left == 0 {
+                    return Err("injected log failure".into());
+                }
+                self.allowed.store(left - 1, Ordering::SeqCst);
+                self.inner.record_durably(event)
+            }
+        }
+        let bus = RuntimeBus::new();
+        let log = Arc::new(FailAfter {
+            inner: FlakyLog::default(),
+            allowed: std::sync::atomic::AtomicUsize::new(1),
+        });
+        bus.subscribe(log.clone());
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        let first = AgentMessage::new(run, AgentId::new(), agent, "first");
+        let second = AgentMessage::new(run, AgentId::new(), agent, "second");
+        mailbox.send(first.clone()).unwrap();
+        mailbox.send(second.clone()).unwrap();
+
+        let delivered = mailbox.drain(agent, 10);
+        assert_eq!(
+            delivered.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [first.id]
+        );
+        assert_eq!(
+            mailbox
+                .peek(&agent)
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            [second.id]
+        );
+        assert_eq!(
+            mailbox.get_steering_receipt(&first.id).unwrap().state,
+            "delivered"
+        );
+        assert_eq!(
+            mailbox.get_steering_receipt(&second.id).unwrap().state,
+            "queued"
+        );
+    }
+
+    /// A crash right after the durable delivered record: replay finds the
+    /// delivery and does not queue the instruction a second time.
+    #[test]
+    fn replay_after_a_recorded_delivery_does_not_requeue_the_message() {
+        let (mailbox, log, _registry, agent, run) = flaky_mailbox();
+        let message = AgentMessage::new(run, AgentId::new(), agent, "do it once");
+        mailbox.send(message.clone()).unwrap();
+        assert_eq!(mailbox.drain(agent, 1).len(), 1);
+        // The process dies here: nothing was applied.
+
+        let envelopes = log.kept.lock().unwrap().clone();
+        let restarted = AgentMailbox::new();
+        restarted.rehydrate_from_events(&envelopes);
+        assert_eq!(restarted.pending_count(&agent), 0);
+        assert!(restarted.drain(agent, 10).is_empty());
+        let receipt = restarted.get_steering_receipt(&message.id).unwrap();
+        assert_eq!(receipt.state, "unknown");
+        assert_eq!(receipt.reason.as_deref(), Some("restart_before_apply"));
     }
 
     /// WOR-91: a failed wake withdraws the message, so an error never hides

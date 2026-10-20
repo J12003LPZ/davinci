@@ -699,6 +699,8 @@ pub struct SubagentRow {
     pub state: SubagentRowState,
     pub tool_uses: u64,
     pub tokens: u64,
+    /// Part of `tokens` is an estimate (drawn with `~`).
+    pub tokens_estimated: bool,
     /// Newest last: `Read(src/lib.rs)`.
     pub recent: Vec<String>,
     pub elapsed_secs: u64,
@@ -2397,7 +2399,20 @@ pub struct AgentRow {
     pub elapsed: String,
     pub owned_paths: Vec<String>,
     pub tool_count: u64,
+    /// Cumulative input + output tokens; `None` when nothing was reported or
+    /// estimated (shown as `unknown`, never as 0).
     pub tokens: Option<u64>,
+    /// Part of `tokens` is DaVinci's estimate (shown with `~`).
+    pub tokens_estimated: bool,
+    /// Cache reads and writes, kept apart from `tokens` (detail view only).
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Wall seconds the worker has run, frozen once it is finished.
+    pub elapsed_secs: u64,
+    /// Where it works, short: `shared`, `⎇ davinci/agent/x`, `⎇ detached`.
+    pub workspace: String,
+    /// The same, in words, for the worker view.
+    pub workspace_detail: String,
     pub waiting_on: Option<String>,
     pub disconnected: bool,
     pub usage_unknown: bool,
@@ -3026,6 +3041,8 @@ pub struct Model {
     pub terminal_task: Option<TerminalTask>,
     /// The last drawn frame's pointer targets; empty until the first draw.
     pub hit_cache: std::cell::RefCell<Option<HitCache>>,
+    /// The agent roster, worker focus and the messages sent to workers.
+    pub roster: super::roster::RosterState,
     /// Where the composer drew its text, as of the last frame.
     pub composer_hit: std::cell::Cell<Option<ComposerHit>>,
     /// Prompts sent in this run, newest first.
@@ -3556,6 +3573,7 @@ impl Model {
             quit_armed: None,
             terminal_task: None,
             hit_cache: std::cell::RefCell::new(None),
+            roster: super::roster::RosterState::default(),
             composer_hit: std::cell::Cell::new(None),
             session_history: Vec::new(),
             history_all: None,
@@ -4524,12 +4542,12 @@ impl Model {
         true
     }
 
-    /// ctrl+c interrupts the run, never the app (design.md §6). What was
-    /// waiting to be sent goes with it: the user stopped this train of
-    /// thought, not just this turn.
+    /// ctrl+c and Esc interrupt the run, never the app (design.md §6). What
+    /// was waiting to be sent stays: it was shown as queued, so dropping it
+    /// would be an acknowledged instruction vanishing without a word. The
+    /// queue is sent, in order, once the interrupted turn has ended.
     pub fn interrupt(&mut self) {
         self.running = false;
-        self.queued.clear();
         if let Some(working) = self.working.as_mut() {
             working.interrupting = true;
         }
@@ -5199,7 +5217,7 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_typed_mid_turn_waits_its_place_and_an_interrupt_drops_it() {
+    fn a_follow_up_typed_mid_turn_waits_its_place_and_survives_an_interrupt() {
         let mut m = model(120);
         m.type_char("run the tests");
         m.submit();
@@ -5211,10 +5229,11 @@ mod tests {
         assert_eq!(m.composer, "", "queuing clears the line being typed");
         assert!(!m.queue(), "an empty composer queues nothing");
 
-        // ctrl+c stops the train of thought, not only the turn in flight.
+        // An interrupt ends the turn in flight, not the instruction the user
+        // was already shown as queued.
         m.interrupt();
         assert!(!m.running);
-        assert!(m.queued.is_empty());
+        assert_eq!(m.queued, vec!["then commit".to_string()]);
     }
 
     #[test]

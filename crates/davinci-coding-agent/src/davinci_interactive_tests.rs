@@ -3851,6 +3851,7 @@ fn delegated_workers_draw_live_under_their_agent_call() {
             state,
             tool_uses: uses,
             tokens: 1_500,
+            usage: Default::default(),
             recent: recent.iter().map(|call| call.to_string()).collect(),
             elapsed_ms: 3_000,
         },
@@ -4350,4 +4351,286 @@ fn the_masthead_takes_the_catalog_title_and_the_provider_name() {
     sync_model_titles(&mut model);
     assert_eq!(model.model_title, "local-7b");
     assert_eq!(model.provider_title, "my-router");
+}
+
+fn live_worker_fixture(
+    kind: davinci_agent::AgentKind,
+) -> (
+    davinci_agent::Agent,
+    davinci_agent::RuntimeHandle,
+    davinci_agent::runtime::AgentId,
+) {
+    use davinci_agent::{AgentId, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    let id = AgentId::new();
+    runtime
+        .registry
+        .register_agent(AgentRecord {
+            id,
+            run_id: runtime.run_id,
+            parent: Some(runtime.agent_id),
+            kind,
+            name: "scout".into(),
+            provider: String::new(),
+            model_id: String::new(),
+            cwd: ".".into(),
+            state: AgentState::Starting,
+            task_id: None,
+            worktree: None,
+            started_ms: 0,
+            updated_ms: 0,
+            failure_reason: None,
+        })
+        .unwrap();
+    runtime
+        .registry
+        .transition(id, AgentState::Running)
+        .unwrap();
+    agent.set_runtime(runtime.clone());
+    (agent, runtime, id)
+}
+
+#[test]
+fn panel_stop_uses_the_workers_real_generation_and_is_never_stale() {
+    use davinci_agent::runtime::{ControlStatus, WorkerControlAction};
+    let (_agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    let receipt = panel_control(
+        &runtime,
+        id,
+        WorkerControlAction::Stop {
+            reason: Some("from the panel".into()),
+        },
+    );
+    assert_ne!(receipt.status, ControlStatus::Stale, "{receipt:?}");
+    assert!(
+        matches!(
+            receipt.status,
+            ControlStatus::Stopping | ControlStatus::Stopped | ControlStatus::Accepted
+        ),
+        "{receipt:?}"
+    );
+    assert_eq!(
+        runtime.registry.get(&id).unwrap().state,
+        davinci_agent::AgentState::Stopping
+    );
+}
+
+#[test]
+fn panel_retry_is_judged_on_its_merits_not_on_a_zero_generation() {
+    use davinci_agent::runtime::WorkerControlAction;
+    let (_agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    // A running worker cannot be retried, and the receipt says that reason,
+    // not "stale control version".
+    let receipt = panel_control(&runtime, id, WorkerControlAction::Retry { reason: None });
+    assert_ne!(
+        receipt.reason.as_deref(),
+        Some("stale_control_version"),
+        "{receipt:?}"
+    );
+}
+
+#[test]
+fn agents_stop_goes_through_the_controller_and_says_why_it_refused() {
+    let (agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    assert_eq!(
+        team_command_text(&agent, String::new(), "stop scout"),
+        "stopping scout"
+    );
+    runtime
+        .registry
+        .transition(id, davinci_agent::AgentState::Cancelled)
+        .unwrap();
+    let again = team_command_text(&agent, String::new(), "stop scout");
+    assert!(again.contains("No live agent"), "{again}");
+    // Asked directly, the controller names the reason.
+    let receipt = panel_control(
+        &runtime,
+        id,
+        davinci_agent::runtime::WorkerControlAction::Stop { reason: None },
+    );
+    assert_eq!(receipt.reason.as_deref(), Some("worker_already_terminal"));
+}
+
+#[test]
+fn agents_msg_reaches_the_live_worker_mailbox() {
+    let (agent, runtime, id) = live_worker_fixture(davinci_agent::AgentKind::Background);
+    let reply = team_command_text(&agent, String::new(), "msg scout look at the parser");
+    assert_eq!(reply, "sent to scout");
+    assert_eq!(runtime.mailbox.pending_count(&id), 1);
+}
+
+#[test]
+fn esc_in_a_worker_view_returns_to_main_and_never_interrupts_or_drops_the_queue() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use davinci_tui::davinci::model::AgentRow;
+    let mut model = model();
+    model.set_workers(vec![AgentRow::new(
+        "w1".to_string(),
+        "scout".to_string(),
+        State::Active,
+    )]);
+    model.queued.push("after this".into());
+    model.focus_agent("w1");
+    let abort = Arc::new(AtomicBool::new(false));
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+    // In the worker's view Esc only goes back.
+    assert!(!mid_turn_key(&mut model, esc, &abort));
+    assert!(
+        !abort.load(Ordering::Relaxed),
+        "Esc in a worker view interrupted the turn"
+    );
+    assert_eq!(model.viewing_worker(), None);
+    assert_eq!(model.queued, vec!["after this".to_string()]);
+
+    // On main it keeps interrupting, and the queued follow-up survives.
+    assert!(!mid_turn_key(&mut model, esc, &abort));
+    assert!(abort.load(Ordering::Relaxed));
+    assert_eq!(model.queued, vec!["after this".to_string()]);
+}
+
+#[test]
+fn the_roster_flag_reads_from_settings_and_defaults_on() {
+    let off: crate::settings::Settings =
+        serde_json::from_str(r#"{"agentFocusUi": false}"#).unwrap();
+    assert_eq!(off.agent_focus_ui, Some(false));
+    let unset: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+    assert!(unset.agent_focus_ui.unwrap_or(true));
+    let mut model = model();
+    model.roster.enabled = off.agent_focus_ui.unwrap_or(true);
+    model.set_workers(vec![davinci_tui::davinci::model::AgentRow::new(
+        "w1".to_string(),
+        "scout".to_string(),
+        State::Active,
+    )]);
+    // Off: nothing of the roster is drawn or reachable.
+    assert!(!model.roster_visible());
+}
+
+/// A model viewing a worker, with two commands to offer in a popup.
+fn worker_view_model() -> Model {
+    use davinci_tui::davinci::model::AgentRow;
+    let mut model = model();
+    model.slash_commands = ["compact", "rewind"]
+        .into_iter()
+        .map(|name| davinci_tui::SlashCommandSpec {
+            name: name.into(),
+            description: String::new(),
+            argument_hint: None,
+            argument_items: Vec::new(),
+        })
+        .collect();
+    model.set_workers(vec![AgentRow::new(
+        "w1".to_string(),
+        "scout".to_string(),
+        State::Active,
+    )]);
+    model.focus_agent("w1");
+    model
+}
+
+fn esc() -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    )
+}
+
+/// The idle loop's order: the double-escape pre-handler, then `app::handle_key`.
+/// Returns whether the pre-handler saw a double escape.
+fn idle_esc(model: &mut Model, last: &mut Option<Instant>) -> bool {
+    let doubled = double_escape(model, esc(), last);
+    if !doubled {
+        let _ = davinci_tui::davinci::app::handle_key(model, esc());
+    }
+    doubled
+}
+
+#[test]
+fn mid_turn_esc_in_a_worker_view_with_a_popup_only_closes_the_popup() {
+    let mut model = worker_view_model();
+    model.queued.push("later".into());
+    model.type_char("/");
+    assert!(model.suggestions.is_some(), "the popup must be open");
+    let abort = Arc::new(AtomicBool::new(false));
+
+    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!abort.load(Ordering::Relaxed), "Esc interrupted main");
+    assert!(model.suggestions.is_none());
+    assert_eq!(
+        model.viewing_worker(),
+        Some("w1"),
+        "closing the popup stays put"
+    );
+    assert_eq!(model.queued, vec!["later".to_string()]);
+
+    // Next Esc goes back to main, still without touching the turn.
+    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!abort.load(Ordering::Relaxed));
+    assert_eq!(model.viewing_worker(), None);
+}
+
+#[test]
+fn mid_turn_esc_in_a_worker_view_with_an_overlay_only_closes_the_overlay() {
+    let mut model = worker_view_model();
+    model.toggle_overlay(Overlay::Sessions);
+    assert!(model.overlay.is_some());
+    let abort = Arc::new(AtomicBool::new(false));
+
+    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!abort.load(Ordering::Relaxed), "Esc interrupted main");
+    assert!(model.overlay.is_none());
+    assert_eq!(model.viewing_worker(), Some("w1"));
+}
+
+#[test]
+fn mid_turn_ctrl_c_in_a_worker_view_still_interrupts_main_and_says_so() {
+    let mut model = worker_view_model();
+    let abort = Arc::new(AtomicBool::new(false));
+    let ctrl_c = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert!(!mid_turn_key(&mut model, ctrl_c, &abort));
+    assert!(abort.load(Ordering::Relaxed));
+    assert!(model
+        .toast
+        .as_ref()
+        .is_some_and(|(text, _)| text.contains("interrupting main")));
+}
+
+#[test]
+fn idle_double_esc_never_runs_the_main_action_from_a_worker_view() {
+    let mut model = worker_view_model();
+    let mut last = None;
+    // First Esc: leaves the worker view and arms nothing.
+    assert!(!idle_esc(&mut model, &mut last));
+    assert_eq!(model.viewing_worker(), None);
+    assert!(last.is_none(), "a worker-view Esc armed the double escape");
+    // Second Esc, right away, on main: only arms. No /rewind.
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(last.is_some());
+    // A genuine pair on main still fires.
+    assert!(idle_esc(&mut model, &mut last));
+}
+
+#[test]
+fn idle_esc_with_a_popup_or_overlay_in_a_worker_view_closes_it_and_arms_nothing() {
+    let mut model = worker_view_model();
+    let mut last = None;
+    model.type_char("/");
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(model.suggestions.is_none());
+    assert_eq!(model.viewing_worker(), Some("w1"));
+
+    model.composer.set_text(String::new());
+    model.toggle_overlay(Overlay::Sessions);
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(model.overlay.is_none());
+    assert_eq!(model.viewing_worker(), Some("w1"));
+    assert!(last.is_none());
+    // Two quick Escapes in the view: back to main, and still nothing fires.
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(!idle_esc(&mut model, &mut last));
 }

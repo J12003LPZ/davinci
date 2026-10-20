@@ -4,11 +4,11 @@
     "media_type": "text/html; charset=utf-8"
   },
   "app.js": {
-    "sha256": "9ac3920b3d1f5d6b7f462b1ae63aeb557521dd3d56e2cbe8d79b74a663028248",
+    "sha256": "afe6257128499a2ae708d6a85d0b0f70dafdf27ee8c19aeda0372c822f6959ce",
     "media_type": "application/javascript"
   },
   "app.css": {
-    "sha256": "9c7468184e01ea87af488f03b4bc8eaf181786baf0b12b241aa6cf93f02a6bb3",
+    "sha256": "36716a513297ddd765a2a31ba92b141c1ea6b8671289457e391b7e0d31ee5ffe",
     "media_type": "text/css"
   }
 }

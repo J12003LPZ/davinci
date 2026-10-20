@@ -80,6 +80,9 @@ pub enum Target {
     Suggestion(usize),
     /// The earlier prompt at this index of the history search's matches.
     HistoryMatch(usize),
+    /// Row `n` of the agent roster as drawn; `Model::roster.hit` names its
+    /// agent, so the click opens the worker the user saw.
+    Roster(usize),
 }
 
 /// A clickable band of screen rows.
@@ -176,6 +179,19 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let above = extension_rows(model, &model.extensions.above());
     let below = extension_rows(model, &model.extensions.below());
     let notice = chrome::governor_notice(chrome_model);
+    // The agent roster rides under the composer; while a worker is in view
+    // the composer is addressed to it, and says so.
+    let roster = if conversation {
+        super::views::agent_focus::roster_lines(chrome_model, model.width, height as u16)
+    } else {
+        Vec::new()
+    };
+    let recipient = if conversation {
+        super::views::agent_focus::recipient_row(chrome_model)
+    } else {
+        None
+    };
+    let worker_view = conversation && model.viewing_worker().is_some();
     // The context bar sits right above what the composer offers, as the
     // last thing read before typing.
     let meter = if conversation {
@@ -219,6 +235,8 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             + meter.len()
             + offered.len()
             + composer_rows.len()
+            + roster.len()
+            + usize::from(recipient.is_some())
             + below.len()
             + chrome::footer(chrome_model).len()
             + 1;
@@ -242,6 +260,8 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         + meter.len()
         + offered.len()
         + composer_rows.len()
+        + roster.len()
+        + usize::from(recipient.is_some())
         + below.len()
         + chrome::footer(chrome_model).len();
     let body_height = height.saturating_sub(reserved);
@@ -254,7 +274,9 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let body_start = rows.len() as u16;
     let mut graph = None;
     let mut scrollbar = None;
-    let content = if conversation {
+    let content = if worker_view {
+        super::views::agent_focus::worker_body(model, body_height)
+    } else if conversation {
         let (rows, bar) = conversation_body(model, body_height);
         scrollbar = bar.map(|bar| Scrollbar {
             top: body_start,
@@ -283,6 +305,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     });
     let offered_start = rows.len().min(height) as u16;
     rows.extend(offered);
+    rows.extend(recipient);
     let mut targets = Vec::new();
     if let Some(bar) = scrollbar.as_ref().filter(|bar| bar.offset > 0) {
         let last = bar.top + bar.height.saturating_sub(1);
@@ -328,6 +351,19 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         }
     }
     rows.extend(composer_rows);
+    let mut roster_ids = Vec::new();
+    for entry in roster {
+        let row = rows.len();
+        if let (Some(id), true) = (entry.target, row < height) {
+            targets.push(HitTarget {
+                rows: row as u16..row as u16 + 1,
+                target: Target::Roster(roster_ids.len()),
+            });
+            roster_ids.push(id);
+        }
+        rows.push(entry.line);
+    }
+    *model.roster.hit.borrow_mut() = roster_ids;
     rows.extend(below);
     rows.extend(chrome::footer(chrome_model));
     rows.truncate(height);
@@ -1221,6 +1257,11 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     }
     if model.history_search.is_some() {
         return handle_history_search_key(model, key);
+    }
+    // The roster and a worker's view own Esc, the arrows and Enter before
+    // anything else: Esc in a worker's view returns to main and nothing more.
+    if super::views::agent_focus::handle_key(model, key) {
+        return Flow::Continue;
     }
     if let Some(flow) = handle_footer_key(model, key) {
         return flow;
