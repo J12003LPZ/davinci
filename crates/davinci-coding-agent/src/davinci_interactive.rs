@@ -363,6 +363,8 @@ fn subagent_row(progress: &davinci_agent::subagent_progress::SubagentProgress) -
         },
         tool_uses: progress.tool_uses,
         tokens: progress.tokens,
+        tokens_estimated: progress.usage.source()
+            == davinci_agent::subagent_progress::UsageSource::Estimated,
         recent: progress.recent.clone(),
         elapsed_secs: progress.elapsed_ms / 1000,
     }
@@ -1499,12 +1501,45 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
 /// the terminal back and leave. That path restores the screen first, which is
 /// what killing the process from outside never did.
 #[must_use]
+/// Whether this Esc is the second of a pair on main. An Esc in a worker's view
+/// is never one: it returns to main, and the pair starts over from there.
+fn double_escape(
+    model: &Model,
+    key: crossterm::event::KeyEvent,
+    last: &mut Option<Instant>,
+) -> bool {
+    let eligible = key.code == crossterm::event::KeyCode::Esc
+        && key.modifiers.is_empty()
+        && model.viewing_worker().is_none()
+        && model.overlay.is_none()
+        && model.suggestions.is_none()
+        && model.screen == davinci_tui::davinci::model::Screen::Agent
+        && !model.codex_open()
+        && model.composer.trim().is_empty()
+        && model.double_escape_action != "none";
+    if !eligible {
+        *last = None;
+        return false;
+    }
+    let now = Instant::now();
+    let doubled = last.is_some_and(|prev| {
+        now.duration_since(prev) < Duration::from_millis(davinci_tui::DOUBLE_ESCAPE_MS)
+    });
+    *last = if doubled { None } else { Some(now) };
+    doubled
+}
+
 fn mid_turn_key(
     model: &mut Model,
     key: crossterm::event::KeyEvent,
     abort: &Arc<AtomicBool>,
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
+    // The roster and a worker's view own their keys first: Esc in a worker's
+    // view goes back to main and never reaches the interrupt below.
+    if davinci_tui::davinci::views::agent_focus::handle_key(model, key) {
+        return false;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if let Some(data) = davinci_tui::key_event_bytes(&key) {
         if model.keybindings.matches(&data, "davinci.tools.expand") {
@@ -1525,6 +1560,11 @@ fn mid_turn_key(
             return again;
         }
         KeyCode::Char('c') if ctrl => {
+            // Ctrl+C is the explicit interrupt and acts on main, also from a
+            // worker's view; say so.
+            if model.viewing_worker().is_some() {
+                model.push_toast("interrupting main".into());
+            }
             let again = abort.swap(true, Ordering::Relaxed);
             model.interrupt();
             return again;
@@ -1660,6 +1700,10 @@ fn run_turn(
     let mut last_tick = Instant::now();
     // The job book, read on every tick while the worker holds the agent.
     let jobs = agent.tool_context.jobs.clone();
+    // The runtime and roster feed, read the same way: the worker owns the
+    // agent for the turn, this loop owns the screen.
+    let roster_runtime = agent.runtime.clone();
+    let mut roster_host = crate::agent_roster_host::RosterHost::default();
     // The working line above the composer, for as long as the turn runs.
     let started = Instant::now();
     let verb_seed = model
@@ -1708,6 +1752,9 @@ fn run_turn(
                 model.dirty = true;
                 last_tick = Instant::now();
                 poll_jobs(&jobs, model);
+                if let Some(runtime) = &roster_runtime {
+                    roster_host.tick(runtime, model);
+                }
             }
             while let Ok(event) = event_rx.try_recv() {
                 apply(model, &mut turn, &event);
@@ -1851,7 +1898,11 @@ fn run_turn(
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {
-                        if mid_turn_key(model, key, &abort) {
+                        let hung = mid_turn_key(model, key, &abort);
+                        if let Some(runtime) = &roster_runtime {
+                            roster_host.pump(runtime, model);
+                        }
+                        if hung {
                             // The abort flag was already up and the worker is
                             // not answering it: a hung read holds it somewhere
                             // with no timeout left to fire. Give the terminal
@@ -4829,6 +4880,7 @@ pub fn run(
     let startup_settings =
         crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
     model.show_tool_output = startup_settings.show_tool_output.unwrap_or(false);
+    model.roster.enabled = startup_settings.agent_focus_ui.unwrap_or(true);
     model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(
         startup_settings.context_bar.as_deref().unwrap_or("compact"),
     );
@@ -4987,6 +5039,7 @@ pub fn run(
     // The `5a` sheet shows a run that is progressing on its own thread; it is
     // re-read from `graph-status` once a second while it is open.
     let mut last_graph_refresh = Instant::now();
+    let mut roster_host = crate::agent_roster_host::RosterHost::default();
     // The question the `Ask` instrument is currently putting, if any. It lives
     // here rather than in the model because only this module knows what the
     // rows mean.
@@ -5132,6 +5185,13 @@ pub fn run(
                 model.workflows_running = workflows;
                 model.dirty = true;
             }
+            if let Some(runtime) = &agent.runtime {
+                roster_host.tick(runtime, &mut model);
+            }
+        }
+        // A message typed in a worker's view goes out now, not on the next tick.
+        if let Some(runtime) = &agent.runtime {
+            roster_host.pump(runtime, &mut model);
         }
         // Lines shared code printed while the screen was ours belong in the
         // transcript, which is the only place a davinci shell can say anything
@@ -5433,22 +5493,8 @@ pub fn run(
                         // Two escapes on an empty composer, within the same window
                         // the legacy chrome uses, run the stored double-escape
                         // action: rewind by default, with tree and fork still configurable.
-                        if key.code == crossterm::event::KeyCode::Esc
-                            && key.modifiers.is_empty()
-                            && model.overlay.is_none()
-                            && model.suggestions.is_none()
-                            && model.screen == davinci_tui::davinci::model::Screen::Agent
-                            && !model.codex_open()
-                            && model.composer.trim().is_empty()
-                            && model.double_escape_action != "none"
-                        {
-                            let now = Instant::now();
-                            let doubled = last_escape.is_some_and(|prev| {
-                                now.duration_since(prev)
-                                    < Duration::from_millis(davinci_tui::DOUBLE_ESCAPE_MS)
-                            });
-                            if doubled {
-                                last_escape = None;
+                        if double_escape(&model, key, &mut last_escape) {
+                            {
                                 match davinci_tui::DoubleEscapeAction::parse(
                                     &model.double_escape_action,
                                 ) {
@@ -5482,9 +5528,6 @@ pub fn run(
                                 }
                                 continue;
                             }
-                            last_escape = Some(now);
-                        } else {
-                            last_escape = None;
                         }
                         let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
                             && key
@@ -10534,6 +10577,47 @@ fn agents_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     Next::Go
 }
 
+/// Run one control command against a worker at the generation and revision it
+/// has right now. The panel used to send 0 and 0, which no worker ever has, so
+/// every stop and retry came back stale.
+pub(crate) fn panel_control(
+    runtime: &davinci_agent::RuntimeHandle,
+    agent_id: davinci_agent::runtime::AgentId,
+    action: davinci_agent::runtime::WorkerControlAction,
+) -> davinci_agent::runtime::WorkerControlReceipt {
+    let controller = davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
+    controller.execute_command(
+        davinci_agent::runtime::WorkerControlCommand {
+            id: uuid::Uuid::new_v4(),
+            root_run_id: runtime.run_id,
+            agent_id,
+            generation: runtime.registry.get_generation(&agent_id),
+            task_id: None,
+            expected_revision: runtime.registry.get_revision(&agent_id),
+            action,
+        },
+        true,
+    )
+}
+
+/// What a control receipt means for the person who clicked: the outcome and,
+/// when it was not carried out, why.
+pub(crate) fn control_line(
+    verb: &str,
+    name: &str,
+    receipt: &davinci_agent::runtime::WorkerControlReceipt,
+) -> String {
+    let reason = receipt
+        .reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    format!(
+        "{verb} for worker '{name}': {}{reason}",
+        receipt.status.as_str()
+    )
+}
+
 fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {
     let Some(sheet) = shell.model.agents.as_ref() else {
         return Next::Go;
@@ -10565,62 +10649,42 @@ fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
             ));
         }
         "steer" => {
-            if let Some(runtime) = &shell.agent.runtime {
-                let _ = runtime.mailbox.send_steer(
-                    agent_id,
-                    0,
-                    "focus on primary objective".into(),
-                    true,
-                );
-                shell.note(&format!(
-                    "Steering message queued for worker '{}'",
-                    agent_row.name
-                ));
-            }
+            // The sheet has no text field, and a canned instruction is not the
+            // user's words: hand the composer a `/agents msg` for this worker.
+            shell
+                .model
+                .composer
+                .set_text(format!("/agents msg {} ", agent_row.name));
+            shell.model.agents = None;
+            shell.model.screen = Screen::Agent;
+            shell.note(&format!(
+                "Type the message for '{}' and press Enter",
+                agent_row.name
+            ));
         }
         "stop" => {
             if let Some(runtime) = &shell.agent.runtime {
-                let controller =
-                    davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
-                let cmd = davinci_agent::runtime::WorkerControlCommand {
-                    id: uuid::Uuid::new_v4(),
-                    root_run_id: runtime.run_id,
+                let receipt = panel_control(
+                    runtime,
                     agent_id,
-                    generation: 0,
-                    task_id: None,
-                    expected_revision: 0,
-                    action: davinci_agent::runtime::WorkerControlAction::Stop {
+                    davinci_agent::runtime::WorkerControlAction::Stop {
                         reason: Some("stopped via live agent panel".into()),
                     },
-                };
-                let receipt = controller.execute_command(cmd, true);
-                shell.note(&format!(
-                    "Stop requested for worker '{}': status {:?}",
-                    agent_row.name, receipt.status
-                ));
+                );
+                shell.note(&control_line("Stop", &agent_row.name, &receipt));
             }
             open_agents_sheet(shell.agent, shell.model);
         }
         "retry" => {
             if let Some(runtime) = &shell.agent.runtime {
-                let controller =
-                    davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
-                let cmd = davinci_agent::runtime::WorkerControlCommand {
-                    id: uuid::Uuid::new_v4(),
-                    root_run_id: runtime.run_id,
+                let receipt = panel_control(
+                    runtime,
                     agent_id,
-                    generation: 0,
-                    task_id: None,
-                    expected_revision: 0,
-                    action: davinci_agent::runtime::WorkerControlAction::Retry {
+                    davinci_agent::runtime::WorkerControlAction::Retry {
                         reason: Some("retry via live agent panel".into()),
                     },
-                };
-                let receipt = controller.execute_command(cmd, true);
-                shell.note(&format!(
-                    "Retry requested for worker '{}': status {:?}",
-                    agent_row.name, receipt.status
-                ));
+                );
+                shell.note(&control_line("Retry", &agent_row.name, &receipt));
             }
             open_agents_sheet(shell.agent, shell.model);
         }
@@ -11231,11 +11295,22 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
             };
             match davinci_agent::runtime::resolve_worker(runtime, name) {
                 Ok(id) => {
-                    let _ = runtime
-                        .registry
-                        .transition(id, davinci_agent::AgentState::Stopping);
-                    runtime.team.cancel(&id);
-                    format!("stopping {name}")
+                    let receipt = panel_control(
+                        runtime,
+                        id,
+                        davinci_agent::runtime::WorkerControlAction::Stop {
+                            reason: Some("stopped with /agents stop".into()),
+                        },
+                    );
+                    match receipt.status {
+                        davinci_agent::runtime::ControlStatus::Accepted
+                        | davinci_agent::runtime::ControlStatus::Stopping
+                        | davinci_agent::runtime::ControlStatus::Stopped => {
+                            runtime.team.cancel(&id);
+                            format!("stopping {name}")
+                        }
+                        _ => control_line("Stop", name, &receipt),
+                    }
                 }
                 Err(error) => error,
             }
@@ -11253,17 +11328,20 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
                     // User steering: an unregistered sender id, delivered to
                     // the teammate as plain user text (see
                     // take_labeled_messages), and it wakes an idle teammate.
-                    let generation = runtime.registry.get_generation(&id);
-                    match runtime
-                        .mailbox
-                        .send_steer(id, generation, text.join(" "), false)
-                    {
-                        Ok(receipt) if receipt.state == "rejected" => format!(
+                    // The same journaled path as the worker view and the RPC.
+                    let (state, reason, _) = crate::agent_roster_host::send_to_worker(
+                        runtime,
+                        &id.to_string(),
+                        &text.join(" "),
+                        uuid::Uuid::new_v4(),
+                    );
+                    if matches!(state.as_str(), "queued" | "delivered" | "applied") {
+                        format!("sent to {name}")
+                    } else {
+                        format!(
                             "{name} did not accept the message ({})",
-                            receipt.reason.unwrap_or_else(|| "rejected".into())
-                        ),
-                        Ok(_) => format!("sent to {name}"),
-                        Err(error) => error.to_string(),
+                            reason.unwrap_or(state)
+                        )
                     }
                 }
                 Err(error) => error,

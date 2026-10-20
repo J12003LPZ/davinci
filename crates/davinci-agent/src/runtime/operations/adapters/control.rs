@@ -40,6 +40,11 @@ pub enum ControlOperationError {
     Domain(String),
     #[error("operation requires recovery evidence before another effect can run")]
     RecoveryRequired,
+    /// The mailbox holds the steering message, but the journal could not
+    /// record that it did. The message is accepted; its receipt is not
+    /// complete. Resending the same id returns the mailbox's receipt.
+    #[error("message {message_id} is accepted but its receipt was not recorded: {reason}")]
+    AcceptedUnrecorded { message_id: Uuid, reason: String },
     #[error("operation idempotency key collided with a different command")]
     Collision,
     #[error("operation result was not a control receipt")]
@@ -287,7 +292,20 @@ impl ControlOperationAdapter {
         } else {
             worker_value
         };
-        self.complete_success(&admitted, &mut receipt)?;
+        let accepted = match &receipt.value {
+            ControlReceiptValue::Steering(steering) if steering.state != "rejected" => {
+                Some(steering.message_id)
+            }
+            _ => None,
+        };
+        self.complete_success(&admitted, &mut receipt)
+            .map_err(|error| match accepted {
+                Some(message_id) => ControlOperationError::AcceptedUnrecorded {
+                    message_id,
+                    reason: error.to_string(),
+                },
+                None => error,
+            })?;
         Ok(receipt)
     }
 

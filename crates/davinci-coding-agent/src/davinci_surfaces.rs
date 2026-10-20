@@ -478,6 +478,15 @@ pub fn worker_action(key: &str) -> Option<&'static str> {
     }
 }
 
+/// `m:ss`, or `h:mm:ss` from the first hour.
+pub fn clock(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
 /// Project authoritative worker snapshots into UI rows for the live agents panel.
 pub fn agents_from_snapshots(
     snapshots: &[davinci_agent::runtime::WorkerSnapshot],
@@ -497,9 +506,7 @@ pub fn agents_from_snapshots(
             };
 
             let elapsed_secs = s.elapsed_ms / 1000;
-            let mins = elapsed_secs / 60;
-            let secs = elapsed_secs % 60;
-            let elapsed = format!("{mins:02}:{secs:02}");
+            let elapsed = clock(elapsed_secs);
 
             let owned_paths = s
                 .owned_paths
@@ -520,6 +527,21 @@ pub fn agents_from_snapshots(
                 davinci_agent::runtime::AgentState::Cancelled => "cancelled".into(),
             };
             row.elapsed = elapsed;
+            row.elapsed_secs = elapsed_secs;
+            row.activity = s.activity.clone().unwrap_or_default();
+            row.tokens = (!s.usage_unknown).then(|| s.usage.total());
+            row.tokens_estimated =
+                s.usage.source() == davinci_agent::subagent_progress::UsageSource::Estimated;
+            row.cache_read = s.usage.cache_read;
+            row.cache_write = s.usage.cache_write;
+            row.workspace = match (s.workspace.kind, &s.workspace.branch) {
+                (davinci_agent::runtime::WorkspaceKind::Shared, _) => "shared".into(),
+                (davinci_agent::runtime::WorkspaceKind::Unavailable, _) => "worktree gone".into(),
+                (_, Some(branch)) => format!("\u{2387} {branch}"),
+                (_, None) if s.workspace.detached => "\u{2387} detached".into(),
+                (_, None) => "\u{2387} worktree".into(),
+            };
+            row.workspace_detail = s.workspace.label();
             row.owned_paths = owned_paths;
             row.tool_count = s.tool_count;
             row.waiting_on = s.waiting_on.clone();
@@ -1482,12 +1504,98 @@ mod tests {
                 waiting_on: None,
                 disconnected: false,
                 usage_unknown: false,
+                usage: Default::default(),
+                activity: None,
+                workspace: Default::default(),
             });
         }
         let rows = agents_from_snapshots(&snapshots);
         assert_eq!(rows.len(), 2000);
         assert_eq!(rows[0].name, "worker-0");
         assert_eq!(rows[1999].name, "worker-1999");
+    }
+
+    fn snapshot_with(
+        usage: davinci_agent::subagent_progress::SubagentUsage,
+        elapsed_ms: u64,
+    ) -> davinci_agent::runtime::WorkerSnapshot {
+        use davinci_agent::subagent_progress::UsageSource;
+        davinci_agent::runtime::WorkerSnapshot {
+            agent_id: davinci_agent::AgentId::new(),
+            run_id: davinci_agent::RunId::new(),
+            task_id: None,
+            name: "w".into(),
+            kind: davinci_agent::runtime::AgentKind::Subagent,
+            state: davinci_agent::runtime::AgentState::Running,
+            generation: 1,
+            revision: 1,
+            elapsed_ms,
+            last_activity_ms: 0,
+            tool_count: 3,
+            owned_paths: vec![],
+            waiting_on: None,
+            disconnected: false,
+            usage_unknown: usage.source() == UsageSource::Unknown,
+            usage,
+            activity: Some("Read(src/lib.rs)".into()),
+            workspace: Default::default(),
+        }
+    }
+
+    #[test]
+    fn agents_from_snapshots_displays_reported_tokens() {
+        let usage = davinci_agent::subagent_progress::SubagentUsage {
+            input: 21_000,
+            output: 2_400,
+            cache_read: 90_000,
+            cache_write: 1_000,
+            reported_replies: 4,
+            ..Default::default()
+        };
+        let rows = agents_from_snapshots(&[snapshot_with(usage, 125_000)]);
+        // Input + output; the cache is carried apart, never added in.
+        assert_eq!(rows[0].tokens, Some(23_400));
+        assert!(!rows[0].tokens_estimated);
+        assert_eq!((rows[0].cache_read, rows[0].cache_write), (90_000, 1_000));
+        assert_eq!(rows[0].activity, "Read(src/lib.rs)");
+        assert_eq!(rows[0].elapsed, "2:05");
+        assert_eq!(
+            davinci_tui::davinci::views::agents::tokens_cell(&rows[0]),
+            "23k"
+        );
+    }
+
+    #[test]
+    fn unknown_usage_never_shows_zero_and_estimates_carry_a_tilde() {
+        let none = davinci_agent::subagent_progress::SubagentUsage::default();
+        let rows = agents_from_snapshots(&[snapshot_with(none, 1_000)]);
+        assert_eq!(rows[0].tokens, None);
+        assert!(rows[0].usage_unknown);
+        assert_eq!(
+            davinci_tui::davinci::views::agents::tokens_cell(&rows[0]),
+            "unknown"
+        );
+
+        let estimated = davinci_agent::subagent_progress::SubagentUsage {
+            estimated: 4_200,
+            ..Default::default()
+        };
+        let rows = agents_from_snapshots(&[snapshot_with(estimated, 1_000)]);
+        assert!(rows[0].tokens_estimated);
+        assert_eq!(
+            davinci_tui::davinci::views::agents::tokens_cell(&rows[0]),
+            "~4k"
+        );
+    }
+
+    #[test]
+    fn elapsed_reads_h_mm_ss_from_the_first_hour() {
+        assert_eq!(clock(0), "0:00");
+        assert_eq!(clock(59), "0:59");
+        assert_eq!(clock(61), "1:01");
+        assert_eq!(clock(3_599), "59:59");
+        assert_eq!(clock(3_600), "1:00:00");
+        assert_eq!(clock(3_725), "1:02:05");
     }
 
     #[test]

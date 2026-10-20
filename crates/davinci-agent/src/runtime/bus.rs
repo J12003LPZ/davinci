@@ -15,6 +15,14 @@ pub enum RuntimeDecision {
 
 pub trait RuntimeSubscriber: Send + Sync {
     fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision;
+
+    /// Record the event and report whether it is safely kept. Subscribers that
+    /// only watch cannot fail, so the default is `on_event`; the runtime log
+    /// overrides it so a caller can refuse to confirm what was not written.
+    fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+        self.on_event(event);
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -155,6 +163,32 @@ impl RuntimeBus {
         // Subscriber destructors may reenter the bus; release them outside its lock.
         drop(current);
         drop(previous);
+    }
+
+    /// Emit an event that a caller is about to confirm to a person. Every
+    /// observer still sees it; the first that could not keep it makes this an
+    /// error, so the caller can undo and say so instead of claiming success.
+    pub fn emit_durable(&self, event: RuntimeEventEnvelope) -> Result<(), String> {
+        let subscribers = match self.inner.subscribers.lock() {
+            Ok(subs) => subs.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let mut failure = None;
+        for subscriber in subscribers {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                subscriber.observer.record_durably(&event)
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| "an observer panicked".to_string());
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Emits an event to observers in registration order. Observer panics are
