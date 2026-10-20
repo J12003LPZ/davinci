@@ -117,7 +117,7 @@ use serde_json::json;
 #[test]
 fn design_error_reports_exact_stage_and_recoverable_revision() {
     let (dir, mut agent, store, request) = setup();
-    let secret = "sk-live0123456789abcdef0123456789abcdef";
+    let secret = "sk-live0123456789abcdef0123456789abcdef"; // ggignore
     let bad = format!("Sure! here are ideas {secret} {}", "x ".repeat(2_000));
     let mut m = model(vec![text(&bad), text(&bad), text(&bad)]);
     let mut r = renderer();
@@ -445,23 +445,23 @@ fn resume_with_another_designs_checkpoint_stops_before_any_provider_call() {
 fn snippets_redact_json_headers_jwts_and_prefixed_tokens() {
     let secrets = [
         (
-            r#"{"apiKey":"sk-proj-AbCdEf0123456789xyzWVUT"}"#,
-            "sk-proj-AbCdEf0123456789xyzWVUT",
+            r#"{"apiKey":"sk-proj-AbCdEf0123456789xyzWVUT"}"#, // ggignore
+            "sk-proj-AbCdEf0123456789xyzWVUT",                 // ggignore
         ),
-        (r#"{"Password": "hunter2"}"#, "hunter2"),
-        ("Cookie: session=abc123; theme=dark", "abc123"),
+        (r#"{"Password": "hunter2"}"#, "hunter2"), // ggignore
+        ("Cookie: session=abc123; theme=dark", "abc123"), // ggignore
         (
-            "Set-Cookie: sid=AbCdEf0123456789XyZ; Path=/",
+            "Set-Cookie: sid=AbCdEf0123456789XyZ; Path=/", // ggignore
             "AbCdEf0123456789XyZ",
         ),
-        ("Authorization:Bearer abc.def.ghi", "abc.def.ghi"),
+        ("Authorization:Bearer abc.def.ghi", "abc.def.ghi"), // ggignore
         (
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92",
-            "eyJhbGciOiJIUzI1NiJ9",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92", // ggignore
+            "eyJhbGciOiJIUzI1NiJ9",                                              // ggignore
         ),
         (
-            r#"token "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH""#,
-            "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH",
+            r#"token "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH""#, // ggignore
+            "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH",            // ggignore
         ),
     ];
     for (text, secret) in secrets {

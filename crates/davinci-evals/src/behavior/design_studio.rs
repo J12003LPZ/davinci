@@ -173,108 +173,108 @@ fn leaks() -> Vec<(&'static str, String, &'static str)> {
     vec![
         (
             "an API key",
-            "reply was sk-live0123456789abcdef0123456789abcdef end".into(),
-            "sk-live0123456789abcdef0123456789abcdef",
+            "reply was sk-live0123456789abcdef0123456789abcdef end".into(), // ggignore
+            "sk-live0123456789abcdef0123456789abcdef", // ggignore
         ),
         (
             "a bearer token",
-            "Authorization: Bearer abc.def.ghi trailing".into(),
-            "abc.def.ghi",
+            "Authorization: Bearer abc.def.ghi trailing".into(), // ggignore
+            "abc.def.ghi", // ggignore
         ),
         (
-            "a long opaque token",
-            "token=Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg== done".into(),
-            "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg==",
+            "a long opaque token", // ggignore
+            "token=Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg== done".into(), // ggignore
+            "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg==", // ggignore
         ),
         (
-            "a JSON apiKey",
-            r#"{"apiKey":"sk-proj-AbCdEf0123456789xyzWVUT"}"#.into(),
-            r#"sk-proj-AbCdEf0123456789xyzWVUT"#,
+            "a JSON apiKey", // ggignore
+            r#"{"apiKey":"sk-proj-AbCdEf0123456789xyzWVUT"}"#.into(), // ggignore
+            r#"sk-proj-AbCdEf0123456789xyzWVUT"#, // ggignore
         ),
         (
-            "a JSON APIKEY in capitals",
-            r#"{"APIKEY":"sk-ABCDEFGH12345678"}"#.into(),
-            r#"sk-ABCDEFGH12345678"#,
+            "a JSON APIKEY in capitals", // ggignore
+            r#"{"APIKEY":"sk-ABCDEFGH12345678"}"#.into(), // ggignore
+            r#"sk-ABCDEFGH12345678"#, // ggignore
         ),
         (
             "a JSON token",
-            r#"{"token":"opaque-session-value"}"#.into(),
-            r#"opaque-session-value"#,
+            r#"{"token":"opaque-session-value"}"#.into(), // ggignore
+            r#"opaque-session-value"#, // ggignore
         ),
         (
             "a JSON secret",
-            r#"{"Secret": "s3cr3t-value-here"}"#.into(),
-            r#"s3cr3t-value-here"#,
+            r#"{"Secret": "s3cr3t-value-here"}"#.into(), // ggignore
+            r#"s3cr3t-value-here"#, // ggignore
         ),
         (
             "a JSON password",
-            r#"{"password":"hunter2"}"#.into(),
-            r#"hunter2"#,
+            r#"{"password":"hunter2"}"#.into(), // ggignore
+            r#"hunter2"#, // ggignore
         ),
         (
             "a JSON authorization",
-            r#"{"authorization":"Bearer abc.def.ghi"}"#.into(),
-            r#"abc.def.ghi"#,
+            r#"{"authorization":"Bearer abc.def.ghi"}"#.into(), // ggignore
+            r#"abc.def.ghi"#, // ggignore
         ),
         (
             "a JSON cookie",
-            r#"{"cookie":"sid=AbCdEf0123456789"}"#.into(),
+            r#"{"cookie":"sid=AbCdEf0123456789"}"#.into(), // ggignore
             r#"AbCdEf0123456789"#,
         ),
         (
             "an escaped JSON key",
-            r#"args "{\"apiKey\":\"sk-proj-ZZZZ1234567890\"}""#.into(),
-            r#"sk-proj-ZZZZ1234567890"#,
+            r#"args "{\"apiKey\":\"sk-proj-ZZZZ1234567890\"}""#.into(), // ggignore
+            r#"sk-proj-ZZZZ1234567890"#, // ggignore
         ),
         (
-            "a Cookie header",
-            r#"Cookie: session=abc123; theme=dark"#.into(),
-            r#"abc123"#,
+            "a Cookie header", // ggignore
+            r#"Cookie: session=abc123; theme=dark"#.into(), // ggignore
+            r#"abc123"#, // ggignore
         ),
         (
-            "a Set-Cookie header",
-            r#"Set-Cookie: sid=AbCdEf0123456789XyZ; Path=/"#.into(),
+            "a Set-Cookie header", // ggignore
+            r#"Set-Cookie: sid=AbCdEf0123456789XyZ; Path=/"#.into(), // ggignore
             r#"AbCdEf0123456789XyZ"#,
         ),
         (
             "a SET-COOKIE header in capitals",
-            r#"SET-COOKIE: sid=zzzzzzzz1; Secure"#.into(),
-            r#"zzzzzzzz1"#,
+            r#"SET-COOKIE: sid=zzzzzzzz1; Secure"#.into(), // ggignore
+            r#"zzzzzzzz1"#, // ggignore
         ),
         (
             "a scheme glued to its header",
-            r#"Authorization:Bearer abc.def.ghi"#.into(),
-            r#"abc.def.ghi"#,
+            r#"Authorization:Bearer abc.def.ghi"#.into(), // ggignore
+            r#"abc.def.ghi"#, // ggignore
         ),
         (
             "a basic credential",
-            r#"Authorization: Basic dXNlcjpwYXNzd29yZA=="#.into(),
-            r#"dXNlcjpwYXNzd29yZA=="#,
+            r#"Authorization: Basic dXNlcjpwYXNzd29yZA=="#.into(), // ggignore
+            r#"dXNlcjpwYXNzd29yZA=="#, // ggignore
         ),
         (
             "a bare JWT",
-            r#"jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r end"#.into(),
-            r#"eyJhbGciOiJIUzI1NiJ9"#,
+            r#"jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r end"#.into(), // ggignore
+            r#"eyJhbGciOiJIUzI1NiJ9"#, // ggignore
         ),
         (
             "a quoted GitHub token",
-            r#"token "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH""#.into(),
-            r#"ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH"#,
+            r#"token "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH""#.into(), // ggignore
+            r#"ghp_abcdefghijklmnopqrstuvwxyzABCDEFGH"#, // ggignore
         ),
         (
-            "a gho_ token",
-            r#"gho_abcdefghijklmnopqrstuvwxyzABCDEFGH"#.into(),
-            r#"gho_abcdefghijklmnopqrstuvwxyzABCDEFGH"#,
+            "a gho_ token", // ggignore
+            r#"gho_abcdefghijklmnopqrstuvwxyzABCDEFGH"#.into(), // ggignore
+            r#"gho_abcdefghijklmnopqrstuvwxyzABCDEFGH"#, // ggignore
         ),
         (
             "a fine-grained GitHub token",
-            r#"github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz"#.into(),
-            r#"github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz"#,
+            r#"github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz"#.into(), // ggignore
+            r#"github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz"#, // ggignore
         ),
         (
             "an AWS key id",
-            r#"key AKIAIOSFODNN7EXAMPLE end"#.into(),
-            r#"AKIAIOSFODNN7EXAMPLE"#,
+            r#"key AKIAIOSFODNN7EXAMPLE end"#.into(), // ggignore
+            r#"AKIAIOSFODNN7EXAMPLE"#, // ggignore
         ),
     ]
 }
