@@ -15,10 +15,11 @@ use davinci_agent::{
 use davinci_tui::davinci::model::{
     Ask, AskKind, CatalogRow, Choice, CorpusItem, Credential, Entry, ExportLedger, ExtensionRow,
     ExtensionTab, ExtensionView, ExtensionsSheet, FailedRun, Finding, GovernorCounter,
-    GovernorSheet, GovernorStored, GraphResumeRow, GraphRunSheet, GraphTask, Hunk, HunkKind, KeymapGroup, Model,
-    ModelItem, Overlay, PermissionRow, PickerItem, PlanStep, ProviderRow, ResumeRow, ReviewFile,
-    ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step, SubagentRow, SubagentRowState,
-    ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow, WorkflowsSheet, Working, WorkshopSheet,
+    GovernorSheet, GovernorStored, GraphResumeRow, GraphRunSheet, GraphTask, Hunk, HunkKind,
+    KeymapGroup, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep, ProviderRow,
+    ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step,
+    SubagentRow, SubagentRowState, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
+    WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -7212,9 +7213,7 @@ fn open_graph_resume_sheet(agent: &Agent, model: &mut Model, all: bool) {
             run_id: run.run_id,
             goal: run.goal,
             phase: run.phase,
-            updated: crate::davinci_sources::humanise(
-                now.saturating_sub(run.updated_at) / 1_000
-            ),
+            updated: crate::davinci_sources::humanise(now.saturating_sub(run.updated_at) / 1_000),
             completed: run.completed_tasks,
             total: run.total_tasks,
             cost_usd: run.cost_usd,
