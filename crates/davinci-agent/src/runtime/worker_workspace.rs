@@ -321,7 +321,7 @@ impl WorkspaceCache {
         let entry = entries
             .entry(record.id)
             .or_insert_with(|| CachedWorkspace::new(path));
-        if entry.path != *path {
+        if entry.path.as_path() != path.as_path() {
             // Do not present another worktree's branch while a new read runs.
             *entry = CachedWorkspace::new(path);
         }
@@ -506,12 +506,17 @@ mod cache_tests {
         moved.worktree = None;
         assert_eq!(cache.get(&moved), WorkerWorkspace::default());
         moved.worktree = Some(PathBuf::from("/worktree/new"));
-        assert!(cache.get_with(
-            &moved,
-            quick_read,
-            Duration::from_secs(60),
-            Duration::from_secs(2),
-        ).branch.is_none());
+        assert!(
+            cache
+                .get_with(
+                    &moved,
+                    quick_read,
+                    Duration::from_secs(60),
+                    Duration::from_secs(2),
+                )
+                .branch
+                .is_none()
+        );
     }
 
     #[test]
