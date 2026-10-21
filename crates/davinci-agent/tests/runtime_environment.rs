@@ -211,13 +211,32 @@ fn unchanged_snapshot_does_not_repeat_and_resume_reintroduces_removed_context() 
             .count(),
         1
     );
-    current.prompt_user_with("Inspect again", &[]);
-    assert!(current
-        .runtime_prompt_state()
-        .environment
-        .unwrap()
-        .top_level_entries
-        .contains(&"new-file".into()));
+    // Environment observation is best effort and time bounded. A saturated
+    // CI worker may miss the 75 ms probe deadline; retry only transient
+    // snapshots, but require an actual refreshed listing to contain the file.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        current.prompt_user_with("Inspect again", &[]);
+        let environment = current.runtime_prompt_state().environment.unwrap();
+        if matches!(
+            environment.listing_status,
+            ListingStatus::TimedOut | ListingStatus::ProbeBusy
+        ) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        assert!(
+            matches!(
+                environment.listing_status,
+                ListingStatus::Complete | ListingStatus::Truncated
+            ),
+            "environment refresh failed: {:?}",
+            environment.listing_status
+        );
+        assert!(environment.top_level_entries.contains(&"new-file".into()));
+        break;
+    }
 }
 
 #[test]
