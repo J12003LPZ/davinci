@@ -614,25 +614,67 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Scope fixtures to a child process: changing the test runner's environment
+    // lets the nonzero-exit test accidentally take the dry-run success path.
+    fn editor_test_child(test_name: &str, dry_run: bool) -> bool {
+        const CHILD: &str = "DAVINCI_EXTERNAL_EDITOR_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test_name) {
+            return true;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .env_remove("PI_EXTERNAL_EDITOR_DRY_RUN")
+            .env_remove("PI_EXTERNAL_EDITOR_CONTENT");
+        if dry_run {
+            command
+                .env("PI_EXTERNAL_EDITOR_DRY_RUN", "1")
+                .env("PI_EXTERNAL_EDITOR_CONTENT", "from editor");
+        }
+        let output = command.output().expect("editor test child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     #[test]
     fn non_zero_editor_exit_cancels_the_edit() {
-        let editor = ExternalEditor::new(Some("false"), "draft").unwrap();
-        assert!(editor.edit().is_err());
+        if !editor_test_child(
+            "external_editor::tests::non_zero_editor_exit_cancels_the_edit",
+            false,
+        ) {
+            return;
+        }
+        #[cfg(windows)]
+        let command = "cmd /C exit 1";
+        #[cfg(not(windows))]
+        let command = "false";
+        let editor = ExternalEditor::new(Some(command), "draft").unwrap();
+        let error = editor
+            .edit()
+            .expect_err("a failing editor must discard the edit");
+        assert!(error.contains("editor exited with"), "{error}");
     }
 
     #[test]
     fn dry_run_appends_fixture_and_strips_bom() {
-        std::env::set_var("PI_EXTERNAL_EDITOR_DRY_RUN", "1");
-        std::env::set_var("PI_EXTERNAL_EDITOR_CONTENT", "from editor");
-        let editor = ExternalEditor::new(Some("code --wait"), "draft").expect("editor");
+        if !editor_test_child(
+            "external_editor::tests::dry_run_appends_fixture_and_strips_bom",
+            true,
+        ) {
+            return;
+        }
+        let editor = ExternalEditor::new(Some("code --wait"), "\u{feff}draft\r\n").expect("editor");
         assert!(editor
             .launch_message()
             .contains("Launching external editor: code --wait"));
         let out = editor.edit().expect("edit");
         assert_eq!(out, "draft\nfrom editor");
-        std::env::remove_var("PI_EXTERNAL_EDITOR_DRY_RUN");
-        std::env::remove_var("PI_EXTERNAL_EDITOR_CONTENT");
     }
 
     #[test]
