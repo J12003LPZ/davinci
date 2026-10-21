@@ -19,9 +19,9 @@ use super::views::scrollbar::{self, Scrollbar};
 use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_bar, context_inspector, decision_modal, diff,
-    disegno, export, extensions, goal_path, governor, grafo, graph_resume, graph_run, instrumenta, keys, login,
-    mcp, memoria, mensura, officina, opera, permissions, plan_usage, recovery, resume, rewind,
-    securitas, settings, startup, task_board, transcript, tree, trust, vectors, workflows,
+    disegno, export, extensions, goal_path, governor, grafo, graph_resume, graph_run, instrumenta,
+    keys, login, mcp, memoria, mensura, officina, opera, permissions, plan_usage, recovery, resume,
+    rewind, securitas, settings, startup, task_board, transcript, tree, trust, vectors, workflows,
 };
 
 /// What the runtime should do after a key.
