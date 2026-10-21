@@ -258,7 +258,7 @@ pub struct Settings {
     pub theme: Option<String>,
     #[serde(default)]
     pub quiet_startup: bool,
-    #[serde(default)]
+    #[serde(default, rename = "trustedProjects", alias = "trusted_projects")]
     pub trusted_projects: Vec<String>,
     #[serde(default)]
     pub double_escape_action: Option<String>,
@@ -2970,6 +2970,36 @@ mod tests {
         assert_eq!(skipped.theme.as_deref(), Some("dark"));
         let forced = load_merged_settings_with_override(&agent_dir, &project, Some(true));
         assert_eq!(forced.theme.as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn trusted_projects_key_is_read_in_documented_and_legacy_spelling() {
+        for key in ["trustedProjects", "trusted_projects"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let agent_dir = dir.path().join("agent");
+            let project = dir.path().join("proj");
+            std::fs::create_dir_all(&agent_dir).ok();
+            std::fs::create_dir_all(project.join(".pi")).ok();
+            std::fs::write(
+                agent_dir.join("settings.json"),
+                serde_json::json!({ key: [project.to_string_lossy()] }).to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                project.join(".pi").join("settings.json"),
+                r#"{ "theme": "light" }"#,
+            )
+            .unwrap();
+            let merged = load_merged_settings(&agent_dir, &project);
+            assert_eq!(
+                merged.theme.as_deref(),
+                Some("light"),
+                "{key} did not trust the folder"
+            );
+            let written = serde_json::to_value(&merged).unwrap();
+            assert!(written.get("trustedProjects").is_some(), "{written}");
+            assert!(written.get("trusted_projects").is_none(), "{written}");
+        }
     }
 
     #[test]
