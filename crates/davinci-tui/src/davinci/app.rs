@@ -1668,7 +1668,7 @@ fn handle_graph_resume_key(model: &mut Model, key: KeyEvent) -> Flow {
             let len = graph_resume::visible_indices(model).len();
             if len > 0 {
                 let delta = if key.code == KeyCode::Up { -1 } else { 1 };
-                model.graph_resume_index = wrap_index(model.graph_resume_index, delta, len);
+                model.graph_resume_index = super::model::wrap_index(model.graph_resume_index, delta, len);
                 model.graph_resume_details = false;
             }
         }
