@@ -1,6 +1,6 @@
 # DaVinci resource lifecycle improvements
 
-Status: design and plan approved by the user on 2026-10-21; Native implementation complete, release measurements and final review in progress. See the [execution ledger](../../perf/resource-lifecycle-progress.md).
+Status: design and plan approved by the user on 2026-10-21; Native implementation, local release measurements and review corrections complete. See the [execution ledger](../../perf/resource-lifecycle-progress.md).
 
 Base: remote main `d44028fbe822cd71975e91ceda69c7c901a82693`, checked 2026-10-21.
 

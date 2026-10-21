@@ -36,10 +36,12 @@ No performance result is inferred from a source bound or an unavailable measurem
 
 ## Lead resolution
 
-Both Important findings are being addressed in the follow-up commit. Shell now has a streaming FlowBlock visitor; the collected public shell_lines compatibility path remains only for callers requesting all rows. The 10,000-line Shell regression failed before the change and checks distant viewport output after it.
+Both Important findings were addressed in `8fd946d6` and verified with focused regressions. Shell now has a streaming FlowBlock visitor; the collected shell_lines compatibility path remains only for callers requesting all rows. The 10,000-line Shell regression failed before the change and checks distant viewport output after it.
 
 Admission now carries a weak marker tied to the actual parent lease through host-only runtime and workflow launch context. Nested saturated launches return an explicit local resource error; they retain the parent's reservation and do not bypass budget checks. The marker expires when the parent exits, allowing later background work to use normal waiting semantics. Graph reservation waits also observe absolute run deadlines and report deadline exhaustion.
 
 Additional lead finding: with_worker_state_from omitted the admission owner, so a for_worker-created handle could use a fresh standalone budget instead of the root owner. This qualifies the original nested-Graph reproduction: owner propagation first needed correction on that path, after which the self-wait became reachable. The follow-up copies both owner and weak lease context. A focused regression checks inherited reserved bytes, nested refusal, workflow launch propagation, release accounting and expired parent context. No permission grants or model-authored values enter these fields.
 
 Benchmark cautions accepted: host results compare the full baseline constructor with a candidate classifier Graph-role constructor; the original transcript fixture measures many small Prose entries; Shell bounded allocation is established by its targeted regression. Sampled RSS and five runs support descriptive medians/ranges only. Cold resize CPU remains explicitly synchronous.
+
+Per-turn host rebuilding also preserves the inherited owner and rebinds its workflow runner. Verified: 3 admission tests, the Graph deadline/nested regression, 9 selected resource/host/settings tests (1 existing ignored), and 61 transcript tests all passed; final workspace compilation/formatting checks passed. The full 7095-test workspace run predates these follow-up fixes and was not repeated, following the user's request for only necessary tests.

@@ -82,4 +82,40 @@ Fixtures cover a 50,000-entry transcript (cold layout plus five warm viewport ca
 
 The Linux sampler sums observed process-tree RSS every 2 ms, with PID birth identities. Shared pages count once per process and short peaks can be missed; this is not unique physical memory. Unsupported counters are unknown. Five independent samples support medians/ranges, not credible p95 claims. Build/source identities and raw samples accompany the recorded results. No live coding quality, platform-wide speedup, subscription usage or sustained production workload claim follows from these fixtures.
 
-Measured results and validation are recorded below after the final source build.
+
+
+## Recorded component results
+
+Linux x86_64, Rust 1.88.0, Node 24.19.0, Python 3.12.14. Baseline source `d44028fb`; candidate code `8fd946d6`. Five runs per variant. All original 32 MiB output bytes were recovered, and transcript row counts/checksums matched. [Raw samples, source digests, binary hashes and validation](resource-lifecycle-results.json) identify the exact measured artifacts.
+
+RSS below is the median sampled process-tree peak, followed by the largest observed peak in parentheses, in MiB. Cold time is median [minimum–maximum], in milliseconds; transcript time includes model/history construction plus first layout, and host time includes temporary-directory setup.
+
+| Local fixture | Baseline RSS | Candidate RSS | Baseline cold ms | Candidate cold ms |
+| --- | ---: | ---: | ---: | ---: |
+| 50,000-entry transcript | 40.87 (40.93) | 16.08 (16.14) | 197.30 [133.72–284.65] | 108.46 [105.28–129.61] |
+| 12,000 cache inserts/churn | 4.49 (4.68) | 4.87 (4.93) | 250.54 [181.06–253.10] | 59.24 [52.19–97.79] |
+| 32 MiB newline-free output | 59.55 (66.73) | 7.34 (7.41) | 90.50 [77.92–117.17] | 69.47 [60.85–96.38] |
+| Full baseline / classifier worker host | 5.79 (6.06) | 5.41 (5.45) | 21.44 [21.33–22.01] | 21.34 [21.09–21.81] |
+
+The ordered cache index uses slightly more RSS in this fixture while reducing churn time. Classifier bootstrap avoided learning-store creation in all five candidate runs (baseline created it in all five); its cold time was essentially unchanged with empty stores. These are local observations, not universal speedups.
+
+Baseline warm viewport visits: median 0.235 ms, range 0.174–0.529 ms (five visits within each of five runs). Candidate warm viewport visits: median 0.225 ms, range 0.200–0.874 ms (five visits within each of five runs). The ranges overlap; this does not establish a warm-latency improvement.
+
+Both JS and LSP baseline children remained resident after the 2.3-second idle observation (roughly 27–29 MiB per Node process); all candidate idle children had exited. Both variants completed every active handler/request in the same process beyond the accelerated one-second timeout. Peak RSS of these lifecycle fixtures stayed similar because each first starts a real server/runner. The improvement is release after idle, not a lower active-process peak.
+
+Sampling requested a 2 ms pause between snapshots; actual cadence also includes `/proc` enumeration and sampler overhead. Observations are descriptive: baseline runs precede candidate runs, OS caches are not reset, shared pages are counted per process, and short peaks can be missed. Raw observation counts and all samples are retained. The sampler itself is outside the measured tree but competes for CPU. No p95, live coding-quality or subscription-saving claim is made.
+
+Output spools are recovery artifacts, outside the persistent-cache byte budget. Capture failures remain explicit; preserving evidence can consume disk space. Cold resize still performs synchronous source/height work. Native Windows/macOS behavior has not been executed in this Linux environment.
+
+## Validation and review
+
+The full workspace run before the final review corrections passed 7,095 tests with zero failures and 63 ignored tests. After correcting the review findings, 3 admission, 9 selected resource/host/settings (1 existing ignored), and 61 transcript tests passed; workspace compilation and formatting passed. No additional broad test run was made after the user requested only necessary tests. Three sampler parser tests passed. The [independent review and lead resolutions](resource-lifecycle-review.md) record the two Important findings and the additional inherited-owner correction.
+
+The final native release build passed using the repository release profile and locked dependencies. Five explicitly offline CLI invocations per variant produced the expected stub, with zero provider calls. Baseline binary SHA-256 remained `cfcf8e4272ccd6ab581f99da90623fdefb1876c7954de5d72ea6ecf027406b7e`; candidate is `58cec03675154de588c572f93647df3f25c63be3e8dc8fb168e55a21e611b778`.
+
+| Offline CLI invocation | Baseline | Candidate |
+| --- | ---: | ---: |
+| Harness wall time median [min–max], ms | 108.21 [93.45–111.27] | 92.80 [91.30–111.78] |
+| Sampled peak-tree RSS median (max), MiB | 30.77 (32.07) | 26.29 (27.91) |
+
+Wall time includes process startup, one offline stub turn, sampling and output capture. Five runs with overlapping timing ranges do not establish a general startup speedup. This is separate from the component profile and does not simulate an interactive session or live coding task. The installed baseline was preserved; the candidate executable is a separate build artifact.

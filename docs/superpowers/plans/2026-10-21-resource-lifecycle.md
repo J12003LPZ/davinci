@@ -1,6 +1,6 @@
 # DaVinci resource lifecycle implementation plan
 
-Status: approved by the user; Native execution in progress on `perf/resource-lifecycle`. See [execution evidence and rulings](../../perf/resource-lifecycle-progress.md).
+Status: approved Native implementation, review corrections and local measurements complete on `perf/resource-lifecycle`; remote PR delivery in progress. See [execution evidence and rulings](../../perf/resource-lifecycle-progress.md).
 
 **Goal:** Implement the approved local-resource improvements and create one PR targeting main from `perf/resource-lifecycle`.
 
