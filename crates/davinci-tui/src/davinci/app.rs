@@ -19,7 +19,7 @@ use super::views::scrollbar::{self, Scrollbar};
 use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_bar, context_inspector, decision_modal, diff,
-    disegno, export, extensions, goal_path, governor, grafo, graph_run, instrumenta, keys, login,
+    disegno, export, extensions, goal_path, governor, grafo, graph_resume, graph_run, instrumenta, keys, login,
     mcp, memoria, mensura, officina, opera, permissions, plan_usage, recovery, resume, rewind,
     securitas, settings, startup, task_board, transcript, tree, trust, vectors, workflows,
 };
@@ -835,6 +835,7 @@ fn section_rows(model: &Model) -> Option<Vec<Line<'static>>> {
         Screen::Compact => Some(compact::lines(model)),
         Screen::Export => Some(export::lines(model)),
         Screen::GraphRun => Some(graph_run::lines(model)),
+        Screen::GraphResume => Some(graph_resume::lines(model)),
         Screen::Vectors => Some(vectors::lines(model)),
         Screen::Governor => Some(governor::lines(model)),
         Screen::Securitas => Some(securitas::lines(model)),
@@ -1630,7 +1631,72 @@ fn handle_workflows_key(model: &mut Model, key: KeyEvent, data: Option<&str>) ->
     Some(Flow::Continue)
 }
 
+/// Graph picker owns its search input. Enter is read-only; r explicitly
+/// dispatches the existing checkpoint-validated resume path by ID.
+fn handle_graph_resume_key(model: &mut Model, key: KeyEvent) -> Flow {
+    if key.kind != KeyEventKind::Press {
+        return Flow::Continue;
+    }
+    let plain = key.modifiers.is_empty();
+    if model.graph_resume_searching {
+        match key.code {
+            KeyCode::Enter if plain => model.graph_resume_searching = false,
+            KeyCode::Esc => model.graph_resume_searching = false,
+            KeyCode::Backspace if plain => {
+                model.graph_resume_query.pop();
+                model.graph_resume_index = 0;
+                model.graph_resume_details = false;
+            }
+            KeyCode::Char(ch) if plain && model.graph_resume_query.len() < 256 => {
+                model.graph_resume_query.push(ch);
+                model.graph_resume_index = 0;
+                model.graph_resume_details = false;
+            }
+            _ => {}
+        }
+        return Flow::Continue;
+    }
+    match key.code {
+        KeyCode::Esc => model.close(),
+        KeyCode::Char('/') if plain => model.graph_resume_searching = true,
+        KeyCode::Char('a') if plain => {
+            model.graph_resume_all = !model.graph_resume_all;
+            model.graph_resume_index = 0;
+            model.graph_resume_details = false;
+        }
+        KeyCode::Up | KeyCode::Down if plain => {
+            let len = graph_resume::visible_indices(model).len();
+            if len > 0 {
+                let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                model.graph_resume_index = wrap_index(model.graph_resume_index, delta, len);
+                model.graph_resume_details = false;
+            }
+        }
+        KeyCode::Enter if plain => {
+            if graph_resume::selected(model).is_some() {
+                model.graph_resume_details = !model.graph_resume_details;
+            }
+        }
+        KeyCode::Char('r') if plain => {
+            if let Some(row) = graph_resume::selected(model) {
+                if row.resumable() {
+                    return Flow::Choose(Choice::GraphResume {
+                        action: "resume",
+                        run_id: row.run_id.clone(),
+                    });
+                }
+                model.section_notice = Some("Completed graphs cannot be resumed.".into());
+            }
+        }
+        _ => {}
+    }
+    Flow::Continue
+}
+
 fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Flow {
+    if model.screen == Screen::GraphResume {
+        return handle_graph_resume_key(model, key);
+    }
     if model.screen == Screen::GraphRun && super::views::graph_nav::handle_key(model, key) {
         return Flow::Continue;
     }
