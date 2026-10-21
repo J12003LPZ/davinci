@@ -1,6 +1,6 @@
 # DaVinci resource lifecycle implementation plan
 
-Status: approved Native implementation, review corrections and local measurements complete on `perf/resource-lifecycle`; remote PR delivery in progress. See [execution evidence and rulings](../../perf/resource-lifecycle-progress.md).
+Status: approved Native implementation, review corrections and local measurements complete on `perf/resource-lifecycle`; feature branch pushed; PR creation blocked by the cloud proxy (API CONNECT 403). See [execution evidence and rulings](../../perf/resource-lifecycle-progress.md).
 
 **Goal:** Implement the approved local-resource improvements and create one PR targeting main from `perf/resource-lifecycle`.
 
