@@ -894,7 +894,6 @@ fn visit_single_line(line: &str, width: usize, emit: &mut dyn FnMut(String)) {
     if !current_line.is_empty() {
         output(current_line);
     }
-    drop(output);
     if !emitted {
         emit(String::new());
     }
