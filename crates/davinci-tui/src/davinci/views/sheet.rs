@@ -145,7 +145,10 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         return Some(chrome);
     }
     // The manager names the keys the selected row allows.
-    if matches!(model.screen, Screen::GraphRun | Screen::GraphResume | Screen::Extensions) {
+    if matches!(
+        model.screen,
+        Screen::GraphRun | Screen::GraphResume | Screen::Extensions
+    ) {
         return Some(chrome);
     }
     if model.screen == Screen::TaskBoard {
