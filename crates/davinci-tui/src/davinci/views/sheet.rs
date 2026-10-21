@@ -114,6 +114,7 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         Screen::Compact => compact::chrome(model),
         Screen::Export => export::chrome(model),
         Screen::GraphRun => graph_run::chrome(model),
+        Screen::GraphResume => super::graph_resume::chrome(model),
         Screen::Vectors => vectors::chrome(model),
         Screen::Governor => governor::chrome(model),
         Screen::Securitas => securitas::chrome(model),
@@ -144,7 +145,7 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         return Some(chrome);
     }
     // The manager names the keys the selected row allows.
-    if matches!(model.screen, Screen::GraphRun | Screen::Extensions) {
+    if matches!(model.screen, Screen::GraphRun | Screen::GraphResume | Screen::Extensions) {
         return Some(chrome);
     }
     if model.screen == Screen::TaskBoard {
@@ -244,6 +245,7 @@ pub fn title(screen: Screen) -> &'static str {
         Screen::Compact => "Compaction",
         Screen::Export => "Export session",
         Screen::GraphRun => "Agent command center",
+        Screen::GraphResume => "Resume graph run",
         Screen::Vectors => "Vector memory",
         Screen::Governor => "Output governor",
         Screen::Securitas => "Security report",
