@@ -442,6 +442,12 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     }
     atomic_write(&state_path, &content)?;
     run.updated_at = snapshot.updated_at;
+    // Advisory index: the committed state.json remains authoritative. Losing
+    // the index must never turn a successful checkpoint into a failed one.
+    let summary = RunSummary::from_run(&snapshot);
+    if let Ok(bytes) = serde_json::to_vec(&summary) {
+        let _ = atomic_write(&run_dir(&cwd, &run.run_id).join("summary.json"), &bytes);
+    }
     Ok(())
 }
 
@@ -667,7 +673,8 @@ pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
     Ok(run)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunSummary {
     pub run_id: String,
     pub phase: String,
@@ -675,6 +682,48 @@ pub struct RunSummary {
     pub updated_at: u64,
     pub cost_usd: f64,
     pub workers_spawned: u32,
+    #[serde(default)]
+    pub completed_tasks: usize,
+    #[serde(default)]
+    pub total_tasks: usize,
+}
+
+impl RunSummary {
+    fn from_run(run: &GraphRun) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            phase: run.phase.as_str().to_string(),
+            goal: run.goal.clone(),
+            updated_at: run.updated_at,
+            cost_usd: run.counters.cost_usd,
+            workers_spawned: run.counters.workers_spawned,
+            completed_tasks: run.tasks.iter().filter(|task|
+                task.status == super::types::TaskStatus::Succeeded
+            ).count(),
+            total_tasks: run.tasks.len(),
+        }
+    }
+}
+
+/// Read a small index when it is no older than the canonical checkpoint.
+/// Old runs without sidecars, corrupt sidecars, and sidecar write failures all
+/// fall back to the validated checkpoint.
+fn indexed_run_summary(cwd: &Path, run_id: &str) -> Option<RunSummary> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let directory = run_dir(cwd, run_id);
+    let state_metadata = fs::metadata(directory.join("state.json")).ok()?;
+    let summary_path = directory.join("summary.json");
+    let summary_metadata = fs::metadata(&summary_path).ok()?;
+    if summary_metadata.modified().ok()? < state_metadata.modified().ok()? {
+        return None;
+    }
+    let mut file = fs::File::open(summary_path).ok()?;
+    let mut bytes = Vec::new();
+    file.by_ref().take(16 * 1024).read_to_end(&mut bytes).ok()?;
+    let summary: RunSummary = serde_json::from_slice(&bytes).ok()?;
+    (summary.run_id == run_id && summary.goal.len() <= 8192).then_some(summary)
 }
 
 /// Every persisted run in this project, newest first.
@@ -692,14 +741,9 @@ pub fn list_runs(cwd: &Path) -> Vec<RunSummary> {
     }
     let mut runs: Vec<RunSummary> = run_ids
         .into_iter()
-        .filter_map(|run_id| load_run(cwd, &run_id))
-        .map(|run| RunSummary {
-            run_id: run.run_id,
-            phase: run.phase.as_str().to_string(),
-            goal: run.goal,
-            updated_at: run.updated_at,
-            cost_usd: run.counters.cost_usd,
-            workers_spawned: run.counters.workers_spawned,
+        .filter_map(|run_id| {
+            indexed_run_summary(cwd, &run_id)
+                .or_else(|| load_run(cwd, &run_id).as_ref().map(RunSummary::from_run))
         })
         .collect();
     runs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
