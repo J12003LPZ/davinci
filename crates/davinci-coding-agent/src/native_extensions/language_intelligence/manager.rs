@@ -1192,9 +1192,19 @@ mod tests {
         manager.shutdown();
     }
 
+    // Exercise the real idle reaper without constructing an Instant before the
+    // platform's monotonic-clock epoch (which panics on fresh Windows runners).
+    fn short_idle_timeout_fixture() -> TestWorkspace {
+        let mut fixture = TestWorkspace::new("typescript", "capture");
+        Arc::get_mut(&mut fixture.manager.inner)
+            .expect("fixture manager should be uniquely owned before first use")
+            .config.idle_timeout_ms = 50;
+        fixture
+    }
+
     #[test]
     fn idle_sessions_expire_without_another_request() {
-        let fixture = TestWorkspace::new("typescript", "capture");
+        let fixture = short_idle_timeout_fixture();
         fixture
             .manager
             .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
@@ -1202,9 +1212,6 @@ mod tests {
         {
             let slots = fixture.manager.inner.slots.lock().unwrap();
             assert_eq!(slots.len(), 1);
-            for slot in slots.values() {
-                slot.lock().unwrap().last_used = Instant::now() - Duration::from_secs(901);
-            }
         }
         let until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < until {
@@ -1218,7 +1225,7 @@ mod tests {
 
     #[test]
     fn an_owned_request_slot_is_not_evicted_as_idle() {
-        let fixture = TestWorkspace::new("typescript", "capture");
+        let fixture = short_idle_timeout_fixture();
         fixture
             .manager
             .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
@@ -1233,7 +1240,6 @@ mod tests {
             .next()
             .unwrap()
             .clone();
-        held.lock().unwrap().last_used = Instant::now() - Duration::from_secs(901);
         std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(fixture.manager.inner.slots.lock().unwrap().len(), 1);
         drop(held);
