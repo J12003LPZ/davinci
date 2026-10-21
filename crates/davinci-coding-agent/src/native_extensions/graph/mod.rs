@@ -2694,6 +2694,42 @@ name = \"x\"
     }
 
     #[test]
+    fn latest_resume_selects_a_stopped_run_without_an_id() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+        let mut blocked = controller
+            .run_to_completion(parse_graph_args("--dry-run --simple first graph"), None)
+            .unwrap();
+        blocked.phase = Phase::Blocked;
+        blocked.blocked_reason = Some("incomplete".into());
+        store::save_run(&mut blocked).unwrap();
+        drain_active(dir.path());
+
+        // Newer completed work should not shadow an older resumable checkpoint.
+        let done = controller
+            .run_to_completion(parse_graph_args("--dry-run --simple second graph"), None)
+            .unwrap();
+        assert_eq!(done.phase, Phase::Done);
+        drain_active(dir.path());
+        let response = controller.command("graph-resume", "--latest").unwrap().unwrap();
+        assert_eq!(response["started"], true);
+        assert_eq!(response["runId"], blocked.run_id);
+        drain_active(dir.path());
+        assert_eq!(load_run(dir.path(), &blocked.run_id).unwrap().phase, Phase::Done);
+    }
+
+    #[test]
+    fn latest_resume_refuses_when_there_are_no_saved_runs() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let error = controller(dir.path())
+            .command("graph-resume", "--latest")
+            .unwrap_err();
+        assert!(error.contains("No resumable graph runs"));
+    }
+
+    #[test]
     fn bare_graph_command_shows_cancelled_run_without_resuming() {
         let _guard = registry_guard();
         let dir = tempdir().unwrap();
