@@ -45,6 +45,7 @@ pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
 pub(crate) mod worker_sessions;
+mod workspace_files;
 
 #[cfg(test)]
 mod operation_bridge_tests;

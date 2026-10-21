@@ -1355,6 +1355,20 @@ impl GraphExecution {
             if !self.finish_attempt(&spec, attempt, &result) {
                 return None;
             }
+            write_log(
+                Path::new(&run.cwd),
+                &run.run_id,
+                &task_id,
+                attempt,
+                &format!(
+                    "attempt {attempt}\nexit {} timedOut={}\n--- stderr ---\n{}\n--- final text ---\n{}\n--- failure reason ---\n{}",
+                    result.exit_code,
+                    result.timed_out,
+                    result.stderr,
+                    result.final_text,
+                    result.failure_reason.clone().unwrap_or_default()
+                ),
+            );
             if result.recovery_required {
                 let error = format!(
                     "reconciliation required: {}",
@@ -1367,19 +1381,6 @@ impl GraphExecution {
                 self.checkpoint(Some("worker history requires recovery; retry stopped"));
                 return None;
             }
-            write_log(
-                Path::new(&run.cwd),
-                &run.run_id,
-                &task_id,
-                &format!(
-                    "attempt {attempt}\nexit {} timedOut={}\n--- stderr ---\n{}\n--- final text ---\n{}\n--- failure reason ---\n{}",
-                    result.exit_code,
-                    result.timed_out,
-                    result.stderr,
-                    result.final_text,
-                    result.failure_reason.clone().unwrap_or_default()
-                ),
-            );
 
             if result.run_deadline_exceeded
                 || result.failure_reason.as_deref() == Some("run deadline exceeded")

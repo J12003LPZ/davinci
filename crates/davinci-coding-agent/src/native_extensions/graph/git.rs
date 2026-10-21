@@ -46,6 +46,12 @@ pub fn run(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     if output.timed_out {
         return Err(format!("git {} timed out after 30s", args.join(" ")));
     }
+    if output.stdout_truncated {
+        return Err(format!(
+            "git {} output exceeded bookkeeping limit",
+            args.join(" ")
+        ));
+    }
     let status = output
         .status
         .ok_or_else(|| format!("git {} did not return a status", args.join(" ")))?;

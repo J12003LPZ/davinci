@@ -141,9 +141,13 @@ const MAX_OPERATION_REFERENCE_SCAN_BYTES: u64 = 256 * 1024;
 
 pub fn create_run_dir(cwd: &Path, run_id: &str) -> std::io::Result<()> {
     let root = run_dir(cwd, run_id);
+    // Run retention before creating an unpublished directory: GC treats a
+    // missing checkpoint as unknown references. Resuming a run does not prune it.
+    if !root.exists() {
+        prune_finished_runs(cwd);
+    }
     fs::create_dir_all(root.join("artifacts"))?;
     fs::create_dir_all(root.join("logs"))?;
-    prune_finished_runs(cwd);
     Ok(())
 }
 
@@ -214,11 +218,63 @@ fn prune_finished_runs(cwd: &Path) {
 }
 
 fn collect_unreferenced_blobs(cwd: &Path) {
-    let referenced: std::collections::HashSet<String> = list_runs(cwd)
-        .iter()
-        .filter_map(|summary| load_run(cwd, &summary.run_id))
-        .flat_map(|run| run.baseline_hashes())
-        .collect();
+    // Inspect both authority roots directly: list_runs omits unreadable states.
+    // Unknown references must retain blobs, never turn corruption into deletion.
+    fn references(cwd: &Path) -> std::io::Result<std::collections::HashSet<String>> {
+        let mut referenced = std::collections::HashSet::new();
+        for root in graph_run_roots(cwd) {
+            let runs = match fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for entry in runs {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "redirected graph run",
+                    ));
+                }
+                if !kind.is_dir() {
+                    continue;
+                }
+                let mut states = vec![entry.path().join("state.json")];
+                match fs::read_dir(entry.path().join("history")) {
+                    Ok(history) => {
+                        for state in history {
+                            let state = state?;
+                            let name = state.file_name();
+                            let name = name.to_string_lossy();
+                            if name.starts_with("revision-") && name.ends_with(".state.json") {
+                                states.push(state.path());
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                for path in states {
+                    let run: GraphRun =
+                        serde_json::from_slice(&fs::read(path)?).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                    if run.version != 1 || entry.file_name().to_str() != Some(run.run_id.as_str()) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unknown graph checkpoint identity or version",
+                        ));
+                    }
+                    referenced.extend(run.baseline_hashes());
+                }
+            }
+        }
+        Ok(referenced)
+    }
+    let Ok(referenced) = references(cwd) else {
+        return;
+    };
     let blob_dir = super::blobs::dir(cwd);
     let Ok(shards) = fs::read_dir(&blob_dir) else {
         return;
@@ -400,6 +456,27 @@ fn migrate_inline_baselines(run: &mut GraphRun, blob_dir: &Path) -> std::io::Res
 pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     let cwd = PathBuf::from(&run.cwd);
     let state_path = run_dir(&cwd, &run.run_id).join("state.json");
+    // Fence stale writers before publishing companions as well as state.json.
+    // Keep the lock inode in place so other processes share the same lock.
+    let _state_lock = davinci_sys::lock::ExclusiveFileLock::acquire(
+        &state_path.with_extension("json.lock"),
+        std::time::Duration::from_secs(5),
+    )?;
+    let previous_bytes = match fs::read(&state_path) {
+        Ok(bytes) => {
+            let previous: GraphRun = serde_json::from_slice(&bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if previous.run_id != run.run_id || previous.revision > run.revision {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to overwrite a different run or newer graph revision",
+                ));
+            }
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
 
     if let Some(definition) = &run.definition {
         let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
@@ -429,7 +506,7 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     snapshot.updated_at = now_ms();
     let content = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if let Ok(previous_bytes) = fs::read(&state_path) {
+    if let Some(previous_bytes) = previous_bytes {
         if let Ok(previous) = serde_json::from_slice::<GraphRun>(&previous_bytes) {
             if previous.run_id == snapshot.run_id && previous.revision < snapshot.revision {
                 let history_path = super::history::history_dir(&cwd, &run.run_id)
@@ -746,12 +823,21 @@ pub fn read_artifact(
 }
 
 /// Diagnostics only — never let logging kill a run.
-pub fn write_log(cwd: &Path, run_id: &str, task_id: &str, content: &str) {
+pub fn write_log(cwd: &Path, run_id: &str, task_id: &str, attempt: u32, content: &str) {
     let path = run_dir(cwd, run_id)
         .join("logs")
         .join(format!("{task_id}.log"));
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
+    }
+    let attempt_path = path.with_file_name(format!("{task_id}.attempt_{attempt}.log"));
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(attempt_path)
+    {
+        use std::io::Write;
+        let _ = file.write_all(content.as_bytes());
     }
     let _ = fs::write(path, content);
 }
@@ -787,6 +873,84 @@ mod tests {
         ArtifactKind, GraphBudgets, GraphCounters, Phase, ReviewDecision, Verdict,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn graph_integrity_attempt_logs_preserve_prior_diagnostics() {
+        let dir = tempdir().unwrap();
+        write_log(dir.path(), "logs", "worker", 1, "first failure");
+        write_log(dir.path(), "logs", "worker", 2, "retry success");
+        let logs = run_dir(dir.path(), "logs").join("logs");
+        assert_eq!(
+            fs::read_to_string(logs.join("worker.attempt_1.log")).unwrap(),
+            "first failure"
+        );
+        assert_eq!(
+            fs::read_to_string(logs.join("worker.attempt_2.log")).unwrap(),
+            "retry success"
+        );
+        assert_eq!(
+            fs::read_to_string(logs.join("worker.log")).unwrap(),
+            "retry success"
+        );
+        write_log(dir.path(), "logs", "worker", 1, "duplicate result");
+        assert_eq!(
+            fs::read_to_string(logs.join("worker.attempt_1.log")).unwrap(),
+            "first failure"
+        );
+    }
+
+    #[test]
+    fn graph_integrity_checkpoint_rejects_revision_rollback() {
+        let dir = tempdir().unwrap();
+        let mut run = sample_run(dir.path(), "revision-fence", "new");
+        run.revision = 5;
+        save_run(&mut run).unwrap();
+        run.revision = 4;
+        run.goal = "stale".into();
+        assert!(save_run(&mut run).is_err());
+        assert_eq!(load_run(dir.path(), &run.run_id).unwrap().goal, "new");
+    }
+
+    #[test]
+    fn graph_integrity_blob_gc_preserves_history_and_unknown_references() {
+        use super::super::continuation::GraphContinuation;
+        use super::super::mutation::{FileFingerprint, MutationBaseline};
+        let dir = tempdir().unwrap();
+        let blob_dir = super::super::blobs::dir(dir.path());
+        let hash = super::super::replay::sha256_hex(b"historical");
+        super::super::blobs::put(&blob_dir, &hash, b"historical").unwrap();
+        let mut run = sample_run(dir.path(), "history-gc", "goal");
+        run.continuation = Some(GraphContinuation {
+            saved_baseline: Some(MutationBaseline {
+                files: [(
+                    "a".into(),
+                    FileFingerprint {
+                        hash: hash.clone(),
+                        len: 10,
+                    },
+                )]
+                .into(),
+                contents: Default::default(),
+            }),
+            ..Default::default()
+        });
+        save_run(&mut run).unwrap();
+        run.revision += 1;
+        run.continuation = None;
+        save_run(&mut run).unwrap();
+        collect_unreferenced_blobs(dir.path());
+        assert!(super::super::blobs::get(&blob_dir, &hash).is_some());
+        let unknown = super::super::replay::sha256_hex(b"unknown");
+        super::super::blobs::put(&blob_dir, &unknown, b"unknown").unwrap();
+        let history = super::super::history::history_dir(dir.path(), &run.run_id)
+            .join("revision-0.state.json");
+        run.version = 2;
+        for unreadable in [b"corrupt".to_vec(), serde_json::to_vec(&run).unwrap()] {
+            fs::write(&history, unreadable).unwrap();
+            collect_unreferenced_blobs(dir.path());
+            assert!(super::super::blobs::get(&blob_dir, &unknown).is_some());
+        }
+    }
 
     #[test]
     fn blob_gc_keeps_referenced_hashes_and_removes_orphans() {
