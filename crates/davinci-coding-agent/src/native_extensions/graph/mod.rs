@@ -708,6 +708,9 @@ impl GraphController {
         let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let run_id = if wanted.is_empty() || wanted == "--latest" {
             let runs = list_runs(&self.cwd);
+            if wanted.is_empty() && runs.is_empty() {
+                return Err("No graph runs in this project.".into());
+            }
             let resumable = runs.iter().find(|run| run.phase != "done");
             let choice = if wanted == "--latest" {
                 resumable
