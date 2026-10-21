@@ -149,6 +149,8 @@ pub enum Screen {
     Export,
     /// `5a` — a task running as a graph (`/graph`).
     GraphRun,
+    /// Browse persisted graph runs by goal instead of remembering run IDs.
+    GraphResume,
     /// `5b` — the vector index (`/memory-status`).
     Vectors,
     /// `5c` — the token governor's ledger (`/governor-status`).
@@ -257,6 +259,8 @@ pub enum Choice {
     Provider(usize),
     /// A session of the resume screen (`4a`).
     ResumeSession(usize),
+    /// A graph resume-picker action; the ID is captured at selection time.
+    GraphResume { action: &'static str, run_id: String },
     /// A node of the session tree (`4b`), as an index into `session_tree`.
     TreeEntry(usize),
     /// Enter on the trust sheet (`6a`): read first, then decide.
@@ -1299,6 +1303,24 @@ pub struct ResumeRow {
     pub size: String,
     /// The commit the session was last at, if known.
     pub commit: String,
+}
+
+/// One persisted graph execution shown in the graph recovery picker.
+#[derive(Debug, Clone, Default)]
+pub struct GraphResumeRow {
+    pub run_id: String,
+    pub goal: String,
+    pub phase: String,
+    pub updated: String,
+    pub completed: usize,
+    pub total: usize,
+    pub cost_usd: f64,
+}
+
+impl GraphResumeRow {
+    pub fn resumable(&self) -> bool {
+        self.phase != "done"
+    }
 }
 
 /// One row of the session tree (`4b`). Rows with no `id` are spacers that
@@ -2968,6 +2990,13 @@ pub struct Model {
     pub resume_sessions: Vec<ResumeRow>,
     pub resume_index: usize,
     pub session_count: usize,
+    /// Saved graph runs discovered in the current workspace.
+    pub graph_resume_runs: Vec<GraphResumeRow>,
+    pub graph_resume_index: usize,
+    pub graph_resume_query: String,
+    pub graph_resume_searching: bool,
+    pub graph_resume_all: bool,
+    pub graph_resume_details: bool,
     /// `4b` — the session tree.
     pub session_tree: Vec<TreeNode>,
     pub tree_index: usize,
@@ -3534,6 +3563,12 @@ impl Model {
             resume_sessions: Vec::new(),
             resume_index: 0,
             session_count: 0,
+            graph_resume_runs: Vec::new(),
+            graph_resume_index: 0,
+            graph_resume_query: String::new(),
+            graph_resume_searching: false,
+            graph_resume_all: false,
+            graph_resume_details: false,
             session_tree: Vec::new(),
             tree_index: 0,
             compaction: None,
@@ -3714,6 +3749,7 @@ impl Model {
             Screen::Login => self.login_index,
             Screen::Keys => self.keys_offset,
             Screen::Resume => self.resume_index,
+            Screen::GraphResume => self.graph_resume_index,
             Screen::Tree => self.tree_index,
             Screen::Securitas => self.security_index,
             Screen::Diff => self.diff_index,
@@ -3751,7 +3787,7 @@ impl Model {
             Screen::Agent | Screen::Recovery | Screen::Diff if self.is_plan_mode() => "plan",
             Screen::Agent | Screen::Recovery | Screen::Diff => "agent",
             Screen::Plan => "plan",
-            Screen::GraphRun => "graph",
+            Screen::GraphRun | Screen::GraphResume => "graph",
             Screen::Vectors => "memory",
             Screen::Governor => "governor",
             Screen::Grafo => "grafo",
