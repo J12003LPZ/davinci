@@ -35,6 +35,7 @@ pub mod source_manifest;
 mod task_migration;
 pub mod transactions;
 pub mod worker_activity;
+pub mod worker_admission;
 pub mod worker_workspace;
 pub use task_migration::LegacyTaskRecovery;
 pub mod task_store;
@@ -145,6 +146,7 @@ pub use worktree::{has_uncommitted_changes, WorktreeError, WorktreeLease, Worktr
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
 #[derive(Clone)]
 pub struct RuntimeHandle {
+    pub worker_admission: worker_admission::WorkerAdmission,
     pub(crate) read_diagnostics: Arc<crate::tool_diagnostics::ReadDiagnostics>,
     pub cache: cache::CacheRuntime,
     pub context_vm: context_vm::ContextVmRuntime,
@@ -276,6 +278,7 @@ impl RuntimeHandle {
         };
         Self {
             read_diagnostics: Arc::default(),
+            worker_admission: worker_admission::WorkerAdmission::default(),
             context_vm: context_vm::ContextVmRuntime::new(context_vm_config, cache.clone()),
             cache,
             run_id,
@@ -443,6 +446,7 @@ impl RuntimeHandle {
         self.read_diagnostics = previous.read_diagnostics.clone();
         self.root_budget = previous.root_budget.clone();
         self.cache = previous.cache.clone();
+        self.worker_admission = previous.worker_admission.clone();
         self.context_vm = previous.context_vm.clone();
         self.run_id = previous.run_id;
         self.agent_id = previous.agent_id;

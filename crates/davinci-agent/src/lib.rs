@@ -118,7 +118,8 @@ pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
     run_tool as run_subagent_tool, scoped_tools, scoped_tools_for_access, scoped_tools_with_policy,
     scoped_tools_with_registry, AgentSpawnMode, SubagentParent, SubagentRequest, SubagentRunner,
-    WorkerAccess, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX, PLAN_MODE_DENIAL,
+    WorkerAccess, DEFAULT_SUBAGENT_TOOLS, MAX_TASK_CONCURRENCY, PLAN_MODE_APPENDIX,
+    PLAN_MODE_DENIAL,
 };
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,

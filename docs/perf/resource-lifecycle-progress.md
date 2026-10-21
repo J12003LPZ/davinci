@@ -1,0 +1,44 @@
+# Execution ledger — plan: docs/superpowers/plans/2026-10-21-resource-lifecycle.md
+
+Base d44028fbe822cd71975e91ceda69c7c901a82693. User approved design, plan and native execution. Feature branch perf/resource-lifecycle. Installed baseline remains untouched.
+
+Pre-flight: tasks 1/5/7 share Graph lifecycle; capture errors must settle admission and preserve artifacts. Tasks 2/4/7 share startup/shutdown ownership; lazy services must still register maintenance on first use. Tasks 5/6 share worker launch; acquire once and do not cache caller authority. Task 8 is independent of runtime context storage.
+
+Ruling: Execute in the existing clean feature checkout, solo, rather than create another worktree — no concurrent implementers or local unrelated changes; cost if wrong is reduced filesystem isolation.
+
+Ruling: Cloud skill helper scripts have no mounted filesystem location; use this durable tracked ledger and the plan's commands directly — preserve review/test evidence without inventing tool scripts.
+
+Task 1: in progress.
+
+Task 1: giant output regression RED (10,485,836-byte callback), GREEN with bounded frames and recoverable spooling; existing process suite 11 passed / 1 subprocess fixture ignored. Additional capture/error tests pending before completion.
+
+Task 2: Ruling: js_host is a binary module, so the plan's --lib js_host command selected zero tests — use --bin davinci; cost if wrong is longer compile time, not a false passing claim.
+
+Task 2: metadata count/byte regressions RED→GREEN; 33 existing JS-host tests passed. Idle/active maintenance tests and final settings review pending.
+Task 3: cache saturation regression RED→GREEN; Governor repeated-root sweep regression RED→GREEN; all 40 Governor tests passed.
+Task 4: idle server retained without another request RED→GREEN (reaped in 1 second); broad suite initially 55 passed, 2 failed, 5 ignored.
+Task 4: Ruling: two transport assertions measured process existence/startup races rather than a ready live server — RSS passes alone but raced spawn under suite load; container PID 1 retains terminated orphan zombies — wait for fixture readiness and assert no live descendant with zombie-aware polling; cost if wrong is overlooking a still-running descendant, prevented by retaining the live-state check and deadline.
+
+Task 5: resource settings initially round-tripped through opaque extra settings, so that was not proof of enforcement. Corrected regression asserts typed parsing; RED "worker resource policy is opaque and unenforced". Admission cancellation/oversize/panic-release tests passed; 45 existing subagent tests passed. Configured real-fanout test added.
+Task 6: immutable catalog sharing regression RED (different model Vec pointers)→GREEN using Arc snapshots and existing invalidation keys. Worker trust/configuration now resolves the effective worktree first; root host can reuse its already loaded settings.
+Task 6: Ruling: extend the existing bounded, input-keyed ModelRuntimeSnapshot cache with Arc sharing rather than add a parallel snapshot cache — avoid duplicating invalidation and retain fresh settings/trust checks; cost if wrong is continued settings read cost, not cached permission grants.
+Task 7: Ruling: disabling automatic learning does not revoke explicit skill-management tools, so do not globally skip learning stores based on config.enabled — use an inert controller only for authenticated Graph roles without any authorized skill tools; cost if wrong is a missing worker capability, covered by authorized-tool initialization parity tests.
+Task 7: dormant-store test GREEN; main selects worker startup only after private worker-session binding validates. Authorized optional services still initialize, others avoid store reads/discovery.
+Task 8: full TUI library suite passed 981/981 executed tests (2 existing ignored); includes transcript/Markdown/ANSI compatibility. Settled height index and bounded viewport cache replace full styled history; prose, user text and reasoning emit rows incrementally.
+Integration: coding-agent library initial broad run 1601 passed / 4 failed / 19 ignored. Three security CLI tests used a stale non-fixture target/debug/davinci from Oct 18; build current CLI with test-fixtures before rerunning. RSS readiness probe needed its fixture URI to avoid an invalid diagnostic frame; corrected.
+
+Task 1: cancellation during a frame of thousands of short callbacks RED (8.82 s)→GREEN; controls are checked between lines, not just between frames. Process/capture suite 15 passed, 1 fixture ignored. Post-exit drain is bounded by idle waiting and 4096 frames, not an arbitrary callback wall-time cutoff.
+Task 4: full language suite now 58 passed, 5 existing ignored; active slot ownership and idle expiry both covered.
+Task 5: real fanout at configured widths 1/2/4 passed, invalid widths rejected. Graph and workflow use the same parent reservation owner without charging workflow launches twice. Standalone native Graph controllers receive configured admission or a fail-closed invalid-policy owner.
+Task 6: isolated worktree profile regression RED (parent's local named profile disappeared) — recheck the parent profile source's trust separately, preserving its selection while resolving worker settings against the effective workspace. Cost if wrong is a changed worker prompt; regression asserts parent-selected profile survives isolation.
+Task 9: baseline component release build running against an archive of d44028fb. Benchmark sampler parser tests 3 passed; baseline offline CLI probe succeeded. No live provider runs.
+External PR prerequisite: GitHub API CONNECT returns proxy 403; gh reports auth failure but the API is unreachable, so token validity cannot be established. Git remote reads succeed. Finish implementation/tests and branch delivery before reporting an unresolvable PR-creation blocker.
+
+Integration: first workspace compilation exhausted the 32 GiB cloud filesystem with debug symbols/incremental artifacts. Removed only rebuildable target/debug cache and rebuilt with CARGO_PROFILE_DEV_DEBUG=0, CARGO_PROFILE_TEST_DEBUG=0, CARGO_INCREMENTAL=0, -j 2. No source or installed binary removed.
+Task 2: additional heap-heavy JSON regression RED→GREEN: memo weights include container/string capacities and conservative map-node overhead rather than compact serialized bytes alone. This is an accounting estimate, not measured RSS.
+Integration: workspace rerun passed every target except five eval subprocess fixtures: env_clear discarded the runner PATH before searching for python; cloud Python lives outside /usr/bin. Resolve fixture interpreter with the existing davinci-sys resolver before clearing environment; no product environment allowlist changes. Attempt to create a system python symlink was denied and made no filesystem change.
+Integration: revocation regression was flaky because read-only Codemode defaults allow multiple parallel-safe reads; request-count admission did not imply queuing. Set this test's parallelism to one so the second request cannot execute before revocation. No permission implementation change. Observed failure and source tracing establish the test race; isolated original passed.
+Task 8 ruling: retain exact synchronous row-height calculation on first layout/width invalidation, streaming rows and retaining only the viewport. Yielding height rebuilds over frames would require provisional scrollbar/jump semantics; do not add that behavior to this memory-focused change. Warm scrolling uses indexed ranges. Cold layout/resize CPU remains proportional to source and Markdown parsing; report measurements and this limitation rather than claim bounded resize latency. Cost: long history can still pause on first layout/resize, though it no longer retains full styled history.
+
+Integration verification: cargo fmt --all -- --check passed; cargo check --workspace --locked passed (Rust 1.88.0, reduced debug artifacts). cargo test --workspace --locked --no-fail-fast -j 2 completed with exit 0: 7095 passed, 0 failed, 63 ignored across 254 test/doc-test targets. Source logs: /tmp/davinci-workspace-final2.log and /tmp/davinci-check-workspace.log. Live provider/optional external-server probes remain ignored. User requested no excessive tests: no further full-workspace runs; only focused verification of later fixes.
+PR network diagnosis: read current cloud draft; GitHub package-manager preset allows github.com but not api.github.com. Saved additive custom rule api.github.com preserving mega.nz and all preset rules. Draft save confirmed requires_publish=true; current runtime access remains unverified until user saves/publishes settings. No credentials changed.

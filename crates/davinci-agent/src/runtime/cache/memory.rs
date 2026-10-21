@@ -1,7 +1,7 @@
 use super::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ impl Default for CacheConfig {
     }
 }
 struct Entry {
+    index_key: Arc<str>,
     value: Arc<dyn Any + Send + Sync>,
     dependencies: Vec<CacheDependency>,
     namespace: CacheNamespace,
@@ -42,6 +43,7 @@ struct Entry {
 #[derive(Default)]
 struct State {
     entries: HashMap<String, Entry>,
+    access_order: BTreeSet<(u64, Arc<str>)>,
     bytes: usize,
     sequence: u64,
     stats: CacheStats,
@@ -159,14 +161,21 @@ impl CacheRuntime {
         }
         let id = request.identity::<T>();
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.sequence = state.sequence.saturating_add(1);
-        let sequence = state.sequence;
+        let sequence = next_access(&mut state);
         let expired = state
             .entries
             .get(&id)
             .is_some_and(|e| e.expires.is_some_and(|t| Instant::now() >= t));
         if expired {
             remove(&mut state, &id);
+        }
+        if let Some((old, index_key)) = state
+            .entries
+            .get(&id)
+            .map(|entry| (entry.access, entry.index_key.clone()))
+        {
+            state.access_order.remove(&(old, index_key.clone()));
+            state.access_order.insert((sequence, index_key));
         }
         if let Some(entry) = state.entries.get_mut(&id) {
             entry.access = sequence;
@@ -408,7 +417,7 @@ impl CacheRuntime {
         let weight = serialized_bytes
             .saturating_add(std::mem::size_of::<T>())
             .saturating_add(serde_json::to_vec(&request.key).map_or(0, |bytes| bytes.len()))
-            .saturating_add(std::mem::size_of::<Entry>() + 64);
+            .saturating_add(std::mem::size_of::<Entry>() + 192);
         if !self.inner.config.memory_enabled
             || weight > self.inner.config.memory_max_bytes
             || self.inner.config.max_entries == 0
@@ -428,11 +437,7 @@ impl CacheRuntime {
         while state.entries.len() >= self.inner.config.max_entries
             || state.bytes.saturating_add(weight) > self.inner.config.memory_max_bytes
         {
-            let oldest = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.access)
-                .map(|(id, _)| id.clone());
+            let oldest = state.access_order.first().map(|(_, id)| id.clone());
             let Some(oldest) = oldest else {
                 break;
             };
@@ -445,12 +450,14 @@ impl CacheRuntime {
                     .or_default() += 1;
             }
         }
-        state.sequence = state.sequence.saturating_add(1);
-        let access = state.sequence;
+        let access = next_access(&mut state);
         state.bytes += weight;
+        let index_key: Arc<str> = Arc::from(id.as_str());
+        state.access_order.insert((access, index_key.clone()));
         state.entries.insert(
             id,
             Entry {
+                index_key,
                 value,
                 dependencies: request.key.dependencies().to_vec(),
                 namespace: request.key.namespace(),
@@ -644,6 +651,39 @@ impl std::io::Write for BoundedWriter {
 }
 fn remove(state: &mut State, id: &str) -> Option<CacheNamespace> {
     let entry = state.entries.remove(id)?;
+    state.access_order.remove(&(entry.access, entry.index_key));
     state.bytes = state.bytes.saturating_sub(entry.weight);
     Some(entry.namespace)
+}
+
+fn next_access(state: &mut State) -> u64 {
+    if state.sequence == u64::MAX {
+        let ordered = std::mem::take(&mut state.access_order);
+        state.sequence = 0;
+        for (_, id) in ordered {
+            state.sequence += 1;
+            if let Some(entry) = state.entries.get_mut(id.as_ref()) {
+                entry.access = state.sequence;
+                state.access_order.insert((state.sequence, id));
+            }
+        }
+    }
+    state.sequence += 1;
+    state.sequence
+}
+
+#[cfg(test)]
+mod resource_lifecycle_tests {
+    use super::*;
+    #[test]
+    fn lru_access_sequence_does_not_saturate() {
+        let cache = CacheRuntime::default();
+        cache.inner.state.lock().unwrap().sequence = u64::MAX;
+        let request = CacheRequest::new(
+            CacheKey::new(CacheNamespace::Ast, "rollover", 1, "test", vec![]),
+            CachePolicy::MemoryOnly,
+        );
+        let _ = cache.get::<u64>(&request, || Ok(()));
+        assert!(cache.inner.state.lock().unwrap().sequence < u64::MAX);
+    }
 }

@@ -95,6 +95,33 @@ fn legacy_store_in_use(root: &Path) -> bool {
 }
 
 impl LearningController {
+    /// No stores are opened. Only used for roles without learning authority;
+    /// roles authorized for skill tools receive the ordinary controller.
+    pub(crate) fn dormant(cwd: &Path, agent_dir: &Path) -> Self {
+        Self {
+            config: LearningConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            background_usage: Default::default(),
+            project_store: LearningStore::unopened(cwd.join(".davinci/learning")),
+            global_store: LearningStore::unopened(agent_dir.join("learning")),
+            stats: Default::default(),
+            diagnostics: Vec::new(),
+            notifications: Vec::new(),
+            project_skills_dir: cwd.join(".davinci/skills"),
+            global_skills_dir: agent_dir.join("skills"),
+            read_set: Arc::new(Mutex::new(ReviewReadSet::new())),
+            project_trusted: false,
+            active_review: None,
+            project_store_owned: false,
+            live: None,
+            live_review: None,
+            completed_reviews: Arc::new(Mutex::new(Vec::new())),
+            last_live_review_ms: 0,
+            review_runner: None,
+        }
+    }
     pub fn new(cwd: &Path, agent_dir: Option<&Path>, config: Option<LearningConfig>) -> Self {
         let config = config.unwrap_or_default();
         let mut diagnostics = Vec::new();
@@ -1382,6 +1409,17 @@ impl ContextSource for SkillContextSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dormant_worker_learning_does_not_open_stores() {
+        let cwd = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let controller = LearningController::dormant(cwd.path(), agent.path());
+        assert!(!controller.config.enabled);
+        assert!(
+            !agent.path().join("learning").exists(),
+            "disabled service created or opened learning stores"
+        );
+    }
     use crate::native_extensions::MemoryMessage;
     use std::sync::Mutex;
     use tempfile::tempdir;

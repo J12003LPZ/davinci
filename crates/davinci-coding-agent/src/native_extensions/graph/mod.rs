@@ -31,6 +31,7 @@ pub(crate) mod operation_bridge;
 pub(crate) mod operations;
 pub(crate) mod preflight;
 pub(crate) mod process;
+mod process_output;
 pub(crate) mod recovery;
 pub(crate) mod render;
 pub(crate) mod replay;
@@ -352,6 +353,7 @@ fn saved_definition_from_run(
 
 #[derive(Debug, Clone)]
 pub struct GraphController {
+    pub worker_admission: davinci_agent::runtime::worker_admission::WorkerAdmission,
     cwd: PathBuf,
     session_model: Option<String>,
     session_thinking: Option<String>,
@@ -420,6 +422,7 @@ fn economy_role_models(session_model: Option<&str>) -> std::collections::BTreeMa
 impl GraphController {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
+            worker_admission: Default::default(),
             cwd,
             session_model: None,
             session_thinking: None,
@@ -517,11 +520,27 @@ impl GraphController {
             loaded.config.models = models.clone();
         }
         let sink = Arc::clone(active);
+        let admission = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.worker_admission.clone())
+            .filter(|admission| admission.is_configured())
+            .unwrap_or_else(|| self.worker_admission.clone());
         let deps = ControllerDeps {
             runner: if dry_run {
                 Arc::new(run_dry_worker)
             } else {
-                Arc::new(run_worker)
+                Arc::new(move |spec, abort, progress| {
+                    match admission
+                        .acquire_worker(|| abort.load(std::sync::atomic::Ordering::Acquire))
+                    {
+                        Ok(_lease) => run_worker(spec, abort, progress),
+                        Err(error) => WorkerResult {
+                            failure_reason: Some(error),
+                            ..Default::default()
+                        },
+                    }
+                })
             },
             verify_exec: if dry_run {
                 Arc::new(dry_run_verify_exec)

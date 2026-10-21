@@ -19,6 +19,7 @@ pub mod permissions;
 pub mod plugins;
 pub mod project_config;
 pub mod prompt_host;
+pub mod resource_lifecycle;
 pub mod root_budget;
 pub mod runtime_host;
 pub mod runtime_inspect;

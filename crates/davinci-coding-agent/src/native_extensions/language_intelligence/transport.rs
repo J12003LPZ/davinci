@@ -830,6 +830,15 @@ mod tests {
     #[test]
     fn process_tree_rss_reports_live_fixture_memory() {
         let transport = fixture("normal");
+        // Wait for the child to initialize: immediately after spawn its RSS
+        // may still be zero, particularly when the suite starts many fixtures.
+        transport
+            .request(
+                "fixture/echo",
+                json!({"uri":"file:///fixture.ts"}),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(transport.rss_bytes().is_some_and(|bytes| bytes > 0));
     }
 
@@ -870,15 +879,31 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         drop(transport);
-        let result = Command::new("node").args(["-e", "try { process.kill(Number(process.argv[1]), 0); process.exit(1); } catch { process.exit(0); }", &pid.to_string()]).status().unwrap();
+        let live = || {
+            #[cfg(target_os = "linux")]
+            {
+                // A container's PID 1 may leave an already terminated orphan
+                // as a zombie. kill(pid, 0) tests existence, not liveness.
+                if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    if let Some(end) = stat.rfind(')') {
+                        if matches!(stat[end + 1..].trim_start().chars().next(), Some('Z' | 'X')) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            !Command::new("node").args(["-e", "try { process.kill(Number(process.argv[1]), 0); process.exit(1); } catch { process.exit(0); }", &pid.to_string()]).status().unwrap().success()
+        };
+        let until = Instant::now() + Duration::from_secs(3);
+        while live() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let survived = live();
         // Always clean up the fixture even on the RED run.
-        if !result.success() {
+        if survived {
             davinci_agent::jobs::kill_tree(pid as u32);
         }
-        assert!(
-            result.success(),
-            "server descendant survived transport shutdown"
-        );
+        assert!(!survived, "server descendant survived transport shutdown");
     }
     use serde_json::json;
     use std::io::{BufReader, Cursor, Read};

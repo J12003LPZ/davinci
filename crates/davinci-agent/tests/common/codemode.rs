@@ -984,7 +984,10 @@ fn queued_codemode_child_rechecks_scoped_revocation() {
         }
         None
     })));
-    let context = broker_context(&agent);
+    let mut context = broker_context(&agent);
+    // A queued-child test must reserve the only lane. Parallel-safe reads
+    // otherwise race the revocation and can legitimately finish beforehand.
+    context.limits.parallelism = 1;
     let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     std::thread::scope(|scope| {
         let first = scope.spawn(|| {

@@ -138,6 +138,9 @@ pub fn configure_session_workflow_with_legacy_recovery(
     if let Some(previous) = previous {
         runtime = runtime.with_session_state_from(previous);
     }
+    if let Some(runner) = &runner {
+        runtime.worker_admission = runner.admission().clone();
+    }
     if let Some(session) = session {
         runtime = runtime.with_session(&session.header.id);
         if previous.is_none() {

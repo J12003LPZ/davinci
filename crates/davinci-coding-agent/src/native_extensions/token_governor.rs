@@ -674,15 +674,18 @@ impl OutputStore {
     /// a failure to remove one directory is not an error. Returns how many
     /// directories went.
     pub fn sweep_stale_sessions(&self, max_age: Duration) -> usize {
+        self.sweep_stale_sessions_checked(max_age).unwrap_or(0)
+    }
+
+    fn sweep_stale_sessions_checked(&self, max_age: Duration) -> std::io::Result<usize> {
         let Some(parent) = self.root.parent() else {
-            return 0;
+            return Ok(0);
         };
-        let Ok(entries) = fs::read_dir(parent) else {
-            return 0;
-        };
+        let entries = fs::read_dir(parent)?;
         let now = SystemTime::now();
         let mut removed = 0;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let path = entry.path();
             if path == self.root || !path.is_dir() {
                 continue;
@@ -694,11 +697,12 @@ impl OutputStore {
                 .duration_since(newest)
                 .map(|age| age > max_age)
                 .unwrap_or(false);
-            if stale && fs::remove_dir_all(&path).is_ok() {
+            if stale {
+                fs::remove_dir_all(&path)?;
                 removed += 1;
             }
         }
-        removed
+        Ok(removed)
     }
 }
 fn stored_output_is_intact(path: &Path, digest: &str) -> bool {
@@ -1206,7 +1210,7 @@ impl TokenGovernor {
         self.store = Self::store_for(&self.config, session_key);
         self.stored.clear();
         self.session_start();
-        let _ = self.sweep_stale_outputs();
+        let _ = self.sweep_stale_outputs_if_due();
         true
     }
 
@@ -1215,6 +1219,15 @@ impl TokenGovernor {
     /// constructor never deletes anything.
     pub fn sweep_stale_outputs(&self) -> usize {
         self.store.sweep_stale_sessions(STORE_RETENTION)
+    }
+
+    pub fn sweep_stale_outputs_if_due(&self) -> std::io::Result<usize> {
+        let Some(root) = self.store.root.parent() else {
+            return Ok(0);
+        };
+        super::governor_maintenance::sweep_if_due(root, || {
+            self.store.sweep_stale_sessions_checked(STORE_RETENTION)
+        })
     }
 
     /// The ledgers only: a new session, or a compaction that rewrote what the
@@ -2569,6 +2582,27 @@ mod tests {
             .unwrap();
         let _governor = session_governor(dir.path(), "session-a");
         assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn repeated_session_binding_throttles_directory_sweeps() {
+        let dir = tempdir().unwrap();
+        let mut governor = session_governor(dir.path(), "first");
+        let stale = dir.path().join("outputs/old-session");
+        fs::create_dir_all(&stale).unwrap();
+        let file = stale.join("output.txt");
+        fs::write(&file, "recoverable").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60))
+            .unwrap();
+        governor.bind_session("second");
+        assert!(
+            file.exists(),
+            "another host/session rescanned the same output root"
+        );
     }
 
     #[test]

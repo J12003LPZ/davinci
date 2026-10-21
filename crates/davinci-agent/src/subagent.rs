@@ -275,6 +275,8 @@ type SubagentFn = dyn Fn(&SubagentRequest) -> Result<String, String> + Send + Sy
 #[derive(Clone)]
 pub struct SubagentRunner {
     inner: Arc<SubagentFn>,
+    max_concurrency: usize,
+    admission: crate::runtime::worker_admission::WorkerAdmission,
 }
 
 impl std::fmt::Debug for SubagentRunner {
@@ -288,10 +290,42 @@ impl SubagentRunner {
     where
         F: Fn(&SubagentRequest) -> Result<String, String> + Send + Sync + 'static,
     {
-        Self { inner: Arc::new(f) }
+        Self {
+            inner: Arc::new(f),
+            max_concurrency: MAX_TASK_CONCURRENCY,
+            admission: Default::default(),
+        }
+    }
+
+    pub fn with_concurrency(mut self, width: usize) -> Result<Self, String> {
+        if !(1..=MAX_PARALLEL_TASKS).contains(&width) {
+            return Err("subagentMaxConcurrentTasks must be 1..8".into());
+        }
+        self.max_concurrency = width;
+        Ok(self)
+    }
+    pub fn with_admission(
+        mut self,
+        admission: crate::runtime::worker_admission::WorkerAdmission,
+    ) -> Self {
+        self.admission = admission;
+        self
+    }
+    pub fn admission(&self) -> &crate::runtime::worker_admission::WorkerAdmission {
+        &self.admission
     }
 
     pub fn run(&self, request: &SubagentRequest) -> Result<String, String> {
+        let _lease = self.admission.acquire_worker(|| {
+            request
+                .cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+                || request
+                    .abort
+                    .as_ref()
+                    .is_some_and(|abort| abort.load(std::sync::atomic::Ordering::Acquire))
+        })?;
         (self.inner)(request)
     }
 }
@@ -1255,7 +1289,7 @@ pub fn run_tool(
     let (outcomes, _) = crate::scheduler::run_lanes(
         calls,
         false,
-        MAX_TASK_CONCURRENCY,
+        runner.max_concurrency,
         parent_abort.as_deref(),
         |_| {},
     );
@@ -1418,6 +1452,45 @@ fn run_journaled_subagent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_worker_concurrency_limits_real_fanout() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for width in [1, 2, 4] {
+            let live = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let active = live.clone();
+            let maximum = peak.clone();
+            let runner = SubagentRunner::new(move |request| {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(request.prompt.clone())
+            })
+            .with_concurrency(width)
+            .unwrap();
+            let tasks: Vec<_> = (0..8)
+                .map(|i| json!({"prompt":format!("task-{i}")}))
+                .collect();
+            let result = run_tool(
+                &json!({"tasks":tasks}),
+                &["read".into()],
+                Some(&runner),
+                &SubagentParent::default(),
+            )
+            .unwrap();
+            assert!(!result.is_error);
+            assert_eq!(peak.load(Ordering::SeqCst), width);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+        assert!(SubagentRunner::new(|_| Ok(String::new()))
+            .with_concurrency(0)
+            .is_err());
+        assert!(SubagentRunner::new(|_| Ok(String::new()))
+            .with_concurrency(9)
+            .is_err());
+    }
     use super::*;
     use serde_json::json;
 
