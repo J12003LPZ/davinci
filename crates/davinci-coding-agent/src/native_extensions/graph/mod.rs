@@ -2712,11 +2712,17 @@ name = \"x\"
             .unwrap();
         assert_eq!(done.phase, Phase::Done);
         drain_active(dir.path());
-        let response = controller.command("graph-resume", "--latest").unwrap().unwrap();
+        let response = controller
+            .command("graph-resume", "--latest")
+            .unwrap()
+            .unwrap();
         assert_eq!(response["started"], true);
         assert_eq!(response["runId"], blocked.run_id);
         drain_active(dir.path());
-        assert_eq!(load_run(dir.path(), &blocked.run_id).unwrap().phase, Phase::Done);
+        assert_eq!(
+            load_run(dir.path(), &blocked.run_id).unwrap().phase,
+            Phase::Done
+        );
     }
 
     #[test]
