@@ -262,20 +262,15 @@ pub fn run_child_with_output_dir(
         // Limit continuously writing descendants by frames, not callback wall
         // time: a finite queue of short lines can take a slow caller seconds.
         let mut drained = 0usize;
-        loop {
-            match receiver.recv_timeout(DRAIN_GRACE) {
-                Ok(frame) => {
-                    if let Err(error) = deliver(frame, &mut outcome.output_spools, &mut child) {
-                        if abort.load(Ordering::Acquire) {
-                            outcome.aborted = true;
-                            terminate_process_tree(child_pid);
-                            break;
-                        }
-                        terminate_process_tree(child_pid);
-                        return Err(error);
-                    }
+        while let Ok(frame) = receiver.recv_timeout(DRAIN_GRACE) {
+            if let Err(error) = deliver(frame, &mut outcome.output_spools, &mut child) {
+                if abort.load(Ordering::Acquire) {
+                    outcome.aborted = true;
+                    terminate_process_tree(child_pid);
+                    break;
                 }
-                Err(_) => break,
+                terminate_process_tree(child_pid);
+                return Err(error);
             }
             drained += 1;
             if drained >= 4096 {
@@ -287,7 +282,6 @@ pub fn run_child_with_output_dir(
             }
         }
     }
-    drop(deliver);
     stdout.finish(
         false,
         &mut |line| {
