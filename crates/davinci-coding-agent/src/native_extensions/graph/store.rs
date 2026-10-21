@@ -697,9 +697,11 @@ impl RunSummary {
             updated_at: run.updated_at,
             cost_usd: run.counters.cost_usd,
             workers_spawned: run.counters.workers_spawned,
-            completed_tasks: run.tasks.iter().filter(|task|
-                task.status == super::types::TaskStatus::Succeeded
-            ).count(),
+            completed_tasks: run
+                .tasks
+                .iter()
+                .filter(|task| task.status == super::types::TaskStatus::Succeeded)
+                .count(),
             total_tasks: run.tasks.len(),
         }
     }
