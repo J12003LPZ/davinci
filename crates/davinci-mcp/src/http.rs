@@ -119,7 +119,7 @@ impl HttpTransport {
     fn send_post(&self, body: &Value) -> Result<ureq::http::Response<ureq::Body>> {
         let mut request = self.agent.post(&self.url);
         for (key, value) in self.request_headers() {
-            request = request.header(&key, &value);
+            request = set_header(request, &key, &value);
         }
         // ureq 3's `send_json` pretty-prints; ureq 2 sent compact JSON.
         let bytes =
@@ -340,7 +340,7 @@ impl Drop for HttpTransport {
             .build()
             .header(SESSION_HEADER, session);
         for (key, value) in &self.headers {
-            request = request.header(key, value);
+            request = set_header(request, key, value);
         }
         let _ = request.call();
     }
@@ -386,12 +386,27 @@ fn validate_response(value: &Value, wanted: &Value) -> Result<()> {
     Ok(())
 }
 
+fn set_header<S>(
+    mut request: ureq::RequestBuilder<S>,
+    name: &str,
+    value: &str,
+) -> ureq::RequestBuilder<S> {
+    // ureq 2 replaced ordinary headers but appended X-* headers.
+    if !name.to_ascii_lowercase().starts_with("x-") {
+        if let Some(headers) = request.headers_mut() {
+            headers.remove(name);
+        }
+    }
+    request.header(name, value)
+}
+
 fn build_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         // A 4xx or 5xx answer carries the server's explanation; `send_post` reads it.
         .http_status_as_error(false)
         // ureq 2 never read the proxy environment.
         .proxy(None)
+        .max_redirects(5)
         .timeout_global(Some(timeout))
         .build()
         .into()
@@ -509,6 +524,26 @@ fn sse_events(text: &str) -> impl Iterator<Item = String> + '_ {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn agent_keeps_the_redirect_budget_and_header_override_behavior() {
+        let agent = build_agent(Duration::from_secs(1));
+        assert_eq!(agent.config().max_redirects(), 5);
+        let request = agent
+            .post("http://localhost/")
+            .header("Authorization", "old")
+            .header("Accept", "text/plain")
+            .header("X-Custom", "first");
+        let request = set_header(request, "authorization", "new");
+        let request = set_header(request, "accept", "application/json");
+        let request = set_header(request, "x-custom", "second");
+        let headers = request.headers_ref().unwrap();
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(headers["authorization"], "new");
+        assert_eq!(headers.get_all("accept").iter().count(), 1);
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(headers.get_all("x-custom").iter().count(), 2);
+    }
 
     #[test]
     fn uncorrelated_sse_keeps_the_last_notification() {

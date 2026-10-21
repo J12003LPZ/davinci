@@ -8,6 +8,7 @@
 - Automatic local memory. `/setup` is one surface: `check [--json]` (read-only), `repair` (re-embed stale vectors, never deletes), `approve start-ollama|download-model` (one recorded yes, one action), `enable|disable memory|governor` (persistent opt-out in `setup-profile.json`). Health states come from live probes (`disabled`, `unconfigured`, `checking`, `starting`, `ready`, `degraded`, `actionRequired`, `failed`) with codes such as `PROVIDER_OFFLINE`, `MODEL_MISSING`, `EMBEDDING_MISMATCH`, `LOCAL_STORE_UNREADABLE`. A later session restarts the approved local Ollama by itself (backoff 1s, 2s, 4s, then every 120s, one notice per failure and one on recovery) and never stops an Ollama you started. See `docs/setup.md`.
 
 ### Changed
+- HTTP clients use ureq 3.4.2 with one `webpki-roots` dependency; the RUSTSEC-2026-0381 advisory exception is removed. Provider idle timeouts, compact JSON, header overrides and five-redirect limits are retained. Streaming readers remain uncapped. The default User-Agent now identifies `ureq/3.4.2`; `Accept: */*` remains the default unless overridden; budgeted requests reject redirects, and Ollama model-pull requests have a 60-second write timeout.
 - A trusted project's `permissions.mode` can tighten the approval mode but no longer loosen it past the mode in your own settings (warning at startup, row in `/permissions`). `/setup` ignores relative `PATH` entries when looking for `ollama`.
 
 ### Fixed

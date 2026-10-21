@@ -279,12 +279,14 @@ fn check_retry_abort(
 /// `provider_error_from_status`).
 pub fn provider_error_from_ureq(err: ureq::Error) -> ProviderError {
     match err {
-        ureq::Error::StatusCode(status) => ProviderError {
-            status: Some(status),
-            headers: HashMap::new(),
-            message: format!("Provider request failed: Provider error: {status}"),
-            phase: RequestPhase::Response,
-        },
+        ureq::Error::StatusCode(status) => ProviderError::new(
+            None,
+            format!(
+                "Provider HTTP {status} lost its response headers; configure \
+                 http_status_as_error(false) and use provider_error_from_status \
+                 before deciding whether to retry"
+            ),
+        ),
         transport => {
             let phase = match &transport {
                 ureq::Error::HostNotFound
@@ -332,6 +334,14 @@ pub(crate) fn provider_error_from_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headerless_status_errors_fail_closed_instead_of_guessing_a_retry() {
+        let error = provider_error_from_ureq(ureq::Error::StatusCode(429));
+        assert!(!is_retryable_provider_error(&error));
+        assert!(error.message.contains("http_status_as_error(false)"));
+        assert!(error.message.contains("provider_error_from_status"));
+    }
 
     #[test]
     fn cancel_during_provider_backoff_sends_no_request() {

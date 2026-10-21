@@ -589,6 +589,15 @@ fn brave_key() -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+fn read_brave_response(response: &mut ureq::http::Response<ureq::Body>) -> Result<Value, String> {
+    response
+        .body_mut()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .map_err(|err| format!("Brave search answered badly: {err}"))
+}
+
 fn search(query: &str, limit: usize) -> Result<(String, Vec<SearchResult>), String> {
     if let Some(map) = fixture("PI_WEB_SEARCH_FIXTURE") {
         let hits = map
@@ -638,10 +647,7 @@ fn search(query: &str, limit: usize) -> Result<(String, Vec<SearchResult>), Stri
             .header("X-Subscription-Token", &key)
             .call()
             .map_err(|err| format!("Brave search failed: {err}"))?;
-        let body: Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|err| format!("Brave search answered badly: {err}"))?;
+        let body = read_brave_response(&mut response)?;
         let results = body
             .get("web")
             .and_then(|web| web.get("results"))
@@ -1366,6 +1372,18 @@ pub fn search_parameters() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brave_json_keeps_ureq_twos_uncapped_response_size() {
+        let description = "x".repeat(11 * 1024 * 1024);
+        let body = serde_json::to_vec(&json!({
+            "web": {"results": [{"description": description}]}
+        }))
+        .unwrap();
+        let mut response = ureq::http::Response::new(ureq::Body::builder().data(body));
+        let parsed = read_brave_response(&mut response).unwrap();
+        assert_eq!(parsed["web"]["results"][0]["description"], description);
+    }
 
     #[test]
     fn audit_regression_rejects_malformed_punycode_hosts() {

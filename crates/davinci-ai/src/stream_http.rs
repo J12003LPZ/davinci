@@ -250,12 +250,12 @@ pub(crate) fn send(
     .build();
     let mut request = agent.post(url);
     for (key, value) in headers {
-        request = request.header(key.as_str(), value.as_str());
+        request = crate::http::set_header(request, key, value);
     }
     let bytes = if compress_zstd {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
-            request = request.header("content-encoding", "zstd");
+            request = crate::http::set_header(request, "content-encoding", "zstd");
         }
         bytes
     } else {
@@ -308,6 +308,65 @@ mod tests {
             }
         }
         reader.read_exact(&mut vec![0; length]).unwrap();
+    }
+
+    #[test]
+    fn chunked_streams_over_ten_megabytes_are_not_capped() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            consume_request(&mut socket);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..176 {
+                write!(socket, "{:x}\r\n", chunk.len()).unwrap();
+                socket.write_all(&chunk).unwrap();
+                socket.write_all(b"\r\n").unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let response = send(&url, &[], &serde_json::json!({}), Some(10_000), false, None).unwrap();
+        let (mut reader, _) = response.into_reader();
+        let count = io::copy(&mut reader, &mut io::sink()).unwrap();
+        server.join().unwrap();
+        assert_eq!(count, 11 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_truncated_body_is_classified_as_an_interrupted_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            consume_request(&mut socket);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\ncut",
+                )
+                .unwrap();
+        });
+        let response = send(&url, &[], &serde_json::json!({}), Some(10_000), false, None).unwrap();
+        let (mut reader, _) = response.into_reader();
+        let error = io::copy(&mut reader, &mut io::sink()).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            crate::retry::classify_stream_read_error(&error),
+            crate::retry::ResponseStreamFailure::TransportInterrupted
+        );
     }
 
     #[test]

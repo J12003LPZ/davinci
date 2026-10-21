@@ -163,10 +163,10 @@ fn post_images(
     }
     request = request.header("content-type", "application/json");
     for (key, value) in &model.headers {
-        request = request.header(key, value);
+        request = crate::http::set_header(request, key, value);
     }
     for (key, value) in &options.headers {
-        request = request.header(key, value);
+        request = crate::http::set_header(request, key, value);
     }
     let mut response = request
         .send(&body.to_string())

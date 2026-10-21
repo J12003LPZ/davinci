@@ -10,7 +10,7 @@ use ureq::typestate::AgentScope;
 /// A config builder with ureq 2's defaults. ureq 3 reads `HTTP_PROXY` and
 /// friends unless told not to; ureq 2 never did.
 pub fn config() -> ConfigBuilder<AgentScope> {
-    ureq::Agent::config_builder().proxy(None)
+    ureq::Agent::config_builder().proxy(None).max_redirects(5)
 }
 
 /// An agent with no timeouts.
@@ -97,6 +97,17 @@ mod tests {
         assert!(
             request.contains("content-type: application/json\r\n"),
             "{request}"
+        );
+    }
+
+    #[test]
+    fn agents_keep_the_five_redirect_limit() {
+        assert_eq!(agent().config().max_redirects(), 5);
+        assert_eq!(
+            agent_with_timeout(Duration::from_secs(10))
+                .config()
+                .max_redirects(),
+            5
         );
     }
 

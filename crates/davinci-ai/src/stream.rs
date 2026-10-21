@@ -1428,7 +1428,7 @@ pub fn raw_provider_post(
         .http_status_as_error(false)
         .build();
     for (key, value) in &headers {
-        request = request.header(key, value);
+        request = crate::http::set_header(request, key, value);
     }
 
     let result = if model.api == "openai-codex-responses"
@@ -1436,7 +1436,7 @@ pub fn raw_provider_post(
     {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
-            request = request.header("content-encoding", "zstd");
+            request = crate::http::set_header(request, "content-encoding", "zstd");
         }
         request.send(&bytes)
     } else {
@@ -1609,12 +1609,12 @@ fn send_provider_request(
         .http_status_as_error(false)
         .build();
     for (key, value) in headers {
-        request = request.header(key, value);
+        request = crate::http::set_header(request, key, value);
     }
     let response = if compress_zstd {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
-            request = request.header("content-encoding", "zstd");
+            request = crate::http::set_header(request, "content-encoding", "zstd");
         }
         request.send(&bytes)
     } else {
@@ -2332,28 +2332,30 @@ pub fn live_stream(
     let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(&url);
     for (key, value) in &auth.headers {
         if !crate::auth::is_url_var_header(key) {
-            request = request.header(key, value);
+            request = crate::http::set_header(request, key, value);
         }
     }
     for (key, value) in &model.headers {
-        request = request.header(key, value);
+        request = crate::http::set_header(request, key, value);
     }
     if let Some(key) = &auth.api_key {
         if model.api == "google-generative-ai" {
             request = request.header("x-goog-api-key", key);
         } else if model.api == "anthropic-messages" {
-            request = request
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01");
+            request = crate::http::set_header(
+                request.header("x-api-key", key),
+                "anthropic-version",
+                "2023-06-01",
+            );
         } else {
-            request = request.header("Authorization", &format!("Bearer {key}"));
+            request = crate::http::set_header(request, "Authorization", &format!("Bearer {key}"));
         }
     }
-    request = request.header("content-type", "application/json");
+    request = crate::http::set_header(request, "content-type", "application/json");
     let response = if model.api == "openai-codex-responses" {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
-            request = request.header("content-encoding", "zstd");
+            request = crate::http::set_header(request, "content-encoding", "zstd");
         }
         request
             .send(&bytes)

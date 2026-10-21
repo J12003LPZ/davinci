@@ -21,6 +21,20 @@ pub(crate) fn agent(idle: Duration) -> ureq::Agent {
         .clone()
 }
 
+/// Match ureq 2's `set`: replace ordinary headers, append `X-*` headers.
+pub(crate) fn set_header<S>(
+    mut request: ureq::RequestBuilder<S>,
+    name: &str,
+    value: &str,
+) -> ureq::RequestBuilder<S> {
+    if !name.to_ascii_lowercase().starts_with("x-") {
+        if let Some(headers) = request.headers_mut() {
+            headers.remove(name);
+        }
+    }
+    request.header(name, value)
+}
+
 /// ureq 2's `into_json` had no size cap (`read_json` caps at 10 MB), and an
 /// image answer is base64 in JSON.
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
@@ -38,6 +52,24 @@ mod tests {
     use super::agent;
     use std::io::Read;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn header_overrides_replace_authorization_and_content_type_but_append_x_headers() {
+        let request = agent(Duration::from_secs(1))
+            .post("http://localhost/")
+            .header("Authorization", "old")
+            .header("Content-Type", "text/plain")
+            .header("X-Custom", "first");
+        let request = super::set_header(request, "authorization", "new");
+        let request = super::set_header(request, "content-type", "application/json");
+        let request = super::set_header(request, "x-custom", "second");
+        let headers = request.headers_ref().unwrap();
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(headers["authorization"], "new");
+        assert_eq!(headers.get_all("content-type").iter().count(), 1);
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers.get_all("x-custom").iter().count(), 2);
+    }
 
     #[test]
     fn budgeted_requests_never_follow_redirects() {

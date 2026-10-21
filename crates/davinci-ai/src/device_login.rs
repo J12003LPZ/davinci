@@ -345,7 +345,7 @@ pub(crate) fn copilot_token_at(url: &str, github_token: &str) -> Result<OauthTok
         .header("accept", "application/json")
         .header("authorization", &format!("Bearer {github_token}"));
     for (name, value) in crate::auth::copilot_headers() {
-        request = request.header(name, value);
+        request = crate::http::set_header(request, name, value);
     }
     let mut response = request
         .call()
