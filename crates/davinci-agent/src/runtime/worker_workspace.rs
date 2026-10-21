@@ -256,10 +256,30 @@ const FRESH_FOR: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct CachedWorkspace {
+    path: PathBuf,
+    /// Unique for this path assignment, so an old background read cannot
+    /// overwrite a newer worktree (even if the path changes away and back).
+    token: std::sync::Arc<()>,
     value: WorkerWorkspace,
     read_at: Option<std::time::Instant>,
     /// A read in flight, and when it began.
     reading_since: Option<std::time::Instant>,
+}
+
+impl CachedWorkspace {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            token: std::sync::Arc::new(()),
+            value: WorkerWorkspace {
+                kind: WorkspaceKind::Worktree,
+                path: Some(path.to_path_buf()),
+                ..WorkerWorkspace::default()
+            },
+            read_at: None,
+            reading_since: None,
+        }
+    }
 }
 
 /// The last known workspace of each worker, refreshed off the caller's thread.
@@ -287,22 +307,24 @@ impl WorkspaceCache {
         fresh_for: Duration,
         timeout: Duration,
     ) -> WorkerWorkspace {
-        // No worktree: nothing to read.
+        // A removed worktree invalidates the old read even if this agent ID
+        // receives a new path before the background task finishes.
         let Some(path) = record.worktree.as_ref() else {
+            self.entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&record.id);
             return WorkerWorkspace::default();
         };
         let now = std::time::Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = entries.entry(record.id).or_insert_with(|| CachedWorkspace {
-            // Until the first read lands: a worktree, branch not known yet.
-            value: WorkerWorkspace {
-                kind: WorkspaceKind::Worktree,
-                path: Some(path.clone()),
-                ..WorkerWorkspace::default()
-            },
-            read_at: None,
-            reading_since: None,
-        });
+        let entry = entries
+            .entry(record.id)
+            .or_insert_with(|| CachedWorkspace::new(path));
+        if entry.path != *path {
+            // Do not present another worktree's branch while a new read runs.
+            *entry = CachedWorkspace::new(path);
+        }
         if let Some(since) = entry.reading_since {
             if now.duration_since(since) >= timeout {
                 entry.value = WorkerWorkspace {
@@ -318,16 +340,18 @@ impl WorkspaceCache {
             .is_none_or(|at| now.duration_since(at) >= fresh_for);
         if stale {
             entry.reading_since = Some(now);
-            let (cache, record) = (self.clone(), record.clone());
+            let (cache, record, token) = (self.clone(), record.clone(), entry.token.clone());
             let spawned = std::thread::Builder::new()
                 .name("davinci-workspace-read".into())
                 .spawn(move || {
                     let value = read(&record);
                     let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = entries.get_mut(&record.id) {
-                        entry.value = value;
-                        entry.read_at = Some(std::time::Instant::now());
-                        entry.reading_since = None;
+                        if std::sync::Arc::ptr_eq(&entry.token, &token) {
+                            entry.value = value;
+                            entry.read_at = Some(std::time::Instant::now());
+                            entry.reading_since = None;
+                        }
                     }
                 });
             if spawned.is_err() {
@@ -427,6 +451,67 @@ mod cache_tests {
             Duration::from_secs(60),
         );
         assert_eq!(third.branch.as_deref(), Some("late"));
+    }
+
+    #[test]
+    fn changed_worktree_path_never_shows_or_restores_the_previous_branch() {
+        let cache = WorkspaceCache::default();
+        let original = record(Some(PathBuf::from("/worktree/old")));
+        let initial = cache.get_with(
+            &original,
+            slow_read,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        );
+        assert_eq!(initial.path, original.worktree);
+
+        let mut moved = original.clone();
+        moved.worktree = Some(PathBuf::from("/worktree/new"));
+        let pending = cache.get_with(
+            &moved,
+            quick_read,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        );
+        assert_eq!(pending.path, moved.worktree);
+        assert!(pending.branch.is_none());
+
+        let mut current = pending;
+        for _ in 0..100 {
+            current = cache.get_with(
+                &moved,
+                quick_read,
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+            );
+            if current.branch.as_deref() == Some("fast") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(current.branch.as_deref(), Some("fast"));
+        // Wait for the slow read of the original path; it must not clobber
+        // the newer worker assignment or its branch.
+        std::thread::sleep(Duration::from_millis(450));
+        let final_value = cache.get_with(
+            &moved,
+            quick_read,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        );
+        assert_eq!(final_value.path, moved.worktree);
+        assert_eq!(final_value.branch.as_deref(), Some("fast"));
+
+        // Clearing the assignment also invalidates outstanding cache state.
+        moved.worktree = None;
+        assert_eq!(cache.get(&moved), WorkerWorkspace::default());
+        moved.worktree = Some(PathBuf::from("/worktree/new"));
+        assert!(cache.get_with(
+            &moved,
+            quick_read,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        ).branch.is_none());
     }
 
     #[test]
