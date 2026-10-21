@@ -52,6 +52,11 @@ pub fn parse_u64_budget(value: &Value, name: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{name} must be a non-negative whole integer"))
 }
 
+pub fn parse_u32_budget(value: &Value, name: &str) -> Result<u32, String> {
+    u32::try_from(parse_u64_budget(value, name)?)
+        .map_err(|_| format!("{name} exceeds maximum u32 ({})", u32::MAX))
+}
+
 #[allow(dead_code)]
 pub fn parse_usize_budget(value: &Value, name: &str) -> Result<usize, String> {
     let n = parse_u64_budget(value, name)?;
@@ -90,28 +95,28 @@ pub fn load_config(cwd: &Path) -> LoadedConfig {
     if let Some(budgets) = object.get("budgets").and_then(Value::as_object) {
         let target = &mut loaded.config.budgets;
         if let Some(val) = budgets.get("maxResearchers") {
-            if let Ok(value) = parse_u64_budget(val, "budgets.maxResearchers") {
-                target.max_researchers = value as u32;
+            if let Ok(value) = parse_u32_budget(val, "budgets.maxResearchers") {
+                target.max_researchers = value;
             }
         }
         if let Some(val) = budgets.get("maxParallelWorkers") {
-            if let Ok(value) = parse_u64_budget(val, "budgets.maxParallelWorkers") {
-                target.max_parallel_workers = value.max(1) as u32;
+            if let Ok(value) = parse_u32_budget(val, "budgets.maxParallelWorkers") {
+                target.max_parallel_workers = value.max(1);
             }
         }
         if let Some(val) = budgets.get("maxWorkers") {
-            if let Ok(value) = parse_u64_budget(val, "budgets.maxWorkers") {
-                target.max_workers = value as u32;
+            if let Ok(value) = parse_u32_budget(val, "budgets.maxWorkers") {
+                target.max_workers = value;
             }
         }
         if let Some(val) = budgets.get("maxRevisionCycles") {
-            if let Ok(value) = parse_u64_budget(val, "budgets.maxRevisionCycles") {
-                target.max_revision_cycles = value as u32;
+            if let Ok(value) = parse_u32_budget(val, "budgets.maxRevisionCycles") {
+                target.max_revision_cycles = value;
             }
         }
         if let Some(val) = budgets.get("maxReplans") {
-            if let Ok(value) = parse_u64_budget(val, "budgets.maxReplans") {
-                target.max_replans = value as u32;
+            if let Ok(value) = parse_u32_budget(val, "budgets.maxReplans") {
+                target.max_replans = value;
             }
         }
         if let Some(val) = budgets.get("maxCostUsd") {
@@ -247,6 +252,27 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn graph_followup_budget_overflow_is_rejected() {
+        for key in [
+            "maxWorkers",
+            "maxResearchers",
+            "maxParallelWorkers",
+            "maxRevisionCycles",
+            "maxReplans",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::create_dir_all(dir.path().join(".davinci")).unwrap();
+            fs::write(
+                dir.path().join(".davinci/graph.json"),
+                format!(r#"{{"budgets":{{"{key}":4294967296}}}}"#),
+            )
+            .unwrap();
+            let loaded = load_config(dir.path());
+            assert!(!loaded.errors.is_empty(), "{key} overflow was accepted");
+        }
     }
 
     #[test]

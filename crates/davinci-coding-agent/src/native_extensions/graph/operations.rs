@@ -298,6 +298,8 @@ pub struct ForkPreview {
     pub invalidated_node_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     #[serde(default)]
     pub applied: bool,
 }
@@ -348,6 +350,10 @@ pub struct VerifyOnlyReport {
 #[serde(rename_all = "camelCase")]
 pub struct GraphDiffReport {
     pub current_revision: u64,
+    #[serde(default)]
+    pub current_checkpoint: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_checkpoint: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_revision: Option<u64>,
     pub definition_diff: Vec<String>,
@@ -505,6 +511,8 @@ pub fn generate_graph_diff(
 
     GraphDiffReport {
         current_revision: current.revision,
+        current_checkpoint: current.checkpoint_sequence,
+        prior_checkpoint: prior.map(|run| run.checkpoint_sequence),
         prior_revision: prior_rev,
         definition_diff,
         state_diff,
@@ -661,6 +669,16 @@ pub fn render_diff_report(report: &GraphDiffReport, max_width: usize) -> String 
         report.current_revision
     );
     out.push(truncate_or_wrap(&title, width));
+    out.push(truncate_or_wrap(
+        &format!(
+            "Checkpoint {} -> {}",
+            report
+                .prior_checkpoint
+                .map_or_else(|| "none".into(), |id| id.to_string()),
+            report.current_checkpoint
+        ),
+        width,
+    ));
 
     if !report.definition_diff.is_empty() {
         out.push(truncate_or_wrap("--- Definition Changes ---", width));
@@ -754,6 +772,232 @@ fn truncate_or_wrap(line: &str, max_width: usize) -> String {
     }
 }
 
+/// Reset only receipts/cursors which consume invalidated nodes. Parent attempt
+/// history remains authoritative for rewinds; fork materialization owns lineage.
+pub(super) fn reset_execution_cursor(
+    run: &mut GraphRun,
+    affected: &BTreeSet<String>,
+) -> Result<(), String> {
+    let classifier_reset = run
+        .tasks
+        .iter()
+        .any(|task| affected.contains(&task.id) && task.role == Role::Classifier);
+    let Some(cursor) = run.continuation.as_mut() else {
+        return Ok(());
+    };
+    for id in affected {
+        cursor.saved_stage_inputs.remove(id);
+        cursor.saved_verifications.remove(id);
+        cursor.saved_security.remove(id);
+    }
+    if run
+        .tasks
+        .iter()
+        .any(|task| affected.contains(&task.id) && task.role == Role::Researcher)
+    {
+        cursor.evidence_digest = None;
+    }
+    if run.saved_definition.is_some() {
+        return Ok(());
+    }
+    let first_writer = run
+        .tasks
+        .iter()
+        .filter(|task| {
+            affected.contains(&task.id) && task.role == Role::Writer && task.attempts > 0
+        })
+        .min_by_key(|task| task.started_at.unwrap_or(u64::MAX));
+    if let Some(writer) = first_writer {
+        let boundary = cursor
+            .delivery
+            .as_ref()
+            .or(cursor.completed_delivery.as_ref());
+        if boundary.and_then(|delivery| delivery.writer_task.as_deref()) != Some(writer.id.as_str())
+        {
+            return Err(
+                "Earlier writer rewind requires its exact execution boundary; no state changed"
+                    .into(),
+            );
+        }
+    }
+    if classifier_reset {
+        run.classification = None;
+        run.milestones = None;
+        cursor.completed_milestones = 0;
+        cursor.delivery = None;
+        cursor.completed_delivery = None;
+        cursor.evidence_digest = None;
+        cursor.indices = Default::default();
+        return Ok(());
+    }
+    let mut delivery = cursor
+        .delivery
+        .clone()
+        .or_else(|| cursor.completed_delivery.clone());
+    if let Some(ref mut delivery) = delivery {
+        let plan_reset = delivery
+            .plan_task
+            .as_ref()
+            .is_some_and(|id| affected.contains(id));
+        let writer_reset = delivery
+            .writer_task
+            .as_ref()
+            .is_some_and(|id| affected.contains(id));
+        let review_reset = delivery
+            .review_task
+            .as_ref()
+            .is_some_and(|id| affected.contains(id));
+        if plan_reset || writer_reset || review_reset {
+            use super::continuation::DeliveryStage;
+            fn rewind_index(id: &Option<String>, index: &mut u32) {
+                if let Some(number) = id
+                    .as_ref()
+                    .and_then(|id| id.rsplit('-').next())
+                    .and_then(|number| number.parse::<u32>().ok())
+                {
+                    *index = number.saturating_sub(1);
+                }
+            }
+            if plan_reset {
+                rewind_index(&delivery.plan_task, &mut cursor.indices.plan);
+            }
+            if writer_reset {
+                rewind_index(&delivery.writer_task, &mut cursor.indices.implement);
+            }
+            if review_reset {
+                rewind_index(&delivery.review_task, &mut cursor.indices.review);
+            }
+            if plan_reset {
+                delivery.plan_task = None;
+                delivery.plan = None;
+            }
+            if plan_reset || writer_reset {
+                delivery.writer_task = None;
+                delivery.patch = None;
+                delivery.attempt_baseline = None;
+            }
+            delivery.review_task = None;
+            delivery.review_inputs = None;
+            delivery.verification_inputs = None;
+            delivery.stage = if plan_reset {
+                DeliveryStage::Plan
+            } else if writer_reset {
+                DeliveryStage::Implement
+            } else {
+                DeliveryStage::Verify
+            };
+            if cursor.delivery.is_none() {
+                cursor.completed_milestones = cursor.completed_milestones.saturating_sub(1);
+                if cursor.completed_milestones > 0 {
+                    let previous =
+                        super::history::checkpoint_runs(Path::new(&run.cwd), &run.run_id)?
+                            .into_iter()
+                            .rev()
+                            .filter_map(|run| run.continuation)
+                            .find(|prior| {
+                                prior.completed_milestones == cursor.completed_milestones
+                                    && prior.delivery.is_none()
+                                    && prior.completed_delivery.is_some()
+                                    && prior.completion_inputs.is_some()
+                            })
+                            .ok_or(
+                                "Preceding milestone checkpoint is unavailable; state not rewound",
+                            )?;
+                    cursor.completed_delivery = previous.completed_delivery;
+                    cursor.completion_inputs = previous.completion_inputs;
+                } else {
+                    cursor.completed_delivery = None;
+                    cursor.completion_inputs = None;
+                }
+            }
+            cursor.delivery = Some(delivery.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn affected_nodes(run: &GraphRun, target: &str) -> Result<BTreeSet<String>, String> {
+    let mut edges: Vec<(String, String)> = run
+        .tasks
+        .iter()
+        .flat_map(|task| {
+            task.depends_on
+                .iter()
+                .map(move |dep| (dep.clone(), task.id.clone()))
+        })
+        .collect();
+    if let Some(definition) = &run.definition {
+        edges.extend(
+            definition
+                .edges
+                .iter()
+                .map(|edge| (edge.from.clone(), edge.to.clone())),
+        );
+    }
+    if run.saved_definition.is_none() {
+        // Old dynamic runs did not put delivery edges in GraphTaskState.
+        // Recover only relationships explicitly recorded by their stack.
+        let mut cursors = vec![];
+        if let Some(cursor) = &run.continuation {
+            cursors.push(cursor.clone());
+        }
+        for previous in super::history::checkpoint_runs(Path::new(&run.cwd), &run.run_id)? {
+            if let Some(cursor) = previous.continuation {
+                cursors.push(cursor);
+            }
+        }
+        for cursor in cursors {
+            for delivery in [&cursor.delivery, &cursor.completed_delivery]
+                .into_iter()
+                .flatten()
+            {
+                if let (Some(plan), Some(writer)) = (&delivery.plan_task, &delivery.writer_task) {
+                    edges.push((plan.clone(), writer.clone()));
+                }
+                if let (Some(writer), Some(review)) = (&delivery.writer_task, &delivery.review_task)
+                {
+                    edges.push((writer.clone(), review.clone()));
+                }
+                if let Some(first) = delivery
+                    .plan_task
+                    .as_ref()
+                    .or(delivery.writer_task.as_ref())
+                {
+                    edges.extend(
+                        run.tasks
+                            .iter()
+                            .filter(|task| {
+                                task.id == "classify" || task.id.starts_with("research-")
+                            })
+                            .map(|task| (task.id.clone(), first.clone())),
+                    );
+                }
+            }
+            if let (Some(previous), Some(next)) = (&cursor.completed_delivery, &cursor.delivery) {
+                if let (Some(from), Some(to)) = (
+                    previous
+                        .review_task
+                        .as_ref()
+                        .or(previous.writer_task.as_ref()),
+                    next.plan_task.as_ref().or(next.writer_task.as_ref()),
+                ) {
+                    if from != to {
+                        edges.push((from.clone(), to.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let borrowed: Vec<_> = edges
+        .iter()
+        .map(|(from, to)| (from.as_str(), to.as_str()))
+        .collect();
+    Ok(super::control::descendant_ids(target, &borrowed)
+        .into_iter()
+        .map(str::to_owned)
+        .collect())
+}
+
 #[allow(dead_code)]
 pub fn generate_fork_preview(
     parent_run: &GraphRun,
@@ -778,12 +1022,9 @@ pub fn generate_fork_preview(
     let mut preserved_node_ids = Vec::new();
     let mut invalidated_node_ids = Vec::new();
 
-    let mut past_fork_node = false;
+    let affected = affected_nodes(parent_run, fork_node_id)?;
     for task in &parent_run.tasks {
-        if task.id == fork_node_id {
-            past_fork_node = true;
-            invalidated_node_ids.push(task.id.clone());
-        } else if past_fork_node {
+        if affected.contains(&task.id) {
             invalidated_node_ids.push(task.id.clone());
         } else {
             preserved_node_ids.push(task.id.clone());
@@ -833,12 +1074,17 @@ pub fn generate_fork_preview(
         parent_run_id: parent_run.run_id.clone(),
         fork_node_id: fork_node_id.to_string(),
         strategy,
-        new_run_id,
+        new_run_id: new_run_id.clone(),
         retained_spend_usd: parent_run.counters.cost_usd,
         remaining_ceiling_ms,
         preserved_node_ids,
         invalidated_node_ids,
         checkpoint_ref,
+        workspace_path: cwd.map(|cwd| {
+            super::forks::workspace_path(cwd, &new_run_id)
+                .to_string_lossy()
+                .into_owned()
+        }),
         applied: false,
     })
 }
@@ -849,56 +1095,7 @@ pub fn execute_fork(
     preview: &ForkPreview,
     cwd: &Path,
 ) -> Result<GraphRun, String> {
-    super::store::pin_run(cwd, &parent_run.run_id)
-        .map_err(|error| format!("failed to pin parent run: {error}"))?;
-
-    let mut new_run = parent_run.clone();
-    new_run.run_id = preview.new_run_id.clone();
-    new_run.revision = 1;
-    new_run.phase = crate::native_extensions::graph::types::Phase::Classify;
-    new_run.verification = None;
-    new_run.verification_bundle = None;
-    new_run.review_coverage = None;
-
-    new_run.counters.cost_usd = preview.retained_spend_usd;
-
-    for task in &mut new_run.tasks {
-        if preview.invalidated_node_ids.contains(&task.id) {
-            task.status = TaskStatus::Pending;
-            task.artifact_file = None;
-            task.error = None;
-            task.mutation = None;
-            task.fingerprint = None;
-            task.attempts = 0;
-            task.started_at = None;
-            task.ended_at = None;
-        }
-    }
-
-    new_run.cwd = cwd.to_string_lossy().to_string();
-    super::store::create_run_dir(cwd, &new_run.run_id)
-        .map_err(|error| format!("failed to create forked run directory: {error}"))?;
-    super::store::record_ancestor_run(cwd, &preview.new_run_id, &parent_run.run_id)
-        .map_err(|error| format!("failed to persist fork ancestry: {error}"))?;
-
-    let history_entry = super::history::GraphHistoryEntry {
-        id: format!("h-fork-{}", new_run.run_id),
-        parent_id: Some(parent_run.run_id.clone()),
-        run_id: new_run.run_id.clone(),
-        definition_digest: new_run.definition_digest.clone(),
-        task_checkpoint: preview.checkpoint_ref.clone(),
-        attempt_refs: vec![],
-        evidence_refs: vec![],
-        root_budget_id: None,
-        state_revision: 1,
-        timestamp: super::store::now_ms(),
-    };
-    super::history::write_history_entry(cwd, &history_entry)
-        .map_err(|error| format!("failed to persist fork history: {error}"))?;
-    super::store::save_run(&mut new_run)
-        .map_err(|error| format!("failed to save forked run: {error}"))?;
-
-    Ok(new_run)
+    super::forks::execute(parent_run, preview, cwd)
 }
 
 #[allow(dead_code)]
@@ -978,21 +1175,29 @@ pub fn execute_rewind(
     }
 
     if restore_state {
-        let mut past_target = false;
+        let affected = affected_nodes(run, &preview.target_node_id)?;
         for task in &mut run.tasks {
-            if task.id == preview.target_node_id {
-                past_target = true;
+            if affected.contains(&task.id) {
                 task.status = TaskStatus::Pending;
                 task.artifact_file = None;
                 task.mutation = None;
                 task.error = None;
-            } else if past_target {
-                task.status = TaskStatus::Pending;
-                task.artifact_file = None;
-                task.mutation = None;
-                task.error = None;
+                task.fingerprint = None;
+                task.started_at = None;
+                task.ended_at = None;
+                task.last_activity = None;
+                task.last_message = None;
             }
         }
+        reset_execution_cursor(run, &affected)?;
+        run.phase = super::types::Phase::Classify;
+        run.lifecycle = Some(super::types::GraphLifecycle::Stopped);
+        run.blocked_reason = None;
+        run.verification_bundle = None;
+        run.revision = run
+            .revision
+            .checked_add(1)
+            .ok_or("graph revision exhausted")?;
         run.verification = None;
         run.review_coverage = None;
         run.cwd = cwd.to_string_lossy().to_string();
@@ -1096,6 +1301,27 @@ pub fn execute_rewind_with_runtime(
         ));
     }
 
+    if restore_state {
+        let mut candidate = run.clone();
+        let affected = affected_nodes(run, &preview.target_node_id)?;
+        reset_execution_cursor(&mut candidate, &affected)?;
+        candidate.phase = super::types::Phase::Classify;
+        candidate.verification = None;
+        candidate.verification_bundle = None;
+        candidate.review_coverage = None;
+        for task in &mut candidate.tasks {
+            if affected.contains(&task.id) {
+                task.status = TaskStatus::Pending;
+                task.artifact_file = None;
+                task.error = None;
+                task.fingerprint = None;
+            }
+        }
+        if candidate.continuation.is_some() {
+            super::continuation::validate_resume(&candidate, cwd)?;
+        }
+    }
+
     let mut restored_files = Vec::new();
     if restore_code {
         let runtime_preview = load_runtime_rewind_preview(run, preview, cwd)?;
@@ -1175,6 +1401,13 @@ pub fn render_fork_preview(preview: &ForkPreview) -> String {
     } else {
         "Preview only: repeat with --authorize to apply".to_string()
     });
+    if let Some(workspace) = &preview.workspace_path {
+        lines.push(format!("Fork workspace: {workspace}"));
+        lines.push(format!(
+            "Resume there with /graph-resume {}",
+            preview.new_run_id
+        ));
+    }
     if let Some(cp) = &preview.checkpoint_ref {
         lines.push(format!("Checkpoint: {cp}"));
     }
@@ -1399,8 +1632,234 @@ mod tests {
             updated_at: 0,
             lifecycle: None,
             revision: 1,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
+        }
+    }
+
+    #[test]
+    fn graph_followup_rewind_preserves_independent_later_node() {
+        let dir = tempdir().unwrap();
+        let mut run = sample_run("rewind-dag", "goal");
+        run.cwd = dir.path().to_string_lossy().into_owned();
+        let mut independent = run.tasks[1].clone();
+        independent.id = "independent".into();
+        independent.depends_on.clear();
+        independent.status = TaskStatus::Succeeded;
+        independent.artifact_file = Some("artifacts/independent.json".into());
+        run.tasks.push(independent.clone());
+        super::super::history::record_task_checkpoint(dir.path(), &run.run_id, "write", "cp")
+            .unwrap();
+        let preview = generate_rewind_preview(&run, "write", dir.path(), &[]).unwrap();
+        execute_rewind(&mut run, &preview, dir.path(), false, true).unwrap();
+        assert_eq!(run.tasks[2], independent);
+    }
+
+    #[test]
+    fn graph_followup_fork_materializes_and_validates_checkpoint() {
+        use super::super::{controller, ActiveRun, GraphController};
+        for (use_git, milestones, fork_first) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("source.txt"), b"before writer").unwrap();
+            if use_git {
+                super::super::git::run(dir.path(), &["init"]).unwrap();
+                super::super::git::run(dir.path(), &["add", "source.txt"]).unwrap();
+                super::super::git::run(
+                    dir.path(),
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "-m",
+                        "initial",
+                    ],
+                )
+                .unwrap();
+            }
+            let host = GraphController::new(dir.path().into());
+            let (mut deps, errors) = host.deps(true, &Arc::new(ActiveRun::default()));
+            assert!(errors.is_empty());
+            deps.runner = Arc::new(move |spec, abort, progress| {
+                let mut result = super::super::worker::run_dry_worker(spec, abort, progress);
+                if spec.role == Role::Classifier && milestones {
+                    result.artifact = Some(super::super::types::Artifact::Classification(
+                        super::super::types::Classification {
+                            task_class: super::super::types::TaskClass::Feature,
+                            complexity: super::super::types::Complexity::Complex,
+                            rationale: "two milestone fork fixture".into(),
+                            research_tasks: vec![],
+                            milestones: Some(vec!["first".into(), "second".into()]),
+                        },
+                    ));
+                }
+                if spec.role == Role::Writer {
+                    std::fs::write(spec.cwd.join("source.txt"), spec.task_id.as_bytes()).unwrap();
+                    result.artifact = Some(super::super::types::Artifact::PatchReport(Box::new(
+                        super::super::types::PatchReport {
+                            changed_files: vec!["source.txt".into()],
+                            summary: "fixture write".into(),
+                            deviations: vec![],
+                            plan_invalidated: false,
+                            invalidation_reason: None,
+                        },
+                    )));
+                }
+                if let Some(artifact) = &result.artifact {
+                    super::super::store::write_artifact(&spec.artifact_path, artifact).unwrap();
+                }
+                result
+            });
+            let runner = deps.runner.clone();
+            let parent = controller::run_graph(
+                controller::RunOptions {
+                    goal: "fork fixture".into(),
+                    cwd: dir.path().into(),
+                    forced: Some(if milestones {
+                        super::super::types::Complexity::Complex
+                    } else {
+                        super::super::types::Complexity::Trivial
+                    }),
+                    dry_run: true,
+                    abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    resume_artifacts: Default::default(),
+                    resume_run: None,
+                },
+                deps,
+            );
+            assert_eq!(parent.phase, super::super::types::Phase::Done);
+            let writer = parent
+                .tasks
+                .iter()
+                .filter(|task| task.role == Role::Writer)
+                .nth(if milestones && !fork_first { 1 } else { 0 })
+                .unwrap();
+            std::fs::write(dir.path().join("source.txt"), b"later writer edits").unwrap();
+            let preview = generate_fork_preview(
+                &parent,
+                &writer.id,
+                ForkStrategy::RepairMinimal,
+                Some(dir.path()),
+            )
+            .unwrap();
+            let expected_bytes: &[u8] = if milestones && !fork_first {
+                b"implement-1"
+            } else {
+                b"before writer"
+            };
+            let fork = execute_fork(&parent, &preview, dir.path()).unwrap();
+            assert_ne!(Path::new(&fork.cwd), dir.path());
+            assert_eq!(
+                std::fs::read(Path::new(&fork.cwd).join("source.txt")).unwrap(),
+                expected_bytes
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("source.txt")).unwrap(),
+                b"later writer edits"
+            );
+            super::super::continuation::validate_resume(&fork, Path::new(&fork.cwd)).unwrap();
+            assert!(super::super::store::is_run_pinned(
+                dir.path(),
+                &parent.run_id
+            ));
+            assert!(fork
+                .tasks
+                .iter()
+                .any(|task| task.status == TaskStatus::Succeeded));
+            assert!(fork
+                .continuation
+                .as_ref()
+                .unwrap()
+                .attempt_history
+                .is_empty());
+            assert_eq!(
+                super::super::forks::published_workspace(dir.path(), &fork.run_id)
+                    .unwrap()
+                    .as_deref(),
+                Some(Path::new(&fork.cwd))
+            );
+            let child_host = GraphController::new(Path::new(&fork.cwd).into());
+            let (mut deps, _) = child_host.deps(true, &Arc::new(ActiveRun::default()));
+            deps.runner = runner;
+            let resumed = controller::run_graph(
+                controller::RunOptions {
+                    goal: fork.goal.clone(),
+                    cwd: Path::new(&fork.cwd).into(),
+                    forced: fork.forced,
+                    dry_run: true,
+                    abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    resume_artifacts: Default::default(),
+                    resume_run: Some(Box::new(fork.clone())),
+                },
+                deps,
+            );
+            assert_eq!(
+                resumed.phase,
+                super::super::types::Phase::Done,
+                "{:?}",
+                resumed.blocked_reason
+            );
+            // Missing preimages must fail before another fork becomes discoverable.
+            let hash = super::super::replay::sha256_hex(expected_bytes);
+            let blob_dir = super::super::blobs::dir(dir.path());
+            std::fs::remove_file(blob_dir.join(&hash[..2]).join(hash)).unwrap();
+            let missing_preview = generate_fork_preview(
+                &parent,
+                &writer.id,
+                ForkStrategy::RepairMinimal,
+                Some(dir.path()),
+            )
+            .unwrap();
+            assert!(execute_fork(&parent, &missing_preview, dir.path())
+                .unwrap_err()
+                .contains("checkpoint bytes"));
+            assert!(super::super::forks::published_workspace(
+                dir.path(),
+                &missing_preview.new_run_id
+            )
+            .unwrap()
+            .is_none());
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink("source.txt", dir.path().join("source-link")).unwrap();
+                if use_git {
+                    super::super::git::run(dir.path(), &["add", "source-link"]).unwrap();
+                }
+                let unsupported = generate_fork_preview(
+                    &parent,
+                    &writer.id,
+                    ForkStrategy::RepairMinimal,
+                    Some(dir.path()),
+                )
+                .unwrap();
+                assert!(execute_fork(&parent, &unsupported, dir.path())
+                    .unwrap_err()
+                    .contains("symlink"));
+                assert!(super::super::forks::published_workspace(
+                    dir.path(),
+                    &unsupported.new_run_id
+                )
+                .unwrap()
+                .is_none());
+            }
+            if milestones && !fork_first {
+                let mut rewound = parent.clone();
+                let preview =
+                    generate_rewind_preview(&rewound, &writer.id, dir.path(), &[]).unwrap();
+                execute_rewind(&mut rewound, &preview, dir.path(), false, true).unwrap();
+                assert_eq!(
+                    rewound.continuation.as_ref().unwrap().completed_milestones,
+                    1
+                );
+                super::super::continuation::validate_resume(&rewound, dir.path()).unwrap();
+            }
         }
     }
 
@@ -1622,13 +2081,9 @@ mod tests {
             Some(dir.path()),
         )
         .unwrap();
-        let _forked = execute_fork(&parent, &preview, dir.path()).unwrap();
-
-        assert!(store::is_run_pinned(dir.path(), &parent.run_id));
-        assert_eq!(
-            store::read_ancestor_run(dir.path(), &preview.new_run_id),
-            Some(parent.run_id.clone())
-        );
+        let error = execute_fork(&parent, &preview, dir.path()).unwrap_err();
+        assert!(error.contains("execution cursor"));
+        assert!(store::load_run(dir.path(), &preview.new_run_id).is_none());
     }
 
     #[test]

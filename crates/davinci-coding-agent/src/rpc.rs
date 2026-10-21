@@ -2688,6 +2688,7 @@ mod tests {
             updated_at: 0,
             lifecycle: Some(crate::native_extensions::graph::GraphLifecycle::Running),
             revision: 1,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         };
