@@ -1196,6 +1196,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::Compact => Some("/compact keep the store.rs decisions"),
         Screen::Export => Some("/share"),
         Screen::GraphRun => Some("/graph-view t6"),
+        Screen::GraphResume => Some("/graph-resume"),
         Screen::Vectors => Some("/memory-search <query>"),
         Screen::Governor => Some("/governor-status"),
         Screen::Securitas => Some("/sec-report --severity high"),
