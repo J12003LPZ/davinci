@@ -615,7 +615,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_reader_waits_for_data_on_an_accepted_nonblocking_socket() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut accepted, _) = listener.accept().unwrap();
+        // Windows inherits this state from the nonblocking listener above.
+        // Set it explicitly so the regression is exercised on every platform.
+        accepted.set_nonblocking(true).unwrap();
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = "POST /mcp HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            client.write_all(request.as_bytes()).unwrap();
+        });
+        let received = read_test_request(&mut accepted);
+        writer.join().unwrap();
+        assert_eq!(received, request);
+    }
+
     fn read_test_request(stream: &mut std::net::TcpStream) -> String {
+        // Windows can inherit nonblocking mode from the listening socket.
+        stream.set_nonblocking(false).unwrap();
         let mut bytes = Vec::new();
         let mut buf = [0u8; 1024];
         let mut header_end = None;
