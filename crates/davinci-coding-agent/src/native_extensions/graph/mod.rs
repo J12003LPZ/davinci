@@ -706,13 +706,18 @@ impl GraphController {
 
     fn resume(&self, wanted: &str) -> Result<Value, String> {
         let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
-        let run_id = if wanted.is_empty() {
+        let run_id = if wanted.is_empty() || wanted == "--latest" {
             let runs = list_runs(&self.cwd);
-            runs.iter()
-                .find(|run| run.phase != "done" && run.phase != "cancelled")
-                .or_else(|| runs.first())
+            let resumable = runs.iter().find(|run| run.phase != "done");
+            let choice = if wanted == "--latest" {
+                resumable
+            } else {
+                // Keep the noninteractive no-argument fallback compatible.
+                resumable.or_else(|| runs.first())
+            };
+            choice
                 .map(|run| run.run_id.clone())
-                .ok_or_else(|| "No graph runs in this project.".to_string())?
+                .ok_or_else(|| "No resumable graph runs in this project.".to_string())?
         } else {
             wanted.to_owned()
         };
