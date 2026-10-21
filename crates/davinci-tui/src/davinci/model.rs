@@ -260,7 +260,10 @@ pub enum Choice {
     /// A session of the resume screen (`4a`).
     ResumeSession(usize),
     /// A graph resume-picker action; the ID is captured at selection time.
-    GraphResume { action: &'static str, run_id: String },
+    GraphResume {
+        action: &'static str,
+        run_id: String,
+    },
     /// A node of the session tree (`4b`), as an index into `session_tree`.
     TreeEntry(usize),
     /// Enter on the trust sheet (`6a`): read first, then decide.
