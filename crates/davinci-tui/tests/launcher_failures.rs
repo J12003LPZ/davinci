@@ -4,10 +4,18 @@ use std::{fs, process::Command};
 
 fn probe(kind: &str) {
     let fixture = tempfile::tempdir().unwrap();
-    let executable = fixture
-        .path()
-        .join(if cfg!(windows) { "probe.exe" } else { "probe" });
-    fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    // On Unix a freshly copied executable can have a writable descriptor
+    // inherited by a concurrent spawn, causing exec to fail with ETXTBSY.
+    #[cfg(not(windows))]
+    let executable = std::env::current_exe().unwrap();
+    // Windows searches the executable's directory for child commands. Keep
+    // the probe beside the fake launchers so no system launcher is selected.
+    #[cfg(windows)]
+    let executable = {
+        let path = fixture.path().join("probe.exe");
+        fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        path
+    };
     let (browser, _) = davinci_tui::open_browser_argv("https://example.test");
     let clipboard = if cfg!(target_os = "macos") {
         "pbcopy"
