@@ -91,19 +91,23 @@ impl HttpTransport {
 
     fn post(&mut self, body: &Value, want: Option<&Value>) -> Result<Reply> {
         let response = self.send_post(body)?;
-        let content_type = response
-            .header("content-type")
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        };
+        let content_type = header("content-type")
             .unwrap_or("application/json")
             .to_string();
-        let session_id = response
-            .header(SESSION_HEADER)
+        let session_id = header(SESSION_HEADER)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
         let value = if content_type.contains("text/event-stream") {
-            self.read_sse_response(response.into_reader(), want)?
+            self.read_sse_response(response.into_body().into_reader(), want)?
         } else {
-            let text = read_response_body(response.into_reader(), MAX_BODY_BYTES)?;
+            let text = read_response_body(response.into_body().into_reader(), MAX_BODY_BYTES)?;
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
                 self.answer_batch_requests(&value)?;
             }
@@ -112,16 +116,24 @@ impl HttpTransport {
         Ok(Reply { session_id, value })
     }
 
-    fn send_post(&self, body: &Value) -> Result<ureq::Response> {
+    fn send_post(&self, body: &Value) -> Result<ureq::http::Response<ureq::Body>> {
         let mut request = self.agent.post(&self.url);
         for (key, value) in self.request_headers() {
-            request = request.set(&key, &value);
+            request = set_header(request, &key, &value);
         }
-        match request.send_json(body) {
-            Ok(response) => Ok(response),
-            Err(ureq::Error::Status(code, response)) => {
+        // ureq 3's `send_json` pretty-prints; ureq 2 sent compact JSON.
+        let bytes =
+            serde_json::to_vec(body).map_err(|err| Error::Transport(format!("mcp http: {err}")))?;
+        match request.send(&bytes) {
+            Ok(response) if response.status().as_u16() < 400 => Ok(response),
+            Ok(response) => {
+                let code = response.status().as_u16();
                 let mut text = String::new();
-                let _ = response.into_reader().take(4096).read_to_string(&mut text);
+                let _ = response
+                    .into_body()
+                    .into_reader()
+                    .take(4096)
+                    .read_to_string(&mut text);
                 let text = text.trim();
                 Err(Error::Transport(if text.is_empty() {
                     format!("mcp http {code}")
@@ -323,10 +335,12 @@ impl Drop for HttpTransport {
         let mut request = self
             .agent
             .delete(&self.url)
-            .timeout(Duration::from_secs(2))
-            .set(SESSION_HEADER, session);
+            .config()
+            .timeout_global(Some(Duration::from_secs(2)))
+            .build()
+            .header(SESSION_HEADER, session);
         for (key, value) in &self.headers {
-            request = request.set(key, value);
+            request = set_header(request, key, value);
         }
         let _ = request.call();
     }
@@ -372,8 +386,30 @@ fn validate_response(value: &Value, wanted: &Value) -> Result<()> {
     Ok(())
 }
 
+fn set_header<S>(
+    mut request: ureq::RequestBuilder<S>,
+    name: &str,
+    value: &str,
+) -> ureq::RequestBuilder<S> {
+    // ureq 2 replaced ordinary headers but appended X-* headers.
+    if !name.to_ascii_lowercase().starts_with("x-") {
+        if let Some(headers) = request.headers_mut() {
+            headers.remove(name);
+        }
+    }
+    request.header(name, value)
+}
+
 fn build_agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(timeout).build()
+    ureq::Agent::config_builder()
+        // A 4xx or 5xx answer carries the server's explanation; `send_post` reads it.
+        .http_status_as_error(false)
+        // ureq 2 never read the proxy environment.
+        .proxy(None)
+        .max_redirects(5)
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
 }
 
 /// `fixture:<path>` loads a method→result map from disk so tests never hit
@@ -488,6 +524,26 @@ fn sse_events(text: &str) -> impl Iterator<Item = String> + '_ {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn agent_keeps_the_redirect_budget_and_header_override_behavior() {
+        let agent = build_agent(Duration::from_secs(1));
+        assert_eq!(agent.config().max_redirects(), 5);
+        let request = agent
+            .post("http://localhost/")
+            .header("Authorization", "old")
+            .header("Accept", "text/plain")
+            .header("X-Custom", "first");
+        let request = set_header(request, "authorization", "new");
+        let request = set_header(request, "accept", "application/json");
+        let request = set_header(request, "x-custom", "second");
+        let headers = request.headers_ref().unwrap();
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(headers["authorization"], "new");
+        assert_eq!(headers.get_all("accept").iter().count(), 1);
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(headers.get_all("x-custom").iter().count(), 2);
+    }
 
     #[test]
     fn uncorrelated_sse_keeps_the_last_notification() {

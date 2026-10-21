@@ -429,13 +429,11 @@ fn marketplace_skill_listings(agent_dir: &Path) -> Vec<Listing> {
 }
 
 fn http_get_json(url: &str) -> Result<Value, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(10))
-        .build();
+    let agent = crate::http_client::agent_with_timeout(Duration::from_secs(10));
     let response = agent
         .get(url)
-        .set("accept", "application/json")
-        .set("user-agent", concat!("davinci/", env!("CARGO_PKG_VERSION")))
+        .header("accept", "application/json")
+        .header("user-agent", concat!("davinci/", env!("CARGO_PKG_VERSION")))
         .call()
         .map_err(|err| format!("{url}: {err}"))?;
     // A directory answer is a page of listings; anything far larger is
@@ -443,6 +441,7 @@ fn http_get_json(url: &str) -> Result<Value, String> {
     use std::io::Read;
     let mut body = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut body)

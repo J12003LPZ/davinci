@@ -156,15 +156,13 @@ pub fn model_matches(configured: &str, installed: &str) -> bool {
 /// configured model. Read-only: no pull, no start, no write. Each request is
 /// bounded by `target.timeout`.
 pub fn probe_ollama(target: &ProbeTarget) -> OllamaProbe {
-    let agent = ureq::AgentBuilder::new().timeout(target.timeout).build();
+    let agent = crate::http_client::agent_with_timeout(target.timeout);
     let tags = agent
         .get(&format!("{}/api/tags", target.url))
         .call()
         .map_err(|error| error.to_string())
-        .and_then(|response| {
-            response
-                .into_json::<Value>()
-                .map_err(|error| error.to_string())
+        .and_then(|mut response| {
+            crate::http_client::read_json::<Value>(&mut response).map_err(|error| error.to_string())
         });
     let tags = match tags {
         Ok(tags) => tags,
@@ -203,15 +201,14 @@ pub fn probe_ollama(target: &ProbeTarget) -> OllamaProbe {
 
 fn probe_embedding(agent: &ureq::Agent, target: &ProbeTarget) -> EmbedOutcome {
     let started = Instant::now();
-    let response = agent
-        .post(&format!("{}/api/embed", target.url))
-        .send_json(json!({"model": target.model, "input": ["DaVinci setup probe"]}))
-        .map_err(|error| error.to_string())
-        .and_then(|response| {
-            response
-                .into_json::<Value>()
-                .map_err(|error| error.to_string())
-        });
+    let response = crate::http_client::send_json(
+        agent.post(&format!("{}/api/embed", target.url)),
+        &json!({"model": target.model, "input": ["DaVinci setup probe"]}),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|mut response| {
+        crate::http_client::read_json::<Value>(&mut response).map_err(|error| error.to_string())
+    });
     let value = match response {
         Ok(value) => value,
         Err(error) => return EmbedOutcome::Failed(error),

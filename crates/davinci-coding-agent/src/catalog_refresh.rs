@@ -255,15 +255,13 @@ fn refresh_provider(
     let base = std::env::var("PI_CATALOG_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_CATALOG_BASE_URL.to_string());
     let url = catalog_url(&base, provider);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(4000))
-        .build();
-    let response = agent
+    let agent = davinci_coding_agent::http_client::agent_with_timeout(Duration::from_millis(4000));
+    let mut response = agent
         .get(&url)
-        .set("accept", "application/json")
+        .header("accept", "application/json")
         .call()
         .map_err(|err| format!("Model catalog request failed for {provider}: {err}"))?;
-    let status = response.status();
+    let status = response.status().as_u16();
     let checked_at = davinci_ai::now_ms();
     if status == 304 {
         if let Some(mut entry) = stored {
@@ -295,8 +293,7 @@ fn refresh_provider(
             "Model catalog request failed for {provider}: {status}"
         ));
     }
-    let payload: serde_json::Value = response
-        .into_json()
+    let payload: serde_json::Value = davinci_coding_agent::http_client::read_json(&mut response)
         .map_err(|err| format!("Invalid model catalog for provider \"{provider}\": {err}"))?;
     let models = parse_remote_catalog(provider, &payload)?;
     store.providers.insert(

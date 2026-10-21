@@ -1482,19 +1482,18 @@ fn embed_with_config(
         return Ok(Vec::new());
     }
     let base_url = config.ollama_url.trim_end_matches('/');
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(config.embed_timeout_seconds))
-        .build();
+    let agent =
+        crate::http_client::agent_with_timeout(Duration::from_secs(config.embed_timeout_seconds));
 
     // Ollama's current endpoint accepts a batch under `input` and returns
     // `embeddings`.  Try it first, while retaining the older endpoint for
     // installations that have not yet adopted `/api/embed`.
     let modern_payload = embedding_request_payload(&config.embedding_model, texts, prefix);
-    let modern_error = match agent
-        .post(&format!("{base_url}/api/embed"))
-        .send_json(modern_payload)
-    {
-        Ok(response) => match response.into_json::<Value>() {
+    let modern_error = match crate::http_client::send_json(
+        agent.post(&format!("{base_url}/api/embed")),
+        &modern_payload,
+    ) {
+        Ok(mut response) => match crate::http_client::read_json::<Value>(&mut response) {
             Ok(value) => {
                 match parse_embedding_responses(&value, config.embedding_dimensions, texts.len()) {
                     Ok(embeddings) => return Ok(embeddings),
@@ -1511,7 +1510,7 @@ fn embed_with_config(
         // Only a server that does not know `/api/embed` gets the older
         // per-text endpoint. A host that is down or slow would fail that
         // one too, once per text, each with the full timeout.
-        Err(ureq::Error::Status(404, _)) => {
+        Err(ureq::Error::StatusCode(404)) => {
             ToolError::Failed("/api/embed is not served (404)".into())
         }
         Err(error) => return Err(ToolError::Failed(error.to_string())),
@@ -1520,15 +1519,15 @@ fn embed_with_config(
     let mut embeddings = Vec::with_capacity(texts.len());
     for text in texts {
         let prefixed = format!("{prefix}{text}");
-        let legacy_response = agent
-            .post(&format!("{base_url}/api/embeddings"))
-            .send_json(json!({
+        let mut legacy_response = crate::http_client::send_json(
+            agent.post(&format!("{base_url}/api/embeddings")),
+            &json!({
                 "model": config.embedding_model,
                 "prompt": prefixed
-            }))
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        let legacy_value: Value = legacy_response
-            .into_json()
+            }),
+        )
+        .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let legacy_value: Value = crate::http_client::read_json(&mut legacy_response)
             .map_err(|error| ToolError::Failed(error.to_string()))?;
         let embedding = parse_embedding_response(&legacy_value, config.embedding_dimensions)
             .map_err(|error| {

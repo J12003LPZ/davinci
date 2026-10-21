@@ -259,7 +259,7 @@ pub fn probe_service(url: &str, allow_remote: bool, timeout: Duration) -> Servic
             reason: "the URL is not on this machine and remote Qdrant is not allowed".into(),
         };
     }
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http_client::agent_with_timeout(timeout);
     match agent
         .get(&format!("{}/readyz", url.trim_end_matches('/')))
         .call()

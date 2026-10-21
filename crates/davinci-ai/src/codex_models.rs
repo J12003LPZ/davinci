@@ -358,15 +358,17 @@ pub fn refresh_codex_models(
     let url = base;
     let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .set("accept", "application/json")
-        .set("authorization", &format!("Bearer {token}"));
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .header("accept", "application/json")
+        .header("authorization", &format!("Bearer {token}"));
     if let Some(etag) = saved.as_ref().and_then(|saved| saved.etag.as_deref()) {
-        request = request.set("if-none-match", etag);
+        request = request.header("if-none-match", etag);
     }
-    let response = match request.call() {
+    let mut response = match request.call() {
         Ok(response) => response,
-        Err(ureq::Error::Status(status, _)) => {
+        Err(ureq::Error::StatusCode(status)) => {
             return Err(format!("Codex model list request failed: HTTP {status}"))
         }
         Err(err) => return Err(format!("Codex model list request failed: {err}")),
@@ -378,9 +380,12 @@ pub fn refresh_codex_models(
         }
         return Ok(CodexModelsRefresh::Unchanged);
     }
-    let etag = response.header("etag").map(str::to_string);
-    let value: Value = response
-        .into_json()
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let value: Value = crate::http::read_json(&mut response)
         .map_err(|err| format!("Invalid Codex model list: {err}"))?;
     save(&path, parse_codex_models(&value), etag)
 }

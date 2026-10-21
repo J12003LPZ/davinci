@@ -532,7 +532,7 @@ fn probe_ollama_up(target: &ProbeTarget) -> bool {
 fn probe_tags_only(target: &ProbeTarget) -> bool {
     // `probe_ollama` also embeds when the model is installed; for "is the
     // service up" only the model list matters, so ask just for that.
-    let agent = ureq::AgentBuilder::new().timeout(target.timeout).build();
+    let agent = crate::http_client::agent_with_timeout(target.timeout);
     agent
         .get(&format!("{}/api/tags", target.url))
         .call()

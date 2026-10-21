@@ -272,32 +272,29 @@ fn check_retry_abort(
     }
 }
 
+/// Classifies a failed send. A connection that never opened is retryable
+/// (`Connect`); anything after the request left is `Response`. ureq 3 reports a
+/// 4xx or 5xx as `Error::StatusCode` without a body, so callers that need the
+/// body or the retry headers read the response themselves (see
+/// `provider_error_from_status`).
 pub fn provider_error_from_ureq(err: ureq::Error) -> ProviderError {
     match err {
-        ureq::Error::Status(status, response) => {
-            let mut headers = HashMap::new();
-            for name in ["retry-after", "retry-after-ms", "x-should-retry"] {
-                if let Some(value) = response.header(name) {
-                    headers.insert(name.to_string(), value.to_string());
+        ureq::Error::StatusCode(status) => ProviderError::new(
+            None,
+            format!(
+                "Provider HTTP {status} lost its response headers; configure \
+                 http_status_as_error(false) and use provider_error_from_status \
+                 before deciding whether to retry"
+            ),
+        ),
+        transport => {
+            let phase = match &transport {
+                ureq::Error::HostNotFound
+                | ureq::Error::ConnectionFailed
+                | ureq::Error::ConnectProxyFailed(_) => RequestPhase::Connect,
+                ureq::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    RequestPhase::Connect
                 }
-            }
-            let message = response
-                .into_string()
-                .ok()
-                .filter(|body| !body.is_empty())
-                .unwrap_or_else(|| format!("Provider error: {status}"));
-            ProviderError {
-                status: Some(status),
-                headers,
-                message: format!("Provider request failed: {message}"),
-                phase: RequestPhase::Response,
-            }
-        }
-        ureq::Error::Transport(transport) => {
-            let phase = match transport.kind() {
-                ureq::ErrorKind::Dns
-                | ureq::ErrorKind::ConnectionFailed
-                | ureq::ErrorKind::ProxyConnect => RequestPhase::Connect,
                 _ => RequestPhase::Response,
             };
             ProviderError {
@@ -310,9 +307,41 @@ pub fn provider_error_from_ureq(err: ureq::Error) -> ProviderError {
     }
 }
 
+/// The provider error for an HTTP failure whose response was read: status, the
+/// retry headers, and the body as the message (or `Provider error: <status>`).
+pub(crate) fn provider_error_from_status(
+    status: u16,
+    header: impl Fn(&str) -> Option<String>,
+    body: Option<String>,
+) -> ProviderError {
+    let mut headers = HashMap::new();
+    for name in ["retry-after", "retry-after-ms", "x-should-retry"] {
+        if let Some(value) = header(name) {
+            headers.insert(name.to_string(), value);
+        }
+    }
+    let message = body
+        .filter(|body| !body.is_empty())
+        .unwrap_or_else(|| format!("Provider error: {status}"));
+    ProviderError {
+        status: Some(status),
+        headers,
+        message: format!("Provider request failed: {message}"),
+        phase: RequestPhase::Response,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headerless_status_errors_fail_closed_instead_of_guessing_a_retry() {
+        let error = provider_error_from_ureq(ureq::Error::StatusCode(429));
+        assert!(!is_retryable_provider_error(&error));
+        assert!(error.message.contains("http_status_as_error(false)"));
+        assert!(error.message.contains("provider_error_from_status"));
+    }
 
     #[test]
     fn cancel_during_provider_backoff_sends_no_request() {

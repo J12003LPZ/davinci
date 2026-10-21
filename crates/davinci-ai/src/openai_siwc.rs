@@ -288,14 +288,15 @@ fn fetch_jwks() -> Result<Value, String> {
                 .map_err(|_| "invalid fixture OpenAI JWKS".to_string());
         }
     }
-    let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+    let mut response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .get(OPENAI_SIWC_JWKS_URL)
-        .set("accept", "application/json")
-        .timeout(std::time::Duration::from_secs(10))
+        .header("accept", "application/json")
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
         .call()
         .map_err(|err| format!("OpenAI JWKS request failed: {err}"))?;
-    response
-        .into_json()
+    crate::http::read_json(&mut response)
         .map_err(|err| format!("OpenAI JWKS response was invalid: {err}"))
 }
 
@@ -336,17 +337,22 @@ fn post_token_form(pairs: &[(&str, &str)]) -> Result<Value, String> {
     let body = form.finish();
     let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .post(OPENAI_SIWC_TOKEN_URL)
-        .set("accept", "application/json")
-        .set("content-type", "application/x-www-form-urlencoded")
-        .send_string(&body);
+        .config()
+        // The error body carries the OAuth error code.
+        .http_status_as_error(false)
+        .build()
+        .header("accept", "application/json")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .send(&body);
     match response {
-        Ok(response) => response
-            .into_json()
-            .map_err(|_| "OpenAI OAuth token response was invalid JSON".to_string()),
-        Err(ureq::Error::Status(status, response)) => {
-            let value: Value = response
-                .into_json()
-                .unwrap_or_else(|_| serde_json::json!({}));
+        Ok(mut response) if response.status().as_u16() < 400 => {
+            crate::http::read_json(&mut response)
+                .map_err(|_| "OpenAI OAuth token response was invalid JSON".to_string())
+        }
+        Ok(mut response) => {
+            let status = response.status().as_u16();
+            let value: Value =
+                crate::http::read_json(&mut response).unwrap_or_else(|_| serde_json::json!({}));
             Err(safe_oauth_error(&value, status))
         }
         Err(err) => Err(format!("OpenAI OAuth token request failed: {err}")),

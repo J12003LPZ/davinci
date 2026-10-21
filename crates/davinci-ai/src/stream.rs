@@ -1421,9 +1421,14 @@ pub fn raw_provider_post(
         return Err("root budget denied: unaccounted raw provider probes are unavailable".into());
     }
     let headers = collect_request_headers(model, auth, &StreamOptions::default());
-    let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(url);
+    let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT)
+        .post(url)
+        .config()
+        // The reply is the point of a raw probe, including a 4xx or 5xx body.
+        .http_status_as_error(false)
+        .build();
     for (key, value) in &headers {
-        request = request.set(key, value);
+        request = crate::http::set_header(request, key, value);
     }
 
     let result = if model.api == "openai-codex-responses"
@@ -1431,29 +1436,29 @@ pub fn raw_provider_post(
     {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
-            request = request.set("content-encoding", "zstd");
+            request = crate::http::set_header(request, "content-encoding", "zstd");
         }
-        request.send_bytes(&bytes)
+        request.send(&bytes)
     } else {
-        request.send_string(&body.to_string())
+        request.send(&body.to_string())
     };
 
-    let response = match result {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(error) => return Err(error.to_string()),
-    };
-    let status = response.status();
+    let mut response = result.map_err(|error| error.to_string())?;
+    let status = response.status().as_u16();
     let headers = response
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| {
-            response
-                .header(&name)
-                .map(|value| (name.clone(), value.to_string()))
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_string(), value.to_string()))
         })
         .collect();
-    let body = response.into_string().map_err(|error| error.to_string())?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| error.to_string())?;
     Ok(RawProviderReply {
         status,
         headers,
@@ -1592,28 +1597,53 @@ fn send_provider_request(
     body: &Value,
     timeout_ms: Option<u64>,
     compress_zstd: bool,
-) -> Result<ureq::Response, crate::provider_retry::ProviderError> {
+) -> Result<ureq::http::Response<ureq::Body>, crate::provider_retry::ProviderError> {
     let idle = timeout_ms
         .filter(|timeout_ms| *timeout_ms > 0)
         .map(std::time::Duration::from_millis)
         .unwrap_or(crate::http::PROVIDER_IDLE_TIMEOUT);
-    let mut request = crate::http::agent(idle).post(url);
+    let mut request = crate::http::agent(idle)
+        .post(url)
+        .config()
+        // The retry loop needs the status, the retry headers and the body.
+        .http_status_as_error(false)
+        .build();
     for (key, value) in headers {
-        request = request.set(key, value);
+        request = crate::http::set_header(request, key, value);
     }
-    if compress_zstd {
+    let response = if compress_zstd {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
-            request = request.set("content-encoding", "zstd");
+            request = crate::http::set_header(request, "content-encoding", "zstd");
         }
-        request
-            .send_bytes(&bytes)
-            .map_err(crate::provider_retry::provider_error_from_ureq)
+        request.send(&bytes)
     } else {
-        request
-            .send_string(&body.to_string())
-            .map_err(crate::provider_retry::provider_error_from_ureq)
+        request.send(&body.to_string())
     }
+    .map_err(crate::provider_retry::provider_error_from_ureq)?;
+    let status = response.status().as_u16();
+    if status < 400 {
+        return Ok(response);
+    }
+    let retry_headers: Vec<(String, String)> = ["retry-after", "retry-after-ms", "x-should-retry"]
+        .into_iter()
+        .filter_map(|name| {
+            let value = response.headers().get(name)?.to_str().ok()?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+    let mut response = response;
+    let text = response.body_mut().read_to_string().ok();
+    Err(crate::provider_retry::provider_error_from_status(
+        status,
+        |name| {
+            retry_headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        },
+        text,
+    ))
 }
 
 fn send_provider_body(
@@ -1623,8 +1653,8 @@ fn send_provider_body(
     timeout_ms: Option<u64>,
     compress_zstd: bool,
 ) -> Result<String, crate::provider_retry::ProviderError> {
-    let response = send_provider_request(url, headers, body, timeout_ms, compress_zstd)?;
-    response.into_string().map_err(|err| {
+    let mut response = send_provider_request(url, headers, body, timeout_ms, compress_zstd)?;
+    response.body_mut().read_to_string().map_err(|err| {
         crate::provider_retry::ProviderError::new(
             None,
             format!("Unable to read provider response: {err}"),
@@ -2302,39 +2332,42 @@ pub fn live_stream(
     let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(&url);
     for (key, value) in &auth.headers {
         if !crate::auth::is_url_var_header(key) {
-            request = request.set(key, value);
+            request = crate::http::set_header(request, key, value);
         }
     }
     for (key, value) in &model.headers {
-        request = request.set(key, value);
+        request = crate::http::set_header(request, key, value);
     }
     if let Some(key) = &auth.api_key {
         if model.api == "google-generative-ai" {
-            request = request.set("x-goog-api-key", key);
+            request = request.header("x-goog-api-key", key);
         } else if model.api == "anthropic-messages" {
-            request = request
-                .set("x-api-key", key)
-                .set("anthropic-version", "2023-06-01");
+            request = crate::http::set_header(
+                request.header("x-api-key", key),
+                "anthropic-version",
+                "2023-06-01",
+            );
         } else {
-            request = request.set("Authorization", &format!("Bearer {key}"));
+            request = crate::http::set_header(request, "Authorization", &format!("Bearer {key}"));
         }
     }
-    request = request.set("content-type", "application/json");
+    request = crate::http::set_header(request, "content-type", "application/json");
     let response = if model.api == "openai-codex-responses" {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
-            request = request.set("content-encoding", "zstd");
+            request = crate::http::set_header(request, "content-encoding", "zstd");
         }
         request
-            .send_bytes(&bytes)
+            .send(&bytes)
             .map_err(|err| format!("Provider request failed: {err}"))?
     } else {
         request
-            .send_string(&body.to_string())
+            .send(&body.to_string())
             .map_err(|err| format!("Provider request failed: {err}"))?
     };
     let text = response
-        .into_string()
+        .into_body()
+        .read_to_string()
         .map_err(|err| format!("Unable to read provider response: {err}"))?;
     if text.contains("data:") {
         Ok(replay_sse_events(model, &text))

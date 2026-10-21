@@ -413,13 +413,13 @@ fn fetch_radius_config() -> Option<String> {
     let url = format!("{gateway}/v1/config");
     let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .get(&url)
-        .set("accept", "application/json");
+        .header("accept", "application/json");
     if let Ok(key) = std::env::var("RADIUS_API_KEY") {
-        request = request.set("Authorization", &format!("Bearer {key}"));
+        request = request.header("Authorization", &format!("Bearer {key}"));
     } else if let Ok(key) = std::env::var("PI_RADIUS_TOKEN") {
-        request = request.set("Authorization", &format!("Bearer {key}"));
+        request = request.header("Authorization", &format!("Bearer {key}"));
     }
-    request.call().ok()?.into_string().ok()
+    request.call().ok()?.body_mut().read_to_string().ok()
 }
 
 pub fn radius_models_from_config(config: &serde_json::Value) -> Vec<Model> {

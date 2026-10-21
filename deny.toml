@@ -6,14 +6,7 @@
 version = 2
 yanked = "deny"
 # Every ignored advisory needs a reason and a removal condition.
-ignore = [
-    # webpki-roots 0.26.11 is only a shim over webpki-roots 1.0.10 (the fixed
-    # version), so the bundled roots are the fixed ones; the advisory matches
-    # on the 0.26 version range only.
-    # Remove when ureq 2.x is replaced by ureq 3.x and webpki-roots 0.26
-    # leaves Cargo.lock.
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a shim over the fixed webpki-roots 1.0.10; remove when ureq 3.x replaces ureq 2.x and webpki-roots 0.26 leaves Cargo.lock" },
-]
+ignore = []
 
 [sources]
 unknown-registry = "deny"
