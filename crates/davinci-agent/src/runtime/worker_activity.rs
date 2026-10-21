@@ -320,7 +320,10 @@ mod tests {
         assert!(store.after(agent, 0, 10).gap);
         for cursor in [u64::MAX - 1, u64::MAX] {
             let page = store.after(agent, cursor, 10);
-            assert!(!page.gap, "a future cursor cannot be behind the retained history");
+            assert!(
+                !page.gap,
+                "a future cursor cannot be behind the retained history"
+            );
             assert!(page.events.is_empty());
             assert_eq!(page.dropped, 1);
         }
