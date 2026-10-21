@@ -506,17 +506,15 @@ mod cache_tests {
         moved.worktree = None;
         assert_eq!(cache.get(&moved), WorkerWorkspace::default());
         moved.worktree = Some(PathBuf::from("/worktree/new"));
-        assert!(
-            cache
-                .get_with(
-                    &moved,
-                    quick_read,
-                    Duration::from_secs(60),
-                    Duration::from_secs(2),
-                )
-                .branch
-                .is_none()
-        );
+        assert!(cache
+            .get_with(
+                &moved,
+                quick_read,
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+            )
+            .branch
+            .is_none());
     }
 
     #[test]
