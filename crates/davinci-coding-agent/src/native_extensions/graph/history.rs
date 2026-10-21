@@ -55,6 +55,45 @@ pub fn load_revision(cwd: &Path, run_id: &str, revision: u64) -> Option<super::t
     (run.run_id == run_id && run.revision == revision).then_some(run)
 }
 
+pub fn load_checkpoint(cwd: &Path, run_id: &str, sequence: u64) -> Option<super::types::GraphRun> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let path = history_dir(cwd, run_id).join(format!("checkpoint-{sequence}.state.json"));
+    let run: super::types::GraphRun = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (run.run_id == run_id && run.checkpoint_sequence == sequence).then_some(run)
+}
+
+pub(super) fn checkpoint_runs(
+    cwd: &Path,
+    run_id: &str,
+) -> Result<Vec<super::types::GraphRun>, String> {
+    let entries = match fs::read_dir(history_dir(cwd, run_id)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut runs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("checkpoint-") || name.starts_with("revision-"))
+            && name.ends_with(".state.json")
+        {
+            let run: super::types::GraphRun =
+                serde_json::from_slice(&fs::read(entry.path()).map_err(|error| error.to_string())?)
+                    .map_err(|error| format!("Unreadable historical checkpoint: {error}"))?;
+            if run.run_id != run_id || run.version != 1 {
+                return Err("Unknown historical checkpoint identity/version".into());
+            }
+            runs.push(run);
+        }
+    }
+    runs.sort_by_key(|run| run.checkpoint_sequence);
+    Ok(runs)
+}
+
 pub fn list_history_entries(cwd: &Path, run_id: &str) -> Vec<GraphHistoryEntry> {
     if !is_safe_run_id(run_id) {
         return Vec::new();
@@ -172,6 +211,7 @@ mod tests {
             updated_at: 0,
             lifecycle: None,
             revision: 0,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         }

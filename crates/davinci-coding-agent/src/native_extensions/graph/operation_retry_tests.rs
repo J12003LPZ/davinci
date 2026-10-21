@@ -64,6 +64,7 @@ fn sample_run() -> GraphRun {
         updated_at: 0,
         lifecycle: Some(GraphLifecycle::Running),
         revision: 0,
+        checkpoint_sequence: 0,
         control_history: Vec::new(),
         continuation: None,
     }

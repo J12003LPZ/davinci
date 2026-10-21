@@ -909,10 +909,21 @@ pub fn validate_config_shape(value: &Value) -> Vec<String> {
                         }
                     }
                     Some(value) => {
-                        if super::config::parse_u64_budget(value, key).is_err() {
-                            errors.push(format!(
-                                "budgets.{key} must be a non-negative whole integer"
-                            ));
+                        let result = if matches!(
+                            *key,
+                            "maxResearchers"
+                                | "maxParallelWorkers"
+                                | "maxWorkers"
+                                | "maxRevisionCycles"
+                                | "maxReplans"
+                        ) {
+                            super::config::parse_u32_budget(value, &format!("budgets.{key}"))
+                                .map(u64::from)
+                        } else {
+                            super::config::parse_u64_budget(value, &format!("budgets.{key}"))
+                        };
+                        if let Err(reason) = result {
+                            errors.push(reason);
                         }
                     }
                 }

@@ -1108,6 +1108,7 @@ mod tests {
             definition: None,
             lifecycle: None,
             revision: 0,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         }

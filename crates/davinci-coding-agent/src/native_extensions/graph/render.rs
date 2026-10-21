@@ -707,6 +707,7 @@ mod tests {
             updated_at: 120_000,
             lifecycle: None,
             revision: 0,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         }

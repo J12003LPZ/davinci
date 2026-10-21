@@ -247,7 +247,9 @@ fn collect_unreferenced_blobs(cwd: &Path) {
                             let state = state?;
                             let name = state.file_name();
                             let name = name.to_string_lossy();
-                            if name.starts_with("revision-") && name.ends_with(".state.json") {
+                            if (name.starts_with("revision-") || name.starts_with("checkpoint-"))
+                                && name.ends_with(".state.json")
+                            {
                                 states.push(state.path());
                             }
                         }
@@ -504,9 +506,21 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     // all companion writes succeed, and retain the previous timestamp on error.
     let mut snapshot = run.clone();
     snapshot.updated_at = now_ms();
+    let previous_sequence = previous_bytes
+        .as_ref()
+        .and_then(|bytes| serde_json::from_slice::<GraphRun>(bytes).ok())
+        .map_or(0, |previous| previous.checkpoint_sequence);
+    snapshot.checkpoint_sequence = previous_sequence
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("checkpoint sequence exhausted"))?;
     let content = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if let Some(previous_bytes) = previous_bytes {
+        let checkpoint_path = super::history::history_dir(&cwd, &run.run_id)
+            .join(format!("checkpoint-{previous_sequence}.state.json"));
+        if !checkpoint_path.exists() {
+            atomic_write(&checkpoint_path, &previous_bytes)?;
+        }
         if let Ok(previous) = serde_json::from_slice::<GraphRun>(&previous_bytes) {
             if previous.run_id == snapshot.run_id && previous.revision < snapshot.revision {
                 let history_path = super::history::history_dir(&cwd, &run.run_id)
@@ -519,6 +533,7 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     }
     atomic_write(&state_path, &content)?;
     run.updated_at = snapshot.updated_at;
+    run.checkpoint_sequence = snapshot.checkpoint_sequence;
     Ok(())
 }
 
@@ -875,6 +890,39 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn graph_followup_same_control_revision_retains_execution_history() {
+        let dir = tempdir().unwrap();
+        let mut run = sample_run(dir.path(), "checkpoint-sequence", "goal");
+        fs::write(dir.path().join("source.txt"), b"historical source").unwrap();
+        let baseline = super::super::mutation::capture_baseline(dir.path()).unwrap();
+        let hash = baseline.files["source.txt"].hash.clone();
+        run.continuation = Some(super::super::continuation::GraphContinuation {
+            saved_baseline: Some(baseline),
+            ..Default::default()
+        });
+        save_run(&mut run).unwrap();
+        run.phase = Phase::Investigate;
+        run.continuation = None;
+        save_run(&mut run).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(
+            &fs::read(run_dir(dir.path(), &run.run_id).join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["checkpointSequence"], 2);
+        let prior: GraphRun = serde_json::from_slice(
+            &fs::read(
+                history::history_dir(dir.path(), &run.run_id).join("checkpoint-1.state.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prior.phase, Phase::Classify);
+        assert_eq!(prior.revision, run.revision);
+        collect_unreferenced_blobs(dir.path());
+        assert!(super::super::blobs::get(&super::super::blobs::dir(dir.path()), &hash).is_some());
+    }
+
+    #[test]
     fn graph_integrity_attempt_logs_preserve_prior_diagnostics() {
         let dir = tempdir().unwrap();
         write_log(dir.path(), "logs", "worker", 1, "first failure");
@@ -1048,6 +1096,7 @@ mod tests {
             updated_at: 0,
             lifecycle: None,
             revision: 0,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         }

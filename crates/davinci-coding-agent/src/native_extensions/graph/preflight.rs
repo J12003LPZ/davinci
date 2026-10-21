@@ -346,6 +346,7 @@ mod tests {
             updated_at: 0,
             lifecycle: None,
             revision: 1,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         }
