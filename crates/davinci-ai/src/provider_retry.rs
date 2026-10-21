@@ -596,9 +596,7 @@ mod tests {
             retry_delay_from_headers(&error, 0, Some(60_000), i64::MAX).unwrap(),
             0
         );
-        assert!(
-            retry_delay_from_headers(&error, 0, Some(60_000), i64::MIN).is_err()
-        );
+        assert!(retry_delay_from_headers(&error, 0, Some(60_000), i64::MIN).is_err());
     }
 
     #[test]
