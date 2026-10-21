@@ -238,13 +238,13 @@ fn worker_output_respects_existing_redaction() {
     r.observe(&start(
         "c1",
         "bash",
-        json!({"command": "curl -H 'Authorization: Bearer abc123def456ghi' https://x.test"}),
+        json!({"command": "curl -H 'Authorization: Bearer abc123def456ghi' https://x.test"}), // ggignore
     ));
     let page = registry.activity().after(id, 0, 10);
     assert!(
         page.events
             .iter()
-            .all(|e| !e.summary.contains("abc123def456ghi")),
+            .all(|e| !e.summary.contains("abc123def456ghi")), // ggignore
         "{page:?}"
     );
 }
@@ -283,44 +283,44 @@ fn another_runs_workers_are_not_in_this_runs_store() {
 #[test]
 fn credentials_in_any_common_shape_never_reach_a_summary() {
     use davinci_agent::runtime::worker_activity::safe_summary;
-    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.c2lnbmF0dXJlMTIz";
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.c2lnbmF0dXJlMTIz"; // ggignore
     let cases = [
-        ("export API_KEY=abc123secretvalue", "abc123secretvalue"),
+        ("export API_KEY=abc123secretvalue", "abc123secretvalue"), // ggignore
         (
-            "curl --token abc123secretvalue https://x",
-            "abc123secretvalue",
+            "curl --token abc123secretvalue https://x", // ggignore
+            "abc123secretvalue",                        // ggignore
         ),
-        ("curl --password=abc123secretvalue", "abc123secretvalue"),
+        ("curl --password=abc123secretvalue", "abc123secretvalue"), // ggignore
         (
-            r#"{"access_token": "abc123secretvalue", "n": 1}"#,
-            "abc123secretvalue",
-        ),
-        (
-            r#"{"clientSecret":"abc123secretvalue"}"#,
-            "abc123secretvalue",
+            r#"{"access_token": "abc123secretvalue", "n": 1}"#, // ggignore
+            "abc123secretvalue",                                // ggignore
         ),
         (
-            "Authorization: Basic abc123secretvalue",
-            "abc123secretvalue",
-        ),
-        ("authorization:Bearerabc123secretvalue", "abc123secretvalue"),
-        ("Bearerabc123secretvalue", "abc123secretvalue"),
-        (
-            "Cookie: sid=abc123secretvalue; theme=dark",
-            "abc123secretvalue",
+            r#"{"clientSecret":"abc123secretvalue"}"#, // ggignore
+            "abc123secretvalue",                       // ggignore
         ),
         (
-            "Set-Cookie: sid=abc123secretvalue; HttpOnly",
-            "abc123secretvalue",
+            "Authorization: Basic abc123secretvalue", // ggignore
+            "abc123secretvalue",                      // ggignore
         ),
-        ("token gho_abc123secretvalue", "abc123secretvalue"),
+        ("authorization:Bearerabc123secretvalue", "abc123secretvalue"), // ggignore
+        ("Bearerabc123secretvalue", "abc123secretvalue"),               // ggignore
         (
-            "ghs_abc123secretvalue and ghu_abc123secretvalue",
-            "abc123secretvalue",
+            "Cookie: sid=abc123secretvalue; theme=dark", // ggignore
+            "abc123secretvalue",                         // ggignore
+        ),
+        (
+            "Set-Cookie: sid=abc123secretvalue; HttpOnly", // ggignore
+            "abc123secretvalue",                           // ggignore
+        ),
+        ("token gho_abc123secretvalue", "abc123secretvalue"), // ggignore
+        (
+            "ghs_abc123secretvalue and ghu_abc123secretvalue", // ggignore
+            "abc123secretvalue",                               // ggignore
         ),
         (&format!("echo {jwt}"), "c2lnbmF0dXJl"),
-        ("sk-proj1234567890abcdef", "sk-proj1234567890abcdef"),
-        ("DB_PASSWORD='abc123secretvalue' ./run", "abc123secretvalue"),
+        ("sk-proj1234567890abcdef", "sk-proj1234567890abcdef"), // ggignore
+        ("DB_PASSWORD='abc123secretvalue' ./run", "abc123secretvalue"), // ggignore
     ];
     for (input, secret) in cases {
         let out = safe_summary(input);
