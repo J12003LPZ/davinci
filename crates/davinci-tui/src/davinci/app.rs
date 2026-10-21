@@ -5824,3 +5824,57 @@ mod scroll_to_entry_tests {
         assert!(rows(&m).iter().any(|row| row.contains("streamed 5")));
     }
 }
+
+#[cfg(test)]
+mod graph_resume_picker_tests {
+    use super::*;
+    use crate::davinci::model::GraphResumeRow;
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn graph_resume_is_explicit_and_does_not_auto_launch_on_enter() {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 30, false);
+        model.screen = Screen::GraphResume;
+        model.graph_resume_runs = vec![
+            GraphResumeRow {
+                run_id: "can-resume".into(),
+                goal: "Fix the login".into(),
+                phase: "blocked".into(),
+                ..Default::default()
+            },
+            GraphResumeRow {
+                run_id: "finished".into(),
+                goal: "Write tests".into(),
+                phase: "done".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(handle_key(&mut model, key(KeyCode::Enter)), Flow::Continue);
+        assert!(model.graph_resume_details);
+        assert_eq!(
+            handle_key(&mut model, key(KeyCode::Char('r'))),
+            Flow::Choose(Choice::GraphResume {
+                action: "resume",
+                run_id: "can-resume".into()
+            })
+        );
+
+        assert_eq!(handle_key(&mut model, key(KeyCode::Char('a'))), Flow::Continue);
+        assert_eq!(handle_key(&mut model, key(KeyCode::Down)), Flow::Continue);
+        assert_eq!(handle_key(&mut model, key(KeyCode::Char('r'))), Flow::Continue);
+        assert!(model.section_notice.as_deref().unwrap().contains("Completed"));
+
+        assert_eq!(handle_key(&mut model, key(KeyCode::Char('/'))), Flow::Continue);
+        for ch in "login".chars() {
+            assert_eq!(handle_key(&mut model, key(KeyCode::Char(ch))), Flow::Continue);
+        }
+        assert_eq!(handle_key(&mut model, key(KeyCode::Enter)), Flow::Continue);
+        assert_eq!(graph_resume::selected(&model).unwrap().run_id, "can-resume");
+        assert_eq!(handle_key(&mut model, key(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(model.screen, Screen::Agent);
+    }
+}
