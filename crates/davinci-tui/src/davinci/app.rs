@@ -5863,14 +5863,30 @@ mod graph_resume_picker_tests {
             })
         );
 
-        assert_eq!(handle_key(&mut model, key(KeyCode::Char('a'))), Flow::Continue);
+        assert_eq!(
+            handle_key(&mut model, key(KeyCode::Char('a'))),
+            Flow::Continue
+        );
         assert_eq!(handle_key(&mut model, key(KeyCode::Down)), Flow::Continue);
-        assert_eq!(handle_key(&mut model, key(KeyCode::Char('r'))), Flow::Continue);
-        assert!(model.section_notice.as_deref().unwrap().contains("Completed"));
+        assert_eq!(
+            handle_key(&mut model, key(KeyCode::Char('r'))),
+            Flow::Continue
+        );
+        assert!(model
+            .section_notice
+            .as_deref()
+            .unwrap()
+            .contains("Completed"));
 
-        assert_eq!(handle_key(&mut model, key(KeyCode::Char('/'))), Flow::Continue);
+        assert_eq!(
+            handle_key(&mut model, key(KeyCode::Char('/'))),
+            Flow::Continue
+        );
         for ch in "login".chars() {
-            assert_eq!(handle_key(&mut model, key(KeyCode::Char(ch))), Flow::Continue);
+            assert_eq!(
+                handle_key(&mut model, key(KeyCode::Char(ch))),
+                Flow::Continue
+            );
         }
         assert_eq!(handle_key(&mut model, key(KeyCode::Enter)), Flow::Continue);
         assert_eq!(graph_resume::selected(&model).unwrap().run_id, "can-resume");
