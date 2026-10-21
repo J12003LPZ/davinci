@@ -510,6 +510,15 @@ fn visit_rendered_blocks<'a>(
                 base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
                 FlowBlock::User(text),
             ),
+            (
+                Entry::Shell {
+                    command, output, ..
+                },
+                _,
+            ) => emit(
+                base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
+                FlowBlock::Shell { command, output },
+            ),
             (entry, _) => emit(
                 base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
                 FlowBlock::Rows(entry_lines(model, entry, width)),
@@ -622,6 +631,10 @@ enum FlowBlock<'a> {
         reveal: Option<(usize, usize)>,
     },
     User(&'a str),
+    Shell {
+        command: &'a str,
+        output: &'a [String],
+    },
 }
 impl FlowBlock<'_> {
     fn visit(self, model: &Model, width: u16, emit: &mut dyn FnMut(Line<'static>)) {
@@ -632,6 +645,9 @@ impl FlowBlock<'_> {
                 }
             }
             Self::User(text) => visit_user_lines(&model.theme, text, width, emit),
+            Self::Shell { command, output } => {
+                visit_shell_lines(&model.theme, command, output, width, emit)
+            }
             Self::Prose { text, reveal } => {
                 if reveal.is_some_and(|(index, _)| !model.writing(index)) {
                     return;
@@ -1278,8 +1294,20 @@ fn merge_same_style(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 }
 
 fn shell_lines(theme: &Theme, command: &str, output: &[String], width: u16) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    visit_shell_lines(theme, command, output, width, &mut |row| rows.push(row));
+    rows
+}
+
+fn visit_shell_lines(
+    theme: &Theme,
+    command: &str,
+    output: &[String],
+    width: u16,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
     let cc = theme.cc();
-    let mut rows = vec![Line::from(truncate_run(
+    emit(Line::from(truncate_run(
         vec![
             Span::styled("! ", Style::default().fg(cc.bash).bg(cc.bash_bg)),
             Span::styled(
@@ -1288,19 +1316,18 @@ fn shell_lines(theme: &Theme, command: &str, output: &[String], width: u16) -> V
             ),
         ],
         width,
-    ))];
+    )));
     if output.is_empty() {
-        rows.push(Line::from(span(format!("{ELBOW}(No output)"), cc.inactive)));
-        return rows;
+        emit(Line::from(span(format!("{ELBOW}(No output)"), cc.inactive)));
+        return;
     }
     for (index, row) in output.iter().enumerate() {
         let lead = if index == 0 { ELBOW } else { "     " };
-        rows.push(Line::from(truncate_run(
+        emit(Line::from(truncate_run(
             vec![span(lead, cc.inactive), span(row.clone(), theme.text)],
             width,
         )));
     }
-    rows
 }
 
 fn bold_numbers(text: &str, color: Color) -> Vec<Span<'static>> {
@@ -2839,6 +2866,25 @@ mod tests {
             .map(text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn shell_history_does_not_materialize_a_full_styled_block() {
+        let mut m = model(80);
+        m.transcript.push(Entry::Shell {
+            command: "fixture".into(),
+            output: (0..10_000).map(|i| format!("row {i}")).collect(),
+            failed: false,
+        });
+        visit_rendered_blocks(&m, &m.transcript, 80, Some(0), |_, block| {
+            assert!(
+                !matches!(block, FlowBlock::Rows(_)),
+                "a large shell entry allocated all styled rows before viewport selection"
+            );
+        });
+        let view = conversation_rows(&m, 80);
+        assert_eq!(view.len(), 10_001);
+        assert!(text(&view.slice(9999..10_000)[0]).contains("row 9998"));
     }
 
     #[test]

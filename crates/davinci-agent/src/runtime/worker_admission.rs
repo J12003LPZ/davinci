@@ -70,7 +70,24 @@ impl WorkerAdmission {
     pub fn acquire_worker(&self, cancelled: impl Fn() -> bool) -> Result<WorkerLease, String> {
         self.acquire(self.0.estimate, cancelled)
     }
+    /// A worker that already holds a parent reservation must not wait for
+    /// capacity that can only be released when that same worker returns.
+    pub fn acquire_worker_with_wait(
+        &self,
+        wait: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<WorkerLease, String> {
+        self.acquire_inner(self.0.estimate, wait, cancelled)
+    }
     pub fn acquire(&self, bytes: u64, cancelled: impl Fn() -> bool) -> Result<WorkerLease, String> {
+        self.acquire_inner(bytes, true, cancelled)
+    }
+    fn acquire_inner(
+        &self,
+        bytes: u64,
+        wait: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<WorkerLease, String> {
         if let Some(error) = &self.0.error {
             return Err(error.clone());
         }
@@ -95,7 +112,15 @@ impl WorkerAdmission {
                 return Ok(WorkerLease {
                     owner: self.clone(),
                     bytes,
+                    alive: Arc::new(()),
                 });
+            }
+            if !wait {
+                state.waiting_workers -= 1;
+                return Err(
+                    "nested worker reservation cannot fit while its parent holds local resources"
+                        .into(),
+                );
             }
             state = self
                 .0
@@ -106,10 +131,23 @@ impl WorkerAdmission {
         }
     }
 }
+#[derive(Debug, Clone, Default)]
+pub struct WorkerLeaseContext(std::sync::Weak<()>);
+impl WorkerLeaseContext {
+    pub fn is_held(&self) -> bool {
+        self.0.upgrade().is_some()
+    }
+}
 #[derive(Debug)]
 pub struct WorkerLease {
     owner: WorkerAdmission,
     bytes: u64,
+    alive: Arc<()>,
+}
+impl WorkerLease {
+    pub fn context(&self) -> WorkerLeaseContext {
+        WorkerLeaseContext(Arc::downgrade(&self.alive))
+    }
 }
 impl Drop for WorkerLease {
     fn drop(&mut self) {
@@ -127,6 +165,62 @@ mod tests {
             estimated_worker_bytes: 8,
         }))
         .unwrap()
+    }
+    #[test]
+    fn nested_worker_context_retains_the_owner_and_refuses_saturated_launches() {
+        use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+        let admission = budget();
+        let mut parent = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+        parent.worker_admission = admission.clone();
+        let runner = crate::SubagentRunner::new(|request| {
+            let runtime = request.runtime.as_ref().unwrap();
+            assert!(runtime.worker_resource_lease.is_held());
+            let inherited = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+                .with_worker_state_from(runtime);
+            assert!(inherited.worker_resource_lease.is_held());
+            assert_eq!(inherited.worker_admission.stats().reserved_bytes, 8);
+            let mut agent = crate::Agent::new("local reservation fixture");
+            agent.runtime = Some(inherited.clone());
+            assert!(agent
+                .workflow_launch(false)
+                .worker_resource_parent
+                .is_held());
+            let nested = crate::SubagentRunner::new(|_| panic!("saturated child must not run"))
+                .with_admission(inherited.worker_admission.clone());
+            let request = crate::SubagentRequest {
+                runtime: Some(inherited),
+                abort: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+                ..Default::default()
+            };
+            let abort = request.abort.clone().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let child = std::thread::spawn(move || tx.send(nested.run(&request)).unwrap());
+            let result = rx.recv_timeout(Duration::from_millis(500));
+            abort.store(true, std::sync::atomic::Ordering::Release);
+            child.join().unwrap();
+            let error = result
+                .expect("nested launch must settle without waiting for its parent")
+                .unwrap_err();
+            assert!(error.contains("nested worker"), "{error}");
+            Ok("complete".into())
+        })
+        .with_admission(admission.clone());
+        runner
+            .run(&crate::SubagentRequest {
+                runtime: Some(parent),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(admission.stats().reserved_bytes, 0);
+        assert_eq!(admission.stats().waiting_workers, 0);
+        let lease = admission.acquire_worker(|| false).unwrap();
+        let background_context = lease.context();
+        assert!(background_context.is_held());
+        drop(lease);
+        assert!(
+            !background_context.is_held(),
+            "background context must not retain its parent's lease"
+        );
     }
     #[test]
     fn impossible_reservations_fail_and_unwinding_releases_a_lease() {

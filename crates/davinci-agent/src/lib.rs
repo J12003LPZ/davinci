@@ -1133,6 +1133,11 @@ impl Agent {
     /// for background runs whose host can deliver the report.
     pub fn workflow_launch(&self, report_to_lead: bool) -> crate::runtime::WorkflowLaunch {
         crate::runtime::WorkflowLaunch {
+            worker_resource_parent: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.worker_resource_lease.clone())
+                .unwrap_or_default(),
             service_tier: self.service_tier,
             parent_permission_mode: Some(self.permission_mode()),
             provider: Some(self.provider.clone()),

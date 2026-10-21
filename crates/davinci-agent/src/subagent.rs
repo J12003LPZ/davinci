@@ -316,7 +316,11 @@ impl SubagentRunner {
     }
 
     pub fn run(&self, request: &SubagentRequest) -> Result<String, String> {
-        let _lease = self.admission.acquire_worker(|| {
+        let nested = request
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.worker_resource_lease.is_held());
+        let _lease = self.admission.acquire_worker_with_wait(!nested, || {
             request
                 .cancellation_token
                 .as_ref()
@@ -326,7 +330,16 @@ impl SubagentRunner {
                     .as_ref()
                     .is_some_and(|abort| abort.load(std::sync::atomic::Ordering::Acquire))
         })?;
-        (self.inner)(request)
+        let mut admitted = request.clone();
+        if let Some(runtime) = admitted.runtime.as_mut() {
+            runtime.worker_admission = self.admission.clone();
+            runtime.worker_resource_lease = if self.admission.is_configured() {
+                _lease.context()
+            } else {
+                Default::default()
+            };
+        }
+        (self.inner)(&admitted)
     }
 }
 

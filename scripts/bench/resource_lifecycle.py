@@ -165,7 +165,7 @@ def prepare(source, destination, candidate):
     manifest += '[features]\ncandidate = []\n[dependencies]\n'
     for name, dependency in dependencies.items():
         manifest += f'{name} = {{ path = {json.dumps(dependency["path"])} }}\n'
-    manifest += 'serde_json = "=1.0.154"\ntempfile = "=3.27.0"\nlibc = "=0.2.189"\n'
+    manifest += 'sha2 = "=0.10.9"\nserde_json = "=1.0.154"\ntempfile = "=3.27.0"\nlibc = "=0.2.189"\n'
     manifest += 'serde = { version = "=1.0.229", features = ["derive"] }\nuuid = { version = "=1.11.0", features = ["v4"] }\n'
     manifest += '[profile.release]\nopt-level = 3\ndebug = false\nstrip = true\n'
     (destination / "Cargo.toml").write_text(manifest)

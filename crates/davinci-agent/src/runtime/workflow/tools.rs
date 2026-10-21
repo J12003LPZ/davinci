@@ -156,12 +156,13 @@ pub fn workflow_run_tool_with_parent(
     cwd: &Path,
     input: &Value,
     context: &ToolContext,
-    launch: WorkflowLaunch,
+    mut launch: WorkflowLaunch,
 ) -> Result<ToolResult, ToolError> {
     let runtime = context
         .runtime
         .as_ref()
         .ok_or_else(|| ToolError::Failed("Runtime subsystem not initialized".into()))?;
+    launch.worker_resource_parent = runtime.worker_resource_lease.clone();
 
     let name_val = input.get("name").and_then(Value::as_str);
     let spec_val = input.get("spec");
