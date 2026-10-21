@@ -192,6 +192,12 @@ impl WorktreeManager {
         agent_id: AgentId,
         explicit_branch: Option<&str>,
     ) -> Result<WorktreeLease, WorktreeError> {
+        // Git scans other worktree entries during add/remove, including entries
+        // another add has not finished writing. Keep administration and lease
+        // publication atomic across clones of this manager.
+        let mut leases = self.leases.write().map_err(|_| {
+            WorktreeError::GitError("Failed to acquire write lock on leases".into())
+        })?;
         self.validate_git_repo()?;
 
         // UUIDv7's leading characters encode time, so the first eight characters
@@ -203,14 +209,9 @@ impl WorktreeManager {
             .unwrap_or_else(|| format!("davinci/agent/{agent_key}"));
 
         // 1. Validate branch is not held by another active lease
-        {
-            let leases = self.leases.read().map_err(|_| {
-                WorktreeError::GitError("Failed to acquire read lock on leases".into())
-            })?;
-            for existing in leases.values() {
-                if existing.branch == branch {
-                    return Err(WorktreeError::BranchInUse(branch));
-                }
+        for existing in leases.values() {
+            if existing.branch == branch {
+                return Err(WorktreeError::BranchInUse(branch));
             }
         }
 
@@ -265,13 +266,9 @@ impl WorktreeManager {
             generation: self.generations.fetch_add(1, Ordering::SeqCst) + 1,
         };
 
-        // 5. Record active lease
-        {
-            let mut leases = self.leases.write().map_err(|_| {
-                WorktreeError::GitError("Failed to acquire write lock on leases".into())
-            })?;
-            leases.insert(wt_path.clone(), lease.clone());
-        }
+        // 5. Record active lease, then unlock before invoking subscribers.
+        leases.insert(wt_path.clone(), lease.clone());
+        drop(leases);
 
         // 6. Emit WorktreeCreated event
         if let Some(bus) = &self.bus {
@@ -335,12 +332,15 @@ impl WorktreeManager {
     /// Release an existing worktree lease.
     /// If dirty and `force` is false, preserves the worktree directory and returns `DirtyWorktreePreserved`.
     pub fn release_lease(&self, lease: &WorktreeLease, force: bool) -> Result<(), WorktreeError> {
+        let mut leases = self.leases.write().map_err(|_| {
+            WorktreeError::GitError("Failed to acquire write lock on leases".into())
+        })?;
         // The manager's record is the authority, not the caller's struct: a
         // newer lease on the same path must survive a stale holder's release,
         // even a forced one.
-        if self
-            .get_lease(&lease.path)
-            .is_some_and(|recorded| recorded != *lease)
+        if leases
+            .get(&lease.path)
+            .is_some_and(|recorded| recorded != lease)
         {
             return Err(WorktreeError::StaleLease(lease.path.clone()));
         }
@@ -378,13 +378,9 @@ impl WorktreeManager {
             let _ = run_git(&self.repo_root, &["branch", "-D", &lease.branch]);
         }
 
-        // Remove from leases
-        {
-            let mut leases = self.leases.write().map_err(|_| {
-                WorktreeError::GitError("Failed to acquire write lock on leases".into())
-            })?;
-            leases.remove(&lease.path);
-        }
+        // Remove from leases, then unlock before invoking subscribers.
+        leases.remove(&lease.path);
+        drop(leases);
 
         // Emit WorktreeRemoved event
         if let Some(bus) = &self.bus {
@@ -520,6 +516,80 @@ mod tests {
             .unwrap();
 
         dir
+    }
+
+    #[test]
+    fn parallel_leases_cannot_claim_the_same_branch() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let manager = manager.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        manager.create_lease(RunId::new(), AgentId::new(), Some("shared-worker"))
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        for result in results {
+            match result {
+                Ok(lease) => manager.release_lease(&lease, false).unwrap(),
+                Err(error) => assert_eq!(error, WorktreeError::BranchInUse("shared-worker".into())),
+            }
+        }
+        assert!(manager.list_leases().is_empty());
+    }
+
+    #[test]
+    fn parallel_creates_and_removals_leave_no_partial_git_metadata() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let manager = manager.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..3 {
+                            let lease = manager
+                                .create_lease(RunId::new(), AgentId::new(), None)
+                                .unwrap();
+                            manager.release_lease(&lease, false).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        assert!(manager.list_leases().is_empty());
+        let listed = run_git(repo.path(), &["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(
+            listed
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            1,
+            "{listed}"
+        );
     }
 
     #[test]
