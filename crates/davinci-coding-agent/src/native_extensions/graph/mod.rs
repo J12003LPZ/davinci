@@ -551,7 +551,7 @@ impl GraphController {
                     match acquire_worker_resources(
                         &admission,
                         parent_reservation.is_held(),
-                        &abort,
+                        abort,
                         spec.run_deadline,
                     ) {
                         Ok(_lease) => run_worker(spec, abort, progress),
