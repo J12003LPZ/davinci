@@ -1198,7 +1198,8 @@ mod tests {
         let mut fixture = TestWorkspace::new("typescript", "capture");
         Arc::get_mut(&mut fixture.manager.inner)
             .expect("fixture manager should be uniquely owned before first use")
-            .config.idle_timeout_ms = 50;
+            .config
+            .idle_timeout_ms = 50;
         fixture
     }
 
