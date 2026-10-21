@@ -947,6 +947,31 @@ mod tests {
     }
 
     #[test]
+    fn graph_summary_index_is_small_and_falls_back_on_corruption() {
+        let dir = tempdir().unwrap();
+        let run_id = "indexed-run";
+        create_run_dir(dir.path(), run_id).unwrap();
+        let mut run = sample_run(dir.path(), run_id, "Improve the graph recovery picker");
+        run.counters.cost_usd = 1.25;
+        save_run(&mut run).unwrap();
+
+        let summary_path = run_dir(dir.path(), run_id).join("summary.json");
+        let raw = fs::read(&summary_path).unwrap();
+        assert!(raw.len() < 16 * 1024);
+        assert!(!String::from_utf8_lossy(&raw).contains("continuation"));
+        let summary = indexed_run_summary(dir.path(), run_id).unwrap();
+        assert_eq!(summary.goal, "Improve the graph recovery picker");
+        assert_eq!(summary.cost_usd, 1.25);
+        assert_eq!(summary.total_tasks, 0);
+        assert_eq!(list_runs(dir.path())[0].run_id, run_id);
+
+        // A corrupted optional index must not hide an otherwise valid run.
+        fs::write(&summary_path, b"{ invalid").unwrap();
+        assert!(indexed_run_summary(dir.path(), run_id).is_none());
+        assert_eq!(list_runs(dir.path())[0].goal, run.goal);
+    }
+
+    #[test]
     fn saved_state_is_compact_and_has_no_inline_contents() {
         let dir = tempdir().unwrap();
         let run_id = new_run_id();
