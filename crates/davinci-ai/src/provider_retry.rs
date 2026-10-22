@@ -141,20 +141,63 @@ fn retry_after_number(value: &str) -> Option<f64> {
 }
 
 fn http_date_delay_ms(value: &str, now_ms: i64) -> Option<f64> {
-    parse_http_date_ms(value).map(|then| (then - now_ms) as f64)
+    // Avoid i64 overflow if a caller supplies an extreme clock value.
+    parse_http_date_ms(value).map(|then| (i128::from(then) - i128::from(now_ms)) as f64)
+}
+
+fn parse_two_digits(value: &str) -> Option<i64> {
+    if value.len() != 2 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn parse_http_date_ms(value: &str) -> Option<i64> {
-    let rest = value.trim().split_once(", ")?.1;
+    // Retry-After HTTP dates use IMF-fixdate. Reject malformed timestamps
+    // rather than interpreting a different timezone or rolling invalid dates
+    // into another month; an invalid header uses exponential backoff.
+    let (weekday, rest) = value.trim().split_once(", ")?;
+    let weekday = match weekday {
+        "Sun" => 0,
+        "Mon" => 1,
+        "Tue" => 2,
+        "Wed" => 3,
+        "Thu" => 4,
+        "Fri" => 5,
+        "Sat" => 6,
+        _ => return None,
+    };
     let mut parts = rest.split_whitespace();
-    let day: i64 = parts.next()?.parse().ok()?;
+    let day = parse_two_digits(parts.next()?)?;
     let month = month_num(parts.next()?)?;
-    let year: i64 = parts.next()?.parse().ok()?;
+    let year_str = parts.next()?;
+    if year_str.len() != 4 || !year_str.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_str.parse().ok()?;
     let mut time = parts.next()?.split(':');
-    let hour: i64 = time.next()?.parse().ok()?;
-    let min: i64 = time.next()?.parse().ok()?;
-    let sec: i64 = time.next()?.parse().ok()?;
-    Some(ymd_hms_to_unix_ms(year, month, day, hour, min, sec))
+    let hour = parse_two_digits(time.next()?)?;
+    let min = parse_two_digits(time.next()?)?;
+    let sec = parse_two_digits(time.next()?)?;
+    if time.next().is_some() || parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=max_day).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    let then = ymd_hms_to_unix_ms(year, month, day, hour, min, sec);
+    // 1970-01-01 was a Thursday; Sunday is index zero.
+    if (then.div_euclid(86_400_000) + 4).rem_euclid(7) != weekday {
+        return None;
+    }
+    Some(then)
 }
 
 fn month_num(name: &str) -> Option<i64> {
@@ -515,6 +558,45 @@ mod tests {
             .with_header("retry-after", "Tue, 01 Jan 2030 00:00:45 GMT");
         let delay = retry_delay_from_headers(&error, 0, Some(60_000), now).unwrap();
         assert_eq!(delay, (then - now) as u64);
+    }
+
+    #[test]
+    fn malformed_retry_after_http_dates_use_exponential_backoff() {
+        for value in [
+            "Mon, 01 Jan 2030 00:00:45 GMT", // Incorrect weekday.
+            "Tue, 32 Jan 2030 00:00:45 GMT",
+            "Tue, 00 Jan 2030 00:00:45 GMT",
+            "Tue, 29 Feb 2030 00:00:45 GMT",
+            "Tue, 01 Jan 2030 24:00:45 GMT",
+            "Tue, 01 Jan 2030 00:60:45 GMT",
+            "Tue, 01 Jan 2030 00:00:60 GMT",
+            "Tue, 01 Jan 2030 00:00:45 PST",
+            "Tue, 01 Jan 2030 00:00:45",
+            "Tue, 01 Jan 2030 00:00:45 GMT extra",
+            "Tue, 01 Jan 20300 00:00:45 GMT",
+        ] {
+            let error = ProviderError::new(Some(429), "wait").with_header("retry-after", value);
+            assert_eq!(
+                retry_delay_from_headers(&error, 0, Some(60_000), 0).unwrap(),
+                500,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leap_day_and_extreme_clocks_are_handled_without_overflow() {
+        let leap_day = parse_http_date_ms("Sun, 29 Feb 2032 00:00:00 GMT").unwrap();
+        assert_eq!(leap_day, ymd_hms_to_unix_ms(2032, 2, 29, 0, 0, 0));
+        assert!(parse_http_date_ms("Fri, 29 Feb 2030 00:00:00 GMT").is_none());
+
+        let error = ProviderError::new(Some(429), "wait")
+            .with_header("retry-after", "Tue, 01 Jan 2030 00:00:45 GMT");
+        assert_eq!(
+            retry_delay_from_headers(&error, 0, Some(60_000), i64::MAX).unwrap(),
+            0
+        );
+        assert!(retry_delay_from_headers(&error, 0, Some(60_000), i64::MIN).is_err());
     }
 
     #[test]
