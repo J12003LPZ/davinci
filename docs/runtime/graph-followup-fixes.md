@@ -85,7 +85,10 @@ on conflict; a shared control revision does not authorize an older snapshot.
 
 Recovery changes retain immutable `checkpoint-N` snapshots. Diagnostic-only
 updates retain at most 16 recent `progress-N` snapshots (16 MiB soft byte budget).
-Current canonical state still includes all diagnostics and spending. Diff can
+A single latest diagnostic snapshot larger than 16 MiB may exceed the soft
+budget; older diagnostics are evicted, and the hard total below still applies.
+This preserves the preceding diff snapshot for large runs. Current canonical
+state still includes all diagnostics and spending. Diff can
 read recent progress snapshots; forks consume recovery boundaries. Snapshot
 history has a 512 MiB / 4096-file hard capacity. When essential snapshots alone
 exhaust capacity, publication fails before overwriting canonical state or
