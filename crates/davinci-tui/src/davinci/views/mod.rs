@@ -26,6 +26,7 @@ pub mod graph_canvas;
 pub mod graph_inspector;
 pub mod graph_layout;
 pub mod graph_nav;
+pub mod graph_resume;
 pub mod graph_run;
 pub mod highlight;
 pub mod instrumenta;

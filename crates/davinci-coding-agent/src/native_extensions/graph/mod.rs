@@ -748,13 +748,21 @@ impl GraphController {
 
     fn resume(&self, wanted: &str) -> Result<Value, String> {
         let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
-        let run_id = if wanted.is_empty() {
+        let run_id = if wanted.is_empty() || wanted == "--latest" {
             let runs = list_runs(&self.cwd);
-            runs.iter()
-                .find(|run| run.phase != "done" && run.phase != "cancelled")
-                .or_else(|| runs.first())
+            if wanted.is_empty() && runs.is_empty() {
+                return Err("No graph runs in this project.".into());
+            }
+            let resumable = runs.iter().find(|run| run.phase != "done");
+            let choice = if wanted == "--latest" {
+                resumable
+            } else {
+                // Keep the noninteractive no-argument fallback compatible.
+                resumable.or_else(|| runs.first())
+            };
+            choice
                 .map(|run| run.run_id.clone())
-                .ok_or_else(|| "No graph runs in this project.".to_string())?
+                .ok_or_else(|| "No resumable graph runs in this project.".to_string())?
         } else {
             wanted.to_owned()
         };
@@ -2757,6 +2765,48 @@ name = \"x\"
         assert!(resumed.blocked_reason.is_none());
         assert!(resumed.counters.cost_usd >= 6.83);
         assert!(resumed.counters.revision_cycles >= 3);
+    }
+
+    #[test]
+    fn latest_resume_selects_a_stopped_run_without_an_id() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+        let mut blocked = controller
+            .run_to_completion(parse_graph_args("--dry-run --simple first graph"), None)
+            .unwrap();
+        blocked.phase = Phase::Blocked;
+        blocked.blocked_reason = Some("incomplete".into());
+        store::save_run(&mut blocked).unwrap();
+        drain_active(dir.path());
+
+        // Newer completed work should not shadow an older resumable checkpoint.
+        let done = controller
+            .run_to_completion(parse_graph_args("--dry-run --simple second graph"), None)
+            .unwrap();
+        assert_eq!(done.phase, Phase::Done);
+        drain_active(dir.path());
+        let response = controller
+            .command("graph-resume", "--latest")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["started"], true);
+        assert_eq!(response["runId"], blocked.run_id);
+        drain_active(dir.path());
+        assert_eq!(
+            load_run(dir.path(), &blocked.run_id).unwrap().phase,
+            Phase::Done
+        );
+    }
+
+    #[test]
+    fn latest_resume_refuses_when_there_are_no_saved_runs() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let error = controller(dir.path())
+            .command("graph-resume", "--latest")
+            .unwrap_err();
+        assert!(error.contains("No resumable graph runs"));
     }
 
     #[test]

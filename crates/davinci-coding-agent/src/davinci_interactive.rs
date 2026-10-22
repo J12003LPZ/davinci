@@ -15,10 +15,11 @@ use davinci_agent::{
 use davinci_tui::davinci::model::{
     Ask, AskKind, CatalogRow, Choice, CorpusItem, Credential, Entry, ExportLedger, ExtensionRow,
     ExtensionTab, ExtensionView, ExtensionsSheet, FailedRun, Finding, GovernorCounter,
-    GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk, HunkKind, KeymapGroup, Model,
-    ModelItem, Overlay, PermissionRow, PickerItem, PlanStep, ProviderRow, ResumeRow, ReviewFile,
-    ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step, SubagentRow, SubagentRowState,
-    ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow, WorkflowsSheet, Working, WorkshopSheet,
+    GovernorSheet, GovernorStored, GraphResumeRow, GraphRunSheet, GraphTask, Hunk, HunkKind,
+    KeymapGroup, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep, ProviderRow,
+    ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step,
+    SubagentRow, SubagentRowState, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
+    WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -2579,6 +2580,14 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
     let (name, args) = crate::parse_extension_command(line);
     if name.is_empty() {
         return None;
+    }
+    // A dedicated recovery picker needs no run ID and never starts workers
+    // while the user is merely browsing saved runs.
+    if (name == "graph-resume" && args.trim().is_empty())
+        || (name == "graph" && args.trim() == "runs")
+    {
+        open_graph_resume_sheet(shell.agent, shell.model, name == "graph");
+        return Some(Next::Go);
     }
     if setup && name == "graph" && graph_setup::is_launch(&args) {
         graph_setup::open(shell, &args);
@@ -7194,6 +7203,30 @@ fn open_keys_sheet(model: &mut Model) {
     open_sheet(model, Screen::Keys);
 }
 
+/// Discover saved runs in this workspace. This never launches a controller,
+/// and the final selection is revalidated by the existing resume path.
+fn open_graph_resume_sheet(agent: &Agent, model: &mut Model, all: bool) {
+    let now = crate::native_extensions::graph::graph_now_ms();
+    model.graph_resume_runs = crate::native_extensions::graph::list_runs(&agent.cwd)
+        .into_iter()
+        .map(|run| GraphResumeRow {
+            run_id: run.run_id,
+            goal: run.goal,
+            phase: run.phase,
+            updated: crate::davinci_sources::humanise(now.saturating_sub(run.updated_at) / 1_000),
+            completed: run.completed_tasks,
+            total: run.total_tasks,
+            cost_usd: run.cost_usd,
+        })
+        .collect();
+    model.graph_resume_index = 0;
+    model.graph_resume_query.clear();
+    model.graph_resume_searching = false;
+    model.graph_resume_all = all;
+    model.graph_resume_details = false;
+    open_sheet(model, Screen::GraphResume);
+}
+
 /// `4a` — the session list, with what resuming each one would carry, from the
 /// real store. Token counts are an estimate and say so.
 fn open_resume_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Model) {
@@ -9712,6 +9745,16 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             });
             open_login_sheet(shell.parsed, shell.model);
             next
+        }
+        Choice::GraphResume { action, run_id } => {
+            if action == "resume" {
+                // Do not trust a menu snapshot for execution authorization.
+                // This dispatch loads and validates the real checkpoint.
+                let command = format!("/graph-resume {run_id}");
+                run_extension_command(shell, &command).unwrap_or(Next::Go)
+            } else {
+                Next::Go
+            }
         }
         // `4a` — open the chosen session.
         Choice::ResumeSession(index) => {
