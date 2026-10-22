@@ -10,6 +10,7 @@ pub mod docker_discovery;
 pub mod ecosystem;
 pub mod engineering_snapshot;
 pub mod git_intelligence;
+mod governor_maintenance;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
@@ -343,8 +344,15 @@ pub type SharedTokenGovernor = Arc<Mutex<TokenGovernor>>;
 /// skills learned mid-session reach graph workers and the ledger has one writer.
 pub type SharedLearning = Arc<Mutex<LearningController>>;
 
+#[derive(Debug, Clone, Copy)]
+pub enum HostStartupRole<'a> {
+    Lead,
+    GraphWorker(&'a graph::GraphWorkerContext),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    suppress_worker_memory: bool,
     pub background: background_usage::BackgroundUsage,
     pub(crate) accounting_key: Option<String>,
     pub browser: browser::BrowserController,
@@ -416,6 +424,34 @@ impl NativeExtensionHost {
             .map(Path::to_path_buf)
             .unwrap_or_else(davinci_session::default_agent_dir);
         let merged_settings = crate::settings::load_merged_settings(&repo_agent_dir, cwd);
+        Self::new_with_settings(
+            session_key,
+            cwd,
+            agent_dir,
+            merged_settings,
+            HostStartupRole::Lead,
+        )
+    }
+
+    pub fn new_with_settings(
+        session_key: impl Into<String>,
+        cwd: &Path,
+        agent_dir: Option<&Path>,
+        merged_settings: crate::settings::Settings,
+        role: HostStartupRole<'_>,
+    ) -> Self {
+        let session_key = session_key.into();
+        let repo_agent_dir = agent_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(davinci_session::default_agent_dir);
+        let permitted = |prefix: &str| match role {
+            HostStartupRole::Lead => true,
+            HostStartupRole::GraphWorker(context) => context
+                .allowed_tools
+                .iter()
+                .any(|name| name.starts_with(prefix)),
+        };
+        let suppress_worker_memory = !permitted("memory");
         let cache = match agent_dir {
             Some(dir) => davinci_agent::runtime::cache::CacheRuntime::shared(
                 merged_settings.cache.clone().unwrap_or_default(),
@@ -446,33 +482,41 @@ impl NativeExtensionHost {
         }
         let memory_config = host_memory_config(agent_dir);
         let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
-        let _ = governor_value.sweep_stale_outputs();
+        let _ = governor_value.sweep_stale_outputs_if_due();
         let governor = Arc::new(Mutex::new(governor_value));
         let learning_config = if agent_dir.is_some() {
             merged_settings.learning.clone()
         } else {
             None
         };
-        let learning = Arc::new(Mutex::new(LearningController::new(
-            cwd,
-            agent_dir,
-            learning_config,
-        )));
+        let learning = Arc::new(Mutex::new(if permitted("skill_") {
+            LearningController::new(cwd, agent_dir, learning_config)
+        } else {
+            LearningController::dormant(cwd, &repo_agent_dir)
+        }));
         // The store is read from the working tree, so an untrusted folder's is
         // not. `--approve` is not known here; the host corrects this with
         // `set_project_trusted` once launch options are resolved, and every turn.
-        let memory_trusted =
-            agent_dir.is_none() || crate::settings::is_trusted(&merged_settings, cwd, None);
+        let memory_trusted = !suppress_worker_memory
+            && (agent_dir.is_none() || crate::settings::is_trusted(&merged_settings, cwd, None));
         let memory = Arc::new(Mutex::new(VectorMemory::with_config_for_project(
             cwd.to_path_buf(),
             memory_config,
             memory_trusted,
         )));
         let mut graph = GraphController::new(cwd.to_path_buf());
+        graph.worker_admission = davinci_agent::runtime::worker_admission::WorkerAdmission::new(
+            merged_settings.worker_resources.clone(),
+        )
+        .unwrap_or_else(davinci_agent::runtime::worker_admission::WorkerAdmission::denied);
         graph.memory = Some(Arc::clone(&memory));
         graph.learning = Some(Arc::clone(&learning));
         graph.governor = Some(Arc::clone(&governor));
-        let visual_snapshot = VisualSnapshotHost::discover(cwd);
+        let visual_snapshot = if permitted("visual_") {
+            VisualSnapshotHost::discover(cwd)
+        } else {
+            VisualSnapshotHost::default()
+        };
 
         let repo_config = merged_settings
             .repo_intelligence
@@ -563,6 +607,7 @@ impl NativeExtensionHost {
 
         Self {
             background: Default::default(),
+            suppress_worker_memory,
             accounting_key: None,
             browser: browser::BrowserController::new(cwd, browser_config),
             test_impact,
@@ -859,10 +904,12 @@ impl NativeExtensionHost {
     pub fn set_learning_project_trusted(&mut self, trusted: bool) {
         self.learning().set_project_trusted(trusted);
         // Memory is project-controlled data too: it follows the same decision.
-        self.memory
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .set_project_trusted(trusted);
+        if !self.suppress_worker_memory {
+            self.memory
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .set_project_trusted(trusted);
+        }
     }
 
     pub fn drain_learning_notifications(&mut self) -> Vec<String> {
@@ -1348,6 +1395,44 @@ fn host_memory_config(agent_dir: Option<&Path>) -> VectorMemoryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_bootstrap_only_opens_authorized_optional_services() {
+        let cwd = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let context = graph::GraphWorkerContext::from_parts(
+            Some("classifier"),
+            Some("classification"),
+            Some("/tmp/worker-artifact"),
+            None,
+        )
+        .unwrap();
+        let mut host = NativeExtensionHost::new_with_settings(
+            "worker",
+            cwd.path(),
+            Some(agent.path()),
+            Default::default(),
+            HostStartupRole::GraphWorker(&context),
+        );
+        host.set_learning_project_trusted(true);
+        assert!(!agent.path().join("learning").exists());
+        assert!(!host.memory.lock().unwrap().project_trusted());
+        assert!(!host.learning().config.enabled);
+        let mut authorized = context;
+        authorized.allowed_tools.insert("skill_list".into());
+        authorized.allowed_tools.insert("memory_search".into());
+        let mut host = NativeExtensionHost::new_with_settings(
+            "authorized-worker",
+            cwd.path(),
+            Some(agent.path()),
+            Default::default(),
+            HostStartupRole::GraphWorker(&authorized),
+        );
+        host.set_learning_project_trusted(true);
+        assert!(agent.path().join("learning").exists());
+        assert!(host.learning().config.enabled);
+        assert!(host.memory.lock().unwrap().project_trusted());
+    }
 
     #[test]
     fn every_external_native_command_is_listed() {

@@ -118,7 +118,8 @@ pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
     run_tool as run_subagent_tool, scoped_tools, scoped_tools_for_access, scoped_tools_with_policy,
     scoped_tools_with_registry, AgentSpawnMode, SubagentParent, SubagentRequest, SubagentRunner,
-    WorkerAccess, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX, PLAN_MODE_DENIAL,
+    WorkerAccess, DEFAULT_SUBAGENT_TOOLS, MAX_TASK_CONCURRENCY, PLAN_MODE_APPENDIX,
+    PLAN_MODE_DENIAL,
 };
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,
@@ -1132,6 +1133,11 @@ impl Agent {
     /// for background runs whose host can deliver the report.
     pub fn workflow_launch(&self, report_to_lead: bool) -> crate::runtime::WorkflowLaunch {
         crate::runtime::WorkflowLaunch {
+            worker_resource_parent: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.worker_resource_lease.clone())
+                .unwrap_or_default(),
             service_tier: self.service_tier,
             parent_permission_mode: Some(self.permission_mode()),
             provider: Some(self.provider.clone()),

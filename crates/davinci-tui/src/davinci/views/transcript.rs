@@ -55,40 +55,39 @@ pub fn tail_lines(
     width: u16,
     height: usize,
 ) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
     let base = own_base(model, entries).unwrap_or(0);
     let typed = own_base(model, entries).is_some();
     let mut reach = 64usize;
-    let blocks = loop {
+    loop {
         let mut start = entries.len().saturating_sub(reach);
         while start > 0 && matches!(entries[start], Entry::Tool { .. } | Entry::Gap) {
             start -= 1;
         }
-        let blocks = rendered_blocks(
+        let mut rows = std::collections::VecDeque::new();
+        let mut total = 0usize;
+        visit_rendered_blocks(
             model,
             &entries[start..],
             width,
             typed.then_some(base + start),
+            |_, block| {
+                block.visit(model, width, &mut |row| {
+                    total += 1;
+                    if rows.len() == height {
+                        rows.pop_front();
+                    }
+                    rows.push_back(row);
+                });
+            },
         );
-        let rows: usize = blocks.iter().map(Vec::len).sum();
-        if rows >= height || start == 0 {
-            break blocks;
+        if total >= height || start == 0 {
+            return rows.into_iter().collect();
         }
         reach = reach.saturating_mul(2);
-    };
-    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
-    let mut total = 0usize;
-    for rows in blocks.into_iter().rev() {
-        total += rows.len();
-        chunks.push(rows);
-        if total >= height {
-            break;
-        }
     }
-    let mut out: Vec<Line<'static>> = chunks.into_iter().rev().flatten().collect();
-    if out.len() > height {
-        out = crate::davinci::ui::tail(out, height);
-    }
-    out
 }
 
 /// The whole conversation as rows, for a view that scrolls through it.
@@ -100,52 +99,66 @@ pub fn tail_lines(
 /// not reached). Only what follows is drawn fresh. The kept rows are reused
 /// while the settled entries, the width and every setting they are drawn
 /// with are unchanged.
-pub struct ConversationRows {
-    settled: std::rc::Rc<Vec<Line<'static>>>,
-    live: Vec<Line<'static>>,
+pub struct ConversationRows<'a> {
+    model: &'a Model,
+    width: u16,
+    settled: std::rc::Rc<super::transcript_cache::RowIndex>,
+    live: super::transcript_cache::RowIndex,
 }
 
-impl ConversationRows {
+impl ConversationRows<'_> {
     pub fn len(&self) -> usize {
-        self.settled.len() + self.live.len()
+        self.settled.len + self.live.len
     }
-
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Rows `range`, cloned; nothing outside it is copied.
     pub fn slice(&self, range: std::ops::Range<usize>) -> Vec<Line<'static>> {
-        let split = self.settled.len();
-        let mut out = Vec::with_capacity(range.len());
-        if range.start < split {
-            out.extend_from_slice(&self.settled[range.start..range.end.min(split)]);
+        let end = range.end.min(self.len());
+        let start = range.start.min(end);
+        let render = |block: &super::transcript_cache::BlockRows, local: std::ops::Range<usize>| {
+            let mut rows = Vec::new();
+            let mut at = 0;
+            visit_rendered_blocks(
+                self.model,
+                &self.model.transcript[block.entries.clone()],
+                self.width,
+                Some(block.entries.start),
+                |_, block| {
+                    block.visit(self.model, self.width, &mut |row| {
+                        if local.contains(&at) {
+                            rows.push(row);
+                        }
+                        at += 1;
+                    });
+                },
+            );
+            rows
+        };
+        let mut rows = Vec::new();
+        if start < self.settled.len {
+            rows.extend(self.settled.slice(start..end.min(self.settled.len), render));
         }
-        if range.end > split {
-            out.extend_from_slice(&self.live[range.start.max(split) - split..range.end - split]);
+        if end > self.settled.len {
+            rows.extend(self.live.slice(
+                start.max(self.settled.len) - self.settled.len..end - self.settled.len,
+                render,
+            ));
         }
-        out
+        rows
     }
 }
-
 struct SettledCache {
     key: u64,
-    rows: std::rc::Rc<Vec<Line<'static>>>,
+    split: usize,
+    index: std::rc::Rc<super::transcript_cache::RowIndex>,
 }
-
 #[cfg(test)]
+thread_local! { static HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 thread_local! {
-    /// Cache hits, so tests can tell a reuse from a fresh draw.
-    static HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SETTLED: std::cell::RefCell<Option<SettledCache>> = const { std::cell::RefCell::new(None) };
 }
-
-thread_local! {
-    static SETTLED: std::cell::RefCell<Option<SettledCache>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-pub fn conversation_rows(model: &Model, width: u16) -> ConversationRows {
-    let entries = &model.transcript;
+pub fn conversation_rows(model: &Model, width: u16) -> ConversationRows<'_> {
     let split = settled_len(model);
     let key = settled_key(model, split, width);
     let settled = SETTLED.with(|cache| {
@@ -153,35 +166,89 @@ pub fn conversation_rows(model: &Model, width: u16) -> ConversationRows {
         if let Some(hit) = cache.as_ref().filter(|hit| hit.key == key) {
             #[cfg(test)]
             HITS.with(|hits| hits.set(hits.get() + 1));
-            return hit.rows.clone();
+            return hit.index.clone();
         }
-        let rows = std::rc::Rc::new(
-            rendered_blocks(model, &entries[..split], width, Some(0))
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>(),
+        let previous = cache
+            .take()
+            .filter(|old| old.split <= split && settled_key(model, old.split, width) == old.key);
+        let (mut index, start) = previous
+            .map(|old| (old.index, old.split))
+            .unwrap_or_else(|| {
+                (
+                    std::rc::Rc::new(super::transcript_cache::RowIndex::default()),
+                    0,
+                )
+            });
+        let update = std::rc::Rc::make_mut(&mut index);
+        visit_rendered_blocks(
+            model,
+            &model.transcript[start..split],
+            width,
+            Some(start),
+            |entries, block| {
+                let mut count = 0;
+                block.visit(model, width, &mut |_| count += 1);
+                update.push(entries, count);
+            },
         );
         *cache = Some(SettledCache {
             key,
-            rows: rows.clone(),
+            split,
+            index: index.clone(),
         });
-        rows
+        index
     });
-    let live = rendered_blocks(model, &entries[split..], width, Some(split))
-        .into_iter()
-        .flatten()
-        .collect();
-    ConversationRows { settled, live }
+    let mut live = super::transcript_cache::RowIndex::default();
+    visit_rendered_blocks(
+        model,
+        &model.transcript[split..],
+        width,
+        Some(split),
+        |entries, block| {
+            let mut count = 0;
+            block.visit(model, width, &mut |_| count += 1);
+            live.push(entries, count);
+        },
+    );
+    ConversationRows {
+        model,
+        width,
+        settled,
+        live,
+    }
 }
-
-/// How many rows the entries before `entry` take at `width`, which is the
-/// row `entry` starts on within the conversation.
 pub fn rows_before(model: &Model, entry: usize, width: u16) -> usize {
-    let entries = &model.transcript[..entry.min(model.transcript.len())];
-    rendered_blocks(model, entries, width, Some(0))
+    let view = conversation_rows(model, width);
+    let live_start = view
+        .live
+        .blocks
+        .first()
+        .map_or(model.transcript.len(), |block| block.entries.start);
+    let (index, base) = if entry >= live_start {
+        (&view.live, view.settled.len)
+    } else {
+        (view.settled.as_ref(), 0)
+    };
+    let at = index
+        .blocks
+        .partition_point(|block| block.entries.end <= entry);
+    let Some(block) = index.blocks.get(at) else {
+        return base + index.len;
+    };
+    let prefix = if block.entries.start < entry {
+        rendered_blocks(
+            model,
+            &model.transcript[block.entries.start..entry],
+            width,
+            Some(block.entries.start),
+        )
         .iter()
         .map(Vec::len)
         .sum()
+    } else {
+        0
+    };
+    base + block.rows.start + prefix
 }
 
 /// Where the last scan for the first live entry ended, and what it assumed.
@@ -340,6 +407,21 @@ fn rendered_blocks(
     base: Option<usize>,
 ) -> Vec<Vec<Line<'static>>> {
     let mut out = Vec::new();
+    visit_rendered_blocks(model, entries, width, base, |_, block| {
+        let mut rows = Vec::new();
+        block.visit(model, width, &mut |row| rows.push(row));
+        out.push(rows);
+    });
+    out
+}
+
+fn visit_rendered_blocks<'a>(
+    model: &Model,
+    entries: &'a [Entry],
+    width: u16,
+    base: Option<usize>,
+    mut emit: impl FnMut(std::ops::Range<usize>, FlowBlock<'a>),
+) {
     let mut index = 0usize;
     while index < entries.len() {
         if !model.show_tool_output {
@@ -387,7 +469,10 @@ fn rendered_blocks(
                 }
             }
             if !calls.is_empty() {
-                out.push(group_rows(model, &calls, width));
+                emit(
+                    base.unwrap_or(0) + index..base.unwrap_or(0) + consumed,
+                    FlowBlock::Rows(group_rows(model, &calls, width)),
+                );
                 index = consumed;
                 continue;
             }
@@ -398,7 +483,10 @@ fn rendered_blocks(
         let at = base.map(|base| base + index);
         if let (Entry::Tool { duration: None, .. }, Some(at)) = (&entries[index], at) {
             if let Some(rows) = shell_running_lines(model, at, width) {
-                out.push(rows);
+                emit(
+                    base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
+                    FlowBlock::Rows(rows),
+                );
                 index += 1;
                 continue;
             }
@@ -406,13 +494,38 @@ fn rendered_blocks(
         match (&entries[index], at.and_then(|at| model.revealed(at))) {
             (Entry::Prose(text), Some(shown)) => {
                 let at = at.unwrap_or_default();
-                out.push(writing_lines(model, at, text, shown, width));
+                emit(
+                    base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
+                    FlowBlock::Prose {
+                        text,
+                        reveal: Some((at, shown)),
+                    },
+                );
             }
-            (entry, _) => out.push(entry_lines(model, entry, width)),
+            (Entry::Prose(text), _) => emit(
+                base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
+                FlowBlock::Prose { text, reveal: None },
+            ),
+            (Entry::User(text), _) => emit(
+                base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
+                FlowBlock::User(text),
+            ),
+            (
+                Entry::Shell {
+                    command, output, ..
+                },
+                _,
+            ) => emit(
+                base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
+                FlowBlock::Shell { command, output },
+            ),
+            (entry, _) => emit(
+                base.unwrap_or(0) + index..base.unwrap_or(0) + index + 1,
+                FlowBlock::Rows(entry_lines(model, entry, width)),
+            ),
         }
         index += 1;
     }
-    out
 }
 
 /// Command lines a running shell call shows before it says how many more.
@@ -511,42 +624,79 @@ fn shell_running_lines(model: &Model, at: usize, width: u16) -> Option<Vec<Line<
     Some(rows)
 }
 
-/// A reply mid-typewriter: the first `shown` characters through the same
-/// markdown path as finished prose, then a soft caret where the next
-/// character lands. The caret blinks while the reveal has caught up and this
-/// block is still the newest thing on screen, and is gone otherwise. A block
-/// queued behind the one being typed draws nothing yet.
-fn writing_lines(
-    model: &Model,
-    index: usize,
-    text: &str,
-    shown: usize,
-    width: u16,
-) -> Vec<Line<'static>> {
-    if !model.writing(index) {
-        return Vec::new();
-    }
-    let th = &model.theme;
-    let cc = th.cc();
-    let cut = text
-        .char_indices()
-        .nth(shown)
-        .map_or(text.len(), |(byte, _)| byte);
-    let mut rows = entry_lines(model, &Entry::Prose(text[..cut].to_string()), width);
-    let typing = model.revealing();
-    let newest = model.transcript[index + 1..]
-        .iter()
-        .all(|entry| matches!(entry, Entry::Gap));
-    let waiting = model.working.is_some() && newest && (model.tick / 2) % 2 == 0;
-    if typing || waiting {
-        let caret = span(CARET, cc.claude);
-        match rows.last_mut() {
-            Some(row) if run_width(&row.spans) < width => row.spans.push(caret),
-            Some(_) => {}
-            None => rows.push(Line::from(vec![span("● ", th.text), caret])),
+enum FlowBlock<'a> {
+    Rows(Vec<Line<'static>>),
+    Prose {
+        text: &'a str,
+        reveal: Option<(usize, usize)>,
+    },
+    User(&'a str),
+    Shell {
+        command: &'a str,
+        output: &'a [String],
+    },
+}
+impl FlowBlock<'_> {
+    fn visit(self, model: &Model, width: u16, emit: &mut dyn FnMut(Line<'static>)) {
+        match self {
+            Self::Rows(rows) => {
+                for row in rows {
+                    emit(row);
+                }
+            }
+            Self::User(text) => visit_user_lines(&model.theme, text, width, emit),
+            Self::Shell { command, output } => {
+                visit_shell_lines(&model.theme, command, output, width, emit)
+            }
+            Self::Prose { text, reveal } => {
+                if reveal.is_some_and(|(index, _)| !model.writing(index)) {
+                    return;
+                }
+                let cut = reveal.map_or(text.len(), |(_, shown)| {
+                    text.char_indices()
+                        .nth(shown)
+                        .map_or(text.len(), |(byte, _)| byte)
+                });
+                let safe = crate::davinci::sanitize::terminal_safe(&text[..cut]);
+                let mut index = 0;
+                let mut last = None;
+                markdown::visit_lines(
+                    &model.theme,
+                    &safe,
+                    MEASURE.min(width.saturating_sub(2)),
+                    &mut |row| {
+                        let mut spans =
+                            vec![span(if index == 0 { "● " } else { "  " }, model.theme.text)];
+                        spans.extend(row.spans);
+                        let row = Line::from(truncate_run(spans, width));
+                        if let Some(previous) = last.replace(row) {
+                            emit(previous);
+                        }
+                        index += 1;
+                    },
+                );
+                let caret = reveal.is_some_and(|(at, _)| {
+                    model.revealing()
+                        || model.working.is_some()
+                            && model.transcript[at + 1..]
+                                .iter()
+                                .all(|entry| matches!(entry, Entry::Gap))
+                            && (model.tick / 2) % 2 == 0
+                });
+                if caret {
+                    let cursor = span(CARET, model.theme.cc().claude);
+                    match last.as_mut() {
+                        Some(row) if run_width(&row.spans) < width => row.spans.push(cursor),
+                        Some(_) => {}
+                        None => last = Some(Line::from(vec![span("● ", model.theme.text), cursor])),
+                    }
+                }
+                if let Some(row) = last {
+                    emit(row);
+                }
+            }
         }
     }
-    rows
 }
 
 fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec<Line<'static>> {
@@ -1072,15 +1222,20 @@ fn tool_result(theme: &Theme, text: &str, width: u16) -> Line<'static> {
 }
 
 fn user_lines(theme: &Theme, text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    visit_user_lines(theme, text, width, &mut |row| rows.push(row));
+    rows
+}
+fn visit_user_lines(theme: &Theme, text: &str, width: u16, emit: &mut dyn FnMut(Line<'static>)) {
     let cc = theme.cc();
     let plain = text.replace('`', "");
     let code = code_ranges(text);
-    let wrapped = crate::wrap_text_with_ansi(&plain, width.saturating_sub(3).max(1) as usize);
     let mut offset = 0usize;
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(row, content)| {
+    let mut row = 0;
+    crate::ansi::visit_text_with_ansi(
+        &plain,
+        width.saturating_sub(3).max(1) as usize,
+        &mut |content| {
             let lead = if row == 0 { "❯ " } else { "  " };
             let mut spans = vec![Span::styled(
                 lead,
@@ -1102,9 +1257,10 @@ fn user_lines(theme: &Theme, text: &str, width: u16) -> Vec<Line<'static>> {
             }
             offset += content.chars().count() + 1;
             spans.push(Span::styled(" ", Style::default().bg(cc.user_bg)));
-            Line::from(truncate_run(merge_same_style(spans), width))
-        })
-        .collect()
+            emit(Line::from(truncate_run(merge_same_style(spans), width)));
+            row += 1;
+        },
+    );
 }
 
 fn code_ranges(text: &str) -> Vec<(usize, usize)> {
@@ -1138,8 +1294,20 @@ fn merge_same_style(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 }
 
 fn shell_lines(theme: &Theme, command: &str, output: &[String], width: u16) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    visit_shell_lines(theme, command, output, width, &mut |row| rows.push(row));
+    rows
+}
+
+fn visit_shell_lines(
+    theme: &Theme,
+    command: &str,
+    output: &[String],
+    width: u16,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
     let cc = theme.cc();
-    let mut rows = vec![Line::from(truncate_run(
+    emit(Line::from(truncate_run(
         vec![
             Span::styled("! ", Style::default().fg(cc.bash).bg(cc.bash_bg)),
             Span::styled(
@@ -1148,19 +1316,18 @@ fn shell_lines(theme: &Theme, command: &str, output: &[String], width: u16) -> V
             ),
         ],
         width,
-    ))];
+    )));
     if output.is_empty() {
-        rows.push(Line::from(span(format!("{ELBOW}(No output)"), cc.inactive)));
-        return rows;
+        emit(Line::from(span(format!("{ELBOW}(No output)"), cc.inactive)));
+        return;
     }
     for (index, row) in output.iter().enumerate() {
         let lead = if index == 0 { ELBOW } else { "     " };
-        rows.push(Line::from(truncate_run(
+        emit(Line::from(truncate_run(
             vec![span(lead, cc.inactive), span(row.clone(), theme.text)],
             width,
         )));
     }
-    rows
 }
 
 fn bold_numbers(text: &str, color: Color) -> Vec<Span<'static>> {
@@ -1271,12 +1438,15 @@ fn thinking_lines(
             span(format!("{} ", glyph::COLLAPSED), theme.primary),
             span("reasoning", theme.muted),
         ])];
-        let wrapped = wrap(text.trim(), measure);
-        let start = wrapped.len().saturating_sub(THINKING_TAIL);
+        let mut tail = std::collections::VecDeque::new();
+        crate::davinci::ui::visit_wrapped(text.trim(), measure, |row| {
+            if tail.len() == THINKING_TAIL {
+                tail.pop_front();
+            }
+            tail.push_back(row);
+        });
         rows.extend(
-            wrapped
-                .into_iter()
-                .skip(start)
+            tail.into_iter()
                 .map(|row| indent(2, vec![span(row, theme.muted)])),
         );
         return rows;
@@ -2696,6 +2866,55 @@ mod tests {
             .map(text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn shell_history_does_not_materialize_a_full_styled_block() {
+        let mut m = model(80);
+        m.transcript.push(Entry::Shell {
+            command: "fixture".into(),
+            output: (0..10_000).map(|i| format!("row {i}")).collect(),
+            failed: false,
+        });
+        visit_rendered_blocks(&m, &m.transcript, 80, Some(0), |_, block| {
+            assert!(
+                !matches!(block, FlowBlock::Rows(_)),
+                "a large shell entry allocated all styled rows before viewport selection"
+            );
+        });
+        let view = conversation_rows(&m, 80);
+        assert_eq!(view.len(), 10_001);
+        assert!(text(&view.slice(9999..10_000)[0]).contains("row 9998"));
+    }
+
+    #[test]
+    fn settled_render_cache_is_bounded_for_long_history() {
+        let mut m = model(80);
+        for index in 0..10_000 {
+            m.transcript.push(Entry::Prose(format!("answer {index}")));
+        }
+        let rows = conversation_rows(&m, 80);
+        assert!(rows.len() > 4096);
+        let window = rows.slice(100..140);
+        assert_eq!(window.len(), 40);
+        assert!(text(&window[0]).contains("answer 100"));
+        // Copying a large selection must not pin the selection in the cache.
+        assert_eq!(rows.slice(0..5000).len(), 5000);
+        let retained = SETTLED.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .index
+                .cached
+                .borrow()
+                .as_ref()
+                .map_or(0, |(_, rows)| rows.len())
+        });
+        assert!(
+            retained <= 4096,
+            "retained {retained} rendered history rows"
+        );
     }
 
     /// Entries the first-live scan examined, and settled-cache hits, for one

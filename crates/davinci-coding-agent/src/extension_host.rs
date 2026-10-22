@@ -202,6 +202,16 @@ impl ExtensionHost {
     }
 
     pub fn load_with_cwd(agent_dir: &Path, names: &[String], cwd: &Path) -> Self {
+        Self::load_with_startup(agent_dir, names, cwd, None, None)
+    }
+
+    pub fn load_with_startup(
+        agent_dir: &Path,
+        names: &[String],
+        cwd: &Path,
+        settings: Option<crate::settings::Settings>,
+        worker: Option<&crate::native_extensions::graph::GraphWorkerContext>,
+    ) -> Self {
         let manifests = discover_extensions(agent_dir, names);
         let mut host = Self {
             events: Vec::new(),
@@ -225,10 +235,14 @@ impl ExtensionHost {
             load_errors: Vec::new(),
             // Unique until `bind_native_session` names the real session, so a
             // `--no-session` run never shares a store with another process.
-            native: Arc::new(Mutex::new(NativeExtensionHost::new_with_agent_dir(
+            native: Arc::new(Mutex::new(NativeExtensionHost::new_with_settings(
                 ephemeral_session_key(),
                 cwd,
                 Some(agent_dir),
+                settings.unwrap_or_else(|| crate::settings::load_merged_settings(agent_dir, cwd)),
+                worker
+                    .map(crate::native_extensions::HostStartupRole::GraphWorker)
+                    .unwrap_or(crate::native_extensions::HostStartupRole::Lead),
             ))),
             before_agent_start_messages: Vec::new(),
             before_agent_start_system_prompt: None,

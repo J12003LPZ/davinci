@@ -542,7 +542,8 @@ mod tests {
         let mut allowed = BTreeMap::new();
         allowed.insert("DAVINCI_EVAL_ALLOWED".into(), "visible".into());
         let config = DavinciProcessConfig {
-            binary: "python".into(),
+            // Resolve before env_clear removes the test runner's PATH.
+            binary: davinci_sys::process::resolve_program("python"),
             launcher_args: vec![script.to_string_lossy().into_owned()],
             provider: "fixture".into(),
             model: "fixture-model".into(),
@@ -577,7 +578,8 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
         )
         .unwrap();
         let config = DavinciProcessConfig {
-            binary: "python".into(),
+            // Resolve before env_clear removes the test runner's PATH.
+            binary: davinci_sys::process::resolve_program("python"),
             launcher_args: vec![script.to_string_lossy().into_owned()],
             provider: "openai-codex".into(),
             model: "gpt-6-astra".into(),
@@ -611,7 +613,8 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
         fs::write(&script, "print('{\"type\":\"agent_end\"}')\n").unwrap();
         let clean_agent_dir = dir.path().join("agent");
         let config = DavinciProcessConfig {
-            binary: "python".into(),
+            // Resolve before env_clear removes the test runner's PATH.
+            binary: davinci_sys::process::resolve_program("python"),
             launcher_args: vec![script.to_string_lossy().into_owned()],
             provider: "selected".into(),
             model: "fixture-model".into(),
@@ -889,7 +892,8 @@ end"
         )
         .unwrap();
         let config = DavinciProcessConfig {
-            binary: "python".into(),
+            // Resolve before env_clear removes the test runner's PATH.
+            binary: davinci_sys::process::resolve_program("python"),
             launcher_args: vec![script.to_string_lossy().into_owned()],
             provider: "fixture".into(),
             model: "fixture-model".into(),
@@ -918,7 +922,8 @@ end"
         let script = dir.path().join("slow_davinci.py");
         fs::write(&script, "import time\ntime.sleep(5)\n").unwrap();
         let config = DavinciProcessConfig {
-            binary: "python".into(),
+            // Resolve before env_clear removes the test runner's PATH.
+            binary: davinci_sys::process::resolve_program("python"),
             launcher_args: vec![script.to_string_lossy().into_owned()],
             provider: "fixture".into(),
             model: "fixture-model".into(),

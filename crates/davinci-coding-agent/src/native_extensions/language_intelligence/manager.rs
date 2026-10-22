@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -57,6 +57,7 @@ struct NegativeDiscovery {
 
 #[derive(Debug)]
 struct Manager {
+    maintenance: Arc<OnceLock<crate::resource_lifecycle::IdleReaper>>,
     workspace: PathBuf,
     config: LanguageIntelligenceConfig,
     slots: Arc<Mutex<BTreeMap<SessionKey, Arc<Mutex<Slot>>>>>,
@@ -92,6 +93,7 @@ impl LanguageIntelligence {
     pub fn new(workspace: &Path, config: LanguageIntelligenceConfig) -> Self {
         Self {
             inner: Arc::new(Manager {
+                maintenance: Arc::default(),
                 workspace: workspace.into(),
                 config,
                 slots: Arc::new(Mutex::new(BTreeMap::new())),
@@ -114,6 +116,7 @@ impl LanguageIntelligence {
     fn fork(&self, workspace: PathBuf, permissions: Option<Arc<PermissionState>>) -> Self {
         Self {
             inner: Arc::new(Manager {
+                maintenance: self.inner.maintenance.clone(),
                 workspace,
                 config: self.inner.config.clone(),
                 slots: self.inner.slots.clone(),
@@ -834,6 +837,40 @@ impl LanguageIntelligence {
         family_cap: usize,
         budget: &RequestBudget,
     ) -> Result<(SharedSlot, Vec<SharedSlot>)> {
+        let slots = Arc::downgrade(&self.inner.slots);
+        let closed = Arc::downgrade(&self.inner.closed);
+        let timeout = Duration::from_millis(self.inner.config.idle_timeout_ms);
+        self.inner.maintenance.get_or_init(|| {
+            crate::resource_lifecycle::IdleReaper::start(Duration::from_secs(1), move || {
+                let (Some(slots), Some(closed)) = (slots.upgrade(), closed.upgrade()) else {
+                    return false;
+                };
+                if closed.load(Ordering::Acquire) {
+                    return false;
+                }
+                let retired = if let Ok(mut slots) = slots.try_lock() {
+                    let expired: Vec<_> = slots
+                        .iter()
+                        .filter_map(|(key, slot)| {
+                            // A request may own a slot before it obtains the slot lock.
+                            if Arc::strong_count(slot) != 1 {
+                                return None;
+                            }
+                            let guard = slot.try_lock().ok()?;
+                            (guard.last_used.elapsed() >= timeout).then(|| key.clone())
+                        })
+                        .collect();
+                    expired
+                        .into_iter()
+                        .filter_map(|key| slots.remove(&key))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                drop(retired);
+                true
+            })
+        });
         let mut slots = lock_until(&self.inner.slots, budget)?;
         if let Some(slot) = slots.get(key) {
             return Ok((slot.clone(), Vec::new()));
@@ -852,6 +889,9 @@ impl LanguageIntelligence {
                     }
                 })
                 .filter_map(|(candidate, slot)| {
+                    if Arc::strong_count(slot) != 1 {
+                        return None;
+                    }
                     let guard = slot.try_lock().ok()?;
                     if guard.session.is_none() {
                         return Some((candidate.clone(), guard.last_used));
@@ -1150,6 +1190,65 @@ mod tests {
             json!(second_root.path().canonicalize().unwrap())
         );
         manager.shutdown();
+    }
+
+    // Exercise the real idle reaper without constructing an Instant before the
+    // platform's monotonic-clock epoch (which panics on fresh Windows runners).
+    fn short_idle_timeout_fixture() -> TestWorkspace {
+        let mut fixture = TestWorkspace::new("typescript", "capture");
+        Arc::get_mut(&mut fixture.manager.inner)
+            .expect("fixture manager should be uniquely owned before first use")
+            .config
+            .idle_timeout_ms = 50;
+        fixture
+    }
+
+    #[test]
+    fn idle_sessions_expire_without_another_request() {
+        let fixture = short_idle_timeout_fixture();
+        fixture
+            .manager
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
+        {
+            let slots = fixture.manager.inner.slots.lock().unwrap();
+            assert_eq!(slots.len(), 1);
+        }
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until {
+            if fixture.manager.inner.slots.lock().unwrap().is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("idle server retained without another request");
+    }
+
+    #[test]
+    fn an_owned_request_slot_is_not_evicted_as_idle() {
+        let fixture = short_idle_timeout_fixture();
+        fixture
+            .manager
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
+        let held = fixture
+            .manager
+            .inner
+            .slots
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(fixture.manager.inner.slots.lock().unwrap().len(), 1);
+        drop(held);
+        let until = Instant::now() + Duration::from_secs(3);
+        while !fixture.manager.inner.slots.lock().unwrap().is_empty() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

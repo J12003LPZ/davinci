@@ -197,3 +197,5 @@ The workflows view follows Claude Code's progress view and refreshes every secon
 | Nested teams, teammates surviving `/resume` | Not supported |
 
 See [runtime orchestration](runtime-orchestration.md) for routing and artifact boundaries.
+
+Ordinary subagent concurrency is configurable with `subagentMaxConcurrentTasks` (1–8, default 4). Optional shared estimated worker reservations and smaller resource profiles are documented in [resource lifecycle](perf/resource-lifecycle.md).

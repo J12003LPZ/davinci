@@ -31,6 +31,7 @@ pub(crate) mod operation_bridge;
 pub(crate) mod operations;
 pub(crate) mod preflight;
 pub(crate) mod process;
+mod process_output;
 pub(crate) mod recovery;
 pub(crate) mod render;
 pub(crate) mod replay;
@@ -352,6 +353,7 @@ fn saved_definition_from_run(
 
 #[derive(Debug, Clone)]
 pub struct GraphController {
+    pub worker_admission: davinci_agent::runtime::worker_admission::WorkerAdmission,
     cwd: PathBuf,
     session_model: Option<String>,
     session_thinking: Option<String>,
@@ -417,9 +419,22 @@ fn economy_role_models(session_model: Option<&str>) -> std::collections::BTreeMa
     )
 }
 
+fn acquire_worker_resources(
+    admission: &davinci_agent::runtime::worker_admission::WorkerAdmission,
+    parent_reserved: bool,
+    abort: &std::sync::atomic::AtomicBool,
+    deadline: Option<std::time::Instant>,
+) -> Result<davinci_agent::runtime::worker_admission::WorkerLease, String> {
+    admission.acquire_worker_with_wait(!parent_reserved, || {
+        abort.load(std::sync::atomic::Ordering::Acquire)
+            || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    })
+}
+
 impl GraphController {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
+            worker_admission: Default::default(),
             cwd,
             session_model: None,
             session_thinking: None,
@@ -517,11 +532,38 @@ impl GraphController {
             loaded.config.models = models.clone();
         }
         let sink = Arc::clone(active);
+        let admission = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.worker_admission.clone())
+            .filter(|admission| admission.is_configured())
+            .unwrap_or_else(|| self.worker_admission.clone());
+        let parent_reservation = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.worker_resource_lease.clone())
+            .unwrap_or_default();
         let deps = ControllerDeps {
             runner: if dry_run {
                 Arc::new(run_dry_worker)
             } else {
-                Arc::new(run_worker)
+                Arc::new(move |spec, abort, progress| {
+                    match acquire_worker_resources(
+                        &admission,
+                        parent_reservation.is_held(),
+                        abort,
+                        spec.run_deadline,
+                    ) {
+                        Ok(_lease) => run_worker(spec, abort, progress),
+                        Err(error) => WorkerResult {
+                            run_deadline_exceeded: spec
+                                .run_deadline
+                                .is_some_and(|deadline| std::time::Instant::now() >= deadline),
+                            failure_reason: Some(error),
+                            ..Default::default()
+                        },
+                    }
+                })
             },
             verify_exec: if dry_run {
                 Arc::new(dry_run_verify_exec)
@@ -1800,6 +1842,35 @@ mod tests {
         let mut controller = GraphController::new(cwd.to_path_buf());
         controller.set_session_context(None, None, false);
         controller
+    }
+
+    #[test]
+    fn resource_wait_honors_deadlines_and_never_blocks_a_reserved_parent() {
+        use davinci_agent::runtime::worker_admission::{WorkerAdmission, WorkerResourceConfig};
+        let admission = WorkerAdmission::new(Some(WorkerResourceConfig {
+            memory_budget_bytes: 1,
+            estimated_worker_bytes: 1,
+        }))
+        .unwrap();
+        let _parent = admission.acquire_worker(|| false).unwrap();
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        assert!(acquire_worker_resources(
+            &admission,
+            false,
+            &abort,
+            Some(std::time::Instant::now())
+        )
+        .is_err());
+        let error = acquire_worker_resources(
+            &admission,
+            true,
+            &abort,
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(500)),
+        )
+        .unwrap_err();
+        assert!(error.contains("nested worker"), "{error}");
+        assert_eq!(admission.stats().waiting_workers, 0);
+        assert_eq!(admission.stats().reserved_bytes, 1);
     }
 
     #[test]

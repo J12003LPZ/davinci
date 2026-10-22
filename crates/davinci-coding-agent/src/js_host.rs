@@ -10,6 +10,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod lifecycle;
+use crate::settings::ExtensionRuntimeConfig;
+use davinci_coding_agent::resource_lifecycle::IdleReaper;
+use lifecycle::LoadMemo;
+use std::time::Instant;
 
 const RUNNER_JS: &str = include_str!("extension_runner.js");
 
@@ -521,30 +526,96 @@ const MAX_PERSISTENT_JS_SESSIONS: usize = 8;
 struct PersistentJsPool {
     sessions: std::collections::HashMap<PathBuf, PersistentJsSession>,
     lru: std::collections::VecDeque<PathBuf>,
+    last_used: std::collections::HashMap<PathBuf, Instant>,
+    retired: Vec<PersistentJsSession>,
 }
 
 impl PersistentJsPool {
     fn touch(&mut self, module: &Path) {
+        self.last_used.insert(module.to_path_buf(), Instant::now());
         self.lru.retain(|path| path != module);
         self.lru.push_back(module.to_path_buf());
     }
 
     fn remove(&mut self, module: &Path) {
-        self.sessions.remove(module);
+        if let Some(session) = self.sessions.remove(module) {
+            self.retired.push(session);
+        }
+        self.last_used.remove(module);
         self.lru.retain(|path| path != module);
     }
 
     fn ensure_capacity(&mut self) {
-        while self.sessions.len() >= MAX_PERSISTENT_JS_SESSIONS {
+        while self.sessions.len()
+            >= js_config()
+                .max_persistent_sessions
+                .min(MAX_PERSISTENT_JS_SESSIONS)
+        {
             let Some(oldest) = self.lru.pop_front() else {
                 break;
             };
-            self.sessions.remove(&oldest);
+            self.remove(&oldest);
         }
     }
 }
 
 static JS_POOL: Mutex<Option<PersistentJsPool>> = Mutex::new(None);
+static JS_REAPER: Mutex<Option<IdleReaper>> = Mutex::new(None);
+static JS_CONFIG: OnceLock<Mutex<ExtensionRuntimeConfig>> = OnceLock::new();
+
+fn js_config() -> ExtensionRuntimeConfig {
+    JS_CONFIG
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+pub fn configure_js_runtime(config: ExtensionRuntimeConfig) -> Result<(), String> {
+    config.validate()?;
+    *JS_CONFIG
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+        .map_err(|e| e.to_string())? = config.clone();
+    let mut memo = LOAD_CACHE.lock().map_err(|e| e.to_string())?;
+    memo.max_entries = config.load_cache_max_entries;
+    memo.max_bytes = config.load_cache_max_bytes;
+    memo.trim();
+    Ok(())
+}
+
+fn start_js_reaper() {
+    let mut owner = JS_REAPER.lock().unwrap_or_else(|e| e.into_inner());
+    owner.get_or_insert_with(|| {
+        IdleReaper::start(Duration::from_secs(1), || {
+            let config = js_config();
+            if config.idle_timeout_ms == 0 {
+                return true;
+            }
+            let retired = if let Ok(mut guard) = JS_POOL.try_lock() {
+                if let Some(pool) = guard.as_mut() {
+                    let expired: Vec<_> = pool
+                        .last_used
+                        .iter()
+                        .filter(|(_, used)| {
+                            used.elapsed() >= Duration::from_millis(config.idle_timeout_ms)
+                        })
+                        .map(|(path, _)| path.clone())
+                        .collect();
+                    for path in expired {
+                        pool.remove(&path);
+                    }
+                    std::mem::take(&mut pool.retired)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            drop(retired);
+            true
+        })
+    });
+}
 
 fn js_pool_enabled() -> bool {
     !matches!(
@@ -558,9 +629,14 @@ fn run_pooled_js_extension(
     op: &str,
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
+    start_js_reaper();
     let mut pool = JS_POOL.lock().map_err(|err| err.to_string())?;
-    let pool = pool.get_or_insert_with(PersistentJsPool::default);
-    run_in_js_pool(pool, module, op, payload)
+    let state = pool.get_or_insert_with(PersistentJsPool::default);
+    let result = run_in_js_pool(state, module, op, payload);
+    let retired = std::mem::take(&mut state.retired);
+    drop(pool);
+    drop(retired);
+    result
 }
 
 fn run_in_js_pool(
@@ -583,7 +659,9 @@ fn run_in_js_pool(
             return Ok(initial);
         }
     }
-    match session.send(op, payload) {
+    let result = session.send(op, payload);
+    pool.touch(module);
+    match result {
         Ok(result) => Ok(result),
         // A hung runner was killed by the timeout; retrying the same op on a
         // fresh one would hang the caller for another whole timeout.
@@ -606,9 +684,14 @@ fn run_in_js_pool(
 
 /// Drop every pooled runner (used on shutdown and by tests).
 pub fn shutdown_js_pool() {
-    if let Ok(mut pool) = JS_POOL.lock() {
-        *pool = None;
-    }
+    // Serialize a new owner with both stopping the old loop and detaching its
+    // pool. The loop never takes JS_REAPER, so joining here cannot invert it.
+    let mut owner = JS_REAPER.lock().unwrap_or_else(|e| e.into_inner());
+    let reaper = owner.take();
+    drop(reaper);
+    let pool = JS_POOL.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(owner);
+    drop(pool);
     if let Ok(mut cache) = LOAD_CACHE.lock() {
         cache.clear();
     }
@@ -618,8 +701,7 @@ pub fn shutdown_js_pool() {
 /// rebuilt frequently; without this every rebuild paid one node spawn per
 /// extension just to re-read a manifest that cannot have changed.
 type LoadCacheKey = (PathBuf, Option<std::time::SystemTime>, String);
-static LOAD_CACHE: Mutex<std::collections::BTreeMap<LoadCacheKey, JsExtensionResult>> =
-    Mutex::new(std::collections::BTreeMap::new());
+static LOAD_CACHE: Mutex<LoadMemo> = Mutex::new(LoadMemo::new());
 
 fn load_cache_key(module: &Path, payload: &Value) -> LoadCacheKey {
     let mtime = std::fs::metadata(module)
@@ -642,12 +724,21 @@ pub fn run_js_extension(
     // identical loads are served from the memo instead of a fresh spawn.
     let pooling =
         !wait_ui && std::env::var_os("PI_EXTENSION_UI_REPLY").is_none() && js_pool_enabled();
-    if op == "load" && pooling {
-        let key = load_cache_key(module, payload);
+    let memo_key = if op == "load"
+        && pooling
+        && LOAD_CACHE
+            .lock()
+            .is_ok_and(|cache| cache.max_entries > 0 && cache.max_bytes > 0)
+    {
+        Some(load_cache_key(module, payload))
+    } else {
+        None
+    };
+    if let Some(key) = &memo_key {
         if let Some(cached) = LOAD_CACHE
             .lock()
             .ok()
-            .and_then(|cache| cache.get(&key).cloned())
+            .and_then(|mut cache| cache.get(key).cloned())
         {
             return Ok(cached);
         }
@@ -739,9 +830,9 @@ pub fn run_js_extension(
             String::from_utf8_lossy(&output.stderr)
         )
     })?;
-    if op == "load" && pooling && parsed.ok {
-        if let Ok(mut cache) = LOAD_CACHE.lock() {
-            cache.insert(load_cache_key(module, payload), parsed.clone());
+    if parsed.ok {
+        if let (Some(key), Ok(mut cache)) = (memo_key, LOAD_CACHE.lock()) {
+            cache.insert(key, &parsed);
         }
     }
     Ok(parsed)
@@ -1087,6 +1178,112 @@ pub fn execute_command_tool(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn idle_pool_fixture() {
+        let Ok(mode) = std::env::var("DAVINCI_JS_IDLE_FIXTURE") else {
+            return;
+        };
+        if find_node().is_none() {
+            return;
+        }
+        configure_js_runtime(ExtensionRuntimeConfig {
+            idle_timeout_ms: 100,
+            ..Default::default()
+        })
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let module = dir.path().join("index.js");
+        std::fs::write(&module, "module.exports = pi => { pi.on('agent_start', async () => { await new Promise(resolve => setTimeout(resolve, 1500)); return { ok: true }; }); };").unwrap();
+        run_persistent_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        if mode == "active" {
+            run_persistent_js_extension(
+                &module,
+                "emit",
+                &serde_json::json!({"type":"agent_start"}),
+            )
+            .unwrap();
+            assert_eq!(
+                JS_SESSION_SPAWNS.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "active runner was killed and restarted"
+            );
+        } else {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                if JS_POOL
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|pool| pool.sessions.is_empty())
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "idle process retained without another event"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        shutdown_js_pool();
+    }
+
+    #[test]
+    fn idle_pool_releases_idle_children_and_preserves_active_calls() {
+        for mode in ["idle", "active"] {
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "js_host::tests::idle_pool_fixture",
+                    "--nocapture"
+                ])
+                .env("DAVINCI_JS_IDLE_FIXTURE", mode)
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+
+    #[test]
+    fn load_cache_retention_is_bounded() {
+        let _guard = persistent_host_guard();
+        let mut cache = LOAD_CACHE.lock().unwrap();
+        cache.clear();
+        for index in 0..256 {
+            cache.insert(
+                (
+                    PathBuf::from(format!("extension-{index}")),
+                    None,
+                    "{}".into(),
+                ),
+                JsExtensionResult::default(),
+            );
+        }
+        let retained = cache.len();
+        cache.clear();
+        drop(cache);
+        assert!(retained <= 128, "memo retained {retained} entries");
+    }
+
+    #[test]
+    fn load_cache_does_not_retain_oversized_payloads() {
+        let _guard = persistent_host_guard();
+        let mut cache = LOAD_CACHE.lock().unwrap();
+        cache.clear();
+        cache.insert(
+            (
+                PathBuf::from("extension"),
+                None,
+                "x".repeat(9 * 1024 * 1024),
+            ),
+            JsExtensionResult::default(),
+        );
+        let empty = cache.is_empty();
+        cache.clear();
+        drop(cache);
+        assert!(empty);
+    }
 
     #[test]
     fn sandbox_persistent_js_transition_fixture() {

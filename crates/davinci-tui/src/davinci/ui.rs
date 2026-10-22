@@ -232,44 +232,44 @@ fn break_head(word: &str, width: u16) -> String {
 
 /// Wrap prose to the measure. Words longer than the measure are broken.
 pub fn wrap(text: &str, width: u16) -> Vec<String> {
+    let mut rows = Vec::new();
+    visit_wrapped(text, width, |row| rows.push(row));
+    rows
+}
+
+/// Stream word-wrapped rows without materializing the whole paragraph.
+pub(crate) fn visit_wrapped(text: &str, width: u16, mut emit: impl FnMut(String)) {
     if width == 0 {
-        return vec![String::new()];
+        emit(String::new());
+        return;
     }
-    let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
-    for word in text.split_whitespace() {
-        let mut word = word.to_string();
-        if current.is_empty() {
-            while UnicodeWidthStr::width(word.as_str()) > width as usize {
-                let head = break_head(&word, width);
-                word = word[head.len()..].to_string();
-                lines.push(head);
+    let mut emitted = false;
+    for mut word in text.split_whitespace() {
+        let mut cells = UnicodeWidthStr::width(word);
+        if !current.is_empty() {
+            if UnicodeWidthStr::width(current.as_str()) + 1 + cells <= width as usize {
+                current.push(' ');
+                current.push_str(word);
+                continue;
             }
-            current = word;
-            continue;
+            emit(std::mem::take(&mut current));
+            emitted = true;
         }
-        let candidate_width =
-            UnicodeWidthStr::width(current.as_str()) + 1 + UnicodeWidthStr::width(word.as_str());
-        if candidate_width <= width as usize {
-            current.push(' ');
-            current.push_str(&word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            while UnicodeWidthStr::width(word.as_str()) > width as usize {
-                let head = break_head(&word, width);
-                word = word[head.len()..].to_string();
-                lines.push(head);
-            }
-            current = word;
+        while cells > width as usize {
+            let head = break_head(word, width);
+            cells = cells.saturating_sub(UnicodeWidthStr::width(head.as_str()));
+            word = &word[head.len()..];
+            emit(head);
+            emitted = true;
         }
+        current.push_str(word);
     }
     if !current.is_empty() {
-        lines.push(current);
+        emit(current);
+    } else if !emitted {
+        emit(String::new());
     }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
 }
 
 /// Keep the last `n` rows — the transcript scrolls like a terminal.
