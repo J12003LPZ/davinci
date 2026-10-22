@@ -228,6 +228,60 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// Closing a Windows socket with an unread POST body can reset the connection.
+fn read_fake_ollama_request(reader: &mut impl Read) -> std::io::Result<String> {
+    let mut buffer = vec![0u8; 8192];
+    let mut read = 0;
+    loop {
+        if read == buffer.len() {
+            return Err(std::io::Error::other(
+                "fake Ollama request exceeds 8192 bytes",
+            ));
+        }
+        let n = reader.read(&mut buffer[read..])?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        read += n;
+        if let Some(split) = buffer[..read].windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buffer[..split]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .unwrap_or("0")
+                .parse::<usize>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if length > buffer.len() - split - 4 {
+                return Err(std::io::Error::other(
+                    "fake Ollama request exceeds 8192 bytes",
+                ));
+            }
+            if read >= split + 4 + length {
+                return Ok(String::from_utf8_lossy(&buffer[..read]).to_string());
+            }
+        }
+    }
+}
+
+#[test]
+fn fake_ollama_reads_a_body_delivered_after_the_headers() {
+    let headers = b"POST /api/embed HTTP/1.1\r\nHost: localhost\r\ncontent-length: 13\r\n\r\n";
+    let body = b"{\"input\":\"x\"}";
+    let mut request = std::io::Cursor::new(headers).chain(std::io::Cursor::new(body));
+    assert_eq!(
+        read_fake_ollama_request(&mut request).unwrap(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(headers),
+            String::from_utf8_lossy(body)
+        )
+    );
+}
+
 /// A loopback Ollama: `/api/tags` lists `models`, `/api/embed` answers with
 /// vectors of `dimensions`. Counts the requests it serves.
 struct FakeOllama {
@@ -245,20 +299,10 @@ fn fake_ollama(models: &'static [&'static str], dimensions: usize) -> FakeOllama
             let Ok(mut stream) = stream else { continue };
             let counter = Arc::clone(&counter);
             std::thread::spawn(move || {
-                let mut buffer = vec![0u8; 8192];
-                let mut read = 0;
-                // Read until the headers (and a short body) are in.
-                while let Ok(n) = stream.read(&mut buffer[read..]) {
-                    if n == 0 {
-                        break;
-                    }
-                    read += n;
-                    if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") && read > 40 {
-                        break;
-                    }
-                }
+                let Ok(request) = read_fake_ollama_request(&mut stream) else {
+                    return;
+                };
                 counter.fetch_add(1, Ordering::SeqCst);
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let body = if request.starts_with("GET /api/tags") {
                     let list: Vec<_> = models
                         .iter()
@@ -434,18 +478,9 @@ fn serve_fake_ollama_at(url: &str, models: &'static [&'static str], dimensions: 
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             std::thread::spawn(move || {
-                let mut buffer = vec![0u8; 8192];
-                let mut read = 0;
-                while let Ok(n) = stream.read(&mut buffer[read..]) {
-                    if n == 0 {
-                        break;
-                    }
-                    read += n;
-                    if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") && read > 40 {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let Ok(request) = read_fake_ollama_request(&mut stream) else {
+                    return;
+                };
                 let body = if request.starts_with("GET /api/tags") {
                     let list: Vec<_> = models
                         .iter()
@@ -727,18 +762,9 @@ fn pull_server(installed: bool, dimensions: usize, succeed: bool) -> PullServer 
             let Ok(mut stream) = stream else { continue };
             let (have, pulls) = (Arc::clone(&have_t), Arc::clone(&pulls_t));
             std::thread::spawn(move || {
-                let mut buffer = vec![0u8; 8192];
-                let mut read = 0;
-                while let Ok(n) = stream.read(&mut buffer[read..]) {
-                    if n == 0 {
-                        break;
-                    }
-                    read += n;
-                    if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") && read > 40 {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let Ok(request) = read_fake_ollama_request(&mut stream) else {
+                    return;
+                };
                 let body = if request.starts_with("GET /api/tags") {
                     if have.load(Ordering::SeqCst) {
                         "{\"models\":[{\"name\":\"embeddinggemma:latest\"}]}".to_string()
