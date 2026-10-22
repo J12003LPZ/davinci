@@ -512,8 +512,32 @@ jobs:
           # run closure after early errors, and fatal frame mapping.
           cargo test -p davinci-coding-agent --test codemode_supervisor --test codemode_supervisor_budget --locked -- --ignored --nocapture --test-threads=1
       - name: Current dependency advisory report
+        # All matrix legs resolve the same platform-independent pinned
+        # production packages. Audit the shared lockfile once rather than
+        # requiring the npm advisory endpoint to respond on three runners.
+        if: runner.os == 'Linux'
         working-directory: crates/davinci-coding-agent/codemode-host
-        run: npm audit --omit=dev --json
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if npm audit --omit=dev --json --fetch-retries=0 --fetch-timeout=30000 > npm-audit.json; then
+              cat npm-audit.json
+              exit 0
+            fi
+            cat npm-audit.json
+            # An actual advisory report with vulnerabilities is not a
+            # transient network error: fail immediately and keep the evidence.
+            if node -e 'const fs=require("node:fs");let report;try{report=JSON.parse(fs.readFileSync("npm-audit.json","utf8"))}catch{process.exit(1)};process.exit(report.auditReportVersion && report.metadata && report.vulnerabilities ? 0 : 1)'; then
+              echo "npm audit reported vulnerabilities; failing the security gate"
+              exit 1
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "npm audit unavailable after 3 attempts; failing closed"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Preserve resolved dependency evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -522,6 +546,7 @@ jobs:
           path: |
             crates/davinci-coding-agent/codemode-host/package-lock.json
             crates/davinci-coding-agent/codemode-host/package-assets-report.json
+            crates/davinci-coding-agent/codemode-host/npm-audit.json
           if-no-files-found: warn
 
   codemode-structured:
