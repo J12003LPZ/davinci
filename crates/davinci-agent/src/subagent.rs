@@ -1939,19 +1939,41 @@ mod tests {
 
     #[test]
     fn tasks_fan_out_and_report_in_order() {
-        let runner = SubagentRunner::new(|req| {
+        // Synchronize the two successful workers instead of relying on a
+        // wall-clock limit that flakes on busy Windows CI runners.
+        let gate = Arc::new((
+            std::sync::Mutex::new((0usize, false)),
+            std::sync::Condvar::new(),
+        ));
+        let worker_gate = gate.clone();
+        let runner = SubagentRunner::new(move |req| {
             if req.prompt == "boom" {
-                Err("nope".into())
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(if req.prompt == "slow" {
-                    60
-                } else {
-                    5
-                }));
-                Ok(format!("answer to {}", req.prompt))
+                return Err("nope".into());
             }
+            let (lock, ready) = &*worker_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 += 1;
+            ready.notify_all();
+            let (next, _) = ready
+                .wait_timeout_while(state, std::time::Duration::from_secs(10), |s| s.0 < 2)
+                .unwrap();
+            state = next;
+            if state.0 < 2 {
+                return Err("workers were not scheduled concurrently".into());
+            }
+            if req.prompt == "slow" {
+                let (next, _) = ready
+                    .wait_timeout_while(state, std::time::Duration::from_secs(10), |s| !s.1)
+                    .unwrap();
+                if !next.1 {
+                    return Err("fast worker did not complete".into());
+                }
+            } else {
+                state.1 = true;
+                ready.notify_all();
+            }
+            Ok(format!("answer to {}", req.prompt))
         });
-        let start = std::time::Instant::now();
         let result = run_tool(
             &json!({"tasks": [
                 {"prompt": "slow", "description": "first"},
@@ -1963,7 +1985,6 @@ mod tests {
             &SubagentParent::default(),
         )
         .unwrap();
-        assert!(start.elapsed() < std::time::Duration::from_millis(120));
         let text = result.content;
         let first = text.find("## 1 — first\nanswer to slow").unwrap();
         let second = text.find("## 2 — task 2\nanswer to fast").unwrap();
