@@ -444,9 +444,15 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     run.updated_at = snapshot.updated_at;
     // Advisory index: the committed state.json remains authoritative. Losing
     // the index must never turn a successful checkpoint into a failed one.
-    let summary = RunSummary::from_run(&snapshot);
-    if let Ok(bytes) = serde_json::to_vec(&summary) {
-        let _ = atomic_write(&run_dir(&cwd, &run.run_id).join("summary.json"), &bytes);
+    if let Ok(stamp) = serde_json::from_slice::<CheckpointIndexStamp>(&content) {
+        let index = RunSummaryIndex {
+            summary: RunSummary::from_run(&snapshot),
+            checkpoint_sequence: stamp.checkpoint_sequence,
+            state_sha256: super::replay::sha256_hex(&content),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&index) {
+            let _ = atomic_write(&run_dir(&cwd, &run.run_id).join("summary.json"), &bytes);
+        }
     }
     Ok(())
 }
@@ -707,25 +713,91 @@ impl RunSummary {
     }
 }
 
-/// Read a small index when it is no older than the canonical checkpoint.
-/// Old runs without sidecars, corrupt sidecars, and sidecar write failures all
-/// fall back to the validated checkpoint.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSummaryIndex {
+    #[serde(flatten)]
+    summary: RunSummary,
+    #[serde(default)]
+    checkpoint_sequence: Option<u64>,
+    state_sha256: String,
+}
+
+// This branch can read older checkpoints without a sequence. The digest binds
+// the entire canonical generation in that case; sequence support is automatic
+// when composed with the checkpoint-integrity branch.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointIndexStamp {
+    version: u32,
+    cwd: String,
+    run_id: String,
+    phase: super::types::Phase,
+    #[serde(default)]
+    checkpoint_sequence: Option<u64>,
+}
+
+/// Timestamp resolution cannot establish index freshness. Stream canonical
+/// state once, hashing every byte and reading only its tiny metadata projection.
 fn indexed_run_summary(cwd: &Path, run_id: &str) -> Option<RunSummary> {
+    use sha2::{Digest, Sha256};
     if !is_safe_run_id(run_id) {
         return None;
     }
-    let directory = run_dir(cwd, run_id);
-    let state_metadata = fs::metadata(directory.join("state.json")).ok()?;
-    let summary_path = directory.join("summary.json");
-    let summary_metadata = fs::metadata(&summary_path).ok()?;
-    if summary_metadata.modified().ok()? < state_metadata.modified().ok()? {
+    // A sidecar must not bypass canonical conflict detection across aliases.
+    if modern_runs_root_dir(cwd)
+        .join(run_id)
+        .join("state.json")
+        .exists()
+        && legacy_runs_root_dir(cwd)
+            .join(run_id)
+            .join("state.json")
+            .exists()
+    {
         return None;
     }
-    let mut file = fs::File::open(summary_path).ok()?;
+    let directory = run_dir(cwd, run_id);
+    let mut file = fs::File::open(directory.join("summary.json")).ok()?;
     let mut bytes = Vec::new();
     file.by_ref().take(16 * 1024).read_to_end(&mut bytes).ok()?;
-    let summary: RunSummary = serde_json::from_slice(&bytes).ok()?;
-    (summary.run_id == run_id && summary.goal.len() <= 8192).then_some(summary)
+    let index: RunSummaryIndex = serde_json::from_slice(&bytes).ok()?;
+    if index.summary.run_id != run_id || index.summary.goal.len() > 8192 {
+        return None;
+    }
+    struct HashingReader<R> {
+        inner: R,
+        hash: Sha256,
+    }
+    impl<R: Read> Read for HashingReader<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(bytes)?;
+            self.hash.update(&bytes[..count]);
+            Ok(count)
+        }
+    }
+    let hashing = HashingReader {
+        inner: fs::File::open(directory.join("state.json")).ok()?,
+        hash: Sha256::new(),
+    };
+    let mut reader = std::io::BufReader::new(hashing);
+    let stamp: CheckpointIndexStamp = serde_json::from_reader(&mut reader).ok()?;
+    let state_sha256: String = reader
+        .into_inner()
+        .hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if stamp.version != 1
+        || Path::new(&stamp.cwd).canonicalize().ok()? != cwd.canonicalize().ok()?
+        || stamp.run_id != run_id
+        || stamp.phase.as_str() != index.summary.phase
+        || stamp.checkpoint_sequence != index.checkpoint_sequence
+        || state_sha256 != index.state_sha256
+    {
+        return None;
+    }
+    Some(index.summary)
 }
 
 /// Every persisted run in this project, newest first.
@@ -833,6 +905,37 @@ mod tests {
         ArtifactKind, GraphBudgets, GraphCounters, Phase, ReviewDecision, Verdict,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn pr_review_equal_mtimes_do_not_validate_stale_summary() {
+        let dir = tempdir().unwrap();
+        let mut run = sample_run(dir.path(), "coarse-index", "goal");
+        save_run(&mut run).unwrap();
+        let directory = run_dir(dir.path(), &run.run_id);
+        let old_summary = fs::read(directory.join("summary.json")).unwrap();
+        run.phase = Phase::Done;
+        save_run(&mut run).unwrap();
+        // Equivalent to a failed optional summary publication after state commits.
+        fs::write(directory.join("summary.json"), old_summary).unwrap();
+        let coarse = std::time::UNIX_EPOCH + std::time::Duration::from_secs(42);
+        for name in ["summary.json", "state.json"] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(directory.join(name))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(coarse))
+                .unwrap();
+        }
+        assert!(indexed_run_summary(dir.path(), &run.run_id).is_none());
+        assert_eq!(
+            list_runs(dir.path())
+                .iter()
+                .find(|entry| entry.run_id == run.run_id)
+                .unwrap()
+                .phase,
+            "done"
+        );
+    }
 
     #[test]
     fn blob_gc_keeps_referenced_hashes_and_removes_orphans() {
