@@ -1452,6 +1452,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         // starts without Codemode and says why, rather than refusing to start.
         let explicit = parsed.codemode.is_some();
         let agent_dir = default_agent_dir();
+        agent.set_codemode_configured_mode(
+            davinci_coding_agent::codemode_host::config::configured_mode(
+                parsed.codemode.as_deref(),
+                settings.codemode.as_ref(),
+            ),
+        );
         let staged = davinci_coding_agent::codemode_host::config::resolve_config(
             parsed.codemode.as_deref(),
             settings.codemode.as_ref(),
@@ -4305,10 +4311,8 @@ fn run_print_turns(
         .unwrap_or_default();
     // Written before any approval_required, which stays the final line.
     if json_mode {
-        let encoded = serde_json::to_string(&serde_json::json!({
-            "type": "harness_stats", "schema_version": 1, "runtime": agent.run_stats(),
-        }))
-        .map_err(|err| err.to_string())?;
+        let encoded = serde_json::to_string(&output::harness_stats_record(agent))
+            .map_err(|err| err.to_string())?;
         output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
     }
     if json_mode && !denied.is_empty() {
@@ -8415,6 +8419,12 @@ fn apply_orchestration_settings(agent: &mut Agent, settings: &settings::Settings
 pub(crate) fn sync_codemode_from_settings(agent: &mut Agent) -> Result<(), String> {
     let agent_dir = default_agent_dir();
     let stored = load_merged_settings(&agent_dir, &agent.cwd);
+    agent.set_codemode_configured_mode(
+        davinci_coding_agent::codemode_host::config::configured_mode(
+            None,
+            stored.codemode.as_ref(),
+        ),
+    );
     let config = davinci_coding_agent::codemode_host::config::resolve_config(
         None,
         stored.codemode.as_ref(),

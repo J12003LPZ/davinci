@@ -5265,12 +5265,18 @@ fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     // The message names where it looked, so a wrong agent dir is visible.
     assert!(missing.contains(&node), "{missing}");
     assert!(!agent.has_staged_codemode());
+    // On in /config but not admitted: the stats say so, not "off".
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        serde_json::json!({"mode": "read-only", "available": false, "calls": 0})
+    );
 
     super::persist_interactive_setting("codemode=false").unwrap();
     assert_eq!(saved()["codemode"]["mode"], "off");
     assert_eq!(saved()["codemode"]["hostPath"], host.as_str());
     super::sync_codemode_from_settings(&mut agent).unwrap();
     assert!(!agent.has_staged_codemode());
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
 }
 
 #[test]

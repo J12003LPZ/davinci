@@ -483,6 +483,9 @@ pub struct Agent {
     /// Admitted at startup, registered on each turn's runtime once it has an
     /// operation journal (see `activate_staged_codemode`).
     pub(crate) staged_codemode: Option<codemode::CodeModeBinding>,
+    /// The Codemode mode the host resolved from `--codemode` and `/config`,
+    /// reported by `feature_use` even when the runtime was not admitted.
+    codemode_configured_mode: Option<String>,
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
@@ -779,6 +782,7 @@ impl Agent {
             agent_profile_models: None,
             codemode: None,
             staged_codemode: None,
+            codemode_configured_mode: None,
             pre_tool: None,
             post_tool: None,
             script_post_tool: None,
@@ -2926,6 +2930,65 @@ impl Agent {
         self.counters.fold_into(&mut stats);
         self.read_diagnostics().fold_into(&mut stats);
         stats
+    }
+
+    /// Record the Codemode mode the host resolved, admitted or not.
+    pub fn set_codemode_configured_mode(&mut self, mode: &str) {
+        self.codemode_configured_mode = Some(mode.to_string());
+    }
+
+    /// Whether Context VM and Codemode were configured and used, for the
+    /// `harness_stats` record. Observability only: reads existing counters.
+    /// `contextVm` is `{"mode":"off"}` alone while the VM is off. `codemode`
+    /// reports the configured mode when the host recorded one (so "on but the
+    /// runtime was not admitted" reads `read-only` with `available: false`),
+    /// else `read-only` if the tool is exposed and `off` if not. `calls`
+    /// counts every `codemode` dispatch, including requests refused before a
+    /// script ran.
+    pub fn feature_use(&self) -> serde_json::Value {
+        let mode = match self.context_vm_mode() {
+            ContextVmMode::Off => "off",
+            ContextVmMode::Shadow => "shadow",
+            ContextVmMode::Active => "active",
+            ContextVmMode::Hybrid => "hybrid",
+        };
+        let mut context_vm = serde_json::json!({ "mode": mode });
+        if mode != "off" {
+            let metrics = self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.context_vm.metrics())
+                .unwrap_or_default();
+            context_vm = serde_json::json!({
+                "mode": mode,
+                "imagesCompiled": metrics.images_compiled,
+                "folds": metrics.folds,
+                "rebuilds": metrics.rebuilds,
+                "pageLookupHits": metrics.page_lookup_hits,
+                "pageLookupMisses": metrics.page_lookup_misses,
+                "semanticPageFaults": metrics.semantic_page_faults,
+                "retrievalHits": metrics.retrieval_hits,
+                "retrievalMisses": metrics.retrieval_misses,
+                "pageFaults": metrics.page_faults,
+                "tokensBeforeFold": metrics.tokens_before_fold,
+                "tokensAfterFold": metrics.tokens_after_fold,
+                "pinnedPageLoads": metrics.pinned_page_loads,
+                "retrievalOffered": self.context_vm_offers_retrieval(),
+            });
+        }
+        let available = self.codemode_exposed();
+        serde_json::json!({
+            "contextVm": context_vm,
+            "codemode": {
+                "mode": match (&self.codemode_configured_mode, available) {
+                    (Some(mode), _) => mode.as_str(),
+                    (None, true) => "read-only",
+                    (None, false) => "off",
+                },
+                "available": available,
+                "calls": self.run_stats().codemode_runs,
+            },
+        })
     }
 
     /// The token estimate for what the provider will actually be sent:

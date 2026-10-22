@@ -238,6 +238,14 @@ VM body duplication does not make total process memory constant.
 (zero when no requests occurred). Legacy page-fault counters follow semantic
 retrieval only. A successful rebuild after a missing page remains a lookup miss.
 
+The `--mode json` `harness_stats` record carries a top-level `contextVm` block
+so a run shows whether the VM was configured and used. It is `{"mode": "off"}`
+while the VM is off. Otherwise it holds `mode` (`shadow`, `active` or `hybrid`),
+the counters above in camelCase plus `folds`, `tokensBeforeFold`,
+`tokensAfterFold` and `pinnedPageLoads`, and `retrievalOffered`, which is true
+once a fold made `retrieve_context` available. `folds: 0` in a long session
+means the VM never needed to fold; compactions stay under `runtime.compactions`.
+
 ## Shared engineering facts
 
 `EngineeringSnapshots` is owned by the native extension host. Test Impact

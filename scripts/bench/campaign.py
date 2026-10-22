@@ -194,6 +194,79 @@ def metric(row, field):
     return row.get(field)
 
 
+def _configured_modes(rows, feature):
+    modes = set()
+    for row in rows:
+        settings = row.get("effective_settings")
+        settings = settings if isinstance(settings, dict) else {}
+        value = settings.get(feature, "off")
+        if feature == "codemode":
+            value = value.get("mode", "off") if isinstance(value, dict) else value
+        modes.add(value if isinstance(value, str) else "unknown")
+    return modes
+
+
+def _activity(row, feature):
+    """True when the run used the feature, False when it provably did not, None if unknown."""
+    tools = row.get("tools")
+    tools = tools if isinstance(tools, dict) else None
+    if feature == "codemode":
+        calls = row.get("codemode_calls")
+        if type(calls) is not int:
+            calls = tools.get("codemode", 0) if tools is not None else None
+        return None if calls is None else calls > 0
+    block = row.get("context_vm")
+    block = block if isinstance(block, dict) else {}
+    folds = block.get("folds")
+    retrieved = block.get("retrieve_context_calls")
+    if type(retrieved) is not int:
+        retrieved = tools.get("retrieve_context", 0) if tools is not None else None
+    if (type(folds) is int and folds > 0) or (type(retrieved) is int and retrieved > 0):
+        return True
+    return False if type(folds) is int and retrieved == 0 else None
+
+
+def _mode_of(row, feature):
+    return next(iter(_configured_modes([row], feature)))
+
+
+def _use(rows, feature):
+    modes = _configured_modes(rows, feature)
+    mode = next(iter(modes)) if len(modes) == 1 else "mixed"
+    levels = [_activity(row, feature) for row in rows]
+    active, unknown = levels.count(True), levels.count(None)
+    if modes == {"off"}:
+        status = "off"
+    elif active:
+        status = "used"
+    elif unknown or "unknown" in modes:
+        status = "unknown"
+    else:
+        status = "unused"
+    return {"configured_mode": mode, "runs": len(rows), "runs_with_activity": active,
+            "runs_unknown": unknown, "status": status,
+            "configured_but_unused": {"unused": True, "unknown": None}.get(status, False)}
+
+
+def feature_use(rows):
+    """Was Context VM / Codemode configured, and did any run show it working?
+
+    Activity: Context VM folds > 0 or a retrieve_context call; Codemode a
+    codemode call. A run missing the evidence (an old log) is unknown, so an
+    arm is `configured_but_unused` only when every run is known to be idle.
+    `by_mode` repeats the verdict for each configured mode seen in the rows
+    (off/shadow/active/hybrid; off/read-only/controlled), so an arm that mixes
+    modes still reports every one.
+    """
+    result = {}
+    for feature in ("contextVm", "codemode"):
+        result[feature] = _use(rows, feature)
+        result[feature]["by_mode"] = {
+            mode: _use([row for row in rows if _mode_of(row, feature) == mode], feature)
+            for mode in sorted(_configured_modes(rows, feature))}
+    return result
+
+
 def paired_metrics(baseline, candidate):
     """Candidate / baseline ratios over exact task/repetition pairs, failures included."""
     left = {(row["task"], row["rep"]): row for row in baseline}

@@ -23,6 +23,99 @@ def row(harness, rep=0):
             "effective_settings": {"fixed": True}}
 
 
+def feature_row(vm=None, cm=None, tools=None, context_vm="__none__", calls="__none__", rep=0):
+    """A davinci result row; settings carry the configured modes, fields mirror bench.py."""
+    settings = {"fixed": True}
+    if vm is not None:
+        settings["contextVm"] = vm
+    if cm is not None:
+        settings["codemode"] = {"mode": cm}
+    value = dict(row("davinci", rep), effective_settings=settings)
+    if tools is not None:
+        value["tools"] = tools
+    if context_vm != "__none__":
+        value["context_vm"] = context_vm
+    if calls != "__none__":
+        value["codemode_calls"] = calls
+    return value
+
+
+def vm_block(folds, retrieve=0, mode="hybrid"):
+    return {"mode": mode, "folds": folds, "compactions": folds,
+            "retrieve_context_calls": retrieve, "retrieval_offered": bool(folds)}
+
+
+class FeatureUseTests(unittest.TestCase):
+    def test_old_log_without_the_fields_is_unknown_not_unused(self):
+        use = campaign.feature_use([feature_row(vm="hybrid", cm="read-only")])
+        self.assertEqual(use["contextVm"]["status"], "unknown")
+        self.assertIsNone(use["contextVm"]["configured_but_unused"])
+        self.assertEqual(use["contextVm"]["runs_unknown"], 1)
+        self.assertEqual(use["codemode"]["status"], "unknown")
+        self.assertIsNone(use["codemode"]["configured_but_unused"])
+
+    def test_old_log_tool_events_still_count_as_use(self):
+        use = campaign.feature_use([feature_row(
+            vm="hybrid", cm="read-only", tools={"retrieve_context": 2, "codemode": 1})])
+        self.assertEqual(use["contextVm"]["status"], "used")
+        self.assertEqual(use["codemode"]["status"], "used")
+
+    def test_hybrid_with_zero_folds_is_configured_but_unused(self):
+        use = campaign.feature_use([feature_row(
+            vm="hybrid", context_vm=vm_block(0), tools={})])["contextVm"]
+        self.assertEqual((use["configured_mode"], use["runs"], use["runs_with_activity"]),
+                         ("hybrid", 1, 0))
+        self.assertTrue(use["configured_but_unused"])
+        self.assertEqual(use["status"], "unused")
+
+    def test_folds_make_it_used(self):
+        use = campaign.feature_use([feature_row(vm="hybrid", context_vm=vm_block(2)),
+                                    feature_row(vm="hybrid", context_vm=vm_block(0), rep=1)])["contextVm"]
+        self.assertEqual((use["runs"], use["runs_with_activity"], use["status"]), (2, 1, "used"))
+        self.assertFalse(use["configured_but_unused"])
+
+    def test_active_with_a_fold_is_used_and_shadow_without_one_is_unused(self):
+        use = campaign.feature_use([feature_row(vm="active", context_vm=vm_block(1, mode="active"))])
+        self.assertEqual(use["contextVm"]["status"], "used")
+        use = campaign.feature_use([feature_row(vm="shadow", context_vm=vm_block(0, mode="shadow"))])
+        self.assertTrue(use["contextVm"]["configured_but_unused"])
+
+    def test_retrieve_context_call_alone_counts_as_use(self):
+        use = campaign.feature_use([feature_row(vm="active", context_vm=vm_block(0, retrieve=1, mode="active"))])
+        self.assertEqual(use["contextVm"]["status"], "used")
+
+    def test_every_mode_seen_in_an_arm_is_reported(self):
+        rows = [feature_row(vm="hybrid", cm="read-only", context_vm=vm_block(0), calls=0),
+                feature_row(vm="active", cm="controlled", context_vm=vm_block(2, mode="active"), calls=1, rep=1),
+                feature_row(vm=None, cm=None, context_vm=vm_block(0, mode="off"), calls=0, rep=2)]
+        use = campaign.feature_use(rows)
+        self.assertEqual(sorted(use["contextVm"]["by_mode"]), ["active", "hybrid", "off"])
+        self.assertEqual(use["contextVm"]["configured_mode"], "mixed")
+        self.assertTrue(use["contextVm"]["by_mode"]["hybrid"]["configured_but_unused"])
+        self.assertEqual(use["contextVm"]["by_mode"]["active"]["status"], "used")
+        self.assertEqual(use["contextVm"]["by_mode"]["off"]["status"], "off")
+        self.assertEqual(sorted(use["codemode"]["by_mode"]), ["controlled", "off", "read-only"])
+        self.assertTrue(use["codemode"]["by_mode"]["read-only"]["configured_but_unused"])
+        self.assertEqual(use["codemode"]["by_mode"]["controlled"]["status"], "used")
+
+    def test_codemode_on_with_zero_calls_is_configured_but_unused(self):
+        use = campaign.feature_use([feature_row(cm="read-only", calls=0)])["codemode"]
+        self.assertTrue(use["configured_but_unused"])
+        self.assertEqual(use["configured_mode"], "read-only")
+
+    def test_codemode_call_is_counted(self):
+        use = campaign.feature_use([feature_row(cm="read-only", calls=3)])["codemode"]
+        self.assertEqual((use["runs_with_activity"], use["status"]), (1, "used"))
+        self.assertFalse(use["configured_but_unused"])
+
+    def test_off_is_never_reported_unused(self):
+        use = campaign.feature_use([feature_row(context_vm=vm_block(0, mode="off"), calls=0)])
+        for name in ("contextVm", "codemode"):
+            self.assertEqual(use[name]["configured_mode"], "off")
+            self.assertEqual(use[name]["status"], "off")
+            self.assertFalse(use[name]["configured_but_unused"])
+
+
 class CampaignTests(unittest.TestCase):
     def test_cluster_uncertainty_is_reproducible_and_does_not_treat_repetitions_as_tasks(self):
         left = [dict(row("davinci", rep), task=task, wall_s=10)

@@ -39,6 +39,37 @@ class StreamTelemetryTests(unittest.TestCase):
         self.assertNotIn("secret", result["runtime_stats"])
         self.assertIsNone(bench.parse_stream("davinci", "")["runtime_stats"])
 
+    def test_feature_use_comes_from_tool_events_and_harness_stats(self):
+        stats = {"type": "harness_stats", "schema_version": 1,
+                 "runtime": {"compactions": 2, "codemodeRuns": 1},
+                 "contextVm": {"mode": "hybrid", "folds": 3, "retrievalOffered": True},
+                 "codemode": {"mode": "read-only", "available": True, "calls": 1}}
+        events = [{"type": "tool_execution_start", "toolName": "retrieve_context"},
+                  {"type": "tool_execution_start", "toolName": "codemode"}, stats]
+        result = bench.parse_stream("davinci", chr(10).join(map(json.dumps, events)))
+        self.assertEqual(result["context_vm"], {
+            "mode": "hybrid", "folds": 3, "compactions": 2,
+            "retrieve_context_calls": 1, "retrieval_offered": True})
+        self.assertEqual(result["codemode_calls"], 1)
+        self.assertEqual(result["codemode_calls_reported"], 1)
+
+    def test_old_stream_keeps_harness_stats_fields_unknown(self):
+        events = [{"type": "tool_execution_start", "toolName": "read"},
+                  {"type": "harness_stats", "schema_version": 1, "runtime": {"wallMs": 5}}]
+        result = bench.parse_stream("davinci", chr(10).join(map(json.dumps, events)))
+        self.assertEqual(result["context_vm"], {
+            "mode": None, "folds": None, "compactions": None,
+            "retrieve_context_calls": 0, "retrieval_offered": None})
+        self.assertEqual(result["codemode_calls"], 0)
+        self.assertIsNone(result["codemode_calls_reported"])
+
+    def test_codemode_tool_events_and_harness_stats_disagreement_is_visible(self):
+        events = [{"type": "tool_execution_start", "toolName": "codemode"},
+                  {"type": "harness_stats", "schema_version": 1, "runtime": {},
+                   "codemode": {"mode": "read-only", "available": True, "calls": 2}}]
+        result = bench.parse_stream("davinci", chr(10).join(map(json.dumps, events)))
+        self.assertEqual((result["codemode_calls"], result["codemode_calls_reported"]), (1, 2))
+
     def test_harness_conflicting_raw_receipt_cannot_remain_complete(self):
         usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
         events = self.observed_stream([(1, "completed", usage)])

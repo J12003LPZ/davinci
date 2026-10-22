@@ -339,6 +339,19 @@ hidden-grader secrecy. Independent acceptance remains a separate gate.
   leaf dispatches remain separate. Reminder reasons, harness verification runs,
   requests after the first reminder, and completion-ledger mutation generations
   are reported; generations are not a census of filesystem writes.
+- **Feature use:** each DaVinci arm in `summarize` carries `feature_use` for
+  `contextVm` and `codemode`: `configured_mode` (from the frozen effective
+  settings; an absent key means the default, `off`), `runs`,
+  `runs_with_activity`, `runs_unknown`, `status` and `configured_but_unused`.
+  Activity is Context VM folds above zero or a `retrieve_context` call, and a
+  `codemode` call. Per-run fields are `context_vm` (`mode`, `folds`,
+  `compactions`, `retrieve_context_calls`, `retrieval_offered`) and
+  `codemode_calls`, counted from `tool_execution_start` events, with
+  `codemode_calls_reported` from `harness_stats` as a cross-check. Fields that
+  only `harness_stats` carries are `null` in older logs. A run missing the
+  evidence is `unknown`; an arm is `configured_but_unused: true` only when
+  the mode is not off and every run is known to be idle, and `null` when any
+  run is unknown.
 - **Pairs and uncertainty:** candidate divided by parent uses exact unique
   task/repetition pairs. Bootstrap resamples whole task clusters, retaining all
   repetitions together, with 2,000 deterministic resamples and a 95% percentile

@@ -31,7 +31,7 @@ from pathlib import Path
 from contextlib import nullcontext
 from observations import PURPOSES, activity
 from campaign import (LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task_success,
-                      manifest_errors, paired_metrics, file_hash, digest, metric,
+                      manifest_errors, paired_metrics, feature_use, file_hash, digest, metric,
                       latency_uncertainty, promotion_gates)
 from runner import (create_campaign, isolate_settings, controlled_environment, select_tasks,
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
@@ -384,6 +384,29 @@ def parse_stream(harness, stdout):
                                   "diagnosticsMs", "diagnosticComparableOperations", "diagnosticUnknownOperations",
                                   "repeatedReads", "repeatedSearches", "workerDuplicateOperations",
                                   "toolCalls", "batchOperations", "subagents")}
+    # Tool events are the count of record; harness_stats says whether the
+    # feature was configured. A field absent from an older log stays None.
+    stats["context_vm"] = stats["codemode_calls"] = stats["codemode_calls_reported"] = None
+    if harness == "davinci":
+        snapshot = {}
+        if not malformed_stream:
+            for event in events:
+                if event.get("type") == "harness_stats" and event.get("schema_version") == 1:
+                    snapshot = event
+        non_negative = lambda value: value if type(value) is int and value >= 0 else None
+        vm, codemode = snapshot.get("contextVm"), snapshot.get("codemode")
+        vm = vm if isinstance(vm, dict) else {}
+        codemode = codemode if isinstance(codemode, dict) else {}
+        runtime = snapshot.get("runtime")
+        runtime = runtime if isinstance(runtime, dict) else {}
+        stats["context_vm"] = {
+            "mode": vm["mode"] if vm.get("mode") in ("off", "shadow", "active", "hybrid") else None,
+            "folds": non_negative(vm.get("folds")),
+            "compactions": non_negative(runtime.get("compactions")),
+            "retrieve_context_calls": stats["tools"].get("retrieve_context", 0),
+            "retrieval_offered": vm["retrievalOffered"] if type(vm.get("retrievalOffered")) is bool else None}
+        stats["codemode_calls"] = stats["tools"].get("codemode", 0)
+        stats["codemode_calls_reported"] = non_negative(codemode.get("calls"))
     if observed:
         receipts, coding_groups = {}, {}
         complete_receipts, uncertain_receipts = set(), set()
@@ -625,7 +648,7 @@ def run_one(harness, tid, rep, campaign=None):
                        ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes")})
         result["task_set"] = "private"
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts",
-                "runtime_stats",
+                "runtime_stats", "context_vm", "codemode_calls", "codemode_calls_reported",
                 "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio", "known_usage",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",
                 "mutations_after_reminder", "executed_leaf_operations", "batch_children_reported",
@@ -774,6 +797,8 @@ def summarize(rows):
                 ("logical_requests", "provider_attempts", "uncached_input_tokens", "reasoning_tokens")},
             "complete_request_telemetry_runs": sum(row.get("request_metrics_complete") is True for row in rs),
         }
+        if harness == "davinci":
+            out[harness]["feature_use"] = feature_use(rs)
         for name in ("first", "later"):
             total = aggregate_available(rs, f"{name}_request_input_tokens")
             hits = aggregate_available(rs, f"{name}_request_cached_tokens")

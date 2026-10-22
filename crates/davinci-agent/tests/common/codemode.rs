@@ -1459,6 +1459,36 @@ fn a_request_refused_before_any_script_runs_is_still_counted() {
 }
 
 #[test]
+fn feature_use_reports_codemode_off_with_no_calls() {
+    let agent = Agent::new("You are a coding agent.");
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        json!({"mode": "off", "available": false, "calls": 0})
+    );
+}
+
+#[test]
+fn feature_use_counts_a_dispatched_codemode_call() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent
+        .enable_read_only_codemode(Arc::new(EmptyAfterReadHost("[]")))
+        .unwrap();
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        json!({"mode": "read-only", "available": true, "calls": 0})
+    );
+    agent.execute_tool_batch(
+        workspace.path(),
+        vec![("one".into(), "codemode".into(), json!({"code":"return 1"}))],
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        json!({"mode": "read-only", "available": true, "calls": 1})
+    );
+}
+
+#[test]
 fn an_empty_value_after_tool_calls_is_flagged_and_counted() {
     for empty in ["[]", "{}", "null", "", "  "] {
         let (outcome, stats) = run_with_output(empty);
