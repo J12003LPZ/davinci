@@ -830,6 +830,38 @@ pub fn verification_outcome(command: &str) -> Option<bool> {
     Some(!status_masked)
 }
 
+/// Verifiers that build, lint, format or type-check without running tests.
+const NON_TEST_CHECK_PATTERNS: &[&str] = &[
+    r"(?i)^\s*(?:npx\s+)?(?:tsc|tsgo|eslint)\b",
+    r"(?i)^\s*(?:npx\s+)?biome\s+(check|lint)\b",
+    r"(?i)^\s*npm\s+run\s+(check|typecheck|lint|build)\b",
+    r"(?i)^\s*(?:yarn|pnpm)\s+(check|typecheck|lint)\b",
+    r"(?i)^\s*cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(check|clippy|fmt)\b",
+    r"(?i)^\s*go\s+vet\b",
+    r"(?i)^\s*make\s+(check|lint|fmt|clippy|build)\b",
+];
+
+fn non_test_check_regex() -> &'static RegexSet {
+    static SET: OnceLock<RegexSet> = OnceLock::new();
+    SET.get_or_init(|| RegexSet::new(NON_TEST_CHECK_PATTERNS).expect("check patterns compile"))
+}
+
+/// Whether a verification command ran tests: some segment is a verifier that
+/// is not a build, lint or type check. `cargo check && cargo test` ran tests;
+/// `cargo clippy` alone did not.
+pub fn verification_ran_tests(command: &str) -> bool {
+    analyze_command(command).segments.iter().any(|segment| {
+        let cleaned = segment.replace("2>&1", "");
+        let Some(words) = literal_shell_words(cleaned.trim()) else {
+            return false;
+        };
+        let Some(first) = words.iter().position(|word| !shell_env_assignment(word)) else {
+            return false;
+        };
+        verification_segment(segment) && !non_test_check_regex().is_match(&words[first..].join(" "))
+    })
+}
+
 impl ShellAnalysisReport {
     /// Classifies the declared effects of this shell command based on static analysis.
     ///
@@ -994,6 +1026,38 @@ mod tests {
             ("ls", None),
         ] {
             assert_eq!(verification_outcome(command), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn only_verifiers_that_execute_tests_count_as_ran_tests() {
+        for (command, expected) in [
+            ("cargo test", true),
+            ("cargo --offline --locked test -p x", true),
+            ("RUST_BACKTRACE=1 cargo test", true),
+            ("cd crates/x && cargo test", true),
+            ("cargo check && cargo test", true),
+            ("pytest -q", true),
+            ("npm test", true),
+            ("go test ./...", true),
+            ("cargo check", false),
+            (
+                "cargo --offline --locked clippy --all-targets -- -D warnings",
+                false,
+            ),
+            ("cargo fmt --all -- --check", false),
+            ("cargo +nightly fmt --check", false),
+            ("RUST_BACKTRACE=1 cargo clippy", false),
+            ("cargo check && cargo clippy", false),
+            ("tsc --noEmit", false),
+            ("npx eslint .", false),
+            ("npm run typecheck", false),
+            ("go vet ./...", false),
+            ("cargo test --no-run", false),
+            ("echo cargo test", false),
+            ("ls", false),
+        ] {
+            assert_eq!(verification_ran_tests(command), expected, "{command}");
         }
     }
 

@@ -258,7 +258,12 @@ impl Agent {
         // A finish attempt repeated after another gate (a hook block, a
         // capability reminder) with nothing changed since the skip: same
         // answer, without observing the workspace again.
-        let verified = self.completion_evidence() == crate::CompletionEvidence::Verified;
+        // A pass that ran no tests (build, lint, type check) says nothing
+        // about per-requirement tests, so it does not stand in for the review.
+        // A test pass on this change still counts after a later lint check.
+        let verified = self.completion_evidence() == crate::CompletionEvidence::Verified
+            && self.mutation_verification_state().tests_passed_generation
+                == Some(self.mutation_verification_state().mutation_generation);
         if verified
             && state.requirement_skipped_generation
                 == Some(self.mutation_verification_state().mutation_generation)
@@ -1394,6 +1399,158 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_check_alone_does_not_suppress_review() {
+        // A workspace-wide check is `Verified` for the gate, but only a run
+        // that executed tests can stand in for the review's request for them.
+        for (command, ran_tests) in [
+            ("cargo check", false),
+            ("cargo clippy --all-targets -- -D warnings", false),
+            ("cargo test", true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut agent = fixture(root.path());
+            agent.prompt(THREE_CLAUSES);
+            std::fs::write(root.path().join("app.py"), "after").unwrap();
+            std::fs::write(root.path().join("lib.py"), "after").unwrap();
+            agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+            let generation = agent.mutation_verification_state().mutation_generation;
+            agent.record_verification_assessment(
+                generation,
+                command,
+                &crate::verification::Assessment {
+                    kind: crate::verification::CheckKind::Suite,
+                    covered: vec!["app.py".into(), "lib.py".into()],
+                    complete: true,
+                    full_workspace: true,
+                    reason: "test",
+                },
+                Some(true),
+            );
+            assert_eq!(
+                agent.completion_evidence(),
+                crate::CompletionEvidence::Verified,
+                "{command}"
+            );
+            assert_eq!(reminders(&mut agent), usize::from(!ran_tests), "{command}");
+            assert_eq!(
+                agent.stats.completion_requirement_reviews_skipped,
+                u64::from(ran_tests),
+                "{command}"
+            );
+        }
+    }
+
+    fn workspace_check(command: &str, agent: &Agent) {
+        let generation = agent.mutation_verification_state().mutation_generation;
+        agent.record_verification_assessment(
+            generation,
+            command,
+            &crate::verification::Assessment {
+                kind: crate::verification::CheckKind::Suite,
+                covered: vec!["app.py".into(), "lib.py".into()],
+                complete: true,
+                full_workspace: true,
+                reason: "test",
+            },
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn tests_then_clippy_on_the_same_change_still_skips_review() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt(THREE_CLAUSES);
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        std::fs::write(root.path().join("lib.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        workspace_check("cargo test", &agent);
+        workspace_check("cargo clippy --all-targets -- -D warnings", &agent);
+        assert_eq!(reminders(&mut agent), 0);
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+    }
+
+    #[test]
+    fn tests_then_an_edit_then_clippy_reviews_because_the_test_pass_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt(THREE_CLAUSES);
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        std::fs::write(root.path().join("lib.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        workspace_check("cargo test", &agent);
+        std::fs::write(root.path().join("app.py"), "later").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        workspace_check("cargo clippy --all-targets -- -D warnings", &agent);
+        assert_eq!(reminders(&mut agent), 1);
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 0);
+    }
+
+    fn two_file_edit(agent: &mut Agent, root: &Path) {
+        std::fs::write(root.join("app.py"), "after").unwrap();
+        std::fs::write(root.join("lib.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    }
+
+    #[test]
+    fn lint_then_partial_tests_still_reviews() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt(THREE_CLAUSES);
+        two_file_edit(&mut agent, root.path());
+        workspace_check("cargo clippy --all-targets -- -D warnings", &agent);
+        // The lint made covered_paths sticky; this run tested only app.py.
+        let generation = agent.mutation_verification_state().mutation_generation;
+        agent.record_verification_assessment(
+            generation,
+            "pytest tests/test_app.py",
+            &passing_check("app.py"),
+            Some(true),
+        );
+        assert_eq!(reminders(&mut agent), 1);
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 0);
+    }
+
+    #[test]
+    fn tests_pass_then_fail_then_lint_reviews() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt(THREE_CLAUSES);
+        two_file_edit(&mut agent, root.path());
+        workspace_check("cargo test", &agent);
+        let generation = agent.mutation_verification_state().mutation_generation;
+        agent.record_verification_assessment(
+            generation,
+            "cargo test -p b",
+            &crate::verification::Assessment {
+                kind: crate::verification::CheckKind::Suite,
+                covered: Vec::new(),
+                complete: false,
+                full_workspace: false,
+                reason: "test",
+            },
+            Some(false),
+        );
+        workspace_check("cargo clippy --all-targets -- -D warnings", &agent);
+        assert_eq!(
+            agent.completion_evidence(),
+            crate::CompletionEvidence::Verified
+        );
+        assert_eq!(reminders(&mut agent), 1);
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 0);
+    }
+
+    #[test]
+    fn state_saved_before_tests_passed_generation_loads_with_none() {
+        let mut json = serde_json::to_value(crate::MutationVerificationState::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("tests_passed_generation");
+        let state: crate::MutationVerificationState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.tests_passed_generation, None);
     }
 
     #[test]

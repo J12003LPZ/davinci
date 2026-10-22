@@ -14,10 +14,16 @@ change, a pass that a later edit made stale) still gets the review, and a later
 unverified edit in the same prompt is reviewed. `RunStats` counts these as
 `completionRequirementReviewsSkipped`, at most one per prompt.
 
-Two limits. `verified` is the verification gate's own definition, so a
-workspace-wide `cargo check` or `cargo clippy` counts as a passing check here
-as it does there; such a run says nothing about tests for each requirement,
-and the review that would ask for them is not sent. And the review is decided
+Two limits. The skip needs a check that ran tests. A passing check that ran
+none (`cargo check`, `cargo clippy`, `cargo fmt`, `tsc`, `eslint`, `go vet`,
+`npm run lint`/`typecheck`/`build`) stays `verified` for the verification gate
+but does not skip the review, because it says nothing about tests for each
+requirement. A chain such as `cargo check && cargo test` counts, since it ran
+tests, and a test pass on the latest change still counts after a later lint or
+build check. "Ran tests" is judged from the command, so a test command that
+selects or lists no tests (`cargo test nomatch`, `pytest --collect-only`) and a
+project `npm test` script that only lints still count, as they already did for
+the verification gate. And the review is decided
 before the harness's automatic rerun of the last check, so an edit made after
 the last passing check still gets the review even when that rerun would pass.
 

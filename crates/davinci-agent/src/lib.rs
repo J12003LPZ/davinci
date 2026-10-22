@@ -344,6 +344,10 @@ pub struct VerificationEvidence {
 pub struct MutationVerificationState {
     pub mutation_generation: u64,
     pub verified_generation: Option<u64>,
+    /// Generation a passing check that ran tests covered; a later lint or
+    /// build check does not clear it.
+    #[serde(default)]
+    pub tests_passed_generation: Option<u64>,
     pub last_verification_succeeded: bool,
     #[serde(default)]
     pub mutation_paths: Vec<PathBuf>,
@@ -1641,6 +1645,9 @@ impl Agent {
                 VerificationCoverage::Broad | VerificationCoverage::Targeted
             ))
         .then_some(generation);
+        if state.verified_generation.is_some() && shell_policy::verification_ran_tests(command) {
+            state.tests_passed_generation = Some(generation);
+        }
         state.last_verification_succeeded = succeeded;
         state.latest_evidence = Some(VerificationEvidence {
             generation,
@@ -1720,6 +1727,21 @@ impl Agent {
                 .iter()
                 .all(|path| state.covered_paths.contains(path));
         state.verified_generation = (succeeded && complete).then_some(generation);
+        // Judged per run, not from the sticky covered set: a lint that covered
+        // everything must not let a partial test run stand for the change.
+        if !succeeded {
+            state.tests_passed_generation = None;
+        } else if complete
+            && shell_policy::verification_ran_tests(command)
+            && (assessment.full_workspace
+                || (!state.unknown_mutation_paths
+                    && state
+                        .mutation_paths
+                        .iter()
+                        .all(|path| assessment.covered.contains(path))))
+        {
+            state.tests_passed_generation = Some(generation);
+        }
         state.last_verification_succeeded = succeeded;
         state.latest_evidence = Some(VerificationEvidence {
             generation,
