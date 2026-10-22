@@ -473,6 +473,7 @@ impl GraphExecution {
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             run.updated_at = run.updated_at.max(snapshot.updated_at);
+            run.checkpoint_sequence = run.checkpoint_sequence.max(snapshot.checkpoint_sequence);
             // A successful state-transition checkpoint starts a fresh progress
             // debounce window as well.
             *self
@@ -1355,6 +1356,20 @@ impl GraphExecution {
             if !self.finish_attempt(&spec, attempt, &result) {
                 return None;
             }
+            write_log(
+                Path::new(&run.cwd),
+                &run.run_id,
+                &task_id,
+                attempt,
+                &format!(
+                    "attempt {attempt}\nexit {} timedOut={}\n--- stderr ---\n{}\n--- final text ---\n{}\n--- failure reason ---\n{}",
+                    result.exit_code,
+                    result.timed_out,
+                    result.stderr,
+                    result.final_text,
+                    result.failure_reason.clone().unwrap_or_default()
+                ),
+            );
             if result.recovery_required {
                 let error = format!(
                     "reconciliation required: {}",
@@ -1367,19 +1382,6 @@ impl GraphExecution {
                 self.checkpoint(Some("worker history requires recovery; retry stopped"));
                 return None;
             }
-            write_log(
-                Path::new(&run.cwd),
-                &run.run_id,
-                &task_id,
-                &format!(
-                    "attempt {attempt}\nexit {} timedOut={}\n--- stderr ---\n{}\n--- final text ---\n{}\n--- failure reason ---\n{}",
-                    result.exit_code,
-                    result.timed_out,
-                    result.stderr,
-                    result.final_text,
-                    result.failure_reason.clone().unwrap_or_default()
-                ),
-            );
 
             if result.run_deadline_exceeded
                 || result.failure_reason.as_deref() == Some("run deadline exceeded")
@@ -1986,6 +1988,7 @@ fn run_graph_internal(
             .map(|run| run.control_history.clone())
             .unwrap_or_default(),
         revision: 0,
+        checkpoint_sequence: 0,
         continuation: Some(GraphContinuation::default()),
     };
 
@@ -3082,6 +3085,43 @@ fn materialize_generated_dependencies(run: &mut GraphRun, task: &mut GraphTaskSt
     }
 }
 
+/// Persist the same dependencies the dynamic delivery stack actually consumes.
+/// Fork/rewind must not have to infer them from task insertion order.
+fn delivery_dependencies(run: &GraphRun, role: Role) -> Vec<String> {
+    let cursor = run.continuation.as_ref().unwrap();
+    let delivery = cursor.delivery.as_ref();
+    let mut dependencies = Vec::new();
+    if role == Role::Reviewer {
+        dependencies.extend(delivery.and_then(|delivery| delivery.writer_task.clone()));
+    } else if role == Role::Writer
+        && delivery
+            .and_then(|delivery| delivery.plan_task.as_ref())
+            .is_some()
+    {
+        dependencies.extend(delivery.and_then(|delivery| delivery.plan_task.clone()));
+    } else {
+        dependencies.extend(
+            run.tasks
+                .iter()
+                .filter(|task| task.id == "classify" || task.id.starts_with("research-"))
+                .map(|task| task.id.clone()),
+        );
+    }
+    if role != Role::Reviewer {
+        if let Some(previous) = &cursor.completed_delivery {
+            dependencies.extend(
+                previous
+                    .review_task
+                    .clone()
+                    .or_else(|| previous.writer_task.clone()),
+            );
+        }
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    dependencies
+}
+
 fn produce_plan(
     execution: &GraphExecution,
     indices: &mut NodeIndices,
@@ -3108,7 +3148,13 @@ fn produce_plan(
     if !execution.save_delivery(&delivery, *indices, Some("planning cursor saved")) {
         return None;
     }
-    let task = GraphTaskState::new(task_id, Role::Planner, ArtifactKind::Plan, vec![], None);
+    let task = GraphTaskState::new(
+        task_id,
+        Role::Planner,
+        ArtifactKind::Plan,
+        delivery_dependencies(&execution.snapshot(), Role::Planner),
+        None,
+    );
     execution
         .execute_node(
             task,
@@ -3205,7 +3251,7 @@ fn deliver_goal(
                 task_id.clone(),
                 Role::Writer,
                 ArtifactKind::PatchReport,
-                vec![],
+                delivery_dependencies(&execution.snapshot(), Role::Writer),
                 None,
             );
             let attempt_baseline = if let Some(baseline) = &saved.attempt_baseline {
@@ -3646,7 +3692,7 @@ fn deliver_goal(
                     chunk_task_id,
                     Role::Reviewer,
                     ArtifactKind::Review,
-                    vec![],
+                    delivery_dependencies(&execution.snapshot(), Role::Reviewer),
                     None,
                 );
                 let req_ids = vec![chunk.id.clone()];
@@ -3695,7 +3741,7 @@ fn deliver_goal(
                 format!("review-{}", indices.review),
                 Role::Reviewer,
                 ArtifactKind::Review,
-                vec![],
+                delivery_dependencies(&execution.snapshot(), Role::Reviewer),
                 None,
             );
             let final_review = execution
@@ -3741,7 +3787,7 @@ fn deliver_goal(
                 format!("review-{}", indices.review),
                 Role::Reviewer,
                 ArtifactKind::Review,
-                vec![],
+                delivery_dependencies(&execution.snapshot(), Role::Reviewer),
                 None,
             );
             let review = execution
@@ -5081,6 +5127,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                checkpoint_sequence: 0,
                 control_history: Vec::new(),
                 continuation: None,
             }),
@@ -6355,6 +6402,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                checkpoint_sequence: 0,
                 control_history: Vec::new(),
                 continuation: None,
             }),
@@ -6470,6 +6518,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                checkpoint_sequence: 0,
                 control_history: Vec::new(),
                 continuation: None,
             }),
@@ -6564,6 +6613,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Paused),
                 revision: 0,
+                checkpoint_sequence: 0,
                 control_history: Vec::new(),
                 continuation: None,
             }),
@@ -6700,6 +6750,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                checkpoint_sequence: 0,
                 control_history: Vec::new(),
                 continuation: None,
             }),
@@ -6762,6 +6813,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                checkpoint_sequence: 0,
                 control_history: Vec::new(),
                 continuation: None,
             }),

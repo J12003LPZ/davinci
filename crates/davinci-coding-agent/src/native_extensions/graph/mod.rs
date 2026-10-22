@@ -23,8 +23,10 @@ pub(crate) mod controller;
 mod coordinator_handler;
 pub(crate) mod definitions;
 pub(crate) mod export;
+mod forks;
 pub(crate) mod git;
 pub(crate) mod history;
+mod history_retention;
 mod lease;
 pub(crate) mod mutation;
 pub(crate) mod operation_bridge;
@@ -46,6 +48,7 @@ pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
 pub(crate) mod worker_sessions;
+mod workspace_files;
 
 #[cfg(test)]
 mod operation_bridge_tests;
@@ -747,6 +750,20 @@ impl GraphController {
     }
 
     fn resume(&self, wanted: &str) -> Result<Value, String> {
+        // Fork state lives with its isolated workspace. Explicit IDs may be
+        // routed only to this parent's fixed fork namespace, never arbitrary cwd.
+        if !wanted.is_empty() && store::is_safe_run_id(wanted) {
+            if let Some(workspace) = forks::published_workspace(&self.cwd, wanted)? {
+                refuse_if_active(&self.cwd)?;
+                let mut child = self.clone();
+                child.cwd = workspace;
+                let result = child.resume(wanted)?;
+                if let Some(active) = active_run(&child.cwd) {
+                    register_run(&self.cwd, active);
+                }
+                return Ok(result);
+            }
+        }
         let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let run_id = if wanted.is_empty() || wanted == "--latest" {
             let runs = list_runs(&self.cwd);
@@ -1321,6 +1338,11 @@ impl GraphController {
         let prior = match revision {
             Some(rev) if rev == current.revision => Some(current.clone()),
             Some(rev) => history::load_revision(&self.cwd, &current.run_id, rev),
+            None if current.checkpoint_sequence > 0 => history::load_checkpoint(
+                &self.cwd,
+                &current.run_id,
+                current.checkpoint_sequence - 1,
+            ),
             None if current.revision > 0 => {
                 history::load_revision(&self.cwd, &current.run_id, current.revision - 1)
             }
@@ -1369,14 +1391,15 @@ impl GraphController {
         strategy_str: Option<&str>,
         authorized: bool,
     ) -> Result<operations::ForkPreview, String> {
+        if is_running(&self.cwd) {
+            return Err(
+                "fork requires a stopped controller; stop the active run and wait for it to finish first".into(),
+            );
+        }
         let _workspace_lease = authorized
             .then(|| lease::WorkspaceLease::acquire(&self.cwd))
             .transpose()?;
-        if is_running(&self.cwd) {
-            return Err(
-                "fork requires a quiescent graph; pause or stop the active run first".into(),
-            );
-        }
+
         let latest = list_runs(&self.cwd)
             .first()
             .cloned()
@@ -1405,14 +1428,15 @@ impl GraphController {
         node_id: &str,
         authorized: bool,
     ) -> Result<operations::GraphRewindPreview, String> {
+        if is_running(&self.cwd) {
+            return Err(
+                "rewind requires a stopped controller; stop the active run and wait for it to finish first".into(),
+            );
+        }
         let _workspace_lease = authorized
             .then(|| lease::WorkspaceLease::acquire(&self.cwd))
             .transpose()?;
-        if is_running(&self.cwd) {
-            return Err(
-                "rewind requires a quiescent graph; pause or stop the active run first".into(),
-            );
-        }
+
         let latest = list_runs(&self.cwd)
             .first()
             .cloned()
@@ -1518,6 +1542,9 @@ impl GraphController {
         expected_revision: Option<u64>,
         authorized: bool,
     ) -> Result<Option<Value>, String> {
+        if is_running(&self.cwd) && value.is_some() {
+            return Err("budget updates require a stopped controller; stop the active run and wait for it to finish first".into());
+        }
         let _workspace_lease = value
             .map(|_| lease::WorkspaceLease::acquire(&self.cwd))
             .transpose()?;
@@ -1525,9 +1552,7 @@ impl GraphController {
             .first()
             .cloned()
             .ok_or_else(|| "No graph run found in this project to inspect.".to_string())?;
-        if is_running(&self.cwd) && value.is_some() {
-            return Err("budget updates are serialized at run boundaries; pause the active graph before updating".into());
-        }
+
         let mut current = load_run(&self.cwd, &latest.run_id)
             .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
         if resource.is_none() && value.is_none() {
@@ -1800,6 +1825,28 @@ mod tests {
 
     // Durable state writes can take seconds under parallel Windows CI load.
     const CONTROLLER_TEST_WAIT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn graph_followup_active_mutations_require_stop_before_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = Arc::new(ActiveRun::default());
+        register_run(dir.path(), active.clone());
+        let _finish = FinishedOnDrop(active);
+        let _lease = lease::WorkspaceLease::acquire(dir.path()).unwrap();
+        let controller = GraphController::new(dir.path().into());
+        assert!(controller
+            .fork_command("node", None, true)
+            .unwrap_err()
+            .contains("stopped controller"));
+        assert!(controller
+            .rewind_command("node", true)
+            .unwrap_err()
+            .contains("stopped controller"));
+        assert!(controller
+            .budget_command(Some("workers"), Some("2"), Some(1), true)
+            .unwrap_err()
+            .contains("stopped controller"));
+    }
 
     #[test]
     fn displayed_run_has_no_baseline_contents() {
@@ -2868,6 +2915,7 @@ name = \"x\"
             updated_at: 0,
             lifecycle: Some(types::GraphLifecycle::Paused),
             revision: 1,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         };
@@ -2942,6 +2990,7 @@ name = \"x\"
             updated_at: 0,
             lifecycle: Some(types::GraphLifecycle::Running),
             revision: 1,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         };
