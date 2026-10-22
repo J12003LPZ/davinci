@@ -119,3 +119,9 @@ The final native release build passed using the repository release profile and l
 | Sampled peak-tree RSS median (max), MiB | 30.77 (32.07) | 26.29 (27.91) |
 
 Wall time includes process startup, one offline stub turn, sampling and output capture. Five runs with overlapping timing ranges do not establish a general startup speedup. This is separate from the component profile and does not simulate an interactive session or live coding task. The installed baseline was preserved; the candidate executable is a separate build artifact.
+
+## PR review: bounded output artifacts
+
+Each child retains at most 64 oversized-output files and 32 MiB of spooled bytes. A single line may spool up to 16 MiB; exceeding that limit returns an explicit capture error. Eviction deletes the file before dropping its metadata. Temporary-file ownership covers callback failures, and supervisor errors delete previously retained files. Successful outcomes transfer the surviving artifact references to their caller. These are per-child bounds, not a global disk-retention policy.
+
+Native validation: 19 focused process/output tests passed (one existing ignored fixture), including 100 oversized lines, byte-budget eviction, failed delivery, and a real child that fails after producing one retained spool. Locked package compilation, formatting, and diff checks passed. Earlier benchmark results above predate these limits and do not measure this revision.

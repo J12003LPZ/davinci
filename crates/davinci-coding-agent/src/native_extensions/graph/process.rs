@@ -6,7 +6,7 @@
 //! the graph never imposes a clock the operator did not ask for.
 
 pub use super::process_output::OutputSpool;
-use super::process_output::{LineCapture, FRAME_BYTES, QUEUED_FRAMES};
+use super::process_output::{LineCapture, SpoolFiles, FRAME_BYTES, QUEUED_FRAMES};
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,6 +160,7 @@ pub fn run_child_with_output_dir(
         ..ChildOutcome::default()
     };
 
+    let mut spools = SpoolFiles::default();
     let mut pipes_closed = false;
     let mut stdout = LineCapture::default();
     let mut stderr = LineCapture::default();
@@ -208,7 +209,7 @@ pub fn run_child_with_output_dir(
         } else {
             match receiver.recv_timeout(POLL_INTERVAL) {
                 Ok(frame) => {
-                    if let Err(error) = deliver(frame, &mut outcome.output_spools, &mut child) {
+                    if let Err(error) = deliver(frame, &mut spools.files, &mut child) {
                         if abort.load(Ordering::Acquire) {
                             outcome.aborted = true;
                             terminate(&mut child);
@@ -263,7 +264,7 @@ pub fn run_child_with_output_dir(
         // time: a finite queue of short lines can take a slow caller seconds.
         let mut drained = 0usize;
         while let Ok(frame) = receiver.recv_timeout(DRAIN_GRACE) {
-            if let Err(error) = deliver(frame, &mut outcome.output_spools, &mut child) {
+            if let Err(error) = deliver(frame, &mut spools.files, &mut child) {
                 if abort.load(Ordering::Acquire) {
                     outcome.aborted = true;
                     terminate_process_tree(child_pid);
@@ -288,7 +289,7 @@ pub fn run_child_with_output_dir(
             on_stdout(line);
             Ok(())
         },
-        &mut outcome.output_spools,
+        &mut spools.files,
     )?;
     stderr.finish(
         true,
@@ -296,7 +297,7 @@ pub fn run_child_with_output_dir(
             on_stderr(line);
             Ok(())
         },
-        &mut outcome.output_spools,
+        &mut spools.files,
     )?;
     outcome.stdout_spooled = stdout.spooled;
     outcome.exit_code = match child.wait() {
@@ -311,6 +312,7 @@ pub fn run_child_with_output_dir(
         }
         Err(_) => 1,
     };
+    outcome.output_spools = spools.commit();
     Ok(outcome)
 }
 
@@ -382,6 +384,14 @@ mod tests {
     #[ignore = "subprocess fixture invoked by pipe lifecycle tests"]
     fn pipe_lifecycle_fixture() {
         match std::env::var("DAVINCI_TEST_PIPE_MODE").as_deref() {
+            Ok("overflow-after-spool") => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                out.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+                out.write_all(b"\n").unwrap();
+                out.flush().unwrap();
+                out.write_all(&vec![b'y'; 17 * 1024 * 1024]).unwrap();
+            }
             Ok("close") => {
                 #[cfg(windows)]
                 unsafe {
@@ -426,6 +436,22 @@ mod tests {
             }
             _ => panic!("fixture mode required"),
         }
+    }
+
+    #[test]
+    fn pr_review_supervisor_error_cleans_prior_spools() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = run_child_with_output_dir(
+            fixture("overflow-after-spool"),
+            &Arc::new(AtomicBool::new(false)),
+            WorkerDeadline::default(),
+            Some(dir.path()),
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
