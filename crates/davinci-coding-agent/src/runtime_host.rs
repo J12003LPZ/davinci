@@ -138,6 +138,16 @@ pub fn configure_session_workflow_with_legacy_recovery(
     if let Some(previous) = previous {
         runtime = runtime.with_session_state_from(previous);
     }
+    let runner = runner.map(|runner| {
+        if runtime.parent_agent_id.is_some() && runtime.worker_admission.is_configured() {
+            // A child rebuilds host services for its turn, but keeps the
+            // parent's reservation owner instead of opening another budget.
+            runner.with_admission(runtime.worker_admission.clone())
+        } else {
+            runtime.worker_admission = runner.admission().clone();
+            runner
+        }
+    });
     if let Some(session) = session {
         runtime = runtime.with_session(&session.header.id);
         if previous.is_none() {
@@ -834,6 +844,49 @@ mod tests {
         let ephemeral = configure_session_workflow(worker(), None, None, store(), None).unwrap();
         assert!(ephemeral.session_id.is_none());
         assert!(ephemeral.task_registry.rehydrate_from_events(&[]).is_ok());
+    }
+
+    #[test]
+    fn resource_worker_turn_preserves_parent_reservations() {
+        use davinci_agent::runtime::worker_admission::{WorkerAdmission, WorkerResourceConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let admission = WorkerAdmission::new(Some(WorkerResourceConfig {
+            memory_budget_bytes: 8,
+            estimated_worker_bytes: 8,
+        }))
+        .unwrap();
+        let lease = admission.acquire_worker(|| false).unwrap();
+        let mut worker = davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::RuntimeBus::new(),
+        )
+        .with_parent(davinci_agent::AgentId::new());
+        worker.worker_admission = admission;
+        worker.worker_resource_lease = lease.context();
+        let result = configure_session_workflow(
+            worker,
+            None,
+            None,
+            davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+            Some(davinci_agent::SubagentRunner::new(|_| {
+                panic!("fixture must not execute a worker")
+            })),
+        )
+        .unwrap();
+        assert_eq!(result.worker_admission.stats().reserved_bytes, 8);
+        let runner = result
+            .workflow_executor
+            .as_ref()
+            .unwrap()
+            .runner
+            .as_ref()
+            .unwrap();
+        assert_eq!(runner.admission().stats().reserved_bytes, 8);
+        assert!(result.worker_resource_lease.is_held());
+        drop(lease);
+        assert_eq!(runner.admission().stats().reserved_bytes, 0);
+        assert!(!result.worker_resource_lease.is_held());
     }
 
     #[test]

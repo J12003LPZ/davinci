@@ -12,7 +12,7 @@
 //! definition of success. stdout JSON lines are folded for usage accounting,
 //! the live transcript, and diagnostics.
 
-use super::process::run_child_with_deadline;
+use super::process::run_child_with_output_dir;
 pub use super::process::WorkerDeadline;
 use super::store::{iso8601_utc, now_ms, write_artifact};
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -632,10 +632,11 @@ pub fn run_worker(
     let outcome = {
         let state = &mut state;
         let stderr = &mut stderr;
-        run_child_with_deadline(
+        run_child_with_output_dir(
             command,
             abort,
             deadline,
+            spec.artifact_path.parent(),
             |line| {
                 parse_worker_event(line, state, |text| {
                     if let Some(path) = &transcript {
@@ -754,6 +755,16 @@ fn finish_worker(
     if outcome.run_deadline_exceeded {
         return WorkerResult {
             failure_reason: Some("run deadline exceeded".to_string()),
+            ..base
+        };
+    }
+
+    if outcome.stdout_spooled {
+        return WorkerResult {
+            failure_reason: Some(format!(
+                "worker protocol exceeds bounded line size; full output saved: {:?}",
+                outcome.output_spools
+            )),
             ..base
         };
     }

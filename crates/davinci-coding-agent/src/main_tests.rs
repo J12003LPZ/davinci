@@ -1263,6 +1263,12 @@ fn model_runtime_snapshot_is_reused_until_an_input_changes() {
     clear_model_runtime_cache();
     let first = load_model_runtime(&parsed);
     assert!(!first.stored_providers.contains(&"anthropic".to_string()));
+    let second = load_model_runtime(&parsed);
+    assert_eq!(
+        first.all.as_ptr(),
+        second.all.as_ptr(),
+        "immutable model catalogs are copied for each worker"
+    );
 
     // Unchanged inputs are served from the cache, not rebuilt: a marker
     // planted in the cached snapshot comes back.
@@ -1275,7 +1281,7 @@ fn model_runtime_snapshot_is_reused_until_an_input_changes() {
             .iter_mut()
             .find(|(cached, _)| *cached == key)
             .expect("first load fills the cache");
-        snapshot
+        Arc::make_mut(snapshot)
             .composition_errors
             .insert("cache-marker".into(), "reused".into());
     }
@@ -4628,6 +4634,23 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
     assert!(!child.tools.contains(&"write".into()));
     assert!(!child.tools.contains(&"agent".into()));
     assert_eq!(child.max_model_turns, Some(60));
+    let isolated = tempfile::tempdir().unwrap();
+    let worktree_request = davinci_agent::SubagentRequest {
+        worktree_path: Some(isolated.path().to_path_buf()),
+        ..req.clone()
+    };
+    let (isolated_child, _) = build_worker_agent(
+        &parsed,
+        dir.path(),
+        &davinci_agent::McpRegistry::default(),
+        &worktree_request,
+    )
+    .unwrap();
+    assert_eq!(
+        isolated_child.cwd,
+        isolated.path(),
+        "parent-selected profile must remain available in an isolated worktree"
+    );
     // A worktree worker runs in its parent's mode, with one deliberate
     // exception: Manual asks before every edit and the worker has no
     // approver, so inside its own lease (edits confined by the worktree

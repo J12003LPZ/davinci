@@ -5,7 +5,9 @@
 //! means the child runs until it exits on its own or the operator aborts —
 //! the graph never imposes a clock the operator did not ask for.
 
-use std::io::{BufRead, BufReader, Read};
+pub use super::process_output::OutputSpool;
+use super::process_output::{LineCapture, SpoolFiles, FRAME_BYTES, QUEUED_FRAMES};
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -17,13 +19,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long the final drain will keep taking already-queued output.
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChildOutcome {
     pub exit_code: i32,
     pub timed_out: bool,
     pub run_deadline_exceeded: bool,
     pub aborted: bool,
     pub pid: u32,
+    pub output_spools: Vec<OutputSpool>,
+    pub stdout_spooled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,25 +48,33 @@ impl WorkerDeadline {
     }
 }
 
-enum Line {
-    Stdout(String),
-    Stderr(String),
+struct Frame {
+    stderr: bool,
+    bytes: Vec<u8>,
 }
 
-fn pump<R: Read + Send + 'static>(reader: R, sender: mpsc::Sender<Line>, wrap: fn(String) -> Line) {
+fn pump<R: Read + Send + 'static>(
+    mut reader: R,
+    sender: mpsc::SyncSender<std::io::Result<Frame>>,
+    stderr: bool,
+) {
     thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut buffer = Vec::new();
+        let mut buffer = [0; FRAME_BYTES];
         loop {
-            buffer.clear();
-            match reader.read_until(b'\n', &mut buffer) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    let text = String::from_utf8_lossy(&buffer).trim_end().to_string();
-                    if sender.send(wrap(text)).is_err() {
-                        return;
-                    }
+            let frame = match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(n) => Ok(Frame {
+                    stderr,
+                    bytes: buffer[..n].to_vec(),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
                 }
+            };
+            if sender.send(frame).is_err() {
+                return;
             }
         }
     });
@@ -106,9 +118,20 @@ pub fn is_pid_alive(pid: u32) -> bool {
 /// Run `command` to completion with a composite deadline (run deadline + role timeout),
 /// streaming every line and terminating the process tree if either deadline expires.
 pub fn run_child_with_deadline(
+    command: Command,
+    abort: &Arc<AtomicBool>,
+    deadline: WorkerDeadline,
+    on_stdout: impl FnMut(&str),
+    on_stderr: impl FnMut(&str),
+) -> std::io::Result<ChildOutcome> {
+    run_child_with_output_dir(command, abort, deadline, None, on_stdout, on_stderr)
+}
+
+pub fn run_child_with_output_dir(
     mut command: Command,
     abort: &Arc<AtomicBool>,
     deadline: WorkerDeadline,
+    output_dir: Option<&std::path::Path>,
     mut on_stdout: impl FnMut(&str),
     mut on_stderr: impl FnMut(&str),
 ) -> std::io::Result<ChildOutcome> {
@@ -121,12 +144,12 @@ pub fn run_child_with_deadline(
         .spawn()?;
 
     let child_pid = child.id();
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(QUEUED_FRAMES);
     if let Some(stdout) = child.stdout.take() {
-        pump(stdout, sender.clone(), Line::Stdout);
+        pump(stdout, sender.clone(), false);
     }
     if let Some(stderr) = child.stderr.take() {
-        pump(stderr, sender.clone(), Line::Stderr);
+        pump(stderr, sender.clone(), true);
     }
     drop(sender);
 
@@ -137,26 +160,87 @@ pub fn run_child_with_deadline(
         ..ChildOutcome::default()
     };
 
+    let mut spools = SpoolFiles::default();
     let mut pipes_closed = false;
+    let mut stdout = LineCapture::default();
+    let mut stderr = LineCapture::default();
+    let mut deliver =
+        |frame: std::io::Result<Frame>, saved: &mut Vec<OutputSpool>, child: &mut Child| {
+            let frame = frame?;
+            let mut checked = |line: &str, callback: &mut dyn FnMut(&str)| -> std::io::Result<()> {
+                if abort.load(Ordering::Acquire) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "output delivery cancelled",
+                    ));
+                }
+                if effective_deadline.is_some_and(|end| Instant::now() >= end)
+                    && child.try_wait()?.is_none()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "output delivery deadline exceeded",
+                    ));
+                }
+                callback(line);
+                Ok(())
+            };
+            if frame.stderr {
+                stderr.feed(
+                    &frame.bytes,
+                    output_dir,
+                    true,
+                    &mut |line| checked(line, &mut on_stderr),
+                    saved,
+                )
+            } else {
+                stdout.feed(
+                    &frame.bytes,
+                    output_dir,
+                    false,
+                    &mut |line| checked(line, &mut on_stdout),
+                    saved,
+                )
+            }
+        };
     loop {
         if pipes_closed {
             thread::sleep(POLL_INTERVAL);
         } else {
             match receiver.recv_timeout(POLL_INTERVAL) {
-                Ok(Line::Stdout(line)) => on_stdout(&line),
-                Ok(Line::Stderr(line)) => on_stderr(&line),
+                Ok(frame) => {
+                    if let Err(error) = deliver(frame, &mut spools.files, &mut child) {
+                        if abort.load(Ordering::Acquire) {
+                            outcome.aborted = true;
+                            terminate(&mut child);
+                            break;
+                        }
+                        if error.kind() == std::io::ErrorKind::TimedOut
+                            && effective_deadline.is_some_and(|end| Instant::now() >= end)
+                        {
+                            outcome.run_deadline_exceeded = deadline
+                                .run_deadline
+                                .is_some_and(|run| Some(run) == effective_deadline);
+                            outcome.timed_out = !outcome.run_deadline_exceeded;
+                            terminate(&mut child);
+                            break;
+                        }
+                        terminate(&mut child);
+                        return Err(error);
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => pipes_closed = true,
             }
         }
         // Pipe lifetime and process lifetime are independent. A child can close
         // its pipes early, or leave them inherited by a longer-lived descendant.
-        if child.try_wait()?.is_some() {
-            break;
-        }
         if abort.load(Ordering::Relaxed) {
             outcome.aborted = true;
             terminate(&mut child);
+            break;
+        }
+        if child.try_wait()?.is_some() {
             break;
         }
         let now = Instant::now();
@@ -174,24 +258,48 @@ pub fn run_child_with_deadline(
     }
 
     if !outcome.run_deadline_exceeded && !outcome.aborted {
-        let drain_until = Instant::now() + DRAIN_GRACE;
-        let mut pending = Vec::new();
-        while Instant::now() < drain_until {
-            match receiver.try_recv() {
-                Ok(line) => pending.push(line),
-                Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(5)),
-                Err(mpsc::TryRecvError::Disconnected) => break,
+        // A bounded frame queue is drained directly. Waiting for inherited
+        // idle pipes is bounded independently of callback delivery time.
+        // Limit continuously writing descendants by frames, not callback wall
+        // time: a finite queue of short lines can take a slow caller seconds.
+        let mut drained = 0usize;
+        while let Ok(frame) = receiver.recv_timeout(DRAIN_GRACE) {
+            if let Err(error) = deliver(frame, &mut spools.files, &mut child) {
+                if abort.load(Ordering::Acquire) {
+                    outcome.aborted = true;
+                    terminate_process_tree(child_pid);
+                    break;
+                }
+                terminate_process_tree(child_pid);
+                return Err(error);
             }
-        }
-        // Bound waiting for inherited pipes, not delivery of already collected
-        // output. Slow callbacks must not drop a worker's final artifact.
-        for line in pending {
-            match line {
-                Line::Stdout(line) => on_stdout(&line),
-                Line::Stderr(line) => on_stderr(&line),
+            drained += 1;
+            if drained >= 4096 {
+                terminate_process_tree(child_pid);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "descendant output did not settle; capture incomplete",
+                ));
             }
         }
     }
+    stdout.finish(
+        false,
+        &mut |line| {
+            on_stdout(line);
+            Ok(())
+        },
+        &mut spools.files,
+    )?;
+    stderr.finish(
+        true,
+        &mut |line| {
+            on_stderr(line);
+            Ok(())
+        },
+        &mut spools.files,
+    )?;
+    outcome.stdout_spooled = stdout.spooled;
     outcome.exit_code = match child.wait() {
         Ok(status) => {
             status
@@ -204,6 +312,7 @@ pub fn run_child_with_deadline(
         }
         Err(_) => 1,
     };
+    outcome.output_spools = spools.commit();
     Ok(outcome)
 }
 
@@ -275,6 +384,14 @@ mod tests {
     #[ignore = "subprocess fixture invoked by pipe lifecycle tests"]
     fn pipe_lifecycle_fixture() {
         match std::env::var("DAVINCI_TEST_PIPE_MODE").as_deref() {
+            Ok("overflow-after-spool") => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                out.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+                out.write_all(b"\n").unwrap();
+                out.flush().unwrap();
+                out.write_all(&vec![b'y'; 17 * 1024 * 1024]).unwrap();
+            }
             Ok("close") => {
                 #[cfg(windows)]
                 unsafe {
@@ -304,8 +421,81 @@ mod tests {
                     println!("burst-line-{index}");
                 }
             }
+            Ok("giant") => {
+                use std::io::Write;
+                std::io::stdout()
+                    .write_all(&vec![b'x'; 10 * 1024 * 1024])
+                    .unwrap();
+            }
+            Ok("flood") => {
+                use std::io::Write;
+                let block = "x\n".repeat(1024);
+                loop {
+                    std::io::stdout().write_all(block.as_bytes()).unwrap();
+                }
+            }
             _ => panic!("fixture mode required"),
         }
+    }
+
+    #[test]
+    fn pr_review_supervisor_error_cleans_prior_spools() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = run_child_with_output_dir(
+            fixture("overflow-after-spool"),
+            &Arc::new(AtomicBool::new(false)),
+            WorkerDeadline::default(),
+            Some(dir.path()),
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn giant_output_is_spooled_instead_of_delivered_as_an_unbounded_line() {
+        let mut largest = 0;
+        let mut saved = false;
+        run_child(
+            fixture("giant"),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            |line| {
+                largest = largest.max(line.len());
+                saved |= line.contains("output saved");
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(largest <= 256 * 1024, "unbounded callback: {largest} bytes");
+        assert!(saved, "oversized evidence must remain recoverable");
+    }
+
+    #[test]
+    fn cancellation_interrupts_slow_delivery_inside_a_full_frame() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = abort.clone();
+        let signal = std::thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let outcome = run_child(
+            fixture("flood"),
+            &abort,
+            0,
+            |_| thread::sleep(Duration::from_millis(1)),
+            |_| {},
+        )
+        .unwrap();
+        signal.join().unwrap();
+        assert!(outcome.aborted);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cancellation waited for a full frame of callbacks"
+        );
     }
 
     #[test]

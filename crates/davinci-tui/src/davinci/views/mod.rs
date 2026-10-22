@@ -53,6 +53,7 @@ pub mod studio;
 pub mod task_board;
 pub mod thinking;
 pub mod transcript;
+mod transcript_cache;
 pub mod tree;
 pub mod trust;
 pub mod vectors;

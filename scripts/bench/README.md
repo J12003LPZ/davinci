@@ -391,3 +391,11 @@ Concurrent campaigns share the machine and the provider account, so their wall
 times are not comparable with a solo campaign, and each needs its own
 credential lineage (two campaigns refreshing copies of one login invalidate
 each other).
+
+## Local resource lifecycle fixtures
+
+[Resource lifecycle measurements](../../docs/perf/resource-lifecycle.md) use
+`resource_lifecycle.py` with separate baseline/candidate executables. These
+local release fixtures and explicitly offline CLI startup runs consume no
+provider usage. They measure process-tree RSS, cold/warm rendering, output
+recovery, cache churn and idle Node lifecycle; they do not grade coding quality.

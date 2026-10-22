@@ -28,7 +28,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::davinci::theme::{glyph, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, hair_rule, indent, run_width, span, span_strong, truncate_run, wrap,
+    blank, clip_ellipsis, hair_rule, indent, run_width, span, span_strong, truncate_run,
 };
 
 /// Below this width there is no measure to wrap to: rows are clipped instead.
@@ -45,27 +45,43 @@ const MAX_DEPTH: usize = 32;
 /// width below [`NARROW`] is clipped with an ellipsis instead. A width of zero
 /// has no room for anything and returns no rows.
 pub fn lines(theme: &Theme, source: &str, width: u16) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    visit_lines(theme, source, width, &mut |line| rows.push(line));
+    rows
+}
+
+/// Stream styled rows, retaining no rendered document outside the consumer.
+pub(super) fn visit_lines(
+    theme: &Theme,
+    source: &str,
+    width: u16,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
     if width == 0 {
-        return Vec::new();
+        return;
     }
     let blocks = parse(source);
     let ctx = Ctx {
         theme,
         base: theme.text,
     };
-    let mut rows: Vec<Line<'static>> = render_blocks(&blocks, width, &ctx, true)
-        .into_iter()
-        // Every row fits, whatever a nested container did with its share of
-        // the width: clipped, never wrapped, so a row count stays a row count.
-        .map(|line| Line::from(truncate_run(line.spans, width)))
-        .collect();
-    while rows.first().is_some_and(is_blank) {
-        rows.remove(0);
-    }
-    while rows.last().is_some_and(is_blank) {
-        rows.pop();
-    }
-    rows
+    let mut seen = false;
+    let mut pending = 0usize;
+    visit_blocks(&blocks, width, &ctx, true, &mut |line| {
+        let line = Line::from(truncate_run(line.spans, width));
+        if is_blank(&line) {
+            if seen {
+                pending += 1;
+            }
+        } else {
+            for _ in 0..pending {
+                emit(blank());
+            }
+            pending = 0;
+            seen = true;
+            emit(line);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -588,50 +604,60 @@ fn prefixed(mut prefix: Vec<Span<'static>>, line: Line<'static>) -> Line<'static
 /// A sequence of blocks as rows. `spaced` puts one blank row between blocks
 /// (§3); a list keeps its items tight. A block that renders to nothing —
 /// an empty quote, a bare fence while it streams — leaves no gap behind.
-fn render_blocks(blocks: &[Block], width: u16, ctx: &Ctx, spaced: bool) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
+fn visit_blocks(
+    blocks: &[Block],
+    width: u16,
+    ctx: &Ctx,
+    spaced: bool,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
+    let mut any = false;
     for block in blocks {
-        let rows = render_block(block, width, ctx);
-        if rows.is_empty() {
-            continue;
-        }
-        if spaced && !out.is_empty() {
-            out.push(blank());
-        }
-        out.extend(rows);
+        let mut started = false;
+        visit_block(block, width, ctx, &mut |line| {
+            if !started && spaced && any {
+                emit(blank());
+            }
+            started = true;
+            any = true;
+            emit(line);
+        });
     }
-    out
 }
-
-fn render_block(block: &Block, width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
-    let theme = ctx.theme;
+fn visit_block(block: &Block, width: u16, ctx: &Ctx, emit: &mut dyn FnMut(Line<'static>)) {
     match block {
-        Block::Paragraph(inlines) => wrap_inlines(inlines, measure(width), false, ctx),
-        Block::Heading { inlines, .. } => wrap_inlines(inlines, measure(width), true, ctx),
-        Block::Code { lang, text } => code_rows(lang.as_deref(), text, width, ctx),
-        Block::Quote(children) => {
-            render_blocks(children, width.saturating_sub(2), &ctx.muted(), true)
-                .into_iter()
-                .map(|line| prefixed(vec![span("│ ", theme.muted)], line))
-                .collect()
+        Block::Paragraph(inlines) => visit_inlines(inlines, measure(width), false, ctx, emit),
+        Block::Heading { inlines, .. } => visit_inlines(inlines, measure(width), true, ctx, emit),
+        Block::Code { lang, text } => visit_code_rows(lang.as_deref(), text, width, ctx, emit),
+        Block::Quote(children) => visit_blocks(
+            children,
+            width.saturating_sub(2),
+            &ctx.muted(),
+            true,
+            &mut |line| emit(prefixed(vec![span("│ ", ctx.theme.muted)], line)),
+        ),
+        Block::List { start, items } => visit_list_rows(*start, items, width, ctx, emit),
+        Block::Rule => emit(hair_rule(width, ctx.theme, "")),
+        Block::Html(text) => {
+            for line in text.lines() {
+                crate::davinci::ui::visit_wrapped(line, measure(width), |row| {
+                    if !row.trim().is_empty() {
+                        emit(Line::from(vec![span(row, ctx.theme.muted)]));
+                    }
+                });
+            }
         }
-        Block::List { start, items } => list_rows(*start, items, width, ctx),
-        Block::Rule => vec![hair_rule(width, theme, "")],
-        Block::Html(text) => text
-            .lines()
-            .flat_map(|line| wrap(line, measure(width)))
-            .filter(|row| !row.trim().is_empty())
-            .map(|row| Line::from(vec![span(row, theme.muted)]))
-            .collect(),
-        Block::Table { header, rows } => table_rows(header, rows, width, ctx),
+        Block::Table { header, rows } => visit_table_rows(header, rows, width, ctx, emit),
     }
 }
-
-/// Paragraph and heading text: hard breaks split the run, everything else
-/// wraps. `strong` is the heading's weight, laid over every run.
-fn wrap_inlines(inlines: &[Inline], width: u16, strong: bool, ctx: &Ctx) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    let mut run: Vec<(&str, Face)> = Vec::new();
+fn visit_inlines(
+    inlines: &[Inline],
+    width: u16,
+    strong: bool,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
+    let mut run = Vec::new();
     for inline in inlines {
         match inline {
             Inline::Text(text, face) => run.push((
@@ -642,63 +668,54 @@ fn wrap_inlines(inlines: &[Inline], width: u16, strong: bool, ctx: &Ctx) -> Vec<
                 },
             )),
             Inline::Break => {
-                rows.extend(wrap_run(&run, width, ctx));
+                visit_run(&run, width, ctx, emit);
                 run.clear();
             }
         }
     }
-    rows.extend(wrap_run(&run, width, ctx));
-    rows
+    visit_run(&run, width, ctx, emit);
 }
-
-/// Wrap one run of faced text to `width`, keeping each character's face.
-///
-/// `ui::wrap` decides the breaks on the plain text, so markdown prose breaks
-/// exactly where plain prose does; the faces are then laid back over its rows
-/// character by character. `wrap` collapses whitespace to single spaces and
-/// drops the space it breaks at, so the face stream is normalised the same
-/// way and one pending space is skipped at each row boundary. A run that is
-/// only whitespace has no row.
-fn wrap_run(run: &[(&str, Face)], width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
-    let mut plain = String::new();
-    let mut faces: Vec<(char, Face)> = Vec::new();
-    for (text, face) in run {
-        plain.push_str(text);
-        for ch in text.chars() {
+fn visit_run(run: &[(&str, Face)], width: u16, ctx: &Ctx, emit: &mut dyn FnMut(Line<'static>)) {
+    let plain: String = run.iter().map(|(text, _)| *text).collect();
+    if !plain.chars().any(|ch| !ch.is_whitespace()) {
+        return;
+    }
+    let mut last_was_text = false;
+    let mut faces = run
+        .iter()
+        .flat_map(|(text, face)| text.chars().map(move |ch| (ch, *face)))
+        .filter_map(|(ch, face)| {
             if ch.is_whitespace() {
-                if faces.last().is_some_and(|(last, _)| *last != ' ') {
-                    faces.push((' ', *face));
+                if last_was_text {
+                    last_was_text = false;
+                    Some((' ', face))
+                } else {
+                    None
                 }
             } else {
-                faces.push((ch, *face));
+                last_was_text = true;
+                Some((ch, face))
             }
+        })
+        .peekable();
+    let mut unmatched = false;
+    crate::davinci::ui::visit_wrapped(&plain, width, |row| {
+        if faces.peek().is_some_and(|(ch, _)| *ch == ' ') {
+            faces.next();
         }
-    }
-    if faces.is_empty() {
-        return Vec::new();
-    }
-
-    let mut next = 0usize;
-    let mut rows = Vec::new();
-    for row in wrap(&plain, width) {
-        if faces.get(next).is_some_and(|(ch, _)| *ch == ' ') {
-            next += 1;
-        }
-        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut spans = Vec::new();
         let mut text = String::new();
         let mut current = Face::default();
         for ch in row.chars() {
-            let face = match faces.get(next) {
-                Some((expected, face)) if *expected == ch => {
-                    next += 1;
-                    *face
-                }
-                // Out of step with `wrap`, which cannot happen while it keeps
-                // every non-blank character; if it ever does, the rest of the
-                // paragraph is plain rather than wrong.
-                _ => {
-                    next = faces.len();
-                    Face::default()
+            let face = if unmatched {
+                Face::default()
+            } else {
+                match faces.next() {
+                    Some((expected, face)) if expected == ch => face,
+                    _ => {
+                        unmatched = true;
+                        Face::default()
+                    }
                 }
             };
             if face != current && !text.is_empty() {
@@ -710,39 +727,42 @@ fn wrap_run(run: &[(&str, Face)], width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
         if !text.is_empty() {
             spans.push(current.span(text, ctx));
         }
-        rows.push(Line::from(spans));
-    }
-    rows
+        emit(Line::from(spans));
+    });
 }
 
 /// Code sits two columns in behind a `│`, never wrapped: a row past the
 /// width is clipped, and tabs are four spaces. A fence that names its
 /// language gets that name as a muted first row.
-fn code_rows(lang: Option<&str>, text: &str, width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
+fn visit_code_rows(
+    lang: Option<&str>,
+    text: &str,
+    width: u16,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
     use super::highlight::Token;
     let cc = ctx.theme.cc();
     let language = lang.and_then(super::highlight::language_of);
     let body = text.strip_suffix('\n').unwrap_or(text);
     if body.is_empty() {
-        return Vec::new();
+        return;
     }
-    body.split('\n')
-        .map(|line| {
-            let content = clip_ellipsis(&line.trim_end_matches('\r').replace('\t', "    "), width);
-            let mut spans = Vec::new();
-            for (token, run) in super::highlight::tokens(language, &content) {
-                match token {
-                    Token::Keyword => spans.push(span(run, cc.code_keyword)),
-                    Token::String => spans.push(span(run, cc.code_string)),
-                    Token::Comment => spans.push(span(run, cc.inactive)),
-                    Token::Number | Token::Plain => {
-                        spans.extend(split_macros(&run, ctx.base, cc.code_macro));
-                    }
+    for line in body.split('\n') {
+        let content = clip_ellipsis(&line.trim_end_matches('\r').replace('\t', "    "), width);
+        let mut spans = Vec::new();
+        for (token, run) in super::highlight::tokens(language, &content) {
+            match token {
+                Token::Keyword => spans.push(span(run, cc.code_keyword)),
+                Token::String => spans.push(span(run, cc.code_string)),
+                Token::Comment => spans.push(span(run, cc.inactive)),
+                Token::Number | Token::Plain => {
+                    spans.extend(split_macros(&run, ctx.base, cc.code_macro));
                 }
             }
-            Line::from(spans)
-        })
-        .collect()
+        }
+        emit(Line::from(spans));
+    }
 }
 
 fn split_macros(run: &str, base: Color, macro_color: Color) -> Vec<Span<'static>> {
@@ -775,15 +795,20 @@ fn split_macros(run: &str, base: Color, macro_color: Color) -> Vec<Span<'static>
 /// text hanging under itself. Numbers right-align to the widest label in the
 /// list so every item's text shares a column; nested content, lists
 /// included, starts in that column — two columns in for a bullet.
-fn list_rows(start: Option<u64>, items: &[Item], width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
-    let theme = ctx.theme;
+fn visit_list_rows(
+    start: Option<u64>,
+    items: &[Item],
+    width: u16,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
     let label_width = start.map_or(0, |first| {
-        (0..items.len() as u64)
-            .map(|offset| format!("{}.", first.saturating_add(offset)).len())
-            .max()
-            .unwrap_or(0)
+        format!(
+            "{}.",
+            first.saturating_add(items.len().saturating_sub(1) as u64)
+        )
+        .len()
     });
-    let mut out = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let mut marker = match start {
             Some(first) => vec![span(
@@ -797,44 +822,50 @@ fn list_rows(start: Option<u64>, items: &[Item], width: u16, ctx: &Ctx) -> Vec<L
             None => vec![span("- ", ctx.base)],
         };
         match item.task {
-            Some(true) => marker.push(span(format!("{} ", glyph::DONE), theme.success)),
-            Some(false) => marker.push(span(format!("{} ", glyph::QUEUED), theme.border)),
+            Some(true) => marker.push(span(format!("{} ", glyph::DONE), ctx.theme.success)),
+            Some(false) => marker.push(span(format!("{} ", glyph::QUEUED), ctx.theme.border)),
             None => {}
         }
         let hang = run_width(&marker);
-        let body = render_blocks(&item.blocks, width.saturating_sub(hang), ctx, false);
-        if body.is_empty() {
+        let mut seen = false;
+        visit_blocks(
+            &item.blocks,
+            width.saturating_sub(hang),
+            ctx,
+            false,
+            &mut |line| {
+                emit(if !seen {
+                    prefixed(marker.clone(), line)
+                } else {
+                    indent(hang, line.spans)
+                });
+                seen = true;
+            },
+        );
+        if !seen {
             if let Some(last) = marker.last_mut() {
                 last.content = last.content.trim_end().to_string().into();
             }
-            out.push(Line::from(marker));
-            continue;
-        }
-        for (row, line) in body.into_iter().enumerate() {
-            out.push(if row == 0 {
-                prefixed(marker.clone(), line)
-            } else {
-                indent(hang, line.spans)
-            });
+            emit(Line::from(marker));
         }
     }
-    out
 }
 
 /// Plain cells, columns padded to their widest cell and joined by two
 /// spaces, the header strong. No rules: the alignment is the grid. A row
 /// wider than the width is clipped, never wrapped.
-fn table_rows(
+fn visit_table_rows(
     header: &[String],
     rows: &[Vec<String>],
     width: u16,
     ctx: &Ctx,
-) -> Vec<Line<'static>> {
+    emit: &mut dyn FnMut(Line<'static>),
+) {
     let columns = header
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
     if columns == 0 {
-        return Vec::new();
+        return;
     }
     let mut widths = vec![0usize; columns];
     for row in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)) {
@@ -857,19 +888,16 @@ fn table_rows(
         }
         clip_ellipsis(&out, width)
     };
-    let mut out = Vec::new();
     if !header.is_empty() {
-        out.push(Line::from(vec![span_strong(
+        emit(Line::from(vec![span_strong(
             join(header),
             ctx.base,
             ctx.theme,
         )]));
     }
-    out.extend(
-        rows.iter()
-            .map(|row| Line::from(vec![span(join(row), ctx.base)])),
-    );
-    out
+    for row in rows {
+        emit(Line::from(vec![span(join(row), ctx.base)]));
+    }
 }
 
 #[cfg(test)]

@@ -801,15 +801,20 @@ fn split_into_tokens_with_ansi(text: &str) -> Vec<String> {
     tokens
 }
 
-fn break_long_word(word: &str, width: usize, tracker: &mut AnsiCodeTracker) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current_line = tracker.get_active_codes();
-    let mut current_width = 0usize;
-    let mut segments = Vec::new();
+fn visit_long_word(
+    word: &str,
+    width: usize,
+    tracker: &mut AnsiCodeTracker,
+    emit: &mut dyn FnMut(String),
+) {
+    let mut current = tracker.get_active_codes();
+    let mut cells = 0;
+    let mut any = false;
     let mut i = 0;
     while i < word.len() {
         if let Some((code, len)) = extract_ansi_code(word, i) {
-            segments.push((true, code));
+            current.push_str(&code);
+            tracker.process(&code);
             i += len;
         } else {
             let mut end = i;
@@ -817,73 +822,63 @@ fn break_long_word(word: &str, width: usize, tracker: &mut AnsiCodeTracker) -> V
                 end += word[end..].chars().next().map_or(1, |ch| ch.len_utf8());
             }
             for grapheme in word[i..end].graphemes(true) {
-                segments.push((false, grapheme.to_string()));
+                let gw = visible_width(grapheme);
+                if cells + gw > width {
+                    current.push_str(&tracker.get_line_end_reset());
+                    emit(std::mem::take(&mut current));
+                    any = true;
+                    current = tracker.get_active_codes();
+                    cells = 0;
+                }
+                current.push_str(grapheme);
+                cells += gw;
             }
             i = end;
         }
     }
-    for (is_ansi, value) in segments {
-        if is_ansi {
-            current_line.push_str(&value);
-            tracker.process(&value);
-            continue;
-        }
-        if value.is_empty() {
-            continue;
-        }
-        let gw = visible_width(&value);
-        if current_width + gw > width {
-            current_line.push_str(&tracker.get_line_end_reset());
-            lines.push(std::mem::take(&mut current_line));
-            current_line = tracker.get_active_codes();
-            current_width = 0;
-        }
-        current_line.push_str(&value);
-        current_width += gw;
-    }
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-    if lines.is_empty() {
-        vec![String::new()]
-    } else {
-        lines
+    if !current.is_empty() {
+        emit(current);
+    } else if !any {
+        emit(String::new());
     }
 }
-
-fn wrap_single_line(line: &str, width: usize) -> Vec<String> {
-    if line.is_empty() {
-        return vec![String::new()];
+fn visit_single_line(line: &str, width: usize, emit: &mut dyn FnMut(String)) {
+    if line.is_empty() || visible_width(line) <= width {
+        emit(line.to_owned());
+        return;
     }
-    if visible_width(line) <= width {
-        return vec![line.to_string()];
-    }
-    let mut wrapped = Vec::new();
     let mut tracker = AnsiCodeTracker::default();
     let tokens = split_into_tokens_with_ansi(line);
     let mut current_line = String::new();
     let mut current_visible = 0usize;
+    let mut emitted = false;
+    let mut output = |line: String| {
+        emitted = true;
+        emit(line.trim_end().to_owned());
+    };
     for token in tokens {
         let token_visible = visible_width(&token);
-        let is_whitespace = token.trim().is_empty();
-        if token_visible > width && !is_whitespace {
+        let whitespace = token.trim().is_empty();
+        if token_visible > width && !whitespace {
             if !current_line.is_empty() {
                 current_line.push_str(&tracker.get_line_end_reset());
-                wrapped.push(std::mem::take(&mut current_line));
+                output(std::mem::take(&mut current_line));
             }
-            let broken = break_long_word(&token, width, &mut tracker);
-            for line in broken.iter().take(broken.len().saturating_sub(1)) {
-                wrapped.push(line.clone());
-            }
-            current_line = broken.last().cloned().unwrap_or_default();
+            let mut last = None;
+            visit_long_word(&token, width, &mut tracker, &mut |line| {
+                if let Some(previous) = last.replace(line) {
+                    output(previous);
+                }
+            });
+            current_line = last.unwrap_or_default();
             current_visible = visible_width(&current_line);
             continue;
         }
         if current_visible + token_visible > width && current_visible > 0 {
-            let mut line_to_wrap = current_line.trim_end().to_string();
-            line_to_wrap.push_str(&tracker.get_line_end_reset());
-            wrapped.push(line_to_wrap);
-            if is_whitespace {
+            let mut line = current_line.trim_end().to_owned();
+            line.push_str(&tracker.get_line_end_reset());
+            output(line);
+            if whitespace {
                 current_line = tracker.get_active_codes();
                 current_visible = 0;
             } else {
@@ -897,63 +892,45 @@ fn wrap_single_line(line: &str, width: usize) -> Vec<String> {
         update_tracker_from_text(&token, &mut tracker);
     }
     if !current_line.is_empty() {
-        wrapped.push(current_line);
+        output(current_line);
     }
-    if wrapped.is_empty() {
-        vec![String::new()]
-    } else {
-        wrapped
-            .into_iter()
-            .map(|line| line.trim_end().to_string())
-            .collect()
+    if !emitted {
+        emit(String::new());
     }
 }
 
-/// TS `wrapTextWithAnsi`.
+/// TS `wrapTextWithAnsi`, collected for callers that explicitly need all rows.
 pub fn wrap_text_with_ansi(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let input_lines: Vec<&str> = {
-        let mut lines = Vec::new();
-        let mut rest = text;
-        loop {
-            let crlf = rest.find("\r\n");
-            let cr = rest.find('\r');
-            let lf = rest.find('\n');
-            let next = [crlf.map(|i| (i, 2)), cr.map(|i| (i, 1)), lf.map(|i| (i, 1))]
-                .into_iter()
-                .flatten()
-                .min_by_key(|(idx, _)| *idx);
-            match next {
-                Some((idx, skip)) => {
-                    lines.push(&rest[..idx]);
-                    rest = &rest[idx + skip..];
-                }
-                None => {
-                    lines.push(rest);
-                    break;
-                }
-            }
-        }
-        lines
-    };
-    let mut result = Vec::new();
+    let mut rows = Vec::new();
+    visit_text_with_ansi(text, width, &mut |row| rows.push(row));
+    rows
+}
+pub(crate) fn visit_text_with_ansi(text: &str, width: usize, emit: &mut dyn FnMut(String)) {
     let mut tracker = AnsiCodeTracker::default();
-    for input_line in input_lines {
-        let prefix = if result.is_empty() {
+    let mut first = true;
+    let mut rest = text;
+    loop {
+        let next = rest.find(['\r', '\n']);
+        let line = next.map_or(rest, |end| &rest[..end]);
+        let prefix = if first {
             String::new()
         } else {
             tracker.get_active_codes()
         };
-        let prefixed = format!("{prefix}{input_line}");
-        result.extend(wrap_single_line(&prefixed, width));
-        update_tracker_from_text(input_line, &mut tracker);
-    }
-    if result.is_empty() {
-        vec![String::new()]
-    } else {
-        result
+        visit_single_line(&format!("{prefix}{line}"), width, emit);
+        update_tracker_from_text(line, &mut tracker);
+        first = false;
+        match next {
+            Some(end) => {
+                let skip = if rest[end..].starts_with("\r\n") {
+                    2
+                } else {
+                    1
+                };
+                rest = &rest[end + skip..];
+            }
+            None => break,
+        }
     }
 }
 

@@ -172,6 +172,37 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     Ok(value.map(LanguageIntelligenceConfig::from_value))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionRuntimeConfig {
+    pub max_persistent_sessions: usize,
+    pub idle_timeout_ms: u64,
+    pub load_cache_max_entries: usize,
+    pub load_cache_max_bytes: usize,
+}
+impl Default for ExtensionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_persistent_sessions: 8,
+            idle_timeout_ms: 300_000,
+            load_cache_max_entries: 128,
+            load_cache_max_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+impl ExtensionRuntimeConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=8).contains(&self.max_persistent_sessions)
+            || self.idle_timeout_ms > 86_400_000
+            || self.load_cache_max_entries > 4096
+            || self.load_cache_max_bytes > 64 * 1024 * 1024
+        {
+            return Err("invalid extensionRuntime limits (sessions 1..8, idle <= 86400000 ms, memo <= 4096 entries/64 MiB)".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     /// User-controlled only. Unused configuration remains opaque in Off mode.
@@ -250,6 +281,8 @@ pub struct Settings {
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
     #[serde(default)]
     pub cache: Option<davinci_agent::runtime::cache::CacheConfig>,
+    #[serde(default, rename = "extensionRuntime")]
+    pub extension_runtime: Option<ExtensionRuntimeConfig>,
     #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]
@@ -352,6 +385,10 @@ pub struct Settings {
     /// counterpart.
     #[serde(default, rename = "workflowMaxConcurrentAgents")]
     pub workflow_max_concurrent_agents: Option<u64>,
+    #[serde(default, rename = "subagentMaxConcurrentTasks")]
+    pub subagent_max_concurrent_tasks: Option<usize>,
+    #[serde(default, rename = "workerResources")]
+    pub worker_resources: Option<davinci_agent::runtime::worker_admission::WorkerResourceConfig>,
     /// Agent teams (persistent teammates). `DAVINCI_EXPERIMENTAL_AGENT_TEAMS`
     /// overrides. No TypeScript counterpart.
     #[serde(default, rename = "agentTeams")]
@@ -1944,6 +1981,21 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_resource_configuration_round_trips() {
+        let input = serde_json::json!({"subagentMaxConcurrentTasks":2,"workerResources":{"memoryBudgetBytes":4096,"estimatedWorkerBytes":1024}});
+        let settings: super::Settings = serde_json::from_value(input.clone()).unwrap();
+        assert!(
+            !settings.extra.contains_key("workerResources"),
+            "worker resource policy is opaque and unenforced"
+        );
+        let output = serde_json::to_value(settings).unwrap();
+        assert_eq!(
+            output["subagentMaxConcurrentTasks"],
+            input["subagentMaxConcurrentTasks"]
+        );
+        assert_eq!(output["workerResources"], input["workerResources"]);
+    }
     #[test]
     fn regression_manifest_globs_obey_package_filters() {
         use super::*;

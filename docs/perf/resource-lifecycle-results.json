@@ -1,0 +1,1308 @@
+{
+  "recordedUtc": "2026-10-21T15:49:51.540629+00:00",
+  "baselineSourceCommit": "d44028fbe822cd71975e91ceda69c7c901a82693",
+  "candidateCodeCommit": "8fd946d6d9b7260afc50938c4668bf1741390792",
+  "installedBaselineSha256": "cfcf8e4272ccd6ab581f99da90623fdefb1876c7954de5d72ea6ecf027406b7e",
+  "environment": {
+    "os": "Linux 6.18.55 x86_64 GNU/Linux",
+    "rustc": "1.88.0 (6b00bc388 2025-06-23)",
+    "node": "v24.19.0",
+    "python": "3.12.14"
+  },
+  "profiles": {
+    "component": "release opt-level=3, debug=false, strip=true; no LTO; same profile in both variants",
+    "cli": "repository release profile; separate final binary; explicitly offline"
+  },
+  "sourceManifests": {
+    "baseline": {
+      "crateSourceDigest": "2ed11bc57f7b9155bf7a77343acdd71b59a99e2aaeff435781c65e1bc786bbcd",
+      "digestDefinition": "sorted crates/**/*.{rs,js,toml}: relative UTF-8 path, NUL, raw SHA256 bytes",
+      "workspaceLockSha256": "78e525020744c796bff1c3d53f2996d18296e062b2aeee14baa56db5e727b0f1",
+      "copiedFiles": {
+        "src/extension_runner.js": "b54725874d77822b9b2d8515f528412ebdfc369e30298827e1636ee94d0dc1d6",
+        "src/graph/process.rs": "ac965c00af16697dea12802df3a52a452311c84e8b55375cf3abdde3c6e0fa77",
+        "src/js_host.rs": "0a203971356ce2bb5c5ea963c652f512bbfc609d43391da143886a83b7d0c73d",
+        "src/language-server.cjs": "7790165a2e7a223e741125c911f127af2b1c0b2d2ada461844f3fd4c007a9467",
+        "src/main.rs": "31b67a0d8a1c19a56600dd8e6419d07cd2040c122311d963b4b842b724622ac7"
+      }
+    },
+    "candidate": {
+      "crateSourceDigest": "c7d6c774165e38d8de85e6ee8ad495f490fa3f68b164840714bd72663d0dea0b",
+      "digestDefinition": "sorted crates/**/*.{rs,js,toml}: relative UTF-8 path, NUL, raw SHA256 bytes",
+      "workspaceLockSha256": "78e525020744c796bff1c3d53f2996d18296e062b2aeee14baa56db5e727b0f1",
+      "copiedFiles": {
+        "src/extension_runner.js": "b54725874d77822b9b2d8515f528412ebdfc369e30298827e1636ee94d0dc1d6",
+        "src/graph/process.rs": "08a6187ed42b014fadd139a6a9d0a7ada05dde00699fd3677187d1412d3b771d",
+        "src/graph/process_output.rs": "26357c897fd15a6af1349db057fb11a688b0c725d71acc355c6beb23a74863b5",
+        "src/js_host/lifecycle.rs": "b26064113e6e26dc358f2d736e6463446c71ef9c024a73733313b6eacb2a224d",
+        "src/js_host.rs": "61ce8bccd9117228fcd17c4bad909cf2e86971999c52f94e5f771133029b8f13",
+        "src/language-server.cjs": "7790165a2e7a223e741125c911f127af2b1c0b2d2ada461844f3fd4c007a9467",
+        "src/main.rs": "31b67a0d8a1c19a56600dd8e6419d07cd2040c122311d963b4b842b724622ac7"
+      }
+    }
+  },
+  "components": {
+    "platform": "linux",
+    "samplesPerVariant": 5,
+    "samplingIntervalMs": 2,
+    "kind": "component",
+    "rssDefinition": "sum of observed process-tree RSS; shared pages counted per process; short peaks may be missed",
+    "providerCalls": 0,
+    "variants": {
+      "baseline": {
+        "binarySha256": "a24c0b829c393293ff35d48184212a8aa2ff71ee439de2caab5cecc9d7ce9812",
+        "workloads": {
+          "transcript": [
+            {
+              "elapsedNs": 358385558,
+              "peakTreeRssBytes": 42786816,
+              "rssObservations": 19,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 197301906,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  201171,
+                  184498,
+                  173587,
+                  178297,
+                  175980
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 463797330,
+              "peakTreeRssBytes": 42917888,
+              "rssObservations": 20,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 284647299,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  529101,
+                  507327,
+                  426288,
+                  520272,
+                  253661
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 295272632,
+              "peakTreeRssBytes": 42786816,
+              "rssObservations": 16,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 133715911,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  311049,
+                  189501,
+                  269291,
+                  179619,
+                  234559
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 316834641,
+              "peakTreeRssBytes": 42852352,
+              "rssObservations": 17,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 138658860,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  195500,
+                  176776,
+                  195220,
+                  182210,
+                  175119
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 425078269,
+              "peakTreeRssBytes": 42909696,
+              "rssObservations": 18,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 256412961,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  461345,
+                  411284,
+                  368827,
+                  388061,
+                  421820
+                ],
+                "workload": "transcript"
+              }
+            }
+          ],
+          "cache": [
+            {
+              "elapsedNs": 195163492,
+              "peakTreeRssBytes": 4677632,
+              "rssObservations": 10,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 181057820,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 268714423,
+              "peakTreeRssBytes": 4767744,
+              "rssObservations": 11,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 250540355,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 271936458,
+              "peakTreeRssBytes": 4907008,
+              "rssObservations": 11,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 251693674,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 269851079,
+              "peakTreeRssBytes": 4648960,
+              "rssObservations": 11,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 253099390,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 264076145,
+              "peakTreeRssBytes": 4710400,
+              "rssObservations": 11,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 246701302,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            }
+          ],
+          "output": [
+            {
+              "elapsedNs": 115878695,
+              "peakTreeRssBytes": 69971968,
+              "rssObservations": 6,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "coldNs": 96074629,
+                "maxCallbackBytes": 33554432,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 97462034,
+              "peakTreeRssBytes": 51400704,
+              "rssObservations": 5,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "coldNs": 90498995,
+                "maxCallbackBytes": 33554432,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 92979798,
+              "peakTreeRssBytes": 66355200,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 77915101,
+                "maxCallbackBytes": 33554432,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 99427419,
+              "peakTreeRssBytes": 37007360,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 80350752,
+                "maxCallbackBytes": 33554432,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 128881014,
+              "peakTreeRssBytes": 62447616,
+              "rssObservations": 6,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "coldNs": 117167364,
+                "maxCallbackBytes": 33554432,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            }
+          ],
+          "host": [
+            {
+              "elapsedNs": 175218540,
+              "peakTreeRssBytes": 5509120,
+              "rssObservations": 9,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21421950,
+                "learningStoreCreated": true,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 181158597,
+              "peakTreeRssBytes": 6066176,
+              "rssObservations": 9,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21443142,
+                "learningStoreCreated": true,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 191988049,
+              "peakTreeRssBytes": 6356992,
+              "rssObservations": 10,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 22009846,
+                "learningStoreCreated": true,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 187470481,
+              "peakTreeRssBytes": 6078464,
+              "rssObservations": 9,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21697113,
+                "learningStoreCreated": true,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 187970455,
+              "peakTreeRssBytes": 6066176,
+              "rssObservations": 9,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21332389,
+                "learningStoreCreated": true,
+                "workload": "host"
+              }
+            }
+          ],
+          "js_idle": [
+            {
+              "elapsedNs": 2359716754,
+              "peakTreeRssBytes": 34000896,
+              "rssObservations": 126,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 30007296,
+                "nodeRssBeforeIdleBytes": 30007296,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2357589636,
+              "peakTreeRssBytes": 34299904,
+              "rssObservations": 125,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 30269440,
+                "nodeRssBeforeIdleBytes": 30269440,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2357891598,
+              "peakTreeRssBytes": 33935360,
+              "rssObservations": 125,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 30273536,
+                "nodeRssBeforeIdleBytes": 30273536,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2350683639,
+              "peakTreeRssBytes": 34426880,
+              "rssObservations": 126,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 30400512,
+                "nodeRssBeforeIdleBytes": 30400512,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2355837819,
+              "peakTreeRssBytes": 34279424,
+              "rssObservations": 123,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 30269440,
+                "nodeRssBeforeIdleBytes": 30269440,
+                "workload": "js_idle"
+              }
+            }
+          ],
+          "js_active": [
+            {
+              "elapsedNs": 1575926893,
+              "peakTreeRssBytes": 34131968,
+              "rssObservations": 82,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502373609,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1577235505,
+              "peakTreeRssBytes": 34525184,
+              "rssObservations": 83,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502549974,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1555558456,
+              "peakTreeRssBytes": 34521088,
+              "rssObservations": 83,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502157026,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1582099358,
+              "peakTreeRssBytes": 34127872,
+              "rssObservations": 82,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502544371,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1577080974,
+              "peakTreeRssBytes": 34459648,
+              "rssObservations": 82,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502261743,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            }
+          ],
+          "lsp_idle": [
+            {
+              "elapsedNs": 2386190417,
+              "peakTreeRssBytes": 34689024,
+              "rssObservations": 126,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 28561408,
+                "nodeRssBeforeIdleBytes": 28561408,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2374849895,
+              "peakTreeRssBytes": 34627584,
+              "rssObservations": 127,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 28434432,
+                "nodeRssBeforeIdleBytes": 28434432,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2389467750,
+              "peakTreeRssBytes": 34181120,
+              "rssObservations": 127,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 28434432,
+                "nodeRssBeforeIdleBytes": 28434432,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2359834231,
+              "peakTreeRssBytes": 34787328,
+              "rssObservations": 128,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 28434432,
+                "nodeRssBeforeIdleBytes": 28434432,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2368686417,
+              "peakTreeRssBytes": 34476032,
+              "rssObservations": 131,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": 28434432,
+                "nodeRssBeforeIdleBytes": 28434432,
+                "workload": "lsp_idle"
+              }
+            }
+          ],
+          "lsp_active": [
+            {
+              "elapsedNs": 1597924885,
+              "peakTreeRssBytes": 34566144,
+              "rssObservations": 89,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1553505513,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1597013324,
+              "peakTreeRssBytes": 34611200,
+              "rssObservations": 85,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1558485964,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1631128416,
+              "peakTreeRssBytes": 34856960,
+              "rssObservations": 89,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1597929763,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1586873624,
+              "peakTreeRssBytes": 34779136,
+              "rssObservations": 88,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1557978083,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1579899311,
+              "peakTreeRssBytes": 34803712,
+              "rssObservations": 85,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1549337379,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            }
+          ]
+        }
+      },
+      "candidate": {
+        "binarySha256": "17da3823eadf9ec1f42d77bf8727387041f1f1b076b8d5bd92fed224ace36b93",
+        "workloads": {
+          "transcript": [
+            {
+              "elapsedNs": 293408435,
+              "peakTreeRssBytes": 16863232,
+              "rssObservations": 17,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 127847674,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  246042,
+                  438977,
+                  201554,
+                  230783,
+                  873730
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 298907325,
+              "peakTreeRssBytes": 16928768,
+              "rssObservations": 17,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 129613386,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  213185,
+                  209636,
+                  248648,
+                  204484,
+                  215409
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 275020418,
+              "peakTreeRssBytes": 16859136,
+              "rssObservations": 16,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 105277392,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  211487,
+                  525114,
+                  286053,
+                  249679,
+                  200394
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 278627417,
+              "peakTreeRssBytes": 16805888,
+              "rssObservations": 16,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 106344697,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  217203,
+                  231799,
+                  230523,
+                  265464,
+                  200287
+                ],
+                "workload": "transcript"
+              }
+            },
+            {
+              "elapsedNs": 270230593,
+              "peakTreeRssBytes": 16863232,
+              "rssObservations": 15,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "checksum": 1590,
+                "coldNs": 108462044,
+                "entries": 50000,
+                "rows": 50000,
+                "warmNs": [
+                  210922,
+                  209064,
+                  224939,
+                  201973,
+                  459523
+                ],
+                "workload": "transcript"
+              }
+            }
+          ],
+          "cache": [
+            {
+              "elapsedNs": 73418596,
+              "peakTreeRssBytes": 5165056,
+              "rssObservations": 4,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 59462003,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 71232606,
+              "peakTreeRssBytes": 5099520,
+              "rssObservations": 4,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 59238475,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 118610575,
+              "peakTreeRssBytes": 5103616,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 97788725,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 68858667,
+              "peakTreeRssBytes": 5103616,
+              "rssObservations": 4,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 52188000,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            },
+            {
+              "elapsedNs": 71572202,
+              "peakTreeRssBytes": 5103616,
+              "rssObservations": 4,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 52506149,
+                "operations": 12000,
+                "workload": "cache"
+              }
+            }
+          ],
+          "output": [
+            {
+              "elapsedNs": 104059513,
+              "peakTreeRssBytes": 7708672,
+              "rssObservations": 6,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "coldNs": 96375751,
+                "maxCallbackBytes": 66,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 88344879,
+              "peakTreeRssBytes": 7770112,
+              "rssObservations": 5,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "coldNs": 70926784,
+                "maxCallbackBytes": 66,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 69740693,
+              "peakTreeRssBytes": 7692288,
+              "rssObservations": 4,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "coldNs": 62054209,
+                "maxCallbackBytes": 66,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 66512621,
+              "peakTreeRssBytes": 5083136,
+              "rssObservations": 3,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 60854994,
+                "maxCallbackBytes": 66,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            },
+            {
+              "elapsedNs": 88596998,
+              "peakTreeRssBytes": 7442432,
+              "rssObservations": 5,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "coldNs": 69471614,
+                "maxCallbackBytes": 66,
+                "retainedOutputBytes": 33554432,
+                "workload": "output"
+              }
+            }
+          ],
+          "host": [
+            {
+              "elapsedNs": 190432142,
+              "peakTreeRssBytes": 5668864,
+              "rssObservations": 11,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21811748,
+                "learningStoreCreated": false,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 174601639,
+              "peakTreeRssBytes": 5701632,
+              "rssObservations": 10,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21389954,
+                "learningStoreCreated": false,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 189041159,
+              "peakTreeRssBytes": 5582848,
+              "rssObservations": 11,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21341623,
+                "learningStoreCreated": false,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 190932755,
+              "peakTreeRssBytes": 5709824,
+              "rssObservations": 11,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21259120,
+                "learningStoreCreated": false,
+                "workload": "host"
+              }
+            },
+            {
+              "elapsedNs": 173702302,
+              "peakTreeRssBytes": 5582848,
+              "rssObservations": 10,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "coldNs": 21087810,
+                "learningStoreCreated": false,
+                "workload": "host"
+              }
+            }
+          ],
+          "js_idle": [
+            {
+              "elapsedNs": 2379092624,
+              "peakTreeRssBytes": 34385920,
+              "rssObservations": 137,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 30138368,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2355026136,
+              "peakTreeRssBytes": 34516992,
+              "rssObservations": 137,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 30273536,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2353925041,
+              "peakTreeRssBytes": 34500608,
+              "rssObservations": 135,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 30269440,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2366572539,
+              "peakTreeRssBytes": 34299904,
+              "rssObservations": 95,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 30138368,
+                "workload": "js_idle"
+              }
+            },
+            {
+              "elapsedNs": 2354953925,
+              "peakTreeRssBytes": 34295808,
+              "rssObservations": 137,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 30007296,
+                "workload": "js_idle"
+              }
+            }
+          ],
+          "js_active": [
+            {
+              "elapsedNs": 1552247042,
+              "peakTreeRssBytes": 34582528,
+              "rssObservations": 91,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502311040,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1560638448,
+              "peakTreeRssBytes": 34390016,
+              "rssObservations": 91,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502192236,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1557144563,
+              "peakTreeRssBytes": 34451456,
+              "rssObservations": 91,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1503167647,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1578520043,
+              "peakTreeRssBytes": 34271232,
+              "rssObservations": 84,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502498600,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            },
+            {
+              "elapsedNs": 1555780297,
+              "peakTreeRssBytes": 34254848,
+              "rssObservations": 86,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1502245048,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "js_active"
+              }
+            }
+          ],
+          "lsp_idle": [
+            {
+              "elapsedNs": 2372742248,
+              "peakTreeRssBytes": 35307520,
+              "rssObservations": 110,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 28696576,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2388641285,
+              "peakTreeRssBytes": 35082240,
+              "rssObservations": 109,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 28303360,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2369866511,
+              "peakTreeRssBytes": 35012608,
+              "rssObservations": 130,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 28434432,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2340759521,
+              "peakTreeRssBytes": 35135488,
+              "rssObservations": 135,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 28561408,
+                "workload": "lsp_idle"
+              }
+            },
+            {
+              "elapsedNs": 2354283485,
+              "peakTreeRssBytes": 35078144,
+              "rssObservations": 141,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "configuredIdleMs": 1000,
+                "idleWaitMs": 2300,
+                "nodeRssAfterIdleBytes": null,
+                "nodeRssBeforeIdleBytes": 28430336,
+                "workload": "lsp_idle"
+              }
+            }
+          ],
+          "lsp_active": [
+            {
+              "elapsedNs": 1580394170,
+              "peakTreeRssBytes": 34656256,
+              "rssObservations": 94,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1554040768,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1577749312,
+              "peakTreeRssBytes": 34820096,
+              "rssObservations": 94,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1554294335,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1565162681,
+              "peakTreeRssBytes": 34725888,
+              "rssObservations": 93,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1548103643,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1575768966,
+              "peakTreeRssBytes": 34955264,
+              "rssObservations": 92,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1551255336,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            },
+            {
+              "elapsedNs": 1573482597,
+              "peakTreeRssBytes": 35045376,
+              "rssObservations": 93,
+              "peakObservedChildren": 1,
+              "metrics": {
+                "activeNs": 1551996221,
+                "configuredIdleMs": 1000,
+                "sameProcess": true,
+                "workload": "lsp_active"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "validation": [
+    {
+      "phase": "before final review corrections",
+      "command": "cargo test --workspace --locked --no-fail-fast -j 2",
+      "devDebug": 0,
+      "testDebug": 0,
+      "incremental": 0,
+      "exitCode": 0,
+      "passed": 7095,
+      "failed": 0,
+      "ignored": 63,
+      "completedTargets": 254
+    },
+    {
+      "phase": "after corrections",
+      "command": "cargo test -p davinci-agent --lib worker_admission --locked -j 2",
+      "exitCode": 0,
+      "passed": 3,
+      "failed": 0
+    },
+    {
+      "phase": "after corrections",
+      "command": "cargo test -p davinci-coding-agent --lib resource_ --locked -j 2",
+      "exitCode": 0,
+      "passed": 9,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "phase": "after corrections",
+      "command": "cargo test -p davinci-tui --lib davinci::views::transcript::tests --locked -j 2",
+      "exitCode": 0,
+      "passed": 61,
+      "failed": 0
+    },
+    {
+      "phase": "after corrections",
+      "command": "cargo check --workspace --locked -j 2",
+      "exitCode": 0
+    },
+    {
+      "phase": "after corrections",
+      "command": "cargo fmt --all -- --check",
+      "exitCode": 0
+    },
+    {
+      "phase": "benchmark sampler",
+      "command": "python3 -m unittest discover -s scripts/bench/tests -p test_resource_lifecycle.py",
+      "exitCode": 0,
+      "passed": 3,
+      "failed": 0
+    },
+    {
+      "phase": "final native release",
+      "command": "cargo build --release -p davinci-coding-agent --bin davinci --locked --target-dir /workspace/davinci-resource-target -j 2",
+      "exitCode": 0
+    }
+  ],
+  "cli": {
+    "platform": "linux",
+    "samplesPerVariant": 5,
+    "samplingIntervalMs": 2,
+    "kind": "cli",
+    "rssDefinition": "sum of observed process-tree RSS; shared pages counted per process; short peaks may be missed",
+    "providerCalls": 0,
+    "variants": {
+      "baseline": {
+        "binarySha256": "cfcf8e4272ccd6ab581f99da90623fdefb1876c7954de5d72ea6ecf027406b7e",
+        "workloads": {
+          "cli": [
+            {
+              "elapsedNs": 100229143,
+              "peakTreeRssBytes": 32268288,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 109336475,
+              "peakTreeRssBytes": 33632256,
+              "rssObservations": 6,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 111271273,
+              "peakTreeRssBytes": 31637504,
+              "rssObservations": 6,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 108212877,
+              "peakTreeRssBytes": 33173504,
+              "rssObservations": 6,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 93449331,
+              "peakTreeRssBytes": 31064064,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            }
+          ]
+        }
+      },
+      "candidate": {
+        "binarySha256": "58cec03675154de588c572f93647df3f25c63be3e8dc8fb168e55a21e611b778",
+        "workloads": {
+          "cli": [
+            {
+              "elapsedNs": 93876779,
+              "peakTreeRssBytes": 27512832,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 91302282,
+              "peakTreeRssBytes": 27488256,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 111783607,
+              "peakTreeRssBytes": 29261824,
+              "rssObservations": 6,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 91320733,
+              "peakTreeRssBytes": 28762112,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            },
+            {
+              "elapsedNs": 92801668,
+              "peakTreeRssBytes": 27566080,
+              "rssObservations": 5,
+              "peakObservedChildren": 0,
+              "metrics": {
+                "offlineStubObserved": true
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

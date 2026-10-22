@@ -838,6 +838,9 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
 /// Set by `run` when the live shell will own this process, so MCP servers may
 /// finish connecting after the first frame.
 static BACKGROUND_MCP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static WORKER_STARTUP_CONTEXT: std::cell::RefCell<Option<crate::native_extensions::graph::GraphWorkerContext>> = const { std::cell::RefCell::new(None) };
+}
 
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
     let graph_worker = crate::native_extensions::graph_worker_context();
@@ -846,6 +849,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     let worker_runtime =
         crate::native_extensions::graph::runtime_from_env(parsed, cwd, graph_worker.as_ref())?;
+    WORKER_STARTUP_CONTEXT.with(|context| {
+        *context.borrow_mut() = graph_worker.clone().filter(|_| worker_runtime.is_some())
+    });
     if worker_runtime.is_some() && parsed.no_session {
         return Err("bound Graph worker cannot disable its conversation".into());
     }
@@ -854,6 +860,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         cwd,
         parsed.project_trust_override,
     );
+    js_host::configure_js_runtime(settings.extension_runtime.clone().unwrap_or_default())?;
     // set_var is only sound before other threads exist. These values are
     // resolved from trust-aware merged settings before MCP or extension
     // runners can spawn any background work.
@@ -1208,45 +1215,56 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     let parsed_for_worker = parsed.clone();
     let cwd_for_worker = cwd.to_path_buf();
     let mcp_for_worker = agent.tool_context.mcp.clone();
-    agent.subagent_runner = Some(davinci_agent::SubagentRunner::new(move |req| {
-        if let Ok(fix) = std::env::var("PI_SUBAGENT_FIXTURE") {
-            let answer = {
-                let path = std::path::Path::new(&fix);
-                if path.is_file() {
-                    std::fs::read_to_string(path).map_err(|err| err.to_string())?
-                } else {
-                    fix.clone()
-                }
-            };
-            if req.mode == davinci_agent::AgentSpawnMode::Teammate {
-                let runtime = req
-                    .runtime
-                    .as_ref()
-                    .ok_or("a teammate needs the parent runtime")?;
-                let timeout = std::env::var("DAVINCI_TEAMMATE_IDLE_TIMEOUT_MS")
-                    .ok()
-                    .and_then(|ms| ms.parse().ok())
-                    .map(std::time::Duration::from_millis)
-                    .unwrap_or(davinci_agent::runtime::team::TEAMMATE_IDLE_TIMEOUT);
-                let exit = davinci_agent::runtime::team::run_teammate_loop(
-                    runtime,
-                    &req.prompt,
-                    timeout,
-                    |prompt| Ok(format!("{answer} [{}]", prompt.len())),
-                );
-                let note = davinci_agent::runtime::team::teammate_exit_note(
-                    req.instance_name.as_deref().unwrap_or("teammate"),
-                    &exit,
-                );
-                return match exit {
-                    davinci_agent::runtime::team::TeammateExit::Failed(_) => Err(note),
-                    _ => Ok(note),
+    let worker_admission = davinci_agent::runtime::worker_admission::WorkerAdmission::new(
+        settings.worker_resources.clone(),
+    )?;
+    agent.subagent_runner = Some(
+        davinci_agent::SubagentRunner::new(move |req| {
+            if let Ok(fix) = std::env::var("PI_SUBAGENT_FIXTURE") {
+                let answer = {
+                    let path = std::path::Path::new(&fix);
+                    if path.is_file() {
+                        std::fs::read_to_string(path).map_err(|err| err.to_string())?
+                    } else {
+                        fix.clone()
+                    }
                 };
+                if req.mode == davinci_agent::AgentSpawnMode::Teammate {
+                    let runtime = req
+                        .runtime
+                        .as_ref()
+                        .ok_or("a teammate needs the parent runtime")?;
+                    let timeout = std::env::var("DAVINCI_TEAMMATE_IDLE_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|ms| ms.parse().ok())
+                        .map(std::time::Duration::from_millis)
+                        .unwrap_or(davinci_agent::runtime::team::TEAMMATE_IDLE_TIMEOUT);
+                    let exit = davinci_agent::runtime::team::run_teammate_loop(
+                        runtime,
+                        &req.prompt,
+                        timeout,
+                        |prompt| Ok(format!("{answer} [{}]", prompt.len())),
+                    );
+                    let note = davinci_agent::runtime::team::teammate_exit_note(
+                        req.instance_name.as_deref().unwrap_or("teammate"),
+                        &exit,
+                    );
+                    return match exit {
+                        davinci_agent::runtime::team::TeammateExit::Failed(_) => Err(note),
+                        _ => Ok(note),
+                    };
+                }
+                return Ok(answer);
             }
-            return Ok(answer);
-        }
-        run_nested_subagent(&parsed_for_worker, &cwd_for_worker, &mcp_for_worker, req)
-    }));
+            run_nested_subagent(&parsed_for_worker, &cwd_for_worker, &mcp_for_worker, req)
+        })
+        .with_concurrency(
+            settings
+                .subagent_max_concurrent_tasks
+                .unwrap_or(davinci_agent::MAX_TASK_CONCURRENCY),
+        )?
+        .with_admission(worker_admission),
+    );
     if let Some(runtime) = worker_runtime {
         agent.set_runtime(runtime);
     }
@@ -1300,7 +1318,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             }
         }
     }
-    let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
+    let mut host = WORKER_STARTUP_CONTEXT.with(|context| {
+        ExtensionHost::load_with_startup(
+            &default_agent_dir(),
+            &extensions,
+            cwd,
+            Some(settings.clone()),
+            context.borrow().as_ref(),
+        )
+    });
     // The host guessed trust without `--approve`; settle it now, before any
     // memory is used or any recovery thread starts.
     host.set_project_trusted(project_trusted_for_sandbox);
@@ -1751,7 +1777,7 @@ fn resolve_or_create_session(
 }
 
 fn available_models(parsed: &Args) -> Vec<davinci_ai::Model> {
-    load_model_runtime(parsed).available
+    load_model_runtime(parsed).available.clone()
 }
 
 /// The note for a provider that has no usable credential: the precise reason
@@ -1911,7 +1937,7 @@ fn load_available_models(parsed: &Args) -> (Vec<davinci_ai::Model>, Option<Strin
         );
     }
     let error = snapshot.get_error();
-    (snapshot.available, error)
+    (snapshot.available.clone(), error)
 }
 
 /// Everything `build_model_runtime` reads, reduced to a comparable value. The
@@ -1983,7 +2009,7 @@ impl ModelRuntimeKey {
 /// while every input it read is unchanged; `/reload` clears the cache so edited
 /// extension sources are read again, as they are at startup. A rebuild replaces
 /// the stale entry for the same inputs, so an ordinary session keeps one entry.
-static MODEL_RUNTIME_CACHE: Mutex<Vec<(ModelRuntimeKey, ModelRuntimeSnapshot)>> =
+static MODEL_RUNTIME_CACHE: Mutex<Vec<(ModelRuntimeKey, Arc<ModelRuntimeSnapshot>)>> =
     Mutex::new(Vec::new());
 const MODEL_RUNTIME_CACHE_ENTRIES: usize = 4;
 
@@ -1994,7 +2020,7 @@ pub(crate) fn clear_model_runtime_cache() {
         .clear();
 }
 
-fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
+fn load_model_runtime(parsed: &Args) -> Arc<ModelRuntimeSnapshot> {
     let key = ModelRuntimeKey::current(parsed);
     if let Some((_, snapshot)) = MODEL_RUNTIME_CACHE
         .lock()
@@ -2004,7 +2030,7 @@ fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
     {
         return snapshot.clone();
     }
-    let snapshot = build_model_runtime(parsed);
+    let snapshot = Arc::new(build_model_runtime(parsed));
     let mut cache = MODEL_RUNTIME_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2493,13 +2519,26 @@ fn build_worker_agent(
     mcp: &davinci_agent::McpRegistry,
     req: &davinci_agent::SubagentRequest,
 ) -> Result<(Agent, bool), String> {
-    let settings = load_merged_settings(&default_agent_dir(), cwd);
-    let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
+    let effective_cwd = req.worktree_path.as_deref().unwrap_or(cwd);
+    let settings = load_merged_settings(&default_agent_dir(), effective_cwd);
+    let trusted = is_trusted(&settings, effective_cwd, parsed.project_trust_override);
     let profile = if let Some(agent_name) = &req.agent {
+        // Named profiles are selected by the parent, including untracked
+        // local profiles absent from its isolated worker's checkout. Recheck
+        // that source's trust without borrowing the worker workspace's grant.
+        let profile_trusted = if effective_cwd == cwd {
+            trusted
+        } else {
+            is_trusted(
+                &load_merged_settings(&default_agent_dir(), cwd),
+                cwd,
+                parsed.project_trust_override,
+            )
+        };
         let profiles = agent_profiles::discover_agent_profiles_with_plugins(
             cwd,
             None,
-            trusted,
+            profile_trusted,
             davinci_coding_agent::plugins::active(&default_agent_dir()).agent_profiles(),
         );
         let found = profiles.into_iter().find(|p| p.name == *agent_name);
@@ -2552,11 +2591,6 @@ fn build_worker_agent(
         child.max_model_turns = Some(max_turns.clamp(1, 60) as u32);
     }
 
-    let effective_cwd = if let Some(wt) = &req.worktree_path {
-        wt.as_path()
-    } else {
-        cwd
-    };
     child.cwd = effective_cwd.to_path_buf();
 
     let mut tools = if let Some(profile) = &profile {
@@ -10549,7 +10583,15 @@ fn loaded_extension_host_for_cwd(parsed: &Args, cwd: &Path) -> ExtensionHost {
         extensions.extend(parsed.extensions.clone());
         extensions
     };
-    ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd)
+    WORKER_STARTUP_CONTEXT.with(|context| {
+        ExtensionHost::load_with_startup(
+            &default_agent_dir(),
+            &extensions,
+            cwd,
+            None,
+            context.borrow().as_ref(),
+        )
+    })
 }
 
 fn replay_custom_messages(agent: &Agent, session: &mut InteractiveSession, host: &ExtensionHost) {

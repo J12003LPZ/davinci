@@ -1109,7 +1109,11 @@ impl WorkflowExecutor {
                 isolation: worker.isolation.clone(),
                 instance_name: Some(worker.id.clone()),
                 runtime_agent_id: Some(aid),
-                runtime: Some(self.runtime.for_worker(aid, Some(child_token))?),
+                runtime: Some({
+                    let mut runtime = self.runtime.for_worker(aid, Some(child_token))?;
+                    runtime.worker_resource_lease = launch.worker_resource_parent.clone();
+                    runtime
+                }),
                 parent_permission_mode: launch.parent_permission_mode,
                 foreground_supervisor: launch.foreground_supervisor.clone(),
                 sandbox: launch.sandbox.clone(),

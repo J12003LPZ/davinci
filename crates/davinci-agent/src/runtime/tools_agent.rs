@@ -112,7 +112,10 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
             })
             .collect();
 
-        let details = json!({ "agents": list });
+        let details = json!({ "agents": list, "workerResources": {
+            "accounting": "estimated reservations; not an OS RSS cap",
+            "usage": runtime.worker_admission.stats(),
+        } });
         Ok(ToolResult {
             content: serde_json::to_string_pretty(&details).unwrap_or_default(),
             is_error: false,

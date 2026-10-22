@@ -102,6 +102,16 @@ pub struct LearningStore {
 }
 
 impl LearningStore {
+    /// Inert handle for a worker that has no authorized learning tools.
+    pub(crate) fn unopened(root: PathBuf) -> Self {
+        Self {
+            root,
+            candidates: BTreeMap::new(),
+            skills: BTreeMap::new(),
+            skill_versions: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        }
+    }
     pub fn open(root: PathBuf) -> Result<Self, String> {
         if !root.exists() {
             fs::create_dir_all(&root).map_err(|e| format!("failed to create dir {root:?}: {e}"))?;

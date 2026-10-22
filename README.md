@@ -1298,3 +1298,5 @@ Review [docs/security](docs/security/) before deploying DaVinci in a sensitive e
 DaVinci is licensed under the [MIT License](LICENSE).
 
 The repository also contains vendored/reference components with their own licenses and notices.
+
+Local resource limits and release measurements: [resource lifecycle](docs/perf/resource-lifecycle.md).
