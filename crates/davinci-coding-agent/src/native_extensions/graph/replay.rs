@@ -180,33 +180,75 @@ pub fn compute_config_hash(cwd: &Path) -> String {
 
 pub fn compute_repo_state_hash(cwd: &Path) -> String {
     if cwd.join(".git").exists() {
-        let head = super::git::run(cwd, &["rev-parse", "HEAD"])
-            .ok()
-            .map(|output| String::from_utf8_lossy(&output).trim().to_string())
-            .unwrap_or_default();
-        let status = super::git::run(cwd, &["status", "--porcelain"])
-            .ok()
-            .map(|output| String::from_utf8_lossy(&output).to_string())
-            .unwrap_or_default();
-        let mut dirty_manifest = Vec::new();
-        for line in status.lines() {
-            if line.len() > 3 {
-                let file_path_str = line[3..].trim();
-                let file_path = cwd.join(file_path_str);
-                if file_path.is_file() {
-                    if let Ok(bytes) = std::fs::read(&file_path) {
-                        dirty_manifest.push(format!(
-                            "{}:{}:{}",
-                            file_path_str,
-                            bytes.len(),
-                            sha256_hex(&bytes)
-                        ));
-                    }
-                }
+        fn git_path(bytes: &[u8]) -> Option<&Path> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                Some(Path::new(std::ffi::OsStr::from_bytes(bytes)))
+            }
+            #[cfg(not(unix))]
+            {
+                std::str::from_utf8(bytes).ok().map(Path::new)
             }
         }
-        dirty_manifest.sort();
-        sha256_hex(format!("{head}\0{status}\0{}", dirty_manifest.join("\n")).as_bytes())
+        fn fingerprint(cwd: &Path) -> Result<String, String> {
+            let head = super::git::run(cwd, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default(); // An unborn repository legitimately has no HEAD.
+            let status = super::git::run(
+                cwd,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            )?;
+            let index = super::git::run(cwd, &["ls-files", "--stage", "-z"])?;
+            let mut manifest = b"graph-repo-state-v2\0".to_vec();
+            for field in [&head, &status, &index] {
+                manifest.extend_from_slice(&(field.len() as u64).to_le_bytes());
+                manifest.extend_from_slice(field);
+            }
+            let mut records = status.split(|byte| *byte == 0);
+            while let Some(record) = records.next() {
+                if record.is_empty() {
+                    continue;
+                }
+                if record.len() < 4 || record[2] != b' ' {
+                    return Err("invalid Git status record".into());
+                }
+                // In -z output, rename/copy destination precedes a second source record.
+                if record[..2].iter().any(|byte| matches!(byte, b'R' | b'C')) {
+                    records
+                        .next()
+                        .filter(|source| !source.is_empty())
+                        .ok_or("missing rename source")?;
+                }
+                let path = git_path(&record[3..]).ok_or("unsupported Git filename")?;
+                let full = match super::workspace_files::checked_path(cwd, path) {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let metadata = match std::fs::symlink_metadata(&full) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let bytes = if metadata.file_type().is_symlink() {
+                    // Hash the link text, never dereference the target.
+                    let target = std::fs::read_link(&full).map_err(|error| error.to_string())?;
+                    manifest.extend_from_slice(b"symlink\0");
+                    target.as_os_str().as_encoded_bytes().to_vec()
+                } else if metadata.is_file() {
+                    manifest.extend_from_slice(b"file\0");
+                    super::workspace_files::read(cwd, path).map_err(|error| error.to_string())?
+                } else {
+                    continue;
+                };
+                manifest.extend_from_slice(&(record.len() as u64).to_le_bytes());
+                manifest.extend_from_slice(record);
+                manifest.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                manifest.extend_from_slice(sha256_hex(&bytes).as_bytes());
+            }
+            Ok(sha256_hex(&manifest))
+        }
+        // Unreadable state cannot safely match a persisted artifact fingerprint.
+        fingerprint(cwd).unwrap_or_else(|_| sha256_hex(uuid::Uuid::new_v4().as_bytes()))
     } else {
         fn collect_entries(root: &Path, dir: &Path, entries: &mut Vec<String>) {
             if let Ok(read_dir) = std::fs::read_dir(dir) {
@@ -220,8 +262,24 @@ pub fn compute_repo_state_hash(cwd: &Path) -> String {
                     {
                         continue;
                     }
-                    if path.is_file() {
-                        if let Ok(bytes) = std::fs::read(&path) {
+                    let Ok(kind) = entry.file_type() else {
+                        continue;
+                    };
+                    if kind.is_symlink() {
+                        if let Ok(target) = std::fs::read_link(&path) {
+                            entries.push(format!(
+                                "symlink:{}:{}",
+                                path.strip_prefix(root).unwrap_or(&path).display(),
+                                sha256_hex(target.as_os_str().as_encoded_bytes())
+                            ));
+                        }
+                        continue;
+                    }
+                    if kind.is_file() {
+                        if let Ok(bytes) = super::workspace_files::read(
+                            root,
+                            path.strip_prefix(root).unwrap_or(&path),
+                        ) {
                             let rel = path
                                 .strip_prefix(root)
                                 .unwrap_or(&path)
@@ -229,7 +287,7 @@ pub fn compute_repo_state_hash(cwd: &Path) -> String {
                                 .replace('\\', "/");
                             entries.push(format!("{}:{}:{}", rel, bytes.len(), sha256_hex(&bytes)));
                         }
-                    } else if path.is_dir() {
+                    } else if kind.is_dir() {
                         collect_entries(root, &path, entries);
                     }
                 }
@@ -257,6 +315,62 @@ mod tests {
             definition_digest: None,
             simulated: None,
             model_id: None,
+        }
+    }
+
+    #[test]
+    fn graph_integrity_renamed_and_unusual_paths_hash_contents() {
+        let dir = tempdir().unwrap();
+        super::super::git::run(dir.path(), &["init"]).unwrap();
+        std::fs::write(dir.path().join("old.txt"), b"original").unwrap();
+        super::super::git::run(dir.path(), &["add", "."]).unwrap();
+        super::super::git::run(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        super::super::git::run(dir.path(), &["mv", "old.txt", " renamed 界.txt "]).unwrap();
+        let before = compute_repo_state_hash(dir.path());
+        assert_eq!(before, compute_repo_state_hash(dir.path()));
+        std::fs::write(dir.path().join(" renamed 界.txt "), b"change one").unwrap();
+        let first = compute_repo_state_hash(dir.path());
+        std::fs::write(dir.path().join(" renamed 界.txt "), b"change two").unwrap();
+        assert_ne!(first, compute_repo_state_hash(dir.path()));
+        assert_ne!(before, first);
+        std::fs::create_dir(dir.path().join("untracked")).unwrap();
+        std::fs::write(dir.path().join("untracked/nested"), b"one").unwrap();
+        let nested = compute_repo_state_hash(dir.path());
+        std::fs::write(dir.path().join("untracked/nested"), b"two").unwrap();
+        assert_ne!(nested, compute_repo_state_hash(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_integrity_replay_does_not_read_symlink_targets() {
+        for git in [false, true] {
+            let dir = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            std::fs::write(outside.path().join("secret"), b"one").unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("file-link"))
+                .unwrap();
+            if git {
+                super::super::git::run(dir.path(), &["init"]).unwrap();
+            }
+            let before = compute_repo_state_hash(dir.path());
+            std::fs::write(outside.path().join("secret"), b"two").unwrap();
+            assert_eq!(before, compute_repo_state_hash(dir.path()));
+            std::fs::remove_file(dir.path().join("file-link")).unwrap();
+            std::os::unix::fs::symlink("different-target", dir.path().join("file-link")).unwrap();
+            assert_ne!(before, compute_repo_state_hash(dir.path()));
         }
     }
 
@@ -575,6 +689,7 @@ mod tests {
             definition: None,
             lifecycle: None,
             revision: 0,
+            checkpoint_sequence: 0,
             control_history: Vec::new(),
             continuation: None,
         };

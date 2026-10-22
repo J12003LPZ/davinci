@@ -30,6 +30,13 @@ fn worker_history_failure_is_not_retried_or_resumed_as_a_fresh_attempt() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(failed.phase, Phase::Blocked);
+    let task = failed.tasks.iter().find(|task| task.attempts > 0).unwrap();
+    let log = super::super::store::run_dir(dir.path(), &failed.run_id)
+        .join("logs")
+        .join(format!("{}.attempt_1.log", task.id));
+    assert!(std::fs::read_to_string(log)
+        .unwrap()
+        .contains("Session recovery required"));
     let durable = super::super::store::load_run_checked(dir.path(), &failed.run_id).unwrap();
     assert!(durable.tasks.iter().any(|task| task
         .error
@@ -308,4 +315,75 @@ fn interrupted_private_worker_reconciles_to_a_safe_retry_boundary() {
     assert_eq!(recovered[0].exit_code, Some(-1));
     assert_eq!(run.task(&task_id).unwrap().status, TaskStatus::Failed);
     super::super::continuation::validate_resume(&run, dir.path()).unwrap();
+}
+
+#[test]
+fn graph_integrity_controls_share_checkpoint_serialization() {
+    use super::super::control::{GraphControl, GraphControlAction};
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = attempt_fixture(dir.path(), None, false);
+    run.phase = Phase::Investigate;
+    run.lifecycle = Some(GraphLifecycle::Running);
+    run.revision += 1;
+    save_run(&mut run).unwrap();
+    let controller = super::super::GraphController::new(dir.path().into());
+    let (deps, errors) = controller.deps(true, &Arc::new(super::super::ActiveRun::default()));
+    assert!(errors.is_empty());
+    let request = GraphControl {
+        operation_id: "serialization-test".into(),
+        run_id: run.run_id.clone(),
+        expected_run_revision: run.revision,
+        node_id: None,
+        expected_attempt: None,
+        action: GraphControlAction::Pause,
+    };
+    let execution = Arc::new(GraphExecution {
+        run: Mutex::new(run),
+        deps,
+        options: RunOptions {
+            goal: "control ordering".into(),
+            cwd: dir.path().into(),
+            forced: None,
+            dry_run: true,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        },
+        exec_abort: Arc::new(AtomicBool::new(false)),
+        budget_abort_reason: Mutex::new(None),
+        persistence_error: Mutex::new(None),
+        last_progress_checkpoint: Mutex::new(None),
+        checkpoint_io: Mutex::new(()),
+        run_deadline: None,
+        active_workers: Arc::new(AtomicUsize::new(0)),
+        node_aborts: Arc::new(Mutex::new(HashMap::new())),
+    });
+    let guard = execution.checkpoint_io.lock().unwrap();
+    let worker = execution.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        done_tx.send(worker.apply_control(&request)).unwrap();
+    });
+    started_rx.recv().unwrap();
+    let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+    drop(guard);
+    thread.join().unwrap();
+    assert!(matches!(
+        early,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    let receipt = done_rx.recv().unwrap().unwrap();
+    assert_eq!(
+        receipt.state,
+        super::super::control::ControlReceiptState::Applied
+    );
+    assert!(execution.checkpoint(Some("after control")));
+    let saved = super::super::store::load_run(dir.path(), &execution.snapshot().run_id).unwrap();
+    assert_eq!(saved.current_lifecycle(), GraphLifecycle::Paused);
+    assert!(saved
+        .control_history
+        .iter()
+        .any(|record| record.receipt == receipt));
 }

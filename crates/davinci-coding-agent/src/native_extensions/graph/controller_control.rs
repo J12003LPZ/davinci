@@ -17,6 +17,12 @@ impl GraphExecution {
         &self,
         request: &GraphControl,
     ) -> Result<GraphControlReceipt, String> {
+        // Same ordering as checkpoint_with: serialize before taking a snapshot.
+        // A receipt must never be overtaken by an older progress checkpoint.
+        let _io = self
+            .checkpoint_io
+            .lock()
+            .map_err(|_| "Graph checkpoint lock poisoned")?;
         let (snapshot, receipt) = {
             let mut run = self.run.lock().map_err(|_| "Graph state lock poisoned")?;
             let mut failure = self

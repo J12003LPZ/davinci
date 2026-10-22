@@ -27,14 +27,15 @@ pub struct MutationBaseline {
 }
 
 impl MutationBaseline {
-    pub fn old_bytes(&self, path: &str, blob_dir: &Path) -> Vec<u8> {
+    pub fn old_bytes(&self, path: &str, blob_dir: &Path) -> Option<Vec<u8>> {
         if let Some(bytes) = self.contents.get(path) {
-            return bytes.clone();
+            return Some(bytes.clone());
         }
-        self.files
-            .get(path)
-            .and_then(|fingerprint| super::blobs::get(blob_dir, &fingerprint.hash))
-            .unwrap_or_default()
+        self.files.get(path).and_then(|fingerprint| {
+            super::blobs::get(blob_dir, &fingerprint.hash).filter(|bytes| {
+                bytes.len() as u64 == fingerprint.len && sha256_hex(bytes) == fingerprint.hash
+            })
+        })
     }
 }
 
@@ -123,30 +124,31 @@ fn is_transaction_journal(path: &str) -> bool {
     .any(|prefix| path.starts_with(prefix))
 }
 
-fn list_workspace_files(cwd: &Path) -> Vec<String> {
+fn list_workspace_files(cwd: &Path) -> Result<Vec<String>, String> {
     if cwd.join(".git").exists() {
         let mut list = Vec::new();
-        if let Ok(output) = super::git::run(cwd, &["ls-files"]) {
-            for line in String::from_utf8_lossy(&output).lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    list.push(normalize_rel_path(trimmed));
-                }
-            }
-        }
-        if let Ok(output) = super::git::run(cwd, &["ls-files", "--others", "--exclude-standard"]) {
-            for line in String::from_utf8_lossy(&output).lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    list.push(normalize_rel_path(trimmed));
-                }
+        for args in [
+            vec!["ls-files", "-z"],
+            vec!["ls-files", "-z", "--others", "--exclude-standard"],
+        ] {
+            let output = super::git::run(cwd, &args)?;
+            for path in output
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+            {
+                // A lossy substitute could read a different file. The checkpoint
+                // schema uses UTF-8 keys, so fail rather than omit evidence.
+                let path = std::str::from_utf8(path).map_err(|_| {
+                    "Mutation baseline cannot represent a non-UTF-8 Git filename".to_string()
+                })?;
+                list.push(path.to_owned());
             }
         }
         list.sort();
         list.dedup();
-        list
+        Ok(list)
     } else {
-        walk_dir_files(cwd)
+        Ok(walk_dir_files(cwd))
     }
 }
 
@@ -170,9 +172,15 @@ fn walk_dir_files(root: &Path) -> Vec<String> {
             {
                 continue;
             }
-            if path.is_dir() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
                 stack.push(path);
-            } else if path.is_file() {
+            } else if kind.is_file() {
                 if let Ok(rel) = path.strip_prefix(root) {
                     result.push(normalize_rel_path(&rel.to_string_lossy()));
                 }
@@ -188,13 +196,12 @@ pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
     let blob_dir = super::blobs::dir(cwd);
     let mut files = BTreeMap::new();
 
-    let paths = list_workspace_files(cwd);
+    let paths = list_workspace_files(cwd)?;
     for rel_path in paths {
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        let full = cwd.join(&rel_path);
-        if let Ok(bytes) = std::fs::read(&full) {
+        if let Ok(bytes) = super::workspace_files::read(cwd, Path::new(&rel_path)) {
             let hash = sha256_hex(&bytes);
             if bytes.len() <= 512 * 1024 {
                 super::blobs::put(&blob_dir, &hash, &bytes).map_err(|error| error.to_string())?;
@@ -221,15 +228,14 @@ pub fn capture_graph_delta(
     baseline: &MutationBaseline,
 ) -> Result<GraphMutation, String> {
     let blob_dir = super::blobs::dir(cwd);
-    let current_paths = list_workspace_files(cwd);
+    let current_paths = list_workspace_files(cwd)?;
     let mut current_map = BTreeMap::new();
 
     for rel_path in current_paths {
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        let full = cwd.join(&rel_path);
-        if let Ok(bytes) = std::fs::read(&full) {
+        if let Ok(bytes) = super::workspace_files::read(cwd, Path::new(&rel_path)) {
             let hash = sha256_hex(&bytes);
             current_map.insert(
                 rel_path,
@@ -250,7 +256,8 @@ pub fn capture_graph_delta(
             None => {
                 // Newly added by graph
                 changed_files.push(ChangedFile::added(path));
-                let current_bytes = std::fs::read(cwd.join(path)).unwrap_or_default();
+                let current_bytes = super::workspace_files::read(cwd, Path::new(path))
+                    .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
                 let patch = format_added_file_diff(path, &current_bytes);
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
@@ -261,8 +268,12 @@ pub fn capture_graph_delta(
                 // Modified by graph
                 changed_files.push(ChangedFile::modified(path));
                 let old_bytes = baseline.old_bytes(path, &blob_dir);
-                let current_bytes = std::fs::read(cwd.join(path)).unwrap_or_default();
-                let patch = format_modified_file_diff(path, &old_bytes, &current_bytes);
+                let current_bytes = super::workspace_files::read(cwd, Path::new(path))
+                    .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
+                let patch = match old_bytes {
+                    Some(old_bytes) => format_modified_file_diff(path, &old_bytes, &current_bytes),
+                    None => unavailable_original_summary(path, old_fp, Some(fingerprint)),
+                };
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
                     patch,
@@ -282,7 +293,10 @@ pub fn capture_graph_delta(
         if !current_map.contains_key(old_path) {
             changed_files.push(ChangedFile::deleted(old_path));
             let old_bytes = baseline.old_bytes(old_path, &blob_dir);
-            let patch = format_deleted_file_diff(old_path, &old_bytes);
+            let patch = match old_bytes {
+                Some(old_bytes) => format_deleted_file_diff(old_path, &old_bytes),
+                None => unavailable_original_summary(old_path, &baseline.files[old_path], None),
+            };
             patch_chunks.push(PatchChunk {
                 file: old_path.clone(),
                 patch,
@@ -294,6 +308,27 @@ pub fn capture_graph_delta(
         files: changed_files,
         patch_chunks,
     })
+}
+
+// This is evidence, not an applyable textual patch: absence is not empty content.
+fn unavailable_original_summary(
+    path: &str,
+    old: &FileFingerprint,
+    new: Option<&FileFingerprint>,
+) -> String {
+    let mut summary = format!(
+        "diff --git a/{path} b/{path}\noriginal bytes unavailable; old sha256 {} ({} bytes)\n",
+        old.hash, old.len
+    );
+    if let Some(new) = new {
+        summary.push_str(&format!(
+            "modified; new sha256 {} ({} bytes)\n",
+            new.hash, new.len
+        ));
+    } else {
+        summary.push_str("deleted\n");
+    }
+    summary
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,6 +489,66 @@ fn format_modified_file_diff(file: &str, old_bytes: &[u8], new_bytes: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    #[test]
+    fn graph_integrity_git_enumeration_failure_is_not_empty_evidence() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("source.txt"), b"source").unwrap();
+        assert!(capture_baseline(dir.path()).is_err());
+        assert!(capture_graph_delta(dir.path(), &MutationBaseline::default()).is_err());
+    }
+
+    #[test]
+    fn graph_integrity_large_and_missing_baselines_are_explicit() {
+        for size in [12, 512 * 1024 + 1] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("large.txt"), vec![b'a'; size]).unwrap();
+            let baseline = capture_baseline(dir.path()).unwrap();
+            let fp = &baseline.files["large.txt"];
+            if size == 12 {
+                let blob = super::super::blobs::dir(dir.path())
+                    .join(&fp.hash[..2])
+                    .join(&fp.hash);
+                std::fs::remove_file(blob).unwrap();
+            }
+            std::fs::write(dir.path().join("large.txt"), b"new contents").unwrap();
+            let modified = capture_graph_delta(dir.path(), &baseline).unwrap().diff();
+            assert!(
+                modified.contains("original bytes unavailable"),
+                "{modified}"
+            );
+            assert!(modified.contains(&fp.hash));
+            assert!(modified.contains(&format!("{} bytes", fp.len)));
+            assert!(!modified.contains("@@ -0,0"));
+            std::fs::remove_file(dir.path().join("large.txt")).unwrap();
+            let deleted = capture_graph_delta(dir.path(), &baseline).unwrap().diff();
+            assert!(deleted.contains("original bytes unavailable"));
+            assert!(deleted.contains(&fp.hash));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_integrity_baseline_does_not_follow_symlinks() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked-dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            dir.path().join("linked-file"),
+        )
+        .unwrap();
+        assert!(capture_baseline(dir.path()).unwrap().files.is_empty());
+        // Also exercise Git's tracked/untracked path enumeration.
+        super::super::git::run(dir.path(), &["init"]).unwrap();
+        assert!(capture_baseline(dir.path()).unwrap().files.is_empty());
+    }
+
     #[test]
     fn baseline_serializes_without_file_contents() {
         let dir = tempfile::tempdir().unwrap();
@@ -525,10 +620,6 @@ mod tests {
             .files
             .is_empty());
     }
-
-    use super::*;
-    use std::process::Command;
-    use tempfile::tempdir;
 
     fn setup_git_repo(path: &Path) {
         Command::new("git")
