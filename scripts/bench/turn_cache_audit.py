@@ -1,6 +1,6 @@
 """Per-request cache reuse and turn purpose from recorded DaVinci run logs.
 
-    python scripts/bench/turn_cache_audit.py <campaign-dir> [--out <dir>]
+    python scripts/bench/turn_cache_audit.py <campaign-dir>... [--out <dir>]
 
 Offline: reads `<campaign>/davinci/*.stdout.jsonl` only. No model calls, no
 grader input. For every provider request of every run it records the provider's
@@ -13,6 +13,13 @@ the response went on to do. It writes `turn-cache-requests.csv` and
 the previous request already sent that many input tokens, so an append-only
 conversation could have read them all back. It says that cache was not reused,
 not why.
+
+A gate is a harness reminder that sends the model back to work: a completion
+review (`completion_reminder`, named by its reason code) or a capability
+reminder such as `verification_required`. Every request after the first gate
+marker is attributed to the latest gate seen before it, and `per_gate` sizes
+that work. Several campaign directories aggregate; if one holds `results.jsonl`
+the grader verdict is joined by (task, rep).
 """
 import argparse
 import csv
@@ -83,10 +90,23 @@ def reuse(previous_input, cache_read):
     return "full" if cache_read + FULL_REUSE_SLACK >= previous_input else "partial"
 
 
+class Rows(list):
+    fired: list = []  # gate names in the order their markers appeared, even after the last request
+
+
+def gate_marker(event):
+    kind = event.get("type")
+    if kind == "completion_reminder":
+        return event.get("reason_code") or kind
+    if kind == "message_start":
+        return (event.get("message") or {}).get("davinciCapabilityReminder") or None
+
+
 def audit_run(path):
     """Request rows and run counters for one stdout log."""
-    requests, stats, current = [], None, None
+    requests, stats, current = Rows(), None, None
     between = []  # what happened since the previous attempt ended
+    gate, fired = None, []
     for event in events(path):
         kind = event.get("type")
         if kind == "provider_observation":
@@ -94,7 +114,8 @@ def audit_run(path):
             if seen.get("purpose") not in (None, "coding"):
                 continue  # compaction and helper requests are not turns of the task
             if seen.get("kind") == "attempt_start":
-                current = {"trigger": trigger(between, seen), "calls": []}
+                current = {"trigger": trigger(between, seen), "calls": [], "gate": gate,
+                           "gates_between": ";".join(m[5:] for m in between if m.startswith("gate:"))}
             elif seen.get("kind") == "attempt_end" and current is not None:
                 usage = seen.get("raw_usage") or {}
                 current.update(
@@ -116,10 +137,17 @@ def audit_run(path):
             between.append(kind)
         elif kind == "harness_stats":
             stats = event.get("runtime") or {}
+        if name := gate_marker(event):
+            gate = name
+            between.append("gate:" + name)
+            if name not in fired:
+                fired.append(name)
+    requests.fired = fired
     previous = None
     for index, request in enumerate(requests):
         calls = request.pop("calls")
-        request.update(index=index, action=action(calls), tools=" ".join(name for name, _ in calls))
+        request.update(index=index, action=action(calls), tools=" ".join(name for name, _ in calls),
+                       mutations=sum(name in EDITORS for name, _ in calls))
         known = isinstance(request["input_total"], int) and isinstance(request["cache_read"], int)
         prior = previous["input_total"] if previous else None
         request["previous_input_total"] = prior
@@ -135,12 +163,14 @@ def trigger(between, seen):
         return "retry"
     if "completion_reminder" in between:
         return "completion-reminder"
+    if "gate:verification_required" in between:
+        return "verification-required"
     if "verification_notice" in between:
         return "verification-notice"
     return "tool-results" if "tool" in between else "start"
 
 
-def summarize(runs):
+def summarize(runs, passed=None):
     later = [r for rows, _ in runs.values() for r in rows if r["reuse"] not in ("first", "unknown")]
     every = [r for rows, _ in runs.values() for r in rows]
     counted = [r for r in every if r["reuse"] != "unknown"]
@@ -164,6 +194,7 @@ def summarize(runs):
     tails = [rows[next(i for i, r in enumerate(rows) if r["trigger"] == "completion-reminder"):]
              for rows, _ in runs.values() if any(r["trigger"] == "completion-reminder" for r in rows)]
     return {
+        **gate_summary(runs, passed),
         "requests_from_first_completion_reminder": sum(len(tail) for tail in tails),
         "uncached_input": uncached(every),
         "uncached_input_from_first_completion_reminder": sum(uncached(tail) for tail in tails),
@@ -184,22 +215,64 @@ def summarize(runs):
     }
 
 
+def gate_summary(runs, passed):
+    """Work attributed to each gate; unknown usage never becomes a zero."""
+    both = ("completion.requirements", "verification_required")
+    every = [r for rows, _ in runs.values() for r in rows]
+    fired = {key: list(getattr(rows, "fired", ())) or sorted({r["gate"] for r in rows if r["gate"]})
+             for key, (rows, _) in runs.items()}
+    result = {}
+    for name in sorted({n for names in fired.values() for n in names}):
+        rows = [r for r in every if r["gate"] == name]
+        known = [r for r in rows if r["reuse"] != "unknown"]
+        result[name] = {
+            "runs_fired": sum(name in names for names in fired.values()), "requests": len(rows),
+            "uncached_input": sum(r["input_total"] - r["cache_read"] for r in known),
+            "uncached_input_known_requests": len(known), "mutations": sum(r["mutations"] for r in rows)}
+        if passed is not None:
+            result[name]["runs_fired_passed"] = sum(bool(passed.get(key)) for key, names in fired.items() if name in names)
+    order = [[n for n in names if n in both][0] for names in fired.values() if all(b in names for b in both)]
+    return {
+        "requests_total": len(every), "requests_after_first_gate": sum(1 for r in every if r["gate"]),
+        "runs_with_both_gates": len(order),
+        "gate_order": {f"{name}_first": order.count(name) for name in both},
+        "per_gate": result}
+
+
 FIELDS = ("run", "index", "trigger", "action", "tools", "reuse", "input_total", "cache_read", "cache_write", "output",
           "reasoning", "previous_input_total", "prefix_shortfall", "transport", "schema_hash", "http_status",
-          "status", "attempt_id", "duration_ms", "usage_complete", "logical_request_id")
+          "status", "attempt_id", "duration_ms", "usage_complete", "logical_request_id", "gate", "gates_between")
+
+
+def load_passed(campaign):
+    """{(task, rep): grader verdict} for davinci rows, or None without results.jsonl."""
+    path = campaign / "results.jsonl"
+    if not path.is_file():
+        return None
+    rows = (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    return {(r["task"], r["rep"]): r.get("grader_pass") for r in rows if r.get("harness") == "davinci"}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("campaign", type=Path)
+    parser.add_argument("campaign", type=Path, nargs="+")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    logs = sorted((args.campaign / "davinci").glob("*.stdout.jsonl"))
-    if not logs:
-        parser.error("no davinci/*.stdout.jsonl under the campaign directory")
-    runs = {log.name.removesuffix(".stdout.jsonl"): audit_run(log) for log in logs}
-    summary = summarize(runs)
-    out = args.out or args.campaign
+    runs, passed, joined = {}, {}, False
+    for campaign in args.campaign:
+        verdicts = load_passed(campaign)
+        joined = joined or verdicts is not None
+        for log in sorted((campaign / "davinci").glob("*.stdout.jsonl")):
+            name = log.name.removesuffix(".stdout.jsonl")
+            key = f"{campaign.name}/{name}" if len(args.campaign) > 1 else name
+            runs[key] = audit_run(log)
+            task, _, rep = name.rpartition("-r")
+            if verdicts is not None and rep.isdigit():
+                passed[key] = verdicts.get((task, int(rep)))
+    if not runs:
+        parser.error("no davinci/*.stdout.jsonl under the campaign directories")
+    summary = summarize(runs, passed if joined else None)
+    out = args.out or args.campaign[0]
     out.mkdir(parents=True, exist_ok=True)
     with (out / "turn-cache-requests.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, FIELDS, extrasaction="ignore")
