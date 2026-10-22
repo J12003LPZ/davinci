@@ -69,6 +69,11 @@ impl UnixByteTransport {
         if self.closed {
             return Err(ClientError::Io("Unix transport is closed".into()));
         }
+        // An empty write is a no-op, not EOF. Writing an empty slice to a
+        // UnixStream returns Ok(0), which the flush loop treats as a disconnect.
+        if chunk.is_empty() {
+            return Ok(());
+        }
         if self.pending_bytes + chunk.len() as u64 > self.max_pending_bytes {
             return Err(ClientError::Io(
                 "Unix transport exceeded its pending byte limit".into(),
@@ -206,6 +211,9 @@ impl UnixByteTransport {
 impl ByteTransport for UnixByteTransport {
     fn send(&mut self, chunk: &[u8]) -> Result<(), ClientError> {
         self.send_chunk(chunk)?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
         self.wait_idle(Duration::from_secs(5))?;
         self.pump_until_data(Duration::from_secs(2))?;
         Ok(())
@@ -315,6 +323,24 @@ mod tests {
             Ok(_) => panic!("expected invalid Unix transport options"),
             Err(err) => err.to_string(),
         }
+    }
+
+    #[test]
+    fn empty_writes_are_noops_and_do_not_disconnect_the_socket() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut transport = UnixByteTransport::attach(stream, 1024, empty_handlers());
+
+        transport.send_chunk(&[]).unwrap();
+        assert_eq!(transport.pending_bytes(), 0);
+        transport.wait_idle(Duration::from_millis(10)).unwrap();
+        transport.send(&[]).unwrap();
+        assert!(!transport.closed());
+
+        transport.send_chunk(b"hello").unwrap();
+        let mut received = [0u8; 5];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"hello");
+        assert!(!transport.closed());
     }
 
     #[test]
