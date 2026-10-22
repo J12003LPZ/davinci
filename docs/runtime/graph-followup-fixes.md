@@ -76,3 +76,22 @@ Tests used Rust 1.88.0, disabled debug symbols/incremental artifacts, and two
 build jobs. Independent review found the multi-milestone receipt and missing-link
 issues; both are addressed and covered by the expanded regression. No live provider
 calls, paid services, benchmarks or installed-binary replacement.
+
+## PR review follow-up
+
+Checkpoint publication now compares the caller's expected checkpoint sequence
+under the state-file lock before changing companions. Reload canonical state
+on conflict; a shared control revision does not authorize an older snapshot.
+
+Recovery changes retain immutable `checkpoint-N` snapshots. Diagnostic-only
+updates retain at most 16 recent `progress-N` snapshots (16 MiB soft byte budget).
+Current canonical state still includes all diagnostics and spending. Diff can
+read recent progress snapshots; forks consume recovery boundaries. Snapshot
+history has a 512 MiB / 4096-file hard capacity. When essential snapshots alone
+exhaust capacity, publication fails before overwriting canonical state or
+evicting recovery evidence; the controller follows its existing persistence
+failure stop path. Archive the completed run before continuing.
+
+Validation: stale same-revision snapshots conflict; 2000 progress checkpoints
+retain a bounded file window; essential-capacity exhaustion preserves old bytes.
+Graph suite: 469 passed, 5 existing ignored. Compile and formatting checks passed.

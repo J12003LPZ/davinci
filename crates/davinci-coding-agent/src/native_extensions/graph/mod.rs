@@ -26,6 +26,7 @@ pub(crate) mod export;
 mod forks;
 pub(crate) mod git;
 pub(crate) mod history;
+mod history_retention;
 mod lease;
 pub(crate) mod mutation;
 pub(crate) mod operation_bridge;

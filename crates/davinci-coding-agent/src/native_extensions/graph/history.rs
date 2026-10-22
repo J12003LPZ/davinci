@@ -59,8 +59,11 @@ pub fn load_checkpoint(cwd: &Path, run_id: &str, sequence: u64) -> Option<super:
     if !is_safe_run_id(run_id) {
         return None;
     }
-    let path = history_dir(cwd, run_id).join(format!("checkpoint-{sequence}.state.json"));
-    let run: super::types::GraphRun = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let directory = history_dir(cwd, run_id);
+    let bytes = fs::read(directory.join(format!("checkpoint-{sequence}.state.json")))
+        .or_else(|_| fs::read(directory.join(format!("progress-{sequence}.state.json"))))
+        .ok()?;
+    let run: super::types::GraphRun = serde_json::from_slice(&bytes).ok()?;
     (run.run_id == run_id && run.checkpoint_sequence == sequence).then_some(run)
 }
 

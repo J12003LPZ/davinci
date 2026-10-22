@@ -2182,7 +2182,8 @@ mod tests {
         );
 
         // 3. Combined
-        let mut run_combined = run.clone();
+        // Each subsequent authorized operation starts from canonical state.
+        let mut run_combined = super::super::store::load_run(dir.path(), &run.run_id).unwrap();
         let res3 = execute_rewind(&mut run_combined, &preview, dir.path(), true, true).unwrap();
         assert_eq!(res3.restored_files, vec!["src/lib.rs"]);
         assert_eq!(

@@ -247,7 +247,9 @@ fn collect_unreferenced_blobs(cwd: &Path) {
                             let state = state?;
                             let name = state.file_name();
                             let name = name.to_string_lossy();
-                            if (name.starts_with("revision-") || name.starts_with("checkpoint-"))
+                            if (name.starts_with("revision-")
+                                || name.starts_with("checkpoint-")
+                                || name.starts_with("progress-"))
                                 && name.ends_with(".state.json")
                             {
                                 states.push(state.path());
@@ -464,6 +466,7 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
         &state_path.with_extension("json.lock"),
         std::time::Duration::from_secs(5),
     )?;
+    let mut previous_run = None;
     let previous_bytes = match fs::read(&state_path) {
         Ok(bytes) => {
             let previous: GraphRun = serde_json::from_slice(&bytes)
@@ -474,11 +477,42 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
                     "refusing to overwrite a different run or newer graph revision",
                 ));
             }
+            if previous.checkpoint_sequence != run.checkpoint_sequence {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "stale checkpoint sequence: expected {}, current {}",
+                        run.checkpoint_sequence, previous.checkpoint_sequence
+                    ),
+                ));
+            }
+            previous_run = Some(previous);
             Some(bytes)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && run.checkpoint_sequence == 0 =>
+        {
+            None
+        }
         Err(error) => return Err(error),
     };
+
+    let previous_progress = previous_bytes
+        .as_ref()
+        .map(|bytes| serde_json::from_slice::<super::history_retention::CheckpointClass>(bytes))
+        .transpose()
+        .map_err(std::io::Error::other)?
+        .is_some_and(|class| class.progress_only);
+    if let (Some(previous), Some(bytes)) = (&previous_run, &previous_bytes) {
+        super::history_retention::reserve(
+            &cwd,
+            &run.run_id,
+            previous,
+            bytes.len() as u64,
+            previous_progress,
+            previous.revision < run.revision,
+        )?;
+    }
 
     if let Some(definition) = &run.definition {
         let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
@@ -506,18 +540,29 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     // all companion writes succeed, and retain the previous timestamp on error.
     let mut snapshot = run.clone();
     snapshot.updated_at = now_ms();
-    let previous_sequence = previous_bytes
+    let previous_sequence = previous_run
         .as_ref()
-        .and_then(|bytes| serde_json::from_slice::<GraphRun>(bytes).ok())
         .map_or(0, |previous| previous.checkpoint_sequence);
     snapshot.checkpoint_sequence = previous_sequence
         .checked_add(1)
         .ok_or_else(|| std::io::Error::other("checkpoint sequence exhausted"))?;
-    let content = serde_json::to_vec(&snapshot)
+    let checkpoint = super::history_retention::Checkpoint {
+        progress_only: previous_run
+            .as_ref()
+            .is_some_and(|previous| super::history_retention::same_boundary(previous, &snapshot)),
+        run: &snapshot,
+    };
+    let content = serde_json::to_vec(&checkpoint)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if let Some(previous_bytes) = previous_bytes {
-        let checkpoint_path = super::history::history_dir(&cwd, &run.run_id)
-            .join(format!("checkpoint-{previous_sequence}.state.json"));
+        let checkpoint_path = super::history::history_dir(&cwd, &run.run_id).join(format!(
+            "{}-{previous_sequence}.state.json",
+            if previous_progress {
+                "progress"
+            } else {
+                "checkpoint"
+            }
+        ));
         if !checkpoint_path.exists() {
             atomic_write(&checkpoint_path, &previous_bytes)?;
         }
@@ -888,6 +933,53 @@ mod tests {
         ArtifactKind, GraphBudgets, GraphCounters, Phase, ReviewDecision, Verdict,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn pr_review_same_revision_stale_snapshot_conflicts() {
+        let dir = tempdir().unwrap();
+        let mut run = sample_run(dir.path(), "cas", "initial");
+        save_run(&mut run).unwrap();
+        let mut stale = run.clone();
+        run.goal = "newer".into();
+        save_run(&mut run).unwrap();
+        stale.goal = "stale".into();
+        let error = save_run(&mut stale).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let durable = load_run(dir.path(), &run.run_id).unwrap();
+        assert_eq!(durable.goal, "newer");
+        assert_eq!(durable.checkpoint_sequence, run.checkpoint_sequence);
+    }
+
+    #[test]
+    fn pr_review_progress_history_is_bounded_and_preserves_boundaries() {
+        let dir = tempdir().unwrap();
+        let mut run = sample_run(dir.path(), "retention", "goal");
+        save_run(&mut run).unwrap();
+        run.phase = Phase::Investigate;
+        save_run(&mut run).unwrap();
+        for _ in 0..2000 {
+            run.counters.cost_usd += 0.001;
+            save_run(&mut run).unwrap();
+        }
+        let history = super::super::history::history_dir(dir.path(), &run.run_id);
+        let entries = fs::read_dir(&history).unwrap().count();
+        assert!(
+            entries <= 20,
+            "{entries} files after 2000 progress checkpoints"
+        );
+        assert_eq!(
+            super::super::history::load_checkpoint(dir.path(), &run.run_id, 1)
+                .unwrap()
+                .phase,
+            Phase::Classify
+        );
+        assert!(super::super::history::load_checkpoint(
+            dir.path(),
+            &run.run_id,
+            run.checkpoint_sequence - 1
+        )
+        .is_some());
+    }
 
     #[test]
     fn graph_followup_same_control_revision_retains_execution_history() {
