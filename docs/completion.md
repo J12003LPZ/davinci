@@ -20,7 +20,9 @@ none (`cargo check`, `cargo clippy`, `cargo fmt`, `tsc`, `eslint`, `go vet`,
 but does not skip the review, because it says nothing about tests for each
 requirement. A chain such as `cargo check && cargo test` counts, since it ran
 tests, and a test pass on the latest change still counts after a later lint or
-build check. "Ran tests" is judged from the command, so a test command that
+build check. Targeted scripts that run the changed code (inline Python checks with
+assertions) count as tests; syntax-only checks do not. For test suites, "ran
+tests" is judged from the command, so a test command that
 selects or lists no tests (`cargo test nomatch`, `pytest --collect-only`) and a
 project `npm test` script that only lints still count, as they already did for
 the verification gate. And the review is decided

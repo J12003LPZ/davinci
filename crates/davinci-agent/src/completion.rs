@@ -1554,6 +1554,89 @@ mod tests {
     }
 
     #[test]
+    fn inline_assertion_script_skips_review() {
+        let heredoc = "python - <<'PY'
+from app import f
+from lib import g
+assert f() == 1 and g() == 2
+PY";
+        let dash_c =
+            "python -c \"from app import f; from lib import g; assert f() == 1 and g() == 2\"";
+        for command in [heredoc, dash_c] {
+            let root = tempfile::tempdir().unwrap();
+            let mut agent = fixture(root.path());
+            agent.prompt(THREE_CLAUSES);
+            std::fs::write(
+                root.path().join("app.py"),
+                "def f():
+    return 1
+",
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("lib.py"),
+                "def g():
+    return 2
+",
+            )
+            .unwrap();
+            agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+            let state = agent.mutation_verification_state();
+            let assessment = crate::verification::classify_in_workspace(
+                "bash",
+                command,
+                root.path(),
+                root.path(),
+                &state.mutation_paths,
+            );
+            assert_eq!(
+                assessment.kind,
+                crate::verification::CheckKind::TargetedScript,
+                "{command}"
+            );
+            agent.record_verification_assessment(
+                state.mutation_generation,
+                command,
+                &assessment,
+                Some(true),
+            );
+            assert_eq!(
+                agent.completion_evidence(),
+                crate::CompletionEvidence::Verified,
+                "{command}"
+            );
+            assert_eq!(reminders(&mut agent), 0, "{command}");
+            assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+        }
+    }
+
+    #[test]
+    fn syntax_only_check_still_reviews() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt(THREE_CLAUSES);
+        two_file_edit(&mut agent, root.path());
+        let state = agent.mutation_verification_state();
+        let command = "python -m py_compile app.py lib.py";
+        let assessment = crate::verification::classify_in_workspace(
+            "bash",
+            command,
+            root.path(),
+            root.path(),
+            &state.mutation_paths,
+        );
+        assert_eq!(assessment.kind, crate::verification::CheckKind::SyntaxOnly);
+        agent.record_verification_assessment(
+            state.mutation_generation,
+            command,
+            &assessment,
+            Some(true),
+        );
+        assert_eq!(reminders(&mut agent), 1);
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 0);
+    }
+
+    #[test]
     fn an_unverified_edit_after_a_skipped_review_is_still_reviewed() {
         let root = tempfile::tempdir().unwrap();
         let mut agent = fixture(root.path());

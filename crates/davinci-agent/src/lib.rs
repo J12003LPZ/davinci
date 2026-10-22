@@ -1736,7 +1736,12 @@ impl Agent {
         if !succeeded {
             state.tests_passed_generation = None;
         } else if complete
-            && shell_policy::verification_ran_tests(command)
+            && match assessment.kind {
+                // An inline script executes the changed code with assertions.
+                verification::CheckKind::TargetedScript => true,
+                verification::CheckKind::Suite => shell_policy::verification_ran_tests(command),
+                verification::CheckKind::SyntaxOnly | verification::CheckKind::Unknown => false,
+            }
             && (assessment.full_workspace
                 || (!state.unknown_mutation_paths
                     && state
