@@ -147,7 +147,9 @@ impl WorkerActivityStore {
         let latest = ring.events.back().map_or(0, |event| event.sequence);
         let oldest = ring.events.front().map_or(0, |event| event.sequence);
         // Events were dropped and the caller's cursor is older than what is left.
-        let gap = ring.dropped > 0 && after + 1 < oldest;
+        // Clients can supply u64::MAX as a cursor. Saturating arithmetic
+        // avoids an overflow panic in debug builds (and wraparound in release).
+        let gap = ring.dropped > 0 && after.saturating_add(1) < oldest;
         ActivityPage {
             events: ring
                 .events
@@ -306,6 +308,25 @@ mod tests {
             "asking from the start reports the missing history"
         );
         assert_eq!(page.events.first().unwrap().summary, "Read(file9800.rs)");
+    }
+
+    #[test]
+    fn maximum_cursor_does_not_overflow_when_history_was_dropped() {
+        let store = WorkerActivityStore::new();
+        let agent = AgentId::new();
+        for _ in 0..=MAX_EVENTS_PER_WORKER {
+            store.append(agent, 1, WorkerActivityKind::Message, None, "event", None);
+        }
+        assert!(store.after(agent, 0, 10).gap);
+        for cursor in [u64::MAX - 1, u64::MAX] {
+            let page = store.after(agent, cursor, 10);
+            assert!(
+                !page.gap,
+                "a future cursor cannot be behind the retained history"
+            );
+            assert!(page.events.is_empty());
+            assert_eq!(page.dropped, 1);
+        }
     }
 
     #[test]
