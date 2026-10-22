@@ -93,8 +93,8 @@ rule, and it removes the review for every run.
 
 ## Next
 
-1. Ask for approval and a fresh `/login openai-codex` for Task 0.
-2. With a rebuilt binary, one bounded live run per `/config` mode (Context VM
-   off, hybrid, active; Codemode off, on) on tasks long enough to fold, to see
-   whether the model uses each mode (`harness_stats` `contextVm` and `codemode`,
-   bench `feature_use`). Needs approval; it spends subscription allowance.
+1. Done 2026-10-22 with owner approval: Task 0 (`ROUTE_REPORTS_USAGE`) and one
+   live run per `/config` mode. Results and decision (keep `contextVm` off):
+   `live-2026-10-22.md`.
+2. Check whether Context VM folds enlarge the context (`tokensAfterFold` above
+   `tokensBeforeFold` in both fold runs) before any Context VM default change.
