@@ -101,6 +101,46 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             campaign.paired_metrics(left, right[:-1])
 
+    def test_per_success_counts_failed_run_cost(self):
+        # Two runs, one fails: its cost stays in the numerator, only the pass is the divisor.
+        def cost(harness, rep, passed, tokens):
+            return dict(row(harness, rep), input_tokens=tokens, cached_tokens=0, output_tokens=tokens // 10,
+                        logical_requests=4, provider_attempts=5, wall_s=10, **{"pass": passed})
+        left = [cost("davinci", 0, True, 100), cost("davinci", 1, False, 300)]
+        right = [cost("codex", 0, True, 50), cost("codex", 1, True, 50)]
+        per = campaign.paired_metrics(left, right)["per_verified_success"]
+        self.assertEqual(per["baseline"]["passes"], 1)
+        self.assertEqual(per["baseline"]["uncached_input_tokens"]["value"], 400)
+        self.assertEqual(per["baseline"]["output_tokens"]["value"], 40)
+        self.assertEqual(per["baseline"]["logical_requests"]["value"], 8)
+        self.assertEqual(per["baseline"]["provider_attempts"]["value"], 10)
+        self.assertEqual(per["baseline"]["wall_s"]["value"], 20)
+        self.assertEqual(per["candidate"]["uncached_input_tokens"]["value"], 50)
+
+    def test_per_success_unknown_usage_is_none_not_zero(self):
+        left = [dict(row("davinci", rep), input_tokens=100, cached_tokens=10) for rep in range(2)]
+        right = [dict(row("codex", rep), input_tokens=100, cached_tokens=10) for rep in range(2)]
+        del right[1]["cached_tokens"]
+        per = campaign.paired_metrics(left, right)["per_verified_success"]
+        self.assertEqual(per["baseline"]["uncached_input_tokens"]["value"], 90)
+        self.assertIsNone(per["candidate"]["uncached_input_tokens"]["value"])
+        self.assertEqual(per["candidate"]["uncached_input_tokens"]["reason"], "unavailable_usage")
+
+    def test_per_success_zero_passes_is_none(self):
+        left = [dict(row("davinci"), input_tokens=100, cached_tokens=0, **{"pass": False})]
+        right = [dict(row("codex"), input_tokens=100, cached_tokens=0)]
+        per = campaign.paired_metrics(left, right)["per_verified_success"]
+        self.assertEqual(per["baseline"]["passes"], 0)
+        self.assertEqual(per["baseline"]["uncached_input_tokens"],
+                         {"value": None, "reason": "no_passes"})
+
+    def test_per_success_does_not_double_count_cached(self):
+        left = [dict(row("davinci"), input_tokens=1000, cached_tokens=900)]
+        right = [dict(row("codex"), input_tokens=1000, cached_tokens=0)]
+        per = campaign.paired_metrics(left, right)["per_verified_success"]
+        self.assertEqual(per["baseline"]["uncached_input_tokens"]["value"], 100)
+        self.assertEqual(per["candidate"]["uncached_input_tokens"]["value"], 1000)
+
     def test_manifest_is_authoritative_even_when_rows_agree(self):
         rows = [row("davinci"), row("codex")]
         manifest = {key: rows[0][key] for key in ("schema_version", "campaign", "variant", *campaign.COMPARABLE)}

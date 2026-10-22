@@ -203,12 +203,12 @@ def paired_metrics(baseline, candidate):
     result = {"pairs": len(left), "ratio_direction": "candidate / baseline",
               "baseline_passes": sum(row["pass"] for row in baseline),
               "candidate_passes": sum(row["pass"] for row in candidate)}
+    valid = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
     for field in ("wall_s", "logical_requests", "provider_attempts", "tool_calls",
                   "input_tokens", "cached_tokens", "uncached_input_tokens", "output_tokens",
                   "reasoning_tokens", "auto_verify_runs", "gate_reminder_count",
                   "requests_after_first_reminder", "mutations_after_reminder", "executed_leaf_operations"):
         pairs = [(metric(left[key], field), metric(right[key], field)) for key in sorted(left)]
-        valid = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
         unavailable = sum(not (valid(a) and valid(b)) for a, b in pairs)
         ratios = None if unavailable or any(a == 0 for a, _ in pairs) else [b / a for a, b in pairs]
         result[field] = {
@@ -217,6 +217,33 @@ def paired_metrics(baseline, candidate):
             "median_delta": None if unavailable else statistics.median(b - a for a, b in pairs),
             "total_delta": None if unavailable else sum(b - a for a, b in pairs),
         }
+    result["per_verified_success"] = {
+        arm: per_verified_success(rows, valid)
+        for arm, rows in (("baseline", baseline), ("candidate", candidate))}
+    return result
+
+
+PER_SUCCESS_FIELDS = ("uncached_input_tokens", "output_tokens", "logical_requests",
+                      "provider_attempts", "wall_s")
+
+
+def per_verified_success(rows, valid):
+    """Arm total over every run, failures included, divided by the arm's passes.
+
+    The denominator is verified passes only. A value is None with a reason when it
+    cannot be computed: `no_passes` (nothing to divide by) or `unavailable_usage`
+    (any run lacks a valid value, so the total would understate cost).
+    """
+    passes = sum(row["pass"] for row in rows)
+    result = {"passes": passes, "runs": len(rows)}
+    for field in PER_SUCCESS_FIELDS:
+        values = [metric(row, field) for row in rows]
+        if passes == 0:
+            result[field] = {"value": None, "reason": "no_passes"}
+        elif not all(valid(value) for value in values):
+            result[field] = {"value": None, "reason": "unavailable_usage"}
+        else:
+            result[field] = {"value": sum(values) / passes, "reason": None}
     return result
 
 

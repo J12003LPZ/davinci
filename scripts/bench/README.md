@@ -299,6 +299,15 @@ hidden-grader secrecy. Independent acceptance remains a separate gate.
   Grading/parsing are excluded. All failures/timeouts stay in distributions;
   paired both-successful rows are reported separately so an early failure is
   visible rather than silently rewarded as a speedup.
+- **Cost per verified success:** `campaign.paired_metrics` adds a
+  `per_verified_success` block per arm (`baseline`, `candidate`): the arm total of
+  `uncached_input_tokens`, `output_tokens`, `logical_requests`, `provider_attempts`
+  and `wall_s` over every run, failures included, divided by the arm's passes.
+  Cached tokens are subtracted once (via `metric()`), never again. A value is
+  `{"value": null, "reason": "no_passes"}` with zero passes, or
+  `"unavailable_usage"` when any run lacks a valid number, so a missing cache
+  report cannot make an arm look cheaper. These are token and request proxies,
+  not subscription allowance.
 - **Startup state:** readiness reports retain all rows and separately summarize
   an optional workload-recorded `startup_state` of `cold` or `warm`. Missing or
   unrecognized values are `unknown`; provider cache hits and repetition order
