@@ -10,6 +10,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # GitHub runner DNS/CDN outages can be transient; give Cargo time to recover.
+  CARGO_NET_RETRY: "10"
   PI_OFFLINE: "1"
 
 jobs:
