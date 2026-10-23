@@ -1,7 +1,9 @@
 # Hybrid fold economics
 
-Status: fix written 2026-10-22 and tested offline. No live rerun has been done.
-The live A/B needs the owner's approval (see "Not verified").
+Status: fix written 2026-10-22 and tested offline. Live Off vs Hybrid A/B run
+2026-10-23 with owner approval (12 runs, see "Live A/B"). Verdict: Hybrid is not
+shown to be better. The fix itself (no paid fold that is then thrown away) held
+on every live run.
 
 Related: `docs/perf/codex-efficiency/live-2026-10-22.md` (Stage B, `fold14k`
 arms), `docs/context-vm.md` (Hybrid mode).
@@ -290,17 +292,78 @@ The other direction is the cost that remains. A thin margin passes the dry run
 and the real fit then fails after the paid fold. The backoff caps that at one
 paid request per `keep_recent_tokens` of growth.
 
+## Live A/B (2026-10-23)
+
+Owner-approved, bounded: 3 long tasks (`m5-wide-migration`,
+`m6-requirements-ledger`, `m7-log-forensics`) x 2 arms x 2 repetitions = 12
+runs, order alternated per repetition. Both arms used compaction threshold
+64,000, keep 20,000, reserve 16,384, Codemode off, retries off; only
+`contextVm` differed. Model `gpt-6-luna`, effort high, Codex backend route.
+Binary built from `a8a98549` (green push CI run 39898233917), runner scripts
+at `d10ed0a0`. Every run reported the requested mode as its observed mode. No
+auth, quota or route stop. Usage was present on every attempt. Artifacts:
+`C:\bench\fold64k-20261022\runs`, report `ab_report.py` / `ab_report.json`,
+per-fold rows `fold_economics.json`.
+
+| arm | verified successes | hidden tests passed | requests | compaction requests | uncached input | total input | wall s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Off | 1 of 6 | 95.8% | 232 | 4 | 617,668 | 10,065,732 | 1,272 |
+| Hybrid | 2 of 6 | 96.4% | 250 | 2 | 539,528 | 9,911,816 | 1,307 |
+
+Per run (verified = every hidden test passed):
+
+| task | rep | arm | verified | hidden | requests | compaction req | peak context | uncached | wall s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| m5 | 0 | Off | no | 106/123 | 31 | 0 | 35,369 | 39,514 | 150 |
+| m5 | 0 | Hybrid | yes | 123/123 | 40 | 0 | 57,385 | 53,354 | 192 |
+| m5 | 1 | Off | no | 122/123 | 43 | 0 | 58,173 | 101,103 | 268 |
+| m5 | 1 | Hybrid | no | 110/123 | 36 | 0 | 46,222 | 72,783 | 185 |
+| m6 | 0 | Off | yes | 167/167 | 51 | 0 | 63,591 | 61,407 | 246 |
+| m6 | 0 | Hybrid | yes | 167/167 | 63 | 1 | 63,880 | 158,991 | 339 |
+| m6 | 1 | Off | no | 166/167 | 75 | 0 | 70,801 | 79,071 | 435 |
+| m6 | 1 | Hybrid | no | 166/167 | 43 | 0 | 60,294 | 54,548 | 240 |
+| m7 | 0 | Off | no | 37/41 | 15 | 2 | 116,281 | 187,636 | 74 |
+| m7 | 0 | Hybrid | no | 36/41 | 39 | 1 | 118,780 | 145,162 | 190 |
+| m7 | 1 | Off | no | 36/41 | 17 | 2 | 116,553 | 148,937 | 99 |
+| m7 | 1 | Hybrid | no | 36/41 | 29 | 0 | 63,035 | 54,690 | 162 |
+
+What the evidence shows:
+
+- **Hybrid is not shown to be better.** 2 against 1 verified success in 6 runs
+  each is within run-to-run noise: the m5 and m6 results flip between
+  repetitions in both arms, and in 4 of 6 pairs the hybrid arm never
+  compacted, so those pairs differ only by model variance. Hybrid used 8% more
+  requests and 3% more wall time. Its 13% lower uncached input comes almost
+  entirely from one pair (m7 rep 1), where the hybrid run stayed under the
+  threshold and the off run compacted twice.
+- **The fix held.** Across the 6 hybrid runs: 3 attempts, 2 applied, 1 skipped
+  for free by the dry run (`skippedNoFit`, m7 rep 0), 0 `notAppliedAfterFold`.
+  No summarizer request was paid and thrown away, against 13 of 13 in the
+  October 22 14k log. On m7 the off arm paid 2 summarizer requests per run (the
+  first on turn 3, before the large read, with no reduction); hybrid paid 1.
+- **A fold breaks the cached prefix.** In m6 rep 0 the fold cut the coding
+  prompt from 63,880 to 39,958 tokens, but the next request read 0 cached
+  tokens (63,488 before), so it was billed fully uncached. With the
+  summarizer's own 30,046 input tokens and only 3 coding requests left, that
+  run's uncached input was 2.6x the off run's. `fold_economics.py` reports a
+  net of +41,720 for it because its estimate counts total input; read that
+  column together with the cached share, not alone.
+- **Most runs never reached the threshold.** Only m7 (a 100k-token read on turn
+  4) crossed 64k in both arms. m5 and m6 peaked between 35k and 71k. The
+  comparison is therefore mostly a no-fold comparison.
+
+What would settle it: more repetitions on tasks that cross the threshold in
+both arms (m7-like), with uncached input and verified success as the primary
+metrics, and a fold that keeps the cached prefix (item 4 of the original
+proposal), which this change does not do.
+
 ## Not verified
 
-- No live rerun. Whether the dry run and backoff turn the 13 wasted summarizer
-  requests into 0 on the real task, and what that does to wall time and cached
-  share, is untested. The A/B is hybrid `fold14k` before and after this change
-  on `m3-state-persistence`, read with `fold_economics.py`. It needs the owner's
-  approval and a fresh `/login`.
 - With the dry run in place, the 14k arm will not compact: about 500 tokens of
   budget cannot hold a ledger. The fix is the threshold setting, not the code.
   That is a configuration finding, not something this change decides.
-- The `hybridCompaction` counters have never been emitted by a real run.
+- The cached-prefix cost of a fold is measured in one run only (m6 rep 0).
+- `fold_economics.py` does not yet report uncached input per fold.
 
 ## Out of scope: active mode
 
