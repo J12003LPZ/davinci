@@ -22,10 +22,12 @@ requirement. A chain such as `cargo check && cargo test` counts, since it ran
 tests, and a test pass on the latest change still counts after a later lint or
 build check. Targeted scripts that run the changed code (inline Python checks with
 assertions) count as tests; syntax-only checks do not. For test suites, "ran
-tests" is judged from the command, so a test command that
-selects or lists no tests (`cargo test nomatch`, `pytest --collect-only`) and a
-project `npm test` script that only lints still count, as they already did for
-the verification gate. And the review is decided
+tests" is judged from the command and the counts of the run. A run that
+asserted nothing (`cargo test nomatch`, zero passed) earns no test credit, and
+neither does a command that only lists or inspects (`pytest --collect-only`,
+`--no-run`, `--help`), which is rejected as a `noop_option` before any counts are
+read. A project `npm test` script that only lints still counts, as it already
+did for the verification gate. And the review is decided
 before the harness's automatic rerun of the last check, so an edit made after
 the last passing check still gets the review even when that rerun would pass.
 
@@ -48,6 +50,18 @@ and causes an extra review, which is the safe direction. Earning test credit
 still requires the recognized command form, so `./tools/pytest tests/` credits
 nothing. This recognition is still a heuristic over command text, so an unusual
 spelling of a failed checker can still keep coverage.
+
+A pytest run (`pytest`, `python -m pytest`) earns test credit from pytest's final
+summary line, the last non-empty line of stdout, with or without the `=` padding
+(`6 passed in 0.03s`). A run that collected no tests (`no tests ran`), failed, or
+errored earns none, and an unparsable summary is no evidence. A run with
+deselected tests (`1 passed, 2 deselected`) or a selection option (`-k`, `-m`,
+`--lf`, `--last-failed`, `--sw`, `--stepwise`, `--sw-skip`, `--deselect`,
+`--ignore`, `--ignore-glob`) earns no credit, because the named paths may not
+have run. Python's default
+unittest discovery (`python -m unittest`, with at most `-v`, `-q`, `--verbose` or
+`--quiet`) counts as a whole-suite run like `python -m unittest discover`;
+selectors, `-k`, `-p` and `-s` stay filtered.
 
 Known limitations. The gate classifies shell command text heuristically, and a
 command it cannot parse falls back to unknown: no coverage is credited, so the

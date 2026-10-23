@@ -138,3 +138,26 @@ How many of the 24 runs it would have affected, from these logs:
 
 1. Get a task author for Step 1.
 2. Ask the owner whether a live A/B is approved (Step 4).
+
+## Follow-up 2026-10-23: why passing pytest earned no credit
+
+Cause: a pytest run was recognized as a test runner, but its receipt carried no
+assertion counts, so it was no evidence. `observe_shell_verification` dropped it
+and a passing `pytest -q` earned neither verification nor test credit. Pytest now
+has its own runner id and its counts come from pytest's final summary line.
+
+In 7 of the 9 gated runs a passing pytest run preceded the review. The recorded
+post-gate tails that this fix could reach total at most 46 requests and 56,296
+uncached input tokens, out of 58 requests and 66,747 uncached input tokens in the
+tails of all 9 gated runs. That total is the sum of two parts: pytest receipts in
+the 7 runs with a preceding passing pytest account for 43 requests and 54,070
+uncached tokens, and the unittest default-discovery change accounts for 3
+requests and 2,226 uncached tokens (the verification_required tail of t7-cli
+rep 2).
+
+This is a counterfactual from recorded logs, not a measured saving. A live A/B is
+required before any saving is claimed.
+
+Trade-off: on the rename task the review led to added boundary tests. With the
+fix that review would be skipped when `pytest -q` passed. No hidden-test grade
+changed in that campaign, so this cost is not observed, only possible.
