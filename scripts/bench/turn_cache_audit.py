@@ -230,7 +230,10 @@ def gate_summary(runs, passed):
             "uncached_input": sum(r["input_total"] - r["cache_read"] for r in known),
             "uncached_input_known_requests": len(known), "mutations": sum(r["mutations"] for r in rows)}
         if passed is not None:
-            result[name]["runs_fired_passed"] = sum(bool(passed.get(key)) for key, names in fired.items() if name in names)
+            keys = [key for key, names in fired.items() if name in names]
+            result[name]["runs_fired_passed"] = sum(passed[key] is True for key in keys if key in passed)
+            result[name]["runs_fired_unknown_verdict"] = sum(
+                key not in passed or passed[key] is None for key in keys)
     order = [[n for n in names if n in both][0] for names in fired.values() if all(b in names for b in both)]
     return {
         "requests_total": len(every), "requests_after_first_gate": sum(1 for r in every if r["gate"]),
@@ -259,12 +262,14 @@ def main():
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     runs, passed, joined = {}, {}, False
-    for campaign in args.campaign:
+    for index, campaign in enumerate(args.campaign):
         verdicts = load_passed(campaign)
         joined = joined or verdicts is not None
         for log in sorted((campaign / "davinci").glob("*.stdout.jsonl")):
             name = log.name.removesuffix(".stdout.jsonl")
-            key = f"{campaign.name}/{name}" if len(args.campaign) > 1 else name
+            # Include an index and absolute campaign path; two campaigns can
+            # share a basename (or both be supplied as ".").
+            key = f"{index}:{campaign.resolve()}/{name}" if len(args.campaign) > 1 else name
             runs[key] = audit_run(log)
             task, _, rep = name.rpartition("-r")
             if verdicts is not None and rep.isdigit():

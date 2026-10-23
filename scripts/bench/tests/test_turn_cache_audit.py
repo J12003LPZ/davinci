@@ -169,6 +169,35 @@ class TurnCacheAuditTests(unittest.TestCase):
         self.assertNotIn("runs_fired_passed", audit.summarize({"d/t1-r0": (fired, None)})["per_gate"][
             "completion.requirements"])
 
+    def test_missing_verdict_is_unknown_not_failure_when_other_campaign_has_results(self):
+        fired, _ = self.audit([*attempt(100, 0), completion(), *attempt(200, 100)])
+        summary = audit.summarize({"one": (fired, None), "two": (fired, None),
+                                   "three": (fired, None)},
+                                  passed={"one": True, "two": None})
+        gate = summary["per_gate"]["completion.requirements"]
+        self.assertEqual(gate["runs_fired"], 3)
+        self.assertEqual(gate["runs_fired_passed"], 1)
+        self.assertEqual(gate["runs_fired_unknown_verdict"], 2)
+
+    def test_same_basename_campaigns_get_distinct_run_keys(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            out = root / "out"
+            folders = [root / "a" / "same", root / "b" / "same"]
+            for folder in folders:
+                (folder / "davinci").mkdir(parents=True)
+                (folder / "davinci" / "t1-r0.stdout.jsonl").write_text(
+                    "".join(json.dumps(event) + "\n" for event in [*attempt(100, 0), completion()]),
+                    encoding="utf-8")
+            with patch.object(sys, "argv", ["turn_cache_audit", *(str(x) for x in folders), "--out", str(out)]):
+                audit.main()
+            summary = json.loads((out / "turn-cache-summary.json").read_text())
+            csv = (out / "turn-cache-requests.csv").read_text()
+            self.assertEqual(summary["runs"], 2)
+            self.assertIn("0:", csv)
+            self.assertIn("1:", csv)
+
     def test_load_passed_reads_results_by_task_and_rep(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

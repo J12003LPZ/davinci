@@ -80,6 +80,42 @@ class RunnerTests(unittest.TestCase):
             runner.isolate_settings(source, root / "default", {"autoVerify": True})
             self.assertFalse((root / "default/token-governor.json").exists())
 
+    def test_auth_reference_is_hardlink_without_copy_or_credential_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            auth = source / "auth.json"
+            auth.write_bytes(b"synthetic-only-not-a-credential")
+            settings = {"contextVm": "hybrid"}
+            with patch.object(Path, "read_text", wraps=Path.read_text) as read_text,                  patch.object(Path, "read_bytes", wraps=Path.read_bytes) as read_bytes,                  patch.object(runner.shutil, "copyfile", side_effect=AssertionError("copied auth")):
+                record = runner.isolate_settings(source, root / "agent", settings,
+                                                  auth_reference=True)
+            read_text.assert_not_called()
+            read_bytes.assert_not_called()
+            linked = root / "agent" / "auth.json"
+            self.assertTrue(os.path.samefile(auth, linked))
+            self.assertEqual(auth.read_bytes(), b"synthetic-only-not-a-credential")
+            self.assertEqual(json.loads((root / "agent" / "settings.json").read_text()), settings)
+            self.assertEqual(record["settings"], settings)
+            self.assertEqual(auth.stat().st_nlink, 2)
+
+    def test_auth_reference_fails_closed_when_hardlink_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            auth = source / "auth.json"
+            auth.write_bytes(b"synthetic")
+            with patch.object(runner.os, "link", side_effect=OSError("different volume")):
+                with self.assertRaisesRegex(ValueError, "same-volume hardlink"):
+                    runner.isolate_settings(source, root / "agent", {}, auth_reference=True)
+            self.assertFalse((root / "agent").exists())
+            self.assertEqual(auth.read_bytes(), b"synthetic")
+            with self.assertRaisesRegex(ValueError, "cannot apply subscription"):
+                runner.isolate_settings(source, root / "other", {},
+                                        subscription_only=True, auth_reference=True)
+
     def test_wire_dump_arm_gets_a_per_run_directory_outside_the_workspace(self):
         on = {"bench": {"wireDump": True}}
         with patch.object(bench, "RUNS", os.path.join("campaign", "root")):

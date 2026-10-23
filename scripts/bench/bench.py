@@ -31,7 +31,7 @@ from pathlib import Path
 from contextlib import nullcontext
 from observations import PURPOSES, activity
 from campaign import (LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task_success,
-                      manifest_errors, paired_metrics, feature_use, file_hash, digest, metric,
+                      manifest_errors, paired_metrics, feature_use, requested_codemode, file_hash, digest, metric,
                       latency_uncertainty, promotion_gates)
 from runner import (create_campaign, isolate_settings, controlled_environment, select_tasks,
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
@@ -235,8 +235,7 @@ def forbidden_artifacts(workdir, tid):
 
 def codemode_arm(settings):
     """Codemode mode selected by the DaVinci settings, validated before any launch."""
-    block = (settings or {}).get("codemode")
-    mode = block.get("mode", "off") if isinstance(block, dict) else "off"
+    mode = requested_codemode(settings)
     if mode not in ("off", "read-only"):
         raise ValueError("benchmark codemode arm must be off or read-only")
     return mode
@@ -384,9 +383,12 @@ def parse_stream(harness, stdout):
                                   "diagnosticsMs", "diagnosticComparableOperations", "diagnosticUnknownOperations",
                                   "repeatedReads", "repeatedSearches", "workerDuplicateOperations",
                                   "toolCalls", "batchOperations", "subagents")}
-    # Tool events are the count of record; harness_stats says whether the
-    # feature was configured. A field absent from an older log stays None.
+    # harness_stats is the host's own record of the live agent, and the only
+    # source of a codemode count or a mode. Tool events can prove use but not
+    # its absence, so a log without the codemode block has unknown calls (None),
+    # never zero. A field absent from an older log stays None.
     stats["context_vm"] = stats["codemode_calls"] = stats["codemode_calls_reported"] = None
+    stats["codemode_tool_events"] = stats["codemode_mode"] = stats["codemode_available"] = None
     if harness == "davinci":
         snapshot = {}
         if not malformed_stream:
@@ -399,14 +401,28 @@ def parse_stream(harness, stdout):
         codemode = codemode if isinstance(codemode, dict) else {}
         runtime = snapshot.get("runtime")
         runtime = runtime if isinstance(runtime, dict) else {}
+        hybrid = vm.get("hybridCompaction")
         stats["context_vm"] = {
             "mode": vm["mode"] if vm.get("mode") in ("off", "shadow", "active", "hybrid") else None,
             "folds": non_negative(vm.get("folds")),
             "compactions": non_negative(runtime.get("compactions")),
             "retrieve_context_calls": stats["tools"].get("retrieve_context", 0),
-            "retrieval_offered": vm["retrievalOffered"] if type(vm.get("retrievalOffered")) is bool else None}
-        stats["codemode_calls"] = stats["tools"].get("codemode", 0)
+            "retrieval_offered": vm["retrievalOffered"] if type(vm.get("retrievalOffered")) is bool else None,
+            "images_compiled": non_negative(vm.get("imagesCompiled")),
+            "retrieval_hits": non_negative(vm.get("retrievalHits")),
+            "retrieval_misses": non_negative(vm.get("retrievalMisses")),
+            # Not emitted by Agent::feature_use: unknown until it is.
+            "shadow_comparisons": None,
+            "hybrid_compaction": {
+                key: non_negative(value) for key, value in hybrid.items() if isinstance(key, str)
+            } if isinstance(hybrid, dict) else None}
+        stats["codemode_tool_events"] = stats["tools"].get("codemode", 0)
+        stats["codemode_mode"] = (codemode["mode"] if codemode.get("mode") in ("off", "read-only", "controlled")
+                                  else None)
+        stats["codemode_available"] = codemode.get("available") if type(codemode.get("available")) is bool else None
+        # The reported count is the count of record; tool events cross-check it.
         stats["codemode_calls_reported"] = non_negative(codemode.get("calls"))
+        stats["codemode_calls"] = stats["codemode_calls_reported"]
     if observed:
         receipts, coding_groups = {}, {}
         complete_receipts, uncertain_receipts = set(), set()
@@ -649,6 +665,7 @@ def run_one(harness, tid, rep, campaign=None):
         result["task_set"] = "private"
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts",
                 "runtime_stats", "context_vm", "codemode_calls", "codemode_calls_reported",
+                "codemode_tool_events", "codemode_mode", "codemode_available",
                 "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio", "known_usage",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",
                 "mutations_after_reminder", "executed_leaf_operations", "batch_children_reported",
@@ -984,6 +1001,8 @@ def main():
     ap.add_argument("--large-manifest")
     ap.add_argument("--variant", default="baseline")
     ap.add_argument("--settings", help="explicit DaVinci settings JSON")
+    ap.add_argument("--auth-reference", action="store_true",
+                    help="hardlink original auth.json into isolated settings; fail closed without same-volume hardlink support")
     ap.add_argument("--subscription-policy", help="subscription-only request/task/time caps; fixed gpt-6-luna/high")
     ap.add_argument("--grading-timeout", type=int, default=120, help="maximum seconds per grader/regression process (1–3600)")
     ap.add_argument("--model-store", help="existing public model catalog to pin for DaVinci")
@@ -1069,6 +1088,9 @@ def main():
             pinned_models = pin_model_store(args.model_store, MODEL) if args.model_store else None
             if pinned_models:
                 manifest["identities"]["davinci"]["model_catalog_hash"] = digest(pinned_models)
+            manifest["runner_auth_mode"] = "hardlink-reference" if args.auth_reference else "copy"
+            if args.auth_reference:
+                manifest["runner_auth_source_path"] = str((agent_source() / "auth.json").resolve())
             create_campaign(RUNS, manifest)
             if "subscription" in manifest:
                 Path(manifest["subscription"]["config_path"]).write_text(
@@ -1078,7 +1100,8 @@ def main():
             Path(RUNS, "fixtures.json").write_text(json.dumps(fixtures, indent=2), encoding="utf-8")
             if "davinci" in args.harness:
                 isolate_settings(agent_source(), Path(manifest["agent_dir"]), settings,
-                                 subscription_only="subscription" in manifest)
+                                 subscription_only="subscription" in manifest,
+                                 auth_reference=args.auth_reference)
                 if pinned_models:
                     Path(manifest["agent_dir"], "models-store.json").write_text(
                         json.dumps(pinned_models, indent=2), encoding="utf-8")
