@@ -62,6 +62,82 @@
       "public_verification": "python -m pytest -q tests/test_public_cli.py",
       "reference_solution_hash": "f11e48324df22dfc0b114a555d4fcbbf20253de62491f1809915321f3a6ca095",
       "task_set": "large"
+    },
+    "m5-wide-migration": {
+      "allowed": [
+        "services/billing.py",
+        "services/invoices.py",
+        "services/payroll.py",
+        "services/refunds.py",
+        "services/shipping.py",
+        "services/returns.py",
+        "services/catalog.py",
+        "services/pricing.py",
+        "services/ledger.py",
+        "services/payouts.py",
+        "services/subscriptions.py",
+        "services/coupons.py",
+        "services/taxes.py",
+        "services/disputes.py",
+        "services/settlements.py",
+        "services/quotes.py",
+        "services/credits.py",
+        "services/vouchers.py",
+        "services/tipping.py",
+        "services/escrow.py",
+        "services/rewards.py",
+        "services/fees.py",
+        "services/rebates.py",
+        "services/statements.py",
+        "services/reserves.py",
+        "services/audits.py",
+        "services/budgets.py",
+        "services/grants.py",
+        "services/leases.py",
+        "services/royalties.py",
+        "legacy_clock.py",
+        "tests/test_public_services.py"
+      ],
+      "hidden_grader_hash": "e9e1378de092160690bbe5176c1617176065193c798eece388e7ae55eb8bc19f",
+      "public_hash": "c72764ac1adb029b79a726e85e706ab0a8430550b01e5c34a7637086e73f394b",
+      "public_verification": "python -m pytest -q tests/test_public_services.py",
+      "reference_solution_hash": "ce8bc583cfb4e6eb021313627898602b01ac4237441173c38047e847ace841e2",
+      "task_set": "large"
+    },
+    "m6-requirements-ledger": {
+      "allowed": [
+        "warehouse/__init__.py",
+        "warehouse/errors.py",
+        "warehouse/timeutil.py",
+        "warehouse/categories.py",
+        "warehouse/regions.py",
+        "warehouse/suppliers.py",
+        "warehouse/inventory.py",
+        "warehouse/pricing.py",
+        "warehouse/orders.py",
+        "warehouse/reports.py",
+        "warehouse/importers.py",
+        "tests/test_public_warehouse.py"
+      ],
+      "hidden_grader_hash": "8bc90b2eb5943660de281ea143de780e61e829c63f2c55d292744116f92946af",
+      "public_hash": "009b852aabad519a8203f8c421ddce1fee13b9949838a0006a45db28d62a61c9",
+      "public_verification": "python -m pytest -q tests/test_public_warehouse.py",
+      "reference_solution_hash": "f699582d9f01ce91845631773f17e3d87360608b3a8c0a7a75f0e123c55551fb",
+      "task_set": "large"
+    },
+    "m7-log-forensics": {
+      "allowed": [
+        "logparse.py",
+        "stats.py",
+        "report.py",
+        "README.md",
+        "tests/test_public_logs.py"
+      ],
+      "hidden_grader_hash": "6a1c6f1244a3fabd264e144ee03b9509a572c41749b055da072481b332fb2a8d",
+      "public_hash": "b6e0c500a3dc2a59d638292ede34461b9b6e00595d0c3a8e82e5065fcc512712",
+      "public_verification": "python -m pytest -q tests/test_public_logs.py",
+      "reference_solution_hash": "460222cea073178a68b978571acee312efff815c2ea5c5db9f14a3bf2833f55a",
+      "task_set": "large"
     }
   },
   "generator": "scripts/bench/make_large_tasks.py",
@@ -95,6 +171,9 @@
     "m1-config-parser",
     "m2-public-api-migration",
     "m3-state-persistence",
-    "m4-cli-feature"
+    "m4-cli-feature",
+    "m5-wide-migration",
+    "m6-requirements-ledger",
+    "m7-log-forensics"
   ]
 }

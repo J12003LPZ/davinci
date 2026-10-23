@@ -5256,6 +5256,7 @@ fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     agent.cwd = workspace.clone();
     let sessionless = super::sync_codemode_from_settings(&mut agent).unwrap_err();
     assert!(sessionless.contains("session"), "{sessionless}");
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
 
     agent
         .load_from_session(JsonlSession::create(&workspace, "fixture", None).unwrap())
@@ -5265,12 +5266,62 @@ fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     // The message names where it looked, so a wrong agent dir is visible.
     assert!(missing.contains(&node), "{missing}");
     assert!(!agent.has_staged_codemode());
+    // A refused switch is not recorded as the requested mode: the caller turns
+    // it off, and the stats must not claim "read-only".
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        serde_json::json!({"mode": "off", "available": false, "calls": 0})
+    );
 
     super::persist_interactive_setting("codemode=false").unwrap();
     assert_eq!(saved()["codemode"]["mode"], "off");
     assert_eq!(saved()["codemode"]["hostPath"], host.as_str());
     super::sync_codemode_from_settings(&mut agent).unwrap();
     assert!(!agent.has_staged_codemode());
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
+}
+
+#[test]
+fn startup_codemode_records_the_requested_mode_only_after_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    let node = runtime.join("node.exe").to_string_lossy().into_owned();
+    let host = runtime.join("host").to_string_lossy().into_owned();
+    let stored = serde_json::json!({"mode": "read-only", "nodePath": node, "hostPath": host});
+
+    // Stored read-only, no CLI override, runtime missing: stats say off.
+    let mut agent = Agent::new("fixture");
+    let missing = super::stage_startup_codemode(
+        &mut agent,
+        None,
+        Some(&stored),
+        dir.path(),
+        dir.path(),
+        false,
+    )
+    .unwrap_err();
+    assert!(missing.contains("Node runtime unavailable"), "{missing}");
+    assert!(!agent.has_staged_codemode());
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
+
+    // A sessionless run is refused the same way.
+    let mut agent = Agent::new("fixture");
+    let sessionless = super::stage_startup_codemode(
+        &mut agent,
+        None,
+        Some(&stored),
+        dir.path(),
+        dir.path(),
+        true,
+    )
+    .unwrap_err();
+    assert!(sessionless.contains("--no-session"), "{sessionless}");
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
+
+    // An off setting succeeds and reports off.
+    let mut agent = Agent::new("fixture");
+    super::stage_startup_codemode(&mut agent, None, None, dir.path(), dir.path(), false).unwrap();
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
 }
 
 #[test]
