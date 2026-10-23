@@ -149,6 +149,11 @@ impl Summarizer {
         self.input_budget_tokens
     }
 
+    /// Whether both are the same summarizer: clones share one.
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn summarize(&self, request: &SummarizeRequest) -> Result<SummarizeResponse, String> {
         (self.inner)(request)
     }

@@ -46,6 +46,9 @@ pub struct Assessment {
     /// An unfiltered suite at the workspace root can cover unnamed mutations.
     pub full_workspace: bool,
     pub reason: &'static str,
+    /// The directory the classified command effectively ran in, after a leading
+    /// `cd`. `None` when the classifier could not determine it.
+    pub ran_in: Option<PathBuf>,
 }
 
 impl Assessment {
@@ -56,6 +59,7 @@ impl Assessment {
             complete: false,
             full_workspace: false,
             reason,
+            ran_in: None,
         }
     }
 }
@@ -361,6 +365,67 @@ fn exempt(workspace: &Path, path: &Path) -> bool {
         })
 }
 
+/// The one place test coverage is narrowed, for every check kind.
+/// `classify_in_workspace` credits every documentation-exempt path (`.md`,
+/// `.rst`, `docs/*.txt`) as covered wherever it lives, which is right for
+/// verification but not for tests: a check only tests what sits under the
+/// directory it ran in, exempt documents included.
+fn tested_under(ran_in: &Path, workspace: &Path, covered: Vec<PathBuf>) -> Vec<PathBuf> {
+    let Some(ran_in) = normalized(ran_in, Path::new(".")) else {
+        return Vec::new();
+    };
+    covered
+        .into_iter()
+        .filter(|path| normalized(workspace, path).is_some_and(|path| path.starts_with(&ran_in)))
+        .collect()
+}
+
+/// Test coverage of an inline script check (`python -c ...`), which
+/// `classify_in_workspace` assesses as a whole. The directory is the one the
+/// classifier itself used (`Assessment::ran_in`); when it is unknown nothing is
+/// credited.
+pub(crate) fn targeted_tested_coverage(assessment: &Assessment, workspace: &Path) -> Vec<PathBuf> {
+    match &assessment.ran_in {
+        Some(directory) => tested_under(directory, workspace, assessment.covered.clone()),
+        None => Vec::new(),
+    }
+}
+
+/// Paths actually covered by test-running segments of a literal AND chain.
+/// A preceding lint can cover the workspace for verification without claiming
+/// test coverage for its own segment. Inconclusive shell syntax grants none.
+pub(crate) fn tested_coverage(
+    command: &str,
+    cwd: &Path,
+    workspace: &Path,
+    paths: &[PathBuf],
+) -> (Vec<PathBuf>, bool) {
+    let Some(parts) = segments(command.trim(), true) else {
+        return (Vec::new(), false);
+    };
+    let mut tested = BTreeSet::new();
+    let mut full_workspace = false;
+    let mut directory = cwd.to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        let Some(words) = literal_words(part.trim(), true) else {
+            return (Vec::new(), false);
+        };
+        if index == 0 && words.len() == 2 && words[0] == "cd" {
+            directory = cwd.join(&words[1]);
+            continue;
+        }
+        if !crate::shell_policy::verification_ran_tests(part) {
+            continue;
+        }
+        let assessment = classify_in_workspace("bash", part, &directory, workspace, paths);
+        if assessment.kind == CheckKind::Suite {
+            tested.extend(tested_under(&directory, workspace, assessment.covered));
+            full_workspace |= assessment.full_workspace;
+        }
+    }
+    (tested.into_iter().collect(), full_workspace)
+}
+
 pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Assessment {
     classify_in_workspace(tool, command, cwd, cwd, paths)
 }
@@ -661,6 +726,7 @@ pub(crate) fn classify_in_workspace(
         complete,
         full_workspace,
         reason: "classified",
+        ran_in: Some(directory),
     }
 }
 

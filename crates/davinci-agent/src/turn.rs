@@ -3881,18 +3881,6 @@ Issue the call again if it is still needed.";
                 state.last_classification_reason = Some(assessment.reason.into());
             }
         }
-        if !matches!(
-            assessment.kind,
-            crate::verification::CheckKind::Suite | crate::verification::CheckKind::TargetedScript
-        ) {
-            return self.unrecognized_check_note(
-                generation,
-                command,
-                &assessment,
-                &state,
-                original.is_error,
-            );
-        }
         let receipt = self
             .command_receipts
             .lock()
@@ -3922,6 +3910,42 @@ Issue the call again if it is still needed.";
             // Tool metadata and hook output are not process execution proof.
             None
         };
+        // One rule for every classification, applied before any early return:
+        // a command that started and exited nonzero revokes the test coverage
+        // of this generation when it is a test run or invokes a verifier or
+        // checker (either list counts, so `py_compile x.py && echo ok` still
+        // clears; a failed `python build.py` clearing too is accepted).
+        // Cancelled, denied, simulated and hook-vetoed runs prove nothing
+        // either way, and a failed inspection (`grep`, `ls`) is not a checker and keeps coverage.
+        let exited_nonzero = receipt.as_ref().is_some_and(|receipt| {
+            receipt.started
+                && receipt.exit_code.is_some_and(|code| code != 0)
+                && !(receipt.cancelled
+                    || receipt.permission_denied
+                    || receipt.simulated
+                    || receipt.hook_vetoed)
+        });
+        let test_kind = matches!(
+            assessment.kind,
+            crate::verification::CheckKind::Suite | crate::verification::CheckKind::TargetedScript
+        );
+        let checked = test_kind
+            || assessment.kind == crate::verification::CheckKind::SyntaxOnly
+            || crate::shell_policy::invokes_verifier(command)
+            || invokes_checker(command);
+        if exited_nonzero && checked {
+            self.revoke_test_coverage(generation);
+        }
+        if !test_kind {
+            // Syntax-only and unknown checks earn no credit.
+            return self.unrecognized_check_note(
+                generation,
+                command,
+                &assessment,
+                &state,
+                original.is_error,
+            );
+        }
         if let Some(passed) = terminal {
             if let Some(receipt) = receipt {
                 crate::stats::SharedCounters::add(
@@ -3938,7 +3962,7 @@ Issue the call again if it is still needed.";
             }
             self.remember_verification_call(name, args, cwd);
         }
-        self.record_verification_assessment(generation, command, &assessment, terminal);
+        self.record_verification_assessment_in(generation, command, cwd, &assessment, terminal);
         if invokes_checker(command) {
             let mut current = self
                 .mutation_verification

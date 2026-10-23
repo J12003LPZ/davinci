@@ -1452,30 +1452,18 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         // starts without Codemode and says why, rather than refusing to start.
         let explicit = parsed.codemode.is_some();
         let agent_dir = default_agent_dir();
-        agent.set_codemode_configured_mode(
-            davinci_coding_agent::codemode_host::config::configured_mode(
-                parsed.codemode.as_deref(),
-                settings.codemode.as_ref(),
-            ),
-        );
-        let staged = davinci_coding_agent::codemode_host::config::resolve_config(
+        if let Err(error) = stage_startup_codemode(
+            &mut agent,
             parsed.codemode.as_deref(),
             settings.codemode.as_ref(),
             &agent_dir,
-        )
-        .and_then(|config| match config {
-            None => Ok(None),
-            Some(_) if parsed.no_session => Err(
-                "Codemode records its operations in the session journal; remove --no-session to use it"
-                    .to_string(),
-            ),
-            Some(config) => config.admit(cwd, &agent_dir).map(Some),
-        });
-        match staged {
-            Ok(Some(codemode)) => agent.stage_read_only_codemode(Arc::new(codemode)),
-            Ok(None) => {}
-            Err(error) if explicit => return Err(error),
-            Err(error) => eprintln!("Codemode is on in /config but stays off: {error}"),
+            cwd,
+            parsed.no_session,
+        ) {
+            if explicit {
+                return Err(error);
+            }
+            eprintln!("Codemode is on in /config but stays off: {error}");
         }
     }
     host.emit(ExtensionEvent::SessionStart);
@@ -8414,37 +8402,77 @@ fn apply_orchestration_settings(agent: &mut Agent, settings: &settings::Settings
     agent.sync_orchestration_tools();
 }
 
+/// Record the Codemode mode the host resolved. The requested mode counts only
+/// once it was admitted; any error records `off`, so feature stats never
+/// report a mode that did not start. Shared by startup and `/config`.
+fn record_codemode_outcome(
+    agent: &mut Agent,
+    requested: &str,
+    outcome: Result<(), String>,
+) -> Result<(), String> {
+    agent.set_codemode_configured_mode(if outcome.is_ok() { requested } else { "off" });
+    outcome
+}
+
+/// Startup admission of Codemode from `--codemode` and the stored setting.
+fn stage_startup_codemode(
+    agent: &mut Agent,
+    cli: Option<&str>,
+    stored: Option<&serde_json::Value>,
+    agent_dir: &Path,
+    cwd: &Path,
+    no_session: bool,
+) -> Result<(), String> {
+    use davinci_coding_agent::codemode_host::config::{configured_mode, resolve_config};
+    const SESSIONLESS: &str =
+        "Codemode records its operations in the session journal; remove --no-session to use it";
+    let requested = configured_mode(cli, stored);
+    let staged = resolve_config(cli, stored, agent_dir).and_then(|config| match config {
+        None => Ok(None),
+        Some(_) if no_session => Err(SESSIONLESS.to_string()),
+        Some(config) => config.admit(cwd, agent_dir).map(Some),
+    });
+    let staged = staged.map(|codemode| {
+        if let Some(codemode) = codemode {
+            agent.stage_read_only_codemode(Arc::new(codemode));
+        }
+    });
+    record_codemode_outcome(agent, requested, staged)
+}
+
 /// Bring a running agent's Codemode in line with settings after `/config`
-/// changes the switch. An error names why the runtime cannot be admitted.
+/// changes the switch. An error names why the runtime cannot be admitted, and
+/// leaves the recorded mode `off`: the caller turns the switch off with it.
 pub(crate) fn sync_codemode_from_settings(agent: &mut Agent) -> Result<(), String> {
     let agent_dir = default_agent_dir();
     let stored = load_merged_settings(&agent_dir, &agent.cwd);
-    agent.set_codemode_configured_mode(
-        davinci_coding_agent::codemode_host::config::configured_mode(
-            None,
-            stored.codemode.as_ref(),
-        ),
-    );
-    let config = davinci_coding_agent::codemode_host::config::resolve_config(
+    let requested = davinci_coding_agent::codemode_host::config::configured_mode(
         None,
         stored.codemode.as_ref(),
-        &agent_dir,
-    )?;
-    match config {
-        None => {
-            agent.clear_codemode();
-            Ok(())
+    );
+    let synced = (|| {
+        let config = davinci_coding_agent::codemode_host::config::resolve_config(
+            None,
+            stored.codemode.as_ref(),
+            &agent_dir,
+        )?;
+        match config {
+            None => {
+                agent.clear_codemode();
+                Ok(())
+            }
+            Some(_) if agent.has_staged_codemode() => Ok(()),
+            Some(_) if agent.session.is_none() => {
+                Err("Codemode needs a session journal; this run has no session".into())
+            }
+            Some(config) => {
+                let host = config.admit(&agent.cwd, &agent_dir)?;
+                agent.stage_read_only_codemode(Arc::new(host));
+                Ok(())
+            }
         }
-        Some(_) if agent.has_staged_codemode() => Ok(()),
-        Some(_) if agent.session.is_none() => {
-            Err("Codemode needs a session journal; this run has no session".into())
-        }
-        Some(config) => {
-            let host = config.admit(&agent.cwd, &agent_dir)?;
-            agent.stage_read_only_codemode(Arc::new(host));
-            Ok(())
-        }
-    }
+    })();
+    record_codemode_outcome(agent, requested, synced)
 }
 
 fn sync_agent_from_settings(agent: &mut Agent) {

@@ -29,6 +29,24 @@ the verification gate. And the review is decided
 before the harness's automatic rerun of the last check, so an edit made after
 the last passing check still gets the review even when that rerun would pass.
 
+Deliberate limitation: `make check` and `npm`/`yarn`/`pnpm check` are classified
+as checks, never as test runs, even though a project may wire them to its test
+suite. A pass of one of them is a verifier for the verification gate but does
+not skip the requirement review. The extra review is the safe direction; a
+project that wants the skip runs its test command (`make test`, `npm test`).
+
+Known limitations. The gate classifies shell command text heuristically, and a
+command it cannot parse falls back to unknown: no coverage is credited, so the
+review runs. The one exception is the failure case in the first item below.
+
+- Output redirection on a checker (`tsc --noEmit > /dev/null`) is not recognised
+  as a verifier. If it fails, accumulated coverage is not cleared.
+- A `cd` whose target comes from a variable credits nothing.
+- `make check` and `npm`/`yarn`/`pnpm check` are not treated as tests (see above).
+- A test run credits only edited paths under the directory it ran in, and a
+  full-workspace run only those under the workspace root. A path outside it, such
+  as an extra authorized root, needs its own passing test run.
+
 The reminder asks the same agent to list explicit requirements, identify a check
 for each, add missing coverage in existing test files, update obsolete tests and
 rerun checks. The existing mutation verification gate still follows this step.

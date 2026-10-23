@@ -75,10 +75,13 @@ turn boundary (never onto a tool result); when even the newest turn does not
 fit, nothing is compacted and the transcript is unchanged.
 
 An automatic attempt below the capacity limit applies one more rule to each
-candidate cut: the replaced prefix must contain an assistant reply. Turn 1 is a
-user prompt, plus a turn context message on cache-sensitive routes, and nothing
-a ledger could stand in for, so replacing it costs a summarizer request for no
-gain while the window still has room. A cut that breaks the rule is skipped and
+candidate cut: the replaced prefix must contain an assistant reply. A prefix
+without one holds only user input and nothing a ledger could stand in for, so
+replacing it costs a summarizer request for no gain while the window still has
+room. That is turn 1 (a user prompt, plus a turn context message on
+cache-sensitive routes), and it is equally the history after an earlier
+compaction: the replacement the last compaction left plus the new prompts, until
+an assistant reply lands before the cut. A cut that breaks the rule is skipped and
 the next later cut is tried; only when every cut breaks it is the attempt
 skipped (counter `skippedNoAssistantReply`). Recovery paths do not apply the
 rule. With a 90k tool result after a 100k pasted prompt in a nearly full window,
@@ -115,10 +118,12 @@ defers compaction to the capacity limit, where the attempt is a recovery, pays
 the fold, and fits it. If the ledger state cannot be loaded for the dry run, the
 compaction goes ahead as before.
 
-A compaction that reached the fold and was not applied (the replacement did
-not fit afterwards, the fold failed, or the checkpoint could not be saved)
-starts a backoff, if it was an automatic attempt below the capacity limit
-(`context_window` minus `reserve_tokens`). So does an applied replacement that
+A compaction that paid for a summarizer request and was not applied (the
+replacement did not fit afterwards, the fold failed, or the checkpoint could not
+be saved) starts a backoff, if it was an automatic attempt below the capacity
+limit (`context_window` minus `reserve_tokens`). A failure that sent no request
+(`notAppliedOther`: no summarizer, no chunk fitting its window) cost nothing and
+starts none. So does an applied replacement that
 is no smaller than the history, which still counts as applied. The automatic
 trigger then waits until the calibrated context has grown by `keep_recent_tokens`
 past the size at that attempt. The size recorded is the `tokens` value the automatic trigger passed in for that
@@ -129,9 +134,11 @@ size recorded from the byte estimate (no provider count yet, after a resume or
 a model switch) can read about 3k lower once the provider counts it. An applied
 compaction and a session load, branch switch or rewind (`restore_branch_state`)
 clear it too, and so does a change of the window or of any compaction setting
-(`keep_recent_tokens`, `reserve_tokens`, the threshold): the recorded size says
-nothing about the new limits. The dry run still applies to an automatic attempt
-below capacity that the backoff lets through.
+(`keep_recent_tokens`, `reserve_tokens`, the threshold), of the summarizer, or of
+the Context VM mode: the recorded size says nothing about the new limits, and a
+new summarizer or mode deserves its own attempt. The dry run still applies to an
+automatic attempt below capacity that the backoff lets through. A deferral emits
+the same `PreCompact` and `PostCompact` events a dry-run skip does.
 
 The backoff only ever defers an automatic attempt below the capacity limit. From
 the capacity limit up an attempt is a recovery, like manual `/compact` and the

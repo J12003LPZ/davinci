@@ -348,6 +348,9 @@ pub struct MutationVerificationState {
     /// build check does not clear it.
     #[serde(default)]
     pub tests_passed_generation: Option<u64>,
+    /// Passing test-running segments in the current mutation generation.
+    #[serde(default)]
+    pub tested_paths: Vec<PathBuf>,
     pub last_verification_succeeded: bool,
     #[serde(default)]
     pub mutation_paths: Vec<PathBuf>,
@@ -478,6 +481,26 @@ impl std::fmt::Debug for AutoSandboxResolverHandle {
 }
 
 /// Counts of hybrid-mode compaction entries and what became of them.
+/// What a hybrid fold backoff was recorded under.
+#[derive(Debug, Clone)]
+struct HybridBackoffScope {
+    context_window: u64,
+    compaction: CompactionSettings,
+    summarizer: Option<Summarizer>,
+}
+
+impl PartialEq for HybridBackoffScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.context_window == other.context_window
+            && self.compaction == other.compaction
+            && match (&self.summarizer, &other.summarizer) {
+                (Some(left), Some(right)) => left.is_same(right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
 /// `attempts` = `applied` + `skipped_no_fit` + `skipped_no_assistant_reply` +
 /// `skipped_backoff` + `not_applied_after_fold` + `not_applied_other`. The token sums cover applied compactions only
 /// and use the message estimate (`CompactionResult.tokens_before/after`).
@@ -626,10 +649,11 @@ pub struct Agent {
     /// paid for a summarizer request and then did not apply. While set,
     /// automatic hybrid compaction waits for the context to grow.
     hybrid_fold_backoff: Option<u64>,
-    /// The window and compaction settings the backoff was recorded under. A
-    /// change in any of them clears it: the recorded size says nothing about
-    /// the new limits.
-    hybrid_fold_backoff_settings: Option<(u64, CompactionSettings)>,
+    /// The window, compaction settings and summarizer the backoff was recorded
+    /// under. A change in any of them clears it: the recorded size says nothing
+    /// about the new limits, and a new summarizer deserves its own attempt. A
+    /// change of Context VM mode clears it in [`Agent::set_context_vm_mode`].
+    hybrid_fold_backoff_settings: Option<HybridBackoffScope>,
     /// Summarizer requests the last hybrid fold sent (0 when it sent none).
     hybrid_last_fold_requests: u64,
     observation_root_id: String,
@@ -1601,11 +1625,22 @@ impl Agent {
         let prior_was_verified = state.verified_generation == Some(state.mutation_generation)
             && state.last_verification_succeeded;
         if prior_was_verified {
-            state.mutation_paths.clear();
+            // Only a passing test run retires a path. A build, lint or format
+            // check can complete verification without testing anything, so
+            // paths no test covered stay pending across the next mutation.
+            let all_tested = state.tests_passed_generation == Some(state.mutation_generation);
+            let tested = std::mem::take(&mut state.tested_paths);
+            if all_tested {
+                state.mutation_paths.clear();
+            } else {
+                state.mutation_paths.retain(|path| !tested.contains(path));
+            }
             state.unknown_mutation_paths = false;
         }
         state.unknown_mutation_paths |= paths.is_empty();
         state.covered_paths.clear();
+        state.tested_paths.clear();
+        state.tests_passed_generation = None;
         state.last_classification_reason = None;
         state.mutation_generation = state.mutation_generation.saturating_add(1);
         for path in paths {
@@ -1635,6 +1670,9 @@ impl Agent {
             state.unknown_mutation_paths = false;
             state.failed_verification_paths.clear();
             state.unscoped_verification_failure = false;
+            // An explicit verifier vouches for every current path, so the
+            // next mutation retires them like a passing test run.
+            state.tested_paths = paths.clone();
         }
         state.latest_evidence = Some(VerificationEvidence {
             generation,
@@ -1670,38 +1708,67 @@ impl Agent {
 
     #[cfg(test)]
     pub(crate) fn record_verification_command(&self, command: &str, succeeded: bool) {
-        let mut state = self
-            .mutation_verification
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let generation = state.mutation_generation;
-        let mutation_paths = state.mutation_paths.clone();
-        let (coverage, verification_targets) =
-            verification_coverage_for_command(command, &mutation_paths);
-        state.verified_generation = (succeeded
-            && matches!(
-                coverage,
-                VerificationCoverage::Broad | VerificationCoverage::Targeted
-            ))
-        .then_some(generation);
-        if state.verified_generation.is_some() && shell_policy::verification_ran_tests(command) {
-            state.tests_passed_generation = Some(generation);
-        }
-        state.last_verification_succeeded = succeeded;
-        state.latest_evidence = Some(VerificationEvidence {
-            generation,
-            command: command.to_string(),
-            succeeded,
-            mutation_paths,
-            verification_targets,
+        let state = self.mutation_verification_state();
+        let (coverage, _) = verification_coverage_for_command(command, &state.mutation_paths);
+        let applicable = matches!(
             coverage,
-        });
+            VerificationCoverage::Broad | VerificationCoverage::Targeted
+        );
+        let assessment = verification::Assessment {
+            kind: verification::CheckKind::Suite,
+            covered: if applicable {
+                state.mutation_paths
+            } else {
+                Vec::new()
+            },
+            complete: applicable,
+            full_workspace: coverage == VerificationCoverage::Broad,
+            reason: "legacy_test_helper",
+            ran_in: None,
+        };
+        // Exercise exactly the production accounting, including clearing a
+        // previous test pass on a failed check.
+        self.record_verification_assessment(
+            state.mutation_generation,
+            command,
+            &assessment,
+            Some(succeeded),
+        );
     }
 
+    #[cfg(test)]
     pub(crate) fn record_verification_assessment(
         &self,
         generation: u64,
         command: &str,
+        assessment: &verification::Assessment,
+        terminal: Option<bool>,
+    ) {
+        self.record_verification_assessment_in(
+            generation, command, &self.cwd, assessment, terminal,
+        );
+    }
+
+    /// Drops the test passes accumulated in `generation`. The single rule that
+    /// calls it lives in `observe_shell_verification`.
+    pub(crate) fn revoke_test_coverage(&self, generation: u64) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if state.mutation_generation == generation {
+            state.tested_paths.clear();
+            state.tests_passed_generation = None;
+        }
+    }
+
+    /// `exec_cwd` is the directory the command ran in; test coverage is
+    /// credited relative to it, not to the workspace root.
+    pub(crate) fn record_verification_assessment_in(
+        &self,
+        generation: u64,
+        command: &str,
+        exec_cwd: &Path,
         assessment: &verification::Assessment,
         terminal: Option<bool>,
     ) {
@@ -1715,6 +1782,11 @@ impl Agent {
             assessment.kind,
             verification::CheckKind::Suite | verification::CheckKind::TargetedScript
         ) {
+            // Direct callers only: `observe_shell_verification` applies its
+            // own rule before it ever gets here with a non-test kind.
+            if !succeeded {
+                self.revoke_test_coverage(generation);
+            }
             return;
         }
         let mut state = self
@@ -1766,25 +1838,48 @@ impl Agent {
                 .iter()
                 .all(|path| state.covered_paths.contains(path));
         state.verified_generation = (succeeded && complete).then_some(generation);
-        // Judged per run, not from the sticky covered set: a lint that covered
-        // everything must not let a partial test run stand for the change.
+        // Only tests can fill this separate union. Verification coverage can
+        // include build/lint checks but those cannot suppress the review. A
+        // failed check revokes every test pass in this generation.
         if !succeeded {
+            state.tested_paths.clear();
             state.tests_passed_generation = None;
-        } else if complete
-            && match assessment.kind {
-                // An inline script executes the changed code with assertions.
-                verification::CheckKind::TargetedScript => true,
-                verification::CheckKind::Suite => shell_policy::verification_ran_tests(command),
-                verification::CheckKind::SyntaxOnly | verification::CheckKind::Unknown => false,
+        } else {
+            let (tested, full_test_workspace) = match assessment.kind {
+                verification::CheckKind::TargetedScript => (
+                    verification::targeted_tested_coverage(assessment, &self.cwd),
+                    false,
+                ),
+                verification::CheckKind::Suite => verification::tested_coverage(
+                    command,
+                    exec_cwd,
+                    &self.cwd,
+                    &state.mutation_paths,
+                ),
+                verification::CheckKind::SyntaxOnly | verification::CheckKind::Unknown => {
+                    (Vec::new(), false)
+                }
+            };
+            for path in tested {
+                if state.mutation_paths.contains(&path) && !state.tested_paths.contains(&path) {
+                    state.tested_paths.push(path);
+                }
             }
-            && (assessment.full_workspace
-                || (!state.unknown_mutation_paths
-                    && state
+            // A root run only vouches for what sits under the workspace root:
+            // named paths must each have earned test credit by directory. The
+            // full-workspace flag stands in only for mutations with no names.
+            if complete
+                && if state.mutation_paths.is_empty() {
+                    full_test_workspace
+                } else {
+                    state
                         .mutation_paths
                         .iter()
-                        .all(|path| assessment.covered.contains(path))))
-        {
-            state.tests_passed_generation = Some(generation);
+                        .all(|path| state.tested_paths.contains(path))
+                }
+            {
+                state.tests_passed_generation = Some(generation);
+            }
         }
         state.last_verification_succeeded = succeeded;
         state.latest_evidence = Some(VerificationEvidence {
@@ -2452,6 +2547,9 @@ impl Agent {
     }
 
     pub fn set_context_vm_mode(&mut self, mode: ContextVmMode) {
+        if self.context_vm_mode != mode {
+            self.clear_hybrid_backoff();
+        }
         self.context_vm_mode = mode;
         if let Some(runtime) = &mut self.runtime {
             runtime.context_vm.set_mode(mode);
@@ -4633,9 +4731,10 @@ impl Agent {
     /// the threshold and be compacted again on the next turn.
     ///
     /// An automatic attempt (`recovery == false`) applies one more rule per
-    /// candidate cut: the replaced prefix must hold an assistant reply. Turn 1
-    /// is the user's prompt (and, on cache-sensitive routes, a turn-context
-    /// message) and nothing a ledger could stand in for, so replacing it is
+    /// candidate cut: the replaced prefix must hold an assistant reply. A prefix
+    /// without one is only user input (turn 1, or the earlier replacement plus new
+    /// prompts after a compaction, with a turn-context message on cache-sensitive
+    /// routes) and nothing a ledger could stand in for, so replacing it is
     /// cost without benefit while the context still has room. A cut that fails
     /// the rule is skipped and a later cut is tried. A recovery path does not
     /// apply it: a full window is better served by replacing the prompt with the
@@ -4816,9 +4915,9 @@ impl Agent {
     /// not apply is `notAppliedAfterFold` when the fold sent a summarizer
     /// request and `notAppliedOther` when it did not (no summarizer, no chunk
     /// fitting its window, a failed fold, a session write or rebase failure).
-    /// Either starts the backoff, unless the attempt was a recovery: a recovery
-    /// is never deferred and never records one, so it is retried every turn as
-    /// before.
+    /// Only `notAppliedAfterFold`, the paid one, starts the backoff, and not
+    /// for a recovery: a recovery is never deferred and never records one, so
+    /// it is retried every turn as before.
     fn note_hybrid_outcome(
         &mut self,
         skipped_before: u64,
@@ -4832,9 +4931,14 @@ impl Agent {
             stats.context_tokens_before += result.tokens_before;
             stats.context_tokens_after += result.tokens_after;
             // A replacement that did not shrink the history changed nothing
-            // the trigger can see: wait for growth like after a failed fold.
+            // the trigger can see: wait for growth like after a failed fold,
+            // but only when the fold was paid for. A replacement built from
+            // an existing checkpoint sent no request and costs nothing to retry.
             self.clear_hybrid_backoff();
-            if !recovery && result.tokens_after >= result.tokens_before {
+            if !recovery
+                && self.hybrid_last_fold_requests > 0
+                && result.tokens_after >= result.tokens_before
+            {
                 self.arm_hybrid_backoff(trigger_tokens);
             }
         } else if self.hybrid_preflight_skips() == skipped_before {
@@ -4843,7 +4947,10 @@ impl Agent {
             } else {
                 self.hybrid_compaction_stats.not_applied_other += 1;
             }
-            if !recovery {
+            // Only a fold that was paid for arms the backoff. A failure that
+            // sent no request cost nothing, so deferring the next attempt
+            // would only delay a free retry.
+            if !recovery && self.hybrid_last_fold_requests > 0 {
                 self.arm_hybrid_backoff(trigger_tokens);
             }
         }
@@ -4852,7 +4959,15 @@ impl Agent {
     /// Record a failed automatic attempt at `failed_at` tokens, with the limits it ran under.
     fn arm_hybrid_backoff(&mut self, failed_at: u64) {
         self.hybrid_fold_backoff = Some(failed_at);
-        self.hybrid_fold_backoff_settings = Some((self.context_window, self.compaction));
+        self.hybrid_fold_backoff_settings = Some(self.hybrid_backoff_scope());
+    }
+
+    fn hybrid_backoff_scope(&self) -> HybridBackoffScope {
+        HybridBackoffScope {
+            context_window: self.context_window,
+            compaction: self.compaction,
+            summarizer: self.summarizer.clone(),
+        }
     }
 
     fn clear_hybrid_backoff(&mut self) {
@@ -4877,9 +4992,9 @@ impl Agent {
             if let Some(failed_at) = self.hybrid_fold_backoff {
                 let keep = self.compaction.keep_recent_tokens;
                 let retry_at = failed_at.saturating_add(keep);
-                if self.hybrid_fold_backoff_settings != Some((self.context_window, self.compaction))
+                if self.hybrid_fold_backoff_settings.as_ref() != Some(&self.hybrid_backoff_scope())
                 {
-                    // The limits changed since the failure.
+                    // The limits or the summarizer changed since the failure.
                     self.clear_hybrid_backoff();
                 } else if tokens.saturating_add(keep) < failed_at {
                     // The history was replaced since the failure. A smaller
@@ -4890,6 +5005,18 @@ impl Agent {
                     self.hybrid_compaction_stats.attempts += 1;
                     self.hybrid_compaction_stats.skipped_backoff += 1;
                     let message_tokens = estimate_context_tokens(&self.messages);
+                    // The same events a dry-run skip emits, so hooks and
+                    // observers see every automatic attempt.
+                    let estimated = self.estimated_context_tokens();
+                    if let Some(runtime) = &self.runtime {
+                        runtime.emit_observe(crate::RuntimeEvent::PreCompact {
+                            estimated_tokens: estimated,
+                        });
+                        runtime.emit_observe(crate::RuntimeEvent::PostCompact {
+                            before_tokens: estimated,
+                            after_tokens: estimated,
+                        });
+                    }
                     return CompactionResult {
                         summary: format!(
                             "Hybrid compaction deferred: the last attempt at ~{failed_at} tokens \

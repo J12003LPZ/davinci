@@ -2844,6 +2844,7 @@ fn verification_generation_accumulates_only_fresh_applicable_coverage() {
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: Some(agent.cwd.clone()),
     };
     agent.record_verification_assessment(1, "check a", &assessment(a.clone()), None);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
@@ -2876,6 +2877,7 @@ fn partial_verification_preserves_outstanding_paths_after_mutation() {
             complete: false,
             full_workspace: false,
             reason: "test",
+            ran_in: None,
         },
         Some(true),
     );
@@ -2895,6 +2897,7 @@ fn unknown_mutation_paths_prevent_full_targeted_verification() {
         complete: true,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(2, "check a", &assessment, Some(true));
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
@@ -2921,6 +2924,7 @@ fn partial_success_preserves_a_failure_until_its_scope_passes() {
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(1, "b fails", &assessment(&paths[1]), Some(false));
     agent.record_verification_assessment(1, "a passes", &assessment(&paths[0]), Some(true));
@@ -3348,6 +3352,7 @@ fn passing_harness_verification_does_not_relabel_another_scopes_failure() {
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(1, "check b", &failed, Some(false));
     agent.remember_verification_call(shell_tool(), &serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}), dir.path());
@@ -3400,6 +3405,7 @@ fn overlapping_shell_mutations_record_all_paths_before_rejecting_stale_verificat
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(
         state.mutation_generation,
@@ -4031,10 +4037,10 @@ fn unrelated_successful_test_does_not_verify_mutation() {
     agent.record_verification_command("cargo test -p unrelated-crate", true);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
     let state = agent.mutation_verification_state();
-    assert_eq!(
-        state.latest_evidence.as_ref().map(|e| e.coverage),
-        Some(VerificationCoverage::Unrelated)
-    );
+    // Production ignores an unrelated success; it cannot change the
+    // latest applicable evidence or satisfy the mutation's test coverage.
+    assert!(state.latest_evidence.is_none());
+    assert!(state.tests_passed_generation.is_none());
 }
 
 fn shell_tool() -> &'static str {
@@ -4255,6 +4261,471 @@ fn shell_verification_requires_original_terminal_status_and_fresh_dispatch() {
         .insert("check".into(), 1);
     agent.observe_shell_verification("check", dir.path(), shell_tool(), &args, &result, &result);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+/// Runs one shell result through the production turn path
+/// (`observe_shell_verification`) with a terminal receipt.
+fn observe_shell_result(
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    with_assertions: bool,
+) {
+    observe_shell_result_with(agent, id, cwd, command, exit_code, with_assertions, |_| {});
+}
+
+/// As [`observe_shell_result`], with a hook to mark the receipt (cancelled,
+/// denied, simulated, hook-vetoed).
+fn observe_shell_result_with(
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    with_assertions: bool,
+    mark: impl FnOnce(&mut crate::runtime::evidence_store::ExecutionReceipt),
+) {
+    let generation = agent.mutation_verification_state().mutation_generation;
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert(id.into(), generation);
+    let mut receipt = crate::runtime::evidence_store::ExecutionReceipt {
+        operation_id: id.into(),
+        argv: vec![command.into()],
+        started: true,
+        exit_code: Some(exit_code),
+        assertion_counts: with_assertions.then_some(crate::runtime::AssertionCounts {
+            total: 1,
+            passed: u32::from(exit_code == 0),
+            failed: u32::from(exit_code != 0),
+            skipped: 0,
+        }),
+        ..Default::default()
+    };
+    mark(&mut receipt);
+    agent.command_receipts.lock().unwrap().push_back(receipt);
+    let result = ToolResult {
+        content: if exit_code == 0 { "ok" } else { "failed" }.into(),
+        is_error: exit_code != 0,
+        details: Some(serde_json::json!({"exitCode":exit_code})),
+    };
+    agent.observe_shell_verification(
+        id,
+        cwd,
+        "bash",
+        &serde_json::json!({"command":command}),
+        &result,
+        &result,
+    );
+}
+
+#[test]
+fn failed_syntax_check_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "t1",
+        dir.path(),
+        "pytest tests/test_app.py",
+        0,
+        true,
+    );
+    assert_eq!(
+        agent.mutation_verification_state().tested_paths,
+        [PathBuf::from("app.py")]
+    );
+    // A successful syntax-only check adds no coverage and retires nothing.
+    observe_shell_result(
+        &agent,
+        "s0",
+        dir.path(),
+        "python -m py_compile app.py",
+        0,
+        false,
+    );
+    assert_eq!(
+        agent.mutation_verification_state().tested_paths,
+        [PathBuf::from("app.py")]
+    );
+    observe_shell_result(
+        &agent,
+        "s1",
+        dir.path(),
+        "python -m py_compile missing.py",
+        1,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+    observe_shell_result(
+        &agent,
+        "t2",
+        dir.path(),
+        "pytest tests/test_lib.py",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("lib.py")]);
+    assert_ne!(state.tests_passed_generation, Some(generation));
+}
+
+#[test]
+fn failed_unknown_check_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(
+        &agent,
+        "t1",
+        dir.path(),
+        "pytest tests/test_app.py",
+        0,
+        true,
+    );
+    observe_shell_result(&agent, "u0", dir.path(), "make lint", 0, false);
+    assert_eq!(
+        agent.mutation_verification_state().tested_paths,
+        [PathBuf::from("app.py")]
+    );
+    observe_shell_result(&agent, "u1", dir.path(), "make lint", 1, false);
+    assert!(agent.mutation_verification_state().tested_paths.is_empty());
+}
+
+#[test]
+fn failed_inspection_command_keeps_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(
+        &agent,
+        "t1",
+        dir.path(),
+        "pytest tests/test_app.py",
+        0,
+        true,
+    );
+    let before = agent.mutation_verification_state();
+    for (id, command) in [
+        ("g1", "grep -r foo ."),
+        ("g2", "ls missing"),
+        ("g3", "./inspect.sh"),
+    ] {
+        observe_shell_result(&agent, id, dir.path(), command, 1, false);
+        let state = agent.mutation_verification_state();
+        assert_eq!(state.tested_paths, [PathBuf::from("app.py")], "{command}");
+        assert_eq!(
+            state.tests_passed_generation, before.tests_passed_generation,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn failed_unclassified_checker_without_a_summary_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(&agent, "ok", dir.path(), "pytest -q", 0, true);
+    assert_eq!(agent.mutation_verification_state().tested_paths.len(), 2);
+    // `--no-run` makes this an Unknown check, and a bad feature fails the
+    // build before any test summary exists.
+    let command = "cargo test --no-run --features nonexistent";
+    assert_eq!(
+        crate::verification::classify("bash", command, dir.path(), &["app.py".into()]).kind,
+        crate::verification::CheckKind::Unknown
+    );
+    observe_shell_result(&agent, "bad", dir.path(), command, 101, false);
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn inline_script_in_a_subdirectory_does_not_credit_exempt_docs_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/lib.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    observe_shell_result(
+        &agent,
+        "inline",
+        &dir.path().join("sub"),
+        "python -c \"import lib; assert lib.f() == 1\"",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // Run from the root, the same check does sit above the README.
+    std::fs::write(dir.path().join("lib.py"), "def f():\n    return 1\n").unwrap();
+    agent.record_successful_mutation_paths(vec!["lib.py".into(), "README.md".into()]);
+    observe_shell_result(
+        &agent,
+        "root",
+        dir.path(),
+        "python -c \"import lib; assert lib.f() == 1\"",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.contains(&PathBuf::from("README.md")));
+}
+
+#[test]
+fn heredoc_check_after_cd_credits_only_the_directory_the_classifier_used() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/lib.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    let command = "cd sub && python - <<'PY'\nimport lib\nassert lib.f() == 1\nPY";
+    observe_shell_result(&agent, "heredoc", dir.path(), command, 0, false);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn check_whose_directory_cannot_be_determined_credits_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/lib.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    for (id, command) in [
+        (
+            "var",
+            "cd \"$SUBDIR\" && python -c \"import lib; assert lib.f() == 1\"",
+        ),
+        (
+            "late",
+            "cd sub && cd . && python -c \"import lib; assert lib.f() == 1\"",
+        ),
+    ] {
+        observe_shell_result(&agent, id, dir.path(), command, 0, false);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+    }
+    // The coverage step itself refuses to guess a directory.
+    let unknown = crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec!["sub/lib.py".into(), "README.md".into()],
+        complete: true,
+        full_workspace: false,
+        reason: "test",
+        ran_in: None,
+    };
+    assert!(crate::verification::targeted_tested_coverage(&unknown, dir.path()).is_empty());
+}
+
+#[test]
+fn failed_checker_chained_with_an_unclassified_command_revokes_test_coverage() {
+    for command in [
+        "tsc --noEmit && echo checked",
+        "eslint . && echo ok",
+        "npx biome check . && echo ok",
+        "FOO=1 tsgo -p . && echo ok",
+        "python -m py_compile x.py && echo ok",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_shell_result(
+            &agent,
+            "t1",
+            dir.path(),
+            "pytest tests/test_app.py",
+            0,
+            true,
+        );
+        assert_eq!(
+            agent.mutation_verification_state().tested_paths,
+            [PathBuf::from("app.py")]
+        );
+        // The same chain passing proves nothing and changes nothing.
+        observe_shell_result(&agent, "ok", dir.path(), command, 0, false);
+        assert_eq!(
+            agent.mutation_verification_state().tested_paths,
+            [PathBuf::from("app.py")],
+            "{command}"
+        );
+        observe_shell_result(&agent, "bad", dir.path(), command, 2, false);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+        assert_eq!(state.tests_passed_generation, None, "{command}");
+    }
+}
+
+#[test]
+fn runs_that_prove_nothing_leave_test_coverage_unchanged_through_the_shell_path() {
+    type Mark = fn(&mut crate::runtime::evidence_store::ExecutionReceipt);
+    let marks: [(&str, Mark); 4] = [
+        ("cancelled", |r| r.cancelled = true),
+        ("denied", |r| r.permission_denied = true),
+        ("hook vetoed", |r| r.hook_vetoed = true),
+        ("simulated", |r| r.simulated = true),
+    ];
+    for command in [
+        "pytest tests/test_lib.py",
+        "python -m py_compile lib.py",
+        "make lint",
+    ] {
+        for (label, mark) in marks {
+            let dir = tempfile::tempdir().unwrap();
+            let agent = verifying_agent(dir.path());
+            agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+            observe_shell_result(
+                &agent,
+                "t1",
+                dir.path(),
+                "pytest tests/test_app.py",
+                0,
+                true,
+            );
+            let before = agent.mutation_verification_state();
+            assert_eq!(before.tested_paths, [PathBuf::from("app.py")]);
+            // Started with a nonzero exit code, so only the flag keeps the
+            // coverage: it must neither be cleared nor extended.
+            observe_shell_result_with(&agent, "x", dir.path(), command, 1, false, mark);
+            let after = agent.mutation_verification_state();
+            assert_eq!(
+                after.tested_paths, before.tested_paths,
+                "{label}: {command}"
+            );
+            assert_eq!(
+                after.tests_passed_generation, before.tests_passed_generation,
+                "{label}: {command}"
+            );
+        }
+    }
+}
+
+#[test]
+fn suite_run_in_a_subdirectory_covers_only_paths_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "sub/lib.py".into()]);
+    observe_shell_result(&agent, "sub", &dir.path().join("sub"), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn nonzero_test_run_without_a_summary_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(&agent, "ok", dir.path(), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert_eq!(state.tested_paths.len(), 2);
+    // No test summary (a collection error, an unknown package): the exit code
+    // is the only evidence, and it is a failure.
+    observe_shell_result(
+        &agent,
+        "bad",
+        dir.path(),
+        "pytest tests/missing.py",
+        4,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn suite_run_in_a_subdirectory_does_not_credit_exempt_docs_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    observe_shell_result(&agent, "sub", &dir.path().join("sub"), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // A root run does test the whole workspace, README included.
+    let generation = state.mutation_generation;
+    observe_shell_result(&agent, "root", dir.path(), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert!(state.tested_paths.contains(&PathBuf::from("README.md")));
+}
+
+#[test]
+fn suite_run_at_the_workspace_root_still_covers_every_edited_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "sub/lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(&agent, "root", dir.path(), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert!(state.tested_paths.contains(&PathBuf::from("app.py")));
+    assert!(state.tested_paths.contains(&PathBuf::from("sub/lib.py")));
+}
+
+#[test]
+fn full_workspace_suite_does_not_credit_a_path_outside_the_workspace_root() {
+    let base = tempfile::tempdir().unwrap();
+    let repo = base.path().join("repo");
+    let shared = base.path().join("shared");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(repo.join("app.py"), "def f():\n    return 1\n").unwrap();
+    std::fs::write(shared.join("config.json"), "ok").unwrap();
+    let config = shared.join("config.json");
+    let agent = verifying_agent(&repo);
+    agent.record_successful_mutation_paths(vec!["app.py".into(), config.clone()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "inline",
+        &repo,
+        "python -c \"import app; assert app.f() == 1; assert open('../shared/config.json').read() == 'ok'\"",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("app.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // A root run tests everything under the root and nothing beside it.
+    observe_shell_result(&agent, "root", &repo, "cargo test", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("app.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // The extra root earns its own passing run from inside it.
+    observe_shell_result(&agent, "shared", &shared, "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert!(
+        state.tested_paths.contains(&config),
+        "{:?}",
+        state.tested_paths
+    );
+    assert_eq!(state.tests_passed_generation, Some(generation));
 }
 
 #[test]
@@ -5656,12 +6127,140 @@ mod hybrid_fold_economics {
             tokens_after: 10,
             usage: None,
         };
+        agent.hybrid_last_fold_requests = 1;
         agent.hybrid_compaction_stats.attempts += 1;
         agent.note_hybrid_outcome(0, &failed, 39_000, true);
         assert_eq!(agent.hybrid_fold_backoff, None);
         agent.hybrid_compaction_stats.attempts += 1;
         agent.note_hybrid_outcome(0, &failed, 12_000, false);
         assert_eq!(agent.hybrid_fold_backoff, Some(12_000));
+    }
+
+    #[test]
+    fn a_failure_that_sent_no_request_does_not_arm_the_backoff() {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let failed = CompactionResult {
+            summary: "Compaction not saved: disk full".into(),
+            messages: agent.messages.clone(),
+            compacted: false,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        agent.hybrid_last_fold_requests = 0;
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        assert_eq!(agent.hybrid_fold_backoff_settings, None);
+        assert_eq!(hybrid_stats(&agent)["notAppliedOther"], 1);
+    }
+
+    #[test]
+    fn a_non_shrinking_replacement_arms_the_backoff_only_after_a_paid_fold() {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let grew = CompactionResult {
+            summary: "replaced".into(),
+            messages: agent.messages.clone(),
+            compacted: true,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        // Built from an existing checkpoint: no request, nothing to defer.
+        agent.hybrid_last_fold_requests = 0;
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &grew, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        assert_eq!(agent.hybrid_fold_backoff_settings, None);
+        // A paid fold whose replacement did not shrink the context does.
+        agent.hybrid_last_fold_requests = 1;
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &grew, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, Some(12_000));
+        // Both attempts are counted as applied, so the outcomes still sum.
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["applied"], 2, "{stats}");
+        assert_eq!(stats["attempts"], 2, "{stats}");
+    }
+
+    #[test]
+    fn a_changed_summarizer_or_context_vm_mode_clears_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        let failed_at = agent.hybrid_fold_backoff.unwrap();
+
+        // The same summarizer, even re-assigned as a clone, keeps the backoff.
+        agent.summarizer = agent.summarizer.clone();
+        let result = agent.compact_automatic(failed_at);
+        assert!(result.summary.contains("deferred"), "{}", result.summary);
+
+        agent.summarizer = Some(summarizer(Arc::new(AtomicUsize::new(0)), || {}));
+        let result = agent.compact_automatic(failed_at);
+        assert!(!result.summary.contains("deferred"), "{}", result.summary);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        // Setting the mode it already has keeps the backoff.
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        assert!(agent.hybrid_fold_backoff.is_some());
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Shadow);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        assert_eq!(agent.hybrid_fold_backoff_settings, None);
+    }
+
+    #[test]
+    fn a_backoff_deferral_emits_the_compact_events_like_a_dry_run_skip() {
+        use crate::runtime::{
+            bus::RuntimeSubscriber, AgentId, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
+            RuntimeEventEnvelope, RuntimeHandle,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct EventCollector {
+            events: Mutex<Vec<RuntimeEvent>>,
+        }
+        impl RuntimeSubscriber for EventCollector {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                self.events.lock().unwrap().push(event.payload.clone());
+                RuntimeDecision::Continue
+            }
+        }
+
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let bus = RuntimeBus::new();
+        let collector = Arc::new(EventCollector::default());
+        bus.subscribe(collector.clone());
+        agent.set_runtime(RuntimeHandle::new(RunId::new(), AgentId::new(), bus));
+        fill(&mut agent, 30, 400);
+        agent.arm_hybrid_backoff(12_000);
+        let result = agent.compact_automatic(12_500);
+        assert!(result.summary.contains("deferred"), "{}", result.summary);
+        let events = collector.events.lock().unwrap().clone();
+        let pre: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::PreCompact { estimated_tokens } => Some(*estimated_tokens),
+                _ => None,
+            })
+            .collect();
+        let post: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::PostCompact {
+                    before_tokens,
+                    after_tokens,
+                } => Some((*before_tokens, *after_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pre.len(), 1, "{events:?}");
+        assert_eq!(post.len(), 1, "{events:?}");
+        assert!(pre[0] > 0);
+        assert_eq!(post[0], (pre[0], pre[0]));
     }
 
     #[test]
