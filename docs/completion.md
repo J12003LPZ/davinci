@@ -35,6 +35,20 @@ suite. A pass of one of them is a verifier for the verification gate but does
 not skip the requirement review. The extra review is the safe direction; a
 project that wants the skip runs its test command (`make test`, `npm test`).
 
+A failed command clears accumulated coverage when it runs a checker, and that
+recognition is deliberately loose: a directory, upper case, a `.exe`, `.cmd`,
+`.bat` or `.ps1` suffix, an `env` prefix (with its `--`, `-i` and `-u NAME`
+options, also when `env` is given by path), simple quoting and the PowerShell
+`&` call operator are ignored, so `.\node_modules\.bin\eslint.cmd .` counts.
+The segment splitter follows POSIX rules, so a PowerShell argument with a
+trailing backslash inside quotes (`".\src\"`) is malformed and not recognized.
+A recognized checker anywhere in a chain counts even if an earlier segment
+failed first and it never ran (`grep -q X f && eslint .`); that clears coverage
+and causes an extra review, which is the safe direction. Earning test credit
+still requires the recognized command form, so `./tools/pytest tests/` credits
+nothing. This recognition is still a heuristic over command text, so an unusual
+spelling of a failed checker can still keep coverage.
+
 Known limitations. The gate classifies shell command text heuristically, and a
 command it cannot parse falls back to unknown: no coverage is credited, so the
 review runs. The one exception is the failure case in the first item below.

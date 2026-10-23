@@ -400,7 +400,7 @@ pub(crate) fn tested_coverage(
     workspace: &Path,
     paths: &[PathBuf],
 ) -> (Vec<PathBuf>, bool) {
-    let Some(parts) = segments(command.trim(), true) else {
+    let Some(parts) = segments(strip_posix_prelude(command), true) else {
         return (Vec::new(), false);
     };
     let mut tested = BTreeSet::new();
@@ -414,13 +414,19 @@ pub(crate) fn tested_coverage(
             directory = cwd.join(&words[1]);
             continue;
         }
-        if !crate::shell_policy::verification_ran_tests(part) {
-            continue;
-        }
+        let ran_tests = crate::shell_policy::verification_ran_tests(part);
         let assessment = classify_in_workspace("bash", part, &directory, workspace, paths);
-        if assessment.kind == CheckKind::Suite {
-            tested.extend(tested_under(&directory, workspace, assessment.covered));
-            full_workspace |= assessment.full_workspace;
+        match assessment.kind {
+            CheckKind::Suite if ran_tests => {
+                tested.extend(tested_under(&directory, workspace, assessment.covered));
+                full_workspace |= assessment.full_workspace;
+            }
+            // An inline assertion script is a test when run alone, so it is
+            // one inside a chain too.
+            CheckKind::TargetedScript => {
+                tested.extend(targeted_tested_coverage(&assessment, workspace));
+            }
+            _ => {}
         }
     }
     (tested.into_iter().collect(), full_workspace)
@@ -520,6 +526,12 @@ pub(crate) fn unrecognized_check_reason(assessment: &Assessment) -> &'static str
     }
 }
 
+/// The command without the supported `set -eu` prelude line.
+fn strip_posix_prelude(command: &str) -> &str {
+    let command = command.trim();
+    command.strip_prefix("set -eu\n").unwrap_or(command)
+}
+
 pub(crate) fn classify_in_workspace(
     tool: &str,
     command: &str,
@@ -532,10 +544,7 @@ pub(crate) fn classify_in_workspace(
     }
     let posix = tool == "bash" || (tool == "exec_command" && !cfg!(windows));
     let command = if posix {
-        command
-            .trim()
-            .strip_prefix("set -eu\n")
-            .unwrap_or(command.trim())
+        strip_posix_prelude(command)
     } else {
         command.trim()
     };

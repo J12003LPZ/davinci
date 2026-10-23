@@ -917,6 +917,103 @@ pub fn invokes_verifier(command: &str) -> bool {
         .any(|segment| verifier_program(segment).is_some())
 }
 
+/// As [`invokes_verifier`] or `turn::invokes_checker`, but tolerant of how the
+/// program is spelled: a directory (`./node_modules/.bin/eslint`,
+/// `.\node_modules\.bin\eslint.cmd`), case, an `.exe`, `.cmd`, `.bat` or `.ps1`
+/// suffix and an `env`, `command`, `exec`, `time` or `sudo` prefix are ignored.
+/// For revoking test coverage after a failure only: recognising more failures
+/// can only cause more reviews, but this must never earn test credit.
+pub(crate) fn invokes_verifier_or_checker_loosely(command: &str) -> bool {
+    let (segments, malformed) = split_shell_segments_with_diagnostic(command);
+    if malformed {
+        return false;
+    }
+    segments.iter().any(|segment| {
+        let words = split_words_keeping_backslashes(segment);
+        let mut words = words.iter().map(String::as_str).peekable();
+        // Skip a PowerShell call operator, then wrappers and their options.
+        words.next_if_eq(&"&");
+        let wrapper_name = |word: &str| {
+            let base = word
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            base.strip_suffix(".exe").unwrap_or(&base).to_string()
+        };
+        let mut after_env = false;
+        while let Some(word) = words.next_if(|word| {
+            shell_env_assignment(word)
+                || matches!(
+                    wrapper_name(word).as_str(),
+                    "env" | "time" | "sudo" | "command" | "exec"
+                )
+                || (after_env
+                    && (matches!(
+                        *word,
+                        "--" | "-i" | "--ignore-environment" | "-u" | "--unset"
+                    ) || word.starts_with("--unset=")))
+        }) {
+            after_env |= wrapper_name(word) == "env";
+            if after_env && matches!(word, "-u" | "--unset") {
+                words.next();
+            }
+        }
+        let Some(program) = words.next() else {
+            return false;
+        };
+        let program = program
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let program = [".exe", ".cmd", ".bat", ".ps1"]
+            .iter()
+            .find_map(|suffix| program.strip_suffix(suffix))
+            .unwrap_or(&program);
+        let normalized = std::iter::once(program)
+            .chain(words)
+            .collect::<Vec<_>>()
+            .join(" ");
+        test_regex().is_match(&normalized) || crate::turn::is_checker_program(program)
+    })
+}
+
+/// Splits on whitespace outside single or double quotes and drops the quote
+/// characters. Unlike `literal_shell_words`, backslashes are kept: here they
+/// are Windows path separators.
+fn split_words_keeping_backslashes(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for ch in segment.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => word.push(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            None if ch.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
 /// Whether a verification command ran tests: some segment is a verifier that
 /// is not a build, lint or type check. `cargo check && cargo test` ran tests;
 /// `cargo clippy` alone did not.

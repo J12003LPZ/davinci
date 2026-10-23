@@ -3932,7 +3932,8 @@ Issue the call again if it is still needed.";
         let checked = test_kind
             || assessment.kind == crate::verification::CheckKind::SyntaxOnly
             || crate::shell_policy::invokes_verifier(command)
-            || invokes_checker(command);
+            || invokes_checker(command)
+            || crate::shell_policy::invokes_verifier_or_checker_loosely(command);
         if exited_nonzero && checked {
             self.revoke_test_coverage(generation);
         }
@@ -8621,13 +8622,19 @@ pub(crate) fn invokes_checker(command: &str) -> bool {
         if program == "uv" && words.peek().is_some_and(|next| *next == "run") {
             return true;
         }
-        CHECKER_PROGRAMS.iter().any(|checker| {
-            program == *checker
-                || *checker == "python"
-                    && program
-                        .strip_prefix("python")
-                        .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
-        })
+        is_checker_program(program)
+    })
+}
+
+/// Whether a lowercased program name, without directory or suffix, is a
+/// checker program (`python3.12` counts as `python`).
+pub(crate) fn is_checker_program(program: &str) -> bool {
+    CHECKER_PROGRAMS.iter().any(|checker| {
+        program == *checker
+            || *checker == "python"
+                && program
+                    .strip_prefix("python")
+                    .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
     })
 }
 

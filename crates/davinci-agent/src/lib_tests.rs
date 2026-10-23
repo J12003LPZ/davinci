@@ -4287,6 +4287,30 @@ fn observe_shell_result_with(
     with_assertions: bool,
     mark: impl FnOnce(&mut crate::runtime::evidence_store::ExecutionReceipt),
 ) {
+    observe_shell_result_as(
+        "bash",
+        agent,
+        id,
+        cwd,
+        command,
+        exit_code,
+        with_assertions,
+        mark,
+    );
+}
+
+/// As [`observe_shell_result_with`], for a named shell tool (`powershell`).
+#[allow(clippy::too_many_arguments)]
+fn observe_shell_result_as(
+    tool: &str,
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    with_assertions: bool,
+    mark: impl FnOnce(&mut crate::runtime::evidence_store::ExecutionReceipt),
+) {
     let generation = agent.mutation_verification_state().mutation_generation;
     agent
         .verification_starts
@@ -4316,7 +4340,7 @@ fn observe_shell_result_with(
     agent.observe_shell_verification(
         id,
         cwd,
-        "bash",
+        tool,
         &serde_json::json!({"command":command}),
         &result,
         &result,
@@ -4573,6 +4597,169 @@ fn failed_checker_chained_with_an_unclassified_command_revokes_test_coverage() {
         );
         assert_eq!(state.tests_passed_generation, None, "{command}");
     }
+}
+
+#[test]
+fn failed_path_qualified_checker_revokes_test_coverage() {
+    for command in [
+        "./node_modules/.bin/tsc --noEmit",
+        "./node_modules/.bin/eslint .",
+        r"node_modules\.bin\tsc.cmd --noEmit",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_shell_result(
+            &agent,
+            "t1",
+            dir.path(),
+            "cd . && pytest tests/test_app.py",
+            0,
+            true,
+        );
+        assert_eq!(
+            agent.mutation_verification_state().tested_paths,
+            [PathBuf::from("app.py")],
+            "{command}"
+        );
+        observe_shell_result(&agent, "bad", dir.path(), command, 2, false);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+        observe_shell_result(
+            &agent,
+            "t2",
+            dir.path(),
+            "cd . && pytest tests/test_lib.py",
+            0,
+            true,
+        );
+        assert_eq!(
+            agent.mutation_verification_state().tests_passed_generation,
+            None,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn unrecognized_wrapper_script_named_pytest_earns_no_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(
+        &agent,
+        "w1",
+        dir.path(),
+        "./tools/pytest tests/test_app.py tests/test_lib.py",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn suffixed_python_does_not_bypass_the_filtered_unittest_exclusion() {
+    for program in ["Python.exe", "python.cmd"] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_shell_result(
+            &agent,
+            "u1",
+            dir.path(),
+            &format!("{program} -m unittest discover -s tests/ --pattern=test_lib.py"),
+            0,
+            true,
+        );
+        let state = agent.mutation_verification_state();
+        assert!(
+            !state.tested_paths.contains(&PathBuf::from("app.py")),
+            "{program}: {:?}",
+            state.tested_paths
+        );
+    }
+}
+
+#[test]
+fn failed_loosely_spelled_checker_revokes_test_coverage() {
+    for (tool, command) in [
+        ("bash", "/usr/bin/env -- ./node_modules/.bin/eslint ."),
+        ("powershell", r".\node_modules\.bin\eslint.cmd ."),
+        ("bash", "env ./node_modules/.bin/eslint ."),
+        ("bash", "env ./node_modules/.bin/biome 'check' ."),
+        ("bash", "env -- ./node_modules/.bin/eslint ."),
+        ("bash", "env -u FOO ./node_modules/.bin/eslint ."),
+        ("powershell", r"& '.\tools with spaces\eslint.cmd' ."),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["a.ts".into(), "b.ts".into()]);
+        observe_shell_result(
+            &agent,
+            "t1",
+            dir.path(),
+            "cd . && npm test -- tests/a.test.ts",
+            0,
+            true,
+        );
+        assert!(
+            !agent.mutation_verification_state().tested_paths.is_empty(),
+            "{command}: precondition"
+        );
+        observe_shell_result_as(tool, &agent, "bad", dir.path(), command, 2, false, |_| {});
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+    }
+}
+
+#[test]
+fn compound_inline_assertion_and_suite_credit_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "c1",
+        dir.path(),
+        "python -c \"import app; assert app.f() == 1\" && pytest tests/test_lib.py",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.contains(&PathBuf::from("app.py")));
+    assert!(state.tested_paths.contains(&PathBuf::from("lib.py")));
+    assert_eq!(state.tests_passed_generation, Some(generation));
+}
+
+#[test]
+fn set_eu_prelude_still_earns_suite_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "p1",
+        dir.path(),
+        "set -eu\ncargo test --workspace",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths.len(), 2, "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, Some(generation));
 }
 
 #[test]
@@ -5363,6 +5550,42 @@ fn checker_programs_match_only_as_the_program_word() {
         "Get-Content app.py",
     ] {
         assert!(!invokes_checker(command), "{command}");
+    }
+}
+
+#[test]
+fn loose_checker_predicate_is_wider_than_the_strict_ones_but_not_a_catch_all() {
+    use crate::shell_policy::{invokes_verifier, invokes_verifier_or_checker_loosely};
+    use crate::turn::invokes_checker;
+    for command in [
+        "/usr/bin/env -- ./node_modules/.bin/eslint .",
+        r".\node_modules\.bin\eslint.cmd .",
+        "env ./node_modules/.bin/eslint .",
+        r"node_modules\.bin\TSC.CMD --noEmit",
+        "./node_modules/.bin/tsc --noEmit",
+        r"C:\Python312\python.bat check.py",
+        "FOO=1 ./node_modules/.bin/eslint .",
+        "env ./node_modules/.bin/biome 'check' .",
+        "env -- ./node_modules/.bin/eslint .",
+        "env -u FOO ./node_modules/.bin/eslint .",
+        "env --unset=FOO ./node_modules/.bin/eslint .",
+        r"& '.\tools with spaces\eslint.cmd' .",
+    ] {
+        assert!(invokes_verifier_or_checker_loosely(command), "{command}");
+        assert!(
+            !invokes_verifier(command) && !invokes_checker(command),
+            "{command} is already recognized strictly"
+        );
+    }
+    for command in [
+        "./tools/cat file",
+        "grep x",
+        "echo eslint",
+        "cat tsc.cmd",
+        "grep pytest log.txt",
+        "grep 'pytest' log.txt",
+    ] {
+        assert!(!invokes_verifier_or_checker_loosely(command), "{command}");
     }
 }
 
