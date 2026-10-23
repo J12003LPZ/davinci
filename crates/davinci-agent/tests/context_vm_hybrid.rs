@@ -899,4 +899,34 @@ fn feature_use_reports_hybrid_folds_and_retrieval_after_compaction() {
     assert!(used["folds"].as_u64().unwrap() > 0, "{used}");
     assert_eq!(used["retrievalOffered"], true, "{used}");
     assert!(used["imagesCompiled"].is_u64() && used["tokensBeforeFold"].is_u64());
+    // Every compaction entry is counted once, and an applied one adds its
+    // before/after message estimates (so `after` is smaller).
+    let hybrid = &used["hybridCompaction"];
+    for key in [
+        "attempts",
+        "applied",
+        "skippedNoFit",
+        "skippedNoAssistantReply",
+        "skippedBackoff",
+        "notAppliedAfterFold",
+        "notAppliedOther",
+        "contextTokensBefore",
+        "contextTokensAfter",
+    ] {
+        assert!(hybrid[key].is_u64(), "{key}: {hybrid}");
+    }
+    assert_eq!(hybrid["applied"], agent.run_stats().compactions, "{hybrid}");
+    assert!(hybrid["contextTokensAfter"].as_u64() < hybrid["contextTokensBefore"].as_u64());
+    let accounted: u64 = [
+        "applied",
+        "skippedNoFit",
+        "skippedNoAssistantReply",
+        "skippedBackoff",
+        "notAppliedAfterFold",
+        "notAppliedOther",
+    ]
+    .iter()
+    .map(|key| hybrid[key].as_u64().unwrap())
+    .sum();
+    assert_eq!(hybrid["attempts"], accounted, "{hybrid}");
 }

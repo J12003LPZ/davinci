@@ -564,6 +564,29 @@ mod tests {
         assert_eq!(vm["retrievalOffered"], false);
     }
 
+    #[test]
+    fn harness_stats_record_reports_hybrid_compaction_counters() {
+        let mut agent = davinci_agent::Agent::new("system");
+        agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Hybrid);
+        let vm = harness_stats_record(&agent)["contextVm"].clone();
+        assert_eq!(
+            vm["hybridCompaction"],
+            serde_json::json!({
+                "attempts": 0,
+                "applied": 0,
+                "skippedNoFit": 0,
+                "skippedNoAssistantReply": 0,
+                "skippedBackoff": 0,
+                "notAppliedAfterFold": 0,
+                "notAppliedOther": 0,
+                "contextTokensBefore": 0,
+                "contextTokensAfter": 0,
+            })
+        );
+        let off = davinci_agent::Agent::new("system");
+        assert!(harness_stats_record(&off)["contextVm"]["hybridCompaction"].is_null());
+    }
+
     fn leftover_temp_files(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()

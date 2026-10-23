@@ -845,7 +845,7 @@ Issue the call again if it is still needed.";
                 let mut settings = self.compaction;
                 settings.enabled = true;
                 if crate::should_compact(tokens, self.context_window, &settings) {
-                    let outcome = self.compact(None);
+                    let outcome = self.compact_automatic(tokens);
                     if outcome.compacted {
                         self.stats.compactions += 1;
                     } else if self.context_window > 0 && tokens >= self.context_window {

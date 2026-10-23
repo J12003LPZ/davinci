@@ -5061,7 +5061,7 @@ fn hybrid_compaction_whose_ledger_cannot_follow_keeps_live_history() {
         agent.record_assistant("ok");
     }
     let before = agent.messages.clone();
-    let prepared = agent.hybrid_compaction(None, 0);
+    let prepared = agent.hybrid_compaction(None, true, 0);
     assert!(prepared.compacted, "{}", prepared.summary);
     let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
     let root = vm.root();
@@ -5383,4 +5383,1144 @@ fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
     agent.persist_mutation_verification();
     agent.persist_tool_exposure();
     assert_eq!(customs(&agent), before);
+}
+
+mod hybrid_fold_economics {
+    //! Hybrid compaction must not pay for a summarizer request it cannot use.
+    use super::*;
+    use crate::compaction::{SummarizeResponse, Summarizer};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        /// Request bytes the test estimator reports (the estimator is a plain
+        /// `fn`). Per test thread, so parallel tests cannot see each other.
+        static OVERHEAD_BYTES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn overhead_estimator(_: &Agent) -> u64 {
+        OVERHEAD_BYTES.with(Cell::get)
+    }
+
+    fn summarizer(
+        calls: Arc<AtomicUsize>,
+        on_call: impl Fn() + Send + Sync + 'static,
+    ) -> Summarizer {
+        Summarizer::new(move |request| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            on_call();
+            Ok(SummarizeResponse {
+                text: if request.label == "context state fold" {
+                    "{}".into()
+                } else {
+                    "## Goal\nContinue.".into()
+                },
+                usage: Default::default(),
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        })
+    }
+
+    /// Hybrid agent: compacts at 10k tokens, keeps 1k verbatim; the capacity
+    /// limit (window minus reserve) is 38k.
+    fn agent(calls: Arc<AtomicUsize>, on_call: impl Fn() + Send + Sync + 'static) -> Agent {
+        configure(Agent::new("You are a coding agent."), calls, on_call)
+    }
+
+    fn configure(
+        mut agent: Agent,
+        calls: Arc<AtomicUsize>,
+        on_call: impl Fn() + Send + Sync + 'static,
+    ) -> Agent {
+        agent.set_runtime(crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        agent.context_window = 40_000;
+        agent.compaction = CompactionSettings {
+            reserve_tokens: 2_000,
+            keep_recent_tokens: 1_000,
+            threshold: Some(crate::compaction::CompactionThreshold::Tokens(10_000)),
+            ..CompactionSettings::default()
+        };
+        agent.summarizer = Some(summarizer(calls, on_call));
+        agent
+    }
+
+    /// `turns` exchanges of about `tokens` tokens each, after a constraint.
+    fn fill(agent: &mut Agent, turns: usize, tokens: usize) {
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+        agent.record_assistant("ok");
+        for turn in 0..turns {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(tokens * 4)));
+            agent.record_assistant("ok");
+        }
+    }
+
+    fn hybrid_stats(agent: &Agent) -> serde_json::Value {
+        agent.feature_use()["contextVm"]["hybridCompaction"].clone()
+    }
+
+    #[test]
+    fn a_replacement_that_cannot_fit_never_reaches_the_summarizer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 4, 400);
+        // The newest request alone is over the capacity limit: no cut can fit it.
+        agent.prompt(&"y".repeat(39_000 * 4));
+        let before = agent.messages.clone();
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert_eq!(agent.messages, before);
+        assert!(
+            result.summary.contains("skipped before the summarizer")
+                && result.summary.contains("does not fit"),
+            "{}",
+            result.summary
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["attempts"], 1, "{stats}");
+        assert_eq!(stats["skippedNoFit"], 1, "{stats}");
+        assert_eq!(stats["applied"], 0, "{stats}");
+        // Free skips never start the backoff.
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    #[test]
+    fn a_history_without_a_cut_point_never_reaches_the_summarizer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert!(
+            result.summary.contains("no earlier turn to replace"),
+            "{}",
+            result.summary
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(
+            (stats["attempts"].as_u64(), stats["skippedNoFit"].as_u64()),
+            (Some(1), Some(1))
+        );
+    }
+
+    #[test]
+    fn a_replacement_that_fits_is_folded_applied_and_counted() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 30, 400);
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the fold never ran");
+        assert!(result.tokens_after < result.tokens_before);
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["attempts"], 1, "{stats}");
+        assert_eq!(stats["applied"], 1, "{stats}");
+        assert_eq!(stats["skippedNoFit"], 0, "{stats}");
+        assert_eq!(
+            stats["contextTokensBefore"], result.tokens_before,
+            "{stats}"
+        );
+        assert_eq!(stats["contextTokensAfter"], result.tokens_after, "{stats}");
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    /// A fold that is paid for and then not applied: the overhead jumps while
+    /// the summarizer runs, so the budget recomputed afterwards is too small.
+    fn unapplied_after_a_paid_fold() -> (Agent, Arc<AtomicUsize>) {
+        OVERHEAD_BYTES.with(|bytes| bytes.set(400));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {
+            OVERHEAD_BYTES.with(|bytes| bytes.set(60_000))
+        });
+        agent.set_provider_context_overhead_estimator(overhead_estimator);
+        fill(&mut agent, 30, 400);
+        let result = agent.compact_automatic(15_000);
+        assert!(!result.compacted, "{}", result.summary);
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the fold never ran");
+        // The condition that blocked the fit has passed; only the backoff holds.
+        OVERHEAD_BYTES.with(|bytes| bytes.set(400));
+        (agent, calls)
+    }
+
+    #[test]
+    fn a_paid_fold_that_is_not_applied_defers_the_next_automatic_attempt() {
+        let (mut agent, calls) = unapplied_after_a_paid_fold();
+        let paid = calls.load(Ordering::SeqCst);
+        let failed_at = agent.hybrid_fold_backoff.expect("backoff started");
+        let keep = agent.compaction.keep_recent_tokens;
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["notAppliedAfterFold"], 1, "{stats}");
+        assert_eq!(stats["applied"], 0, "{stats}");
+
+        // No growth, and one token short of `keep_recent_tokens`: deferred.
+        for tokens in [failed_at, failed_at + keep - 1] {
+            let result = agent.compact_automatic(tokens);
+            assert!(!result.compacted);
+            assert!(result.summary.contains("deferred"), "{}", result.summary);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            paid,
+            "backoff paid for a fold"
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["skippedBackoff"], 2, "{stats}");
+        assert_eq!(stats["attempts"], 3, "{stats}");
+
+        // Grown by `keep_recent_tokens`: allowed, and it applies now.
+        let result = agent.compact_automatic(failed_at + keep);
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(
+            agent.hybrid_fold_backoff, None,
+            "applied compaction resets it"
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(
+            (stats["attempts"].as_u64(), stats["applied"].as_u64()),
+            (Some(4), Some(1))
+        );
+    }
+
+    #[test]
+    fn the_backoff_defers_below_capacity_and_never_at_or_above_it() {
+        // context_window = 40_000, capacity = 38_000, keep_recent = 1_000.
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        agent.arm_hybrid_backoff(36_500);
+        let result = agent.compact_automatic(37_000);
+        assert!(
+            !result.compacted && result.summary.contains("deferred"),
+            "{}",
+            result.summary
+        );
+
+        // From the capacity limit up the attempt is a recovery: a stale backoff,
+        // even one recorded just below it, never holds it back.
+        for tokens in [38_000, 39_000, 40_000] {
+            let (mut agent, _) = unapplied_after_a_paid_fold();
+            agent.arm_hybrid_backoff(37_900);
+            let result = agent.compact_automatic(tokens);
+            assert!(result.compacted, "{tokens}: {}", result.summary);
+            assert_eq!(hybrid_stats(&agent)["skippedBackoff"], 0);
+        }
+    }
+
+    #[test]
+    fn a_smaller_context_than_the_failed_one_clears_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        let failed_at = agent.hybrid_fold_backoff.unwrap();
+        let keep = agent.compaction.keep_recent_tokens;
+        let result = agent.compact_automatic(failed_at - keep - 1);
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedBackoff"], 0);
+    }
+
+    #[test]
+    fn a_small_drop_from_a_byte_estimate_does_not_clear_the_backoff() {
+        // The failure was recorded from a byte estimate; the next provider count
+        // reads about 3k lower. That is the scale, not a replaced history.
+        let (mut agent, calls) = unapplied_after_a_paid_fold();
+        let paid = calls.load(Ordering::SeqCst);
+        let failed_at = agent.hybrid_fold_backoff.unwrap();
+        let keep = agent.compaction.keep_recent_tokens;
+        let result = agent.compact_automatic(failed_at - keep);
+        assert!(result.summary.contains("deferred"), "{}", result.summary);
+        assert_eq!(agent.hybrid_fold_backoff, Some(failed_at));
+        assert_eq!(calls.load(Ordering::SeqCst), paid, "a fold was paid for");
+    }
+
+    #[test]
+    fn a_failed_recovery_records_no_backoff_and_a_failed_automatic_attempt_does() {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let failed = CompactionResult {
+            summary: "Compaction not saved: disk full".into(),
+            messages: agent.messages.clone(),
+            compacted: false,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 39_000, true);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, Some(12_000));
+    }
+
+    #[test]
+    fn changing_the_window_or_the_compaction_settings_clears_the_backoff() {
+        for change in [
+            (|agent: &mut Agent| agent.context_window = 50_000) as fn(&mut Agent),
+            |agent: &mut Agent| agent.compaction.keep_recent_tokens = 500,
+            |agent: &mut Agent| agent.compaction.reserve_tokens = 1_000,
+            |agent: &mut Agent| {
+                agent.compaction.threshold =
+                    Some(crate::compaction::CompactionThreshold::Tokens(9_000))
+            },
+        ] {
+            let (mut agent, _) = unapplied_after_a_paid_fold();
+            let failed_at = agent.hybrid_fold_backoff.unwrap();
+            // Unchanged settings: deferred.
+            let result = agent.compact_automatic(failed_at);
+            assert!(result.summary.contains("deferred"), "{}", result.summary);
+            change(&mut agent);
+            let result = agent.compact_automatic(failed_at);
+            assert!(!result.summary.contains("deferred"), "{}", result.summary);
+            assert_eq!(agent.hybrid_fold_backoff, None);
+        }
+    }
+
+    #[test]
+    fn reserve_band_requests_do_not_wait_for_a_backoff_after_a_failed_recovery() {
+        // Default compaction settings (keep 20,000, reserve 16,384), a 60k window and a
+        // first prompt of 42k tokens: with the 2k overhead turn 0 is already above the
+        // capacity limit (43,616) and has no earlier turn to replace, so its recovery
+        // pays a fold that cannot apply. Before the backoff existed, turn 1 compacted;
+        // a backoff held through the reserve band for many turns.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.context_window = 60_000;
+        agent.compaction = CompactionSettings::default();
+        agent.set_provider_context_overhead_tokens(Some(2_000));
+        let capacity = 60_000 - agent.compaction.reserve_tokens;
+        let above_capacity = Arc::new(AtomicUsize::new(0));
+        let mut applied_at = None;
+        for turn in 0..30 {
+            let size = if turn == 0 { 42_000 } else { 500 };
+            agent.prompt(&format!("turn {turn} {}", "x".repeat(size * 4)));
+            let counter = above_capacity.clone();
+            agent
+                .run_loop(move |agent: &Agent| {
+                    let tokens = crate::compaction::estimate_context_tokens(&agent.messages)
+                        + agent.estimated_request_overhead_tokens();
+                    if tokens > capacity {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok::<_, String>(reply_with(tokens))
+                })
+                .unwrap();
+            if applied_at.is_none() && hybrid_stats(&agent)["applied"].as_u64().unwrap() > 0 {
+                applied_at = Some(turn);
+            }
+        }
+        assert_eq!(applied_at, Some(1), "compaction must apply at turn 1");
+        assert!(
+            above_capacity.load(Ordering::SeqCst) <= 1,
+            "{} requests above the capacity limit",
+            above_capacity.load(Ordering::SeqCst)
+        );
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    #[test]
+    fn a_failed_fold_reports_the_full_request_estimate_in_both_fields() {
+        // The checkpoint cannot be written, so the fold fails.
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+            .unwrap();
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        fill(&mut agent, 6, 200);
+        let full = agent.estimated_context_tokens();
+        let messages = crate::compaction::estimate_context_tokens(&agent.messages);
+        assert!(full > messages);
+        let path = agent.session.as_ref().unwrap().path.clone();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let result = agent.compact(None);
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(!result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["applied"], 0);
+        assert_eq!((result.tokens_before, result.tokens_after), (full, full));
+    }
+
+    #[test]
+    fn a_manual_compact_recovers_when_the_fold_shrinks_the_ledger_below_the_dry_run() {
+        let (mut agent, calls, _, _) = a_long_parent_narrative_the_next_fold_shortens();
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one paid fold");
+        assert_eq!(hybrid_stats(&agent)["skippedNoFit"], 0);
+    }
+
+    #[test]
+    fn an_automatic_attempt_at_capacity_recovers_when_the_fold_shrinks_the_ledger() {
+        let (mut agent, calls, _, _) = a_long_parent_narrative_the_next_fold_shortens();
+
+        let result = agent.compact_automatic(38_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one paid fold");
+        assert_eq!(hybrid_stats(&agent)["skippedNoFit"], 0);
+    }
+
+    #[test]
+    fn below_capacity_a_long_parent_narrative_alone_does_not_false_skip_the_dry_run() {
+        let (mut agent, calls, _, _) = a_long_parent_narrative_the_next_fold_shortens();
+
+        // Below capacity, so the free dry run runs. The fold may replace the parent
+        // narrative, so the dry run renders without it and fits.
+        let result = agent.compact_automatic(20_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one paid fold");
+        assert_eq!(hybrid_stats(&agent)["skippedNoFit"], 0);
+    }
+
+    #[test]
+    fn a_recovery_does_not_run_the_dry_run() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 4, 400);
+        // The newest request alone is over the capacity limit: HEAD paid a fold here too.
+        agent.prompt(&"y".repeat(39_000 * 4));
+
+        let result = agent.compact(None);
+
+        assert!(!result.compacted);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "recovery skipped the fold"
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["skippedNoFit"], 0, "{stats}");
+        assert_eq!(stats["notAppliedAfterFold"], 1, "{stats}");
+    }
+
+    fn narrative_proposal(agent: &Agent, narrative: &str) -> String {
+        let source_ref = agent
+            .context_vm_events_for_vm()
+            .iter()
+            .rev()
+            .find(|event| event.kind == crate::runtime::context_vm::ContextEventKind::Assistant)
+            .unwrap()
+            .source_ref
+            .clone();
+        serde_json::json!({"narrative": {
+            "value": narrative, "source_refs": [source_ref], "provenance_kind": "agent_inference"}})
+        .to_string()
+    }
+
+    fn tokens_needed(agent: &Agent, ledger: &str) -> u64 {
+        let result = crate::compaction::compact_messages_with_summary(
+            &agent.messages,
+            agent.compaction.keep_recent_tokens,
+            ledger,
+            0,
+        );
+        let at = result.summary.find(" need ").unwrap() + 6;
+        result.summary[at..]
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// The first fold stores a 1,000-byte narrative; the second proposes "short". The
+    /// deterministic dry run keeps the long one, so its ledger is bigger than the folded
+    /// one, and the budget sits between the two needs. Returns the agent, the summarizer
+    /// request counter and the two needs.
+    fn a_long_parent_narrative_the_next_fold_shortens() -> (Agent, Arc<AtomicUsize>, u64, u64) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reply = Arc::new(std::sync::Mutex::new(String::from("{}")));
+        let counter = calls.clone();
+        let fold_reply = reply.clone();
+        let mut agent = Agent::new("You are a coding agent.");
+        agent.set_runtime(crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        agent.context_window = 40_000;
+        agent.compaction = CompactionSettings {
+            reserve_tokens: 2_000,
+            keep_recent_tokens: 1_000,
+            threshold: None,
+            ..CompactionSettings::default()
+        };
+        agent.auto_compaction = false;
+        agent.summarizer = Some(Summarizer::new(move |request| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(SummarizeResponse {
+                text: if request.label == "context state fold" {
+                    fold_reply.lock().unwrap().clone()
+                } else {
+                    "## Goal\nContinue.".into()
+                },
+                usage: Default::default(),
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        }));
+        agent.prompt("Build the scheduler.");
+        agent.record_assistant("ok, starting");
+        for turn in 0..6 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(1_600)));
+            agent.record_assistant(&format!("done {turn}"));
+        }
+        *reply.lock().unwrap() = narrative_proposal(&agent, &"N".repeat(1_000));
+        agent
+            .fold_context(runtime::context_vm::FoldReason::Manual, None)
+            .unwrap();
+        for turn in 6..12 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(1_600)));
+            agent.record_assistant(&format!("done {turn}"));
+        }
+        agent.prompt(&format!("next {}", "z".repeat(4_000)));
+        let state = agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .context_vm
+            .load_state_from_root()
+            .unwrap();
+        assert!(
+            state.narrative.is_some(),
+            "the first fold kept no narrative"
+        );
+        let newer: Vec<_> = agent
+            .context_vm_events_for_vm()
+            .into_iter()
+            .filter(|event| event.seq > state.through_seq)
+            .collect();
+        let long = runtime::context_vm::ContextStateReducer::deterministic_delta(&state, &newer)
+            .checkpoint_patch;
+        let mut short = long.clone();
+        short.narrative.as_mut().unwrap().value = "short".into();
+        let need_long = tokens_needed(&agent, &runtime::context_vm::render_ledger(&long));
+        let need_short = tokens_needed(&agent, &runtime::context_vm::render_ledger(&short));
+        assert!(need_short < need_long);
+        // Budget between the two needs: the long ledger cannot fit, the folded one can.
+        agent.set_provider_context_overhead_tokens(Some(0));
+        let base = agent.estimated_request_overhead_tokens();
+        let budget = (need_long + need_short) / 2;
+        agent.set_provider_context_overhead_tokens(Some(38_000 - budget - base));
+        assert_eq!(agent.hybrid_replacement_budget(true), budget);
+        *reply.lock().unwrap() = narrative_proposal(&agent, "short");
+        let paid_so_far = calls.load(Ordering::SeqCst);
+        calls.store(0, Ordering::SeqCst);
+        let _ = paid_so_far;
+        (agent, calls, need_long, need_short)
+    }
+
+    /// `fill(4, 400)`, then a 12k-token prompt, "ok" and "next": the threshold
+    /// budget (10k) fits a replacement that keeps only the last turns, and the
+    /// capacity budget (38k) would fit one that keeps the 12k prompt.
+    fn the_probe_history(calls: Arc<AtomicUsize>) -> Agent {
+        let mut agent = agent(calls, || {});
+        agent.auto_compaction = false;
+        fill(&mut agent, 4, 400);
+        agent.prompt(&"y".repeat(12_000 * 4));
+        agent.record_assistant("ok");
+        agent.prompt("next");
+        agent
+    }
+
+    #[test]
+    fn a_recovery_lands_under_the_threshold_when_something_fits_there() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = the_probe_history(calls.clone());
+        let threshold_budget = agent.hybrid_replacement_budget(false);
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(
+            result.tokens_after <= threshold_budget,
+            "{} tokens, threshold budget {threshold_budget}",
+            result.tokens_after
+        );
+        let paid = calls.load(Ordering::SeqCst);
+        assert!(paid >= 1);
+        // The next turn does not trigger a second compaction.
+        let mut settings = agent.compaction;
+        settings.enabled = true;
+        assert!(!crate::should_compact(
+            agent.calibrated_context_tokens(),
+            agent.context_window,
+            &settings
+        ));
+        assert_eq!(hybrid_stats(&agent)["applied"], 1);
+    }
+
+    #[test]
+    fn a_recovery_falls_back_to_capacity_only_when_nothing_fits_the_threshold() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 4, 400);
+        // The newest turn alone is over the 10k threshold, under the 38k capacity.
+        agent.prompt(&"y".repeat(12_000 * 4));
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(result.tokens_after > agent.hybrid_replacement_budget(false));
+    }
+
+    #[test]
+    fn an_overflow_retry_does_not_compact_a_second_time_in_the_same_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = the_probe_history(calls.clone());
+        agent.auto_compaction = true;
+        // The automatic attempt defers (backoff armed at the current size), so
+        // the overflow retry is the compaction.
+        agent.arm_hybrid_backoff(agent.calibrated_context_tokens());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+
+        agent
+            .run_loop(move |_: &Agent| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("context_length_exceeded: input exceeds the context window".to_string())
+                } else {
+                    Ok(reply_with(1_000))
+                }
+            })
+            .unwrap();
+
+        let stats = hybrid_stats(&agent);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(stats["skippedBackoff"], 1, "{stats}");
+        assert_eq!(stats["applied"], 1, "{stats}");
+        assert_eq!(agent.run_stats().compactions, 1, "{stats}");
+        assert_eq!(stats["attempts"], 2, "{stats}");
+    }
+
+    #[test]
+    fn a_host_overhead_that_counts_the_tool_catalog_is_not_charged_the_schema_twice() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        assert!(agent.pending_retrieval_schema_tokens() > 0);
+        agent.set_provider_context_overhead_tokens(Some(500));
+        assert_eq!(agent.pending_retrieval_schema_tokens(), 0);
+        agent.set_provider_context_overhead_tokens(None);
+        assert!(agent.pending_retrieval_schema_tokens() > 0);
+        agent.set_provider_context_overhead_estimator(overhead_estimator);
+        assert_eq!(agent.pending_retrieval_schema_tokens(), 0);
+    }
+
+    #[test]
+    fn replacing_the_history_resets_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        assert!(agent.hybrid_fold_backoff.is_some());
+        agent.restore_branch_state();
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    #[test]
+    fn manual_compaction_ignores_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        assert!(agent.hybrid_fold_backoff.is_some());
+        let result = agent.compact(None);
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedBackoff"], 0);
+    }
+
+    #[test]
+    fn a_context_overflow_refusal_ignores_the_backoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.auto_compaction = false;
+        fill(&mut agent, 30, 400);
+        agent.prompt("Continue.");
+        agent.auto_compaction = true;
+        // Over the 10_000 threshold, so the automatic trigger fires; the backoff
+        // armed at the current size makes that attempt defer.
+        assert!(agent.estimated_context_tokens() > 10_000);
+        agent.arm_hybrid_backoff(agent.calibrated_context_tokens());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+
+        agent
+            .run_loop(move |_: &Agent| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("context_length_exceeded: input exceeds the context window".to_string())
+                } else {
+                    Ok(reply_with(1_000))
+                }
+            })
+            .unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let stats = hybrid_stats(&agent);
+        assert_eq!(
+            stats["skippedBackoff"], 1,
+            "the automatic path must have deferred first: {stats}"
+        );
+        assert_eq!(agent.run_stats().compactions, 1, "{stats}");
+        assert_eq!(stats["applied"], 1, "{stats}");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "recovery skipped the fold"
+        );
+    }
+
+    // ---- Review findings -------------------------------------------------------------------
+
+    fn reply_with(input: u64) -> davinci_ai::AssistantMessage {
+        davinci_ai::AssistantMessage {
+            extra: Default::default(),
+            id: "fixture".into(),
+            role: "assistant".into(),
+            model: "fixture".into(),
+            usage: Some(davinci_protocol::Usage {
+                input,
+                output: 4,
+                ..Default::default()
+            }),
+            error_message: None,
+            content: vec![davinci_ai::ContentBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+        }
+    }
+
+    #[test]
+    fn the_fit_budget_is_the_limit_minus_the_estimated_overhead() {
+        // The budget must not depend on what the provider counted: a provider that
+        // counts the messages below the byte estimate would otherwise grow it, let
+        // the first cut land just under the threshold, and pay a fold every turn.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        agent.set_provider_context_overhead_tokens(Some(3_000));
+        fill(&mut agent, 6, 200);
+        let overhead = agent.estimated_request_overhead_tokens();
+        let schema = agent.pending_retrieval_schema_tokens();
+        assert_eq!(schema, 0, "a host overhead already counts the catalog");
+        assert_eq!(agent.hybrid_replacement_budget(false), 10_000 - overhead);
+        assert_eq!(agent.hybrid_replacement_budget(true), 38_000 - overhead);
+        // Same budget after the provider reports a count far below the estimate.
+        agent
+            .run_loop(|_: &Agent| Ok::<_, String>(reply_with(500)))
+            .unwrap();
+        assert_eq!(
+            agent.hybrid_replacement_budget(false),
+            10_000 - agent.estimated_request_overhead_tokens()
+        );
+    }
+
+    /// 40 turns of about 400 tokens against a provider that counts the messages at
+    /// three quarters of the byte estimate. Returns (summarizer requests, applied).
+    fn forty_turns_with_a_low_counting_provider(keep_recent: u64) -> (usize, u64) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.compaction.keep_recent_tokens = keep_recent;
+        agent.set_provider_context_overhead_tokens(Some(3_000));
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+        for turn in 0..40 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(400 * 4)));
+            agent
+                .run_loop(|agent: &Agent| {
+                    let messages = crate::compaction::estimate_context_tokens(&agent.messages);
+                    Ok::<_, String>(reply_with(
+                        messages * 3 / 4 + agent.estimated_request_overhead_tokens(),
+                    ))
+                })
+                .unwrap();
+        }
+        let stats = hybrid_stats(&agent);
+        (
+            calls.load(Ordering::SeqCst),
+            stats["applied"].as_u64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_provider_that_counts_low_does_not_make_every_turn_a_paid_fold() {
+        // Upper bounds are the summarizer requests the budget formula
+        // `limit - estimated overhead` pays on this probe.
+        for (keep_recent, bound) in [(6_000, 4), (7_000, 4), (7_500, 4), (8_000, 4), (9_000, 3)] {
+            let (paid, applied) = forty_turns_with_a_low_counting_provider(keep_recent);
+            assert!(
+                paid <= bound && applied as usize <= paid,
+                "keep_recent {keep_recent}: {paid} paid requests (bound {bound}), {applied} applied"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_compaction_budgets_against_the_capacity_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 4, 400);
+        // The newest turn alone is over the 10k threshold but far under the 38k capacity.
+        agent.prompt(&"y".repeat(12_000 * 4));
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(result.tokens_after < result.tokens_before);
+    }
+
+    #[test]
+    fn a_full_window_recovers_even_when_the_threshold_budget_cannot_fit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.auto_compaction = false;
+        for turn in 0..30 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(4_000)));
+            agent.record_assistant("ok");
+        }
+        agent.prompt("Continue.");
+        agent
+            .run_loop(|agent: &Agent| Ok::<_, String>(reply_with(agent.estimated_context_tokens())))
+            .unwrap();
+        agent.auto_compaction = true;
+        agent.prompt(&"y".repeat(12_000 * 4));
+        // A paid fold failed at this size, so the backoff is holding.
+        agent.arm_hybrid_backoff(agent.calibrated_context_tokens());
+        assert!(agent.calibrated_context_tokens() >= agent.context_window);
+
+        let outcome = agent.run_loop(|_: &Agent| Ok::<_, String>(reply_with(1_000)));
+
+        outcome.expect("the request must not be blocked: the window can be recovered");
+        assert!(agent.run_stats().compactions >= 1);
+    }
+
+    #[test]
+    fn a_ledger_of_another_branch_does_not_block_the_dry_run() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.context_window = 1_600;
+        agent.compaction = CompactionSettings {
+            reserve_tokens: 500,
+            keep_recent_tokens: 100,
+            ..CompactionSettings::default()
+        };
+        agent.set_provider_context_overhead_tokens(Some(0));
+        // The VM follows a long conversation...
+        for turn in 0..60 {
+            agent.prompt(&format!("old step {turn} {}", "o".repeat(4_000)));
+            agent.record_assistant("ok");
+        }
+        let events = agent.context_vm_events_for_vm();
+        let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
+        vm.append_delta(&events).unwrap();
+        let stale = crate::compaction::estimate_context_tokens(&[ChatMessage::text(
+            "user",
+            runtime::context_vm::render_ledger(&vm.load_state_from_root().unwrap()),
+        )]);
+        assert!(
+            stale > agent.hybrid_replacement_budget(false),
+            "the old ledger must not fit: {stale}"
+        );
+        // ...then the user navigates to a short, different one.
+        agent.messages.clear();
+        for turn in 0..3 {
+            agent.prompt(&format!("new step {turn} {}", "n".repeat(200)));
+            agent.record_assistant("ok");
+        }
+        agent.prompt("Continue.");
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+    }
+
+    #[test]
+    fn a_prefix_without_an_assistant_reply_is_not_replaced() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = configure(
+            Agent::new_builtin(crate::prompt::PromptProfile::Stable),
+            calls.clone(),
+            || {},
+        );
+        agent.turn_context_placement_override =
+            Some(crate::turn_context::TurnContextPlacement::Appended);
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+        agent.append_turn_context(None);
+        assert!(
+            agent.messages.len() >= 2,
+            "turn 1 must hold a user prompt and a context message"
+        );
+        assert!(agent.messages.iter().all(|m| m.role != "assistant"));
+        let before = agent.messages.clone();
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert_eq!(agent.messages, before);
+        assert!(
+            result.summary.contains("no assistant reply") && !result.summary.contains("cannot fit"),
+            "{}",
+            result.summary
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["skippedNoAssistantReply"], 1, "{stats}");
+        assert_eq!(stats["skippedNoFit"], 0, "{stats}");
+        assert_eq!(stats["attempts"], 1, "{stats}");
+        // A free skip never starts the backoff.
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    /// `[U1 huge, A1, TR1 huge]`: the cut point lands inside the tool result, the
+    /// only cut left is after A1, and the prefix to replace is the user's prompt.
+    /// With the window nearly full, replacing it with the ledger is the only
+    /// way out.
+    fn a_huge_prompt_and_a_huge_tool_result(calls: Arc<AtomicUsize>) -> Agent {
+        let mut agent = agent(calls, || {});
+        agent.auto_compaction = false;
+        agent.prompt(&"u".repeat(20_000 * 4));
+        agent.record_assistant("calling");
+        agent.messages.push(ChatMessage::tool_result(
+            "c1",
+            "read",
+            "t".repeat(16_000 * 4),
+            false,
+        ));
+        assert!(agent.estimated_context_tokens() > 36_000);
+        assert!(agent.estimated_context_tokens() < 40_000);
+        agent
+    }
+
+    #[test]
+    fn a_full_window_of_one_prompt_and_one_tool_result_recovers_when_automatic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls.clone());
+
+        // At the capacity limit (38_000) the automatic attempt is a recovery.
+        let result = agent.compact_automatic(39_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(result.tokens_after < result.tokens_before);
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 0);
+    }
+
+    #[test]
+    fn a_full_window_of_one_prompt_and_one_tool_result_recovers_when_manual() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls);
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 0);
+    }
+
+    #[test]
+    fn a_full_window_of_one_prompt_and_one_tool_result_recovers_on_overflow() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls.clone());
+        agent.auto_compaction = true;
+        agent.prompt("Continue.");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+
+        agent
+            .run_loop(move |_: &Agent| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("context_length_exceeded: input exceeds the context window".to_string())
+                } else {
+                    Ok(reply_with(1_000))
+                }
+            })
+            .expect("the overflow retry must recover the session");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(agent.run_stats().compactions >= 1);
+        assert!(hybrid_stats(&agent)["applied"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn an_automatic_attempt_below_capacity_leaves_the_lone_prompt_alone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls.clone());
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 1);
+    }
+
+    #[test]
+    fn the_automatic_path_picks_a_later_cut_when_the_first_has_no_assistant_reply() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        // After an earlier compaction: [ledger, U5, A5, U6]. keep_recent is 1_000 tokens, so
+        // the walk-back stops at U5 and the first cut tried is the one right after the ledger.
+        agent
+            .messages
+            .push(crate::compaction::compaction_context_message(
+                "earlier ledger",
+            ));
+        agent.prompt(&format!("step 5 {}", "x".repeat(1_100 * 4)));
+        agent.record_assistant("ok");
+        agent.prompt("next");
+        let first = crate::compaction::find_cut_point(&agent.messages, 1_000).first_kept_index;
+        assert_eq!(
+            first, 1,
+            "the test needs the first cut to be after the ledger"
+        );
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 0);
+        // The ledger, then only the newest turn: the cut moved past U5 and A5.
+        assert_eq!(agent.messages.len(), 2, "{:?}", agent.messages);
+        assert_eq!(content_text(&agent.messages[1].content), "next");
+    }
+
+    #[test]
+    fn the_backoff_records_the_size_the_trigger_measured() {
+        // `unapplied_after_a_paid_fold` triggers at 15_000 on a history whose
+        // plain estimate is lower: the backoff must hold the trigger's number.
+        let (agent, _) = unapplied_after_a_paid_fold();
+        assert_eq!(agent.hybrid_fold_backoff, Some(15_000));
+    }
+
+    #[test]
+    fn the_retrieval_tool_schema_is_in_the_budget_before_the_first_fold() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 6, 200);
+        assert!(!agent.context_vm_offers_retrieval());
+        let before = agent.hybrid_replacement_budget(false);
+        agent
+            .fold_context(runtime::context_vm::FoldReason::Manual, None)
+            .unwrap();
+        assert!(agent.context_vm_offers_retrieval());
+        let after = agent.hybrid_replacement_budget(false);
+        assert!(
+            before.abs_diff(after) <= 2,
+            "the first fold changed the budget from {before} to {after}"
+        );
+    }
+
+    #[test]
+    fn only_hybrid_mode_reports_hybrid_compaction() {
+        for mode in [
+            crate::runtime::ContextVmMode::Active,
+            crate::runtime::ContextVmMode::Shadow,
+        ] {
+            let mut agent = Agent::new("x");
+            agent.set_context_vm_mode(mode);
+            let vm = agent.feature_use()["contextVm"].clone();
+            assert!(vm.get("hybridCompaction").is_none(), "{mode:?}: {vm}");
+        }
+    }
+
+    #[test]
+    fn counters_separate_paid_folds_from_other_failures() {
+        let (agent, _) = unapplied_after_a_paid_fold();
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["notAppliedAfterFold"], 1, "{stats}");
+        assert_eq!(stats["notAppliedOther"], 0, "{stats}");
+
+        // No summarizer request is sent: the failure is not a paid fold.
+        let mut agent = agent_without_summarizer();
+        fill(&mut agent, 30, 400);
+        agent.hybrid_last_fold_requests = 0;
+        let failed = CompactionResult {
+            summary: "Compaction not saved: disk full".into(),
+            messages: agent.messages.clone(),
+            compacted: false,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 10, false);
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["notAppliedOther"], 1, "{stats}");
+        assert_eq!(stats["notAppliedAfterFold"], 0, "{stats}");
+        let sum: u64 = [
+            "applied",
+            "skippedNoFit",
+            "skippedNoAssistantReply",
+            "skippedBackoff",
+            "notAppliedAfterFold",
+            "notAppliedOther",
+        ]
+        .iter()
+        .map(|key| stats[key].as_u64().unwrap())
+        .sum();
+        assert_eq!(stats["attempts"].as_u64().unwrap(), sum, "{stats}");
+    }
+
+    fn agent_without_summarizer() -> Agent {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        agent.summarizer = None;
+        agent
+    }
+
+    #[test]
+    fn skip_results_report_message_estimates_in_both_fields() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 30, 400);
+        agent.arm_hybrid_backoff(12_000);
+        let estimate = crate::compaction::estimate_context_tokens(&agent.messages);
+        let deferred = agent.compact_automatic(12_500);
+        assert!(
+            deferred.summary.contains("deferred"),
+            "{}",
+            deferred.summary
+        );
+        assert_eq!(
+            (deferred.tokens_before, deferred.tokens_after),
+            (estimate, estimate)
+        );
+
+        agent.hybrid_fold_backoff = None;
+        let mut small = agent_without_summarizer();
+        small.prompt("one message");
+        let estimate = crate::compaction::estimate_context_tokens(&small.messages);
+        let skipped = small.compact(None);
+        assert_eq!(
+            (skipped.tokens_before, skipped.tokens_after),
+            (estimate, estimate)
+        );
+    }
+
+    #[test]
+    fn counters_belong_to_the_agent_and_survive_a_session_load() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 30, 400);
+        assert!(agent.compact(None).compacted);
+        let before = hybrid_stats(&agent);
+        assert_eq!(before["applied"], 1);
+        let dir = tempfile::tempdir().unwrap();
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+            .unwrap();
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        assert_eq!(hybrid_stats(&agent), before);
+    }
 }

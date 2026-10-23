@@ -477,6 +477,23 @@ impl std::fmt::Debug for AutoSandboxResolverHandle {
     }
 }
 
+/// Counts of hybrid-mode compaction entries and what became of them.
+/// `attempts` = `applied` + `skipped_no_fit` + `skipped_no_assistant_reply` +
+/// `skipped_backoff` + `not_applied_after_fold` + `not_applied_other`. The token sums cover applied compactions only
+/// and use the message estimate (`CompactionResult.tokens_before/after`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HybridCompactionStats {
+    pub attempts: u64,
+    pub applied: u64,
+    pub skipped_no_fit: u64,
+    pub skipped_no_assistant_reply: u64,
+    pub skipped_backoff: u64,
+    pub not_applied_after_fold: u64,
+    pub not_applied_other: u64,
+    pub context_tokens_before: u64,
+    pub context_tokens_after: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub(crate) codemode: Option<codemode::CodeModeBinding>,
@@ -603,6 +620,18 @@ pub struct Agent {
     /// peak context, prunings. Read them through `run_stats`, which also
     /// folds in the counters bumped from inside tool calls.
     pub stats: RunStats,
+    /// Hybrid compaction outcomes, reported by `feature_use` (`contextVm.hybridCompaction`).
+    hybrid_compaction_stats: HybridCompactionStats,
+    /// Context size (calibrated tokens) at the last hybrid compaction that
+    /// paid for a summarizer request and then did not apply. While set,
+    /// automatic hybrid compaction waits for the context to grow.
+    hybrid_fold_backoff: Option<u64>,
+    /// The window and compaction settings the backoff was recorded under. A
+    /// change in any of them clears it: the recorded size says nothing about
+    /// the new limits.
+    hybrid_fold_backoff_settings: Option<(u64, CompactionSettings)>,
+    /// Summarizer requests the last hybrid fold sent (0 when it sent none).
+    hybrid_last_fold_requests: u64,
     observation_root_id: String,
     root_budget: Option<runtime::capacity::RootBudget>,
     pub counters: Arc<SharedCounters>,
@@ -809,6 +838,10 @@ impl Agent {
             abort_signal: None,
             host_command_abort: None,
             stats: RunStats::default(),
+            hybrid_compaction_stats: HybridCompactionStats::default(),
+            hybrid_fold_backoff: None,
+            hybrid_fold_backoff_settings: None,
+            hybrid_last_fold_requests: 0,
             observation_root_id: uuid::Uuid::new_v4().to_string(),
             root_budget: None,
             counters: SharedCounters::shared(),
@@ -1413,6 +1446,8 @@ impl Agent {
     /// branch. A session load and a transcript rewind both call this, so the
     /// two cannot disagree about what the branch holds.
     pub(crate) fn restore_branch_state(&mut self) {
+        self.hybrid_fold_backoff = None;
+        self.hybrid_fold_backoff_settings = None;
         self.restore_mutation_verification();
         self.restore_tool_exposure();
     }
@@ -2975,11 +3010,28 @@ impl Agent {
                 "retrievalHits": metrics.retrieval_hits,
                 "retrievalMisses": metrics.retrieval_misses,
                 "pageFaults": metrics.page_faults,
+                // Sums of the estimated size of the previous and the new
+                // checkpoint ledger per fold. Not a prompt-size reduction:
+                // see `hybridCompaction.contextTokens*` for that.
                 "tokensBeforeFold": metrics.tokens_before_fold,
                 "tokensAfterFold": metrics.tokens_after_fold,
                 "pinnedPageLoads": metrics.pinned_page_loads,
                 "retrievalOffered": self.context_vm_offers_retrieval(),
             });
+            let hybrid = self.hybrid_compaction_stats;
+            if mode == "hybrid" {
+                context_vm["hybridCompaction"] = serde_json::json!({
+                "attempts": hybrid.attempts,
+                "applied": hybrid.applied,
+                "skippedNoFit": hybrid.skipped_no_fit,
+                "skippedNoAssistantReply": hybrid.skipped_no_assistant_reply,
+                "skippedBackoff": hybrid.skipped_backoff,
+                "notAppliedAfterFold": hybrid.not_applied_after_fold,
+                "notAppliedOther": hybrid.not_applied_other,
+                "contextTokensBefore": hybrid.context_tokens_before,
+                "contextTokensAfter": hybrid.context_tokens_after,
+                });
+            }
         }
         let available = self.codemode_exposed();
         serde_json::json!({
@@ -4521,57 +4573,357 @@ impl Agent {
             .map(|runtime| runtime.context_vm.cache_affinity())
     }
 
+    /// The `retrieve_context` schema the first fold adds to every request. Before that fold the
+    /// overhead does not contain it, so a thin-margin dry run would pass and the real fit fail.
+    fn pending_retrieval_schema_tokens(&self) -> u64 {
+        // A host estimator or scalar override measures the real tool catalog,
+        // retrieve_context included when it is offered: do not count it twice.
+        if self.context_vm_mode() != ContextVmMode::Hybrid
+            || self.provider_context_overhead_estimator.is_some()
+            || self.provider_context_overhead_tokens.is_some()
+            || self.context_vm_offers_retrieval()
+            || !self.tools.iter().any(|tool| tool == "retrieve_context")
+        {
+            return 0;
+        }
+        self.builtin_and_mcp_specs()
+            .iter()
+            .find(|tool| tool.name == "retrieve_context")
+            .map(|tool| {
+                (serde_json::to_vec(tool)
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(0))
+                .div_ceil(4)
+            })
+            .unwrap_or(0)
+    }
+
+    /// The most a hybrid replacement may estimate: the compaction threshold, or the capacity
+    /// limit (`context_window - reserve_tokens`) on a recovery path, minus the estimated
+    /// request overhead (and the pending `retrieve_context` schema, which only shrinks it).
+    /// The overhead is the byte estimate on purpose, never a figure derived from what the
+    /// provider counted: a provider that counts the messages below their byte estimate would
+    /// turn that gap into budget, the first cut would land just under the threshold on the
+    /// provider scale, and the next turn would pay for another fold.
+    fn hybrid_replacement_budget(&self, recovery: bool) -> u64 {
+        let settings = CompactionSettings {
+            enabled: true,
+            ..self.compaction
+        };
+        let threshold =
+            compaction_threshold(self.context_window, &settings).unwrap_or(self.context_window);
+        let limit = if recovery {
+            self.context_window.saturating_sub(settings.reserve_tokens)
+        } else {
+            threshold
+        };
+        limit.saturating_sub(
+            self.estimated_request_overhead_tokens()
+                .saturating_add(self.pending_retrieval_schema_tokens()),
+        )
+    }
+
+    /// Build the replacement for `messages` from `state`. One path serves the
+    /// free preflight and the real call, so the fit math cannot drift.
+    ///
+    /// The threshold budget comes first for every caller: a result under it
+    /// keeps the next automatic trigger quiet. A recovery path falls back to
+    /// the capacity budget only when nothing fits under the threshold, because
+    /// the first cut that fits keeps the most and would otherwise land above
+    /// the threshold and be compacted again on the next turn.
+    ///
+    /// An automatic attempt (`recovery == false`) applies one more rule per
+    /// candidate cut: the replaced prefix must hold an assistant reply. Turn 1
+    /// is the user's prompt (and, on cache-sensitive routes, a turn-context
+    /// message) and nothing a ledger could stand in for, so replacing it is
+    /// cost without benefit while the context still has room. A cut that fails
+    /// the rule is skipped and a later cut is tried. A recovery path does not
+    /// apply it: a full window is better served by replacing the prompt with the
+    /// ledger than by a blocked session. The flag is true when that rule alone
+    /// left nothing to try.
+    fn hybrid_replacement(
+        &self,
+        state: &runtime::context_vm::CheckpointState,
+        recovery: bool,
+    ) -> (CompactionResult, bool) {
+        let ledger = runtime::context_vm::render_ledger(state);
+        let threshold_budget = self.hybrid_replacement_budget(false);
+        let first = compaction::compact_messages_with_summary_requiring(
+            &self.messages,
+            self.compaction.keep_recent_tokens,
+            &ledger,
+            threshold_budget,
+            !recovery,
+        );
+        let capacity_budget = self.hybrid_replacement_budget(true);
+        if first.0.compacted || !recovery || capacity_budget <= threshold_budget {
+            return first;
+        }
+        compaction::compact_messages_with_summary_requiring(
+            &self.messages,
+            self.compaction.keep_recent_tokens,
+            &ledger,
+            capacity_budget,
+            false,
+        )
+    }
+
+    /// The ledger state a dry run starts from, without touching the VM: what `append_delta`
+    /// would hold for the current events. A VM that does not continue this history holds
+    /// another branch's state (as in [`Self::fold_context`]), so it starts from nothing.
+    fn hybrid_dry_run_state(&self) -> Option<runtime::context_vm::CheckpointState> {
+        let runtime = self.runtime.as_ref()?;
+        let events = self.context_vm_events_for_vm();
+        let base = if runtime.context_vm.continues(&events) {
+            runtime.context_vm.load_state_from_root().ok()?
+        } else {
+            Default::default()
+        };
+        let newer = events
+            .iter()
+            .filter(|event| event.seq > base.through_seq)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut patch =
+            runtime::context_vm::ContextStateReducer::deterministic_delta(&base, &newer)
+                .checkpoint_patch;
+        // The fold replaces the parent narrative with the proposal's (up to 1,024 bytes),
+        // so the folded ledger can be smaller than one that keeps it. Render without it
+        // to stay closer to a lower bound. The retired-entry drain and chunked goals are
+        // not modelled: a residual false skip only defers compaction to the capacity
+        // limit, where a recovery pays the fold exactly as before.
+        patch.narrative = None;
+        Some(patch)
+    }
+
     /// Hybrid mode's compaction: fold the Context VM ledger (one summarizer
     /// call over the events no fold has seen; the deterministic state when
     /// it fails) and keep it with the most recent messages verbatim. The
     /// caller persists the result as an ordinary compaction.
+    ///
+    /// The fold costs a provider request, so an automatic attempt below the
+    /// capacity limit gets a free dry run with the deterministic ledger first.
+    /// When even that replacement cannot fit, or there is no earlier turn to
+    /// replace, no summarizer request is made. The dry run is not a strict lower
+    /// bound (the fold replaces the parent narrative, drains retired entries over
+    /// 32 and folds in chunks), so a recovery (`recovery`: manual `/compact`, the
+    /// overflow retry, an automatic attempt at or above the capacity limit)
+    /// never uses it: it pays the fold and then fits, threshold budget first and
+    /// the capacity budget as the fallback. Anything that could be recovered
+    /// before is therefore still recovered, and a false skip below capacity only
+    /// defers compaction to capacity.
     fn hybrid_compaction(
         &mut self,
         custom_instructions: Option<&str>,
-        tokens_before: u64,
+        recovery: bool,
+        estimated_before: u64,
     ) -> CompactionResult {
-        let state = self
-            .fold_context(runtime::context_vm::FoldReason::Manual, custom_instructions)
-            .and_then(|_| {
-                self.runtime
-                    .as_ref()
-                    .ok_or_else(|| "context VM runtime is unavailable".to_string())?
-                    .context_vm
-                    .load_state_from_root()
+        self.hybrid_compaction_stats.attempts += 1;
+        self.hybrid_last_fold_requests = 0;
+        let message_tokens = estimate_context_tokens(&self.messages);
+        let preflight = if recovery {
+            None
+        } else {
+            self.hybrid_dry_run_state()
+                .map(|state| self.hybrid_replacement(&state, recovery))
+        };
+        if let Some((dry_run, no_reply)) = preflight.filter(|(dry_run, _)| !dry_run.compacted) {
+            let summary = if no_reply {
+                self.hybrid_compaction_stats.skipped_no_assistant_reply += 1;
+                "Hybrid compaction skipped before the summarizer: the part to replace \
+                 holds no assistant reply yet"
+                    .to_string()
+            } else {
+                self.hybrid_compaction_stats.skipped_no_fit += 1;
+                let reason = if dry_run.summary.is_empty() {
+                    format!("no earlier turn to replace, {message_tokens} tokens of history")
+                } else {
+                    dry_run.summary
+                };
+                format!(
+                    "Hybrid compaction skipped before the summarizer: the replacement \
+                     cannot fit ({reason})"
+                )
+            };
+            return CompactionResult {
+                summary,
+                messages: self.messages.clone(),
+                compacted: false,
+                details: CompactionDetails::default(),
+                first_kept_entry_id: String::new(),
+                tokens_before: message_tokens,
+                tokens_after: message_tokens,
+                usage: None,
+            };
+        }
+        // Count the summarizer requests the fold really sends.
+        let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let original = self.summarizer.clone();
+        if let Some(inner) = original.clone() {
+            let counter = sent.clone();
+            let mut counted = Summarizer::new(move |request| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                inner.summarize(request)
             });
-        match state {
-            Ok(state) => {
-                // The replacement must land under the threshold that
-                // triggered it, beside everything sent outside `messages`.
-                let threshold = compaction_threshold(
-                    self.context_window,
-                    &CompactionSettings {
-                        enabled: true,
-                        ..self.compaction
-                    },
-                )
-                .unwrap_or(self.context_window);
-                compact_messages_with_summary(
-                    &self.messages,
-                    self.compaction.keep_recent_tokens,
-                    &runtime::context_vm::render_ledger(&state),
-                    threshold.saturating_sub(self.estimated_request_overhead_tokens()),
-                )
+            if let Some(budget) = original.as_ref().and_then(Summarizer::input_budget) {
+                counted = counted.with_input_budget(budget);
             }
+            self.summarizer = Some(counted);
+        }
+        let folded =
+            self.fold_context(runtime::context_vm::FoldReason::Manual, custom_instructions);
+        self.summarizer = original;
+        self.hybrid_last_fold_requests = sent.load(std::sync::atomic::Ordering::SeqCst);
+        let state = folded.and_then(|_| {
+            self.runtime
+                .as_ref()
+                .ok_or_else(|| "context VM runtime is unavailable".to_string())?
+                .context_vm
+                .load_state_from_root()
+        });
+        match state {
+            // The budget is recomputed: the fold can change what is sent
+            // outside `messages`.
+            Ok(state) => self.hybrid_replacement(&state, recovery).0,
+            // A failed fold reports the full request estimate, as it always did.
             Err(error) => CompactionResult {
                 summary: error,
                 messages: self.messages.clone(),
                 compacted: false,
                 details: CompactionDetails::default(),
                 first_kept_entry_id: String::new(),
-                tokens_before,
-                tokens_after: tokens_before,
+                tokens_before: estimated_before,
+                tokens_after: estimated_before,
                 usage: None,
             },
         }
     }
 
+    /// Preflight skips so far: attempts that ended before the summarizer.
+    fn hybrid_preflight_skips(&self) -> u64 {
+        self.hybrid_compaction_stats.skipped_no_fit
+            + self.hybrid_compaction_stats.skipped_no_assistant_reply
+    }
+
+    /// Account for a finished hybrid compaction. `skipped_before` is
+    /// [`Self::hybrid_preflight_skips`] when it started: a preflight skip is
+    /// counted where it happens and paid for nothing. `trigger_tokens` is the
+    /// context size on the trigger's scale (the calibrated count the automatic
+    /// trigger passed in, or the same count taken at the start of a manual
+    /// attempt, before a commit clears the provider measurement). The backoff
+    /// records it, so the later `tokens < failed_at` check compares like with
+    /// like. Any other compaction that did
+    /// not apply is `notAppliedAfterFold` when the fold sent a summarizer
+    /// request and `notAppliedOther` when it did not (no summarizer, no chunk
+    /// fitting its window, a failed fold, a session write or rebase failure).
+    /// Either starts the backoff, unless the attempt was a recovery: a recovery
+    /// is never deferred and never records one, so it is retried every turn as
+    /// before.
+    fn note_hybrid_outcome(
+        &mut self,
+        skipped_before: u64,
+        result: &CompactionResult,
+        trigger_tokens: u64,
+        recovery: bool,
+    ) {
+        if result.compacted {
+            let stats = &mut self.hybrid_compaction_stats;
+            stats.applied += 1;
+            stats.context_tokens_before += result.tokens_before;
+            stats.context_tokens_after += result.tokens_after;
+            // A replacement that did not shrink the history changed nothing
+            // the trigger can see: wait for growth like after a failed fold.
+            self.clear_hybrid_backoff();
+            if !recovery && result.tokens_after >= result.tokens_before {
+                self.arm_hybrid_backoff(trigger_tokens);
+            }
+        } else if self.hybrid_preflight_skips() == skipped_before {
+            if self.hybrid_last_fold_requests > 0 {
+                self.hybrid_compaction_stats.not_applied_after_fold += 1;
+            } else {
+                self.hybrid_compaction_stats.not_applied_other += 1;
+            }
+            if !recovery {
+                self.arm_hybrid_backoff(trigger_tokens);
+            }
+        }
+    }
+
+    /// Record a failed automatic attempt at `failed_at` tokens, with the limits it ran under.
+    fn arm_hybrid_backoff(&mut self, failed_at: u64) {
+        self.hybrid_fold_backoff = Some(failed_at);
+        self.hybrid_fold_backoff_settings = Some((self.context_window, self.compaction));
+    }
+
+    fn clear_hybrid_backoff(&mut self) {
+        self.hybrid_fold_backoff = None;
+        self.hybrid_fold_backoff_settings = None;
+    }
+
+    /// Automatic compaction (the turn loop's trigger). In hybrid mode it
+    /// stands down after a paid fold that was not applied until the context
+    /// has grown by `keep_recent_tokens`. The backoff only ever defers an
+    /// attempt below the capacity limit (`context_window - reserve_tokens`).
+    /// From the capacity limit up the attempt is a recovery: it is never
+    /// deferred, never records a backoff, budgets against the capacity and
+    /// skips the dry run and the assistant-reply rule, so it is retried every
+    /// turn exactly as before the backoff existed. Manual `/compact` and the
+    /// provider overflow retry call [`Self::compact`] and are the same.
+    pub(crate) fn compact_automatic(&mut self, tokens: u64) -> CompactionResult {
+        let capacity = self
+            .context_window
+            .saturating_sub(self.compaction.reserve_tokens);
+        if self.context_vm_mode() == ContextVmMode::Hybrid {
+            if let Some(failed_at) = self.hybrid_fold_backoff {
+                let keep = self.compaction.keep_recent_tokens;
+                let retry_at = failed_at.saturating_add(keep);
+                if self.hybrid_fold_backoff_settings != Some((self.context_window, self.compaction))
+                {
+                    // The limits changed since the failure.
+                    self.clear_hybrid_backoff();
+                } else if tokens.saturating_add(keep) < failed_at {
+                    // The history was replaced since the failure. A smaller
+                    // drop can be the recorded size's scale (a byte estimate
+                    // against a later provider count), not a replacement.
+                    self.clear_hybrid_backoff();
+                } else if tokens < retry_at && tokens < capacity {
+                    self.hybrid_compaction_stats.attempts += 1;
+                    self.hybrid_compaction_stats.skipped_backoff += 1;
+                    let message_tokens = estimate_context_tokens(&self.messages);
+                    return CompactionResult {
+                        summary: format!(
+                            "Hybrid compaction deferred: the last attempt at ~{failed_at} tokens \
+                             was not applied; retrying at ~{retry_at} tokens (now ~{tokens})"
+                        ),
+                        messages: self.messages.clone(),
+                        compacted: false,
+                        details: CompactionDetails::default(),
+                        first_kept_entry_id: String::new(),
+                        tokens_before: message_tokens,
+                        tokens_after: message_tokens,
+                        usage: None,
+                    };
+                }
+            }
+        }
+        self.compact_with(None, tokens >= capacity, Some(tokens))
+    }
+
+    /// Compact now. This is the manual and recovery entry point: it never
+    /// waits for the hybrid backoff and, in hybrid mode, budgets the
+    /// replacement against the capacity limit.
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
+        self.compact_with(custom_instructions, true, None)
+    }
+
+    /// `trigger_tokens` is the size the automatic trigger measured; a manual
+    /// call has none and takes the calibrated count itself.
+    fn compact_with(
+        &mut self,
+        custom_instructions: Option<&str>,
+        recovery: bool,
+        trigger_tokens: Option<u64>,
+    ) -> CompactionResult {
         if self.context_vm_mode() == ContextVmMode::Active {
             self.is_compacting = true;
             let estimated_before = self.estimated_context_tokens();
@@ -4620,8 +4972,14 @@ impl Agent {
                 estimated_tokens: estimated_before,
             });
         }
+        let skipped_before = self.hybrid_preflight_skips();
+        let trigger_tokens = if self.context_vm_mode() == ContextVmMode::Hybrid {
+            trigger_tokens.unwrap_or_else(|| self.calibrated_context_tokens())
+        } else {
+            0
+        };
         let result = if self.context_vm_mode() == ContextVmMode::Hybrid {
-            self.hybrid_compaction(custom_instructions, estimated_before)
+            self.hybrid_compaction(custom_instructions, recovery, estimated_before)
         } else {
             // Only the active branch's ancestry may seed the next summary; an
             // abandoned branch's compaction describes a conversation that the
@@ -4676,6 +5034,9 @@ impl Agent {
             result
         };
         let result = self.commit_compaction(result);
+        if self.context_vm_mode() == ContextVmMode::Hybrid {
+            self.note_hybrid_outcome(skipped_before, &result, trigger_tokens, recovery);
+        }
         let estimated_after = self.estimated_context_tokens();
         if let Some(runtime) = &self.runtime {
             runtime.emit_observe(crate::RuntimeEvent::PostCompact {
