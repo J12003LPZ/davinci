@@ -289,6 +289,18 @@ impl AgentMailbox {
         seen.remove(id);
     }
 
+    /// Keep results on the coordinator journal, independently of queue admission.
+    pub fn record_worker_result(&self, message: &AgentMessage) -> Result<(), MailboxError> {
+        self.announce_durably(
+            message.run_id,
+            Some(message.from),
+            RuntimeEvent::AgentResultRecorded {
+                message: message.clone(),
+            },
+        )
+        .map_err(MailboxError::NotRecorded)
+    }
+
     /// Send a message to an agent. Rejects messages to terminal agents or duplicates.
     /// Wakes up idle agents to `Running`.
     pub fn send(&self, message: AgentMessage) -> Result<(), MailboxError> {
@@ -408,22 +420,26 @@ impl AgentMailbox {
             }
         }
 
-        // 5. Emit AgentMessageQueued event
-        if let Some(bus) = &self.bus {
-            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let envelope = RuntimeEventEnvelope::new(
-                seq,
-                message.run_id,
-                None,
-                Some(message.from),
-                None,
-                RuntimeEvent::AgentMessageQueued {
-                    to: message.to,
-                    message_id: message.id,
-                    message: Some(message.clone()),
-                },
-            );
-            bus.emit_observe(envelope);
+        // Acceptance requires the same durable queue record as host steering.
+        if let Err(reason) = self.announce_durably(
+            message.run_id,
+            Some(message.from),
+            RuntimeEvent::AgentMessageQueued {
+                to: message.to,
+                message_id: message.id,
+                message: Some(message.clone()),
+            },
+        ) {
+            if let Ok(mut queues) = self.queues.write() {
+                if let Some(queue) = queues.get_mut(&message.to) {
+                    queue.retain(|queued| queued.id != message.id);
+                }
+            }
+            if let Ok(mut receipts) = self.steering_receipts.write() {
+                receipts.remove(&message.id);
+            }
+            self.release_message_id(&message.id);
+            return Err(MailboxError::NotRecorded(reason));
         }
 
         Ok(())
@@ -1735,6 +1751,9 @@ mod tests {
                 self.inner.on_event(event)
             }
             fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+                if !matches!(event.payload, RuntimeEvent::AgentMessageDelivered { .. }) {
+                    return self.inner.record_durably(event);
+                }
                 let left = self.allowed.load(Ordering::SeqCst);
                 if left == 0 {
                     return Err("injected log failure".into());

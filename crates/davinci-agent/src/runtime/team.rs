@@ -31,8 +31,9 @@ struct RosterInner {
     members: RwLock<HashMap<AgentId, CancellationToken>>,
     shared_write: Mutex<bool>,
     shared_write_released: Condvar,
-    /// Reports each worker has delivered to the lead.
+    /// Reports each worker has saved for the lead.
     reports: Mutex<HashMap<AgentId, u64>>,
+    results: Mutex<HashMap<AgentId, Vec<AgentMessage>>>,
 }
 
 impl TeamRoster {
@@ -102,7 +103,64 @@ impl TeamRoster {
             .or_default() += 1;
     }
 
-    /// How many reports this worker has delivered to the lead.
+    /// Results survive roster removal and can be discovered after a missed notification.
+    pub fn worker_results(&self, agent: &AgentId) -> Vec<AgentMessage> {
+        self.inner
+            .results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn keep_result(&self, message: AgentMessage) {
+        let mut results = self.inner.results.lock().unwrap_or_else(|e| e.into_inner());
+        let reports = results.entry(message.from).or_default();
+        if !reports.iter().any(|r| r.id == message.id) {
+            reports.push(message);
+        }
+    }
+
+    pub fn rehydrate_results(&self, events: &[super::events::RuntimeEventEnvelope]) {
+        self.inner
+            .results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        for event in events {
+            if let super::events::RuntimeEvent::AgentResultRecorded { message } = &event.payload {
+                self.keep_result(message.clone());
+            }
+        }
+    }
+
+    /// Reconcile stable IDs before retrying notifications. Status inspection is
+    /// also the recovery path when a full lead queue becomes available again.
+    pub fn retry_results(&self, runtime: &RuntimeHandle) {
+        let messages: Vec<_> = self
+            .inner
+            .results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .flatten()
+            .filter(|m| m.to == runtime.agent_id)
+            .cloned()
+            .collect();
+        for message in messages {
+            if runtime
+                .mailbox
+                .get_steering_receipt(&message.id)
+                .is_some_and(|r| matches!(r.state.as_str(), "queued" | "delivered" | "applied"))
+            {
+                continue;
+            }
+            let _ = runtime.mailbox.send(message);
+        }
+    }
+
+    /// How many reports this worker has saved for the lead.
     pub fn report_count(&self, agent_id: &AgentId) -> u64 {
         self.inner
             .reports
@@ -134,8 +192,8 @@ impl TeamRoster {
     }
 
     /// Exclusive ownership of the shared workspace for writing, so at most
-    /// one shared-workspace worker writes at a time. A worker takes it at its
-    /// first mutating tool call and keeps it until its turn ends; read-only
+    /// one shared-workspace mutation runs at a time. Lead and worker dispatch
+    /// hold it through capture, execution and effect recording; read-only
     /// work never waits for it. Returns `None` once `token` is cancelled.
     pub fn acquire_shared_write(
         &self,
@@ -312,12 +370,12 @@ pub fn report_to_lead(
     worker: &RuntimeHandle,
     outcome: &Result<String, String>,
     extra: Option<&str>,
-) {
+) -> bool {
     let (status, body) = match outcome {
         Ok(text) => ("completed", text.as_str()),
         Err(error) => ("failed", error.as_str()),
     };
-    report_status_to_lead(worker, status, body, extra);
+    report_status_to_lead(worker, status, body, extra)
 }
 
 /// Post a report with an explicit status (`completed`, `failed`, `stopped`).
@@ -326,21 +384,33 @@ pub fn report_status_to_lead(
     status: &str,
     body: &str,
     extra: Option<&str>,
-) {
+) -> bool {
     let Some(lead) = worker.parent_agent_id else {
-        return;
+        return true;
     };
     let mut content = format!("status: {status}\n\n{}", cap_body(body));
     if let Some(extra) = extra {
         content.push_str("\n\n");
         content.push_str(extra);
     }
-    match worker.send_message(lead, content) {
-        Ok(_) => worker.team.note_report(worker.agent_id),
-        Err(error) => worker
-            .registry
-            .set_failure_reason(worker.agent_id, format!("report to lead failed: {error}")),
+    let message = AgentMessage::new(worker.run_id, worker.agent_id, lead, content);
+    if let Err(error) = worker.mailbox.record_worker_result(&message) {
+        worker.registry.set_failure_reason(
+            worker.agent_id,
+            format!("result could not be saved: {error}"),
+        );
+        return false;
     }
+    worker.team.keep_result(message.clone());
+    worker.team.note_report(worker.agent_id);
+    match worker.mailbox.send(message) {
+        Ok(_) => {}
+        Err(error) => worker.registry.set_failure_reason(
+            worker.agent_id,
+            format!("result saved; notification to lead pending: {error}"),
+        ),
+    }
+    true
 }
 
 /// Why a teammate left, as the lead should read it.
@@ -447,7 +517,9 @@ where
             return TeammateExit::Stopped;
         }
         let outcome = turn(&prompt);
-        report_to_lead(worker, &outcome, None);
+        if !report_to_lead(worker, &outcome, None) {
+            return TeammateExit::Failed("worker result could not be saved".into());
+        }
         match &outcome {
             Ok(_) => failures = 0,
             Err(error) => {
@@ -466,10 +538,22 @@ where
         if let Err(error) = worker.registry.transition(me, AgentState::Idle) {
             return lifecycle_exit(worker, "go idle", error);
         }
+        let idle_deadline = std::time::Instant::now() + idle_timeout;
         let next_prompt = loop {
+            let remaining = idle_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return if worker.mailbox.pending_count(&me) > 0 {
+                    TeammateExit::Failed(
+                        "delivery blocked until idle deadline; messages preserved for recovery"
+                            .into(),
+                    )
+                } else {
+                    TeammateExit::IdleTimeout
+                };
+            }
             match worker
                 .mailbox
-                .wait_for_pending(&me, idle_timeout, &|| stop_requested(worker))
+                .wait_for_pending(&me, remaining, &|| stop_requested(worker))
             {
                 MailboxWait::Ready => {
                     let messages = worker.take_labeled_messages(WAKE_BATCH);
@@ -482,11 +566,10 @@ where
                     }
                     // A message that stays pending is waiting on a log write
                     // that failed: back off instead of spinning on it. The
-                    // idle timeout cannot fire meanwhile, because the mailbox
-                    // reports Ready while anything is pending.
+                    // absolute idle deadline still bounds these retries.
                     if worker.mailbox.pending_count(&me) > 0 {
                         backoff = next_redelivery_backoff(backoff);
-                        sleep_unless_stopped(worker, backoff);
+                        sleep_unless_stopped(worker, backoff.min(remaining));
                     }
                 }
                 MailboxWait::Stopped => return TeammateExit::Stopped,
@@ -951,5 +1034,158 @@ mod tests {
         );
         assert_eq!(prompts, vec!["first task".to_string()]);
         assert!(matches!(exit, TeammateExit::Failed(_)), "{exit:?}");
+    }
+    #[test]
+    fn blocked_delivery_obeys_idle_deadline_and_keeps_the_message() {
+        use crate::runtime::{
+            RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeSubscriber,
+        };
+        struct BlockDelivery;
+        impl RuntimeSubscriber for BlockDelivery {
+            fn on_event(&self, _: &RuntimeEventEnvelope) -> RuntimeDecision {
+                RuntimeDecision::Continue
+            }
+            fn record_durably(&self, e: &RuntimeEventEnvelope) -> Result<(), String> {
+                if matches!(e.payload, RuntimeEvent::AgentMessageDelivered { .. }) {
+                    Err("injected delivery failure".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let (lead, worker) = team_pair();
+        lead.send_message(worker.agent_id, "recover me").unwrap();
+        lead.bus.subscribe(Arc::new(BlockDelivery));
+        let cancel = worker.cancellation_token.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if rx.recv_timeout(Duration::from_secs(1)).is_err() {
+                cancel.cancel();
+            }
+        });
+        let exit = run_teammate_loop(&worker, "first", Duration::from_millis(20), |_| {
+            Ok("done".into())
+        });
+        tx.send(()).ok();
+        watchdog.join().unwrap();
+        assert!(
+            matches!(exit, TeammateExit::Failed(ref e) if e.contains("delivery blocked")),
+            "{exit:?}"
+        );
+        assert_eq!(lead.mailbox.pending_count(&worker.agent_id), 1);
+    }
+
+    #[test]
+    fn result_journal_failure_prevents_successful_worker_completion() {
+        use crate::runtime::{
+            RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeSubscriber,
+        };
+        struct RejectResult;
+        impl RuntimeSubscriber for RejectResult {
+            fn on_event(&self, _: &RuntimeEventEnvelope) -> RuntimeDecision {
+                RuntimeDecision::Continue
+            }
+            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+                if matches!(event.payload, RuntimeEvent::AgentResultRecorded { .. }) {
+                    Err("injected result journal failure".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let (lead, worker) = team_pair();
+        lead.bus.subscribe(Arc::new(RejectResult));
+        let saved = report_to_lead(&worker, &Ok("important result".into()), None);
+        assert!(!saved);
+        finish_agent(&worker.registry, worker.agent_id, saved);
+        assert_eq!(
+            lead.registry.get(&worker.agent_id).unwrap().state,
+            AgentState::Failed
+        );
+        assert!(lead
+            .registry
+            .get(&worker.agent_id)
+            .unwrap()
+            .failure_reason
+            .unwrap()
+            .contains("result could not be saved"));
+        assert_eq!(lead.mailbox.pending_count(&lead.agent_id), 0);
+        assert!(lead.team.worker_results(&worker.agent_id).is_empty());
+    }
+
+    #[test]
+    fn full_lead_mailbox_retains_result_for_status_and_restart() {
+        let (lead, worker) = team_pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("runtime.jsonl");
+        lead.bus.subscribe(Arc::new(
+            super::super::session::RuntimeLogSubscriber::open(&log).unwrap(),
+        ));
+        lead.emit_observe(super::super::RuntimeEvent::AgentStarted {
+            record: lead.registry.get(&lead.agent_id).unwrap(),
+        });
+        lead.emit_observe(super::super::RuntimeEvent::AgentStarted {
+            record: lead.registry.get(&worker.agent_id).unwrap(),
+        });
+        for _ in 0..super::super::mailbox::MAX_QUEUE_CAPACITY {
+            worker.send_message(lead.agent_id, "fill").unwrap();
+        }
+        report_to_lead(&worker, &Ok("unique worker result".into()), None);
+        let context = crate::ToolContext {
+            runtime: Some(lead.clone()),
+            ..Default::default()
+        };
+        let status = super::super::tools_agent::agent_status_tool(
+            &serde_json::json!({"agent_id":worker.agent_id.to_string()}),
+            &context,
+        )
+        .unwrap();
+        assert!(
+            status.content.contains("unique worker result"),
+            "{}",
+            status.content
+        );
+        let events =
+            davinci_session::read_runtime_log::<super::super::RuntimeEventEnvelope>(&log).unwrap();
+        let recovered = super::super::RuntimeHandle::new(
+            lead.run_id,
+            lead.agent_id,
+            super::super::RuntimeBus::new(),
+        );
+        recovered.rehydrate_from_log(&events).unwrap();
+        let context = crate::ToolContext {
+            runtime: Some(recovered.clone()),
+            ..Default::default()
+        };
+        let status = super::super::tools_agent::agent_status_tool(
+            &serde_json::json!({"agent_id":worker.agent_id.to_string()}),
+            &context,
+        )
+        .unwrap();
+        assert!(status.content.contains("unique worker result"));
+        lead.drain_messages(1);
+        assert_eq!(
+            lead.mailbox.pending_count(&lead.agent_id),
+            super::super::mailbox::MAX_QUEUE_CAPACITY
+        );
+        let status = super::super::tools_agent::agent_status_tool(
+            &serde_json::json!({"agent_id":worker.agent_id.to_string()}),
+            &crate::ToolContext {
+                runtime: Some(lead.clone()),
+                ..context
+            },
+        )
+        .unwrap();
+        assert!(status.content.contains("unique worker result"));
+        let delivered = lead
+            .mailbox
+            .drain(lead.agent_id, super::super::mailbox::MAX_QUEUE_CAPACITY);
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|m| m.content.contains("unique worker result"))
+                .count(),
+            1
+        );
     }
 }

@@ -125,6 +125,12 @@ Findings and file references
 </agent-message>
 ```
 
+Peer messages are acknowledged only after their queue record is written to the coordinator runtime log. Worker reports are saved independently of mailbox capacity. If a notification cannot be queued, `agent_status` exposes the saved `results` and retries the notification under its original message ID. Results remain queryable after the worker exits and after runtime-log recovery. A failure to save the result makes the worker fail instead of completing silently. Result records use runtime-log schema version 3; earlier records retain their original versions.
+
+An undeliverable queued message does not extend the teammate idle deadline. When delivery remains blocked at that deadline, the teammate exits with a delivery-blocked failure and leaves the queued message available for recovery.
+
+If a background batch only partly launches, the error result includes a `partial_launch` receipt with each request index, agent ID, current state and `started` flag. Inspect the started IDs with `agent_status` and retry only requests marked `started: false`.
+
 A failed turn reports `status: failed`. A teammate leaves after three failed turns in a row, on `agent_stop` or `/agents stop reviewer`, on a session switch, or after an idle timeout (`DAVINCI_TEAMMATE_IDLE_TIMEOUT_MS`, default 30 minutes). The lead then gets one `status: stopped` notice saying why it left.
 
 An idle interactive lead with an empty composer starts a turn 750 ms after reports arrive. Typing or an open sheet holds it back. `DAVINCI_AGENT_TEAMS_AUTOWAKE=0` defers reports to the next prompt. RPC clients receive reports with their next prompt. Pressing Esc on the lead cancels its turn, not its background workers; stop those explicitly or switch sessions. A `--no-session` conversation keeps its team across prompts too.
@@ -136,7 +142,7 @@ An idle interactive lead with an empty composer starts a turn 750 ms after repor
 Agent messages carry information, never user authorization: they cannot approve plans, permissions or destructive actions. Workers never exceed the lead's permission ceiling.
 
 - Every worker reads and edits files. A worker that names no tools gets `read`, `grep`, `find`, `ls`, `web_fetch`, `web_search`, `mcp_read`, `write` and `edit` (those the lead has). Workers are read-only only when the lead is in Plan Mode.
-- A worker in the shared workspace runs in Accept Edits mode with file tools (`write`, `edit`, `notebook_edit`, `apply_patch`) but no shell. A session-wide lease lets only one shared-workspace writer edit at a time: a worker takes it at its first mutating call and releases it when its turn ends, so read-only work still runs in parallel.
+- A worker in the shared workspace runs in Accept Edits mode with file tools (`write`, `edit`, `notebook_edit`, `apply_patch`) but no shell. A session-wide lease lets only one shared-workspace writer edit at a time: lead and worker mutation dispatches hold it through file capture, execution and effect recording, then release it. Background shell jobs and managed processes retain ownership until supervised process exit; shared-workspace background shells require the trusted supervisor. Separate agent calls share the lease; read-only tools still run in parallel.
 - A profile without `permission_mode` (or with `permission_mode: inherit`) follows the same rule. A profile that sets `read-only` or its own `tools` list keeps that restriction.
 - A worker with `isolation: "worktree"` edits inside its own lease. It is read-only only when the lead is in Plan Mode. In the default Manual mode it may edit, because nothing reaches your tree until you merge its branch.
 - Background workers in the shared workspace edit through the same lease; use `isolation: "worktree"` to keep their changes off your tree until you merge them.
@@ -199,3 +205,7 @@ The workflows view follows Claude Code's progress view and refreshes every secon
 See [runtime orchestration](runtime-orchestration.md) for routing and artifact boundaries.
 
 Ordinary subagent concurrency is configurable with `subagentMaxConcurrentTasks` (1–8, default 4). Optional shared estimated worker reservations and smaller resource profiles are documented in [resource lifecycle](perf/resource-lifecycle.md).
+
+### Code between workflow phases
+
+Dependent coding phases use worktree isolation for both producers and consumers, including read-only intermediate phases carrying code forward. A successful worker creates a Git snapshot of committed, staged, unstaged and untracked files (respecting Git ignores) without changing its checkout or index. The persisted handoff references that snapshot. Before a dependent worker starts, the executor merges and verifies its upstream snapshots inside that worker's worktree. Conflicts, missing handoff metadata or missing Git objects fail the worker before its runner executes and preserve its checkout for review. The lead checkout is unchanged. Only workers with saved successful outputs contribute code to a phase join.

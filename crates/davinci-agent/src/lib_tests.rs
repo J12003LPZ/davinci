@@ -2548,6 +2548,14 @@ fn a_background_job_is_announced_to_the_model_before_its_next_completion() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = Agent::new(default_system_prompt());
     agent.cwd = dir.path().to_path_buf();
+    agent.tool_context.foreground_supervisor = Some(crate::jobs::supervisor::SupervisorCommand {
+        executable: std::env::current_exe().unwrap(),
+        argv: vec![
+            "--exact".into(),
+            "tools::foreground::tests::foreground_supervisor_fixture".into(),
+            "--nocapture".into(),
+        ],
+    });
     agent.prompt("build it");
     let events = agent
         .run_loop(scripted_tool_calls(vec![

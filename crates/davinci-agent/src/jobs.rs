@@ -108,12 +108,25 @@ impl OutputBuffer {
 
 struct Shared {
     status: Mutex<JobStatus>,
+    // The process exit watcher releases ownership, even after the tool returns.
+    workspace_write: Mutex<(bool, Option<crate::runtime::team::SharedWriteLease>)>,
     output: Mutex<OutputBuffer>,
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
     finished_at: Mutex<Option<Instant>>,
     supports_stdin: bool,
     supervisor: Mutex<Option<Arc<supervisor::Supervisor>>>,
+}
+
+impl Shared {
+    fn release_shared_write(&self) {
+        let mut write = self
+            .workspace_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        write.0 = true;
+        write.1.take();
+    }
 }
 
 pub struct Job {
@@ -137,6 +150,17 @@ pub struct Job {
 }
 
 impl Job {
+    pub(crate) fn hold_shared_write(&self, lease: crate::runtime::team::SharedWriteLease) {
+        let mut write = self
+            .shared
+            .workspace_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !write.0 {
+            write.1 = Some(lease);
+        }
+    }
+
     pub fn status(&self) -> JobStatus {
         *self
             .shared
@@ -398,6 +422,7 @@ impl SupervisedLaunch {
     ) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             status: Mutex::new(JobStatus::Running),
+            workspace_write: Mutex::new((false, None)),
             output: Mutex::new(OutputBuffer::default()),
             child: Mutex::new(None),
             stdin: Mutex::new(None),
@@ -511,6 +536,7 @@ impl JobBook {
         let supports_stdin = stdin.is_some();
         let shared = Arc::new(Shared {
             status: Mutex::new(JobStatus::Running),
+            workspace_write: Mutex::new((false, None)),
             output: Mutex::new(OutputBuffer::default()),
             child: Mutex::new(None),
             stdin: Mutex::new(stdin),
@@ -599,6 +625,7 @@ impl JobBook {
                             .unwrap_or_else(|err| err.into_inner())
                             .take(),
                     );
+                    shared.release_shared_write();
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(25));

@@ -2892,6 +2892,64 @@ Issue the call again if it is still needed.";
             } else if name == "batch" && depth == 0 {
                 self.run_batch_with_parent_operation(cwd, id, args, parent_operation_id)
             } else {
+                // Coordination tools above must never wait while holding the
+                // workspace: delegated workers may need it to finish. Actual
+                // mutation dispatch (including lead and custom tools) is serialized.
+                let mut shared_write = if self.side_effect_for_tool(name)
+                    == crate::tool_ledger::ToolSideEffect::Mutating
+                    && !matches!(
+                        name,
+                        "job_kill"
+                            | "write_stdin"
+                            | "agent_stop"
+                            | "agent_message"
+                            | "process_start"
+                            | "process_stop"
+                            | "process_write"
+                    ) {
+                    if let Some(runtime) = &self.runtime {
+                        let isolated = runtime
+                            .registry
+                            .get(&runtime.agent_id)
+                            .and_then(|r| r.worktree)
+                            .is_some_and(|path| {
+                                path.canonicalize()
+                                    .ok()
+                                    .zip(cwd.canonicalize().ok())
+                                    .is_some_and(|(worktree, current)| worktree == current)
+                            });
+                        if isolated {
+                            None
+                        } else {
+                            match runtime
+                                .team
+                                .acquire_shared_write(Some(&runtime.cancellation_token))
+                            {
+                                Some(lease) => Some(lease),
+                                None => {
+                                    return crate::ToolResult {
+                                        content:
+                                            "Cancelled while waiting for shared workspace writer"
+                                                .into(),
+                                        is_error: true,
+                                        details: None,
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if shared_write.is_some()
+                    && matches!(name, "bash" | "powershell" | "exec_command")
+                    && args.get("background").and_then(Value::as_bool) == Some(true)
+                    && self.tool_context.foreground_supervisor.is_none()
+                {
+                    return crate::ToolResult { content: "Shared-workspace background commands require the trusted process supervisor; run in the foreground or use an isolated worktree".into(), is_error: true, details: None };
+                }
                 let mutating = crate::runtime::workflow::validate::is_mutating_tool(name);
                 let targets = if mutating {
                     crate::runtime::contracts::extract_tool_targets(name, args)
@@ -3055,6 +3113,25 @@ Issue the call again if it is still needed.";
                 } else {
                     execute_tool_with(cwd, name, args, &context)
                 };
+                let background_job = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.details.as_ref())
+                    .and_then(|details| {
+                        if matches!(name, "bash" | "powershell" | "exec_command") {
+                            details.get("jobId").and_then(Value::as_u64)
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(job_id) = background_job {
+                    if let Some(lease) = shared_write.take() {
+                        let jobs = context.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(job) = jobs.get(job_id as u32) {
+                            job.hold_shared_write(lease);
+                        }
+                    }
+                }
                 drop(retrieval_timing);
                 drop(integration_timing);
                 if let Ok(result) = &result {
@@ -6501,6 +6578,154 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn shared_background_shell_without_supervision_is_rejected_before_launch() {
+        let root = tempdir().unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        runtime.ensure_lead_registered("mock", "mock", root.path());
+        let mut agent = Agent::new("unsupervised writer").with_runtime(runtime);
+        agent.tools = vec!["exec_command".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            crate::PermissionMode::AlwaysApprove,
+        )));
+        let args = json!({"command":"echo unowned", "background":true});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "background", "exec_command", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root.path(), "background", "exec_command", &args, 0);
+        assert!(
+            result.is_error,
+            "unsupervised background process was launched"
+        );
+        assert!(result.content.contains("supervisor"), "{}", result.content);
+        assert!(agent
+            .tool_context
+            .jobs
+            .lock()
+            .unwrap()
+            .summaries()
+            .is_empty());
+    }
+
+    #[test]
+    fn background_shell_keeps_workspace_lease_until_process_exit() {
+        let root = tempdir().unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        runtime.ensure_lead_registered("mock", "mock", root.path());
+        let mut agent = Agent::new("background writer").with_runtime(runtime.clone());
+        agent.tools = vec!["exec_command".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            crate::PermissionMode::AlwaysApprove,
+        )));
+        agent.tool_context.foreground_supervisor =
+            Some(crate::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: vec![
+                    "--exact".into(),
+                    "tools::foreground::tests::foreground_supervisor_fixture".into(),
+                    "--nocapture".into(),
+                ],
+            });
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 250; Set-Content -LiteralPath delayed.txt -Value done"
+        } else {
+            "sleep 0.25; printf done > delayed.txt"
+        };
+        let args = json!({"command":command,"background":true});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "background", "exec_command", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root.path(), "background", "exec_command", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        let token = runtime.cancellation_token.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                token.cancel();
+            }
+        });
+        let next_writer = runtime
+            .team
+            .acquire_shared_write(Some(&runtime.cancellation_token));
+        tx.send(()).ok();
+        watchdog.join().unwrap();
+        assert!(
+            next_writer.is_some(),
+            "background job never released its lease"
+        );
+        assert!(
+            root.path().join("delayed.txt").exists(),
+            "lease was released while the process could still write"
+        );
+    }
+
+    #[test]
+    fn shared_writer_dispatch_waits_for_the_lead_lease_and_cancels_without_editing() {
+        let root = tempdir().unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        runtime.ensure_lead_registered("mock", "mock", root.path());
+        let held = runtime.team.acquire_shared_write(None).unwrap();
+        let token = runtime.cancellation_token.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let path = root.path().to_path_buf();
+        let thread = std::thread::spawn(move || {
+            let mut agent = Agent::new("shared writer").with_runtime(runtime);
+            agent.tools = vec!["fixture_mutation".into()];
+            agent.permissions = Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+            ));
+            agent.custom_tool_executor = Some(crate::CustomToolExecutor::new(move |_, _, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::ToolResult {
+                    content: "edited".into(),
+                    is_error: false,
+                    details: None,
+                })
+            }));
+            let args = json!({});
+            assert!(matches!(
+                agent.prepare_tool_call(&path, "edit", "fixture_mutation", &args, 0),
+                Preparation::Ready { .. }
+            ));
+            ready_tx.send(()).unwrap();
+            let result = agent.run_prepared_call(&path, "edit", "fixture_mutation", &args, 0);
+            done_tx.send(result).unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+        token.cancel();
+        drop(held);
+        let bypassed = early.is_ok();
+        let result = early.unwrap_or_else(|_| {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        });
+        thread.join().unwrap();
+        assert!(!bypassed, "mutation bypassed shared writer lease");
+        assert!(result.is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn a_call_with_invalid_arguments_is_answered_with_an_error_and_not_run() {

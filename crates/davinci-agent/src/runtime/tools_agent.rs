@@ -65,6 +65,7 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
         .as_ref()
         .ok_or_else(|| ToolError::Failed("Runtime subsystem not initialized".into()))?;
 
+    runtime.team.retry_results(runtime);
     if let Some(aid_str) = input.get("agent_id").and_then(Value::as_str) {
         let aid = super::team::resolve_agent(runtime, aid_str).map_err(ToolError::Failed)?;
 
@@ -87,6 +88,7 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
             "updated_ms": record.updated_ms,
             "pending_messages": pending_messages,
             "failure_reason": record.failure_reason,
+            "results": runtime.team.worker_results(&aid),
             "worktree": record.worktree.as_ref().map(|p| p.display().to_string()),
         });
 
@@ -108,6 +110,8 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
                     "state": r.state,
                     "model_id": r.model_id,
                     "pending_messages": pending,
+                    "failure_reason": r.failure_reason,
+                    "results": runtime.team.worker_results(&r.id),
                 })
             })
             .collect();

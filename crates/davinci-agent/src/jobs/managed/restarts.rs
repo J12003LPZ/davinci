@@ -20,6 +20,8 @@ pub struct StartOptions {
     pub counters: Arc<crate::SharedCounters>,
     #[serde(skip)]
     pub provenance: Provenance,
+    #[serde(skip)]
+    pub shared_workspace: Option<crate::RuntimeHandle>,
 }
 
 /// Host-provided correlation, never accepted from model arguments or used as authority.
@@ -83,6 +85,7 @@ fn finish_shared(shared: &Shared, exit: &ProcessExit) {
         JobStatus::Exited(exit.code.unwrap_or(-1))
     };
     *shared.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    shared.release_shared_write();
 }
 
 fn finish(shared: &Shared, record: &Record, mut exit: ProcessExit) {

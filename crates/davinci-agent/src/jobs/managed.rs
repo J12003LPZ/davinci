@@ -493,8 +493,24 @@ impl ManagedOwner {
         if abort.load(Ordering::SeqCst) {
             return Err("process startup cancelled".into());
         }
+        // Reuse has already been reconciled. Only a new process needs to wait
+        // for ownership, and it waits outside the process-book locks.
+        let shared_write = options
+            .shared_workspace
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .team
+                    .acquire_shared_write(Some(&runtime.cancellation_token))
+                    .ok_or_else(|| {
+                        "process startup cancelled while waiting for shared workspace".to_string()
+                    })
+            })
+            .transpose()?;
+        validate()?;
         let shared = Arc::new(Shared {
             status: Mutex::new(JobStatus::Running),
+            workspace_write: Mutex::new((false, shared_write)),
             output: Mutex::new(OutputBuffer::default()),
             child: Mutex::new(None),
             stdin: Mutex::new(None),

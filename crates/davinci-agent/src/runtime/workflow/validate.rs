@@ -101,6 +101,8 @@ pub enum WorkflowValidationError {
     },
     #[error("parallel writer violation in phase '{phase}': multiple workers declare mutating tools without worktree isolation")]
     ParallelWriterViolation { phase: String },
+    #[error("worker '{worker}' requires worktree isolation for dependent code handoffs")]
+    CodeHandoffRequiresWorktree { worker: String },
     #[error("worker '{worker}' declares unknown or hidden tool: '{tool}'")]
     HiddenTool { worker: String, tool: String },
     #[error("worker '{worker}' cannot call internal graph tool '{tool}' directly")]
@@ -380,13 +382,88 @@ pub fn validate_workflow_with_capabilities(
         }
     }
 
+    let code_phases = code_lineage_phases(spec, registry);
+    for phase in &spec.phases {
+        let receives_code = phase
+            .depends_on
+            .iter()
+            .any(|d| code_phases.contains(d.as_str()));
+        let has_dependents = spec.phases.iter().any(|p| p.depends_on.contains(&phase.id));
+        for worker in &phase.workers {
+            let produces_code = worker
+                .tools
+                .iter()
+                .any(|t| is_mutating_tool_with_registry(t, registry));
+            if (receives_code || (has_dependents && produces_code))
+                && worker.isolation.as_deref() != Some("worktree")
+            {
+                return Err(WorkflowValidationError::CodeHandoffRequiresWorktree {
+                    worker: worker.id.clone(),
+                });
+            }
+        }
+    }
+
     Ok(())
+}
+
+pub(crate) fn code_lineage_phases(
+    spec: &WorkflowSpec,
+    registry: &RuntimeCapabilityRegistry,
+) -> HashSet<String> {
+    let mut code_phases: HashSet<String> = spec
+        .phases
+        .iter()
+        .filter(|p| {
+            p.workers.iter().any(|w| {
+                w.tools
+                    .iter()
+                    .any(|t| is_mutating_tool_with_registry(t, registry))
+            })
+        })
+        .map(|p| p.id.clone())
+        .collect();
+    // Carry code lineage through read-only intermediate phases too.
+    loop {
+        let before = code_phases.len();
+        for phase in &spec.phases {
+            if phase
+                .depends_on
+                .iter()
+                .any(|d| code_phases.contains(d.as_str()))
+            {
+                code_phases.insert(phase.id.clone());
+            }
+        }
+        if code_phases.len() == before {
+            break;
+        }
+    }
+    code_phases
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::workflow::spec::*;
+
+    #[test]
+    fn dependent_code_phases_require_isolated_sources_and_consumers() {
+        let mut spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        spec.phases[0].workers.truncate(1);
+        spec.phases[0].workers[0].tools = vec!["write".into()];
+        spec.phases[0].workers[0].isolation = Some("shared".into());
+        assert!(
+            validate_workflow(&spec).is_err(),
+            "upstream code would never be handed off"
+        );
+        spec.phases[0].workers[0].isolation = Some("worktree".into());
+        spec.phases[1].workers[0].isolation = Some("shared".into());
+        assert!(
+            validate_workflow(&spec).is_err(),
+            "downstream cannot receive the snapshot in a shared checkout"
+        );
+    }
 
     #[test]
     fn registry_metadata_controls_custom_tool_mutation_classification() {

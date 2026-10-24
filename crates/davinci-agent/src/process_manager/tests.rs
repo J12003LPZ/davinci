@@ -46,6 +46,38 @@ fn server() -> Value {
 }
 
 #[test]
+fn shared_managed_process_keeps_writer_ownership_until_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = crate::RuntimeHandle::new(
+        crate::RunId::new(),
+        crate::AgentId::new(),
+        crate::RuntimeBus::new(),
+    );
+    runtime.ensure_lead_registered("mock", "mock", root.path());
+    let agent = agent(root.path(), PermissionMode::AlwaysApprove).with_runtime(runtime.clone());
+    let args = json!({"executable":"node", "argv":["-e", "setTimeout(()=>require('fs').writeFileSync('delayed.txt','done'),250)"]});
+    let result = call(&agent, "start", "process_start", &args);
+    assert!(!result.is_error, "{}", result.content);
+    let token = runtime.cancellation_token.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            token.cancel();
+        }
+    });
+    let lease = runtime
+        .team
+        .acquire_shared_write(Some(&runtime.cancellation_token));
+    tx.send(()).ok();
+    watchdog.join().unwrap();
+    assert!(lease.is_some());
+    assert!(
+        root.path().join("delayed.txt").exists(),
+        "managed process escaped workspace ownership"
+    );
+}
+
+#[test]
 fn process_worker_workspace_isolation_preserves_parent_shutdown_and_reuse() {
     let parent_dir = tempfile::tempdir().unwrap();
     let worker_dir = tempfile::tempdir().unwrap();

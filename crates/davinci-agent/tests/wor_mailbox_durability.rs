@@ -173,3 +173,50 @@ fn wor93_rehydrate_preserves_queue_order_for_equal_timestamps() {
         .collect();
     assert_eq!(drained, vec!["first", "second"]);
 }
+
+#[test]
+fn peer_send_requires_a_durable_queue_record_and_can_retry_after_restart() {
+    use davinci_agent::runtime::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    struct Journal {
+        fail: AtomicBool,
+        events: Mutex<Vec<RuntimeEventEnvelope>>,
+    }
+    impl RuntimeSubscriber for Journal {
+        fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+            let _ = self.record_durably(event);
+            RuntimeDecision::Continue
+        }
+        fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("injected journal failure".into());
+            }
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+    let (registry, _, run, agent) = setup(AgentState::Running);
+    let journal = Arc::new(Journal {
+        fail: AtomicBool::new(true),
+        events: Mutex::new(vec![]),
+    });
+    let bus = RuntimeBus::new();
+    bus.subscribe(journal.clone());
+    let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+    let message = AgentMessage::new(run, AgentId::new(), agent, "handoff");
+    assert!(matches!(
+        mailbox.send(message.clone()),
+        Err(MailboxError::NotRecorded(_))
+    ));
+    assert_eq!(mailbox.pending_count(&agent), 0);
+    let recovered = AgentMailbox::new().with_registry(registry);
+    recovered.rehydrate_from_events(&journal.events.lock().unwrap());
+    assert_eq!(recovered.pending_count(&agent), 0);
+    journal.fail.store(false, Ordering::SeqCst);
+    mailbox.send(message.clone()).unwrap();
+    recovered.rehydrate_from_events(&journal.events.lock().unwrap());
+    assert_eq!(recovered.drain(agent, 10), vec![message]);
+}

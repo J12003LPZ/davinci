@@ -217,7 +217,7 @@ impl RuntimeHandle {
     /// the host steering on the user's behalf (`false`).
     pub fn take_labeled_deliveries(&self, limit: usize) -> Vec<(String, bool)> {
         let mut labeled = Vec::new();
-        for msg in self.mailbox.drain(self.agent_id, limit) {
+        for msg in self.drain_messages(limit) {
             let generation = self.registry.get_generation(&self.agent_id);
             if !self
                 .mailbox
@@ -706,7 +706,9 @@ impl RuntimeHandle {
     }
 
     pub fn drain_messages(&self, limit: usize) -> Vec<AgentMessage> {
-        self.mailbox.drain(self.agent_id, limit)
+        let messages = self.mailbox.drain(self.agent_id, limit);
+        self.team.retry_results(self);
+        messages
     }
 
     /// Rehydrate runtime registry, tasks, and mailboxes from historical event log envelopes.
@@ -718,6 +720,7 @@ impl RuntimeHandle {
             .rehydrate_from_events(events)
             .map_err(|e| format!("task registry rehydration failed: {e}"))?;
         self.mailbox.rehydrate_from_events(events);
+        self.team.rehydrate_results(events);
         Ok(())
     }
 }
