@@ -5384,3 +5384,198 @@ fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
     agent.persist_tool_exposure();
     assert_eq!(customs(&agent), before);
 }
+
+fn effect_marker(custom_type: &str, id: &str) -> SessionEntry {
+    let mut entry = SessionEntry::message("user", serde_json::json!([]));
+    entry.entry_type = "custom".into();
+    entry.message = None;
+    entry.custom_type = Some(custom_type.into());
+    entry
+        .extra
+        .insert("data".into(), serde_json::json!({ "id": id }));
+    entry
+}
+
+fn tool_call_entry(id: &str, name: &str) -> SessionEntry {
+    SessionEntry::message(
+        "assistant",
+        serde_json::json!([{"type":"toolCall","id":id,"name":name,"arguments":{}}]),
+    )
+}
+
+fn tool_result_entry(id: &str) -> SessionEntry {
+    let mut entry = SessionEntry::message("toolResult", serde_json::json!([]));
+    entry.message.as_mut().unwrap()["toolCallId"] = id.into();
+    entry
+}
+
+/// Evidence that classifies as `Verified`, not merely a recorded generation.
+fn verified_state(generation: u64) -> MutationVerificationState {
+    MutationVerificationState {
+        mutation_generation: generation,
+        verified_generation: Some(generation),
+        last_verification_succeeded: true,
+        latest_evidence: Some(VerificationEvidence {
+            generation,
+            command: "cargo test".into(),
+            succeeded: true,
+            mutation_paths: Vec::new(),
+            verification_targets: Vec::new(),
+            coverage: VerificationCoverage::Broad,
+        }),
+        ..MutationVerificationState::default()
+    }
+}
+
+fn verified_state_entry(generation: u64) -> SessionEntry {
+    let mut entry = effect_marker(MUTATION_VERIFICATION_ENTRY_TYPE, "unused");
+    entry.extra.insert(
+        "data".into(),
+        serde_json::to_value(verified_state(generation)).unwrap(),
+    );
+    entry
+}
+
+/// Write `entries` to a fresh session and return its path.
+fn seeded_session(dir: &Path, entries: Vec<SessionEntry>) -> PathBuf {
+    let mut session = JsonlSession::create(dir, "effects", None).unwrap();
+    for entry in entries {
+        session.append_entry(entry).unwrap();
+    }
+    session.path.clone()
+}
+
+fn resume(path: &Path) -> Agent {
+    let mut agent = Agent::new(default_system_prompt());
+    agent
+        .load_from_session(JsonlSession::open(path).unwrap())
+        .unwrap();
+    agent
+}
+
+#[test]
+fn resume_leaves_verification_alone_for_read_only_unresolved_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![verified_state_entry(2), tool_call_entry("c1", "read")],
+    );
+    let agent = resume(&path);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 2);
+    assert_eq!(state.verified_generation, Some(2));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn resume_invalidates_for_unresolved_calls_that_may_mutate_and_bumps_once() {
+    // `batch` and `codemode` run other tools, an unregistered name is unknown,
+    // and `mcp_read` and `lsp_*` are read-class yet run external code.
+    for tool in [
+        "write",
+        "bash",
+        "mystery_tool",
+        "batch",
+        "codemode",
+        "mcp_read",
+        "lsp_hover",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_session(
+            dir.path(),
+            vec![verified_state_entry(2), tool_call_entry("c1", tool)],
+        );
+        let seeded = seeded_session(dir.path(), vec![verified_state_entry(2)]);
+        assert_eq!(
+            resume(&seeded).completion_evidence(),
+            CompletionEvidence::Verified,
+            "{tool}: the seed must start verified"
+        );
+        for _ in 0..3 {
+            let agent = resume(&path);
+            let state = agent.mutation_verification_state();
+            assert_eq!(state.mutation_generation, 3, "{tool}");
+            assert_eq!(state.verified_generation, None, "{tool}");
+            assert!(state.unknown_mutation_paths, "{tool}");
+            assert_eq!(
+                agent.completion_evidence(),
+                CompletionEvidence::Unverified,
+                "{tool}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resume_invalidates_for_a_pending_effect_marker_and_bumps_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            verified_state_entry(4),
+            effect_marker(MUTATION_EFFECT_PENDING_ENTRY_TYPE, "effect-1"),
+        ],
+    );
+    let seeded = seeded_session(dir.path(), vec![verified_state_entry(4)]);
+    assert_eq!(
+        resume(&seeded).completion_evidence(),
+        CompletionEvidence::Verified
+    );
+    for _ in 0..3 {
+        let agent = resume(&path);
+        assert_eq!(agent.mutation_verification_state().mutation_generation, 5);
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+}
+
+#[test]
+fn a_reused_call_id_cannot_hide_a_mutating_call() {
+    for calls in [
+        [("bash", "x"), ("read", "x")],
+        [("read", "x"), ("bash", "x")],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<_> = calls
+            .iter()
+            .map(|(name, id)| serde_json::json!({"type":"toolCall","id":id,"name":name,"arguments":{}}))
+            .collect();
+        let path = seeded_session(
+            dir.path(),
+            vec![
+                verified_state_entry(2),
+                SessionEntry::message("assistant", serde_json::Value::Array(content)),
+            ],
+        );
+        let agent = resume(&path);
+        assert_eq!(agent.mutation_verification_state().mutation_generation, 3);
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+}
+
+#[test]
+fn resume_ignores_resolved_effects_and_answered_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            verified_state_entry(2),
+            effect_marker(MUTATION_EFFECT_PENDING_ENTRY_TYPE, "effect-1"),
+            effect_marker(MUTATION_EFFECT_RESOLVED_ENTRY_TYPE, "effect-1"),
+            tool_call_entry("c1", "write"),
+            tool_result_entry("c1"),
+        ],
+    );
+    let agent = resume(&path);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 2);
+    assert_eq!(state.verified_generation, Some(2));
+}
+
+#[test]
+fn an_interrupted_effect_from_generation_zero_is_unverified_not_unrequired() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(dir.path(), vec![tool_call_entry("c1", "write")]);
+    let agent = resume(&path);
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}

@@ -151,6 +151,11 @@ pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
 /// Code on every error that reports a lost session write.
 pub const PERSISTENCE_FAILURE: &str = "PERSISTENCE_FAILURE";
 const MUTATION_VERIFICATION_ENTRY_TYPE: &str = "mutation_verification";
+/// Written before a host-driven tool effect and closed by the matching
+/// `mutation_effect_resolved` once its mutation state is durable. A pending
+/// marker with no resolution means the process died inside the effect.
+const MUTATION_EFFECT_PENDING_ENTRY_TYPE: &str = "mutation_effect_pending";
+const MUTATION_EFFECT_RESOLVED_ENTRY_TYPE: &str = "mutation_effect_resolved";
 const TOOL_EXPOSURE_ENTRY_TYPE: &str = "tool_exposure";
 pub use runtime::{
     conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
@@ -1302,6 +1307,215 @@ impl Agent {
         }
     }
 
+    /// Persist the mutation state and report a failed write. Callers append a
+    /// tool result only after this succeeds, so a result is never durable
+    /// ahead of the state it produced.
+    pub(crate) fn persist_mutation_verification_before_result(&mut self) -> Result<(), String> {
+        self.persist_mutation_verification();
+        if self.session.is_some() && !self.mutation_verification_is_durable() {
+            if let Some(session) = &self.session {
+                self.persistence_failure.get_or_insert_with(|| {
+                    (
+                        session.path.clone(),
+                        "mutation verification state could not be written".into(),
+                    )
+                });
+            }
+        }
+        self.ensure_session_persistence()
+    }
+
+    /// Built-in readers that cannot write or run user-chosen code (`grep` and
+    /// `find` only spawn `rg` and `fd` with fixed flags). The permission class
+    /// is not proof: `mcp_read` runs external server code and `lsp_*` can
+    /// launch language servers. `batch`, `codemode`, `mcp_*` and unknown names
+    /// may have mutated.
+    fn is_provably_read_only_tool(name: &str) -> bool {
+        matches!(name, "read" | "grep" | "find" | "ls")
+    }
+
+    fn append_effect_entry(
+        &mut self,
+        custom_type: &str,
+        id: &str,
+        tool: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        let mut data = serde_json::json!({ "id": id });
+        if let Some(tool) = tool {
+            data["tool"] = tool.into();
+        }
+        let mut extra = serde_json::Map::new();
+        extra.insert("data".into(), data);
+        session
+            .append_entry(SessionEntry {
+                id: String::new(),
+                entry_type: "custom".into(),
+                parent_id: None,
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: Some(custom_type.into()),
+                extra,
+            })
+            .map_err(|error| {
+                self.persistence_failure
+                    .get_or_insert_with(|| (session.path.clone(), error.to_string()));
+                error.to_string()
+            })
+    }
+
+    /// Durably record that a host-driven tool is about to run, before it does.
+    /// A failed append means the effect would be invisible to a resume, so the
+    /// caller must not run the tool. `None` when nothing needs recording.
+    pub(crate) fn begin_mutation_effect(&mut self, tool: &str) -> Result<Option<String>, String> {
+        if self.session.is_none() || Self::is_provably_read_only_tool(tool) {
+            return Ok(None);
+        }
+        let id = format!("effect-{}", Uuid::new_v4());
+        self.append_effect_entry(MUTATION_EFFECT_PENDING_ENTRY_TYPE, &id, Some(tool))
+            .map_err(|error| {
+                format!(
+                    "{PERSISTENCE_FAILURE}: could not record the {tool} effect before running it, so it was not run ({error})"
+                )
+            })?;
+        Ok(Some(id))
+    }
+
+    /// Close a pending marker once the effect's mutation state is durable. If
+    /// that state cannot be written the marker stays open and a resume
+    /// invalidates verification, which is the safe direction.
+    pub(crate) fn resolve_mutation_effect(&mut self, effect: Option<String>) {
+        let Some(id) = effect else {
+            return;
+        };
+        self.persist_mutation_verification();
+        if self.mutation_verification_is_durable() && self.ensure_session_persistence().is_ok() {
+            let _ = self.append_effect_entry(MUTATION_EFFECT_RESOLVED_ENTRY_TYPE, &id, None);
+        }
+    }
+
+    fn mutation_verification_is_durable(&self) -> bool {
+        let state = self.mutation_verification_state();
+        match &self.persisted_mutation_verification {
+            Some(persisted) => *persisted == state,
+            None => state == MutationVerificationState::default(),
+        }
+    }
+
+    /// Marker ids of effects on the current branch that may have run without
+    /// their mutation state being recorded: a `mutation_effect_pending` with no
+    /// resolution, and a model tool call with no result whose tool is not
+    /// provably read-only. A call's marker is keyed by its assistant entry, so a
+    /// provider reusing a call id cannot be mistaken for an earlier one.
+    fn unresolved_mutation_effects(&self) -> Vec<String> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let entry_id = |entry: &SessionEntry| {
+            entry
+                .extra
+                .get("data")
+                .and_then(|data| data.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let mut pending = Vec::new();
+        let mut resolved = std::collections::HashSet::new();
+        // (call id, marker id, tool name) for calls with no result so far.
+        let mut calls: Vec<(String, String, String)> = Vec::new();
+        for entry in davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref()) {
+            match entry.entry_type.as_str() {
+                "custom" => match entry.custom_type.as_deref() {
+                    Some(MUTATION_EFFECT_PENDING_ENTRY_TYPE) => pending.extend(entry_id(entry)),
+                    Some(MUTATION_EFFECT_RESOLVED_ENTRY_TYPE) => resolved.extend(entry_id(entry)),
+                    _ => {}
+                },
+                "message" => {
+                    let Some(message) = entry_to_chat(entry) else {
+                        continue;
+                    };
+                    if message.role == "toolResult" {
+                        // One result answers one occurrence of a reused id.
+                        // Prefer closing a read-only one so a duplicate cannot
+                        // hide a mutating call.
+                        if let Some(id) = &message.tool_call_id {
+                            let matching = || calls.iter().enumerate().filter(|(_, c)| c.0 == *id);
+                            let answered = matching()
+                                .find(|(_, c)| {
+                                    Self::is_provably_read_only_tool(self.canonical_tool_name(&c.2))
+                                })
+                                .or_else(|| matching().next())
+                                .map(|(index, _)| index);
+                            if let Some(index) = answered {
+                                calls.remove(index);
+                            }
+                        }
+                    } else if message.role == "assistant" {
+                        for content in &message.content {
+                            if let davinci_ai::MessageContent::ToolCall { id, name, .. } = content {
+                                calls.push((
+                                    id.clone(),
+                                    format!("call:{}:{id}", entry.id),
+                                    name.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        pending
+            .into_iter()
+            .chain(calls.into_iter().filter_map(|(_, marker, name)| {
+                let name = self.canonical_tool_name(&name);
+                (!Self::is_provably_read_only_tool(name)).then_some(marker)
+            }))
+            .filter(|marker| !resolved.contains(marker))
+            .collect()
+    }
+
+    /// An effect was cut short somewhere between its record and its result, so
+    /// the edit may have landed with no trace in the saved state. Treat the work
+    /// as edited, unscoped and unverified, write that down, then close the
+    /// markers so a second resume does not bump again.
+    fn invalidate_for_interrupted_effects(&mut self, markers: Vec<String>) {
+        {
+            let mut state = self
+                .mutation_verification
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            // On overflow the generation stays put; with no verified generation
+            // and no evidence the state is still unverified.
+            state.mutation_generation = state
+                .mutation_generation
+                .checked_add(1)
+                .unwrap_or(state.mutation_generation);
+            state.verified_generation = None;
+            state.last_verification_succeeded = false;
+            state.latest_evidence = None;
+            state.covered_paths.clear();
+            state.unknown_mutation_paths = true;
+            state.last_classification_reason =
+                Some("a tool call was interrupted before its result was recorded".into());
+        }
+        self.persist_mutation_verification();
+        if !self.mutation_verification_is_durable() {
+            return;
+        }
+        for marker in markers {
+            if self
+                .append_effect_entry(MUTATION_EFFECT_RESOLVED_ENTRY_TYPE, &marker, None)
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
     /// Write the set of tool schemas the model has been shown to the session
     /// when it changed, so a resumed session does not have to rediscover them.
     /// The set is a hint: restoring re-checks it against current authority.
@@ -1454,6 +1668,10 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = state;
         self.persisted_mutation_verification = persisted;
+        let interrupted = self.unresolved_mutation_effects();
+        if !interrupted.is_empty() {
+            self.invalidate_for_interrupted_effects(interrupted);
+        }
     }
 
     /// Classify whether the current run has evidence for its latest mutation.

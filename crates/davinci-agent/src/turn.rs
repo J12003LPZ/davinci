@@ -1670,6 +1670,7 @@ Issue the call again if it is still needed.";
         }
         let id = format!("host-check-{}", uuid::Uuid::new_v4());
         let name = if cfg!(windows) { "powershell" } else { "bash" };
+        let effect = self.begin_mutation_effect(name)?;
         let mut events = Vec::new();
         let parents: Vec<_> = [
             self.abort_signal.clone(),
@@ -1712,6 +1713,7 @@ Issue the call again if it is still needed.";
             )
         });
         self.host_command_abort = previous;
+        self.resolve_mutation_effect(effect);
         if abort.load(std::sync::atomic::Ordering::Acquire) {
             return Err("verification cancelled; inspect the recorded process outcome".into());
         }
@@ -1754,11 +1756,14 @@ Issue the call again if it is still needed.";
             return Err("handoff cannot change the agent workspace".into());
         }
         self.ensure_session_persistence()?;
+        let effect = self.begin_mutation_effect(name)?;
         let mut events = Vec::new();
-        self.execute_tool_batch(cwd, vec![(id.into(), name.into(), args)], &mut events)
+        let result = self
+            .execute_tool_batch(cwd, vec![(id.into(), name.into(), args)], &mut events)
             .into_iter()
-            .next()
-            .ok_or_else(|| "handoff tool returned no result".into())
+            .next();
+        self.resolve_mutation_effect(effect);
+        result.ok_or_else(|| "handoff tool returned no result".into())
     }
 
     /// Run every tool call of one assistant message and return their
@@ -5239,15 +5244,17 @@ Issue the call again if it is still needed.";
                     "Operation result durability failed; provider continuation is blocked.".into(),
                 );
             }
+            // The state goes first: a result that is durable ahead of its
+            // state would let a resume read the call as finished and keep the
+            // old verified generation.
+            self.persist_mutation_verification_before_result()?;
             if self.session.is_some() && self.persist_operation_chat_result(message)? {
-                self.persist_mutation_verification();
                 self.persist_tool_exposure();
                 return self.ensure_session_persistence();
             }
         }
         self.persist_full_message(message);
         if message.role == "toolResult" {
-            self.persist_mutation_verification();
             self.persist_tool_exposure();
         }
         self.ensure_session_persistence()
