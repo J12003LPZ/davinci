@@ -32,6 +32,7 @@ pub struct ProcessManager {
     profile: crate::shell_policy::ShellPolicyProfile,
     counters: Arc<crate::SharedCounters>,
     provenance: crate::jobs::managed::Provenance,
+    shared_workspace: Option<crate::RuntimeHandle>,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +430,11 @@ impl ProcessManager {
         self
     }
 
+    pub(crate) fn with_workspace_writer(mut self, runtime: Option<crate::RuntimeHandle>) -> Self {
+        self.shared_workspace = runtime;
+        self
+    }
+
     pub fn shutdown(&self) {
         self.owner.shutdown();
     }
@@ -456,6 +462,7 @@ impl ProcessManager {
             profile: crate::shell_policy::ShellPolicyProfile::Permissive,
             counters: crate::SharedCounters::shared(),
             provenance: Default::default(),
+            shared_workspace: None,
         })
     }
 
@@ -472,6 +479,7 @@ impl ProcessManager {
             profile,
             counters: self.counters.clone(),
             provenance: self.provenance.clone(),
+            shared_workspace: self.shared_workspace.clone(),
         }
     }
 
@@ -492,6 +500,7 @@ impl ProcessManager {
             profile,
             counters: self.counters.clone(),
             provenance: self.provenance.clone(),
+            shared_workspace: self.shared_workspace.clone(),
         })
     }
 
@@ -547,6 +556,10 @@ impl ProcessManager {
                     ports: request.ports.clone(),
                     counters: self.counters.clone(),
                     provenance: self.provenance.clone(),
+                    shared_workspace: self
+                        .shared_workspace
+                        .clone()
+                        .filter(|_| request.exclusive_workspace),
                 };
                 options.validate()?;
                 match crate::shell_policy::evaluate_argv(

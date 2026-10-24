@@ -16,6 +16,7 @@ use super::bus::RuntimeBus;
 /// subdirectory the user launched from produced leases of the wrong tree.
 pub fn git_toplevel(path: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
+        .args(["-c", "safe.bareRepository=explicit"])
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
@@ -76,6 +77,7 @@ fn now_ms() -> i64 {
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     let output = Command::new("git")
         .current_dir(cwd)
+        .args(["-c", "safe.bareRepository=explicit"])
         .args(args)
         .output()
         .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
@@ -241,6 +243,7 @@ impl WorktreeManager {
         // Check if branch already exists in git
         let branch_exists = Command::new("git")
             .current_dir(&self.repo_root)
+            .args(["-c", "safe.bareRepository=explicit"])
             .args(["rev-parse", "--verify", &branch])
             .output()
             .map(|o| o.status.success())
@@ -287,6 +290,111 @@ impl WorktreeManager {
         Ok(lease)
     }
 
+    /// Snapshot committed, staged, unstaged and untracked code without changing
+    /// the worker's index or checkout. A ref keeps the handoff alive across GC.
+    pub fn snapshot_code(&self, lease: &WorktreeLease) -> Result<String, WorktreeError> {
+        if self.get_lease(&lease.path).as_ref() != Some(lease) {
+            return Err(WorktreeError::StaleLease(lease.path.clone()));
+        }
+        let git_dir = run_git(&lease.path, &["rev-parse", "--absolute-git-dir"])?;
+        let index = PathBuf::from(git_dir).join(format!("handoff-{}.index", uuid::Uuid::new_v4()));
+        struct IndexFile(PathBuf);
+        impl Drop for IndexFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _index_file = IndexFile(index.clone());
+        let git = |args: &[&str]| -> Result<String, WorktreeError> {
+            let output = Command::new("git")
+                .current_dir(&lease.path)
+                .env("GIT_INDEX_FILE", &index)
+                .args(["-c", "safe.bareRepository=explicit"])
+                .args(args)
+                .output()
+                .map_err(|e| WorktreeError::GitError(e.to_string()))?;
+            if !output.status.success() {
+                return Err(WorktreeError::GitError(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+        git(&["read-tree", "HEAD"])?;
+        git(&["add", "-A", "--", "."])?;
+        let tree = git(&["write-tree"])?;
+        let head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
+        let commit = if tree == run_git(&lease.path, &["rev-parse", "HEAD^{tree}"])? {
+            head
+        } else {
+            git(&[
+                "-c",
+                "user.name=Da Vinci",
+                "-c",
+                "user.email=davinci@localhost",
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "-m",
+                "Workflow code handoff",
+            ])?
+        };
+        let reference = format!("refs/davinci/handoffs/{}/{}", lease.run_id, lease.agent_id);
+        run_git(&lease.path, &["update-ref", &reference, &commit])?;
+        Ok(commit)
+    }
+
+    /// Integrate only into the dependent isolated checkout. Conflicts stop the
+    /// launch and remain available for review; the lead checkout is untouched.
+    pub fn integrate_code(
+        &self,
+        lease: &WorktreeLease,
+        commits: &[String],
+    ) -> Result<(), WorktreeError> {
+        if self.get_lease(&lease.path).as_ref() != Some(lease) {
+            return Err(WorktreeError::StaleLease(lease.path.clone()));
+        }
+        for commit in commits {
+            if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(WorktreeError::GitError(
+                    "invalid code handoff commit".into(),
+                ));
+            }
+            run_git(
+                &lease.path,
+                &[
+                    "-c",
+                    "user.name=Da Vinci",
+                    "-c",
+                    "user.email=davinci@localhost",
+                    "-c",
+                    if cfg!(windows) {
+                        "core.hooksPath=NUL"
+                    } else {
+                        "core.hooksPath=/dev/null"
+                    },
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "merge.autoStash=false",
+                    "-c",
+                    "rerere.enabled=false",
+                    "merge",
+                    "--no-edit",
+                    "--no-ff",
+                    "--no-verify",
+                    commit,
+                ],
+            )?;
+            run_git(
+                &lease.path,
+                &["merge-base", "--is-ancestor", commit, "HEAD"],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Check whether a worktree has uncommitted or unmerged changes.
     /// Evidence that cannot be read counts as dirty: see [`Self::check_dirty`].
     pub fn is_dirty(&self, lease: &WorktreeLease) -> bool {
@@ -317,6 +425,7 @@ impl WorktreeManager {
         }
         let integrated = Command::new("git")
             .current_dir(&self.repo_root)
+            .args(["-c", "safe.bareRepository=explicit"])
             .args(["merge-base", "--is-ancestor", &current_head, "HEAD"])
             .output()
             .map(|o| o.status.success())
@@ -465,6 +574,52 @@ mod tests {
             self.events.lock().unwrap().push(event.payload.clone());
             RuntimeDecision::Continue
         }
+    }
+
+    #[test]
+    fn code_snapshot_preserves_source_index_and_hands_off_binary_deletions_and_commits() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let run = RunId::new();
+        let source = manager.create_lease(run, AgentId::new(), None).unwrap();
+        std::fs::write(source.path.join("committed.txt"), "committed").unwrap();
+        run_git(&source.path, &["add", "."]).unwrap();
+        run_git(&source.path, &["commit", "-m", "worker commit"]).unwrap();
+        std::fs::write(source.path.join("staged.txt"), "staged").unwrap();
+        run_git(&source.path, &["add", "."]).unwrap();
+        std::fs::write(source.path.join("staged.txt"), "unstaged").unwrap();
+        std::fs::remove_file(source.path.join("README.md")).unwrap();
+        std::fs::write(source.path.join("binary.dat"), [0, 255, 10, 13]).unwrap();
+        let before = run_git(&source.path, &["status", "--porcelain"]).unwrap();
+        let head = run_git(&source.path, &["rev-parse", "HEAD"]).unwrap();
+        let commit = manager.snapshot_code(&source).unwrap();
+        assert_eq!(
+            run_git(&source.path, &["status", "--porcelain"]).unwrap(),
+            before
+        );
+        assert_eq!(run_git(&source.path, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(
+            run_git(&source.path, &["show", ":staged.txt"]).unwrap(),
+            "staged"
+        );
+        let target = manager.create_lease(run, AgentId::new(), None).unwrap();
+        manager.integrate_code(&target, &[commit]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.path.join("committed.txt")).unwrap(),
+            "committed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.path.join("staged.txt")).unwrap(),
+            "unstaged"
+        );
+        assert_eq!(
+            std::fs::read(target.path.join("binary.dat")).unwrap(),
+            [0, 255, 10, 13]
+        );
+        assert!(!target.path.join("README.md").exists());
+        manager.release_lease(&source, true).unwrap();
+        manager.release_lease(&target, true).unwrap();
     }
 
     #[test]

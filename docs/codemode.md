@@ -90,7 +90,11 @@ appended prompt), and `report` grades every answer against facts read from the
 repository and exits 1 when the Codemode-on arm falls below 50% adoption or 80%
 correct. `report` and its tests are offline; `run` uses model usage. Every
 `harness_stats` also carries `codemodeRuns`, `codemodeUnfinished` and
-`codemodeEmptyResults`. Compare pass rate, tokens and wall time against the
+`codemodeEmptyResults`, and a top-level `codemode` block:
+`{"mode": "off" | "read-only", "available": bool, "calls": n}`. `available` is
+whether the model was offered the tool this run (a missing Node runtime leaves
+it `false`), and `calls` counts every `codemode` dispatch, so `available: true`
+with `calls: 0` means it was offered and never chosen. Compare pass rate, tokens and wall time against the
 same arm with Codemode off before treating more calls as better.
 
 ## Messages

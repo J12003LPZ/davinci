@@ -30,6 +30,21 @@ pub fn write_raw_stdout(text: &str) -> io::Result<()> {
     }
 }
 
+/// The `--mode json` `harness_stats` record: the run counters under `runtime`
+/// plus `contextVm` and `codemode`, so a run shows whether those features were
+/// configured and used.
+pub fn harness_stats_record(agent: &davinci_agent::Agent) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "type": "harness_stats", "schema_version": 1, "runtime": agent.run_stats(),
+    });
+    if let (Some(record), serde_json::Value::Object(features)) =
+        (record.as_object_mut(), agent.feature_use())
+    {
+        record.extend(features);
+    }
+    record
+}
+
 pub fn write_raw_stdout_line(text: &str) -> io::Result<()> {
     write_raw_stdout(&format!("{text}\n"))
 }
@@ -501,6 +516,76 @@ pub fn print_graph_status_plain(status: &StructuredGraphStatus) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_stats_record_keeps_runtime_and_reports_feature_use() {
+        let agent = davinci_agent::Agent::new("system");
+        let record = harness_stats_record(&agent);
+        assert_eq!(record["type"], "harness_stats");
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["runtime"]["modelTurns"], 0);
+        assert_eq!(record["contextVm"], serde_json::json!({"mode": "off"}));
+        assert_eq!(
+            record["codemode"],
+            serde_json::json!({"mode": "off", "available": false, "calls": 0})
+        );
+    }
+
+    #[test]
+    fn harness_stats_record_reports_active_context_vm_after_a_fold() {
+        use davinci_agent::runtime::ContextVmMode;
+        {
+            let (mode, name, offered) = (ContextVmMode::Active, "active", true);
+            let mut agent = davinci_agent::Agent::new("system");
+            agent.set_runtime(davinci_agent::RuntimeHandle::new(
+                davinci_agent::RunId::new(),
+                davinci_agent::AgentId::new(),
+                davinci_agent::RuntimeBus::new(),
+            ));
+            agent.set_context_vm_mode(mode);
+            agent.messages = vec![davinci_ai::ChatMessage::text("user", "fold me")];
+            assert!(agent.compact(None).compacted, "{name}");
+            let record = harness_stats_record(&agent);
+            let vm = &record["contextVm"];
+            assert_eq!(vm["mode"], name);
+            assert!(vm["folds"].as_u64().unwrap() > 0, "{name}: {vm}");
+            assert_eq!(vm["retrievalOffered"], offered, "{name}: {vm}");
+            assert!(record["runtime"]["compactions"].is_u64());
+        }
+    }
+
+    #[test]
+    fn harness_stats_record_reports_shadow_mode_without_offering_retrieval() {
+        let mut agent = davinci_agent::Agent::new("system");
+        agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Shadow);
+        let vm = harness_stats_record(&agent)["contextVm"].clone();
+        assert_eq!(vm["mode"], "shadow");
+        assert_eq!(vm["folds"], 0);
+        assert_eq!(vm["retrievalOffered"], false);
+    }
+
+    #[test]
+    fn harness_stats_record_reports_hybrid_compaction_counters() {
+        let mut agent = davinci_agent::Agent::new("system");
+        agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Hybrid);
+        let vm = harness_stats_record(&agent)["contextVm"].clone();
+        assert_eq!(
+            vm["hybridCompaction"],
+            serde_json::json!({
+                "attempts": 0,
+                "applied": 0,
+                "skippedNoFit": 0,
+                "skippedNoAssistantReply": 0,
+                "skippedBackoff": 0,
+                "notAppliedAfterFold": 0,
+                "notAppliedOther": 0,
+                "contextTokensBefore": 0,
+                "contextTokensAfter": 0,
+            })
+        );
+        let off = davinci_agent::Agent::new("system");
+        assert!(harness_stats_record(&off)["contextVm"]["hybridCompaction"].is_null());
+    }
 
     fn leftover_temp_files(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_dir(dir)

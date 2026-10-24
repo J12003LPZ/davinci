@@ -22,7 +22,10 @@ pub struct ContextVmMetrics {
     pub shadow_missing_user_refs: u64,
     pub shadow_missing_tool_refs: u64,
     pub prefix_churn: u64,
+    /// Sum over folds of the estimated size of the previous checkpoint ledger.
+    /// Not a prompt size: the ledger grows as events are folded in.
     pub tokens_before_fold: u64,
+    /// Sum over folds of the estimated size of the new checkpoint ledger.
     pub tokens_after_fold: u64,
     /// Session JSONL lines read while resolving exact source references.
     pub source_lines_scanned: u64,

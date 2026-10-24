@@ -1,4 +1,7 @@
 use super::*;
+use crate::{
+    CompletionEvidence, MutationVerificationState, VerificationCoverage, VerificationEvidence,
+};
 use davinci_session::JsonlSession;
 use std::sync::Arc;
 
@@ -321,4 +324,180 @@ fn a_host_side_write_failure_is_recorded_for_the_open_session() {
     let error = agent.ensure_session_persistence().unwrap_err();
     assert!(error.starts_with("PERSISTENCE_FAILURE"), "{error}");
     assert!(error.contains("plugin appendEntry: disk full"), "{error}");
+}
+
+/// Preview, through the agent so the owner matches, a patch that rewrites
+/// `a.txt` from "before" to "after". Returns the apply arguments.
+fn previewed_patch(agent: &mut Agent, root: &Path) -> serde_json::Value {
+    std::fs::write(
+        root.join("a.txt"),
+        "before
+",
+    )
+    .unwrap();
+    let preview = agent
+        .execute_host_handoff_tool(
+            root,
+            "preview",
+            "patch_preview",
+            serde_json::json!({
+                "input":"*** Begin Patch
+*** Update File: a.txt
+@@
+-before
++after
+*** End Patch"
+            }),
+        )
+        .unwrap();
+    assert_ne!(preview.is_error, Some(true), "{preview:?}");
+    let id = preview.extra["details"]["transaction"]["id"].clone();
+    serde_json::json!({"id": id, "paths": ["a.txt"]})
+}
+
+fn verified_agent(dir: &Path, session: JsonlSession) -> Agent {
+    let mut agent = Agent::new("host effect fixture");
+    agent.cwd = dir.to_path_buf();
+    agent.session = Some(session);
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    *agent.mutation_verification.lock().unwrap() = MutationVerificationState {
+        mutation_generation: 2,
+        verified_generation: Some(2),
+        last_verification_succeeded: true,
+        latest_evidence: Some(VerificationEvidence {
+            generation: 2,
+            command: "cargo test".into(),
+            succeeded: true,
+            mutation_paths: Vec::new(),
+            verification_targets: Vec::new(),
+            coverage: VerificationCoverage::Broad,
+        }),
+        ..MutationVerificationState::default()
+    };
+    agent.persist_mutation_verification();
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    agent
+}
+
+fn effect_ids(agent: &Agent, kind: &str) -> Vec<String> {
+    agent
+        .session
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .filter(|entry| entry.custom_type.as_deref() == Some(kind))
+        .map(|entry| entry.extra["data"]["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_failed_pending_marker_write_stops_the_host_tool_before_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = verified_agent(dir.path(), session);
+    let args = previewed_patch(&mut agent, dir.path());
+    break_storage(&path);
+    let error = agent
+        .execute_host_handoff_tool(dir.path(), "h1", "patch_apply", args)
+        .unwrap_err();
+    assert!(error.starts_with(crate::PERSISTENCE_FAILURE), "{error}");
+    assert!(error.contains("was not run"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "before\n",
+        "the patch ran although its marker was not durable"
+    );
+}
+
+#[test]
+fn a_host_tool_leaves_a_resolved_marker_for_its_pending_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let mut agent = verified_agent(dir.path(), session);
+    let args = previewed_patch(&mut agent, dir.path());
+    let result = agent
+        .execute_host_handoff_tool(dir.path(), "h1", "patch_apply", args)
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "after\n"
+    );
+    // The preview and the apply each leave a closed pair; only a few readers
+    // are provably read-only, so every other tool is recorded.
+    let pending = effect_ids(&agent, "mutation_effect_pending");
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending, effect_ids(&agent, "mutation_effect_resolved"));
+    // The marker precedes the mutation state it vouches for.
+    let position = |kind: &str| {
+        agent
+            .session
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .rposition(|entry| entry.custom_type.as_deref() == Some(kind))
+            .unwrap()
+    };
+    assert!(position("mutation_effect_pending") < position("mutation_effect_resolved"));
+}
+
+#[test]
+fn a_crash_after_a_host_mutation_marker_resumes_unverified() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = verified_agent(dir.path(), session);
+    let args = previewed_patch(&mut agent, dir.path());
+    agent
+        .execute_host_handoff_tool(dir.path(), "h1", "patch_apply", args)
+        .unwrap();
+    // Cut the log right after the apply's pending marker: the patch landed, nothing
+    // else was recorded.
+    let log = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<_> = log.lines().collect();
+    let cut = lines
+        .iter()
+        .rposition(|line| line.contains("mutation_effect_pending"))
+        .unwrap();
+    let kept = &lines[..=cut];
+    std::fs::write(&path, kept.join("\n") + "\n").unwrap();
+    let mut resumed = Agent::new("host effect fixture");
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    assert_eq!(
+        resumed.completion_evidence(),
+        CompletionEvidence::Unverified
+    );
+}
+
+#[test]
+fn a_tool_result_is_never_durable_ahead_of_its_mutation_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = verified_agent(dir.path(), session);
+    std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.txt")]);
+    agent
+        .persist_chat(&ChatMessage::tool_result("c1", "write", "saved", false))
+        .unwrap();
+    let reopened = JsonlSession::open(&path).unwrap();
+    let state_at = reopened
+        .entries
+        .iter()
+        .rposition(|entry| entry.custom_type.as_deref() == Some("mutation_verification"))
+        .unwrap();
+    let result_at = reopened
+        .entries
+        .iter()
+        .position(|entry| entry.entry_type == "message")
+        .unwrap();
+    assert!(
+        state_at < result_at,
+        "the result was written before its state"
+    );
 }

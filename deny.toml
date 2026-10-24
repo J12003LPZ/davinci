@@ -1,6 +1,6 @@
 # Dependency policy, checked by .github/workflows/dependency-audit.yml with
-# `cargo deny check advisories sources`. Licenses and duplicate versions are
-# not gated yet.
+# `cargo deny check advisories sources licenses`. Duplicate versions are not
+# gated yet.
 
 [advisories]
 version = 2
@@ -13,3 +13,11 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+[licenses]
+allow = ["Apache-2.0", "BSD-3-Clause", "BSL-1.0", "CC0-1.0", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.8
+# No exceptions. terminfo (WTFPL) sits in Cargo.lock behind ratatui-termwiz, an
+# optional ratatui backend no workspace feature enables (`cargo tree -i terminfo
+# --all-features --target all` prints nothing). If it ever enters the graph this
+# check fails and the license gets reviewed then.

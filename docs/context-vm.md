@@ -35,11 +35,125 @@ ordinary `compaction` entry, so reload, branching and native replay follow
 the off-mode paths. A compaction or branch summary is never read as a user
 requirement.
 
-The replacement must estimate under the compaction threshold beside the
-system prompt, tool schemas and other context outside the messages. When the
-recent messages do not fit beside the ledger, the cut moves to a later turn
-boundary (never onto a tool result); when even the newest turn does not fit,
-nothing is compacted and the transcript is unchanged.
+The replacement must estimate under a budget beside the system prompt, tool
+schemas and other context outside the messages. The budget is the compaction
+threshold for an automatic attempt below the capacity limit. A recovery path
+(manual `/compact`, the provider's context-overflow retry, an automatic attempt
+whose context has reached the capacity limit) tries the threshold budget first,
+with the relaxed assistant-reply rule below. Only when nothing fits under the
+threshold does it fall back to the capacity limit, `context_window` minus
+`reserve_tokens`: the window is already full, and a replacement that is under
+capacity is better than a blocked request. Trying the threshold first matters
+because the first cut that fits keeps the most; under the capacity budget alone
+a recovery could keep a 12k prompt, land above the threshold, and the next turn
+would pay for a second fold.
+
+The overhead taken off the budget is the estimated request overhead (system
+prompt, tool schemas, ephemeral context, four bytes a token), never a figure
+derived from what the provider counted. A provider that counts the messages
+below their byte estimate would otherwise turn that gap into budget, the first
+cut would land just under the threshold on the provider scale, and the next turn
+would pay for another fold. Before the first fold the overhead also includes the
+`retrieve_context` schema, which the first fold adds to every request, unless
+the host supplied its own tool overhead (a scalar or an estimator), which
+already measures the real tool catalog and is not charged twice.
+
+Because the budget equals the one the hybrid compaction always used, for the
+same history the dry run, the assistant-reply rule and the backoff only remove
+or defer summarizer requests; none adds one. And because a recovery never uses
+the dry run (below), anything the old behavior recovered from, this recovers
+from: a session cannot get stuck behind a skip.
+
+The budget can be too small to hold any ledger. With a 14,000-token threshold
+and about 13.5k estimated overhead (the live 14k run) it is about 500 tokens,
+so hybrid cannot compact at that threshold: the dry run skips for free, every
+time. That is a property of the setting, not of the code. Raise the threshold or
+shrink the tool catalog.
+
+When the recent messages do not fit beside the ledger, the cut moves to a later
+turn boundary (never onto a tool result); when even the newest turn does not
+fit, nothing is compacted and the transcript is unchanged.
+
+An automatic attempt below the capacity limit applies one more rule to each
+candidate cut: the replaced prefix must contain an assistant reply. A prefix
+without one holds only user input and nothing a ledger could stand in for, so
+replacing it costs a summarizer request for no gain while the window still has
+room. That is turn 1 (a user prompt, plus a turn context message on
+cache-sensitive routes), and it is equally the history after an earlier
+compaction: the replacement the last compaction left plus the new prompts, until
+an assistant reply lands before the cut. A cut that breaks the rule is skipped and
+the next later cut is tried; only when every cut breaks it is the attempt
+skipped (counter `skippedNoAssistantReply`). Recovery paths do not apply the
+rule. With a 90k tool result after a 100k pasted prompt in a nearly full window,
+the only cut that fits replaces the prompt, and replacing it with the ledger is
+better than a blocked session.
+
+The summarizer request is paid for before the replacement is known to fit, so
+an automatic attempt below the capacity limit does not make it blind. A free dry
+run comes first: the same fit check, run with the deterministic ledger and
+without the parent narrative, which the fold may replace. A recovery (manual
+`/compact`, the provider's context-overflow retry, an automatic attempt at or
+above the capacity limit) skips the dry run entirely: it pays the fold as it
+always did, then fits the result (threshold budget first, capacity budget as the
+fallback, assistant-reply rule off). The dry run starts from the ledger the VM holds only
+when that ledger continues the current history (the same check `fold_context`
+makes); after a branch switch it starts from nothing, so another branch's
+ledger cannot block it. It then adds the events no fold has seen, with the
+deterministic reducer.
+
+If that replacement cannot fit, there is no earlier turn to replace
+(`skippedNoFit`), or the assistant-reply rule leaves no cut
+(`skippedNoAssistantReply`, with its own message), the compaction returns not
+compacted with a summary that says which, and no summarizer request is sent.
+
+The dry run is not a strict bound, in either direction. The folded ledger is
+usually at least as large as the deterministic one (the proposal is merged into
+it), so a pass can still fail the real fit after a paid fold; the backoff below
+limits that to one paid request per growth step. But the fold can also be smaller:
+it replaces the parent narrative with the proposal's (up to 1,024 bytes), drains
+retired entries over 32, and a long history is folded in chunks whose goals are
+capped again on each pass. The dry run drops the parent narrative to allow for
+the first; it does not model the other two. A false skip below capacity only
+defers compaction to the capacity limit, where the attempt is a recovery, pays
+the fold, and fits it. If the ledger state cannot be loaded for the dry run, the
+compaction goes ahead as before.
+
+A compaction that paid for a summarizer request and was not applied (the
+replacement did not fit afterwards, the fold failed, or the checkpoint could not
+be saved) starts a backoff, if it was an automatic attempt below the capacity
+limit (`context_window` minus `reserve_tokens`). A failure that sent no request
+(`notAppliedOther`: no summarizer, no chunk fitting its window) cost nothing and
+starts none. So does an applied replacement that
+is no smaller than the history, which still counts as applied. The automatic
+trigger then waits until the calibrated context has grown by `keep_recent_tokens`
+past the size at that attempt. The size recorded is the `tokens` value the automatic trigger passed in for that
+attempt (the calibrated count), so the later comparison uses one scale. A
+context smaller than the recorded size by more than `keep_recent_tokens` means
+the history was replaced, and clears the backoff. A smaller drop does not: a
+size recorded from the byte estimate (no provider count yet, after a resume or
+a model switch) can read about 3k lower once the provider counts it. An applied
+compaction and a session load, branch switch or rewind (`restore_branch_state`)
+clear it too, and so does a change of the window or of any compaction setting
+(`keep_recent_tokens`, `reserve_tokens`, the threshold), of the summarizer, or of
+the Context VM mode: the recorded size says nothing about the new limits, and a
+new summarizer or mode deserves its own attempt. The dry run still applies to an
+automatic attempt below capacity that the backoff lets through. A deferral emits
+the same `PreCompact` and `PostCompact` events a dry-run skip does.
+
+The backoff only ever defers an automatic attempt below the capacity limit. From
+the capacity limit up an attempt is a recovery, like manual `/compact` and the
+provider's context-overflow retry: it is never deferred, never records a
+backoff, skips the dry run, budgets as described above, and is retried every
+turn, exactly as before the backoff existed. A request above `window - reserve`
+is the one that is about to stop fitting, so a recovery must not wait there. A
+backoff that held through the reserve band would, with the default settings
+(`keep_recent_tokens` 20,000, `reserve_tokens` 16,384), keep sending requests
+above the capacity limit for many turns after a fold that could not apply (a
+first prompt of 42k tokens in a 60k window: compaction at turn 1 as before, not
+at turn 11).
+
+Active mode is not changed by any of this. It folds under its own policy and
+rewrites the compiled image when it does, which breaks the cached prefix.
 
 Without a session, where events are numbered by position, the VM is rebased
 onto the compacted transcript before that transcript replaces the live one;
@@ -237,6 +351,45 @@ VM body duplication does not make total process memory constant.
 `context_recovery_rate()` is retrieval hits divided by semantic page faults
 (zero when no requests occurred). Legacy page-fault counters follow semantic
 retrieval only. A successful rebuild after a missing page remains a lookup miss.
+
+The `--mode json` `harness_stats` record carries a top-level `contextVm` block
+so a run shows whether the VM was configured and used. It is `{"mode": "off"}`
+while the VM is off. Otherwise it holds `mode` (`shadow`, `active` or `hybrid`),
+the counters above in camelCase plus `folds`, `tokensBeforeFold`,
+`tokensAfterFold` and `pinnedPageLoads`, and `retrievalOffered`, which is true
+once a fold made `retrieve_context` available. `folds: 0` in a long session
+means the VM never needed to fold; compactions stay under `runtime.compactions`.
+
+`tokensBeforeFold` and `tokensAfterFold` sum, over all folds, the estimated size
+of the previous checkpoint ledger and of the new one. They measure the ledger,
+not the prompt: the ledger grows as events are folded in, so `tokensAfterFold`
+above `tokensBeforeFold` is normal and says nothing about whether a prompt
+shrank. For the prompt, read `hybridCompaction`.
+
+`contextVm.hybridCompaction` is present in `hybrid` mode only. In `shadow` and
+`active` it is absent. It counts compactions:
+
+| Field | Meaning |
+| --- | --- |
+| `attempts` | Every hybrid compaction entry: automatic, manual and overflow recovery |
+| `applied` | Compactions that replaced the history |
+| `skippedNoFit` | Dry run (automatic attempts below capacity only) said the replacement cannot fit or there was no earlier turn; no summarizer request |
+| `skippedNoAssistantReply` | Automatic attempt below capacity where no cut had an assistant reply in the replaced prefix; no summarizer request |
+| `skippedBackoff` | Automatic attempts deferred by the backoff; no summarizer request |
+| `notAppliedAfterFold` | At least one summarizer request was sent and the history was left unchanged |
+| `notAppliedOther` | Not applied without a summarizer request: no summarizer, no chunk fitting its window, a failed fold, a failed session write or rebase |
+| `contextTokensBefore`, `contextTokensAfter` | Sums over applied compactions of the message estimate before and after |
+
+`attempts` is the sum of the six outcome counters (`applied`, `skippedNoFit`,
+`skippedNoAssistantReply`, `skippedBackoff`, `notAppliedAfterFold`, `notAppliedOther`). The token sums use
+the message estimate only, so they leave out the system prompt and tool
+schemas. A skipped or deferred result reports the same message estimate in
+`tokens_before` and `tokens_after`.
+
+The counters belong to the agent, not to the runtime: they survive a session
+load, a branch switch and a rewind, and cover the whole agent lifetime. A run
+that loads a session starts from zero only if the agent is new. Logs written
+before these counters existed lack the object; read that as unknown, not zero.
 
 ## Shared engineering facts
 

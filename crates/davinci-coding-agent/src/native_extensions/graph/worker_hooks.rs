@@ -34,6 +34,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// is unpaid-for work on a finished node.
 static SUBMITTED: AtomicBool = AtomicBool::new(false);
 
+/// Set once this worker admitted Codemode from the user's settings. Codemode
+/// is not in any role's tool list: the outer call is read-only, and every
+/// inner call still passes `block_reason` as its own tool.
+static CODEMODE_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+#[allow(dead_code)] // Used by the CLI host; graph is also compiled as a library.
+pub fn allow_codemode(allowed: bool) {
+    CODEMODE_ALLOWED.store(allowed, Ordering::Relaxed);
+}
+
 /// One process is one node, so `SUBMITTED` is process-wide. Tests share a
 /// process: they take this lock and reset the flag rather than leaking it into
 /// each other.
@@ -237,9 +247,11 @@ impl GraphWorkerContext {
                 self.role
             ));
         }
-        if !self.allowed_tools.contains(tool_name)
-            || (self.role != Role::Writer
-                && !role_tools(self.role).iter().any(|tool| tool == tool_name))
+        let codemode = tool_name == "codemode" && CODEMODE_ALLOWED.load(Ordering::Relaxed);
+        if !codemode
+            && (!self.allowed_tools.contains(tool_name)
+                || (self.role != Role::Writer
+                    && !role_tools(self.role).iter().any(|tool| tool == tool_name)))
         {
             return Some(format!(
                 "tool \"{tool_name}\" is not available to the {} role",
@@ -382,6 +394,28 @@ mod tests {
                 .unwrap()
                 .contains("not available"));
         }
+    }
+
+    #[test]
+    fn codemode_is_callable_only_once_admitted_and_adds_no_authority() {
+        let _guard = submit_guard();
+        let ctx = GraphWorkerContext::from_parts(
+            Some("researcher"),
+            Some("evidence"),
+            Some("artifact.json"),
+            None,
+        )
+        .unwrap();
+        allow_codemode(false);
+        assert!(ctx
+            .block_reason("codemode", &json!({}))
+            .unwrap()
+            .contains("not available"));
+        allow_codemode(true);
+        assert!(ctx.block_reason("codemode", &json!({})).is_none());
+        // Its inner calls are checked as their own tools.
+        assert!(ctx.block_reason("write", &json!({})).is_some());
+        allow_codemode(false);
     }
 
     #[test]

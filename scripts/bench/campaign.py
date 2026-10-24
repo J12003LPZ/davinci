@@ -194,6 +194,214 @@ def metric(row, field):
     return row.get(field)
 
 
+CODEMODE_MODES = ("off", "read-only", "controlled")
+VM_MODES = ("off", "shadow", "active", "hybrid")
+
+
+def requested_codemode(settings):
+    """The Codemode mode the settings ask for, parsed as `bench.codemode_arm` does:
+    only an object with a `mode` counts, anything else is off."""
+    block = settings.get("codemode") if isinstance(settings, dict) else None
+    return block.get("mode", "off") if isinstance(block, dict) else "off"
+
+
+def requested_mode(row, feature):
+    """What the run's settings asked for. A request, not evidence of what ran."""
+    settings = row.get("effective_settings")
+    if not isinstance(settings, dict):
+        return "unknown"
+    value = requested_codemode(settings) if feature == "codemode" else settings.get(feature, "off")
+    return value if isinstance(value, str) else "unknown"
+
+
+def observed_mode(row, feature):
+    """The mode the run's own `harness_stats` reported (the live agent's), or None."""
+    if feature == "codemode":
+        value = row.get("codemode_mode")
+        available = row.get("codemode_available")
+        if available is False:
+            return "off"
+        if available is not True and value != "off":
+            return None
+        allowed = CODEMODE_MODES
+    else:
+        block = row.get("context_vm")
+        value = block.get("mode") if isinstance(block, dict) else None
+        allowed = VM_MODES
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def mode_match(row, feature):
+    """True or False when both the request and the observation are known, else None."""
+    observed, requested = observed_mode(row, feature), requested_mode(row, feature)
+    if observed is None or requested == "unknown":
+        return None
+    return observed == requested
+
+
+def _run_key(row):
+    return f"{row.get('variant', '?')}/{row.get('task', '?')}/r{row.get('rep', '?')}"
+
+
+def _mode_of(row, feature):
+    """Grouping label: the observed mode, or "unknown". Never the requested one."""
+    return observed_mode(row, feature) or "unknown"
+
+
+def _non_negative(value):
+    return value if type(value) is int and value >= 0 else None
+
+
+def vm_signals(row):
+    """Per-run Context VM telemetry; each field is None when the run does not carry it."""
+    block = row.get("context_vm")
+    block = block if isinstance(block, dict) else {}
+    tools = row.get("tools")
+    retrieved = _non_negative(block.get("retrieve_context_calls"))
+    if retrieved is None and isinstance(tools, dict):
+        retrieved = _non_negative(tools.get("retrieve_context", 0))
+    hits, misses = _non_negative(block.get("retrieval_hits")), _non_negative(block.get("retrieval_misses"))
+    hybrid = block.get("hybrid_compaction")
+    hybrid = hybrid if isinstance(hybrid, dict) else None
+    return {"images_compiled": _non_negative(block.get("images_compiled")),
+            "folds": _non_negative(block.get("folds")),
+            "retrieval_calls": retrieved,
+            "retrieval_lookups": None if hits is None or misses is None else hits + misses,
+            # Agent::feature_use does not emit shadow comparison counters.
+            "shadow_comparisons": _non_negative(block.get("shadow_comparisons")),
+            "hybrid": hybrid}
+
+
+def _applied(signals):
+    hybrid = signals["hybrid"]
+    return _non_negative(hybrid.get("applied")) if hybrid else None
+
+
+def _activity(row, feature):
+    """True when the run used the feature, False when it provably did not, None if unknown."""
+    if feature == "codemode":
+        calls = row.get("codemode_calls")
+        # A tool event proves use even when the snapshot erroneously says zero.
+        events = row.get("codemode_tool_events")
+        tools = row.get("tools")
+        if type(events) is not int and isinstance(tools, dict):
+            events = tools.get("codemode", 0)
+        if type(events) is int and events > 0:
+            return True
+        return calls > 0 if type(calls) is int and calls >= 0 else None
+    signals = vm_signals(row)
+    hybrid = signals["hybrid"]
+    attempts = _non_negative(hybrid.get("attempts")) if hybrid else None
+    observed = (signals["images_compiled"], signals["folds"], signals["retrieval_calls"],
+                signals["retrieval_lookups"], signals["shadow_comparisons"], attempts, _applied(signals))
+    if any(type(value) is int and value > 0 for value in observed):
+        return True
+    # Without a reported image/shadow/hybrid count, zero folds and retrievals
+    # do not establish that Context VM was idle.
+    return None if any(value is None for value in observed) else False
+
+
+def _tally(values):
+    known = [value for value in values if value is not None]
+    return {"total": sum(known) if known else None, "runs_unknown": len(values) - len(known)}
+
+
+def _vm_detail(rows):
+    signals = [vm_signals(row) for row in rows]
+    detail = {field: _tally([item[field] for item in signals])
+              for field in ("images_compiled", "folds", "retrieval_calls", "retrieval_lookups",
+                            "shadow_comparisons")}
+    detail["hybrid_applied"] = _tally([_applied(item) for item in signals])
+
+    def label(field, seen, absent):
+        values = [item[field] for item in signals]
+        if any(type(value) is int and value > 0 for value in values):
+            return seen
+        return "unknown" if any(value is None for value in values) else absent
+    detail["fold_status"] = label("folds", "folds_observed", "no_folds_observed")
+    detail["retrieval_status"] = label("retrieval_calls", "retrieval_observed", "no_retrieval_observed")
+    return detail
+
+
+def _use(rows, feature):
+    observed = sorted({_mode_of(row, feature) for row in rows})
+    requested = sorted({requested_mode(row, feature) for row in rows})
+    matches = [mode_match(row, feature) for row in rows]
+    mismatched = [_run_key(row) for row, match in zip(rows, matches) if match is False]
+    levels = [_activity(row, feature) for row in rows]
+    active, unknown = levels.count(True), levels.count(None)
+    modes = set(observed)
+    off_with_activity = [_run_key(row) for row, level in zip(rows, levels)
+                         if level is True and _mode_of(row, feature) == "off"]
+    if active:
+        status = "used"
+    elif modes == {"off"}:
+        status = "off"
+    elif unknown or "unknown" in modes:
+        status = "unknown"
+    else:
+        status = "no_folds_observed" if feature == "contextVm" else "no_calls_observed"
+    result = {
+        "observed_mode": observed[0] if len(observed) == 1 else "mixed",
+        "requested_mode": requested[0] if len(requested) == 1 else "mixed",
+        # Kept for older readers: the request, not the observation.
+        "configured_mode": requested[0] if len(requested) == 1 else "mixed",
+        "mode_match": {"matched": matches.count(True), "mismatched": len(mismatched),
+                       "unknown": matches.count(None), "mismatched_runs": mismatched},
+        "runs": len(rows), "runs_with_activity": active, "runs_unknown": unknown,
+        "status": status,
+        "off_with_activity": off_with_activity,
+        "configured_but_unused": (
+            True if feature == "codemode" and status == "no_calls_observed" else
+            None if status == "unknown" or feature == "contextVm" and status != "off" else False)}
+    if feature == "contextVm":
+        result.update(_vm_detail(rows))
+    else:
+        def counts(row):
+            reported, events = row.get("codemode_calls"), row.get("codemode_tool_events")
+            ok = lambda v: type(v) is int and v >= 0
+            return (reported if ok(reported) else None, events if ok(events) else None)
+        pairs = [counts(row) for row in rows]
+        # Tool events prove at least that many calls; a higher reported count is
+        # legitimate (nested calls are not top-level tool events).
+        contradiction = [r is not None and e is not None and e > r for r, e in pairs]
+        disagree = [_run_key(row) for row, bad in zip(rows, contradiction) if bad]
+        # A contradicted count is unknown, never the reported zero nor a maximum.
+        result["calls"] = _tally([None if bad else r for (r, _), bad in zip(pairs, contradiction)])
+        result["calls_reported"] = _tally([r for r, _ in pairs])
+        result["calls_tool_events"] = _tally([e for _, e in pairs])
+        result["telemetry_mismatch"] = {"count": len(disagree), "run_keys": disagree}
+    return result
+
+
+def feature_use(rows):
+    """What did Context VM / Codemode do, by the mode each run reported itself.
+
+    The mode of a run is the one its `harness_stats` record (the live agent)
+    reported; the settings only say what was requested. Rows are grouped by
+    observed mode (`unknown` when the run reported none), and every run whose
+    observation differs from its request is listed under `mode_match`.
+
+    Activity: Context VM images, folds, retrieval calls/lookups, shadow comparisons,
+    or hybrid compaction attempts; Codemode a reported call (or a tool event, when the log carries
+    no codemode record). Separately per run: images compiled, folds, retrieval
+    calls and lookups, shadow comparisons (not emitted by the agent today:
+    unknown) and the hybridCompaction counters. A run missing the evidence is
+    unknown, so `configured_but_unused` for VM is unknown unless off: zero
+    folds alone does not prove no image or shadow work. Codemode is unused
+    only on a confirmed zero (`no_calls_observed`); `fold_status` and
+    `retrieval_status` say which part was seen. `by_mode` repeats the verdict
+    for each observed mode.
+    """
+    result = {}
+    for feature in ("contextVm", "codemode"):
+        result[feature] = _use(rows, feature)
+        result[feature]["by_mode"] = {
+            mode: _use([row for row in rows if _mode_of(row, feature) == mode], feature)
+            for mode in sorted({_mode_of(row, feature) for row in rows})}
+    return result
+
+
 def paired_metrics(baseline, candidate):
     """Candidate / baseline ratios over exact task/repetition pairs, failures included."""
     left = {(row["task"], row["rep"]): row for row in baseline}
@@ -203,12 +411,12 @@ def paired_metrics(baseline, candidate):
     result = {"pairs": len(left), "ratio_direction": "candidate / baseline",
               "baseline_passes": sum(row["pass"] for row in baseline),
               "candidate_passes": sum(row["pass"] for row in candidate)}
+    valid = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
     for field in ("wall_s", "logical_requests", "provider_attempts", "tool_calls",
                   "input_tokens", "cached_tokens", "uncached_input_tokens", "output_tokens",
                   "reasoning_tokens", "auto_verify_runs", "gate_reminder_count",
                   "requests_after_first_reminder", "mutations_after_reminder", "executed_leaf_operations"):
         pairs = [(metric(left[key], field), metric(right[key], field)) for key in sorted(left)]
-        valid = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
         unavailable = sum(not (valid(a) and valid(b)) for a, b in pairs)
         ratios = None if unavailable or any(a == 0 for a, _ in pairs) else [b / a for a, b in pairs]
         result[field] = {
@@ -217,6 +425,33 @@ def paired_metrics(baseline, candidate):
             "median_delta": None if unavailable else statistics.median(b - a for a, b in pairs),
             "total_delta": None if unavailable else sum(b - a for a, b in pairs),
         }
+    result["per_verified_success"] = {
+        arm: per_verified_success(rows, valid)
+        for arm, rows in (("baseline", baseline), ("candidate", candidate))}
+    return result
+
+
+PER_SUCCESS_FIELDS = ("uncached_input_tokens", "output_tokens", "logical_requests",
+                      "provider_attempts", "wall_s")
+
+
+def per_verified_success(rows, valid):
+    """Arm total over every run, failures included, divided by the arm's passes.
+
+    The denominator is verified passes only. A value is None with a reason when it
+    cannot be computed: `no_passes` (nothing to divide by) or `unavailable_usage`
+    (any run lacks a valid value, so the total would understate cost).
+    """
+    passes = sum(row["pass"] for row in rows)
+    result = {"passes": passes, "runs": len(rows)}
+    for field in PER_SUCCESS_FIELDS:
+        values = [metric(row, field) for row in rows]
+        if passes == 0:
+            result[field] = {"value": None, "reason": "no_passes"}
+        elif not all(valid(value) for value in values):
+            result[field] = {"value": None, "reason": "unavailable_usage"}
+        else:
+            result[field] = {"value": sum(values) / passes, "reason": None}
     return result
 
 

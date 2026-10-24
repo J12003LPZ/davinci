@@ -133,7 +133,13 @@ pub(crate) fn git(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, S
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "safe.bareRepository=explicit",
+        ])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

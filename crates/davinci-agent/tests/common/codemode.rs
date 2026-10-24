@@ -909,6 +909,43 @@ fn broker_hides_revoked_tools_without_expanding_initial_authority() {
 }
 
 #[test]
+fn broker_stays_inside_a_restricted_agents_tool_ceiling() {
+    use crate::codemode::*;
+    // A worker's tool list is narrower than what its runtime knows: the
+    // capability registry still holds `write`, the worker's ceiling does not.
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["read".into()];
+    agent.sync_tool_authorization();
+    let registry = &agent.runtime.as_ref().unwrap().capability_registry;
+    assert!(registry.get("write").is_some() && registry.get("grep").is_some());
+    let broker = AgentCodeModeBroker::new(agent.clone(), broker_context(&agent), None).unwrap();
+    let call = |request_id, tool: &str, args| {
+        broker.call(CodeModeCall {
+            request_id,
+            tool: tool.into(),
+            args,
+        })
+    };
+    assert!(
+        call(1, "read", json!({"path":"input.txt"}))
+            .unwrap()
+            .complete
+    );
+    let denied = call(2, "write", json!({"path":"outside.txt","content":"effect"})).unwrap_err();
+    assert_eq!(denied.code, "DENIED");
+    // Read-only is not the ceiling: a read-only tool outside the list is out too.
+    let outside = call(3, "grep", json!({"pattern":"sentinel"})).unwrap_err();
+    assert_eq!(outside.code, "DENIED");
+    assert_eq!(broker.describe("grep").unwrap_err().code, "DENIED");
+    assert!(broker
+        .catalog(64)
+        .unwrap()
+        .iter()
+        .all(|name| name != "write" && name != "grep"));
+    assert!(!workspace.path().join("outside.txt").exists());
+}
+
+#[test]
 fn broker_records_projection_failure_with_durable_child_reference() {
     use crate::codemode::*;
     let (agent, _workspace, journal) = configured_agent();
@@ -1456,6 +1493,36 @@ fn a_request_refused_before_any_script_runs_is_still_counted() {
     assert_eq!(message.is_error, Some(true));
     let stats = agent.run_stats();
     assert_eq!((stats.codemode_runs, stats.codemode_unfinished), (1, 1));
+}
+
+#[test]
+fn feature_use_reports_codemode_off_with_no_calls() {
+    let agent = Agent::new("You are a coding agent.");
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        json!({"mode": "off", "available": false, "calls": 0})
+    );
+}
+
+#[test]
+fn feature_use_counts_a_dispatched_codemode_call() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent
+        .enable_read_only_codemode(Arc::new(EmptyAfterReadHost("[]")))
+        .unwrap();
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        json!({"mode": "read-only", "available": true, "calls": 0})
+    );
+    agent.execute_tool_batch(
+        workspace.path(),
+        vec![("one".into(), "codemode".into(), json!({"code":"return 1"}))],
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        json!({"mode": "read-only", "available": true, "calls": 1})
+    );
 }
 
 #[test]

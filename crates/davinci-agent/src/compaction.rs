@@ -149,6 +149,11 @@ impl Summarizer {
         self.input_budget_tokens
     }
 
+    /// Whether both are the same summarizer: clones share one.
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn summarize(&self, request: &SummarizeRequest) -> Result<SummarizeResponse, String> {
         (self.inner)(request)
     }
@@ -449,8 +454,35 @@ pub fn compact_messages_with_summary(
     summary: &str,
     max_tokens: u64,
 ) -> CompactionResult {
+    compact_messages_with_summary_requiring(
+        messages,
+        keep_recent_tokens,
+        summary,
+        max_tokens,
+        false,
+    )
+    .0
+}
+
+/// Summary of a result that is not compacted because the assistant-reply rule
+/// of [`compact_messages_with_summary_requiring`] left no cut to try.
+pub const NO_ASSISTANT_REPLY_SUMMARY: &str =
+    "Compaction skipped: the part to replace holds no assistant reply yet";
+
+/// [`compact_messages_with_summary`] with an optional rule applied to each
+/// candidate cut: when `require_assistant_reply` is set, a cut whose replaced
+/// prefix holds no assistant message is skipped and later cuts are tried. The
+/// flag in the result is true when that rule alone left no cut to try (the
+/// result is then not compacted and says so), false otherwise.
+pub fn compact_messages_with_summary_requiring(
+    messages: &[ChatMessage],
+    keep_recent_tokens: u64,
+    summary: &str,
+    max_tokens: u64,
+    require_assistant_reply: bool,
+) -> (CompactionResult, bool) {
     if messages.len() < 2 {
-        return empty_result(messages);
+        return (empty_result(messages), false);
     }
     let first = find_cut_point(messages, keep_recent_tokens).first_kept_index;
     let cuts = (1..messages.len())
@@ -467,7 +499,12 @@ pub fn compact_messages_with_summary(
     }
     let tokens_before = kept[0];
     let mut smallest = None;
+    let mut skipped_for_reply = false;
     for &cut in cuts {
+        if require_assistant_reply && !messages[..cut].iter().any(|m| m.role == "assistant") {
+            skipped_for_reply = true;
+            continue;
+        }
         let details = compute_file_lists(&extract_file_ops(&messages[..cut]));
         let mut summary = summary.to_string();
         summary.push_str(&format_file_operations(
@@ -482,33 +519,43 @@ pub fn compact_messages_with_summary(
         }
         let mut compacted = vec![summary_message];
         compacted.extend(messages[cut..].iter().cloned());
-        return CompactionResult {
-            tokens_before,
-            tokens_after,
-            summary,
-            messages: compacted,
-            compacted: true,
-            details,
-            first_kept_entry_id: String::new(),
-            usage: None,
-        };
+        return (
+            CompactionResult {
+                tokens_before,
+                tokens_after,
+                summary,
+                messages: compacted,
+                compacted: true,
+                details,
+                first_kept_entry_id: String::new(),
+                usage: None,
+            },
+            false,
+        );
     }
     let Some(smallest) = smallest else {
-        return empty_result(messages);
+        let mut result = empty_result(messages);
+        if skipped_for_reply {
+            result.summary = NO_ASSISTANT_REPLY_SUMMARY.to_string();
+        }
+        return (result, skipped_for_reply);
     };
-    CompactionResult {
-        summary: format!(
-            "Compaction result does not fit: the summary and the newest turn need \
-             {smallest} tokens, {max_tokens} allowed"
-        ),
-        messages: messages.to_vec(),
-        compacted: false,
-        details: CompactionDetails::default(),
-        first_kept_entry_id: String::new(),
-        tokens_before,
-        tokens_after: tokens_before,
-        usage: None,
-    }
+    (
+        CompactionResult {
+            summary: format!(
+                "Compaction result does not fit: the summary and the newest turn need \
+                 {smallest} tokens, {max_tokens} allowed"
+            ),
+            messages: messages.to_vec(),
+            compacted: false,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before,
+            tokens_after: tokens_before,
+            usage: None,
+        },
+        false,
+    )
 }
 
 fn empty_result(messages: &[ChatMessage]) -> CompactionResult {
@@ -1322,6 +1369,31 @@ mod tests {
         let none = compact_messages_with_summary(&messages, 900, "ledger", 1);
         assert!(!none.compacted);
         assert_eq!(none.messages, messages);
+    }
+
+    #[test]
+    fn the_assistant_reply_rule_skips_a_cut_and_tries_a_later_one() {
+        let messages = vec![
+            ChatMessage::text("user", "a".repeat(8_000)),
+            ChatMessage::text("assistant", "b".repeat(400)),
+            ChatMessage::text("user", "next"),
+        ];
+        // The first cut (after the prompt) has no assistant reply before it.
+        let (plain, flagged) =
+            compact_messages_with_summary_requiring(&messages, 50, "ledger", 10_000, false);
+        assert!(plain.compacted && !flagged);
+        assert_eq!(plain.messages.len(), 3);
+        let (ruled, flagged) =
+            compact_messages_with_summary_requiring(&messages, 50, "ledger", 10_000, true);
+        assert!(ruled.compacted && !flagged, "{}", ruled.summary);
+        assert_eq!(ruled.messages.len(), 2);
+        // Nothing but the prompt to replace: the rule alone leaves no cut.
+        let lone = &messages[..2];
+        let (none, flagged) =
+            compact_messages_with_summary_requiring(lone, 50, "ledger", 10_000, true);
+        assert!(!none.compacted && flagged);
+        assert_eq!(none.summary, NO_ASSISTANT_REPLY_SUMMARY);
+        assert_eq!(none.messages, lone);
     }
 
     #[test]

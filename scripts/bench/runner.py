@@ -623,7 +623,7 @@ def bench_options(settings):
     return block
 
 
-def isolate_settings(source, target, settings, *, subscription_only=False):
+def isolate_settings(source, target, settings, *, subscription_only=False, auth_reference=False):
     """Restrict host permissions; tools in the same agent remain able to read auth."""
     options = bench_options(settings)
     source, target = Path(source), Path(target)
@@ -632,6 +632,8 @@ def isolate_settings(source, target, settings, *, subscription_only=False):
         raise ValueError("credential file is unavailable in the selected agent directory")
     if auth.is_symlink():
         raise ValueError("linked credential files require an explicit resolved source")
+    if auth_reference and subscription_only:
+        raise ValueError("auth reference cannot apply subscription credential filtering")
     credentials = None
     if subscription_only:
         store = json.loads(auth.read_text(encoding="utf-8"))
@@ -640,11 +642,25 @@ def isolate_settings(source, target, settings, *, subscription_only=False):
             raise ValueError("subscription campaign requires existing Codex OAuth credentials")
         credentials = {"openai-codex": oauth}
     target.mkdir(parents=True, exist_ok=False, mode=0o700)
-    if credentials is None:
+    if auth_reference:
+        # A second name for the SAME file, not a credential copy. The launcher
+        # must check ample expiry first; a hardlink would also see any writes to
+        # the original, so this is not a credential boundary.
+        try:
+            os.link(auth, target / "auth.json")
+        except OSError as error:
+            target.rmdir()
+            raise ValueError("auth reference requires a same-volume hardlink") from error
+        if not os.path.samefile(auth, target / "auth.json"):
+            (target / "auth.json").unlink()
+            target.rmdir()
+            raise ValueError("auth reference did not retain original file identity")
+    elif credentials is None:
         shutil.copyfile(auth, target / "auth.json")
     else:
         (target / "auth.json").write_text(json.dumps(credentials) + "\n", encoding="utf-8")
-    (target / "auth.json").chmod(0o600)
+    if not auth_reference:
+        (target / "auth.json").chmod(0o600)
     (target / "settings.json").write_text(
         json.dumps({key: value for key, value in settings.items() if key != "bench"},
                    indent=2) + "\n", encoding="utf-8")

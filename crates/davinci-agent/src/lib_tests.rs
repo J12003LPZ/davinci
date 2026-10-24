@@ -2548,6 +2548,14 @@ fn a_background_job_is_announced_to_the_model_before_its_next_completion() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = Agent::new(default_system_prompt());
     agent.cwd = dir.path().to_path_buf();
+    agent.tool_context.foreground_supervisor = Some(crate::jobs::supervisor::SupervisorCommand {
+        executable: std::env::current_exe().unwrap(),
+        argv: vec![
+            "--exact".into(),
+            "tools::foreground::tests::foreground_supervisor_fixture".into(),
+            "--nocapture".into(),
+        ],
+    });
     agent.prompt("build it");
     let events = agent
         .run_loop(scripted_tool_calls(vec![
@@ -2844,6 +2852,7 @@ fn verification_generation_accumulates_only_fresh_applicable_coverage() {
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: Some(agent.cwd.clone()),
     };
     agent.record_verification_assessment(1, "check a", &assessment(a.clone()), None);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
@@ -2876,6 +2885,7 @@ fn partial_verification_preserves_outstanding_paths_after_mutation() {
             complete: false,
             full_workspace: false,
             reason: "test",
+            ran_in: None,
         },
         Some(true),
     );
@@ -2895,6 +2905,7 @@ fn unknown_mutation_paths_prevent_full_targeted_verification() {
         complete: true,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(2, "check a", &assessment, Some(true));
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
@@ -2921,6 +2932,7 @@ fn partial_success_preserves_a_failure_until_its_scope_passes() {
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(1, "b fails", &assessment(&paths[1]), Some(false));
     agent.record_verification_assessment(1, "a passes", &assessment(&paths[0]), Some(true));
@@ -3348,6 +3360,7 @@ fn passing_harness_verification_does_not_relabel_another_scopes_failure() {
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(1, "check b", &failed, Some(false));
     agent.remember_verification_call(shell_tool(), &serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}), dir.path());
@@ -3400,6 +3413,7 @@ fn overlapping_shell_mutations_record_all_paths_before_rejecting_stale_verificat
         complete: false,
         full_workspace: false,
         reason: "test",
+        ran_in: None,
     };
     agent.record_verification_assessment(
         state.mutation_generation,
@@ -4031,10 +4045,10 @@ fn unrelated_successful_test_does_not_verify_mutation() {
     agent.record_verification_command("cargo test -p unrelated-crate", true);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
     let state = agent.mutation_verification_state();
-    assert_eq!(
-        state.latest_evidence.as_ref().map(|e| e.coverage),
-        Some(VerificationCoverage::Unrelated)
-    );
+    // Production ignores an unrelated success; it cannot change the
+    // latest applicable evidence or satisfy the mutation's test coverage.
+    assert!(state.latest_evidence.is_none());
+    assert!(state.tests_passed_generation.is_none());
 }
 
 fn shell_tool() -> &'static str {
@@ -4255,6 +4269,854 @@ fn shell_verification_requires_original_terminal_status_and_fresh_dispatch() {
         .insert("check".into(), 1);
     agent.observe_shell_verification("check", dir.path(), shell_tool(), &args, &result, &result);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+/// Runs one shell result through the production turn path
+/// (`observe_shell_verification`) with a terminal receipt.
+fn observe_shell_result(
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    with_assertions: bool,
+) {
+    observe_shell_result_with(agent, id, cwd, command, exit_code, with_assertions, |_| {});
+}
+
+/// As [`observe_shell_result`], with a hook to mark the receipt (cancelled,
+/// denied, simulated, hook-vetoed).
+fn observe_shell_result_with(
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    with_assertions: bool,
+    mark: impl FnOnce(&mut crate::runtime::evidence_store::ExecutionReceipt),
+) {
+    observe_shell_result_as(
+        "bash",
+        agent,
+        id,
+        cwd,
+        command,
+        exit_code,
+        with_assertions,
+        mark,
+    );
+}
+
+/// As [`observe_shell_result_with`], for a named shell tool (`powershell`).
+#[allow(clippy::too_many_arguments)]
+fn observe_shell_result_as(
+    tool: &str,
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    with_assertions: bool,
+    mark: impl FnOnce(&mut crate::runtime::evidence_store::ExecutionReceipt),
+) {
+    let generation = agent.mutation_verification_state().mutation_generation;
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert(id.into(), generation);
+    let mut receipt = crate::runtime::evidence_store::ExecutionReceipt {
+        operation_id: id.into(),
+        argv: vec![command.into()],
+        started: true,
+        exit_code: Some(exit_code),
+        assertion_counts: with_assertions.then_some(crate::runtime::AssertionCounts {
+            total: 1,
+            passed: u32::from(exit_code == 0),
+            failed: u32::from(exit_code != 0),
+            skipped: 0,
+        }),
+        ..Default::default()
+    };
+    mark(&mut receipt);
+    agent.command_receipts.lock().unwrap().push_back(receipt);
+    let result = ToolResult {
+        content: if exit_code == 0 { "ok" } else { "failed" }.into(),
+        is_error: exit_code != 0,
+        details: Some(serde_json::json!({"exitCode":exit_code})),
+    };
+    agent.observe_shell_verification(
+        id,
+        cwd,
+        tool,
+        &serde_json::json!({"command":command}),
+        &result,
+        &result,
+    );
+}
+
+#[test]
+fn failed_syntax_check_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "t1",
+        dir.path(),
+        "pytest tests/test_app.py",
+        0,
+        true,
+    );
+    assert_eq!(
+        agent.mutation_verification_state().tested_paths,
+        [PathBuf::from("app.py")]
+    );
+    // A successful syntax-only check adds no coverage and retires nothing.
+    observe_shell_result(
+        &agent,
+        "s0",
+        dir.path(),
+        "python -m py_compile app.py",
+        0,
+        false,
+    );
+    assert_eq!(
+        agent.mutation_verification_state().tested_paths,
+        [PathBuf::from("app.py")]
+    );
+    observe_shell_result(
+        &agent,
+        "s1",
+        dir.path(),
+        "python -m py_compile missing.py",
+        1,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+    observe_shell_result(
+        &agent,
+        "t2",
+        dir.path(),
+        "pytest tests/test_lib.py",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("lib.py")]);
+    assert_ne!(state.tests_passed_generation, Some(generation));
+}
+
+#[test]
+fn failed_unknown_check_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(
+        &agent,
+        "t1",
+        dir.path(),
+        "pytest tests/test_app.py",
+        0,
+        true,
+    );
+    observe_shell_result(&agent, "u0", dir.path(), "make lint", 0, false);
+    assert_eq!(
+        agent.mutation_verification_state().tested_paths,
+        [PathBuf::from("app.py")]
+    );
+    observe_shell_result(&agent, "u1", dir.path(), "make lint", 1, false);
+    assert!(agent.mutation_verification_state().tested_paths.is_empty());
+}
+
+#[test]
+fn failed_inspection_command_keeps_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(
+        &agent,
+        "t1",
+        dir.path(),
+        "pytest tests/test_app.py",
+        0,
+        true,
+    );
+    let before = agent.mutation_verification_state();
+    for (id, command) in [
+        ("g1", "grep -r foo ."),
+        ("g2", "ls missing"),
+        ("g3", "./inspect.sh"),
+    ] {
+        observe_shell_result(&agent, id, dir.path(), command, 1, false);
+        let state = agent.mutation_verification_state();
+        assert_eq!(state.tested_paths, [PathBuf::from("app.py")], "{command}");
+        assert_eq!(
+            state.tests_passed_generation, before.tests_passed_generation,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn failed_unclassified_checker_without_a_summary_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(&agent, "ok", dir.path(), "pytest -q", 0, true);
+    assert_eq!(agent.mutation_verification_state().tested_paths.len(), 2);
+    // `--no-run` makes this an Unknown check, and a bad feature fails the
+    // build before any test summary exists.
+    let command = "cargo test --no-run --features nonexistent";
+    assert_eq!(
+        crate::verification::classify("bash", command, dir.path(), &["app.py".into()]).kind,
+        crate::verification::CheckKind::Unknown
+    );
+    observe_shell_result(&agent, "bad", dir.path(), command, 101, false);
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn inline_script_in_a_subdirectory_does_not_credit_exempt_docs_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/lib.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    observe_shell_result(
+        &agent,
+        "inline",
+        &dir.path().join("sub"),
+        "python -c \"import lib; assert lib.f() == 1\"",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // Run from the root, the same check does sit above the README.
+    std::fs::write(dir.path().join("lib.py"), "def f():\n    return 1\n").unwrap();
+    agent.record_successful_mutation_paths(vec!["lib.py".into(), "README.md".into()]);
+    observe_shell_result(
+        &agent,
+        "root",
+        dir.path(),
+        "python -c \"import lib; assert lib.f() == 1\"",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.contains(&PathBuf::from("README.md")));
+}
+
+#[test]
+fn heredoc_check_after_cd_credits_only_the_directory_the_classifier_used() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/lib.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    let command = "cd sub && python - <<'PY'\nimport lib\nassert lib.f() == 1\nPY";
+    observe_shell_result(&agent, "heredoc", dir.path(), command, 0, false);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn check_whose_directory_cannot_be_determined_credits_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/lib.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    for (id, command) in [
+        (
+            "var",
+            "cd \"$SUBDIR\" && python -c \"import lib; assert lib.f() == 1\"",
+        ),
+        (
+            "late",
+            "cd sub && cd . && python -c \"import lib; assert lib.f() == 1\"",
+        ),
+    ] {
+        observe_shell_result(&agent, id, dir.path(), command, 0, false);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+    }
+    // The coverage step itself refuses to guess a directory.
+    let unknown = crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec!["sub/lib.py".into(), "README.md".into()],
+        complete: true,
+        full_workspace: false,
+        reason: "test",
+        ran_in: None,
+    };
+    assert!(crate::verification::targeted_tested_coverage(&unknown, dir.path()).is_empty());
+}
+
+#[test]
+fn failed_checker_chained_with_an_unclassified_command_revokes_test_coverage() {
+    for command in [
+        "tsc --noEmit && echo checked",
+        "eslint . && echo ok",
+        "npx biome check . && echo ok",
+        "FOO=1 tsgo -p . && echo ok",
+        "python -m py_compile x.py && echo ok",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_shell_result(
+            &agent,
+            "t1",
+            dir.path(),
+            "pytest tests/test_app.py",
+            0,
+            true,
+        );
+        assert_eq!(
+            agent.mutation_verification_state().tested_paths,
+            [PathBuf::from("app.py")]
+        );
+        // The same chain passing proves nothing and changes nothing.
+        observe_shell_result(&agent, "ok", dir.path(), command, 0, false);
+        assert_eq!(
+            agent.mutation_verification_state().tested_paths,
+            [PathBuf::from("app.py")],
+            "{command}"
+        );
+        observe_shell_result(&agent, "bad", dir.path(), command, 2, false);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+        assert_eq!(state.tests_passed_generation, None, "{command}");
+    }
+}
+
+#[test]
+fn failed_path_qualified_checker_revokes_test_coverage() {
+    for command in [
+        "./node_modules/.bin/tsc --noEmit",
+        "./node_modules/.bin/eslint .",
+        r"node_modules\.bin\tsc.cmd --noEmit",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_shell_result(
+            &agent,
+            "t1",
+            dir.path(),
+            "cd . && pytest tests/test_app.py",
+            0,
+            true,
+        );
+        assert_eq!(
+            agent.mutation_verification_state().tested_paths,
+            [PathBuf::from("app.py")],
+            "{command}"
+        );
+        observe_shell_result(&agent, "bad", dir.path(), command, 2, false);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+        observe_shell_result(
+            &agent,
+            "t2",
+            dir.path(),
+            "cd . && pytest tests/test_lib.py",
+            0,
+            true,
+        );
+        assert_eq!(
+            agent.mutation_verification_state().tests_passed_generation,
+            None,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn unrecognized_wrapper_script_named_pytest_earns_no_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_shell_result(
+        &agent,
+        "w1",
+        dir.path(),
+        "./tools/pytest tests/test_app.py tests/test_lib.py",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+// Captured from bench-pubcmp-20261016: t8-calc-r0 and t7-cli-r2.
+const PYTEST_PASSED: &str =
+    "......                                                                   [100%]\r\n6 passed in 0.01s\r\n";
+const UNITTEST_PASSED: &str = "test_top_requires_a_positive_integer (test_wordcount.WordcountTests.test_top_requires_a_positive_integer) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 4 tests in 0.242s\r\n\r\nOK\r\n";
+
+/// As [`observe_shell_result`], but the assertion counts come from the
+/// captured runner output through the production discovery parser.
+fn observe_captured_run(
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    stdout: &str,
+) {
+    observe_shell_result_with(agent, id, cwd, command, exit_code, false, |receipt| {
+        receipt.assertion_counts =
+            crate::verification::discovery::counts(command, stdout.as_bytes(), b"");
+    });
+}
+
+#[test]
+fn passing_pytest_summary_earns_test_credit_and_skips_the_requirement_review() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "before").unwrap();
+    }
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "after").unwrap();
+    }
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_captured_run(&agent, "p1", dir.path(), "pytest -q", 0, PYTEST_PASSED);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    assert!(!agent.queue_requirement_completion(&mut Vec::new()));
+    assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+}
+
+#[test]
+fn filtered_pytest_runs_earn_no_coverage_and_keep_the_review() {
+    for (command, output) in [
+        (
+            "pytest -q tests/ -k smoke",
+            "1 passed, 2 deselected in 0.01s\r\n",
+        ),
+        ("pytest -q tests/ -k smoke", PYTEST_PASSED),
+        ("pytest -q -m fast tests/", PYTEST_PASSED),
+        ("pytest -q --lf", PYTEST_PASSED),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+        for name in ["app.py", "lib.py"] {
+            std::fs::write(dir.path().join(name), "before").unwrap();
+        }
+        let mut agent = verifying_agent(dir.path());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        for name in ["app.py", "lib.py"] {
+            std::fs::write(dir.path().join(name), "after").unwrap();
+        }
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_captured_run(&agent, "f1", dir.path(), command, 0, output);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+        assert!(
+            agent.queue_requirement_completion(&mut Vec::new()),
+            "{command}"
+        );
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 0);
+    }
+    // Control: the unfiltered directory run still covers the edited paths.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("tests")).unwrap();
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "before").unwrap();
+    }
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "after").unwrap();
+    }
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(
+        &agent,
+        "f2",
+        dir.path(),
+        "pytest -q tests/",
+        0,
+        PYTEST_PASSED,
+    );
+    assert!(!agent.queue_requirement_completion(&mut Vec::new()));
+    assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+}
+
+#[test]
+fn pytest_without_a_passing_summary_or_exact_runner_earns_no_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(
+        &agent,
+        "w1",
+        dir.path(),
+        "./tools/pytest -q",
+        0,
+        PYTEST_PASSED,
+    );
+    // Exit 5 with nothing collected, and a zero-test summary on a zero exit.
+    observe_captured_run(
+        &agent,
+        "n1",
+        dir.path(),
+        "pytest -q",
+        5,
+        "no tests ran in 0.01s\r\n",
+    );
+    observe_captured_run(
+        &agent,
+        "n2",
+        dir.path(),
+        "pytest -q",
+        0,
+        "no tests ran in 0.01s\r\n",
+    );
+    // No parsable summary at all.
+    observe_captured_run(
+        &agent,
+        "n3",
+        dir.path(),
+        "pytest -q",
+        0,
+        "......  [100%]\r\n",
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+    assert_ne!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn failed_pytest_summary_revokes_earlier_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(&agent, "p1", dir.path(), "pytest -q", 0, PYTEST_PASSED);
+    assert_eq!(agent.mutation_verification_state().tested_paths.len(), 2);
+    observe_captured_run(
+        &agent,
+        "p2",
+        dir.path(),
+        "pytest -q",
+        1,
+        "F.....                                                                   [100%]\r\n1 failed, 5 passed in 0.03s\r\n",
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn default_unittest_discovery_covers_edited_paths_but_a_module_selector_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(
+        &agent,
+        "u1",
+        dir.path(),
+        "python -m unittest -v test_mod",
+        0,
+        UNITTEST_PASSED,
+    );
+    assert!(agent.mutation_verification_state().tested_paths.is_empty());
+    observe_captured_run(
+        &agent,
+        "u2",
+        dir.path(),
+        "python -m unittest -v",
+        0,
+        UNITTEST_PASSED,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(
+        state.tested_paths,
+        [PathBuf::from("app.py"), PathBuf::from("lib.py")]
+    );
+    assert!(state.tests_passed_generation.is_some());
+}
+
+#[test]
+fn suffixed_python_does_not_bypass_the_filtered_unittest_exclusion() {
+    for program in ["Python.exe", "python.cmd"] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_shell_result(
+            &agent,
+            "u1",
+            dir.path(),
+            &format!("{program} -m unittest discover -s tests/ --pattern=test_lib.py"),
+            0,
+            true,
+        );
+        let state = agent.mutation_verification_state();
+        assert!(
+            !state.tested_paths.contains(&PathBuf::from("app.py")),
+            "{program}: {:?}",
+            state.tested_paths
+        );
+    }
+}
+
+#[test]
+fn failed_loosely_spelled_checker_revokes_test_coverage() {
+    for (tool, command) in [
+        ("bash", "/usr/bin/env -- ./node_modules/.bin/eslint ."),
+        ("powershell", r".\node_modules\.bin\eslint.cmd ."),
+        ("bash", "env ./node_modules/.bin/eslint ."),
+        ("bash", "env ./node_modules/.bin/biome 'check' ."),
+        ("bash", "env -- ./node_modules/.bin/eslint ."),
+        ("bash", "env -u FOO ./node_modules/.bin/eslint ."),
+        ("powershell", r"& '.\tools with spaces\eslint.cmd' ."),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = verifying_agent(dir.path());
+        agent.record_successful_mutation_paths(vec!["a.ts".into(), "b.ts".into()]);
+        observe_shell_result(
+            &agent,
+            "t1",
+            dir.path(),
+            "cd . && npm test -- tests/a.test.ts",
+            0,
+            true,
+        );
+        assert!(
+            !agent.mutation_verification_state().tested_paths.is_empty(),
+            "{command}: precondition"
+        );
+        observe_shell_result_as(tool, &agent, "bad", dir.path(), command, 2, false, |_| {});
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+    }
+}
+
+#[test]
+fn compound_inline_assertion_and_suite_credit_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "def f():\n    return 1\n").unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "c1",
+        dir.path(),
+        "python -c \"import app; assert app.f() == 1\" && pytest tests/test_lib.py",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.contains(&PathBuf::from("app.py")));
+    assert!(state.tested_paths.contains(&PathBuf::from("lib.py")));
+    assert_eq!(state.tests_passed_generation, Some(generation));
+}
+
+#[test]
+fn set_eu_prelude_still_earns_suite_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "p1",
+        dir.path(),
+        "set -eu\ncargo test --workspace",
+        0,
+        true,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths.len(), 2, "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, Some(generation));
+}
+
+#[test]
+fn runs_that_prove_nothing_leave_test_coverage_unchanged_through_the_shell_path() {
+    type Mark = fn(&mut crate::runtime::evidence_store::ExecutionReceipt);
+    let marks: [(&str, Mark); 4] = [
+        ("cancelled", |r| r.cancelled = true),
+        ("denied", |r| r.permission_denied = true),
+        ("hook vetoed", |r| r.hook_vetoed = true),
+        ("simulated", |r| r.simulated = true),
+    ];
+    for command in [
+        "pytest tests/test_lib.py",
+        "python -m py_compile lib.py",
+        "make lint",
+    ] {
+        for (label, mark) in marks {
+            let dir = tempfile::tempdir().unwrap();
+            let agent = verifying_agent(dir.path());
+            agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+            observe_shell_result(
+                &agent,
+                "t1",
+                dir.path(),
+                "pytest tests/test_app.py",
+                0,
+                true,
+            );
+            let before = agent.mutation_verification_state();
+            assert_eq!(before.tested_paths, [PathBuf::from("app.py")]);
+            // Started with a nonzero exit code, so only the flag keeps the
+            // coverage: it must neither be cleared nor extended.
+            observe_shell_result_with(&agent, "x", dir.path(), command, 1, false, mark);
+            let after = agent.mutation_verification_state();
+            assert_eq!(
+                after.tested_paths, before.tested_paths,
+                "{label}: {command}"
+            );
+            assert_eq!(
+                after.tests_passed_generation, before.tests_passed_generation,
+                "{label}: {command}"
+            );
+        }
+    }
+}
+
+#[test]
+fn suite_run_in_a_subdirectory_covers_only_paths_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "sub/lib.py".into()]);
+    observe_shell_result(&agent, "sub", &dir.path().join("sub"), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn nonzero_test_run_without_a_summary_revokes_test_coverage_through_the_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(&agent, "ok", dir.path(), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert_eq!(state.tested_paths.len(), 2);
+    // No test summary (a collection error, an unknown package): the exit code
+    // is the only evidence, and it is a failure.
+    observe_shell_result(
+        &agent,
+        "bad",
+        dir.path(),
+        "pytest tests/missing.py",
+        4,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn suite_run_in_a_subdirectory_does_not_credit_exempt_docs_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["sub/lib.py".into(), "README.md".into()]);
+    observe_shell_result(&agent, "sub", &dir.path().join("sub"), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("sub/lib.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // A root run does test the whole workspace, README included.
+    let generation = state.mutation_generation;
+    observe_shell_result(&agent, "root", dir.path(), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert!(state.tested_paths.contains(&PathBuf::from("README.md")));
+}
+
+#[test]
+fn suite_run_at_the_workspace_root_still_covers_every_edited_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "sub/lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(&agent, "root", dir.path(), "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert!(state.tested_paths.contains(&PathBuf::from("app.py")));
+    assert!(state.tested_paths.contains(&PathBuf::from("sub/lib.py")));
+}
+
+#[test]
+fn full_workspace_suite_does_not_credit_a_path_outside_the_workspace_root() {
+    let base = tempfile::tempdir().unwrap();
+    let repo = base.path().join("repo");
+    let shared = base.path().join("shared");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(repo.join("app.py"), "def f():\n    return 1\n").unwrap();
+    std::fs::write(shared.join("config.json"), "ok").unwrap();
+    let config = shared.join("config.json");
+    let agent = verifying_agent(&repo);
+    agent.record_successful_mutation_paths(vec!["app.py".into(), config.clone()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_shell_result(
+        &agent,
+        "inline",
+        &repo,
+        "python -c \"import app; assert app.f() == 1; assert open('../shared/config.json').read() == 'ok'\"",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("app.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // A root run tests everything under the root and nothing beside it.
+    observe_shell_result(&agent, "root", &repo, "cargo test", 0, true);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tested_paths, [PathBuf::from("app.py")]);
+    assert_eq!(state.tests_passed_generation, None);
+    // The extra root earns its own passing run from inside it.
+    observe_shell_result(&agent, "shared", &shared, "pytest -q", 0, true);
+    let state = agent.mutation_verification_state();
+    assert!(
+        state.tested_paths.contains(&config),
+        "{:?}",
+        state.tested_paths
+    );
+    assert_eq!(state.tests_passed_generation, Some(generation));
 }
 
 #[test]
@@ -4896,6 +5758,42 @@ fn checker_programs_match_only_as_the_program_word() {
 }
 
 #[test]
+fn loose_checker_predicate_is_wider_than_the_strict_ones_but_not_a_catch_all() {
+    use crate::shell_policy::{invokes_verifier, invokes_verifier_or_checker_loosely};
+    use crate::turn::invokes_checker;
+    for command in [
+        "/usr/bin/env -- ./node_modules/.bin/eslint .",
+        r".\node_modules\.bin\eslint.cmd .",
+        "env ./node_modules/.bin/eslint .",
+        r"node_modules\.bin\TSC.CMD --noEmit",
+        "./node_modules/.bin/tsc --noEmit",
+        r"C:\Python312\python.bat check.py",
+        "FOO=1 ./node_modules/.bin/eslint .",
+        "env ./node_modules/.bin/biome 'check' .",
+        "env -- ./node_modules/.bin/eslint .",
+        "env -u FOO ./node_modules/.bin/eslint .",
+        "env --unset=FOO ./node_modules/.bin/eslint .",
+        r"& '.\tools with spaces\eslint.cmd' .",
+    ] {
+        assert!(invokes_verifier_or_checker_loosely(command), "{command}");
+        assert!(
+            !invokes_verifier(command) && !invokes_checker(command),
+            "{command} is already recognized strictly"
+        );
+    }
+    for command in [
+        "./tools/cat file",
+        "grep x",
+        "echo eslint",
+        "cat tsc.cmd",
+        "grep pytest log.txt",
+        "grep 'pytest' log.txt",
+    ] {
+        assert!(!invokes_verifier_or_checker_loosely(command), "{command}");
+    }
+}
+
+#[test]
 fn gate_reason_distinguishes_failed_and_incomplete_checks() {
     for (command, expected) in [
         (
@@ -5061,7 +5959,7 @@ fn hybrid_compaction_whose_ledger_cannot_follow_keeps_live_history() {
         agent.record_assistant("ok");
     }
     let before = agent.messages.clone();
-    let prepared = agent.hybrid_compaction(None, 0);
+    let prepared = agent.hybrid_compaction(None, true, 0);
     assert!(prepared.compacted, "{}", prepared.summary);
     let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
     let root = vm.root();
@@ -5383,4 +6281,1508 @@ fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
     agent.persist_mutation_verification();
     agent.persist_tool_exposure();
     assert_eq!(customs(&agent), before);
+}
+
+fn effect_marker(custom_type: &str, id: &str) -> SessionEntry {
+    let mut entry = SessionEntry::message("user", serde_json::json!([]));
+    entry.entry_type = "custom".into();
+    entry.message = None;
+    entry.custom_type = Some(custom_type.into());
+    entry
+        .extra
+        .insert("data".into(), serde_json::json!({ "id": id }));
+    entry
+}
+
+fn tool_call_entry(id: &str, name: &str) -> SessionEntry {
+    SessionEntry::message(
+        "assistant",
+        serde_json::json!([{"type":"toolCall","id":id,"name":name,"arguments":{}}]),
+    )
+}
+
+fn tool_result_entry(id: &str) -> SessionEntry {
+    let mut entry = SessionEntry::message("toolResult", serde_json::json!([]));
+    entry.message.as_mut().unwrap()["toolCallId"] = id.into();
+    entry
+}
+
+/// Evidence that classifies as `Verified`, not merely a recorded generation.
+fn verified_state(generation: u64) -> MutationVerificationState {
+    MutationVerificationState {
+        mutation_generation: generation,
+        verified_generation: Some(generation),
+        last_verification_succeeded: true,
+        latest_evidence: Some(VerificationEvidence {
+            generation,
+            command: "cargo test".into(),
+            succeeded: true,
+            mutation_paths: Vec::new(),
+            verification_targets: Vec::new(),
+            coverage: VerificationCoverage::Broad,
+        }),
+        ..MutationVerificationState::default()
+    }
+}
+
+fn verified_state_entry(generation: u64) -> SessionEntry {
+    let mut entry = effect_marker(MUTATION_VERIFICATION_ENTRY_TYPE, "unused");
+    entry.extra.insert(
+        "data".into(),
+        serde_json::to_value(verified_state(generation)).unwrap(),
+    );
+    entry
+}
+
+/// Write `entries` to a fresh session and return its path.
+fn seeded_session(dir: &Path, entries: Vec<SessionEntry>) -> PathBuf {
+    let mut session = JsonlSession::create(dir, "effects", None).unwrap();
+    for entry in entries {
+        session.append_entry(entry).unwrap();
+    }
+    session.path.clone()
+}
+
+fn resume(path: &Path) -> Agent {
+    let mut agent = Agent::new(default_system_prompt());
+    agent
+        .load_from_session(JsonlSession::open(path).unwrap())
+        .unwrap();
+    agent
+}
+
+#[test]
+fn resume_leaves_verification_alone_for_read_only_unresolved_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![verified_state_entry(2), tool_call_entry("c1", "read")],
+    );
+    let agent = resume(&path);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 2);
+    assert_eq!(state.verified_generation, Some(2));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn resume_invalidates_for_unresolved_calls_that_may_mutate_and_bumps_once() {
+    // `batch` and `codemode` run other tools, an unregistered name is unknown,
+    // and `mcp_read` and `lsp_*` are read-class yet run external code.
+    for tool in [
+        "write",
+        "bash",
+        "mystery_tool",
+        "batch",
+        "codemode",
+        "mcp_read",
+        "lsp_hover",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_session(
+            dir.path(),
+            vec![verified_state_entry(2), tool_call_entry("c1", tool)],
+        );
+        let seeded = seeded_session(dir.path(), vec![verified_state_entry(2)]);
+        assert_eq!(
+            resume(&seeded).completion_evidence(),
+            CompletionEvidence::Verified,
+            "{tool}: the seed must start verified"
+        );
+        for _ in 0..3 {
+            let agent = resume(&path);
+            let state = agent.mutation_verification_state();
+            assert_eq!(state.mutation_generation, 3, "{tool}");
+            assert_eq!(state.verified_generation, None, "{tool}");
+            assert!(state.unknown_mutation_paths, "{tool}");
+            assert_eq!(
+                agent.completion_evidence(),
+                CompletionEvidence::Unverified,
+                "{tool}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resume_invalidates_for_a_pending_effect_marker_and_bumps_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            verified_state_entry(4),
+            effect_marker(MUTATION_EFFECT_PENDING_ENTRY_TYPE, "effect-1"),
+        ],
+    );
+    let seeded = seeded_session(dir.path(), vec![verified_state_entry(4)]);
+    assert_eq!(
+        resume(&seeded).completion_evidence(),
+        CompletionEvidence::Verified
+    );
+    for _ in 0..3 {
+        let agent = resume(&path);
+        assert_eq!(agent.mutation_verification_state().mutation_generation, 5);
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+}
+
+#[test]
+fn an_interrupted_effect_revokes_earlier_test_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let paths = vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")];
+    let mut tested = verified_state(7);
+    tested.mutation_paths = paths.clone();
+    tested.covered_paths = paths.clone();
+    tested.tested_paths = paths;
+    tested.tests_passed_generation = Some(7);
+    let mut seed = effect_marker(MUTATION_VERIFICATION_ENTRY_TYPE, "unused");
+    seed.extra
+        .insert("data".into(), serde_json::to_value(tested).unwrap());
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            seed,
+            effect_marker(MUTATION_EFFECT_PENDING_ENTRY_TYPE, "effect-1"),
+        ],
+    );
+    let mut agent = verifying_agent(work.path());
+    agent
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 8);
+    assert!(state.tested_paths.is_empty());
+    assert_eq!(state.tests_passed_generation, None);
+    // A later build-only check must not promote the stale test credit.
+    observe_shell_result(
+        &agent,
+        "c1",
+        work.path(),
+        "cargo check --workspace",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn a_reused_call_id_cannot_hide_a_mutating_call() {
+    for calls in [
+        [("bash", "x"), ("read", "x")],
+        [("read", "x"), ("bash", "x")],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<_> = calls
+            .iter()
+            .map(|(name, id)| serde_json::json!({"type":"toolCall","id":id,"name":name,"arguments":{}}))
+            .collect();
+        let path = seeded_session(
+            dir.path(),
+            vec![
+                verified_state_entry(2),
+                SessionEntry::message("assistant", serde_json::Value::Array(content)),
+            ],
+        );
+        let agent = resume(&path);
+        assert_eq!(agent.mutation_verification_state().mutation_generation, 3);
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+}
+
+#[test]
+fn resume_ignores_resolved_effects_and_answered_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            verified_state_entry(2),
+            effect_marker(MUTATION_EFFECT_PENDING_ENTRY_TYPE, "effect-1"),
+            effect_marker(MUTATION_EFFECT_RESOLVED_ENTRY_TYPE, "effect-1"),
+            tool_call_entry("c1", "write"),
+            tool_result_entry("c1"),
+        ],
+    );
+    let agent = resume(&path);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 2);
+    assert_eq!(state.verified_generation, Some(2));
+}
+
+#[test]
+fn an_interrupted_effect_from_generation_zero_is_unverified_not_unrequired() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(dir.path(), vec![tool_call_entry("c1", "write")]);
+    let agent = resume(&path);
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+mod hybrid_fold_economics {
+    //! Hybrid compaction must not pay for a summarizer request it cannot use.
+    use super::*;
+    use crate::compaction::{SummarizeResponse, Summarizer};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        /// Request bytes the test estimator reports (the estimator is a plain
+        /// `fn`). Per test thread, so parallel tests cannot see each other.
+        static OVERHEAD_BYTES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn overhead_estimator(_: &Agent) -> u64 {
+        OVERHEAD_BYTES.with(Cell::get)
+    }
+
+    fn summarizer(
+        calls: Arc<AtomicUsize>,
+        on_call: impl Fn() + Send + Sync + 'static,
+    ) -> Summarizer {
+        Summarizer::new(move |request| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            on_call();
+            Ok(SummarizeResponse {
+                text: if request.label == "context state fold" {
+                    "{}".into()
+                } else {
+                    "## Goal\nContinue.".into()
+                },
+                usage: Default::default(),
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        })
+    }
+
+    /// Hybrid agent: compacts at 10k tokens, keeps 1k verbatim; the capacity
+    /// limit (window minus reserve) is 38k.
+    fn agent(calls: Arc<AtomicUsize>, on_call: impl Fn() + Send + Sync + 'static) -> Agent {
+        configure(Agent::new("You are a coding agent."), calls, on_call)
+    }
+
+    fn configure(
+        mut agent: Agent,
+        calls: Arc<AtomicUsize>,
+        on_call: impl Fn() + Send + Sync + 'static,
+    ) -> Agent {
+        agent.set_runtime(crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        agent.context_window = 40_000;
+        agent.compaction = CompactionSettings {
+            reserve_tokens: 2_000,
+            keep_recent_tokens: 1_000,
+            threshold: Some(crate::compaction::CompactionThreshold::Tokens(10_000)),
+            ..CompactionSettings::default()
+        };
+        agent.summarizer = Some(summarizer(calls, on_call));
+        agent
+    }
+
+    /// `turns` exchanges of about `tokens` tokens each, after a constraint.
+    fn fill(agent: &mut Agent, turns: usize, tokens: usize) {
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+        agent.record_assistant("ok");
+        for turn in 0..turns {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(tokens * 4)));
+            agent.record_assistant("ok");
+        }
+    }
+
+    fn hybrid_stats(agent: &Agent) -> serde_json::Value {
+        agent.feature_use()["contextVm"]["hybridCompaction"].clone()
+    }
+
+    #[test]
+    fn a_replacement_that_cannot_fit_never_reaches_the_summarizer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 4, 400);
+        // The newest request alone is over the capacity limit: no cut can fit it.
+        agent.prompt(&"y".repeat(39_000 * 4));
+        let before = agent.messages.clone();
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert_eq!(agent.messages, before);
+        assert!(
+            result.summary.contains("skipped before the summarizer")
+                && result.summary.contains("does not fit"),
+            "{}",
+            result.summary
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["attempts"], 1, "{stats}");
+        assert_eq!(stats["skippedNoFit"], 1, "{stats}");
+        assert_eq!(stats["applied"], 0, "{stats}");
+        // Free skips never start the backoff.
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    #[test]
+    fn a_history_without_a_cut_point_never_reaches_the_summarizer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert!(
+            result.summary.contains("no earlier turn to replace"),
+            "{}",
+            result.summary
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(
+            (stats["attempts"].as_u64(), stats["skippedNoFit"].as_u64()),
+            (Some(1), Some(1))
+        );
+    }
+
+    #[test]
+    fn a_replacement_that_fits_is_folded_applied_and_counted() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 30, 400);
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the fold never ran");
+        assert!(result.tokens_after < result.tokens_before);
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["attempts"], 1, "{stats}");
+        assert_eq!(stats["applied"], 1, "{stats}");
+        assert_eq!(stats["skippedNoFit"], 0, "{stats}");
+        assert_eq!(
+            stats["contextTokensBefore"], result.tokens_before,
+            "{stats}"
+        );
+        assert_eq!(stats["contextTokensAfter"], result.tokens_after, "{stats}");
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    /// A fold that is paid for and then not applied: the overhead jumps while
+    /// the summarizer runs, so the budget recomputed afterwards is too small.
+    fn unapplied_after_a_paid_fold() -> (Agent, Arc<AtomicUsize>) {
+        OVERHEAD_BYTES.with(|bytes| bytes.set(400));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {
+            OVERHEAD_BYTES.with(|bytes| bytes.set(60_000))
+        });
+        agent.set_provider_context_overhead_estimator(overhead_estimator);
+        fill(&mut agent, 30, 400);
+        let result = agent.compact_automatic(15_000);
+        assert!(!result.compacted, "{}", result.summary);
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the fold never ran");
+        // The condition that blocked the fit has passed; only the backoff holds.
+        OVERHEAD_BYTES.with(|bytes| bytes.set(400));
+        (agent, calls)
+    }
+
+    #[test]
+    fn a_paid_fold_that_is_not_applied_defers_the_next_automatic_attempt() {
+        let (mut agent, calls) = unapplied_after_a_paid_fold();
+        let paid = calls.load(Ordering::SeqCst);
+        let failed_at = agent.hybrid_fold_backoff.expect("backoff started");
+        let keep = agent.compaction.keep_recent_tokens;
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["notAppliedAfterFold"], 1, "{stats}");
+        assert_eq!(stats["applied"], 0, "{stats}");
+
+        // No growth, and one token short of `keep_recent_tokens`: deferred.
+        for tokens in [failed_at, failed_at + keep - 1] {
+            let result = agent.compact_automatic(tokens);
+            assert!(!result.compacted);
+            assert!(result.summary.contains("deferred"), "{}", result.summary);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            paid,
+            "backoff paid for a fold"
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["skippedBackoff"], 2, "{stats}");
+        assert_eq!(stats["attempts"], 3, "{stats}");
+
+        // Grown by `keep_recent_tokens`: allowed, and it applies now.
+        let result = agent.compact_automatic(failed_at + keep);
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(
+            agent.hybrid_fold_backoff, None,
+            "applied compaction resets it"
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(
+            (stats["attempts"].as_u64(), stats["applied"].as_u64()),
+            (Some(4), Some(1))
+        );
+    }
+
+    #[test]
+    fn the_backoff_defers_below_capacity_and_never_at_or_above_it() {
+        // context_window = 40_000, capacity = 38_000, keep_recent = 1_000.
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        agent.arm_hybrid_backoff(36_500);
+        let result = agent.compact_automatic(37_000);
+        assert!(
+            !result.compacted && result.summary.contains("deferred"),
+            "{}",
+            result.summary
+        );
+
+        // From the capacity limit up the attempt is a recovery: a stale backoff,
+        // even one recorded just below it, never holds it back.
+        for tokens in [38_000, 39_000, 40_000] {
+            let (mut agent, _) = unapplied_after_a_paid_fold();
+            agent.arm_hybrid_backoff(37_900);
+            let result = agent.compact_automatic(tokens);
+            assert!(result.compacted, "{tokens}: {}", result.summary);
+            assert_eq!(hybrid_stats(&agent)["skippedBackoff"], 0);
+        }
+    }
+
+    #[test]
+    fn a_smaller_context_than_the_failed_one_clears_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        let failed_at = agent.hybrid_fold_backoff.unwrap();
+        let keep = agent.compaction.keep_recent_tokens;
+        let result = agent.compact_automatic(failed_at - keep - 1);
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedBackoff"], 0);
+    }
+
+    #[test]
+    fn a_small_drop_from_a_byte_estimate_does_not_clear_the_backoff() {
+        // The failure was recorded from a byte estimate; the next provider count
+        // reads about 3k lower. That is the scale, not a replaced history.
+        let (mut agent, calls) = unapplied_after_a_paid_fold();
+        let paid = calls.load(Ordering::SeqCst);
+        let failed_at = agent.hybrid_fold_backoff.unwrap();
+        let keep = agent.compaction.keep_recent_tokens;
+        let result = agent.compact_automatic(failed_at - keep);
+        assert!(result.summary.contains("deferred"), "{}", result.summary);
+        assert_eq!(agent.hybrid_fold_backoff, Some(failed_at));
+        assert_eq!(calls.load(Ordering::SeqCst), paid, "a fold was paid for");
+    }
+
+    #[test]
+    fn a_failed_recovery_records_no_backoff_and_a_failed_automatic_attempt_does() {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let failed = CompactionResult {
+            summary: "Compaction not saved: disk full".into(),
+            messages: agent.messages.clone(),
+            compacted: false,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        agent.hybrid_last_fold_requests = 1;
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 39_000, true);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, Some(12_000));
+    }
+
+    #[test]
+    fn a_failure_that_sent_no_request_does_not_arm_the_backoff() {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let failed = CompactionResult {
+            summary: "Compaction not saved: disk full".into(),
+            messages: agent.messages.clone(),
+            compacted: false,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        agent.hybrid_last_fold_requests = 0;
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        assert_eq!(agent.hybrid_fold_backoff_settings, None);
+        assert_eq!(hybrid_stats(&agent)["notAppliedOther"], 1);
+    }
+
+    #[test]
+    fn a_non_shrinking_replacement_arms_the_backoff_only_after_a_paid_fold() {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let grew = CompactionResult {
+            summary: "replaced".into(),
+            messages: agent.messages.clone(),
+            compacted: true,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        // Built from an existing checkpoint: no request, nothing to defer.
+        agent.hybrid_last_fold_requests = 0;
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &grew, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        assert_eq!(agent.hybrid_fold_backoff_settings, None);
+        // A paid fold whose replacement did not shrink the context does.
+        agent.hybrid_last_fold_requests = 1;
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &grew, 12_000, false);
+        assert_eq!(agent.hybrid_fold_backoff, Some(12_000));
+        // Both attempts are counted as applied, so the outcomes still sum.
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["applied"], 2, "{stats}");
+        assert_eq!(stats["attempts"], 2, "{stats}");
+    }
+
+    #[test]
+    fn a_changed_summarizer_or_context_vm_mode_clears_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        let failed_at = agent.hybrid_fold_backoff.unwrap();
+
+        // The same summarizer, even re-assigned as a clone, keeps the backoff.
+        agent.summarizer = agent.summarizer.clone();
+        let result = agent.compact_automatic(failed_at);
+        assert!(result.summary.contains("deferred"), "{}", result.summary);
+
+        agent.summarizer = Some(summarizer(Arc::new(AtomicUsize::new(0)), || {}));
+        let result = agent.compact_automatic(failed_at);
+        assert!(!result.summary.contains("deferred"), "{}", result.summary);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        // Setting the mode it already has keeps the backoff.
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        assert!(agent.hybrid_fold_backoff.is_some());
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Shadow);
+        assert_eq!(agent.hybrid_fold_backoff, None);
+        assert_eq!(agent.hybrid_fold_backoff_settings, None);
+    }
+
+    #[test]
+    fn a_backoff_deferral_emits_the_compact_events_like_a_dry_run_skip() {
+        use crate::runtime::{
+            bus::RuntimeSubscriber, AgentId, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
+            RuntimeEventEnvelope, RuntimeHandle,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct EventCollector {
+            events: Mutex<Vec<RuntimeEvent>>,
+        }
+        impl RuntimeSubscriber for EventCollector {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                self.events.lock().unwrap().push(event.payload.clone());
+                RuntimeDecision::Continue
+            }
+        }
+
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        let bus = RuntimeBus::new();
+        let collector = Arc::new(EventCollector::default());
+        bus.subscribe(collector.clone());
+        agent.set_runtime(RuntimeHandle::new(RunId::new(), AgentId::new(), bus));
+        fill(&mut agent, 30, 400);
+        agent.arm_hybrid_backoff(12_000);
+        let result = agent.compact_automatic(12_500);
+        assert!(result.summary.contains("deferred"), "{}", result.summary);
+        let events = collector.events.lock().unwrap().clone();
+        let pre: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::PreCompact { estimated_tokens } => Some(*estimated_tokens),
+                _ => None,
+            })
+            .collect();
+        let post: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::PostCompact {
+                    before_tokens,
+                    after_tokens,
+                } => Some((*before_tokens, *after_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pre.len(), 1, "{events:?}");
+        assert_eq!(post.len(), 1, "{events:?}");
+        assert!(pre[0] > 0);
+        assert_eq!(post[0], (pre[0], pre[0]));
+    }
+
+    #[test]
+    fn changing_the_window_or_the_compaction_settings_clears_the_backoff() {
+        for change in [
+            (|agent: &mut Agent| agent.context_window = 50_000) as fn(&mut Agent),
+            |agent: &mut Agent| agent.compaction.keep_recent_tokens = 500,
+            |agent: &mut Agent| agent.compaction.reserve_tokens = 1_000,
+            |agent: &mut Agent| {
+                agent.compaction.threshold =
+                    Some(crate::compaction::CompactionThreshold::Tokens(9_000))
+            },
+        ] {
+            let (mut agent, _) = unapplied_after_a_paid_fold();
+            let failed_at = agent.hybrid_fold_backoff.unwrap();
+            // Unchanged settings: deferred.
+            let result = agent.compact_automatic(failed_at);
+            assert!(result.summary.contains("deferred"), "{}", result.summary);
+            change(&mut agent);
+            let result = agent.compact_automatic(failed_at);
+            assert!(!result.summary.contains("deferred"), "{}", result.summary);
+            assert_eq!(agent.hybrid_fold_backoff, None);
+        }
+    }
+
+    #[test]
+    fn reserve_band_requests_do_not_wait_for_a_backoff_after_a_failed_recovery() {
+        // Default compaction settings (keep 20,000, reserve 16,384), a 60k window and a
+        // first prompt of 42k tokens: with the 2k overhead turn 0 is already above the
+        // capacity limit (43,616) and has no earlier turn to replace, so its recovery
+        // pays a fold that cannot apply. Before the backoff existed, turn 1 compacted;
+        // a backoff held through the reserve band for many turns.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.context_window = 60_000;
+        agent.compaction = CompactionSettings::default();
+        agent.set_provider_context_overhead_tokens(Some(2_000));
+        let capacity = 60_000 - agent.compaction.reserve_tokens;
+        let above_capacity = Arc::new(AtomicUsize::new(0));
+        let mut applied_at = None;
+        for turn in 0..30 {
+            let size = if turn == 0 { 42_000 } else { 500 };
+            agent.prompt(&format!("turn {turn} {}", "x".repeat(size * 4)));
+            let counter = above_capacity.clone();
+            agent
+                .run_loop(move |agent: &Agent| {
+                    let tokens = crate::compaction::estimate_context_tokens(&agent.messages)
+                        + agent.estimated_request_overhead_tokens();
+                    if tokens > capacity {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok::<_, String>(reply_with(tokens))
+                })
+                .unwrap();
+            if applied_at.is_none() && hybrid_stats(&agent)["applied"].as_u64().unwrap() > 0 {
+                applied_at = Some(turn);
+            }
+        }
+        assert_eq!(applied_at, Some(1), "compaction must apply at turn 1");
+        assert!(
+            above_capacity.load(Ordering::SeqCst) <= 1,
+            "{} requests above the capacity limit",
+            above_capacity.load(Ordering::SeqCst)
+        );
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    #[test]
+    fn a_failed_fold_reports_the_full_request_estimate_in_both_fields() {
+        // The checkpoint cannot be written, so the fold fails.
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+            .unwrap();
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        fill(&mut agent, 6, 200);
+        let full = agent.estimated_context_tokens();
+        let messages = crate::compaction::estimate_context_tokens(&agent.messages);
+        assert!(full > messages);
+        let path = agent.session.as_ref().unwrap().path.clone();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let result = agent.compact(None);
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(!result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["applied"], 0);
+        assert_eq!((result.tokens_before, result.tokens_after), (full, full));
+    }
+
+    #[test]
+    fn a_manual_compact_recovers_when_the_fold_shrinks_the_ledger_below_the_dry_run() {
+        let (mut agent, calls, _, _) = a_long_parent_narrative_the_next_fold_shortens();
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one paid fold");
+        assert_eq!(hybrid_stats(&agent)["skippedNoFit"], 0);
+    }
+
+    #[test]
+    fn an_automatic_attempt_at_capacity_recovers_when_the_fold_shrinks_the_ledger() {
+        let (mut agent, calls, _, _) = a_long_parent_narrative_the_next_fold_shortens();
+
+        let result = agent.compact_automatic(38_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one paid fold");
+        assert_eq!(hybrid_stats(&agent)["skippedNoFit"], 0);
+    }
+
+    #[test]
+    fn below_capacity_a_long_parent_narrative_alone_does_not_false_skip_the_dry_run() {
+        let (mut agent, calls, _, _) = a_long_parent_narrative_the_next_fold_shortens();
+
+        // Below capacity, so the free dry run runs. The fold may replace the parent
+        // narrative, so the dry run renders without it and fits.
+        let result = agent.compact_automatic(20_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one paid fold");
+        assert_eq!(hybrid_stats(&agent)["skippedNoFit"], 0);
+    }
+
+    #[test]
+    fn a_recovery_does_not_run_the_dry_run() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 4, 400);
+        // The newest request alone is over the capacity limit: HEAD paid a fold here too.
+        agent.prompt(&"y".repeat(39_000 * 4));
+
+        let result = agent.compact(None);
+
+        assert!(!result.compacted);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "recovery skipped the fold"
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["skippedNoFit"], 0, "{stats}");
+        assert_eq!(stats["notAppliedAfterFold"], 1, "{stats}");
+    }
+
+    fn narrative_proposal(agent: &Agent, narrative: &str) -> String {
+        let source_ref = agent
+            .context_vm_events_for_vm()
+            .iter()
+            .rev()
+            .find(|event| event.kind == crate::runtime::context_vm::ContextEventKind::Assistant)
+            .unwrap()
+            .source_ref
+            .clone();
+        serde_json::json!({"narrative": {
+            "value": narrative, "source_refs": [source_ref], "provenance_kind": "agent_inference"}})
+        .to_string()
+    }
+
+    fn tokens_needed(agent: &Agent, ledger: &str) -> u64 {
+        let result = crate::compaction::compact_messages_with_summary(
+            &agent.messages,
+            agent.compaction.keep_recent_tokens,
+            ledger,
+            0,
+        );
+        let at = result.summary.find(" need ").unwrap() + 6;
+        result.summary[at..]
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// The first fold stores a 1,000-byte narrative; the second proposes "short". The
+    /// deterministic dry run keeps the long one, so its ledger is bigger than the folded
+    /// one, and the budget sits between the two needs. Returns the agent, the summarizer
+    /// request counter and the two needs.
+    fn a_long_parent_narrative_the_next_fold_shortens() -> (Agent, Arc<AtomicUsize>, u64, u64) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reply = Arc::new(std::sync::Mutex::new(String::from("{}")));
+        let counter = calls.clone();
+        let fold_reply = reply.clone();
+        let mut agent = Agent::new("You are a coding agent.");
+        agent.set_runtime(crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        agent.context_window = 40_000;
+        agent.compaction = CompactionSettings {
+            reserve_tokens: 2_000,
+            keep_recent_tokens: 1_000,
+            threshold: None,
+            ..CompactionSettings::default()
+        };
+        agent.auto_compaction = false;
+        agent.summarizer = Some(Summarizer::new(move |request| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(SummarizeResponse {
+                text: if request.label == "context state fold" {
+                    fold_reply.lock().unwrap().clone()
+                } else {
+                    "## Goal\nContinue.".into()
+                },
+                usage: Default::default(),
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        }));
+        agent.prompt("Build the scheduler.");
+        agent.record_assistant("ok, starting");
+        for turn in 0..6 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(1_600)));
+            agent.record_assistant(&format!("done {turn}"));
+        }
+        *reply.lock().unwrap() = narrative_proposal(&agent, &"N".repeat(1_000));
+        agent
+            .fold_context(runtime::context_vm::FoldReason::Manual, None)
+            .unwrap();
+        for turn in 6..12 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(1_600)));
+            agent.record_assistant(&format!("done {turn}"));
+        }
+        agent.prompt(&format!("next {}", "z".repeat(4_000)));
+        let state = agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .context_vm
+            .load_state_from_root()
+            .unwrap();
+        assert!(
+            state.narrative.is_some(),
+            "the first fold kept no narrative"
+        );
+        let newer: Vec<_> = agent
+            .context_vm_events_for_vm()
+            .into_iter()
+            .filter(|event| event.seq > state.through_seq)
+            .collect();
+        let long = runtime::context_vm::ContextStateReducer::deterministic_delta(&state, &newer)
+            .checkpoint_patch;
+        let mut short = long.clone();
+        short.narrative.as_mut().unwrap().value = "short".into();
+        let need_long = tokens_needed(&agent, &runtime::context_vm::render_ledger(&long));
+        let need_short = tokens_needed(&agent, &runtime::context_vm::render_ledger(&short));
+        assert!(need_short < need_long);
+        // Budget between the two needs: the long ledger cannot fit, the folded one can.
+        agent.set_provider_context_overhead_tokens(Some(0));
+        let base = agent.estimated_request_overhead_tokens();
+        let budget = (need_long + need_short) / 2;
+        agent.set_provider_context_overhead_tokens(Some(38_000 - budget - base));
+        assert_eq!(agent.hybrid_replacement_budget(true), budget);
+        *reply.lock().unwrap() = narrative_proposal(&agent, "short");
+        let paid_so_far = calls.load(Ordering::SeqCst);
+        calls.store(0, Ordering::SeqCst);
+        let _ = paid_so_far;
+        (agent, calls, need_long, need_short)
+    }
+
+    /// `fill(4, 400)`, then a 12k-token prompt, "ok" and "next": the threshold
+    /// budget (10k) fits a replacement that keeps only the last turns, and the
+    /// capacity budget (38k) would fit one that keeps the 12k prompt.
+    fn the_probe_history(calls: Arc<AtomicUsize>) -> Agent {
+        let mut agent = agent(calls, || {});
+        agent.auto_compaction = false;
+        fill(&mut agent, 4, 400);
+        agent.prompt(&"y".repeat(12_000 * 4));
+        agent.record_assistant("ok");
+        agent.prompt("next");
+        agent
+    }
+
+    #[test]
+    fn a_recovery_lands_under_the_threshold_when_something_fits_there() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = the_probe_history(calls.clone());
+        let threshold_budget = agent.hybrid_replacement_budget(false);
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(
+            result.tokens_after <= threshold_budget,
+            "{} tokens, threshold budget {threshold_budget}",
+            result.tokens_after
+        );
+        let paid = calls.load(Ordering::SeqCst);
+        assert!(paid >= 1);
+        // The next turn does not trigger a second compaction.
+        let mut settings = agent.compaction;
+        settings.enabled = true;
+        assert!(!crate::should_compact(
+            agent.calibrated_context_tokens(),
+            agent.context_window,
+            &settings
+        ));
+        assert_eq!(hybrid_stats(&agent)["applied"], 1);
+    }
+
+    #[test]
+    fn a_recovery_falls_back_to_capacity_only_when_nothing_fits_the_threshold() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 4, 400);
+        // The newest turn alone is over the 10k threshold, under the 38k capacity.
+        agent.prompt(&"y".repeat(12_000 * 4));
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(result.tokens_after > agent.hybrid_replacement_budget(false));
+    }
+
+    #[test]
+    fn an_overflow_retry_does_not_compact_a_second_time_in_the_same_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = the_probe_history(calls.clone());
+        agent.auto_compaction = true;
+        // The automatic attempt defers (backoff armed at the current size), so
+        // the overflow retry is the compaction.
+        agent.arm_hybrid_backoff(agent.calibrated_context_tokens());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+
+        agent
+            .run_loop(move |_: &Agent| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("context_length_exceeded: input exceeds the context window".to_string())
+                } else {
+                    Ok(reply_with(1_000))
+                }
+            })
+            .unwrap();
+
+        let stats = hybrid_stats(&agent);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(stats["skippedBackoff"], 1, "{stats}");
+        assert_eq!(stats["applied"], 1, "{stats}");
+        assert_eq!(agent.run_stats().compactions, 1, "{stats}");
+        assert_eq!(stats["attempts"], 2, "{stats}");
+    }
+
+    #[test]
+    fn a_host_overhead_that_counts_the_tool_catalog_is_not_charged_the_schema_twice() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        assert!(agent.pending_retrieval_schema_tokens() > 0);
+        agent.set_provider_context_overhead_tokens(Some(500));
+        assert_eq!(agent.pending_retrieval_schema_tokens(), 0);
+        agent.set_provider_context_overhead_tokens(None);
+        assert!(agent.pending_retrieval_schema_tokens() > 0);
+        agent.set_provider_context_overhead_estimator(overhead_estimator);
+        assert_eq!(agent.pending_retrieval_schema_tokens(), 0);
+    }
+
+    #[test]
+    fn replacing_the_history_resets_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        assert!(agent.hybrid_fold_backoff.is_some());
+        agent.restore_branch_state();
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    #[test]
+    fn manual_compaction_ignores_the_backoff() {
+        let (mut agent, _) = unapplied_after_a_paid_fold();
+        assert!(agent.hybrid_fold_backoff.is_some());
+        let result = agent.compact(None);
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedBackoff"], 0);
+    }
+
+    #[test]
+    fn a_context_overflow_refusal_ignores_the_backoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.auto_compaction = false;
+        fill(&mut agent, 30, 400);
+        agent.prompt("Continue.");
+        agent.auto_compaction = true;
+        // Over the 10_000 threshold, so the automatic trigger fires; the backoff
+        // armed at the current size makes that attempt defer.
+        assert!(agent.estimated_context_tokens() > 10_000);
+        agent.arm_hybrid_backoff(agent.calibrated_context_tokens());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+
+        agent
+            .run_loop(move |_: &Agent| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("context_length_exceeded: input exceeds the context window".to_string())
+                } else {
+                    Ok(reply_with(1_000))
+                }
+            })
+            .unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let stats = hybrid_stats(&agent);
+        assert_eq!(
+            stats["skippedBackoff"], 1,
+            "the automatic path must have deferred first: {stats}"
+        );
+        assert_eq!(agent.run_stats().compactions, 1, "{stats}");
+        assert_eq!(stats["applied"], 1, "{stats}");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "recovery skipped the fold"
+        );
+    }
+
+    // ---- Review findings -------------------------------------------------------------------
+
+    fn reply_with(input: u64) -> davinci_ai::AssistantMessage {
+        davinci_ai::AssistantMessage {
+            extra: Default::default(),
+            id: "fixture".into(),
+            role: "assistant".into(),
+            model: "fixture".into(),
+            usage: Some(davinci_protocol::Usage {
+                input,
+                output: 4,
+                ..Default::default()
+            }),
+            error_message: None,
+            content: vec![davinci_ai::ContentBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+        }
+    }
+
+    #[test]
+    fn the_fit_budget_is_the_limit_minus_the_estimated_overhead() {
+        // The budget must not depend on what the provider counted: a provider that
+        // counts the messages below the byte estimate would otherwise grow it, let
+        // the first cut land just under the threshold, and pay a fold every turn.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        agent.set_provider_context_overhead_tokens(Some(3_000));
+        fill(&mut agent, 6, 200);
+        let overhead = agent.estimated_request_overhead_tokens();
+        let schema = agent.pending_retrieval_schema_tokens();
+        assert_eq!(schema, 0, "a host overhead already counts the catalog");
+        assert_eq!(agent.hybrid_replacement_budget(false), 10_000 - overhead);
+        assert_eq!(agent.hybrid_replacement_budget(true), 38_000 - overhead);
+        // Same budget after the provider reports a count far below the estimate.
+        agent
+            .run_loop(|_: &Agent| Ok::<_, String>(reply_with(500)))
+            .unwrap();
+        assert_eq!(
+            agent.hybrid_replacement_budget(false),
+            10_000 - agent.estimated_request_overhead_tokens()
+        );
+    }
+
+    /// 40 turns of about 400 tokens against a provider that counts the messages at
+    /// three quarters of the byte estimate. Returns (summarizer requests, applied).
+    fn forty_turns_with_a_low_counting_provider(keep_recent: u64) -> (usize, u64) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.compaction.keep_recent_tokens = keep_recent;
+        agent.set_provider_context_overhead_tokens(Some(3_000));
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+        for turn in 0..40 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(400 * 4)));
+            agent
+                .run_loop(|agent: &Agent| {
+                    let messages = crate::compaction::estimate_context_tokens(&agent.messages);
+                    Ok::<_, String>(reply_with(
+                        messages * 3 / 4 + agent.estimated_request_overhead_tokens(),
+                    ))
+                })
+                .unwrap();
+        }
+        let stats = hybrid_stats(&agent);
+        (
+            calls.load(Ordering::SeqCst),
+            stats["applied"].as_u64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_provider_that_counts_low_does_not_make_every_turn_a_paid_fold() {
+        // Upper bounds are the summarizer requests the budget formula
+        // `limit - estimated overhead` pays on this probe.
+        for (keep_recent, bound) in [(6_000, 4), (7_000, 4), (7_500, 4), (8_000, 4), (9_000, 3)] {
+            let (paid, applied) = forty_turns_with_a_low_counting_provider(keep_recent);
+            assert!(
+                paid <= bound && applied as usize <= paid,
+                "keep_recent {keep_recent}: {paid} paid requests (bound {bound}), {applied} applied"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_compaction_budgets_against_the_capacity_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        fill(&mut agent, 4, 400);
+        // The newest turn alone is over the 10k threshold but far under the 38k capacity.
+        agent.prompt(&"y".repeat(12_000 * 4));
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(result.tokens_after < result.tokens_before);
+    }
+
+    #[test]
+    fn a_full_window_recovers_even_when_the_threshold_budget_cannot_fit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.auto_compaction = false;
+        for turn in 0..30 {
+            agent.prompt(&format!("step {turn} {}", "x".repeat(4_000)));
+            agent.record_assistant("ok");
+        }
+        agent.prompt("Continue.");
+        agent
+            .run_loop(|agent: &Agent| Ok::<_, String>(reply_with(agent.estimated_context_tokens())))
+            .unwrap();
+        agent.auto_compaction = true;
+        agent.prompt(&"y".repeat(12_000 * 4));
+        // A paid fold failed at this size, so the backoff is holding.
+        agent.arm_hybrid_backoff(agent.calibrated_context_tokens());
+        assert!(agent.calibrated_context_tokens() >= agent.context_window);
+
+        let outcome = agent.run_loop(|_: &Agent| Ok::<_, String>(reply_with(1_000)));
+
+        outcome.expect("the request must not be blocked: the window can be recovered");
+        assert!(agent.run_stats().compactions >= 1);
+    }
+
+    #[test]
+    fn a_ledger_of_another_branch_does_not_block_the_dry_run() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls.clone(), || {});
+        agent.context_window = 1_600;
+        agent.compaction = CompactionSettings {
+            reserve_tokens: 500,
+            keep_recent_tokens: 100,
+            ..CompactionSettings::default()
+        };
+        agent.set_provider_context_overhead_tokens(Some(0));
+        // The VM follows a long conversation...
+        for turn in 0..60 {
+            agent.prompt(&format!("old step {turn} {}", "o".repeat(4_000)));
+            agent.record_assistant("ok");
+        }
+        let events = agent.context_vm_events_for_vm();
+        let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
+        vm.append_delta(&events).unwrap();
+        let stale = crate::compaction::estimate_context_tokens(&[ChatMessage::text(
+            "user",
+            runtime::context_vm::render_ledger(&vm.load_state_from_root().unwrap()),
+        )]);
+        assert!(
+            stale > agent.hybrid_replacement_budget(false),
+            "the old ledger must not fit: {stale}"
+        );
+        // ...then the user navigates to a short, different one.
+        agent.messages.clear();
+        for turn in 0..3 {
+            agent.prompt(&format!("new step {turn} {}", "n".repeat(200)));
+            agent.record_assistant("ok");
+        }
+        agent.prompt("Continue.");
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+    }
+
+    #[test]
+    fn a_prefix_without_an_assistant_reply_is_not_replaced() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = configure(
+            Agent::new_builtin(crate::prompt::PromptProfile::Stable),
+            calls.clone(),
+            || {},
+        );
+        agent.turn_context_placement_override =
+            Some(crate::turn_context::TurnContextPlacement::Appended);
+        agent.prompt("Build the scheduler. Never modify files under migrations/.");
+        agent.append_turn_context(None);
+        assert!(
+            agent.messages.len() >= 2,
+            "turn 1 must hold a user prompt and a context message"
+        );
+        assert!(agent.messages.iter().all(|m| m.role != "assistant"));
+        let before = agent.messages.clone();
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert_eq!(agent.messages, before);
+        assert!(
+            result.summary.contains("no assistant reply") && !result.summary.contains("cannot fit"),
+            "{}",
+            result.summary
+        );
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["skippedNoAssistantReply"], 1, "{stats}");
+        assert_eq!(stats["skippedNoFit"], 0, "{stats}");
+        assert_eq!(stats["attempts"], 1, "{stats}");
+        // A free skip never starts the backoff.
+        assert_eq!(agent.hybrid_fold_backoff, None);
+    }
+
+    /// `[U1 huge, A1, TR1 huge]`: the cut point lands inside the tool result, the
+    /// only cut left is after A1, and the prefix to replace is the user's prompt.
+    /// With the window nearly full, replacing it with the ledger is the only
+    /// way out.
+    fn a_huge_prompt_and_a_huge_tool_result(calls: Arc<AtomicUsize>) -> Agent {
+        let mut agent = agent(calls, || {});
+        agent.auto_compaction = false;
+        agent.prompt(&"u".repeat(20_000 * 4));
+        agent.record_assistant("calling");
+        agent.messages.push(ChatMessage::tool_result(
+            "c1",
+            "read",
+            "t".repeat(16_000 * 4),
+            false,
+        ));
+        assert!(agent.estimated_context_tokens() > 36_000);
+        assert!(agent.estimated_context_tokens() < 40_000);
+        agent
+    }
+
+    #[test]
+    fn a_full_window_of_one_prompt_and_one_tool_result_recovers_when_automatic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls.clone());
+
+        // At the capacity limit (38_000) the automatic attempt is a recovery.
+        let result = agent.compact_automatic(39_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert!(result.tokens_after < result.tokens_before);
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 0);
+    }
+
+    #[test]
+    fn a_full_window_of_one_prompt_and_one_tool_result_recovers_when_manual() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls);
+
+        let result = agent.compact(None);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 0);
+    }
+
+    #[test]
+    fn a_full_window_of_one_prompt_and_one_tool_result_recovers_on_overflow() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls.clone());
+        agent.auto_compaction = true;
+        agent.prompt("Continue.");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+
+        agent
+            .run_loop(move |_: &Agent| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("context_length_exceeded: input exceeds the context window".to_string())
+                } else {
+                    Ok(reply_with(1_000))
+                }
+            })
+            .expect("the overflow retry must recover the session");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(agent.run_stats().compactions >= 1);
+        assert!(hybrid_stats(&agent)["applied"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn an_automatic_attempt_below_capacity_leaves_the_lone_prompt_alone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = a_huge_prompt_and_a_huge_tool_result(calls.clone());
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(!result.compacted, "{}", result.summary);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fold was paid for");
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 1);
+    }
+
+    #[test]
+    fn the_automatic_path_picks_a_later_cut_when_the_first_has_no_assistant_reply() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        // After an earlier compaction: [ledger, U5, A5, U6]. keep_recent is 1_000 tokens, so
+        // the walk-back stops at U5 and the first cut tried is the one right after the ledger.
+        agent
+            .messages
+            .push(crate::compaction::compaction_context_message(
+                "earlier ledger",
+            ));
+        agent.prompt(&format!("step 5 {}", "x".repeat(1_100 * 4)));
+        agent.record_assistant("ok");
+        agent.prompt("next");
+        let first = crate::compaction::find_cut_point(&agent.messages, 1_000).first_kept_index;
+        assert_eq!(
+            first, 1,
+            "the test needs the first cut to be after the ledger"
+        );
+
+        let result = agent.compact_automatic(15_000);
+
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(hybrid_stats(&agent)["skippedNoAssistantReply"], 0);
+        // The ledger, then only the newest turn: the cut moved past U5 and A5.
+        assert_eq!(agent.messages.len(), 2, "{:?}", agent.messages);
+        assert_eq!(content_text(&agent.messages[1].content), "next");
+    }
+
+    #[test]
+    fn the_backoff_records_the_size_the_trigger_measured() {
+        // `unapplied_after_a_paid_fold` triggers at 15_000 on a history whose
+        // plain estimate is lower: the backoff must hold the trigger's number.
+        let (agent, _) = unapplied_after_a_paid_fold();
+        assert_eq!(agent.hybrid_fold_backoff, Some(15_000));
+    }
+
+    #[test]
+    fn the_retrieval_tool_schema_is_in_the_budget_before_the_first_fold() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 6, 200);
+        assert!(!agent.context_vm_offers_retrieval());
+        let before = agent.hybrid_replacement_budget(false);
+        agent
+            .fold_context(runtime::context_vm::FoldReason::Manual, None)
+            .unwrap();
+        assert!(agent.context_vm_offers_retrieval());
+        let after = agent.hybrid_replacement_budget(false);
+        assert!(
+            before.abs_diff(after) <= 2,
+            "the first fold changed the budget from {before} to {after}"
+        );
+    }
+
+    #[test]
+    fn only_hybrid_mode_reports_hybrid_compaction() {
+        for mode in [
+            crate::runtime::ContextVmMode::Active,
+            crate::runtime::ContextVmMode::Shadow,
+        ] {
+            let mut agent = Agent::new("x");
+            agent.set_context_vm_mode(mode);
+            let vm = agent.feature_use()["contextVm"].clone();
+            assert!(vm.get("hybridCompaction").is_none(), "{mode:?}: {vm}");
+        }
+    }
+
+    #[test]
+    fn counters_separate_paid_folds_from_other_failures() {
+        let (agent, _) = unapplied_after_a_paid_fold();
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["notAppliedAfterFold"], 1, "{stats}");
+        assert_eq!(stats["notAppliedOther"], 0, "{stats}");
+
+        // No summarizer request is sent: the failure is not a paid fold.
+        let mut agent = agent_without_summarizer();
+        fill(&mut agent, 30, 400);
+        agent.hybrid_last_fold_requests = 0;
+        let failed = CompactionResult {
+            summary: "Compaction not saved: disk full".into(),
+            messages: agent.messages.clone(),
+            compacted: false,
+            details: CompactionDetails::default(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 10,
+            tokens_after: 10,
+            usage: None,
+        };
+        agent.hybrid_compaction_stats.attempts += 1;
+        agent.note_hybrid_outcome(0, &failed, 10, false);
+        let stats = hybrid_stats(&agent);
+        assert_eq!(stats["notAppliedOther"], 1, "{stats}");
+        assert_eq!(stats["notAppliedAfterFold"], 0, "{stats}");
+        let sum: u64 = [
+            "applied",
+            "skippedNoFit",
+            "skippedNoAssistantReply",
+            "skippedBackoff",
+            "notAppliedAfterFold",
+            "notAppliedOther",
+        ]
+        .iter()
+        .map(|key| stats[key].as_u64().unwrap())
+        .sum();
+        assert_eq!(stats["attempts"].as_u64().unwrap(), sum, "{stats}");
+    }
+
+    fn agent_without_summarizer() -> Agent {
+        let mut agent = agent(Arc::new(AtomicUsize::new(0)), || {});
+        agent.summarizer = None;
+        agent
+    }
+
+    #[test]
+    fn skip_results_report_message_estimates_in_both_fields() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 30, 400);
+        agent.arm_hybrid_backoff(12_000);
+        let estimate = crate::compaction::estimate_context_tokens(&agent.messages);
+        let deferred = agent.compact_automatic(12_500);
+        assert!(
+            deferred.summary.contains("deferred"),
+            "{}",
+            deferred.summary
+        );
+        assert_eq!(
+            (deferred.tokens_before, deferred.tokens_after),
+            (estimate, estimate)
+        );
+
+        agent.hybrid_fold_backoff = None;
+        let mut small = agent_without_summarizer();
+        small.prompt("one message");
+        let estimate = crate::compaction::estimate_context_tokens(&small.messages);
+        let skipped = small.compact(None);
+        assert_eq!(
+            (skipped.tokens_before, skipped.tokens_after),
+            (estimate, estimate)
+        );
+    }
+
+    #[test]
+    fn counters_belong_to_the_agent_and_survive_a_session_load() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        fill(&mut agent, 30, 400);
+        assert!(agent.compact(None).compacted);
+        let before = hybrid_stats(&agent);
+        assert_eq!(before["applied"], 1);
+        let dir = tempfile::tempdir().unwrap();
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+            .unwrap();
+        agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
+        assert_eq!(hybrid_stats(&agent), before);
+    }
 }

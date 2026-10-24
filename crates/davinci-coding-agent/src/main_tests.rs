@@ -419,7 +419,7 @@ fn in_process_workers_compact_at_the_configured_threshold_with_a_summary() {
     assert_eq!(child.compaction.threshold, None);
     assert!(child.summarizer.is_none());
 
-    super::apply_worker_compaction(&Args::default(), &settings, &mut child);
+    super::apply_worker_settings(&Args::default(), &settings, &mut child);
 
     assert_eq!(
         child.compaction.threshold,
@@ -430,8 +430,359 @@ fn in_process_workers_compact_at_the_configured_threshold_with_a_summary() {
     assert!(child.summarizer.is_some());
 
     settings.auto_compact = Some(false);
-    super::apply_worker_compaction(&Args::default(), &settings, &mut child);
+    super::apply_worker_settings(&Args::default(), &settings, &mut child);
     assert!(!child.auto_compaction);
+}
+
+/// A lead runtime and the request its first worker receives through the real
+/// spawn path (`run_subagent_tool`), so the worker runtime is the one the host
+/// hands out. With `journal`, the lead has the operation journal a session turn
+/// attaches.
+fn lead_and_worker_request(
+    workspace: &Path,
+    parent_tools: &[&str],
+    journal: bool,
+) -> (davinci_agent::RuntimeHandle, davinci_agent::SubagentRequest) {
+    std::fs::create_dir_all(workspace).unwrap();
+    let mut lead = davinci_agent::RuntimeHandle::new(
+        davinci_agent::RunId::new(),
+        davinci_agent::AgentId::new(),
+        davinci_agent::RuntimeBus::new(),
+    );
+    if journal {
+        let session = JsonlSession::create(workspace, "fixture", None).unwrap();
+        lead = runtime_host::attach_operation_runtime(lead, workspace, Some(&session)).unwrap();
+    }
+    lead.ensure_lead_registered("p", "m", workspace);
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let sink = captured.clone();
+    let runner = davinci_agent::SubagentRunner::new(move |req| {
+        *sink.lock().unwrap() = Some(req.clone());
+        Ok("done".into())
+    });
+    let parent_tools: Vec<String> = parent_tools.iter().map(|tool| tool.to_string()).collect();
+    davinci_agent::run_subagent_tool(
+        &serde_json::json!({"prompt": "p"}),
+        &parent_tools,
+        Some(&runner),
+        &davinci_agent::SubagentParent {
+            runtime: Some(lead.clone()),
+            permission_mode: Some(davinci_agent::PermissionMode::ReadOnly),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let request = captured.lock().unwrap().take().expect("worker request");
+    (lead, request)
+}
+
+fn offline_args() -> Args {
+    Args {
+        offline: true,
+        no_extensions: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn in_process_workers_run_the_configured_context_vm_mode_on_their_own_vm() {
+    use davinci_agent::runtime::ContextVmMode;
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _env = EnvRestore::set("DAVINCI_CONTEXT_VM", "");
+    let settings = super::settings::Settings {
+        context_vm: Some("hybrid".into()),
+        ..Default::default()
+    };
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    let workspace = dir.path().join("workspace");
+    let (lead, req) = lead_and_worker_request(&workspace, &["read"], false);
+
+    let child = build_worker_agent(
+        &offline_args(),
+        &workspace,
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+
+    assert_eq!(child.context_vm_mode(), ContextVmMode::Hybrid);
+    let vm = &child.runtime.as_ref().unwrap().context_vm;
+    assert_eq!(vm.config().mode, ContextVmMode::Hybrid);
+    // The worker's VM state (events, folds, cache) is its own, and setting
+    // its mode did not reach the lead's.
+    assert!(!vm.shares_state_with(&lead.context_vm));
+    assert_eq!(lead.context_vm.config().mode, ContextVmMode::Off);
+}
+
+struct UnrunCodeModeHost;
+impl davinci_agent::codemode::CodeModeHost for UnrunCodeModeHost {
+    fn execute(
+        &self,
+        _: &davinci_agent::codemode::CodeModeRequest,
+        _: &davinci_agent::codemode::CodeModeRunContext,
+        _: Arc<dyn davinci_agent::codemode::CodeModeBroker>,
+    ) -> davinci_agent::codemode::CodeModeOutcome {
+        unreachable!("the test only stages and activates the host")
+    }
+}
+
+/// Installs `UnrunCodeModeHost` as the admitted runtime on this thread.
+pub(crate) struct FakeCodemodeHost;
+impl FakeCodemodeHost {
+    pub(crate) fn install() -> Self {
+        crate::TEST_CODEMODE_HOST
+            .with(|host| *host.borrow_mut() = Some(Arc::new(UnrunCodeModeHost)));
+        Self
+    }
+}
+impl Drop for FakeCodemodeHost {
+    fn drop(&mut self) {
+        crate::TEST_CODEMODE_HOST.with(|host| *host.borrow_mut() = None);
+    }
+}
+
+#[test]
+fn worker_codemode_follows_the_setting_and_records_operations_as_the_worker() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let mut settings = super::settings::Settings {
+        codemode: Some(serde_json::json!({"mode": "read-only"})),
+        ..Default::default()
+    };
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    let workspace = dir.path().join("workspace");
+    let (lead, req) = lead_and_worker_request(&workspace, &["read", "codemode"], true);
+
+    // Without an admitted Node runtime the worker still starts, without Codemode.
+    let (without_runtime, offered) = build_worker(
+        &offline_args(),
+        &workspace,
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    assert!(offered && !without_runtime.has_staged_codemode());
+
+    let _host = FakeCodemodeHost::install();
+    let (mut child, offered) = build_worker(
+        &offline_args(),
+        &workspace,
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    assert!(offered);
+    assert!(child.has_staged_codemode());
+    // The worker turn activates it on the worker's runtime, as the lead's does.
+    child.activate_staged_codemode().unwrap();
+    assert!(child.tools.contains(&"codemode".to_string()));
+    // Its operations are the worker's own, in the lead's journal.
+    let context = child
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.operations.as_ref())
+        .expect("the worker holds the parent journal")
+        .operation_context();
+    assert_eq!(Some(context.agent_id), req.runtime_agent_id);
+    assert_ne!(context.agent_id, lead.agent_id);
+
+    settings.codemode = Some(serde_json::json!({"mode": "off"}));
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    super::refresh_worker_settings(&mut child, offered);
+    assert!(!child.has_staged_codemode());
+    assert!(!child.tools.contains(&"codemode".to_string()));
+}
+
+#[test]
+fn worker_codemode_is_withheld_without_a_journal_tools_or_profile_permission() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let worker = |req: &davinci_agent::SubagentRequest, tools: &[&str]| {
+        let mut child = super::new_worker_agent("worker");
+        child.tools = tools.iter().map(|tool| tool.to_string()).collect();
+        child.set_runtime(req.runtime.clone().expect("worker runtime"));
+        child
+    };
+    let (_lead, req) = lead_and_worker_request(&workspace, &["read"], true);
+    assert!(worker_codemode_offered(&worker(&req, &["read"]), true));
+    assert!(!worker_codemode_offered(&worker(&req, &[]), true));
+    let profile = |frontmatter: &str| {
+        agent_profiles::AgentProfile::parse(
+            &format!("---\nname: scout\n{frontmatter}---\nbody"),
+            Path::new("scout.md"),
+            false,
+        )
+        .unwrap()
+    };
+    assert!(super::profile_allows_worker_codemode(None));
+    assert!(super::profile_allows_worker_codemode(Some(&profile(""))));
+    assert!(super::profile_allows_worker_codemode(Some(&profile(
+        "tools: [read, codemode]\n"
+    ))));
+    let pinned = super::profile_allows_worker_codemode(Some(&profile("tools: [read]\n")));
+    assert!(!pinned);
+    assert!(!worker_codemode_offered(&worker(&req, &["read"]), pinned));
+
+    // A sessionless lead has no operation journal to attribute the worker to.
+    let (_lead, sessionless) = lead_and_worker_request(&workspace, &["read"], false);
+    assert!(!worker_codemode_offered(
+        &worker(&sessionless, &["read"]),
+        true
+    ));
+}
+
+#[test]
+fn worker_codemode_does_not_depend_on_the_lead_exposing_it() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let settings = super::settings::Settings {
+        codemode: Some(serde_json::json!({"mode": "read-only"})),
+        ..Default::default()
+    };
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    let workspace = dir.path().join("workspace");
+    // The lead was launched with `--codemode off`: it has no codemode tool.
+    let (_lead, req) = lead_and_worker_request(&workspace, &["read"], true);
+    assert!(!req
+        .parent_tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|tool| tool == "codemode")));
+
+    let _host = FakeCodemodeHost::install();
+    let (child, _) = build_worker(
+        &offline_args(),
+        &workspace,
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    assert!(child.has_staged_codemode());
+}
+
+#[test]
+fn a_teammate_made_while_codemode_was_off_gets_it_when_the_setting_turns_on() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let mut settings = super::settings::Settings {
+        codemode: Some(serde_json::json!({"mode": "off"})),
+        ..Default::default()
+    };
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    let workspace = dir.path().join("workspace");
+    let (_lead, req) = lead_and_worker_request(&workspace, &["read"], true);
+
+    let _host = FakeCodemodeHost::install();
+    let (mut child, profile_allows) = build_worker(
+        &offline_args(),
+        &workspace,
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    assert!(!child.has_staged_codemode());
+
+    settings.codemode = Some(serde_json::json!({"mode": "read-only"}));
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    super::refresh_worker_settings(&mut child, profile_allows);
+    assert!(child.has_staged_codemode());
+}
+
+#[test]
+fn graph_workers_stage_codemode_from_the_stored_setting_only() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let fake =
+        || -> CodemodeAdmission<'static> { Box::new(|_, _| Ok(Arc::new(UnrunCodeModeHost))) };
+    let start = |parsed: &Args, graph: bool, stored: serde_json::Value| {
+        let mut agent = Agent::new("worker");
+        super::start_codemode(
+            &mut agent,
+            parsed,
+            graph,
+            Some(&stored),
+            dir.path(),
+            dir.path(),
+            fake(),
+        )
+        .unwrap();
+        agent
+    };
+    let read_only = serde_json::json!({"mode": "read-only"});
+    let off = serde_json::json!({"mode": "off"});
+    let sessionless = Args {
+        no_session: true,
+        ..Default::default()
+    };
+
+    // The stored switch reaches a Graph worker that has its conversation.
+    let worker = start(&Args::default(), true, read_only.clone());
+    assert!(worker.has_staged_codemode());
+    // Off stays off, and so does a worker launched without a conversation
+    // (no journal), without failing its start.
+    assert!(!start(&Args::default(), true, off.clone()).has_staged_codemode());
+    assert!(!start(&sessionless, true, read_only.clone()).has_staged_codemode());
+
+    // A lead's explicit `--codemode` does not reach a subagent whose stored
+    // setting is off, and a lead still reads its own flag.
+    let explicit = Args {
+        codemode: Some("read-only".into()),
+        ..Default::default()
+    };
+    let mut subagent = super::new_worker_agent("worker");
+    let settings = super::settings::Settings {
+        codemode: Some(off.clone()),
+        ..Default::default()
+    };
+    super::sync_worker_codemode_with(&mut subagent, &settings, true, dir.path(), fake());
+    assert!(!subagent.has_staged_codemode());
+    assert!(start(&explicit, false, off).has_staged_codemode());
+    crate::native_extensions::graph::allow_codemode(false);
+}
+
+#[test]
+fn teammates_pick_up_config_changes_before_their_next_turn() {
+    use davinci_agent::runtime::ContextVmMode;
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _env = EnvRestore::set("DAVINCI_CONTEXT_VM", "");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut child = super::new_worker_agent("worker");
+    child.cwd = workspace;
+    child.stage_read_only_codemode(Arc::new(UnrunCodeModeHost));
+
+    let mut settings = super::settings::Settings {
+        context_vm: Some("active".into()),
+        codemode: Some(serde_json::json!({"mode": "off"})),
+        ..Default::default()
+    };
+    super::settings::set_compaction_threshold(&mut settings, "40%").unwrap();
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    super::refresh_worker_settings(&mut child, true);
+
+    assert_eq!(child.context_vm_mode(), ContextVmMode::Active);
+    assert_eq!(
+        child.compaction.threshold,
+        Some(davinci_agent::CompactionThreshold::Percent(40))
+    );
+    assert!(!child.has_staged_codemode(), "Codemode was switched off");
+
+    settings.context_vm = Some("hybrid".into());
+    super::settings::save_settings(dir.path(), &settings).unwrap();
+    super::refresh_worker_settings(&mut child, true);
+    assert_eq!(child.context_vm_mode(), ContextVmMode::Hybrid);
 }
 
 #[test]
@@ -504,13 +855,13 @@ fn provider_context_tracks_turn_prompt_updates() {
     assert!(prompt.contains("openai/gpt-test"), "{prompt}");
 }
 
-struct EnvRestore {
+pub(crate) struct EnvRestore {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
 }
 
 impl EnvRestore {
-    fn set(key: &'static str, value: &str) -> Self {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
         Self { key, previous }
@@ -4623,7 +4974,7 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         max_turns: Some(100),
         ..Default::default()
     };
-    let (child, _) = build_worker_agent(
+    let child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),
@@ -4639,7 +4990,7 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         worktree_path: Some(isolated.path().to_path_buf()),
         ..req.clone()
     };
-    let (isolated_child, _) = build_worker_agent(
+    let isolated_child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),
@@ -4675,7 +5026,7 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
             worktree_path: Some(dir.path().to_path_buf()),
             ..req.clone()
         };
-        let (child, shared_writer) = build_worker_agent(
+        let child = build_worker_agent(
             &parsed,
             dir.path(),
             &davinci_agent::McpRegistry::default(),
@@ -4683,10 +5034,6 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         )
         .unwrap();
         assert_eq!(child.permission_mode(), expected, "parent {parent:?}");
-        assert!(
-            !shared_writer,
-            "a worktree worker never holds the shared lock"
-        );
     }
 }
 
@@ -4719,7 +5066,7 @@ fn delegated_worker_does_not_exceed_parent_permission() {
                 worktree_path: worktree.clone(),
                 ..Default::default()
             };
-            let (child, _) = build_worker_agent(
+            let child = build_worker_agent(
                 &parsed,
                 dir.path(),
                 &davinci_agent::McpRegistry::default(),
@@ -4761,7 +5108,7 @@ fn auto_worker_shell_runs_recognized_checks_and_refuses_the_rest() {
         worktree_path: Some(dir.path().to_path_buf()),
         ..Default::default()
     };
-    let (child, _) = build_worker_agent(
+    let child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),
@@ -4806,26 +5153,22 @@ fn shared_workers_and_inheriting_profiles_follow_the_parent_mode() {
         ..Default::default()
     };
     for agent in [None, Some("scout".to_string())] {
-        for (parent, expected, writer) in [
+        for (parent, expected) in [
             (
                 davinci_agent::PermissionMode::ReadOnly,
                 davinci_agent::PermissionMode::ReadOnly,
-                false,
             ),
             (
                 davinci_agent::PermissionMode::Ask,
                 davinci_agent::PermissionMode::Ask,
-                false,
             ),
             (
                 davinci_agent::PermissionMode::Edits,
                 davinci_agent::PermissionMode::Edits,
-                true,
             ),
             (
                 davinci_agent::PermissionMode::Auto,
                 davinci_agent::PermissionMode::Auto,
-                true,
             ),
         ] {
             let req = davinci_agent::SubagentRequest {
@@ -4835,7 +5178,7 @@ fn shared_workers_and_inheriting_profiles_follow_the_parent_mode() {
                 parent_permission_mode: Some(parent),
                 ..Default::default()
             };
-            let (child, shared_writer) = build_worker_agent(
+            let child = build_worker_agent(
                 &parsed,
                 dir.path(),
                 &davinci_agent::McpRegistry::default(),
@@ -4847,7 +5190,6 @@ fn shared_workers_and_inheriting_profiles_follow_the_parent_mode() {
                 expected,
                 "{agent:?} under {parent:?}"
             );
-            assert_eq!(shared_writer, writer, "{agent:?} under {parent:?}");
             assert!(child.tools.contains(&"edit".into()));
         }
     }
@@ -4905,7 +5247,7 @@ fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
         ..Default::default()
     };
 
-    let (worker, shared_writer) = build_worker_agent(
+    let worker = build_worker_agent(
         &parsed,
         &parent,
         &davinci_agent::McpRegistry::default(),
@@ -4913,7 +5255,6 @@ fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
     )
     .unwrap();
 
-    assert!(!shared_writer);
     let worker_spec = worker
         .tool_context
         .sandbox
@@ -5032,7 +5373,7 @@ fn worker_host_feeds_its_own_events_into_the_leads_progress() {
         progress: Some(reporter.clone()),
         ..Default::default()
     };
-    let (child, _) = build_worker_agent(
+    let child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),
@@ -5256,6 +5597,7 @@ fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     agent.cwd = workspace.clone();
     let sessionless = super::sync_codemode_from_settings(&mut agent).unwrap_err();
     assert!(sessionless.contains("session"), "{sessionless}");
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
 
     agent
         .load_from_session(JsonlSession::create(&workspace, "fixture", None).unwrap())
@@ -5265,12 +5607,73 @@ fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     // The message names where it looked, so a wrong agent dir is visible.
     assert!(missing.contains(&node), "{missing}");
     assert!(!agent.has_staged_codemode());
+    // A refused switch is not recorded as the requested mode: the caller turns
+    // it off, and the stats must not claim "read-only".
+    assert_eq!(
+        agent.feature_use()["codemode"],
+        serde_json::json!({"mode": "off", "available": false, "calls": 0})
+    );
 
     super::persist_interactive_setting("codemode=false").unwrap();
     assert_eq!(saved()["codemode"]["mode"], "off");
     assert_eq!(saved()["codemode"]["hostPath"], host.as_str());
     super::sync_codemode_from_settings(&mut agent).unwrap();
     assert!(!agent.has_staged_codemode());
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
+}
+
+#[test]
+fn startup_codemode_records_the_requested_mode_only_after_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    let node = runtime.join("node.exe").to_string_lossy().into_owned();
+    let host = runtime.join("host").to_string_lossy().into_owned();
+    let stored = serde_json::json!({"mode": "read-only", "nodePath": node, "hostPath": host});
+
+    // Stored read-only, no CLI override, runtime missing: stats say off.
+    let mut agent = Agent::new("fixture");
+    let missing = super::stage_startup_codemode(
+        &mut agent,
+        None,
+        Some(&stored),
+        dir.path(),
+        dir.path(),
+        false,
+        super::admit_node(dir.path()),
+    )
+    .unwrap_err();
+    assert!(missing.contains("Node runtime unavailable"), "{missing}");
+    assert!(!agent.has_staged_codemode());
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
+
+    // A sessionless run is refused the same way.
+    let mut agent = Agent::new("fixture");
+    let sessionless = super::stage_startup_codemode(
+        &mut agent,
+        None,
+        Some(&stored),
+        dir.path(),
+        dir.path(),
+        true,
+        super::admit_node(dir.path()),
+    )
+    .unwrap_err();
+    assert!(sessionless.contains("--no-session"), "{sessionless}");
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
+
+    // An off setting succeeds and reports off.
+    let mut agent = Agent::new("fixture");
+    super::stage_startup_codemode(
+        &mut agent,
+        None,
+        None,
+        dir.path(),
+        dir.path(),
+        false,
+        super::admit_node(dir.path()),
+    )
+    .unwrap();
+    assert_eq!(agent.feature_use()["codemode"]["mode"], "off");
 }
 
 #[test]

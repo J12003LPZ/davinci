@@ -24,9 +24,12 @@ use davinci_agent::runtime::operations::{
 use davinci_agent::runtime::{
     AgentId, CapabilitySource, RunId, RuntimeBus, RuntimeCapability, RuntimeHandle,
 };
-use davinci_agent::{Agent, CustomToolExecutor, PermissionMode, ToolClass, ToolResult};
+use davinci_agent::{
+    Agent, CompletionEvidence, CustomToolExecutor, MutationVerificationState, PermissionMode,
+    ToolClass, ToolResult, VerificationCoverage, VerificationEvidence,
+};
 use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
-use davinci_session::JsonlSession;
+use davinci_session::{JsonlSession, SessionEntry};
 use operation_harness::{wait_for_marker, SerializedIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -242,6 +245,9 @@ fn agent_crash_after_started_effect_reports_unknown_without_replay() {
     });
     let owner = ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap();
     let mut agent = world.agent(owner, executor);
+    // Generation 0 and a killed mutating call: unverified, never not-required.
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 1);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
     agent.prompt("What happened to the slow effect?");
     let mut requests = 0;
     let mut wire = Vec::new();
@@ -307,4 +313,76 @@ fn agent_crash_after_started_effect_reports_unknown_without_replay() {
     let snapshot = journal.snapshot().unwrap();
     assert_eq!(snapshot.attempts.len(), 1);
     assert_ne!(snapshot.attempts[0].state(), OperationState::Succeeded);
+}
+
+/// Persist a passing verification of `generation`, as a finished earlier run would.
+fn seed_verified_generation(world: &World, generation: u64) {
+    let mut session = JsonlSession::open(&world.session_path).unwrap();
+    let mut entry = SessionEntry::message("user", json!([]));
+    entry.entry_type = "custom".into();
+    entry.message = None;
+    entry.custom_type = Some("mutation_verification".into());
+    entry.extra.insert(
+        "data".into(),
+        serde_json::to_value(MutationVerificationState {
+            mutation_generation: generation,
+            verified_generation: Some(generation),
+            last_verification_succeeded: true,
+            latest_evidence: Some(VerificationEvidence {
+                generation,
+                command: "cargo test".into(),
+                succeeded: true,
+                mutation_paths: Vec::new(),
+                verification_targets: Vec::new(),
+                coverage: VerificationCoverage::Broad,
+            }),
+            ..MutationVerificationState::default()
+        })
+        .unwrap(),
+    );
+    session.append_entry(entry).unwrap();
+}
+
+#[test]
+fn agent_crash_after_started_effect_invalidates_a_verified_generation_before_any_request() {
+    const SEEDED: u64 = 3;
+    let (temp, world) = new_world();
+    seed_verified_generation(&world, SEEDED);
+    let resume = |world: &World| {
+        let executor = CustomToolExecutor::new(|_, _, _| panic!("a resume must not run the tool"));
+        let owner = ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap();
+        world.agent(owner, executor)
+    };
+    assert_eq!(
+        resume(&world).completion_evidence(),
+        CompletionEvidence::Verified,
+        "the seed must start verified"
+    );
+    kill_child_after_effect_started(&temp, &world);
+
+    let mut agent = resume(&world);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.mutation_generation, SEEDED + 1);
+    assert_eq!(state.verified_generation, None);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+
+    // The interrupted-call answer lands after the bumped state, and a second
+    // restore sees both: it must not bump again.
+    agent.prompt("What happened?");
+    agent
+        .run_loop(|_| {
+            Ok(assistant(
+                vec![ContentBlock::Text { text: "ok".into() }],
+                StopReason::Stop,
+            ))
+        })
+        .unwrap();
+    drop(agent);
+    let agent = resume(&world);
+    assert_eq!(
+        agent.mutation_verification_state().mutation_generation,
+        SEEDED + 1
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    assert_eq!(world.effects().lines().collect::<Vec<_>>(), ["START"]);
 }

@@ -7397,16 +7397,13 @@ fn open_tree_sheet(agent: &Agent, model: &mut Model) -> bool {
 /// its counts and its own first hunk. `/diff` is davinci's own command — the
 /// legacy chrome has no such screen.
 fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
-    use std::process::Command;
     let cwd = shell.cwd;
     let changes = crate::davinci_sources::git_changes(cwd);
     if changes.is_empty() {
         shell.note("nothing to review — the working tree is clean");
         return Next::Go;
     }
-    let numstat: Vec<(String, u32, u32)> = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let numstat: Vec<(String, u32, u32)> = crate::davinci_sources::host_git(cwd)
         .args(["diff", "--numstat", "HEAD"])
         .output()
         .ok()
@@ -7424,9 +7421,7 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         })
         .unwrap_or_default();
     let hunk_of = |path: &str| -> (Vec<Hunk>, String, String) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(cwd)
+        let output = crate::davinci_sources::host_git(cwd)
             .args(["diff", "--unified=2", "HEAD", "--", path])
             .output();
         let Ok(output) = output else {
@@ -7508,9 +7503,7 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
             }
         })
         .collect();
-    let behind = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let behind = crate::davinci_sources::host_git(cwd)
         .args(["rev-list", "--count", "HEAD..@{upstream}"])
         .output()
         .ok()

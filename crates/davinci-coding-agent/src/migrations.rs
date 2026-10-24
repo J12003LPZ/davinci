@@ -22,11 +22,11 @@ pub struct MigrationResult {
 
 pub fn project_config_dir(cwd: &Path) -> PathBuf {
     let davinci = cwd.join(CONFIG_DIR_NAME);
-    if davinci.exists() {
+    if crate::project_config::is_populated_dir(&davinci) {
         davinci
     } else {
         let legacy = cwd.join(LEGACY_CONFIG_DIR_NAME);
-        if legacy.exists() {
+        if crate::project_config::is_populated_dir(&legacy) {
             legacy
         } else {
             davinci
@@ -308,6 +308,28 @@ pub fn maybe_run_startup_migrations(cwd: &Path) -> MigrationResult {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn empty_davinci_placeholder_does_not_shadow_populated_legacy_dir() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".davinci")).unwrap();
+        fs::create_dir_all(dir.path().join(".pi").join("tools")).unwrap();
+        fs::write(dir.path().join(".pi").join("tools").join("custom.js"), "").unwrap();
+        assert_eq!(project_config_dir(dir.path()), dir.path().join(".pi"));
+
+        // Both empty (a fresh Linux sandbox launch): keep the new directory.
+        let fresh = tempdir().unwrap();
+        fs::create_dir(fresh.path().join(".davinci")).unwrap();
+        fs::create_dir(fresh.path().join(".pi")).unwrap();
+        assert_eq!(
+            project_config_dir(fresh.path()),
+            fresh.path().join(".davinci")
+        );
+
+        // Content in `.davinci` still wins.
+        fs::write(dir.path().join(".davinci").join("settings.json"), "{}").unwrap();
+        assert_eq!(project_config_dir(dir.path()), dir.path().join(".davinci"));
+    }
 
     #[test]
     fn deprecation_warnings_lock_ts_strings() {

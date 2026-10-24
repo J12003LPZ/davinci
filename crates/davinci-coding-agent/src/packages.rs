@@ -394,7 +394,7 @@ fn settings_dir_for(local: bool, agent_dir: &Path, cwd: &Path) -> PathBuf {
     if !local {
         return agent_dir.to_path_buf();
     }
-    if cwd.join(crate::settings::CONFIG_DIR_NAME).is_dir() {
+    if crate::project_config::is_populated_dir(&cwd.join(crate::settings::CONFIG_DIR_NAME)) {
         cwd.join(crate::settings::CONFIG_DIR_NAME)
     } else {
         cwd.join(crate::settings::LEGACY_CONFIG_DIR_NAME)

@@ -46,6 +46,9 @@ pub struct Assessment {
     /// An unfiltered suite at the workspace root can cover unnamed mutations.
     pub full_workspace: bool,
     pub reason: &'static str,
+    /// The directory the classified command effectively ran in, after a leading
+    /// `cd`. `None` when the classifier could not determine it.
+    pub ran_in: Option<PathBuf>,
 }
 
 impl Assessment {
@@ -56,6 +59,7 @@ impl Assessment {
             complete: false,
             full_workspace: false,
             reason,
+            ran_in: None,
         }
     }
 }
@@ -361,6 +365,73 @@ fn exempt(workspace: &Path, path: &Path) -> bool {
         })
 }
 
+/// The one place test coverage is narrowed, for every check kind.
+/// `classify_in_workspace` credits every documentation-exempt path (`.md`,
+/// `.rst`, `docs/*.txt`) as covered wherever it lives, which is right for
+/// verification but not for tests: a check only tests what sits under the
+/// directory it ran in, exempt documents included.
+fn tested_under(ran_in: &Path, workspace: &Path, covered: Vec<PathBuf>) -> Vec<PathBuf> {
+    let Some(ran_in) = normalized(ran_in, Path::new(".")) else {
+        return Vec::new();
+    };
+    covered
+        .into_iter()
+        .filter(|path| normalized(workspace, path).is_some_and(|path| path.starts_with(&ran_in)))
+        .collect()
+}
+
+/// Test coverage of an inline script check (`python -c ...`), which
+/// `classify_in_workspace` assesses as a whole. The directory is the one the
+/// classifier itself used (`Assessment::ran_in`); when it is unknown nothing is
+/// credited.
+pub(crate) fn targeted_tested_coverage(assessment: &Assessment, workspace: &Path) -> Vec<PathBuf> {
+    match &assessment.ran_in {
+        Some(directory) => tested_under(directory, workspace, assessment.covered.clone()),
+        None => Vec::new(),
+    }
+}
+
+/// Paths actually covered by test-running segments of a literal AND chain.
+/// A preceding lint can cover the workspace for verification without claiming
+/// test coverage for its own segment. Inconclusive shell syntax grants none.
+pub(crate) fn tested_coverage(
+    command: &str,
+    cwd: &Path,
+    workspace: &Path,
+    paths: &[PathBuf],
+) -> (Vec<PathBuf>, bool) {
+    let Some(parts) = segments(strip_posix_prelude(command), true) else {
+        return (Vec::new(), false);
+    };
+    let mut tested = BTreeSet::new();
+    let mut full_workspace = false;
+    let mut directory = cwd.to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        let Some(words) = literal_words(part.trim(), true) else {
+            return (Vec::new(), false);
+        };
+        if index == 0 && words.len() == 2 && words[0] == "cd" {
+            directory = cwd.join(&words[1]);
+            continue;
+        }
+        let ran_tests = crate::shell_policy::verification_ran_tests(part);
+        let assessment = classify_in_workspace("bash", part, &directory, workspace, paths);
+        match assessment.kind {
+            CheckKind::Suite if ran_tests => {
+                tested.extend(tested_under(&directory, workspace, assessment.covered));
+                full_workspace |= assessment.full_workspace;
+            }
+            // An inline assertion script is a test when run alone, so it is
+            // one inside a chain too.
+            CheckKind::TargetedScript => {
+                tested.extend(targeted_tested_coverage(&assessment, workspace));
+            }
+            _ => {}
+        }
+    }
+    (tested.into_iter().collect(), full_workspace)
+}
+
 pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Assessment {
     classify_in_workspace(tool, command, cwd, cwd, paths)
 }
@@ -382,12 +453,11 @@ fn python_name(name: &str) -> bool {
 
 fn unfiltered_suite(words: &[String]) -> bool {
     let args = match words {
-        [python, module, runner, discover, rest @ ..]
-            if python_name(python)
-                && module == "-m"
-                && runner == "unittest"
-                && discover == "discover" =>
+        [python, module, runner, rest @ ..]
+            if python_name(python) && module == "-m" && runner == "unittest" =>
         {
+            // Bare `python -m unittest` uses the same default discovery.
+            let rest = rest.strip_prefix(&["discover".to_string()]).unwrap_or(rest);
             return rest
                 .iter()
                 .all(|arg| matches!(arg.as_str(), "-q" | "--quiet" | "-v" | "--verbose"));
@@ -432,6 +502,30 @@ fn unfiltered_suite(words: &[String]) -> bool {
     })
 }
 
+/// A pytest command with options that drop tests, so it runs less than the
+/// paths it names.
+fn pytest_selection(words: &[String]) -> bool {
+    let args = match words {
+        [python, module, runner, rest @ ..]
+            if python_name(python) && module == "-m" && runner == "pytest" =>
+        {
+            rest
+        }
+        [runner, rest @ ..] if runner == "pytest" || runner == "pytest.exe" => rest,
+        _ => return false,
+    };
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--lf" | "--last-failed" | "--sw" | "--stepwise" | "--sw-skip" | "--stepwise-skip"
+        ) || arg.starts_with("-k")
+            || arg.starts_with("-m")
+            || ["--deselect", "--ignore", "--ignore-glob"]
+                .iter()
+                .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
+    })
+}
+
 /// Plain-language reason a post-edit command is not credited as a check.
 pub(crate) fn unrecognized_check_reason(assessment: &Assessment) -> &'static str {
     if assessment.kind == CheckKind::SyntaxOnly {
@@ -455,6 +549,12 @@ pub(crate) fn unrecognized_check_reason(assessment: &Assessment) -> &'static str
     }
 }
 
+/// The command without the supported `set -eu` prelude line.
+fn strip_posix_prelude(command: &str) -> &str {
+    let command = command.trim();
+    command.strip_prefix("set -eu\n").unwrap_or(command)
+}
+
 pub(crate) fn classify_in_workspace(
     tool: &str,
     command: &str,
@@ -467,10 +567,7 @@ pub(crate) fn classify_in_workspace(
     }
     let posix = tool == "bash" || (tool == "exec_command" && !cfg!(windows));
     let command = if posix {
-        command
-            .trim()
-            .strip_prefix("set -eu\n")
-            .unwrap_or(command.trim())
+        strip_posix_prelude(command)
     } else {
         command.trim()
     };
@@ -620,7 +717,11 @@ pub(crate) fn classify_in_workspace(
         {
             let suite = words.join(" ");
             full_workspace |= directory == workspace && unfiltered_suite(&words);
+            let selected = pytest_selection(&words);
             for path in paths {
+                if selected {
+                    continue;
+                }
                 // unittest selectors and discovery patterns do not establish
                 // coverage of an entire source tree merely by naming tests/.
                 if python
@@ -661,6 +762,7 @@ pub(crate) fn classify_in_workspace(
         complete,
         full_workspace,
         reason: "classified",
+        ran_in: Some(directory),
     }
 }
 
@@ -737,15 +839,30 @@ mod tests {
             assert!(!focused.complete, "{command}");
             assert!(!focused.full_workspace, "{command}");
         }
-        let whole = classify_in_workspace(
-            "bash",
+        for command in [
             "python -m unittest discover",
-            root.path(),
-            root.path(),
-            &paths,
-        );
-        assert!(whole.complete);
-        assert!(whole.full_workspace);
+            "python -m unittest",
+            "python -m unittest -v",
+            "python -m unittest -q",
+            "python -m unittest --verbose",
+            "python -m unittest --quiet",
+        ] {
+            let whole = classify_in_workspace("bash", command, root.path(), root.path(), &paths);
+            assert!(whole.complete, "{command}");
+            assert!(whole.full_workspace, "{command}");
+        }
+        for command in [
+            "python -m unittest -v test_app",
+            "python -m unittest -k test_value",
+            "python -m unittest -s tests",
+            "python -m unittest -p test_app.py",
+            "python -m unittest --pattern test_app.py",
+            "python -m unittest tests.test_app",
+        ] {
+            let focused = classify_in_workspace("bash", command, root.path(), root.path(), &paths);
+            assert!(!focused.complete, "{command}");
+            assert!(!focused.full_workspace, "{command}");
+        }
     }
 
     #[test]

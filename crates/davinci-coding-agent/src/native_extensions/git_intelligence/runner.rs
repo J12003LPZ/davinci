@@ -212,6 +212,8 @@ fn run_status_with_executable(
             "core.hooksPath=/dev/null",
             "-c",
             "core.pager=cat",
+            "-c",
+            "safe.bareRepository=explicit",
         ])
         .args(args);
 

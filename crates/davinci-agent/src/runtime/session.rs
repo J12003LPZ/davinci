@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    RuntimeDecision, RuntimeEventEnvelope, RuntimeHandle, RuntimeSubscriber, TaskError,
-    TaskRegistry, TaskState,
+    DurableError, RuntimeDecision, RuntimeEventEnvelope, RuntimeHandle, RuntimeSubscriber,
+    TaskError, TaskRegistry, TaskState,
 };
 use crate::runtime::operations::{digest_bytes, LegacyObservation, LegacySourceKind};
 
@@ -117,6 +117,7 @@ pub fn restore_session_runtime_with_legacy_recovery(
         .rehydrate_from_events(&events)
         .map_err(|error| format!("runtime registry could not be replayed: {error}"))?;
     runtime.mailbox.rehydrate_from_events(&events);
+    runtime.team.rehydrate_results(&runtime.mailbox, &events);
     let persisted_identity = events
         .iter()
         .find_map(|event| event.agent_id.map(|agent_id| (event.run_id, agent_id)));
@@ -314,14 +315,24 @@ impl RuntimeSubscriber for RuntimeLogSubscriber {
         RuntimeDecision::Continue
     }
 
-    fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+    fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), DurableError> {
         let mut writer = self
             .writer
             .lock()
-            .map_err(|_| "runtime log lock failed".to_string())?;
-        writer
-            .append(event)
-            .map_err(|error| format!("runtime log append failed: {error}"))
+            .map_err(|_| DurableError::Indeterminate("runtime log lock failed".to_string()))?;
+        writer.append(event).map_err(|error| {
+            let reason = format!("runtime log append failed: {error}");
+            match error {
+                davinci_session::RuntimeLogError::OutcomeUnknown(_) => {
+                    DurableError::Indeterminate(reason)
+                }
+                _ => DurableError::Refused(reason),
+            }
+        })
+    }
+
+    fn is_journal(&self) -> bool {
+        true
     }
 }
 
