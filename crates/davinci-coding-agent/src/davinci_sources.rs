@@ -19,13 +19,22 @@ pub struct GitChange {
     pub path: String,
 }
 
+/// `git -C cwd` for the inspection the TUI runs on its own in the user's
+/// workspace. `safe.bareRepository=explicit` stops git from treating the
+/// workspace root as a bare repository it discovered by itself: sandboxed code
+/// can write a root `HEAD`, `objects/`, `refs/` and a `config` with
+/// `core.fsmonitor`, which the next `git status` would then run on the host.
+pub(crate) fn host_git(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "safe.bareRepository=explicit", "-C"])
+        .arg(cwd);
+    command
+}
+
 /// `git status --porcelain` for `cwd`, or an empty list outside a repository.
 pub fn git_changes(cwd: &Path) -> Vec<GitChange> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["status", "--porcelain"])
-        .output();
+    let output = host_git(cwd).args(["status", "--porcelain"]).output();
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -61,11 +70,7 @@ pub fn parse_porcelain(text: &str) -> Vec<GitChange> {
 /// `Δn +a -d` for the status bar, from `git diff --numstat` plus the count of
 /// changed files. Untracked files count as changed but contribute no lines.
 pub fn git_delta(cwd: &Path, changes: &[GitChange]) -> (u32, u32, u32) {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["diff", "--numstat", "HEAD"])
-        .output();
+    let output = host_git(cwd).args(["diff", "--numstat", "HEAD"]).output();
     let (adds, dels) = match output {
         Ok(output) if output.status.success() => {
             parse_numstat(&String::from_utf8_lossy(&output.stdout))
@@ -91,9 +96,7 @@ pub fn parse_numstat(text: &str) -> (u32, u32) {
 
 /// The changes popover (`1e`), with per-file line counts where git has them.
 pub fn change_rows(cwd: &Path, changes: &[GitChange]) -> Vec<ChangeRow> {
-    let counts = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let counts = host_git(cwd)
         .args(["diff", "--numstat", "HEAD"])
         .output()
         .ok()
@@ -419,9 +422,8 @@ fn pull_request_for(
         .output();
     last.asked = Some((std::time::Instant::now(), branch.to_owned()));
     if let (Err(error), false) = (&output, last.hinted) {
-        let origin = std::process::Command::new("git")
+        let origin = host_git(cwd)
             .args(["remote", "get-url", "origin"])
-            .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
@@ -637,5 +639,44 @@ mod tests {
         let changes = git_changes(temp.path());
         assert!(changes.is_empty());
         assert_eq!(git_delta(temp.path(), &changes), (0, 0, 0));
+    }
+
+    #[test]
+    fn host_git_never_discovers_a_bare_repository_implicitly() {
+        let command = host_git(Path::new("work"));
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            ["-c", "safe.bareRepository=explicit", "-C", "work"].map(std::ffi::OsStr::new)
+        );
+    }
+
+    #[test]
+    fn a_workspace_root_planted_as_a_bare_repository_is_not_run() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git is unavailable: skipping");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
+        let marker = root.join("fsmonitor-ran");
+        std::fs::write(root.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        std::fs::create_dir_all(root.join("refs/heads")).unwrap();
+        std::fs::write(
+            root.join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = {}\n\tfsmonitor = echo ran > {} #\n",
+                slashed(root),
+                slashed(&marker)
+            ),
+        )
+        .unwrap();
+        let changes = git_changes(root);
+        git_delta(root, &changes);
+        change_rows(root, &changes);
+        assert!(changes.is_empty());
+        assert!(!marker.exists(), "host git ran the planted core.fsmonitor");
     }
 }

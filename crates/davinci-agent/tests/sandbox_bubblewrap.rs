@@ -295,3 +295,100 @@ fn native_bubblewrap_protects_the_directory_a_git_file_points_at() {
         1
     );
 }
+
+const BARE_ROOT_PROBE: &str = r#"
+import json, os, pathlib, sys
+marker = sys.argv[1]
+def allowed(operation):
+    try:
+        operation()
+        return True
+    except OSError:
+        return False
+def plant_head():
+    pathlib.Path('HEAD').write_text('ref: refs/heads/main\n')
+def plant_config():
+    pathlib.Path('config').write_text(
+        '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = ' + os.getcwd()
+        + '\n\tfsmonitor = echo ran > ' + marker + ' #\n')
+print(json.dumps({
+    'head_file': allowed(plant_head),
+    'head_rmdir': allowed(lambda: os.rmdir('HEAD')),
+    'head_rename_away': allowed(lambda: os.rename('HEAD', 'moved-head')),
+    'objects': allowed(lambda: os.mkdir('objects')),
+    'refs': allowed(lambda: os.makedirs('refs/heads')),
+    'config': allowed(plant_config),
+}))
+"#;
+
+#[test]
+#[ignore = "requires Linux bubblewrap, python3, git, and permission to create user/PID/network namespaces"]
+fn native_bubblewrap_does_not_let_the_workspace_root_become_a_bare_repository() {
+    let git_available = Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !git_available {
+        eprintln!("git is unavailable: skipping the host `git status` half of this fixture");
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let marker = temp.path().join("fsmonitor-ran");
+    let spec = spec(&workspace, SandboxMode::WorkspaceWrite);
+    let request = ExecutionRequest {
+        sandbox_id: spec.id.clone(),
+        executable: "/usr/bin/python3".into(),
+        argv: vec![
+            "-c".into(),
+            BARE_ROOT_PROBE.into(),
+            marker.to_string_lossy().into_owned(),
+        ],
+        cwd: spec.workspace.clone(),
+        launch_id: None,
+    };
+    let environment = sanitize_environment_from(&spec.environment, &BTreeMap::new()).unwrap();
+    let prepared = LinuxBubblewrapBackend::new(PathBuf::from("/usr/bin/bwrap"))
+        .prepare(&spec, &request, &environment)
+        .unwrap();
+    let output = Command::new(prepared.executable)
+        .args(prepared.argv)
+        .current_dir(prepared.cwd)
+        .env_clear()
+        .envs(prepared.environment)
+        .stdin(Stdio::null())
+        .output()
+        .expect("provision bubblewrap before running this opt-in test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::json!({
+            "head_file":false, "head_rmdir":false, "head_rename_away":false,
+            "objects":true, "refs":true, "config":true
+        })
+    );
+    // The host placeholder survived: an empty directory is never a valid HEAD.
+    assert!(workspace.join("HEAD").is_dir());
+    assert_eq!(fs::read_dir(workspace.join("HEAD")).unwrap().count(), 0);
+
+    // The workspace now holds everything a bare repository needs except a valid
+    // HEAD. The host's own `git status` must not discover it and run fsmonitor.
+    if git_available {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["status", "--porcelain"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "host git ran core.fsmonitor planted by the sandbox"
+        );
+    }
+}

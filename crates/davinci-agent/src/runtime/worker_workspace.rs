@@ -196,7 +196,7 @@ fn resolve_ref(git_dir: &Path, reference: &str) -> Option<String> {
 pub fn probe_changes(path: &Path, timeout: Duration) -> (Option<bool>, Vec<String>) {
     let mut command = std::process::Command::new("git");
     command
-        .arg("-C")
+        .args(["-c", "safe.bareRepository=explicit", "-C"])
         .arg(path)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
         .stdin(std::process::Stdio::null())

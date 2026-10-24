@@ -902,6 +902,15 @@ pub fn rebind_worker_spec(
 ///
 /// A `.git` file (linked worktree, submodule) names the real git directory, and
 /// its `commondir`; when those sit inside the workspace they are protected too.
+///
+/// When `.git` is not a valid repository entry (the empty placeholder above, or
+/// any directory that is not a git directory), git discovery skips it and then
+/// asks whether the workspace root itself is a bare repository: a valid `HEAD`,
+/// `objects/` and `refs/`. The root is writable, so the sandbox could complete
+/// one with `core.fsmonitor` in its `config`, and the host's next `git status`
+/// would run it. The root `HEAD` is therefore protected too (an empty directory
+/// when absent, which can never be a valid head), and a root `HEAD` that already
+/// looks like a head ref fails the launch because it cannot be made safe.
 pub fn protected_workspace_paths(spec: &SandboxSpec) -> Result<Vec<String>, SandboxFailure> {
     if spec.mode != SandboxMode::WorkspaceWrite {
         return Ok(Vec::new());
@@ -912,6 +921,9 @@ pub fn protected_workspace_paths(spec: &SandboxSpec) -> Result<Vec<String>, Sand
         .map(|name| protect_workspace_entry(&workspace.join(name)))
         .collect::<Result<Vec<_>, _>>()?;
     let git = workspace.join(".git");
+    if !git.is_file() && !is_git_directory(&git) {
+        paths.push(protect_workspace_head(&workspace.join("HEAD"))?);
+    }
     if git.is_file() {
         let targets = protect_gitfile_targets(workspace, &git)?;
         for path in &targets {
@@ -1055,6 +1067,62 @@ fn lexically_normalized(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+/// Whether `content` is what git accepts as a `HEAD`: a `ref: refs/...` line or
+/// a full object id.
+fn looks_like_head_ref(content: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let text = text.trim();
+    text.strip_prefix("ref:")
+        .is_some_and(|rest| rest.trim_start().starts_with("refs/"))
+        || (matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// The start of `path`, enough to judge it with [`looks_like_head_ref`].
+fn read_head_prefix(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut content = Vec::new();
+    std::fs::File::open(path)?
+        .take(512)
+        .read_to_end(&mut content)?;
+    Ok(content)
+}
+
+/// Whether git would stop discovery at `dir` as a git directory.
+fn is_git_directory(dir: &Path) -> bool {
+    dir.join("objects").is_dir()
+        && dir.join("refs").is_dir()
+        && std::fs::symlink_metadata(dir.join("HEAD")).is_ok_and(|metadata| metadata.is_file())
+        && read_head_prefix(&dir.join("HEAD")).is_ok_and(|content| looks_like_head_ref(&content))
+}
+
+/// The workspace root `HEAD`, see [`protected_workspace_paths`].
+fn protect_workspace_head(path: &Path) -> Result<String, SandboxFailure> {
+    let is_file = std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file());
+    if is_file {
+        let content = read_head_prefix(path).map_err(|error| {
+            SandboxFailure::new(
+                SandboxErrorCode::FilesystemDenied,
+                format!(
+                    "cannot protect workspace control path {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if looks_like_head_ref(&content) {
+            return Err(SandboxFailure::new(
+                SandboxErrorCode::FilesystemDenied,
+                format!(
+                    "cannot protect workspace control path {}: the workspace root already looks like a bare git repository (a valid HEAD and no .git); remove or rename HEAD",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    protect_workspace_entry(path)
 }
 
 fn protect_workspace_entry(path: &Path) -> Result<String, SandboxFailure> {
@@ -1410,6 +1478,97 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must be bound read-only"));
             assert!(at > bind, "{name} bind must sit on top of the workspace");
         }
+    }
+
+    #[test]
+    fn workspace_write_protects_the_root_head_when_git_is_not_a_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let argv = workspace_write_argv(&workspace).unwrap();
+        let bind = argv.iter().position(|arg| arg == "--bind").unwrap();
+        assert!(workspace.join("HEAD").is_dir(), "an empty HEAD placeholder");
+        let at = bound_read_only(&argv, &workspace.join("HEAD")).expect("HEAD bound read-only");
+        assert!(at > bind, "the HEAD bind must sit on top of the workspace");
+
+        // The placeholder .git is still not a repository on the next launch.
+        assert!(workspace_write_argv(&workspace).is_ok());
+
+        // Any other entry is bound as it is: it is not a valid head ref.
+        for content in ["", "hello\n", "ref: heads/main\n", "0123abcd"] {
+            std::fs::remove_dir(workspace.join("HEAD")).ok();
+            std::fs::remove_file(workspace.join("HEAD")).ok();
+            std::fs::write(workspace.join("HEAD"), content).unwrap();
+            let argv = workspace_write_argv(&workspace).unwrap();
+            assert!(bound_read_only(&argv, &workspace.join("HEAD")).is_some());
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("HEAD")).unwrap(),
+                content
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_write_refuses_a_root_head_that_looks_like_a_head_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        for content in [
+            "ref: refs/heads/main\n".to_string(),
+            "ref:refs/heads/main".to_string(),
+            "a".repeat(40),
+            format!("{}\n", "0123456789abcdef".repeat(4)),
+        ] {
+            std::fs::write(workspace.join("HEAD"), &content).unwrap();
+            let error = workspace_write_argv(&workspace).unwrap_err();
+            assert_eq!(
+                error.code,
+                SandboxErrorCode::FilesystemDenied,
+                "{content:?}"
+            );
+            assert!(error.message.contains("bare git repository"), "{content:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_write_refuses_a_symlinked_root_head() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("refs/heads/main", workspace.join("HEAD")).unwrap();
+        let error = workspace_write_argv(&workspace).unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+        assert!(error.message.contains("HEAD") && error.message.contains("symlink"));
+    }
+
+    #[test]
+    fn workspace_write_leaves_the_root_head_alone_when_git_stops_discovery() {
+        // A real git directory.
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let git = workspace.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::create_dir_all(git.join("refs")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let argv = workspace_write_argv(&workspace).unwrap();
+        assert!(!workspace.join("HEAD").exists());
+        assert!(bound_read_only(&argv, &workspace.join("HEAD")).is_none());
+
+        // A git file.
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        std::fs::write(workspace.join(".git"), "gitdir: ../elsewhere\n").unwrap();
+        let argv = workspace_write_argv(&workspace).unwrap();
+        assert!(!workspace.join("HEAD").exists());
+        assert!(bound_read_only(&argv, &workspace.join("HEAD")).is_none());
+    }
+
+    #[test]
+    fn workspace_write_protects_the_root_head_next_to_a_git_directory_that_is_not_one() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        std::fs::write(workspace.join(".git/HEAD"), "garbage\n").unwrap();
+        let argv = workspace_write_argv(&workspace).unwrap();
+        assert!(bound_read_only(&argv, &workspace.join("HEAD")).is_some());
     }
 
     #[test]

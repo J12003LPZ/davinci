@@ -16,6 +16,7 @@ use super::bus::RuntimeBus;
 /// subdirectory the user launched from produced leases of the wrong tree.
 pub fn git_toplevel(path: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
+        .args(["-c", "safe.bareRepository=explicit"])
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
@@ -76,6 +77,7 @@ fn now_ms() -> i64 {
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     let output = Command::new("git")
         .current_dir(cwd)
+        .args(["-c", "safe.bareRepository=explicit"])
         .args(args)
         .output()
         .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
@@ -241,6 +243,7 @@ impl WorktreeManager {
         // Check if branch already exists in git
         let branch_exists = Command::new("git")
             .current_dir(&self.repo_root)
+            .args(["-c", "safe.bareRepository=explicit"])
             .args(["rev-parse", "--verify", &branch])
             .output()
             .map(|o| o.status.success())
@@ -317,6 +320,7 @@ impl WorktreeManager {
         }
         let integrated = Command::new("git")
             .current_dir(&self.repo_root)
+            .args(["-c", "safe.bareRepository=explicit"])
             .args(["merge-base", "--is-ancestor", &current_head, "HEAD"])
             .output()
             .map(|o| o.status.success())

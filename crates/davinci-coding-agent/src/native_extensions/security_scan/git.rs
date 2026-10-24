@@ -110,6 +110,8 @@ fn run_status_interruptible(
             "core.hooksPath=/dev/null",
             "-c",
             "core.pager=cat",
+            "-c",
+            "safe.bareRepository=explicit",
         ])
         .args(args);
     #[cfg(unix)]

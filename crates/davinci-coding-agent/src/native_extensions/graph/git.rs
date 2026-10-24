@@ -31,6 +31,8 @@ pub fn run(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
             "core.hooksPath=/dev/null",
             "-c",
             "core.pager=cat",
+            "-c",
+            "safe.bareRepository=explicit",
         ])
         .args(args);
     let output = davinci_sys::process::run_bounded(
