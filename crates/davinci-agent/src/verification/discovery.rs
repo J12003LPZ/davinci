@@ -56,9 +56,9 @@ pub(crate) fn runner_words(words: &[String]) -> Option<&'static str> {
         [name, module, runner, ..]
             if super::python_name(name) && module == "-m" && runner == "pytest" =>
         {
-            Some("unknown")
+            Some("pytest")
         }
-        [name, ..] if matches!(name.as_str(), "pytest" | "pytest.exe") => Some("unknown"),
+        [name, ..] if matches!(name.as_str(), "pytest" | "pytest.exe") => Some("pytest"),
         [name, action, ..]
             if matches!(name.as_str(), "go" | "npm" | "pnpm" | "yarn") && action == "test" =>
         {
@@ -154,8 +154,79 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
             counts.total = number.parse().ok()?;
             counts.passed = counts.total.checked_sub(counts.skipped)?;
         }
+        "pytest" => {
+            // Only pytest's final terminal summary; earlier lines can be test output.
+            let end = stdout.lines().map(str::trim).rfind(|s| !s.is_empty())?;
+            return pytest_summary(end);
+        }
         _ => return None,
     }
+    Some(counts)
+}
+
+fn pytest_summary(line: &str) -> Option<AssertionCounts> {
+    static DURATION: OnceLock<regex::Regex> = OnceLock::new();
+    if line.contains('\x1b') {
+        return None;
+    }
+    let line = if line.starts_with('=') {
+        line.strip_suffix('=')?.trim_matches('=').trim()
+    } else {
+        line
+    };
+    let (items, elapsed) = line.rsplit_once(" in ")?;
+    let duration = DURATION.get_or_init(|| {
+        regex::Regex::new(r"^\d+(?:\.\d+)?s(?: \(\d+:\d{2}:\d{2}\))?$")
+            .expect("static pytest duration pattern")
+    });
+    if !duration.is_match(elapsed) {
+        return None;
+    }
+    let mut counts = AssertionCounts::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for item in items.split(", ") {
+        if item == "no tests ran" {
+            if !seen.insert("none") {
+                return None;
+            }
+            continue;
+        }
+        let (number, word) = item.split_once(' ')?;
+        let number = number.parse::<u32>().ok()?;
+        let key = match word {
+            "passed" | "failed" | "skipped" | "xfailed" | "xpassed" | "deselected" => word,
+            "error" | "errors" => "error",
+            "warning" | "warnings" => "warning",
+            "rerun" | "reruns" => "rerun",
+            _ => return None,
+        };
+        if !seen.insert(key) {
+            return None;
+        }
+        if key == "deselected" && number > 0 {
+            // Deselected tests never ran, so the summary says nothing about
+            // the paths the command named.
+            return None;
+        }
+        let field = match key {
+            "passed" => &mut counts.passed,
+            "failed" | "error" | "xpassed" => &mut counts.failed,
+            "skipped" | "xfailed" => &mut counts.skipped,
+            _ => continue,
+        };
+        *field = field.checked_add(number)?;
+    }
+    if seen.contains("none")
+        && seen
+            .iter()
+            .any(|key| !matches!(*key, "none" | "warning" | "deselected"))
+    {
+        return None;
+    }
+    counts.total = counts
+        .passed
+        .checked_add(counts.failed)?
+        .checked_add(counts.skipped)?;
     Some(counts)
 }
 
@@ -213,6 +284,106 @@ mod tests {
             "A=one pytest -q",
         ] {
             assert!(counts(command, rust, b"").is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn pytest_final_summary_is_parsed_quiet_and_padded() {
+        // Captured from bench-pubcmp-20261016 (t4-rename-r0, t8-calc-r0, t1-intervals-r2).
+        let quiet = "......                                                                   [100%]\r\n6 passed in 0.01s\r\n";
+        let padded = "collected 6 items\n\n====== 6 passed in 0.03s ======\n";
+        let timed = "====== 6 passed in 1.20s (0:00:01) ======\n";
+        for command in [
+            "pytest -q",
+            "python -m pytest -q",
+            "PYTHONDONTWRITEBYTECODE=1 pytest -q",
+        ] {
+            for output in [quiet, padded, timed] {
+                let result = counts(command, output.as_bytes(), b"").expect(command);
+                assert_eq!((result.total, result.passed, result.failed), (6, 6, 0));
+                assert!(crate::verification::tests_passed(&result));
+            }
+        }
+        let mixed = counts(
+            "pytest -q",
+            b"3 passed, 1 skipped, 2 xfailed, 1 warning in 0.5s\n",
+            b"",
+        )
+        .unwrap();
+        assert_eq!(
+            (mixed.total, mixed.passed, mixed.skipped, mixed.failed),
+            (6, 3, 3, 0)
+        );
+        assert!(crate::verification::tests_passed(&mixed));
+        // Deselected tests never ran: no evidence, not a pass.
+        for output in [
+            "3 passed, 1 skipped, 2 xfailed, 1 warning, 4 deselected in 0.5s\n",
+            "1 passed, 2 deselected in 0.01s\n",
+        ] {
+            assert!(
+                counts("pytest -q", output.as_bytes(), b"").is_none(),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn pytest_failures_errors_and_empty_runs_never_pass() {
+        // The error run is the captured t4-rename-r0 collection failure.
+        let collection = "=== ERRORS ===\r\nE   ModuleNotFoundError: No module named 'shop'\r\n!!!!!!!! Interrupted: 1 error during collection !!!!!!!!\r\n1 error in 0.07s\r\n";
+        for (output, failed) in [
+            ("1 failed, 5 passed in 0.03s\n", 1),
+            ("=== 1 failed, 4 passed, 1 error in 0.03s ===\n", 2),
+            ("1 xpassed, 5 passed in 0.03s\n", 1),
+            (collection, 1),
+        ] {
+            let result = counts("pytest -q", output.as_bytes(), b"").unwrap();
+            assert_eq!(result.failed, failed, "{output}");
+            assert!(!crate::verification::tests_passed(&result), "{output}");
+        }
+        for output in [
+            "no tests ran in 0.01s\n",
+            "=== no tests ran in 0.01s ===\n",
+            "no tests ran, 1 warning in 0.01s\n",
+        ] {
+            let result = counts("pytest -q", output.as_bytes(), b"").unwrap();
+            assert_eq!(result.total, 0, "{output}");
+            assert!(!crate::verification::tests_passed(&result), "{output}");
+        }
+        assert!(counts("pytest -q", b"3 deselected in 0.01s\n", b"").is_none());
+    }
+
+    #[test]
+    fn pytest_rejects_summaries_that_are_not_the_final_clean_line() {
+        for output in [
+            "6 passed in 0.03s\nprinting more output\n",
+            "6 passed in 0.03s\n6 passed in 0.03s extra\n",
+            "6 passed in 0.03s\n\n",
+            "6 passed, 1 flaky in 0.03s\n",
+            "6 passed, 6 passed in 0.03s\n",
+            "6 passed, 1 error, 1 errors in 0.03s\n",
+            "6 passed in soon\n",
+            "6 passed\n",
+            "in 0.03s\n",
+            "no tests ran, 6 passed in 0.03s\n",
+            "4294967295 passed, 1 failed in 0.03s\n",
+            "99999999999 passed in 0.03s\n",
+            "\x1b[32m6 passed\x1b[0m in 0.03s\n",
+            "=== 6 passed in 0.03s\n",
+        ] {
+            let accepted = counts("pytest -q", output.as_bytes(), b"");
+            if output == "6 passed in 0.03s\n\n" {
+                assert!(accepted.is_some(), "trailing blank lines are not output");
+            } else {
+                assert!(accepted.is_none(), "{output:?}");
+            }
+        }
+        assert!(counts("pytest -q", b"", b"6 passed in 0.03s\n").is_none());
+        for command in ["./tools/pytest -q", "npm test", "go test ./..."] {
+            assert!(
+                counts(command, b"6 passed in 0.03s\n", b"").is_none(),
+                "{command}"
+            );
         }
     }
 
