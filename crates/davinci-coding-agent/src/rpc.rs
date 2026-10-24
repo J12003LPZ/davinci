@@ -1104,7 +1104,19 @@ fn create_session(runtime: &mut RpcRuntime, parent: Option<&str>) -> Result<bool
     next.cwd = runtime.cwd.clone();
     next.provider = runtime.agent.provider.clone();
     next.model_id = runtime.agent.model_id.clone();
+    // Percentage compaction thresholds resolve against the selected model's
+    // window, not the `Agent::new` default.
+    next.context_window = runtime.agent.context_window;
     next.tools = runtime.agent.tools.clone();
+    next.tool_registry = runtime.agent.tool_registry.clone();
+    // Host services startup installed on the first agent: without the runner
+    // the `agent` tool is "not configured", and teammate admission resets.
+    next.subagent_runner = runtime.agent.subagent_runner.clone();
+    next.async_agents_allowed = runtime.agent.async_agents_allowed;
+    next.agent_profiles = runtime.agent.agent_profiles.clone();
+    next.agent_profile_models = runtime.agent.agent_profile_models.clone();
+    next.tool_context.mcp = runtime.agent.tool_context.mcp.clone();
+    next.evidence = runtime.agent.evidence.clone();
     next.permissions = runtime.agent.permissions.clone();
     next.approver = runtime.agent.approver.clone();
     next.approval_responder = runtime.agent.approval_responder.clone();
@@ -1113,6 +1125,13 @@ fn create_session(runtime: &mut RpcRuntime, parent: Option<&str>) -> Result<bool
     // included); `load_session` below adds this session's plugin context.
     next.load_instruction_files(runtime.agent.instruction_files_enabled);
     davinci_coding_agent::plugins::load_session(&mut next, session)?;
+    // The fresh Agent starts from defaults; give it the configuration the
+    // first one got at startup.
+    if let Err(error) =
+        crate::apply_session_agent_settings(&mut next, runtime.agent.summarizer.clone())
+    {
+        eprintln!("Codemode is on in /config but stays off: {error}");
+    }
     runtime.agent.reset_session_approvals();
     runtime.agent = next;
     Ok(false)
@@ -1653,6 +1672,55 @@ mod tests {
         assert!(policy.session_allow.is_empty());
         assert!(runtime.agent.approver.is_some());
         assert!(runtime.agent.approval_responder.is_some());
+    }
+
+    #[test]
+    fn rpc_new_session_agent_gets_the_configured_compaction_context_vm_and_codemode() {
+        use crate::tests::{EnvRestore, PROCESS_ENV_LOCK};
+        use davinci_agent::runtime::ContextVmMode;
+        let _lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+        let _env = EnvRestore::set("DAVINCI_CONTEXT_VM", "");
+        let mut settings = davinci_coding_agent::settings::Settings {
+            context_vm: Some("hybrid".into()),
+            codemode: Some(serde_json::json!({"mode": "read-only"})),
+            ..Default::default()
+        };
+        davinci_coding_agent::settings::set_compaction_threshold(&mut settings, "50%").unwrap();
+        davinci_coding_agent::settings::save_settings(dir.path(), &settings).unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut lead = Agent::new("fixture");
+        lead.cwd = workspace.clone();
+        lead.summarizer = Some(davinci_agent::Summarizer::new(|_| Err("fixture".into())));
+        lead.context_window = 400_000;
+        lead.async_agents_allowed = true;
+        lead.subagent_runner = Some(davinci_agent::SubagentRunner::new(|_| Ok("done".into())));
+        let mut runtime = RpcRuntime::new(lead, dir.path().into(), workspace);
+
+        let _host = crate::tests::FakeCodemodeHost::install();
+        assert!(!create_session(&mut runtime, None).unwrap());
+
+        let agent = &runtime.agent;
+        assert!(agent.subagent_runner.is_some());
+        assert!(agent.async_agents_allowed);
+        assert_eq!(agent.context_window, 400_000);
+        // 50% of the selected model's window, not of the 200,000 default.
+        assert_eq!(
+            davinci_agent::compaction_threshold(agent.context_window, &agent.compaction),
+            Some(200_000)
+        );
+        assert_eq!(agent.context_vm_mode(), ContextVmMode::Hybrid);
+        assert_eq!(
+            agent.compaction.threshold,
+            Some(davinci_agent::CompactionThreshold::Percent(50))
+        );
+        assert!(agent.summarizer.is_some());
+        assert!(agent.has_staged_codemode());
     }
 
     #[test]

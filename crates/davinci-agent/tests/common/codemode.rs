@@ -909,6 +909,43 @@ fn broker_hides_revoked_tools_without_expanding_initial_authority() {
 }
 
 #[test]
+fn broker_stays_inside_a_restricted_agents_tool_ceiling() {
+    use crate::codemode::*;
+    // A worker's tool list is narrower than what its runtime knows: the
+    // capability registry still holds `write`, the worker's ceiling does not.
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["read".into()];
+    agent.sync_tool_authorization();
+    let registry = &agent.runtime.as_ref().unwrap().capability_registry;
+    assert!(registry.get("write").is_some() && registry.get("grep").is_some());
+    let broker = AgentCodeModeBroker::new(agent.clone(), broker_context(&agent), None).unwrap();
+    let call = |request_id, tool: &str, args| {
+        broker.call(CodeModeCall {
+            request_id,
+            tool: tool.into(),
+            args,
+        })
+    };
+    assert!(
+        call(1, "read", json!({"path":"input.txt"}))
+            .unwrap()
+            .complete
+    );
+    let denied = call(2, "write", json!({"path":"outside.txt","content":"effect"})).unwrap_err();
+    assert_eq!(denied.code, "DENIED");
+    // Read-only is not the ceiling: a read-only tool outside the list is out too.
+    let outside = call(3, "grep", json!({"pattern":"sentinel"})).unwrap_err();
+    assert_eq!(outside.code, "DENIED");
+    assert_eq!(broker.describe("grep").unwrap_err().code, "DENIED");
+    assert!(broker
+        .catalog(64)
+        .unwrap()
+        .iter()
+        .all(|name| name != "write" && name != "grep"));
+    assert!(!workspace.path().join("outside.txt").exists());
+}
+
+#[test]
 fn broker_records_projection_failure_with_durable_child_reference() {
     use crate::codemode::*;
     let (agent, _workspace, journal) = configured_agent();
