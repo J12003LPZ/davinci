@@ -277,15 +277,22 @@ impl BoundUnixListener {
         }
         self.closed = true;
         self.listener.take();
+        // `cleanup_owned_socket` consumes the identity, and the private path
+        // is a hard link to the same inode.
+        let identity = self.socket_identity;
         let cleanup = self.cleanup_owned_socket();
-        let owned = remove_path(&self.owned_bind_path);
-        let owned_dir = self
-            .owned_bind_path
-            .parent()
-            .map(fs::remove_dir)
-            .transpose()
-            .map_err(|err| ServerError::Io(err.to_string()))
-            .map(|_| ());
+        let owned = remove_owned_path(&self.owned_bind_path, identity);
+        // A replaced private path stays, so its directory is not empty.
+        let owned_dir = if owned.is_ok() {
+            self.owned_bind_path
+                .parent()
+                .map(fs::remove_dir)
+                .transpose()
+                .map_err(|err| ServerError::Io(err.to_string()))
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
         cleanup.and(owned).and(owned_dir)
     }
 
@@ -359,6 +366,24 @@ fn remove_path(path: &Path) -> Result<(), ServerError> {
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(ServerError::Io(err.to_string())),
     }
+}
+
+/// Removes the private socket path only while it still holds the socket this
+/// listener bound. The private directory is 0700 and ours, so nobody else can
+/// swap the entry between the stat and the unlink.
+fn remove_owned_path(path: &Path, identity: Option<(u64, u64)>) -> Result<(), ServerError> {
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(ServerError::Io(err.to_string())),
+    };
+    if !current.file_type().is_socket() || Some((current.dev(), current.ino())) != identity {
+        return Err(ServerError::Io(format!(
+            "private Unix socket path was replaced and left in place: {}",
+            path.display()
+        )));
+    }
+    remove_path(path)
 }
 
 fn remove_stale_socket(path: &Path) -> Result<(), ServerError> {
@@ -767,6 +792,21 @@ mod tests {
         fs::write(&path, "replacement").unwrap();
         bound.close().unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn close_leaves_a_replaced_private_socket_path_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let mut bound = bind_unix(&path.to_string_lossy()).unwrap();
+        let owned = bound.owned_bind_path.clone();
+        fs::remove_file(&owned).unwrap();
+        fs::write(&owned, "not ours").unwrap();
+        let error = bound.close().expect_err("a replaced path must be reported");
+        assert!(error.to_string().contains("replaced"), "{error}");
+        assert_eq!(fs::read_to_string(&owned).unwrap(), "not ours");
+        fs::remove_file(&owned).unwrap();
+        fs::remove_dir(owned.parent().unwrap()).unwrap();
     }
 
     #[test]
