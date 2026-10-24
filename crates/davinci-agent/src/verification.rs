@@ -453,12 +453,11 @@ fn python_name(name: &str) -> bool {
 
 fn unfiltered_suite(words: &[String]) -> bool {
     let args = match words {
-        [python, module, runner, discover, rest @ ..]
-            if python_name(python)
-                && module == "-m"
-                && runner == "unittest"
-                && discover == "discover" =>
+        [python, module, runner, rest @ ..]
+            if python_name(python) && module == "-m" && runner == "unittest" =>
         {
+            // Bare `python -m unittest` uses the same default discovery.
+            let rest = rest.strip_prefix(&["discover".to_string()]).unwrap_or(rest);
             return rest
                 .iter()
                 .all(|arg| matches!(arg.as_str(), "-q" | "--quiet" | "-v" | "--verbose"));
@@ -500,6 +499,30 @@ fn unfiltered_suite(words: &[String]) -> bool {
                 | "--all-features"
                 | "--release"
         )
+    })
+}
+
+/// A pytest command with options that drop tests, so it runs less than the
+/// paths it names.
+fn pytest_selection(words: &[String]) -> bool {
+    let args = match words {
+        [python, module, runner, rest @ ..]
+            if python_name(python) && module == "-m" && runner == "pytest" =>
+        {
+            rest
+        }
+        [runner, rest @ ..] if runner == "pytest" || runner == "pytest.exe" => rest,
+        _ => return false,
+    };
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--lf" | "--last-failed" | "--sw" | "--stepwise" | "--sw-skip" | "--stepwise-skip"
+        ) || arg.starts_with("-k")
+            || arg.starts_with("-m")
+            || ["--deselect", "--ignore", "--ignore-glob"]
+                .iter()
+                .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
     })
 }
 
@@ -694,7 +717,11 @@ pub(crate) fn classify_in_workspace(
         {
             let suite = words.join(" ");
             full_workspace |= directory == workspace && unfiltered_suite(&words);
+            let selected = pytest_selection(&words);
             for path in paths {
+                if selected {
+                    continue;
+                }
                 // unittest selectors and discovery patterns do not establish
                 // coverage of an entire source tree merely by naming tests/.
                 if python
@@ -812,15 +839,30 @@ mod tests {
             assert!(!focused.complete, "{command}");
             assert!(!focused.full_workspace, "{command}");
         }
-        let whole = classify_in_workspace(
-            "bash",
+        for command in [
             "python -m unittest discover",
-            root.path(),
-            root.path(),
-            &paths,
-        );
-        assert!(whole.complete);
-        assert!(whole.full_workspace);
+            "python -m unittest",
+            "python -m unittest -v",
+            "python -m unittest -q",
+            "python -m unittest --verbose",
+            "python -m unittest --quiet",
+        ] {
+            let whole = classify_in_workspace("bash", command, root.path(), root.path(), &paths);
+            assert!(whole.complete, "{command}");
+            assert!(whole.full_workspace, "{command}");
+        }
+        for command in [
+            "python -m unittest -v test_app",
+            "python -m unittest -k test_value",
+            "python -m unittest -s tests",
+            "python -m unittest -p test_app.py",
+            "python -m unittest --pattern test_app.py",
+            "python -m unittest tests.test_app",
+        ] {
+            let focused = classify_in_workspace("bash", command, root.path(), root.path(), &paths);
+            assert!(!focused.complete, "{command}");
+            assert!(!focused.full_workspace, "{command}");
+        }
     }
 
     #[test]

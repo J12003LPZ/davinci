@@ -4663,6 +4663,202 @@ fn unrecognized_wrapper_script_named_pytest_earns_no_coverage() {
     assert_eq!(state.tests_passed_generation, None);
 }
 
+// Captured from bench-pubcmp-20261016: t8-calc-r0 and t7-cli-r2.
+const PYTEST_PASSED: &str =
+    "......                                                                   [100%]\r\n6 passed in 0.01s\r\n";
+const UNITTEST_PASSED: &str = "test_top_requires_a_positive_integer (test_wordcount.WordcountTests.test_top_requires_a_positive_integer) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 4 tests in 0.242s\r\n\r\nOK\r\n";
+
+/// As [`observe_shell_result`], but the assertion counts come from the
+/// captured runner output through the production discovery parser.
+fn observe_captured_run(
+    agent: &Agent,
+    id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    exit_code: i32,
+    stdout: &str,
+) {
+    observe_shell_result_with(agent, id, cwd, command, exit_code, false, |receipt| {
+        receipt.assertion_counts =
+            crate::verification::discovery::counts(command, stdout.as_bytes(), b"");
+    });
+}
+
+#[test]
+fn passing_pytest_summary_earns_test_credit_and_skips_the_requirement_review() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "before").unwrap();
+    }
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "after").unwrap();
+    }
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    observe_captured_run(&agent, "p1", dir.path(), "pytest -q", 0, PYTEST_PASSED);
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, Some(generation));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    assert!(!agent.queue_requirement_completion(&mut Vec::new()));
+    assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+}
+
+#[test]
+fn filtered_pytest_runs_earn_no_coverage_and_keep_the_review() {
+    for (command, output) in [
+        (
+            "pytest -q tests/ -k smoke",
+            "1 passed, 2 deselected in 0.01s\r\n",
+        ),
+        ("pytest -q tests/ -k smoke", PYTEST_PASSED),
+        ("pytest -q -m fast tests/", PYTEST_PASSED),
+        ("pytest -q --lf", PYTEST_PASSED),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+        for name in ["app.py", "lib.py"] {
+            std::fs::write(dir.path().join(name), "before").unwrap();
+        }
+        let mut agent = verifying_agent(dir.path());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        for name in ["app.py", "lib.py"] {
+            std::fs::write(dir.path().join(name), "after").unwrap();
+        }
+        agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+        observe_captured_run(&agent, "f1", dir.path(), command, 0, output);
+        let state = agent.mutation_verification_state();
+        assert!(
+            state.tested_paths.is_empty(),
+            "{command}: {:?}",
+            state.tested_paths
+        );
+        assert!(
+            agent.queue_requirement_completion(&mut Vec::new()),
+            "{command}"
+        );
+        assert_eq!(agent.stats.completion_requirement_reviews_skipped, 0);
+    }
+    // Control: the unfiltered directory run still covers the edited paths.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("tests")).unwrap();
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "before").unwrap();
+    }
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+    for name in ["app.py", "lib.py"] {
+        std::fs::write(dir.path().join(name), "after").unwrap();
+    }
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(
+        &agent,
+        "f2",
+        dir.path(),
+        "pytest -q tests/",
+        0,
+        PYTEST_PASSED,
+    );
+    assert!(!agent.queue_requirement_completion(&mut Vec::new()));
+    assert_eq!(agent.stats.completion_requirement_reviews_skipped, 1);
+}
+
+#[test]
+fn pytest_without_a_passing_summary_or_exact_runner_earns_no_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(
+        &agent,
+        "w1",
+        dir.path(),
+        "./tools/pytest -q",
+        0,
+        PYTEST_PASSED,
+    );
+    // Exit 5 with nothing collected, and a zero-test summary on a zero exit.
+    observe_captured_run(
+        &agent,
+        "n1",
+        dir.path(),
+        "pytest -q",
+        5,
+        "no tests ran in 0.01s\r\n",
+    );
+    observe_captured_run(
+        &agent,
+        "n2",
+        dir.path(),
+        "pytest -q",
+        0,
+        "no tests ran in 0.01s\r\n",
+    );
+    // No parsable summary at all.
+    observe_captured_run(
+        &agent,
+        "n3",
+        dir.path(),
+        "pytest -q",
+        0,
+        "......  [100%]\r\n",
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+    assert_ne!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn failed_pytest_summary_revokes_earlier_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(&agent, "p1", dir.path(), "pytest -q", 0, PYTEST_PASSED);
+    assert_eq!(agent.mutation_verification_state().tested_paths.len(), 2);
+    observe_captured_run(
+        &agent,
+        "p2",
+        dir.path(),
+        "pytest -q",
+        1,
+        "F.....                                                                   [100%]\r\n1 failed, 5 passed in 0.03s\r\n",
+    );
+    let state = agent.mutation_verification_state();
+    assert!(state.tested_paths.is_empty(), "{:?}", state.tested_paths);
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
+fn default_unittest_discovery_covers_edited_paths_but_a_module_selector_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec!["app.py".into(), "lib.py".into()]);
+    observe_captured_run(
+        &agent,
+        "u1",
+        dir.path(),
+        "python -m unittest -v test_mod",
+        0,
+        UNITTEST_PASSED,
+    );
+    assert!(agent.mutation_verification_state().tested_paths.is_empty());
+    observe_captured_run(
+        &agent,
+        "u2",
+        dir.path(),
+        "python -m unittest -v",
+        0,
+        UNITTEST_PASSED,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(
+        state.tested_paths,
+        [PathBuf::from("app.py"), PathBuf::from("lib.py")]
+    );
+    assert!(state.tests_passed_generation.is_some());
+}
+
 #[test]
 fn suffixed_python_does_not_bypass_the_filtered_unittest_exclusion() {
     for program in ["Python.exe", "python.cmd"] {
